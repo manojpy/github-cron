@@ -37,36 +37,3 @@ jobs:
         git diff --quiet && git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
         git push
 ```
-
-### **Step 5: Add GitHub Secrets**
-1. Go to **Settings** → **Secrets and variables** → **Actions**
-2. Click **"New repository secret"**
-3. Add two secrets:
-   - Name: `TELEGRAM_BOT_TOKEN` → Value: `your_bot_token_from_botfather`
-   - Name: `TELEGRAM_CHAT_ID` → Value: `your_chat_id_from_userinfobot`
-
-### **Step 6: Test It**
-1. Go to **Actions** tab
-2. Click **"MACD Alert Bot"**
-3. Click **"Run workflow"** → **"Run workflow"**
-4. Wait 30-60 seconds
-5. Check your Telegram for the startup message!
-
----
-
-## **That's It!** 🎉
-
-✅ Bot runs every 15 minutes automatically  
-✅ Sends Telegram alerts instantly  
-✅ No need to keep anything running  
-✅ Completely free forever  
-✅ Works 24/7  
-
-You'll get Telegram notifications like:
-```
-🟢 BTCUSD - Bullish MACD Crossover
-
-MACD crossed above Signal line
-EMA40 > EMA100 ✓
-Price: $106,770.00
-Time: 2025-10-17 20:15:00
