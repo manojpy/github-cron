@@ -2,8 +2,11 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+import smtplib
 import os
 import json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 # ============ CONFIGURATION ============
@@ -60,26 +63,34 @@ def save_state(state):
     except Exception as e:
         print(f"Error saving state: {e}")
 
-def send_telegram_alert(message):
-    """Send alert message via Telegram"""
+def send_email_alert(subject, message):
+    """Send alert message via Email"""
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        response = requests.post(url, data=data, timeout=10)
+        msg = MIMEMultipart('alternative')
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = subject
         
-        if response.json().get('ok'):
-            print(f"✓ Telegram alert sent")
-            return True
-        else:
-            print(f"Telegram error: {response.json()}")
-            return False
+        html_message = message.replace('\n', '<br>')
+        text_message = message
+        
+        part1 = MIMEText(text_message, 'plain')
+        part2 = MIMEText(html_message, 'html')
+        
+        msg.attach(part1)
+        msg.attach(part2)
+        
+        # Outlook method
+        with smtplib.SMTP('smtp-mail.outlook.com', 587) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.send_message(msg)
+        
+        print(f"✓ Email sent: {subject}")
+        return True
         
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        print(f"Error sending email: {e}")
         return False
 
 def get_product_ids():
@@ -196,28 +207,30 @@ def check_pair(pair_name, pair_info, last_alerts):
             current_state = "bullish"
             if last_alerts.get(pair_name) != "bullish":
                 price = df['close'].iloc[-1]
+                subject = f"🟢 {pair_name} - Bullish MACD Crossover"
                 message = (
-                    f"🟢 <b>{pair_name} - Bullish MACD Crossover</b>\n\n"
+                    f"{pair_name} - BULLISH SIGNAL\n"
                     f"MACD crossed above Signal line\n"
-                    f"EMA40 &gt; EMA100 ✓\n"
+                    f"EMA40 > EMA100 ✓\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
-                send_telegram_alert(message)
+                send_email_alert(subject, message)
                 print(f"✓ Bullish alert sent for {pair_name}")
                 
         elif bearish_cross and ema_bearish:
             current_state = "bearish"
             if last_alerts.get(pair_name) != "bearish":
                 price = df['close'].iloc[-1]
+                subject = f"🔴 {pair_name} - Bearish MACD Crossover"
                 message = (
-                    f"🔴 <b>{pair_name} - Bearish MACD Crossover</b>\n\n"
+                    f"{pair_name} - BEARISH SIGNAL\n"
                     f"MACD crossed below Signal line\n"
-                    f"EMA40 &lt; EMA100 ✓\n"
+                    f"EMA40 < EMA100 ✓\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
-                send_telegram_alert(message)
+                send_email_alert(subject, message)
                 print(f"✓ Bearish alert sent for {pair_name}")
         
         return current_state
