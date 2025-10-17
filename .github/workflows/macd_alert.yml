@@ -36,4 +36,3 @@ jobs:
         git add -A
         git diff --quiet && git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
         git push
-```
