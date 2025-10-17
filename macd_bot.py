@@ -69,13 +69,15 @@ def send_telegram_alert(message):
             "text": message,
             "parse_mode": "HTML"
         }
-        response = requests.post(url, data=data, timeout=10)
         
-        if response.json().get('ok'):
+        response = requests.post(url, data=data, timeout=10)
+        response_data = response.json()
+        
+        if response_data.get('ok'):
             print(f"✓ Telegram alert sent successfully")
             return True
         else:
-            print(f"Telegram error: {response.json()}")
+            print(f"Telegram error: {response_data}")
             return False
         
     except Exception as e:
@@ -245,16 +247,6 @@ def main():
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Found {found_count}/{len(PAIRS)} pairs\n")
     
-    # Send startup notification
-    startup_msg = (
-        f"🤖 <b>MACD Alert Bot - Check Started</b>\n\n"
-        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Monitoring: {found_count} pairs\n"
-        f"MACD: {MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}\n"
-        f"EMAs: {EMA_SHORT},{EMA_LONG}"
-    )
-    send_telegram_alert(startup_msg)
-    
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
@@ -274,7 +266,7 @@ def main():
     # Save state for next run
     save_state(last_alerts)
     
-    print(f"\n✓ Check complete. {alerts_sent} alerts sent.")
+    print(f"\n✓ Check complete. {alerts_sent} crossover alerts sent.")
     print("=" * 50)
 
 if __name__ == "__main__":
