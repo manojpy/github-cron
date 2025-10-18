@@ -177,25 +177,25 @@ def check_pair(pair_name, pair_info, last_alerts):
             return None
         
         macd_line, signal_line = calculate_macd(df)
-        ema_40 = calculate_ema(df['close'], EMA_SHORT)
         ema_100 = calculate_ema(df['close'], EMA_LONG)
         
         macd_curr = macd_line.iloc[-1]
         macd_prev = macd_line.iloc[-2]
         signal_curr = signal_line.iloc[-1]
         signal_prev = signal_line.iloc[-2]
-        ema40_curr = ema_40.iloc[-1]
+        close_curr = df['close'].iloc[-1]
         ema100_curr = ema_100.iloc[-1]
         
         bullish_cross = (macd_prev <= signal_prev) and (macd_curr > signal_curr)
         bearish_cross = (macd_prev >= signal_prev) and (macd_curr < signal_curr)
         
-        ema_bullish = ema40_curr > ema100_curr
-        ema_bearish = ema40_curr < ema100_curr
+        # New condition: Close price vs EMA100
+        close_above_ema100 = close_curr > ema100_curr
+        close_below_ema100 = close_curr < ema100_curr
         
         current_state = None
         
-        if bullish_cross and ema_bullish:
+        if bullish_cross and close_above_ema100:
             current_state = "bullish"
             if last_alerts.get(pair_name) != "bullish":
                 price = df['close'].iloc[-1]
@@ -212,7 +212,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 print(f"✓ Bullish alert sent for {pair_name}")
                 
-        elif bearish_cross and ema_bearish:
+        elif bearish_cross and close_below_ema100:
             current_state = "bearish"
             if last_alerts.get(pair_name) != "bearish":
                 price = df['close'].iloc[-1]
