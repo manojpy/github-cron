@@ -5,6 +5,7 @@ import time
 import os
 import json
 from datetime import datetime
+import pytz
 
 # ============ CONFIGURATION ============
 # Telegram settings - reads from environment variables (GitHub Secrets)
@@ -198,12 +199,15 @@ def check_pair(pair_name, pair_info, last_alerts):
             current_state = "bullish"
             if last_alerts.get(pair_name) != "bullish":
                 price = df['close'].iloc[-1]
+                # Get IST time
+                ist = pytz.timezone('Asia/Kolkata')
+                current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
+                
                 message = (
                     f"🟢 <b>{pair_name} - Bullish MACD Crossover</b>\n\n"
                     f"MACD crossed above Signal line\n"
-                    f"EMA40 &gt; EMA100 ✓\n"
                     f"Price: ${price:,.4f}\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"Time: {current_time}"
                 )
                 send_telegram_alert(message)
                 print(f"✓ Bullish alert sent for {pair_name}")
@@ -212,12 +216,15 @@ def check_pair(pair_name, pair_info, last_alerts):
             current_state = "bearish"
             if last_alerts.get(pair_name) != "bearish":
                 price = df['close'].iloc[-1]
+                # Get IST time
+                ist = pytz.timezone('Asia/Kolkata')
+                current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
+                
                 message = (
                     f"🔴 <b>{pair_name} - Bearish MACD Crossover</b>\n\n"
                     f"MACD crossed below Signal line\n"
-                    f"EMA40 &lt; EMA100 ✓\n"
                     f"Price: ${price:,.4f}\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"Time: {current_time}"
                 )
                 send_telegram_alert(message)
                 print(f"✓ Bearish alert sent for {pair_name}")
