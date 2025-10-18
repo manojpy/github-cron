@@ -35,8 +35,8 @@ PAIRS = {
 MACD_FAST = 20
 MACD_SLOW = 43
 MACD_SIGNAL = 15
-EMA_SHORT = 40
-EMA_LONG = 100
+EMA_100_PERIOD = 100  # EMA100 on 15min
+EMA_200_PERIOD = 200  # EMA200 on 10min
 
 # File to store last alert state
 STATE_FILE = 'alert_state.json'
@@ -170,35 +170,55 @@ def check_pair(pair_name, pair_info, last_alerts):
         if pair_info is None:
             return None
         
-        df = get_candles(pair_info['symbol'], "15", limit=150)
+        # Fetch 15-minute candles for MACD and EMA100
+        df_15m = get_candles(pair_info['symbol'], "15", limit=150)
         
-        if df is None or len(df) < 100:
-            print(f"Insufficient data for {pair_name}")
+        # Fetch 10-minute candles for EMA200
+        df_10m = get_candles(pair_info['symbol'], "10", limit=200)
+        
+        if df_15m is None or len(df_15m) < 100:
+            print(f"Insufficient 15min data for {pair_name}")
+            return None
+            
+        if df_10m is None or len(df_10m) < 200:
+            print(f"Insufficient 10min data for {pair_name}")
             return None
         
-        macd_line, signal_line = calculate_macd(df)
-        ema_100 = calculate_ema(df['close'], EMA_LONG)
+        # Calculate indicators on 15min timeframe
+        macd_line, signal_line = calculate_macd(df_15m)
+        ema_100 = calculate_ema(df_15m['close'], EMA_100_PERIOD)
         
+        # Calculate EMA200 on 10min timeframe
+        ema_200 = calculate_ema(df_10m['close'], EMA_200_PERIOD)
+        
+        # Get latest values from 15min
         macd_curr = macd_line.iloc[-1]
         macd_prev = macd_line.iloc[-2]
         signal_curr = signal_line.iloc[-1]
         signal_prev = signal_line.iloc[-2]
-        close_curr = df['close'].iloc[-1]
+        close_curr = df_15m['close'].iloc[-1]
         ema100_curr = ema_100.iloc[-1]
+        
+        # Get latest values from 10min
+        close_10m_curr = df_10m['close'].iloc[-1]
+        ema200_curr = ema_200.iloc[-1]
         
         bullish_cross = (macd_prev <= signal_prev) and (macd_curr > signal_curr)
         bearish_cross = (macd_prev >= signal_prev) and (macd_curr < signal_curr)
         
-        # New condition: Close price vs EMA100
+        # Conditions: Close vs EMA100 (15min) AND Close vs EMA200 (10min)
         close_above_ema100 = close_curr > ema100_curr
         close_below_ema100 = close_curr < ema100_curr
+        close_above_ema200 = close_10m_curr > ema200_curr
+        close_below_ema200 = close_10m_curr < ema200_curr
         
         current_state = None
         
-        if bullish_cross and close_above_ema100:
+        # Bullish: MACD cross up AND close > EMA100(15m) AND close > EMA200(10m)
+        if bullish_cross and close_above_ema100 and close_above_ema200:
             current_state = "bullish"
             if last_alerts.get(pair_name) != "bullish":
-                price = df['close'].iloc[-1]
+                price = df_15m['close'].iloc[-1]
                 # Get IST time
                 ist = pytz.timezone('Asia/Kolkata')
                 current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
@@ -212,10 +232,11 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 print(f"✓ Bullish alert sent for {pair_name}")
                 
-        elif bearish_cross and close_below_ema100:
+        # Bearish: MACD cross down AND close < EMA100(15m) AND close < EMA200(10m)
+        elif bearish_cross and close_below_ema100 and close_below_ema200:
             current_state = "bearish"
             if last_alerts.get(pair_name) != "bearish":
-                price = df['close'].iloc[-1]
+                price = df_15m['close'].iloc[-1]
                 # Get IST time
                 ist = pytz.timezone('Asia/Kolkata')
                 current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
