@@ -139,7 +139,7 @@ def get_candles(product_id, resolution="15", limit=150):
             'to': to_time
         }
         
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)  # Increased timeout
         data = response.json()
         
         if data.get('success'):
@@ -157,6 +157,9 @@ def get_candles(product_id, resolution="15", limit=150):
             print(f"Candle API Error: {data}")
             return None
             
+    except requests.Timeout:
+        print(f"Timeout fetching candles for {product_id}")
+        return None
     except Exception as e:
         print(f"Error fetching candles: {e}")
         return None
