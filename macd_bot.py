@@ -35,6 +35,7 @@ PAIRS = {
 SMI_K_PERIOD = 30      # %K period
 SMI_K_SMOOTHING = 5    # %K smoothing
 SMI_D_SMOOTHING = 5    # %D smoothing
+EMA_40_PERIOD = 40     # EMA40 on 15min
 EMA_100_PERIOD = 100   # EMA100 on 15min
 EMA_200_PERIOD = 200   # EMA200 on 10min
 
@@ -208,6 +209,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         # Calculate indicators on 15min timeframe
         smi, smi_signal = calculate_smi(df_15m, SMI_K_PERIOD, SMI_K_SMOOTHING, SMI_D_SMOOTHING)
+        ema_40 = calculate_ema(df_15m['close'], EMA_40_PERIOD)
         ema_100 = calculate_ema(df_15m['close'], EMA_100_PERIOD)
         
         # Calculate EMA200 on 10min timeframe
@@ -219,6 +221,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         smi_signal_curr = smi_signal.iloc[-1]
         smi_signal_prev = smi_signal.iloc[-2]
         close_curr = df_15m['close'].iloc[-1]
+        ema40_curr = ema_40.iloc[-1]
         ema100_curr = ema_100.iloc[-1]
         
         # Get latest values from 10min
@@ -228,16 +231,16 @@ def check_pair(pair_name, pair_info, last_alerts):
         bullish_cross = (smi_prev <= smi_signal_prev) and (smi_curr > smi_signal_curr)
         bearish_cross = (smi_prev >= smi_signal_prev) and (smi_curr < smi_signal_curr)
         
-        # Conditions: Close vs EMA100 (15min) AND Close vs EMA200 (10min)
-        close_above_ema100 = close_curr > ema100_curr
-        close_below_ema100 = close_curr < ema100_curr
+        # New conditions: EMA40 vs EMA100 (15min) AND Close vs EMA200 (10min)
+        ema40_above_ema100 = ema40_curr > ema100_curr
+        ema40_below_ema100 = ema40_curr < ema100_curr
         close_above_ema200 = close_10m_curr > ema200_curr
         close_below_ema200 = close_10m_curr < ema200_curr
         
         current_state = None
         
-        # Bullish: SMI cross up AND close > EMA100(15m) AND close > EMA200(10m)
-        if bullish_cross and close_above_ema100 and close_above_ema200:
+        # Bullish: SMI cross up AND EMA40 > EMA100(15m) AND close > EMA200(10m)
+        if bullish_cross and ema40_above_ema100 and close_above_ema200:
             current_state = "bullish"
             if last_alerts.get(pair_name) != "bullish":
                 price = df_15m['close'].iloc[-1]
@@ -254,8 +257,8 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 print(f"✓ Bullish alert sent for {pair_name}")
                 
-        # Bearish: SMI cross down AND close < EMA100(15m) AND close < EMA200(10m)
-        elif bearish_cross and close_below_ema100 and close_below_ema200:
+        # Bearish: SMI cross down AND EMA40 < EMA100(15m) AND close < EMA200(10m)
+        elif bearish_cross and ema40_below_ema100 and close_below_ema200:
             current_state = "bearish"
             if last_alerts.get(pair_name) != "bearish":
                 price = df_15m['close'].iloc[-1]
