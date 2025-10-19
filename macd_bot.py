@@ -9,7 +9,7 @@ import pytz
 
 # ============ CONFIGURATION ============
 # Telegram settings - reads from environment variables (GitHub Secrets)
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAGK9D5IWHmrYVI8zk6TLoKikNzHZSzSJns')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_BOTELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAGK9D5IWHmrYVI8zk6TLoKikNzHZSzSJns')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
 # Delta Exchange API
@@ -156,9 +156,8 @@ def calculate_ema(data, period):
     """Calculate Exponential Moving Average"""
     return data.ewm(span=period, adjust=False).mean()
 
-def calculate_smi(df, k_period=30, k_smooth=5, d_smooth=5):
-    """Calculate Stochastic Momentum Index (SMI)"""
-    # Get high and low
+def calculate_smi(df, k_period=30, d_period=5, ema_period=5):
+    """Calculate Stochastic Momentum Index (SMI) - matches TradingView Pine Script"""
     high = df['high']
     low = df['low']
     close = df['close']
@@ -167,25 +166,23 @@ def calculate_smi(df, k_period=30, k_smooth=5, d_smooth=5):
     highest_high = high.rolling(window=k_period).max()
     lowest_low = low.rolling(window=k_period).min()
     
-    # Calculate the midpoint
-    hl_range = highest_high - lowest_low
-    midpoint = (highest_high + lowest_low) / 2
+    # Calculate range
+    highest_lowest_range = highest_high - lowest_low
     
-    # Distance from close to midpoint
-    distance = close - midpoint
+    # Calculate relative range
+    relative_range = close - (highest_high + lowest_low) / 2
     
-    # Smooth the distance and range
-    distance_smoothed = distance.ewm(span=k_smooth, adjust=False).mean()
-    distance_double_smoothed = distance_smoothed.ewm(span=k_smooth, adjust=False).mean()
-    
-    range_smoothed = hl_range.ewm(span=k_smooth, adjust=False).mean()
-    range_double_smoothed = range_smoothed.ewm(span=k_smooth, adjust=False).mean()
+    # Double EMA function (EMA of EMA)
+    def ema_ema(series, period):
+        ema1 = series.ewm(span=period, adjust=False).mean()
+        ema2 = ema1.ewm(span=period, adjust=False).mean()
+        return ema2
     
     # Calculate SMI
-    smi = (distance_double_smoothed / (range_double_smoothed / 2)) * 100
+    smi = 200 * (ema_ema(relative_range, d_period) / ema_ema(highest_lowest_range, d_period))
     
-    # Calculate Signal line (SMI smoothed)
-    smi_signal = smi.ewm(span=d_smooth, adjust=False).mean()
+    # Calculate signal line (EMA of SMI)
+    smi_signal = smi.ewm(span=ema_period, adjust=False).mean()
     
     return smi, smi_signal
 
@@ -299,18 +296,6 @@ def main():
     
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Found {found_count}/{len(PAIRS)} pairs\n")
-    
-    # Send startup test message
-    ist = pytz.timezone('Asia/Kolkata')
-    current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
-    startup_msg = (
-        f"✅ <b>SMI Alert Bot - Check Started</b>\n\n"
-        f"Time: {current_time}\n"
-        f"Monitoring: {found_count} pairs\n"
-        f"SMI: {SMI_K_PERIOD},{SMI_K_SMOOTHING},{SMI_D_SMOOTHING}\n"
-        f"EMAs: {EMA_100_PERIOD}(15m), {EMA_200_PERIOD}(10m)"
-    )
-    send_telegram_alert(startup_msg)
     
     if found_count == 0:
         print("No valid pairs found. Exiting.")
