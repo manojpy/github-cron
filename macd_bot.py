@@ -260,6 +260,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
+        # PPO value conditions
+        ppo_below_010 = ppo_curr < 0.10
+        ppo_above_minus010 = ppo_curr > -0.10
+        
         # MACD conditions
         macd_above_signal = macd_curr > macd_signal_curr
         macd_below_signal = macd_curr < macd_signal_curr
@@ -356,15 +360,11 @@ def main():
     
     for pair_name, pair_info in PAIRS.items():
         if pair_info is not None:
-            try:
-                new_state = check_pair(pair_name, pair_info, last_alerts)
-                if new_state:
-                    last_alerts[pair_name] = new_state
-                    alerts_sent += 1
-            except Exception as e:
-                print(f"Error processing {pair_name}: {e}")
-                continue
-            time.sleep(2)  # Increased delay between pairs to avoid rate limiting
+            new_state = check_pair(pair_name, pair_info, last_alerts)
+            if new_state:
+                last_alerts[pair_name] = new_state
+                alerts_sent += 1
+            time.sleep(1)  # Small delay between API calls
     
     # Save state for next run
     save_state(last_alerts)
