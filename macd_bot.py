@@ -4,8 +4,8 @@ import numpy as np
 import time
 import os
 import json
-from datetime import datetime
 import pytz
+from datetime import datetime
 
 # ============ CONFIGURATION ============
 # Telegram settings - reads from environment variables (GitHub Secrets)
@@ -32,10 +32,18 @@ PAIRS = {
 }
 
 # Indicator settings
-SMI_K_PERIOD = 30      # %K period
-SMI_K_SMOOTHING = 5    # %K smoothing
-SMI_D_SMOOTHING = 5    # %D smoothing
-EMA_40_PERIOD = 40     # EMA40 on 15min
+# PPO settings
+PPO_FAST = 7
+PPO_SLOW = 16
+PPO_SIGNAL = 5
+PPO_USE_SMA = False  # False = use EMA (as per your script)
+
+# MACD settings
+MACD_FAST = 100
+MACD_SLOW = 200
+MACD_SIGNAL = 50
+
+# EMA/RMA settings
 EMA_100_PERIOD = 100   # EMA100 on 15min
 RMA_200_PERIOD = 200   # RMA200 on 5min
 
@@ -121,7 +129,7 @@ def get_candles(product_id, resolution="15", limit=150):
     """Fetch OHLCV candles from Delta Exchange"""
     try:
         to_time = int(time.time())
-        from_time = to_time - (limit * 15 * 60)
+        from_time = to_time - (limit * int(resolution) * 60)
         
         url = f"{DELTA_API_BASE}/v2/chart/history"
         params = {
@@ -157,57 +165,63 @@ def calculate_ema(data, period):
     """Calculate Exponential Moving Average"""
     return data.ewm(span=period, adjust=False).mean()
 
+def calculate_sma(data, period):
+    """Calculate Simple Moving Average"""
+    return data.rolling(window=period).mean()
+
 def calculate_rma(data, period):
     """Calculate RMA (Smoothed Moving Average) - same as ta.rma in Pine Script"""
-    # RMA is same as Wilder's smoothing / SMMA
-    # alpha = 1/period
     return data.ewm(alpha=1/period, adjust=False).mean()
 
-def calculate_smi(df, k_period=30, d_period=5, ema_period=5):
-    """Calculate Stochastic Momentum Index (SMI) - matches TradingView Pine Script"""
-    high = df['high']
-    low = df['low']
+def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
+    """Calculate PPO (Percentage Price Oscillator) - matches Pine Script"""
     close = df['close']
     
-    # Calculate highest high and lowest low over k_period
-    highest_high = high.rolling(window=k_period).max()
-    lowest_low = low.rolling(window=k_period).min()
+    # Calculate fast and slow MAs
+    if use_sma:
+        fast_ma = calculate_sma(close, fast)
+        slow_ma = calculate_sma(close, slow)
+    else:
+        fast_ma = calculate_ema(close, fast)
+        slow_ma = calculate_ema(close, slow)
     
-    # Calculate range
-    highest_lowest_range = highest_high - lowest_low
+    # Calculate PPO
+    ppo = (fast_ma - slow_ma) / slow_ma * 100
     
-    # Calculate relative range
-    relative_range = close - (highest_high + lowest_low) / 2
+    # Calculate signal line
+    if use_sma:
+        ppo_signal = calculate_sma(ppo, signal)
+    else:
+        ppo_signal = calculate_ema(ppo, signal)
     
-    # Double EMA function (EMA of EMA)
-    def ema_ema(series, period):
-        ema1 = series.ewm(span=period, adjust=False).mean()
-        ema2 = ema1.ewm(span=period, adjust=False).mean()
-        return ema2
+    return ppo, ppo_signal
+
+def calculate_macd(df, fast=100, slow=200, signal=50):
+    """Calculate MACD"""
+    close = df['close']
     
-    # Calculate SMI
-    smi = 200 * (ema_ema(relative_range, d_period) / ema_ema(highest_lowest_range, d_period))
+    ema_fast = calculate_ema(close, fast)
+    ema_slow = calculate_ema(close, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = calculate_ema(macd_line, signal)
     
-    # Calculate signal line (EMA of SMI)
-    smi_signal = smi.ewm(span=ema_period, adjust=False).mean()
-    
-    return smi, smi_signal
+    return macd_line, signal_line
 
 def check_pair(pair_name, pair_info, last_alerts):
-    """Check MACD crossover conditions for a pair"""
+    """Check PPO and MACD crossover conditions for a pair"""
     try:
         if pair_info is None:
             return None
         
         print(f"\n--- Checking {pair_name} ---")
         
-        # Fetch 15-minute candles for SMI and EMAs
-        df_15m = get_candles(pair_info['symbol'], "15", limit=150)
+        # Fetch 15-minute candles for PPO, MACD, EMA100
+        df_15m = get_candles(pair_info['symbol'], "15", limit=250)
         
         # Fetch 5-minute candles for RMA200
         df_5m = get_candles(pair_info['symbol'], "5", limit=250)
         
-        if df_15m is None or len(df_15m) < 100:
+        if df_15m is None or len(df_15m) < 200:
             print(f"Insufficient 15min data for {pair_name}")
             return None
             
@@ -216,82 +230,97 @@ def check_pair(pair_name, pair_info, last_alerts):
             return None
         
         # Calculate indicators on 15min timeframe
-        smi, smi_signal = calculate_smi(df_15m, SMI_K_PERIOD, SMI_K_SMOOTHING, SMI_D_SMOOTHING)
-        ema_40 = calculate_ema(df_15m['close'], EMA_40_PERIOD)
+        ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
+        macd, macd_signal = calculate_macd(df_15m, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
         ema_100 = calculate_ema(df_15m['close'], EMA_100_PERIOD)
         
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
         # Get latest values from 15min
-        smi_curr = smi.iloc[-1]
-        smi_prev = smi.iloc[-2]
-        smi_signal_curr = smi_signal.iloc[-1]
-        smi_signal_prev = smi_signal.iloc[-2]
+        ppo_curr = ppo.iloc[-1]
+        ppo_prev = ppo.iloc[-2]
+        ppo_signal_curr = ppo_signal.iloc[-1]
+        ppo_signal_prev = ppo_signal.iloc[-2]
+        
+        macd_curr = macd.iloc[-1]
+        macd_signal_curr = macd_signal.iloc[-1]
+        
         close_curr = df_15m['close'].iloc[-1]
-        ema40_curr = ema_40.iloc[-1]
         ema100_curr = ema_100.iloc[-1]
         
         # Get latest values from 5min
         close_5m_curr = df_5m['close'].iloc[-1]
         rma200_curr = rma_200.iloc[-1]
         
-        bullish_cross = (smi_prev <= smi_signal_prev) and (smi_curr > smi_signal_curr)
-        bearish_cross = (smi_prev >= smi_signal_prev) and (smi_curr < smi_signal_curr)
+        # Detect PPO crossovers
+        ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
+        ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
-        # Conditions: EMA40 vs EMA100 (15min) AND Close vs RMA200 (5min)
-        ema40_above_ema100 = ema40_curr > ema100_curr
-        ema40_below_ema100 = ema40_curr < ema100_curr
+        # PPO value conditions
+        ppo_below_010 = ppo_curr < 0.10
+        ppo_above_minus010 = ppo_curr > -0.10
+        
+        # MACD conditions
+        macd_above_signal = macd_curr > macd_signal_curr
+        macd_below_signal = macd_curr < macd_signal_curr
+        
+        # EMA/RMA conditions
+        close_above_ema100 = close_curr > ema100_curr
+        close_below_ema100 = close_curr < ema100_curr
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
         # Debug logging
         print(f"Price(15m): ${close_curr:,.4f}, Price(5m): ${close_5m_curr:,.4f}")
-        print(f"SMI: {smi_curr:.2f}, Signal: {smi_signal_curr:.2f}")
-        print(f"SMI prev: {smi_prev:.2f}, Signal prev: {smi_signal_prev:.2f}")
-        print(f"Bullish cross: {bullish_cross}, Bearish cross: {bearish_cross}")
-        print(f"EMA40: {ema40_curr:.2f}, EMA100: {ema100_curr:.2f}, RMA200(5m): {rma200_curr:.2f}")
-        print(f"EMA40 > EMA100: {ema40_above_ema100}, EMA40 < EMA100: {ema40_below_ema100}")
-        print(f"Close > RMA200: {close_above_rma200}, Close < RMA200: {close_below_rma200}")
+        print(f"PPO: {ppo_curr:.4f}, PPO Signal: {ppo_signal_curr:.4f}")
+        print(f"PPO prev: {ppo_prev:.4f}, PPO Signal prev: {ppo_signal_prev:.4f}")
+        print(f"PPO cross up: {ppo_cross_up}, PPO cross down: {ppo_cross_down}")
+        print(f"PPO < 0.10: {ppo_below_010}, PPO > -0.10: {ppo_above_minus010}")
+        print(f"MACD: {macd_curr:.2f}, MACD Signal: {macd_signal_curr:.2f}")
+        print(f"MACD > Signal: {macd_above_signal}, MACD < Signal: {macd_below_signal}")
+        print(f"EMA100: {ema100_curr:.2f}, RMA200(5m): {rma200_curr:.2f}")
+        print(f"Close > EMA100: {close_above_ema100}, Close > RMA200: {close_above_rma200}")
+        print(f"Close < EMA100: {close_below_ema100}, Close < RMA200: {close_below_rma200}")
         print(f"Last alert state: {last_alerts.get(pair_name, 'None')}")
         
         current_state = None
         
-        # Bullish: SMI cross up AND EMA40 > EMA100(15m) AND close > RMA200(5m)
-        if bullish_cross and ema40_above_ema100 and close_above_rma200:
-            current_state = "bullish"
-            if last_alerts.get(pair_name) != "bullish":
+        # BUY: PPO crosses up AND PPO < 0.10 AND MACD > Signal AND Close > EMA100 AND Close > RMA200
+        if ppo_cross_up and ppo_below_010 and macd_above_signal and close_above_ema100 and close_above_rma200:
+            current_state = "buy"
+            if last_alerts.get(pair_name) != "buy":
                 price = df_15m['close'].iloc[-1]
                 # Get IST time
                 ist = pytz.timezone('Asia/Kolkata')
                 current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
                 
                 message = (
-                    f"🟢 <b>{pair_name} - Bullish SMI Crossover</b>\n\n"
-                    f"SMI crossed above Signal line\n"
+                    f"🟢 <b>{pair_name} - BUY Signal</b>\n\n"
+                    f"PPO crossed above Signal (PPO: {ppo_curr:.4f})\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {current_time}"
                 )
                 send_telegram_alert(message)
-                print(f"✓ Bullish alert sent for {pair_name}")
+                print(f"✓ BUY alert sent for {pair_name}")
                 
-        # Bearish: SMI cross down AND EMA40 < EMA100(15m) AND close < RMA200(5m)
-        elif bearish_cross and ema40_below_ema100 and close_below_rma200:
-            current_state = "bearish"
-            if last_alerts.get(pair_name) != "bearish":
+        # SELL: PPO crosses down AND PPO > -0.10 AND MACD < Signal AND Close < EMA100 AND Close < RMA200
+        elif ppo_cross_down and ppo_above_minus010 and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "sell"
+            if last_alerts.get(pair_name) != "sell":
                 price = df_15m['close'].iloc[-1]
                 # Get IST time
                 ist = pytz.timezone('Asia/Kolkata')
                 current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
                 
                 message = (
-                    f"🔴 <b>{pair_name} - Bearish SMI Crossover</b>\n\n"
-                    f"SMI crossed below Signal line\n"
+                    f"🔴 <b>{pair_name} - SELL Signal</b>\n\n"
+                    f"PPO crossed below Signal (PPO: {ppo_curr:.4f})\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {current_time}"
                 )
                 send_telegram_alert(message)
-                print(f"✓ Bearish alert sent for {pair_name}")
+                print(f"✓ SELL alert sent for {pair_name}")
         
         return current_state
         
@@ -302,7 +331,7 @@ def check_pair(pair_name, pair_info, last_alerts):
 def main():
     """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
-    print(f"SMI Alert Bot - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"PPO/MACD Alert Bot - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
     
     # Load previous state
@@ -323,7 +352,7 @@ def main():
         return
     
     # Check all pairs
-    print("Checking for MACD crossovers...")
+    print("Checking for PPO/MACD signals...")
     alerts_sent = 0
     
     for pair_name, pair_info in PAIRS.items():
@@ -337,7 +366,7 @@ def main():
     # Save state for next run
     save_state(last_alerts)
     
-    print(f"\n✓ Check complete. {alerts_sent} crossover alerts sent.")
+    print(f"\n✓ Check complete. {alerts_sent} alerts sent.")
     print("=" * 50)
 
 if __name__ == "__main__":
