@@ -32,11 +32,11 @@ PAIRS = {
 }
 
 # Indicator settings
-MACD_FAST = 20
-MACD_SLOW = 43
-MACD_SIGNAL = 15
-EMA_100_PERIOD = 100  # EMA100 on 15min
-EMA_200_PERIOD = 200  # EMA200 on 10min
+SMI_K_PERIOD = 30      # %K period
+SMI_K_SMOOTHING = 5    # %K smoothing
+SMI_D_SMOOTHING = 5    # %D smoothing
+EMA_100_PERIOD = 100   # EMA100 on 15min
+EMA_200_PERIOD = 200   # EMA200 on 10min
 
 # File to store last alert state
 STATE_FILE = 'alert_state.json'
@@ -156,13 +156,38 @@ def calculate_ema(data, period):
     """Calculate Exponential Moving Average"""
     return data.ewm(span=period, adjust=False).mean()
 
-def calculate_macd(df):
-    """Calculate MACD and Signal line"""
-    ema_fast = calculate_ema(df['close'], MACD_FAST)
-    ema_slow = calculate_ema(df['close'], MACD_SLOW)
-    macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line, MACD_SIGNAL)
-    return macd_line, signal_line
+def calculate_smi(df, k_period=30, k_smooth=5, d_smooth=5):
+    """Calculate Stochastic Momentum Index (SMI)"""
+    # Get high and low
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    
+    # Calculate highest high and lowest low over k_period
+    highest_high = high.rolling(window=k_period).max()
+    lowest_low = low.rolling(window=k_period).min()
+    
+    # Calculate the midpoint
+    hl_range = highest_high - lowest_low
+    midpoint = (highest_high + lowest_low) / 2
+    
+    # Distance from close to midpoint
+    distance = close - midpoint
+    
+    # Smooth the distance and range
+    distance_smoothed = distance.ewm(span=k_smooth, adjust=False).mean()
+    distance_double_smoothed = distance_smoothed.ewm(span=k_smooth, adjust=False).mean()
+    
+    range_smoothed = hl_range.ewm(span=k_smooth, adjust=False).mean()
+    range_double_smoothed = range_smoothed.ewm(span=k_smooth, adjust=False).mean()
+    
+    # Calculate SMI
+    smi = (distance_double_smoothed / (range_double_smoothed / 2)) * 100
+    
+    # Calculate Signal line (SMI smoothed)
+    smi_signal = smi.ewm(span=d_smooth, adjust=False).mean()
+    
+    return smi, smi_signal
 
 def check_pair(pair_name, pair_info, last_alerts):
     """Check MACD crossover conditions for a pair"""
@@ -185,17 +210,17 @@ def check_pair(pair_name, pair_info, last_alerts):
             return None
         
         # Calculate indicators on 15min timeframe
-        macd_line, signal_line = calculate_macd(df_15m)
+        smi, smi_signal = calculate_smi(df_15m, SMI_K_PERIOD, SMI_K_SMOOTHING, SMI_D_SMOOTHING)
         ema_100 = calculate_ema(df_15m['close'], EMA_100_PERIOD)
         
         # Calculate EMA200 on 10min timeframe
         ema_200 = calculate_ema(df_10m['close'], EMA_200_PERIOD)
         
         # Get latest values from 15min
-        macd_curr = macd_line.iloc[-1]
-        macd_prev = macd_line.iloc[-2]
-        signal_curr = signal_line.iloc[-1]
-        signal_prev = signal_line.iloc[-2]
+        smi_curr = smi.iloc[-1]
+        smi_prev = smi.iloc[-2]
+        smi_signal_curr = smi_signal.iloc[-1]
+        smi_signal_prev = smi_signal.iloc[-2]
         close_curr = df_15m['close'].iloc[-1]
         ema100_curr = ema_100.iloc[-1]
         
@@ -203,8 +228,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_10m_curr = df_10m['close'].iloc[-1]
         ema200_curr = ema_200.iloc[-1]
         
-        bullish_cross = (macd_prev <= signal_prev) and (macd_curr > signal_curr)
-        bearish_cross = (macd_prev >= signal_prev) and (macd_curr < signal_curr)
+        bullish_cross = (smi_prev <= smi_signal_prev) and (smi_curr > smi_signal_curr)
+        bearish_cross = (smi_prev >= smi_signal_prev) and (smi_curr < smi_signal_curr)
         
         # Conditions: Close vs EMA100 (15min) AND Close vs EMA200 (10min)
         close_above_ema100 = close_curr > ema100_curr
@@ -214,7 +239,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         current_state = None
         
-        # Bullish: MACD cross up AND close > EMA100(15m) AND close > EMA200(10m)
+        # Bullish: SMI cross up AND close > EMA100(15m) AND close > EMA200(10m)
         if bullish_cross and close_above_ema100 and close_above_ema200:
             current_state = "bullish"
             if last_alerts.get(pair_name) != "bullish":
@@ -224,15 +249,15 @@ def check_pair(pair_name, pair_info, last_alerts):
                 current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
                 
                 message = (
-                    f"🟢 <b>{pair_name} - Bullish MACD Crossover</b>\n\n"
-                    f"MACD crossed above Signal line\n"
+                    f"🟢 <b>{pair_name} - Bullish SMI Crossover</b>\n\n"
+                    f"SMI crossed above Signal line\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {current_time}"
                 )
                 send_telegram_alert(message)
                 print(f"✓ Bullish alert sent for {pair_name}")
                 
-        # Bearish: MACD cross down AND close < EMA100(15m) AND close < EMA200(10m)
+        # Bearish: SMI cross down AND close < EMA100(15m) AND close < EMA200(10m)
         elif bearish_cross and close_below_ema100 and close_below_ema200:
             current_state = "bearish"
             if last_alerts.get(pair_name) != "bearish":
@@ -242,8 +267,8 @@ def check_pair(pair_name, pair_info, last_alerts):
                 current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
                 
                 message = (
-                    f"🔴 <b>{pair_name} - Bearish MACD Crossover</b>\n\n"
-                    f"MACD crossed below Signal line\n"
+                    f"🔴 <b>{pair_name} - Bearish SMI Crossover</b>\n\n"
+                    f"SMI crossed below Signal line\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {current_time}"
                 )
@@ -259,7 +284,7 @@ def check_pair(pair_name, pair_info, last_alerts):
 def main():
     """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
-    print(f"MACD Alert Bot - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"SMI Alert Bot - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 50)
     
     # Load previous state
