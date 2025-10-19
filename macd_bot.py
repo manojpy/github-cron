@@ -218,18 +218,18 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         print(f"\n--- Checking {pair_name} ---")
         
-        # Fetch 15-minute candles for PPO, MACD, EMA100
-        df_15m = get_candles(pair_info['symbol'], "15", limit=250)
+        # Fetch 15-minute candles for PPO, MACD, EMA100 (reduced limit)
+        df_15m = get_candles(pair_info['symbol'], "15", limit=210)
         
-        # Fetch 5-minute candles for RMA200
-        df_5m = get_candles(pair_info['symbol'], "5", limit=250)
+        # Fetch 5-minute candles for RMA200 (reduced limit)
+        df_5m = get_candles(pair_info['symbol'], "5", limit=210)
         
         if df_15m is None or len(df_15m) < 200:
-            print(f"Insufficient 15min data for {pair_name}")
+            print(f"Insufficient 15min data for {pair_name} (got {len(df_15m) if df_15m is not None else 0})")
             return None
             
         if df_5m is None or len(df_5m) < 200:
-            print(f"Insufficient 5min data for {pair_name}")
+            print(f"Insufficient 5min data for {pair_name} (got {len(df_5m) if df_5m is not None else 0})")
             return None
         
         # Calculate indicators on 15min timeframe
@@ -259,10 +259,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Detect PPO crossovers
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
-        
-        # PPO value conditions
-        ppo_below_010 = ppo_curr < 0.10
-        ppo_above_minus010 = ppo_curr > -0.10
         
         # MACD conditions
         macd_above_signal = macd_curr > macd_signal_curr
@@ -360,11 +356,15 @@ def main():
     
     for pair_name, pair_info in PAIRS.items():
         if pair_info is not None:
-            new_state = check_pair(pair_name, pair_info, last_alerts)
-            if new_state:
-                last_alerts[pair_name] = new_state
-                alerts_sent += 1
-            time.sleep(1)  # Small delay between API calls
+            try:
+                new_state = check_pair(pair_name, pair_info, last_alerts)
+                if new_state:
+                    last_alerts[pair_name] = new_state
+                    alerts_sent += 1
+            except Exception as e:
+                print(f"Error processing {pair_name}: {e}")
+                continue
+            time.sleep(2)  # Increased delay between pairs to avoid rate limiting
     
     # Save state for next run
     save_state(last_alerts)
