@@ -300,6 +300,18 @@ def main():
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Found {found_count}/{len(PAIRS)} pairs\n")
     
+    # Send startup test message
+    ist = pytz.timezone('Asia/Kolkata')
+    current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
+    startup_msg = (
+        f"✅ <b>SMI Alert Bot - Check Started</b>\n\n"
+        f"Time: {current_time}\n"
+        f"Monitoring: {found_count} pairs\n"
+        f"SMI: {SMI_K_PERIOD},{SMI_K_SMOOTHING},{SMI_D_SMOOTHING}\n"
+        f"EMAs: {EMA_100_PERIOD}(15m), {EMA_200_PERIOD}(10m)"
+    )
+    send_telegram_alert(startup_msg)
+    
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
