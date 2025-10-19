@@ -261,8 +261,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
         # PPO value conditions
-        ppo_below_010 = ppo_curr < 0.10
-        ppo_above_minus010 = ppo_curr > -0.10
+        ppo_below_020 = ppo_curr < 0.20
+        ppo_above_minus020 = ppo_curr > -0.20
         
         # MACD conditions
         macd_above_signal = macd_curr > macd_signal_curr
@@ -279,7 +279,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         print(f"PPO: {ppo_curr:.4f}, PPO Signal: {ppo_signal_curr:.4f}")
         print(f"PPO prev: {ppo_prev:.4f}, PPO Signal prev: {ppo_signal_prev:.4f}")
         print(f"PPO cross up: {ppo_cross_up}, PPO cross down: {ppo_cross_down}")
-        print(f"PPO < 0.10: {ppo_below_010}, PPO > -0.10: {ppo_above_minus010}")
+        print(f"PPO < 0.20: {ppo_below_020}, PPO > -0.20: {ppo_above_minus020}")
         print(f"MACD: {macd_curr:.2f}, MACD Signal: {macd_signal_curr:.2f}")
         print(f"MACD > Signal: {macd_above_signal}, MACD < Signal: {macd_below_signal}")
         print(f"EMA100: {ema100_curr:.2f}, RMA200(5m): {rma200_curr:.2f}")
@@ -289,8 +289,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         current_state = None
         
-        # BUY: PPO crosses up AND PPO < 0.10 AND MACD > Signal AND Close > EMA100 AND Close > RMA200
-        if ppo_cross_up and ppo_below_010 and macd_above_signal and close_above_ema100 and close_above_rma200:
+        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > EMA100 AND Close > RMA200
+        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_ema100 and close_above_rma200:
             current_state = "buy"
             if last_alerts.get(pair_name) != "buy":
                 price = df_15m['close'].iloc[-1]
@@ -307,8 +307,8 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 print(f"✓ BUY alert sent for {pair_name}")
                 
-        # SELL: PPO crosses down AND PPO > -0.10 AND MACD < Signal AND Close < EMA100 AND Close < RMA200
-        elif ppo_cross_down and ppo_above_minus010 and macd_below_signal and close_below_ema100 and close_below_rma200:
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < EMA100 AND Close < RMA200
+        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_ema100 and close_below_rma200:
             current_state = "sell"
             if last_alerts.get(pair_name) != "sell":
                 price = df_15m['close'].iloc[-1]
