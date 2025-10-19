@@ -193,6 +193,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         if pair_info is None:
             return None
         
+        print(f"\n--- Checking {pair_name} ---")
+        
         # Fetch 15-minute candles for MACD and EMA100
         df_15m = get_candles(pair_info['symbol'], "15", limit=150)
         
@@ -236,6 +238,17 @@ def check_pair(pair_name, pair_info, last_alerts):
         ema40_below_ema100 = ema40_curr < ema100_curr
         close_above_ema200 = close_10m_curr > ema200_curr
         close_below_ema200 = close_10m_curr < ema200_curr
+        
+        # Debug logging
+        print(f"Price: ${close_curr:,.4f}")
+        print(f"SMI: {smi_curr:.2f}, Signal: {smi_signal_curr:.2f}")
+        print(f"SMI prev: {smi_prev:.2f}, Signal prev: {smi_signal_prev:.2f}")
+        print(f"Bullish cross: {bullish_cross}, Bearish cross: {bearish_cross}")
+        print(f"EMA40: {ema40_curr:.2f}, EMA100: {ema100_curr:.2f}")
+        print(f"EMA40 > EMA100: {ema40_above_ema100}, EMA40 < EMA100: {ema40_below_ema100}")
+        print(f"Close(10m): {close_10m_curr:.2f}, EMA200(10m): {ema200_curr:.2f}")
+        print(f"Close > EMA200: {close_above_ema200}, Close < EMA200: {close_below_ema200}")
+        print(f"Last alert state: {last_alerts.get(pair_name, 'None')}")
         
         current_state = None
         
