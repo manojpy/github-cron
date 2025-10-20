@@ -392,7 +392,9 @@ def check_pair(pair_name, pair_info, last_alerts):
 def main():
     """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
-    print(f"PPO/MACD Alert Bot - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    ist = pytz.timezone('Asia/Kolkata')
+    start_time = datetime.now(ist)
+    print(f"PPO/MACD Alert Bot - {start_time.strftime('%Y-%m-%d %H:%M:%S IST')}")
     print("=" * 50)
     
     # Load previous state
@@ -427,7 +429,11 @@ def main():
     # Save state for next run
     save_state(last_alerts)
     
+    end_time = datetime.now(ist)
+    elapsed = (end_time - start_time).total_seconds()
     print(f"\n✓ Check complete. {alerts_sent} alerts sent.")
+    print(f"Execution time: {elapsed:.1f} seconds")
+    print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S IST')}")
     print("=" * 50)
 
 if __name__ == "__main__":
