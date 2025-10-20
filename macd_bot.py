@@ -263,8 +263,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Detect PPO zero-line crossovers
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
         ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
-        ppo_cross_above_015 = (ppo_prev <= 0.15) and (ppo_curr > 0.15)
-        ppo_cross_below_minus015 = (ppo_prev >= -0.15) and (ppo_curr < -0.15)
+        ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
+        ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
         
         # PPO value conditions
         ppo_below_020 = ppo_curr < 0.20
@@ -287,8 +287,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         print(f"PPO: {ppo_curr:.4f}, PPO Signal: {ppo_signal_curr:.4f}")
         print(f"PPO prev: {ppo_prev:.4f}, PPO Signal prev: {ppo_signal_prev:.4f}")
         print(f"PPO cross up: {ppo_cross_up}, PPO cross down: {ppo_cross_down}")
-        print(f"PPO cross above 0: {ppo_cross_above_zero}, PPO cross above 0.15: {ppo_cross_above_015}")
-        print(f"PPO cross below 0: {ppo_cross_below_zero}, PPO cross below -0.15: {ppo_cross_below_minus015}")
+        print(f"PPO cross above 0: {ppo_cross_above_zero}, PPO cross above 0.11: {ppo_cross_above_011}")
+        print(f"PPO cross below 0: {ppo_cross_below_zero}, PPO cross below -0.11: {ppo_cross_below_minus011}")
         print(f"PPO < 0.20: {ppo_below_020}, PPO > -0.20: {ppo_above_minus020}")
         print(f"PPO > Signal: {ppo_above_signal}, PPO < Signal: {ppo_below_signal}")
         print(f"MACD: {macd_curr:.2f}, MACD Signal: {macd_signal_curr:.2f}")
@@ -344,12 +344,12 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 print(f"✓ LONG alert sent for {pair_name}")
         
-        # LONG: PPO > Signal AND PPO crosses above 0.15
-        elif ppo_cross_above_015 and ppo_above_signal and macd_above_signal and close_above_ema100 and close_above_rma200:
-            current_state = "long_015"
-            if last_alerts.get(pair_name) != "long_015":
+        # LONG: PPO > Signal AND PPO crosses above 0.11
+        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_ema100 and close_above_rma200:
+            current_state = "long_011"
+            if last_alerts.get(pair_name) != "long_011":
                 message = (
-                    f"📈 <b>{pair_name} - LONG Signal (PPO > Signal, crosses above 0.15)</b>\n\n"
+                    f"📈 <b>{pair_name} - LONG Signal (PPO > Signal, crosses above 0.11)</b>\n\n"
                     f"PPO: {ppo_curr:.4f}, Signal: {ppo_signal_curr:.4f}\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {current_time}"
@@ -370,12 +370,12 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 print(f"✓ SHORT alert sent for {pair_name}")
         
-        # SHORT: PPO < Signal AND PPO crosses below -0.15
-        elif ppo_cross_below_minus015 and ppo_below_signal and macd_below_signal and close_below_ema100 and close_below_rma200:
-            current_state = "short_015"
-            if last_alerts.get(pair_name) != "short_015":
+        # SHORT: PPO < Signal AND PPO crosses below -0.11
+        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "short_011"
+            if last_alerts.get(pair_name) != "short_011":
                 message = (
-                    f"📉 <b>{pair_name} - SHORT Signal (PPO < Signal, crosses below -0.15)</b>\n\n"
+                    f"📉 <b>{pair_name} - SHORT Signal (PPO < Signal, crosses below -0.11)</b>\n\n"
                     f"PPO: {ppo_curr:.4f}, Signal: {ppo_signal_curr:.4f}\n"
                     f"Price: ${price:,.4f}\n"
                     f"Time: {current_time}"
