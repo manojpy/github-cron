@@ -9,8 +9,8 @@ from datetime import datetime
 
 # ============ CONFIGURATION ============
 # Telegram settings - reads from environment variables (GitHub Secrets)
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAGK9D5IWHmrYVI8zk6TLoKikNzHZSzSJns')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
+TELEGRAM_BOT_TOKEN = os.environ.get('8462496498:AAGK9D5IWHmrYVI8zk6TLoKikNzHZSzSJns')
+TELEGRAM_CHAT_ID = os.environ.get('203813932')
 
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
@@ -89,7 +89,7 @@ def send_telegram_alert(message):
         response_data = response.json()
         
         if response_data.get('ok'):
-            print(f"✓ Telegram alert sent successfully")
+            print(f"✓ Alert sent successfully")
             return True
         else:
             print(f"Telegram error: {response_data}")
@@ -119,7 +119,6 @@ def get_product_ids():
                                 'symbol': product['symbol'],
                                 'contract_type': product['contract_type']
                             }
-                            print(f"✓ Found {pair_name}: {product['symbol']}")
             
             return True
         else:
@@ -144,7 +143,7 @@ def get_candles(product_id, resolution="15", limit=150):
             'to': to_time
         }
         
-        response = requests.get(url, params=params, timeout=15)  # Increased timeout
+        response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
         if data.get('success'):
@@ -159,14 +158,9 @@ def get_candles(product_id, resolution="15", limit=150):
             })
             return df
         else:
-            print(f"Candle API Error: {data}")
             return None
             
-    except requests.Timeout:
-        print(f"Timeout fetching candles for {product_id}")
-        return None
-    except Exception as e:
-        print(f"Error fetching candles: {e}")
+    except:
         return None
 
 def calculate_ema(data, period):
@@ -232,15 +226,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Fetch 15-minute candles for PPO, MACD, EMA100
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         
-        # Fetch 5-minute candles for RMA200 (reduced limit)
+        # Fetch 5-minute candles for RMA200
         df_5m = get_candles(pair_info['symbol'], "5", limit=210)
         
         if df_15m is None or len(df_15m) < min_required:
-            print(f"Insufficient 15min data for {pair_name} (got {len(df_15m) if df_15m is not None else 0}, need {min_required})")
             return None
             
         if df_5m is None or len(df_5m) < 200:
-            print(f"Insufficient 5min data for {pair_name} (got {len(df_5m) if df_5m is not None else 0})")
             return None
         
         # Calculate indicators on 15min timeframe
@@ -271,6 +263,18 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
+        # Detect PPO zero-line crossovers
+        ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
+        ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
+        ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
+        ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
+        
+        # PPO value conditions
+        ppo_below_020 = ppo_curr < 0.20
+        ppo_above_minus020 = ppo_curr > -0.20
+        ppo_above_signal = ppo_curr > ppo_signal_curr
+        ppo_below_signal = ppo_curr < ppo_signal_curr
+        
         # MACD conditions
         macd_above_signal = macd_curr > macd_signal_curr
         macd_below_signal = macd_curr < macd_signal_curr
@@ -281,55 +285,85 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
-        # Debug logging
-        print(f"Price(15m): ${close_curr:,.4f}, Price(5m): ${close_5m_curr:,.4f}")
-        print(f"PPO: {ppo_curr:.4f}, PPO Signal: {ppo_signal_curr:.4f}")
-        print(f"PPO prev: {ppo_prev:.4f}, PPO Signal prev: {ppo_signal_prev:.4f}")
-        print(f"PPO cross up: {ppo_cross_up}, PPO cross down: {ppo_cross_down}")
-        print(f"MACD: {macd_curr:.2f}, MACD Signal: {macd_signal_curr:.2f}")
-        print(f"MACD > Signal: {macd_above_signal}, MACD < Signal: {macd_below_signal}")
-        print(f"EMA100: {ema100_curr:.2f}, RMA200(5m): {rma200_curr:.2f}")
-        print(f"Close > EMA100: {close_above_ema100}, Close > RMA200: {close_above_rma200}")
-        print(f"Close < EMA100: {close_below_ema100}, Close < RMA200: {close_below_rma200}")
-        print(f"Last alert state: {last_alerts.get(pair_name, 'None')}")
-        
         current_state = None
         
-        # BUY: PPO crosses up AND MACD > Signal AND Close > EMA100 AND Close > RMA200
-        if ppo_cross_up and macd_above_signal and close_above_ema100 and close_above_rma200:
+        # Get IST time in correct format
+        ist = pytz.timezone('Asia/Kolkata')
+        current_dt = datetime.now(ist)
+        formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
+        price = df_15m['close'].iloc[-1]
+        
+        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > EMA100 AND Close > RMA200
+        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_ema100 and close_above_rma200:
             current_state = "buy"
             if last_alerts.get(pair_name) != "buy":
-                price = df_15m['close'].iloc[-1]
-                # Get IST time
-                ist = pytz.timezone('Asia/Kolkata')
-                current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
-                
                 message = (
-                    f"🟢 <b>{pair_name} - BUY Signal</b>\n\n"
-                    f"PPO crossed above Signal (PPO: {ppo_curr:.4f})\n"
-                    f"Price: ${price:,.4f}\n"
-                    f"Time: {current_time}"
+                    f"🟢 {pair_name} - BUY\n"
+                    f"PPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
                 )
                 send_telegram_alert(message)
-                print(f"✓ BUY alert sent for {pair_name}")
-                
-        # SELL: PPO crosses down AND MACD < Signal AND Close < EMA100 AND Close < RMA200
-        elif ppo_cross_down and macd_below_signal and close_below_ema100 and close_below_rma200:
+        
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < EMA100 AND Close < RMA200
+        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_ema100 and close_below_rma200:
             current_state = "sell"
             if last_alerts.get(pair_name) != "sell":
-                price = df_15m['close'].iloc[-1]
-                # Get IST time
-                ist = pytz.timezone('Asia/Kolkata')
-                current_time = datetime.now(ist).strftime('%d-%m-%Y %H:%M:%S IST')
-                
                 message = (
-                    f"🔴 <b>{pair_name} - SELL Signal</b>\n\n"
-                    f"PPO crossed below Signal (PPO: {ppo_curr:.4f})\n"
-                    f"Price: ${price:,.4f}\n"
-                    f"Time: {current_time}"
+                    f"🔴 {pair_name} - SELL\n"
+                    f"PPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
                 )
                 send_telegram_alert(message)
-                print(f"✓ SELL alert sent for {pair_name}")
+        
+        # LONG: PPO > Signal AND PPO crosses above 0
+        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_ema100 and close_above_rma200:
+            current_state = "long_zero"
+            if last_alerts.get(pair_name) != "long_zero":
+                message = (
+                    f"🟢 {pair_name} - LONG\n"
+                    f"PPO crossing above 0 ({ppo_curr:.2f})\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
+                )
+                send_telegram_alert(message)
+        
+        # LONG: PPO > Signal AND PPO crosses above 0.11
+        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_ema100 and close_above_rma200:
+            current_state = "long_011"
+            if last_alerts.get(pair_name) != "long_011":
+                message = (
+                    f"🟢 {pair_name} - LONG\n"
+                    f"PPO crossing above 0.11 ({ppo_curr:.2f})\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
+                )
+                send_telegram_alert(message)
+        
+        # SHORT: PPO < Signal AND PPO crosses below 0
+        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "short_zero"
+            if last_alerts.get(pair_name) != "short_zero":
+                message = (
+                    f"🔴 {pair_name} - SHORT\n"
+                    f"PPO crossing below 0 ({ppo_curr:.2f})\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
+                )
+                send_telegram_alert(message)
+        
+        # SHORT: PPO < Signal AND PPO crosses below -0.11
+        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "short_011"
+            if last_alerts.get(pair_name) != "short_011":
+                message = (
+                    f"🔴 {pair_name} - SHORT\n"
+                    f"PPO crossing below -0.11 ({ppo_curr:.2f})\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
+                )
+                send_telegram_alert(message)
         
         return current_state
         
@@ -340,28 +374,27 @@ def check_pair(pair_name, pair_info, last_alerts):
 def main():
     """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
-    print(f"PPO/MACD Alert Bot - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    ist = pytz.timezone('Asia/Kolkata')
+    start_time = datetime.now(ist)
+    print(f"PPO/MACD Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print("=" * 50)
     
     # Load previous state
     last_alerts = load_state()
-    print(f"Loaded previous state: {len(last_alerts)} pairs tracked")
     
     # Fetch product IDs
-    print("\nFetching product information...")
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
     
     found_count = sum(1 for v in PAIRS.values() if v is not None)
-    print(f"✓ Found {found_count}/{len(PAIRS)} pairs\n")
+    print(f"✓ Monitoring {found_count} pairs")
     
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
     
     # Check all pairs
-    print("Checking for PPO/MACD signals...")
     alerts_sent = 0
     
     for pair_name, pair_info in PAIRS.items():
@@ -374,12 +407,14 @@ def main():
             except Exception as e:
                 print(f"Error processing {pair_name}: {e}")
                 continue
-            time.sleep(2)  # Increased delay between pairs to avoid rate limiting
+            time.sleep(2)
     
     # Save state for next run
     save_state(last_alerts)
     
-    print(f"\n✓ Check complete. {alerts_sent} alerts sent.")
+    end_time = datetime.now(ist)
+    elapsed = (end_time - start_time).total_seconds()
+    print(f"✓ Check complete. {alerts_sent} alerts sent. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
