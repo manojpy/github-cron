@@ -215,8 +215,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         if pair_info is None:
             return None
         
-        print(f"\n--- Checking {pair_name} ---")
-        
         # Check if this pair has special requirements
         if pair_name in SPECIAL_PAIRS:
             limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
@@ -232,11 +230,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         df_5m = get_candles(pair_info['symbol'], "5", limit=210)
         
         if df_15m is None or len(df_15m) < min_required:
-            print(f"Insufficient 15min data for {pair_name}")
             return None
             
         if df_5m is None or len(df_5m) < 200:
-            print(f"Insufficient 5min data for {pair_name}")
             return None
         
         # Calculate indicators on 15min timeframe
@@ -288,16 +284,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_below_ema100 = close_curr < ema100_curr
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
-        
-        # Debug output
-        print(f"Price: ${close_curr:,.2f}")
-        print(f"PPO: {ppo_curr:.4f}, Signal: {ppo_signal_curr:.4f}")
-        print(f"PPO cross up: {ppo_cross_up}, cross down: {ppo_cross_down}")
-        print(f"PPO < 0.20: {ppo_below_020}, PPO > -0.20: {ppo_above_minus020}")
-        print(f"MACD > Signal: {macd_above_signal}, MACD < Signal: {macd_below_signal}")
-        print(f"Close > EMA100: {close_above_ema100}, Close > RMA200: {close_above_rma200}")
-        print(f"Close < EMA100: {close_below_ema100}, Close < RMA200: {close_below_rma200}")
-        print(f"Last alert: {last_alerts.get(pair_name, 'None')}")
         
         current_state = None
         
@@ -392,15 +378,6 @@ def main():
     start_time = datetime.now(ist)
     print(f"PPO/MACD Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print("=" * 50)
-    
-    # Send startup test message
-    test_msg = (
-        f"✅ Bot Started\n"
-        f"Time: {start_time.strftime('%d-%m-%Y @ %H:%M IST')}\n"
-        f"Monitoring 12 pairs\n"
-        f"Ready to send alerts"
-    )
-    send_telegram_alert(test_msg)
     
     # Load previous state
     last_alerts = load_state()
