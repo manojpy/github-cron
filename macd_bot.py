@@ -31,11 +31,6 @@ PAIRS = {
     "AAVEUSD": None
 }
 
-# Special data requirements for pairs with limited history
-SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 130, "min_required": 100}  # Reduced requirements for SOLUSD
-}
-
 # Indicator settings
 # PPO settings
 PPO_FAST = 7
@@ -223,22 +218,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         print(f"\n--- Checking {pair_name} ---")
         
-        # Check if this pair has special requirements
-        if pair_name in SPECIAL_PAIRS:
-            limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
-            min_required = SPECIAL_PAIRS[pair_name]["min_required"]
-        else:
-            limit_15m = 210
-            min_required = 200
-        
-        # Fetch 15-minute candles for PPO, MACD, EMA100
-        df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
+        # Fetch 15-minute candles for PPO, MACD, EMA100 (reduced limit)
+        df_15m = get_candles(pair_info['symbol'], "15", limit=210)
         
         # Fetch 5-minute candles for RMA200 (reduced limit)
         df_5m = get_candles(pair_info['symbol'], "5", limit=210)
         
-        if df_15m is None or len(df_15m) < min_required:
-            print(f"Insufficient 15min data for {pair_name} (got {len(df_15m) if df_15m is not None else 0}, need {min_required})")
+        if df_15m is None or len(df_15m) < 200:
+            print(f"Insufficient 15min data for {pair_name} (got {len(df_15m) if df_15m is not None else 0})")
             return None
             
         if df_5m is None or len(df_5m) < 200:
