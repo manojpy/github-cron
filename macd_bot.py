@@ -6,6 +6,7 @@ import os
 import json
 import pytz
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ CONFIGURATION ============
 # Telegram settings - reads from environment variables (GitHub Secrets)
@@ -63,8 +64,8 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
-    except:
-        pass
+    except Exception as e:
+        print(f"Error loading state: {e}")
     return {}
 
 def save_state(state):
@@ -158,9 +159,11 @@ def get_candles(product_id, resolution="15", limit=150):
             })
             return df
         else:
+            print(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
             return None
             
-    except:
+    except Exception as e:
+        print(f"Exception fetching candles for {product_id}: {e}")
         return None
 
 def calculate_ema(data, period):
@@ -230,9 +233,11 @@ def check_pair(pair_name, pair_info, last_alerts):
         df_5m = get_candles(pair_info['symbol'], "5", limit=210)
         
         if df_15m is None or len(df_15m) < min_required:
+            print(f"Not enough 15m data for {pair_name} ({len(df_15m) if df_15m is not None else 0}/{min_required})")
             return None
             
         if df_5m is None or len(df_5m) < 200:
+            print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/200)")
             return None
         
         # Calculate indicators on 15min timeframe
@@ -394,21 +399,37 @@ def main():
         print("No valid pairs found. Exiting.")
         return
     
-    # Check all pairs
+    # Check all pairs in parallel
     alerts_sent = 0
     
-    for pair_name, pair_info in PAIRS.items():
-        if pair_info is not None:
+    # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
+    # We limit workers to 10 to avoid hitting the API too hard all at once.
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        
+        # Create a dictionary to map a running "future" (thread) to its pair_name
+        future_to_pair = {}
+        
+        for pair_name, pair_info in PAIRS.items():
+            if pair_info is not None:
+                # Submit the task to the thread pool.
+                # The executor runs 'check_pair(pair_name, pair_info, last_alerts)' in the background.
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
+                future_to_pair[future] = pair_name
+
+        # As each thread finishes, process its result
+        for future in as_completed(future_to_pair):
+            pair_name = future_to_pair[future]
             try:
-                new_state = check_pair(pair_name, pair_info, last_alerts)
+                # Get the return value from the check_pair function
+                new_state = future.result() 
                 if new_state:
                     last_alerts[pair_name] = new_state
                     alerts_sent += 1
             except Exception as e:
-                print(f"Error processing {pair_name}: {e}")
+                # Catch any error that happened inside the thread
+                print(f"Error processing {pair_name} in thread: {e}")
                 continue
-            time.sleep(2)
-    
+            
     # Save state for next run
     save_state(last_alerts)
     
@@ -418,5 +439,4 @@ def main():
     print("=" * 50)
 
 if __name__ == "__main__":
-
     main()
