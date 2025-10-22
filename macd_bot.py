@@ -38,7 +38,7 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 100, "min_required": 90}  # Reduced requirements for SOLUSD
+    "SOLUSD": {"limit_15m": 150, "min_required": 74}  # SOLUSD only returns ~74 candles max
 }
 
 # Indicator settings
@@ -436,11 +436,6 @@ def main():
     if DEBUG_MODE:
         print(f"DEBUG MODE: ON (Pairs: {DEBUG_PAIRS if DEBUG_PAIRS else 'ALL'})")
     print("=" * 50)
-    
-    # Send test message first
-    print("\n[TEST] Sending test message...")
-    send_test_message()
-    print()
     
     # Load previous state
     last_alerts = load_state()
