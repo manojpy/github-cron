@@ -302,4 +302,111 @@ def check_pair(pair_name, pair_info, last_alerts):
         if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_ema100 and close_above_rma200:
             current_state = "buy"
             if last_alerts.get(pair_name) != "buy":
-                message = (
+                message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+        
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < EMA100 AND Close < RMA200
+        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "sell"
+            if last_alerts.get(pair_name) != "sell":
+                message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+        
+        # LONG: PPO > Signal AND PPO crosses above 0
+        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_ema100 and close_above_rma200:
+            current_state = "long_zero"
+            if last_alerts.get(pair_name) != "long_zero":
+                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+        
+        # LONG: PPO > Signal AND PPO crosses above 0.11
+        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_ema100 and close_above_rma200:
+            current_state = "long_011"
+            if last_alerts.get(pair_name) != "long_011":
+                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+        
+        # SHORT: PPO < Signal AND PPO crosses below 0
+        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "short_zero"
+            if last_alerts.get(pair_name) != "short_zero":
+                message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+        
+        # SHORT: PPO < Signal AND PPO crosses below -0.11
+        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_ema100 and close_below_rma200:
+            current_state = "short_011"
+            if last_alerts.get(pair_name) != "short_011":
+                message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+        
+        return current_state
+        
+    except Exception as e:
+        print(f"Error checking {pair_name}: {e}")
+        return None
+
+def main():
+    """Main function - runs once per GitHub Actions execution"""
+    print("=" * 50)
+    ist = pytz.timezone('Asia/Kolkata')
+    start_time = datetime.now(ist)
+    print(f"PPO/MACD Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
+    print("=" * 50)
+    
+    # Load previous state
+    last_alerts = load_state()
+    
+    # Fetch product IDs
+    if not get_product_ids():
+        print("Failed to fetch products. Exiting.")
+        return
+    
+    found_count = sum(1 for v in PAIRS.values() if v is not None)
+    print(f"✓ Monitoring {found_count} pairs")
+    
+    if found_count == 0:
+        print("No valid pairs found. Exiting.")
+        return
+    
+    # Check all pairs in parallel
+    alerts_sent = 0
+    
+    # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
+    # We limit workers to 10 to avoid hitting the API too hard all at once.
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        
+        # Create a dictionary to map a running "future" (thread) to its pair_name
+        future_to_pair = {}
+        
+        for pair_name, pair_info in PAIRS.items():
+            if pair_info is not None:
+                # Submit the task to the thread pool.
+                # The executor runs 'check_pair(pair_name, pair_info, last_alerts)' in the background.
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
+                future_to_pair[future] = pair_name
+
+        # As each thread finishes, process its result
+        for future in as_completed(future_to_pair):
+            pair_name = future_to_pair[future]
+            try:
+                # Get the return value from the check_pair function
+                new_state = future.result() 
+                if new_state:
+                    last_alerts[pair_name] = new_state
+                    alerts_sent += 1
+            except Exception as e:
+                # Catch any error that happened inside the thread
+                print(f"Error processing {pair_name} in thread: {e}")
+                continue
+            
+    # Save state for next run
+    save_state(last_alerts)
+    
+    end_time = datetime.now(ist)
+    elapsed = (end_time - start_time).total_seconds()
+    print(f"✓ Check complete. {alerts_sent} alerts sent. ({elapsed:.1f}s)")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    main()
