@@ -1,1 +1,1 @@
-{"BNBUSD": "sell", "LTCUSD": "sell", "BCHUSD": "sell"}
+{"BNBUSD": "short_zero", "LTCUSD": "sell", "BCHUSD": "sell", "ETHUSD": "short_011", "BTCUSD": "sell", "AAVEUSD": "short_011"}
