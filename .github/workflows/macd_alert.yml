@@ -2,8 +2,10 @@ name: MACD Alert Bot
 
 on:
   schedule:
-    - cron: '1,16,31,46 * * * *'
-  workflow_dispatch:
+    # IST 5:31 AM = UTC 12:01 AM (midnight + 1 min)
+    # Then every 15 minutes: 5:31, 5:46, 6:01, 6:16, 6:31, 6:46, 7:01... etc throughout the day
+    - cron: '1,16,31,46 * * * *'  # Runs at :01, :16, :31, :46 every hour UTC (which is :31, :46, :01, :16 IST)
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   run-bot:
@@ -28,3 +30,11 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python macd_bot.py
+    
+    - name: Commit state file
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add -A
+        git diff --quiet && git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
+        git push
