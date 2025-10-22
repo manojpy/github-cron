@@ -34,7 +34,7 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 150, "min_required": 74}  # SOLUSD only returns ~74 candles max
+    "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 250, "min_required_5m": 183}
 }
 
 # Indicator settings
@@ -222,22 +222,26 @@ def check_pair(pair_name, pair_info, last_alerts):
         if pair_name in SPECIAL_PAIRS:
             limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
             min_required = SPECIAL_PAIRS[pair_name]["min_required"]
+            limit_5m = SPECIAL_PAIRS[pair_name].get("limit_5m", 210)
+            min_required_5m = SPECIAL_PAIRS[pair_name].get("min_required_5m", 200)
         else:
             limit_15m = 210
             min_required = 200
+            limit_5m = 210
+            min_required_5m = 200
         
         # Fetch 15-minute candles for PPO, MACD, EMA100
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         
         # Fetch 5-minute candles for RMA200
-        df_5m = get_candles(pair_info['symbol'], "5", limit=210)
+        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         
         if df_15m is None or len(df_15m) < min_required:
             print(f"Not enough 15m data for {pair_name} ({len(df_15m) if df_15m is not None else 0}/{min_required})")
             return None
             
-        if df_5m is None or len(df_5m) < 200:
-            print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/200)")
+        if df_5m is None or len(df_5m) < min_required_5m:
+            print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/{min_required_5m})")
             return None
         
         # Calculate indicators on 15min timeframe
