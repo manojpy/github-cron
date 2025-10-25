@@ -45,9 +45,9 @@ PPO_SIGNAL = 5
 PPO_USE_SMA = False  # False = use EMA (as per your script)
 
 # MACD settings
-MACD_FAST = 100
-MACD_SLOW = 200
-MACD_SIGNAL = 50
+MACD_FAST = 112
+MACD_SLOW = 256
+MACD_SIGNAL = 80
 
 # EMA/RMA settings
 EMA_100_PERIOD = 100   # EMA100 on 15min
@@ -201,7 +201,7 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     
     return ppo, ppo_signal
 
-def calculate_macd(df, fast=100, slow=200, signal=50):
+def calculate_macd(df, fast=112, slow=256, signal=80):
     """Calculate MACD"""
     close = df['close']
     
@@ -415,3 +415,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
