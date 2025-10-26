@@ -49,8 +49,8 @@ MACD_F = 112
 MACD_S = 256
 MACD_SG = 80
 
-# EMA/RMA settings
-EMA_100_PERIOD = 100   # EMA100 on 15min
+# RMA settings
+RMA_50_PERIOD = 50   # RMA50 on 15min
 RMA_200_PERIOD = 200   # RMA200 on 5min
 
 # File to store last alert state
@@ -250,7 +250,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         print(f"DEBUG: {pair_name} MACD settings passed: F:{MACD_F}, S:{MACD_S}, SG:{MACD_SG}")
         # ---------------------
         macd, macd_signal = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
-        ema_100 = calculate_ema(df_15m['close'], EMA_100_PERIOD)
+        rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
         
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
@@ -265,7 +265,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         macd_signal_curr = macd_signal.iloc[-1]
         
         close_curr = df_15m['close'].iloc[-1]
-        ema100_curr = ema_100.iloc[-1]
+        rma50_curr = rma_50.iloc[-1]
         
         # Get latest values from 5min
         close_5m_curr = df_5m['close'].iloc[-1]
@@ -291,9 +291,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         macd_above_signal = macd_curr > macd_signal_curr
         macd_below_signal = macd_curr < macd_signal_curr
         
-        # EMA/RMA conditions
-        close_above_ema100 = close_curr > ema100_curr
-        close_below_ema100 = close_curr < ema100_curr
+        # RMA conditions
+        close_above_rma50 = close_curr > rma50_curr
+        close_below_rma50 = close_curr < rma50_curr
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
@@ -418,6 +418,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
