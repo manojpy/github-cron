@@ -246,9 +246,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         # Calculate indicators on 15min timeframe
         ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
-        # --- DEBUG LOGGING ---
-        print(f"DEBUG: {pair_name} MACD settings passed: F:{MACD_F}, S:{MACD_S}, SG:{MACD_SG}")
-        # ---------------------
         macd, macd_signal = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
         rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
         
@@ -418,6 +415,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
