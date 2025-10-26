@@ -302,15 +302,15 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > EMA100 AND Close > RMA200
-        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_ema100 and close_above_rma200:
+        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200
+        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200:
             current_state = "buy"
             if last_alerts.get(pair_name) != "buy":
                 message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < EMA100 AND Close < RMA200
-        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_ema100 and close_below_rma200:
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200
+        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200:
             current_state = "sell"
             if last_alerts.get(pair_name) != "sell":
                 message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
@@ -415,6 +415,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
