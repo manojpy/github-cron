@@ -1,6 +1,5 @@
 name: MACD Alert Bot
 
-
 on:
   schedule:
     # IST 5:31 AM = UTC 12:01 AM (midnight + 1 min)
@@ -40,5 +39,6 @@ jobs:
         git diff --quiet && git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
 
         git push
+
 
 
