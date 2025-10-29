@@ -1,1 +1,1 @@
-{"BNBUSD": "sell", "LTCUSD": "sell", "BCHUSD": "sell", "ETHUSD": "short_011", "BTCUSD": "short_zero", "AAVEUSD": "short_011", "AVAXUSD": "short_011", "SOLUSD": "buy", "XRPUSD": "buy", "ADAUSD": "long_zero", "SUIUSD": "sell", "DOTUSD": "buy"}
+{"BNBUSD": "sell", "LTCUSD": "buy", "BCHUSD": "sell", "ETHUSD": "short_011", "BTCUSD": "short_zero", "AAVEUSD": "short_011", "AVAXUSD": "short_011", "SOLUSD": "buy", "XRPUSD": "buy", "ADAUSD": "long_zero", "SUIUSD": "sell", "DOTUSD": "buy"}
