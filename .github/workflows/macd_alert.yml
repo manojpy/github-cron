@@ -1,63 +1,40 @@
-name: PPO MACD Trading Bot
+name: MACD Alert Bot
 
 on:
   schedule:
-    # Run every 15 minutes at: :00, :15, :30, :45
-    - cron: '*/15 * * * *'
-  
-  # Allow manual trigger for testing
-  workflow_dispatch:
-    inputs:
-      debug_mode:
-        description: 'Enable debug output'
-        required: false
-        default: 'false'
-      test_mode:
-        description: 'Send test message (no trading checks)'
-        required: false
-        default: 'false'
+    # IST 5:31 AM = UTC 12:01 AM (midnight + 1 min)
+    # Then every 15 minutes: 5:31, 5:46, 6:01, 6:16, 6:31, 6:46, 7:01... etc throughout the day
+    - cron: '1,16,31,46 * * * *'  # Runs at :01, :16, :31, :46 every hour UTC (which is :31, :46, :01, :16 IST)
+  workflow_dispatch:  # Manual trigger
 
 jobs:
-  trading-bot:
+  run-bot:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas numpy pytz
-      
-      - name: Run Trading Bot (Debug Mode)
-        if: github.event.inputs.debug_mode == 'true' || contains(github.event.head_commit.message, '[DEBUG]')
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'true'
-          TEST_MODE: 'false'
-        run: python bot.py
-      
-      - name: Run Trading Bot (Test Mode)
-        if: github.event.inputs.test_mode == 'true' || contains(github.event.head_commit.message, '[TEST]')
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'false'
-          TEST_MODE: 'true'
-        run: python bot.py
-      
-      - name: Run Trading Bot (Normal Mode)
-        if: github.event.inputs.debug_mode != 'true' && github.event.inputs.test_mode != 'true' && !contains(github.event.head_commit.message, '[DEBUG]') && !contains(github.event.head_commit.message, '[TEST]')
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'false'
-          TEST_MODE: 'false'
-        run: macd_bot.py
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run MACD Bot
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python macd_bot.py
+    
+    - name: Commit state file
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add -A
+        git diff --quiet && git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
+        git push
