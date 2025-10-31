@@ -13,6 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAFEfw5DU1YtZ_D4nTNbuV5RIdL2K_DqgE0')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
+# NEW: Control for startup test message and debugging
+# Set these in GitHub Repository > Settings > Variables
+SEND_STARTUP_MESSAGE = os.environ.get('SEND_STARTUP_MESSAGE', 'false').lower() == 'true'
+DEBUG_MODE = os.environ.get('DEBUG_MODE', 'false').lower() == 'true'
+
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
 
@@ -267,6 +272,7 @@ def calculate_cirrus_cloud(df):
     
     return upw, dnw
 
+# MODIFIED: Entire function refactored for debugging and clarity
 def check_pair(pair_name, pair_info, last_alerts):
     """Check PPO and MACD crossover conditions for a pair"""
     try:
@@ -278,17 +284,17 @@ def check_pair(pair_name, pair_info, last_alerts):
             limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
             min_required = SPECIAL_PAIRS[pair_name]["min_required"]
             limit_5m = SPECIAL_PAIRS[pair_name].get("limit_5m", 210)
-            min_required_5m = SPECIAL_PAIRS[pair_name].get("min_required_5m", 200)
+            min_required_5m = SPECIAL_PAIRS[pair_name].get("min_required_5m", 183)
         else:
             limit_15m = 210
             min_required = 200
             limit_5m = 210
             min_required_5m = 200
         
-        # Fetch 15-minute candles for PPO, MACD, EMA100
+        # Fetch 15-minute candles
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         
-        # Fetch 5-minute candles for RMA200
+        # Fetch 5-minute candles
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         
         if df_15m is None or len(df_15m) < min_required:
@@ -299,49 +305,45 @@ def check_pair(pair_name, pair_info, last_alerts):
             print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/{min_required_5m})")
             return None
         
-        # Calculate indicators on 15min timeframe
+        # === Calculate Indicators ===
+        # 15min indicators
         ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         macd, macd_signal = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
         rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
-        
-        # Calculate RMA200 on 5min timeframe
-        rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
-        
-        # Calculate Cirrus Cloud on 15min timeframe
         upw, dnw = calculate_cirrus_cloud(df_15m)
         
-        # Get latest values from 15min
+        # 5min indicators
+        rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
+        
+        # === Get Latest Values ===
+        # 15min values
         ppo_curr = ppo.iloc[-1]
         ppo_prev = ppo.iloc[-2]
         ppo_signal_curr = ppo_signal.iloc[-1]
         ppo_signal_prev = ppo_signal.iloc[-2]
-        
         macd_curr = macd.iloc[-1]
         macd_signal_curr = macd_signal.iloc[-1]
-        
         close_curr = df_15m['close'].iloc[-1]
         rma50_curr = rma_50.iloc[-1]
-        
         upw_curr = upw.iloc[-1]
-        upw_prev = upw.iloc[-2]
         dnw_curr = dnw.iloc[-1]
-        dnw_prev = dnw.iloc[-2]
         
-        # Get latest values from 5min
+        # 5min values
         close_5m_curr = df_5m['close'].iloc[-1]
         rma200_curr = rma_200.iloc[-1]
         
-        # Detect PPO crossovers
+        # === Define Conditions ===
+        # PPO Crossover conditions
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
-        # Detect PPO zero-line crossovers
+        # PPO Zero-line Crossover conditions
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
         ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
         ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
         ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
         
-        # PPO value conditions
+        # PPO Value conditions
         ppo_below_020 = ppo_curr < 0.20
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
@@ -357,51 +359,110 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
+        # Cirrus Cloud conditions
+        # (upw_curr and dnw_curr already defined)
+
+        # NEW: Refactored common trend conditions
+        is_bullish_trend = (
+            ppo_above_signal and
+            macd_above_signal and
+            close_above_rma50 and
+            close_above_rma200 and
+            upw_curr
+        )
+        
+        is_bearish_trend = (
+            ppo_below_signal and
+            macd_below_signal and
+            close_below_rma50 and
+            close_below_rma200 and
+            dnw_curr
+        )
+        
+        # NEW: Debugging block
+        if DEBUG_MODE:
+            print(f"\n--- DEBUG REPORT FOR {pair_name} ---")
+            print(f"Price (15m): {close_curr} | Price (5m): {close_5m_curr}")
+            print(f"PPO: {ppo_curr:.4f} | PPO Signal: {ppo_signal_curr:.4f}")
+            print(f"MACD: {macd_curr:.4f} | MACD Signal: {macd_signal_curr:.4f}")
+            print(f"RMA50 (15m): {rma50_curr:.2f} | RMA200 (5m): {rma200_curr:.2f}")
+            
+            print("\n[Crossover Conditions]")
+            print(f"  PPO Cross Up: {ppo_cross_up}")
+            print(f"  PPO Cross Down: {ppo_cross_down}")
+            print(f"  PPO Cross > 0: {ppo_cross_above_zero}")
+            print(f"  PPO Cross < 0: {ppo_cross_below_zero}")
+            print(f"  PPO Cross > 0.11: {ppo_cross_above_011}")
+            print(f"  PPO Cross < -0.11: {ppo_cross_below_minus011}")
+            
+            print("\n[Value Conditions]")
+            print(f"  PPO < 0.20: {ppo_below_020}")
+            print(f"  PPO > -0.20: {ppo_above_minus020}")
+            
+            print("\n[Bullish Trend Components]")
+            print(f"  PPO > Signal: {ppo_above_signal}")
+            print(f"  MACD > Signal: {macd_above_signal}")
+            print(f"  Close > RMA50: {close_above_rma50}")
+            print(f"  Close > RMA200: {close_above_rma200}")
+            print(f"  Cirrus Upw: {upw_curr}")
+            print(f"  >> Overall Bullish Trend: {is_bullish_trend}")
+
+            print("\n[Bearish Trend Components]")
+            print(f"  PPO < Signal: {ppo_below_signal}")
+            print(f"  MACD < Signal: {macd_below_signal}")
+            print(f"  Close < RMA50: {close_below_rma50}")
+            print(f"  Close < RMA200: {close_below_rma200}")
+            print(f"  Cirrus Dnw: {dnw_curr}")
+            print(f"  >> Overall Bearish Trend: {is_bearish_trend}")
+            print(f"--------------------------------------\n")
+        
+        # === Alerting Logic ===
         current_state = None
         
-        # Get IST time in correct format
+        # Get IST time
         ist = pytz.timezone('Asia/Kolkata')
         current_dt = datetime.now(ist)
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Upw (Cirrus Cloud)
-        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+        # MODIFIED: Use the refactored trend variables
+        # BUY:
+        if ppo_cross_up and ppo_below_020 and is_bullish_trend:
             current_state = "buy"
             if last_alerts.get(pair_name) != "buy":
                 message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Dnw (Cirrus Cloud)
-        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
+        # SELL:
+        elif ppo_cross_down and ppo_above_minus020 and is_bearish_trend:
             current_state = "sell"
             if last_alerts.get(pair_name) != "sell":
                 message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # LONG: PPO > Signal AND PPO crosses above 0 AND Upw (Cirrus Cloud)
-        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+        # LONG (Zero Cross):
+        elif ppo_cross_above_zero and is_bullish_trend:
             current_state = "long_zero"
             if last_alerts.get(pair_name) != "long_zero":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # LONG: PPO > Signal AND PPO crosses above 0.11 AND Upw (Cirrus Cloud)
-        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+        # LONG (0.11 Cross):
+        elif ppo_cross_above_011 and is_bullish_trend:
             current_state = "long_011"
             if last_alerts.get(pair_name) != "long_011":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SHORT: PPO < Signal AND PPO crosses below 0 AND Dnw (Cirrus Cloud)
-        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
+        # SHORT (Zero Cross):
+        elif ppo_cross_below_zero and is_bearish_trend:
             current_state = "short_zero"
             if last_alerts.get(pair_name) != "short_zero":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Dnw (Cirrus Cloud)
-        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
+        # SHORT (-0.11 Cross):
+        elif ppo_cross_below_minus011 and is_bearish_trend:
             current_state = "short_011"
             if last_alerts.get(pair_name) != "short_011":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
@@ -411,6 +472,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
+        # NEW: Print stack trace if in debug mode
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
         return None
 
 def main():
@@ -418,8 +483,15 @@ def main():
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
-    print(f"PPO/MACD/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
+    run_time_str = start_time.strftime('%d-%m-%Y @ %H:%M IST')
+    print(f"PPO/MACD/Cirrus Cloud Alert Bot - {run_time_str}")
+    print(f"Debug Mode: {DEBUG_MODE}, Startup Message: {SEND_STARTUP_MESSAGE}")
     print("=" * 50)
+    
+    # NEW: Send startup test message if enabled
+    if SEND_STARTUP_MESSAGE:
+        print("Sending startup test message...")
+        send_telegram_alert(f"🤖 Bot check initiated successfully.\n{run_time_str}")
     
     # Load previous state
     last_alerts = load_state()
@@ -437,33 +509,27 @@ def main():
         return
     
     # Check all pairs in parallel
-    alerts_sent = 0
+    alerts_sent_count = 0
+    new_states = {}
     
-    # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
-    # We limit workers to 10 to avoid hitting the API too hard all at once.
     with ThreadPoolExecutor(max_workers=10) as executor:
-        
-        # Create a dictionary to map a running "future" (thread) to its pair_name
         future_to_pair = {}
-        
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Submit the task to the thread pool.
-                # The executor runs 'check_pair(pair_name, pair_info, last_alerts)' in the background.
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
                 future_to_pair[future] = pair_name
 
-        # As each thread finishes, process its result
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
             try:
-                # Get the return value from the check_pair function
                 new_state = future.result() 
                 if new_state:
+                    # Check if this is a NEW alert state
+                    if last_alerts.get(pair_name) != new_state:
+                        alerts_sent_count += 1
+                    # Store the new state
                     last_alerts[pair_name] = new_state
-                    alerts_sent += 1
             except Exception as e:
-                # Catch any error that happened inside the thread
                 print(f"Error processing {pair_name} in thread: {e}")
                 continue
             
@@ -472,7 +538,7 @@ def main():
     
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
-    print(f"✓ Check complete. {alerts_sent} alerts sent. ({elapsed:.1f}s)")
+    print(f"✓ Check complete. {alerts_sent_count} new alerts sent. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
