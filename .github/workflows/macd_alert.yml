@@ -1,39 +1,63 @@
-name: Run Delta Exchange Bot
+name: PPO MACD Trading Bot
 
 on:
-  # This allows you to run the workflow manually from the Actions tab
-  workflow_dispatch:
-    
   schedule:
-    # This is the cron schedule you requested:
-    # It runs at 1, 16, 31, and 46 minutes past every hour, every day.
-    - cron: '1,16,31,46 * * * *'
+    # Run every 15 minutes at: :00, :15, :30, :45
+    - cron: '*/15 * * * *'
+  
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug output'
+        required: false
+        default: 'false'
+      test_mode:
+        description: 'Send test message (no trading checks)'
+        required: false
+        default: 'false'
 
 jobs:
-  run-bot:
+  trading-bot:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout repository code
+      - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
+      
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-
+          python-version: '3.11'
+      
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas numpy pytz
-
-      - name: Run the bot script
+      
+      - name: Run Trading Bot (Debug Mode)
+        if: github.event.inputs.debug_mode == 'true' || contains(github.event.head_commit.message, '[DEBUG]')
         env:
-          # These are your SECRETS. Store them in GitHub Settings.
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          
-          # These are your new VARIABLES. Store them in GitHub Settings.
-          SEND_STARTUP_MESSAGE: ${{ vars.SEND_STARTUP_MESSAGE }}
-          DEBUG_MODE: ${{ vars.DEBUG_MODE }}
-        run: python macd_bot.py
+          DEBUG_MODE: 'true'
+          TEST_MODE: 'false'
+        run: python bot.py
+      
+      - name: Run Trading Bot (Test Mode)
+        if: github.event.inputs.test_mode == 'true' || contains(github.event.head_commit.message, '[TEST]')
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_MODE: 'false'
+          TEST_MODE: 'true'
+        run: python bot.py
+      
+      - name: Run Trading Bot (Normal Mode)
+        if: github.event.inputs.debug_mode != 'true' && github.event.inputs.test_mode != 'true' && !contains(github.event.head_commit.message, '[DEBUG]') && !contains(github.event.head_commit.message, '[TEST]')
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_MODE: 'false'
+          TEST_MODE: 'false'
+        run: macd_bot.py
