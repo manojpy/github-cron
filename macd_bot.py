@@ -5,7 +5,6 @@ import time
 import os
 import json
 import pytz
-import sys
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,10 +12,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Telegram settings - reads from environment variables (GitHub Secrets)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAFEfw5DU1YtZ_D4nTNbuV5RIdL2K_DqgE0')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
-
-# Debug mode - set via environment variable or command line
-DEBUG_MODE = os.environ.get('DEBUG_MODE', 'false').lower() == 'true'
-TEST_MODE = os.environ.get('TEST_MODE', 'false').lower() == 'true'
 
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
@@ -68,29 +63,14 @@ X4 = 5
 # File to store last alert state
 STATE_FILE = 'alert_state.json'
 
-# ============ UTILITY FUNCTIONS ============
-
-def debug_print(message):
-    """Print debug messages only in DEBUG_MODE"""
-    if DEBUG_MODE:
-        ist = pytz.timezone('Asia/Kolkata')
-        timestamp = datetime.now(ist).strftime('%H:%M:%S')
-        print(f"[DEBUG {timestamp}] {message}")
-
-def log_print(message):
-    """Always print important messages"""
-    ist = pytz.timezone('Asia/Kolkata')
-    timestamp = datetime.now(ist).strftime('%H:%M:%S')
-    print(f"[{timestamp}] {message}")
+# ============ FUNCTIONS ============
 
 def load_state():
     """Load previous alert state from file"""
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-                debug_print(f"Loaded state: {state}")
-                return state
+                return json.load(f)
     except Exception as e:
         print(f"Error loading state: {e}")
     return {}
@@ -100,7 +80,6 @@ def save_state(state):
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
-        debug_print("State saved successfully")
     except Exception as e:
         print(f"Error saving state: {e}")
 
@@ -118,36 +97,24 @@ def send_telegram_alert(message):
         response_data = response.json()
         
         if response_data.get('ok'):
-            log_print(f"✓ Alert sent successfully")
-            debug_print(f"Alert message: {message}")
+            print(f"✓ Alert sent successfully")
             return True
         else:
-            print(f"❌ Telegram error: {response_data}")
+            print(f"Telegram error: {response_data}")
             return False
         
     except Exception as e:
-        print(f"❌ Error sending Telegram message: {e}")
+        print(f"Error sending Telegram message: {e}")
         return False
-
-def send_test_message():
-    """Send a test message to verify Telegram connection"""
-    ist = pytz.timezone('Asia/Kolkata')
-    test_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
-    message = f"🧪 TEST MESSAGE\nBot is working correctly!\nTime: {test_time}"
-    
-    log_print("Sending test message to Telegram...")
-    return send_telegram_alert(message)
 
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange"""
     try:
-        debug_print("Fetching product IDs from Delta Exchange...")
         response = requests.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
         data = response.json()
         
         if data.get('success'):
             products = data['result']
-            debug_print(f"Total products fetched: {len(products)}")
             
             for product in products:
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
@@ -160,15 +127,14 @@ def get_product_ids():
                                 'symbol': product['symbol'],
                                 'contract_type': product['contract_type']
                             }
-                            debug_print(f"Found {pair_name}: ID={product['id']}")
             
             return True
         else:
-            print(f"❌ API Error: {data}")
+            print(f"API Error: {data}")
             return False
             
     except Exception as e:
-        print(f"❌ Error fetching products: {e}")
+        print(f"Error fetching products: {e}")
         return False
 
 def get_candles(product_id, resolution="15", limit=150):
@@ -198,14 +164,13 @@ def get_candles(product_id, resolution="15", limit=150):
                 'close': result['c'],
                 'volume': result['v']
             })
-            debug_print(f"Fetched {len(df)} candles for {product_id} ({resolution}m)")
             return df
         else:
-            print(f"❌ Error fetching candles for {product_id}: {data.get('message', 'No message')}")
+            print(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
             return None
             
     except Exception as e:
-        print(f"❌ Exception fetching candles for {product_id}: {e}")
+        print(f"Exception fetching candles for {product_id}: {e}")
         return None
 
 def calculate_ema(data, period):
@@ -320,8 +285,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             limit_5m = 210
             min_required_5m = 200
         
-        debug_print(f"Checking {pair_name}...")
-        
         # Fetch 15-minute candles for PPO, MACD, EMA100
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         
@@ -329,11 +292,11 @@ def check_pair(pair_name, pair_info, last_alerts):
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         
         if df_15m is None or len(df_15m) < min_required:
-            debug_print(f"Not enough 15m data for {pair_name} ({len(df_15m) if df_15m is not None else 0}/{min_required})")
+            print(f"Not enough 15m data for {pair_name} ({len(df_15m) if df_15m is not None else 0}/{min_required})")
             return None
             
         if df_5m is None or len(df_5m) < min_required_5m:
-            debug_print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/{min_required_5m})")
+            print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/{min_required_5m})")
             return None
         
         # Calculate indicators on 15min timeframe
@@ -394,16 +357,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
-        # Print debug info
-        if DEBUG_MODE:
-            debug_print(f"--- {pair_name} Indicators ---")
-            debug_print(f"PPO: {ppo_curr:.4f} (Signal: {ppo_signal_curr:.4f})")
-            debug_print(f"PPO Cross Up: {ppo_cross_up} | PPO Cross Down: {ppo_cross_down}")
-            debug_print(f"MACD: {macd_curr:.4f} (Signal: {macd_signal_curr:.4f})")
-            debug_print(f"Close: ${close_curr:.2f} | RMA50: ${rma50_curr:.2f} | RMA200: ${rma200_curr:.2f}")
-            debug_print(f"Upw: {upw_curr} | Dnw: {dnw_curr}")
-            debug_print(f"RMA Conditions - Close > RMA50: {close_above_rma50} | Close > RMA200: {close_above_rma200}")
-        
         current_state = None
         
         # Get IST time in correct format
@@ -418,9 +371,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             if last_alerts.get(pair_name) != "buy":
                 message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
-                log_print(f"BUY signal sent for {pair_name}")
-            else:
-                debug_print(f"BUY condition met for {pair_name} but alert already sent")
         
         # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Dnw (Cirrus Cloud)
         elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
@@ -428,9 +378,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             if last_alerts.get(pair_name) != "sell":
                 message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
-                log_print(f"SELL signal sent for {pair_name}")
-            else:
-                debug_print(f"SELL condition met for {pair_name} but alert already sent")
         
         # LONG: PPO > Signal AND PPO crosses above 0 AND Upw (Cirrus Cloud)
         elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
@@ -438,9 +385,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             if last_alerts.get(pair_name) != "long_zero":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
-                log_print(f"LONG signal sent for {pair_name}")
-            else:
-                debug_print(f"LONG condition met for {pair_name} but alert already sent")
         
         # LONG: PPO > Signal AND PPO crosses above 0.11 AND Upw (Cirrus Cloud)
         elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
@@ -448,9 +392,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             if last_alerts.get(pair_name) != "long_011":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
-                log_print(f"LONG signal sent for {pair_name}")
-            else:
-                debug_print(f"LONG condition met for {pair_name} but alert already sent")
         
         # SHORT: PPO < Signal AND PPO crosses below 0 AND Dnw (Cirrus Cloud)
         elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
@@ -458,9 +399,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             if last_alerts.get(pair_name) != "short_zero":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
-                log_print(f"SHORT signal sent for {pair_name}")
-            else:
-                debug_print(f"SHORT condition met for {pair_name} but alert already sent")
         
         # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Dnw (Cirrus Cloud)
         elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
@@ -468,16 +406,11 @@ def check_pair(pair_name, pair_info, last_alerts):
             if last_alerts.get(pair_name) != "short_011":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
-                log_print(f"SHORT signal sent for {pair_name}")
-            else:
-                debug_print(f"SHORT condition met for {pair_name} but alert already sent")
         
         return current_state
         
     except Exception as e:
-        print(f"❌ Error checking {pair_name}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error checking {pair_name}: {e}")
         return None
 
 def main():
@@ -486,34 +419,21 @@ def main():
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
     print(f"PPO/MACD/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
-    
-    if DEBUG_MODE:
-        print(f"⚙️ DEBUG MODE: ON")
-    if TEST_MODE:
-        print(f"🧪 TEST MODE: ON")
-    
     print("=" * 50)
-    
-    # Send test message if TEST_MODE is enabled
-    if TEST_MODE:
-        if not send_test_message():
-            print("❌ Test message failed! Check your Telegram credentials.")
-            return
-        print()
     
     # Load previous state
     last_alerts = load_state()
     
     # Fetch product IDs
     if not get_product_ids():
-        print("❌ Failed to fetch products. Exiting.")
+        print("Failed to fetch products. Exiting.")
         return
     
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
     
     if found_count == 0:
-        print("❌ No valid pairs found. Exiting.")
+        print("No valid pairs found. Exiting.")
         return
     
     # Check all pairs in parallel
@@ -544,7 +464,7 @@ def main():
                     alerts_sent += 1
             except Exception as e:
                 # Catch any error that happened inside the thread
-                print(f"❌ Error processing {pair_name} in thread: {e}")
+                print(f"Error processing {pair_name} in thread: {e}")
                 continue
             
     # Save state for next run
