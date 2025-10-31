@@ -53,6 +53,13 @@ MACD_SG = 20
 RMA_50_PERIOD = 50   # RMA50 on 15min
 RMA_200_PERIOD = 200   # RMA200 on 5min
 
+# Cirrus Cloud settings
+CIRRUS_CLOUD_ENABLED = True
+X1 = 22
+X2 = 9
+X3 = 15
+X4 = 5
+
 # File to store last alert state
 STATE_FILE = 'alert_state.json'
 
@@ -212,6 +219,54 @@ def calculate_macd(df, fast=28, slow=64, signal=20):
     
     return macd_line, signal_line
 
+def smoothrng(x, t, m):
+    """Implements smoothrngX1 from Pine Script"""
+    wper = t * 2 - 1
+    avrng = calculate_ema(np.abs(x.diff()), t)
+    smoothrng = calculate_ema(avrng, wper) * m
+    return smoothrng
+
+def rngfilt(x, r):
+    """Implements rngfiltx1x1 from Pine Script"""
+    result = x.copy()
+    result.iloc[0] = x.iloc[0]
+    
+    for i in range(1, len(x)):
+        prev_result = result.iloc[i-1]
+        curr_x = x.iloc[i]
+        curr_r = r.iloc[i]
+        
+        if curr_x > prev_result:
+            if curr_x - curr_r < prev_result:
+                result.iloc[i] = prev_result
+            else:
+                result.iloc[i] = curr_x - curr_r
+        else:
+            if curr_x + curr_r > prev_result:
+                result.iloc[i] = prev_result
+            else:
+                result.iloc[i] = curr_x + curr_r
+    
+    return result
+
+def calculate_cirrus_cloud(df):
+    """Calculate Cirrus Cloud Upw and Dnw conditions"""
+    close = df['close'].copy()
+    
+    # Calculate smoothed ranges
+    smrngx1x = smoothrng(close, X1, X2)
+    smrngx1x2 = smoothrng(close, X3, X4)
+    
+    # Apply range filter
+    filtx1 = rngfilt(close, smrngx1x)
+    filtx12 = rngfilt(close, smrngx1x2)
+    
+    # Calculate Upw and Dnw conditions
+    upw = filtx1 < filtx12
+    dnw = filtx1 > filtx12
+    
+    return upw, dnw
+
 def check_pair(pair_name, pair_info, last_alerts):
     """Check PPO and MACD crossover conditions for a pair"""
     try:
@@ -252,6 +307,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
+        # Calculate Cirrus Cloud on 15min timeframe
+        upw, dnw = calculate_cirrus_cloud(df_15m)
+        
         # Get latest values from 15min
         ppo_curr = ppo.iloc[-1]
         ppo_prev = ppo.iloc[-2]
@@ -263,6 +321,11 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         close_curr = df_15m['close'].iloc[-1]
         rma50_curr = rma_50.iloc[-1]
+        
+        upw_curr = upw.iloc[-1]
+        upw_prev = upw.iloc[-2]
+        dnw_curr = dnw.iloc[-1]
+        dnw_prev = dnw.iloc[-2]
         
         # Get latest values from 5min
         close_5m_curr = df_5m['close'].iloc[-1]
@@ -302,43 +365,43 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200
-        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200:
+        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Upw (Cirrus Cloud)
+        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "buy"
             if last_alerts.get(pair_name) != "buy":
                 message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200
-        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200:
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Dnw (Cirrus Cloud)
+        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "sell"
             if last_alerts.get(pair_name) != "sell":
                 message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # LONG: PPO > Signal AND PPO crosses above 0
-        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200:
+        # LONG: PPO > Signal AND PPO crosses above 0 AND Upw (Cirrus Cloud)
+        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_zero"
             if last_alerts.get(pair_name) != "long_zero":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # LONG: PPO > Signal AND PPO crosses above 0.11
-        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200:
+        # LONG: PPO > Signal AND PPO crosses above 0.11 AND Upw (Cirrus Cloud)
+        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_011"
             if last_alerts.get(pair_name) != "long_011":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SHORT: PPO < Signal AND PPO crosses below 0
-        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200:
+        # SHORT: PPO < Signal AND PPO crosses below 0 AND Dnw (Cirrus Cloud)
+        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_zero"
             if last_alerts.get(pair_name) != "short_zero":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
         
-        # SHORT: PPO < Signal AND PPO crosses below -0.11
-        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200:
+        # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Dnw (Cirrus Cloud)
+        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_011"
             if last_alerts.get(pair_name) != "short_011":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
@@ -355,7 +418,7 @@ def main():
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
-    print(f"PPO/MACD Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
+    print(f"PPO/MACD/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print("=" * 50)
     
     # Load previous state
@@ -413,15 +476,4 @@ def main():
     print("=" * 50)
 
 if __name__ == "__main__":
-
     main()
-
-
-
-
-
-
-
-
-
-
