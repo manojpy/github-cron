@@ -2,6 +2,3 @@ requests
 pandas
 numpy
 pytz
-
-
-
