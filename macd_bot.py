@@ -13,6 +13,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAFEfw5DU1YtZ_D4nTNbuV5RIdL2K_DqgE0')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
+# Enable debug mode - set to True to see detailed logs
+DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
+
+# Send test message on startup
+SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
+
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
 
@@ -65,14 +71,22 @@ STATE_FILE = 'alert_state.json'
 
 # ============ FUNCTIONS ============
 
+def debug_log(message):
+    """Print debug messages if DEBUG_MODE is enabled"""
+    if DEBUG_MODE:
+        print(f"[DEBUG] {message}")
+
 def load_state():
     """Load previous alert state from file"""
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
-                return json.load(f)
+                state = json.load(f)
+                debug_log(f"Loaded state: {state}")
+                return state
     except Exception as e:
         print(f"Error loading state: {e}")
+    debug_log("No previous state found, starting fresh")
     return {}
 
 def save_state(state):
@@ -80,12 +94,15 @@ def save_state(state):
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
+        debug_log(f"Saved state: {state}")
     except Exception as e:
         print(f"Error saving state: {e}")
 
 def send_telegram_alert(message):
     """Send alert message via Telegram"""
     try:
+        debug_log(f"Attempting to send message: {message[:100]}...")
+        
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -93,28 +110,60 @@ def send_telegram_alert(message):
             "parse_mode": None  # No HTML formatting
         }
         
+        debug_log(f"Telegram URL: {url[:50]}...")
+        debug_log(f"Chat ID: {TELEGRAM_CHAT_ID}")
+        
         response = requests.post(url, data=data, timeout=10)
         response_data = response.json()
+        
+        debug_log(f"Telegram API response: {response_data}")
         
         if response_data.get('ok'):
             print(f"✓ Alert sent successfully")
             return True
         else:
-            print(f"Telegram error: {response_data}")
+            print(f"❌ Telegram error: {response_data}")
             return False
         
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        print(f"❌ Error sending Telegram message: {e}")
+        import traceback
+        if DEBUG_MODE:
+            traceback.print_exc()
         return False
+
+def send_test_message():
+    """Send a test message to verify Telegram connectivity"""
+    ist = pytz.timezone('Asia/Kolkata')
+    current_dt = datetime.now(ist)
+    formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
+    
+    test_msg = f"🔔 Bot Started\nTest message from MACD Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    
+    print("\n" + "="*50)
+    print("SENDING TEST MESSAGE")
+    print("="*50)
+    
+    success = send_telegram_alert(test_msg)
+    
+    if success:
+        print("✓ Test message sent successfully!")
+    else:
+        print("❌ Test message failed - check your bot token and chat ID")
+    
+    print("="*50 + "\n")
+    return success
 
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange"""
     try:
+        debug_log("Fetching product IDs from Delta Exchange...")
         response = requests.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
         data = response.json()
         
         if data.get('success'):
             products = data['result']
+            debug_log(f"Received {len(products)} products from API")
             
             for product in products:
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
@@ -127,6 +176,7 @@ def get_product_ids():
                                 'symbol': product['symbol'],
                                 'contract_type': product['contract_type']
                             }
+                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
             
             return True
         else:
@@ -135,6 +185,9 @@ def get_product_ids():
             
     except Exception as e:
         print(f"Error fetching products: {e}")
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
         return False
 
 def get_candles(product_id, resolution="15", limit=150):
@@ -151,6 +204,8 @@ def get_candles(product_id, resolution="15", limit=150):
             'to': to_time
         }
         
+        debug_log(f"Fetching {resolution}m candles for {product_id}, limit={limit}")
+        
         response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
@@ -164,6 +219,7 @@ def get_candles(product_id, resolution="15", limit=150):
                 'close': result['c'],
                 'volume': result['v']
             })
+            debug_log(f"Received {len(df)} candles for {product_id} ({resolution}m)")
             return df
         else:
             print(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
@@ -273,6 +329,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         if pair_info is None:
             return None
         
+        debug_log(f"\n{'='*60}")
+        debug_log(f"Checking {pair_name}")
+        debug_log(f"{'='*60}")
+        
         # Check if this pair has special requirements
         if pair_name in SPECIAL_PAIRS:
             limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
@@ -331,6 +391,15 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_5m_curr = df_5m['close'].iloc[-1]
         rma200_curr = rma_200.iloc[-1]
         
+        # Debug: Print all indicator values
+        debug_log(f"Price: ${close_curr:,.2f}")
+        debug_log(f"PPO: {ppo_curr:.4f} (prev: {ppo_prev:.4f})")
+        debug_log(f"PPO Signal: {ppo_signal_curr:.4f} (prev: {ppo_signal_prev:.4f})")
+        debug_log(f"MACD: {macd_curr:.4f}, Signal: {macd_signal_curr:.4f}")
+        debug_log(f"RMA50 (15m): {rma50_curr:.2f}, Close: {close_curr:.2f}")
+        debug_log(f"RMA200 (5m): {rma200_curr:.2f}, Close: {close_5m_curr:.2f}")
+        debug_log(f"Cirrus Cloud - Upw: {upw_curr}, Dnw: {dnw_curr}")
+        
         # Detect PPO crossovers
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
@@ -357,6 +426,25 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
+        # Debug: Print crossover detections
+        debug_log(f"\nCrossover Checks:")
+        debug_log(f"  PPO cross up: {ppo_cross_up}")
+        debug_log(f"  PPO cross down: {ppo_cross_down}")
+        debug_log(f"  PPO above 0: {ppo_cross_above_zero}")
+        debug_log(f"  PPO below 0: {ppo_cross_below_zero}")
+        debug_log(f"  PPO above 0.11: {ppo_cross_above_011}")
+        debug_log(f"  PPO below -0.11: {ppo_cross_below_minus011}")
+        
+        debug_log(f"\nCondition Checks:")
+        debug_log(f"  PPO < 0.20: {ppo_below_020}")
+        debug_log(f"  PPO > -0.20: {ppo_above_minus020}")
+        debug_log(f"  PPO > Signal: {ppo_above_signal}")
+        debug_log(f"  MACD > Signal: {macd_above_signal}")
+        debug_log(f"  Close > RMA50: {close_above_rma50}")
+        debug_log(f"  Close > RMA200: {close_above_rma200}")
+        debug_log(f"  Upw (Cirrus): {upw_curr}")
+        debug_log(f"  Dnw (Cirrus): {dnw_curr}")
+        
         current_state = None
         
         # Get IST time in correct format
@@ -368,49 +456,72 @@ def check_pair(pair_name, pair_info, last_alerts):
         # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Upw (Cirrus Cloud)
         if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "buy"
+            debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy":
                 message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+            else:
+                debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
         
         # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Dnw (Cirrus Cloud)
         elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "sell"
+            debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "sell":
                 message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+            else:
+                debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
         
         # LONG: PPO > Signal AND PPO crosses above 0 AND Upw (Cirrus Cloud)
         elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_zero"
+            debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_zero":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+            else:
+                debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
         
         # LONG: PPO > Signal AND PPO crosses above 0.11 AND Upw (Cirrus Cloud)
         elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_011"
+            debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_011":
                 message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+            else:
+                debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
         
         # SHORT: PPO < Signal AND PPO crosses below 0 AND Dnw (Cirrus Cloud)
         elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_zero"
+            debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_zero":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+            else:
+                debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
         
         # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Dnw (Cirrus Cloud)
         elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_011"
+            debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_011":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+            else:
+                debug_log(f"SHORT (-0.11) already alerted for {pair_name}, skipping duplicate")
+        else:
+            debug_log(f"No signal conditions met for {pair_name}")
         
         return current_state
         
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
         return None
 
 def main():
@@ -419,7 +530,12 @@ def main():
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
     print(f"PPO/MACD/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
+    print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
     print("=" * 50)
+    
+    # Send test message if enabled
+    if SEND_TEST_MESSAGE:
+        send_test_message()
     
     # Load previous state
     last_alerts = load_state()
@@ -465,6 +581,9 @@ def main():
             except Exception as e:
                 # Catch any error that happened inside the thread
                 print(f"Error processing {pair_name} in thread: {e}")
+                if DEBUG_MODE:
+                    import traceback
+                    traceback.print_exc()
                 continue
             
     # Save state for next run
@@ -476,14 +595,4 @@ def main():
     print("=" * 50)
 
 if __name__ == "__main__":
-
     main()
-
-
-
-
-
-
-
-
-
