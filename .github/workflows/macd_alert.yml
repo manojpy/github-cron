@@ -30,7 +30,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'True'
+        SEND_TEST_MESSAGE: 'False'
       run: python macd_bot.py
     
     - name: Commit state file
@@ -41,6 +41,7 @@ jobs:
         git diff --quiet && git diff --staged --quiet || git commit -m "Update alert state [skip ci]"
 
         git push
+
 
 
 
