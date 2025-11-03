@@ -45,9 +45,9 @@ PPO_SIGNAL = 5
 PPO_USE_SMA = False  # False = use EMA (as per your script)
 
 # MACD settings
-MACD_Fs = 100
-MACD_Ss = 200
-MACD_SGs = 50
+MACD_F = 100
+MACD_S = 200
+MACD_SG = 50
 
 # RMA settings
 RMA_50_PERIOD = 50   # RMA50 on 15min
@@ -478,6 +478,7 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
 
 
