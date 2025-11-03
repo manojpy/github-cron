@@ -40,7 +40,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'False'
+        SEND_TEST_MESSAGE: 'True'
       run: python macd_bot.py
     
     # 🌟 NEW AND IMPROVED STEP: Commit and Push state file (if changed)
@@ -54,6 +54,7 @@ jobs:
         
         # This action uses the default GITHUB_TOKEN which generally has permission 
         # to push to the branch it runs on.
+
 
 
 
