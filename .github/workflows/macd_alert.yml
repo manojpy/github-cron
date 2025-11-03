@@ -1,15 +1,9 @@
-# .github/workflows/macd_alert.yml
-
 name: MACD Alert Bot
 
-# Define the workflow trigger schedule and manual trigger
 on:
   schedule:
-    # IST 5:31 AM = UTC 12:01 AM (minute 1).
-    # The cron expression runs at minutes 1, 16, 31, and 46 past every hour UTC.
-    # This translates to 5:31, 5:46, 6:01, 6:16, etc., IST, every 15 minutes.
     - cron: '1,16,31,46 * * * *'
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -17,13 +11,8 @@ jobs:
     
     steps:
     - name: Checkout code
-      # Use fetch-depth: 0 if you need the full git history for state management
-      # or if you are using the default GITHUB_TOKEN to push to a protected branch.
       uses: actions/checkout@v4
     
-    - name: Log Execution Time (UTC)
-      run: echo "Workflow running at $(date) UTC"
-
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
@@ -34,27 +23,19 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Run MACD Bot and Check Conditions
-      # This step executes your custom logic (checking conditions and writing state).
+    - name: Run MACD Bot
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'False'
+        SEND_TEST_MESSAGE: 'True'
       run: python macd_bot.py
     
-    # 🌟 NEW AND IMPROVED STEP: Commit and Push state file (if changed)
-    # This action handles configuration, committing, and pushing changes reliably.
-    - name: Commit and Push state file (if changed)
+    - name: Commit and Push state file
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update alert state [skip ci]"
-        # The [skip ci] tag is crucial to prevent this commit from re-triggering 
-        # the same workflow, avoiding an infinite loop.
-        
-        # This action uses the default GITHUB_TOKEN which generally has permission 
-        # to push to the branch it runs on.
-
+        file_pattern: alert_state.json .github/workflows/macd_alert.yml
 
 
 
