@@ -1,9 +1,9 @@
 name: MACD Alert Bot
 on:
-  # REMOVE the entire schedule: block
-  # - cron: '1,16,31,46 * * * *' 
+  
+   - cron: '1,16,31,46 * * * *' 
 
-  workflow_dispatch:  # Manual trigger (now used by the external cron)
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -36,6 +36,7 @@ jobs:
       with:
         commit_message: "Update alert state [skip ci]"
         file_pattern: alert_state.json
+
 
 
 
