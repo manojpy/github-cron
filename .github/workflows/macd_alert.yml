@@ -35,7 +35,8 @@ jobs:
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update alert state [skip ci]"
-        file_pattern: alert_state.json .github/workflows/macd_alert.yml
+        file_pattern: alert_state.json
+
 
 
 
