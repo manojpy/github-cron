@@ -2,7 +2,7 @@ name: MACD Alert Bot
 
 on:
   schedule:
-    - cron: '2,17,32,47 * * * *'
+    - cron: '1,16,31,46 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -27,8 +27,8 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'False'
+        DEBUG_MODE: 'False'
+        SEND_TEST_MESSAGE: 'True'
       run: python macd_bot.py
     
     - name: Commit and Push state file
@@ -36,6 +36,7 @@ jobs:
       with:
         commit_message: "Update alert state [skip ci]"
         file_pattern: alert_state.json
+
 
 
 
