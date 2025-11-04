@@ -1,9 +1,10 @@
 name: MACD Alert Bot
 
 on:
-  schedule:
-    - cron: '1,16,31,46 * * * *'
-  workflow_dispatch:
+ # schedule:
+  #  - cron: '1,16,31,46 * * * *'
+  workflow_dispatch:  # Manual trigger (now used by the external cron)
+
 
 jobs:
   run-bot:
@@ -46,6 +47,7 @@ jobs:
         commit_message: "Update alert state [skip ci]"
         file_pattern: alert_state.json
       continue-on-error: true
+
 
 
 
