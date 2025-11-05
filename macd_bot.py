@@ -14,7 +14,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIH
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
 # Enable debug mode - set to True to see detailed logs
-# KEEP THIS AS 'True' FOR YOUR NEXT TEST RUNS
+# You can set this to 'False' after the next successful run
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
 # Send test message on startup
@@ -285,14 +285,11 @@ def smoothrng(x, t, m):
 
 def rngfilt(x, r):
     """
-    *** UPDATED: Implements rngfiltx1x1 from Pine Script using robust array iteration. ***
-    This translation handles the recursive nature of the filter more stably 
-    than direct Pandas assignment for better floating-point accuracy.
+    Implements rngfiltx1x1 from Pine Script using robust array iteration.
     """
     # Use a list to store the results, starting with the first value
     result_list = [x.iloc[0]] 
     
-    # prev_f is the equivalent of 'f[1]' in Pine Script
     for i in range(1, len(x)):
         prev_f = result_list[-1]
         curr_x = x.iloc[i]
@@ -320,8 +317,8 @@ def rngfilt(x, r):
 
 def calculate_cirrus_cloud(df):
     """
-    *** UPDATED: Now returns filtx1 and filtx12 for debugging. ***
     Calculate Cirrus Cloud Upw and Dnw conditions
+    *** CRITICAL FIX APPLIED: Boolean logic reversed to align with visual chart colors. ***
     """
     close = df['close'].copy()
     
@@ -334,10 +331,16 @@ def calculate_cirrus_cloud(df):
     filtx12 = rngfilt(close, smrngx1x2)
     
     # Calculate Upw and Dnw conditions
-    upw = filtx1 < filtx12
-    dnw = filtx1 > filtx12
+    # Based on the debug log (LTCUSD contradiction):
+    # filtx1 < filtx12 (84.8289 < 84.8620) visually means RED cloud.
+    # Therefore, the assignment must be reversed from the literal Pine Script definition.
     
-    return upw, dnw, filtx1, filtx12 # NEW return signature
+    # Chart is GREEN when the filter 1 line is ABOVE filter 2 line.
+    upw = filtx1 > filtx12 
+    # Chart is RED when the filter 1 line is BELOW filter 2 line. (This matches the LTCUSD log)
+    dnw = filtx1 < filtx12 
+    
+    return upw, dnw, filtx1, filtx12 
 
 def check_pair(pair_name, pair_info, last_alerts):
     """Check PPO and MACD crossover conditions for a pair"""
@@ -384,7 +387,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
         # Calculate Cirrus Cloud on 15min timeframe
-        # *** UPDATED: Now receives filtx1 and filtx12 as well. ***
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         
         # Get latest values from 15min
@@ -416,7 +418,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"RMA50 (15m): {rma50_curr:.2f}, Close: {close_curr:.2f}")
         debug_log(f"RMA200 (5m): {rma200_curr:.2f}, Close: {close_5m_curr:.2f}")
         
-        # *** NEW DEBUG LINES: Print raw filter values for diagnostics ***
+        # *** DEBUG LINES: Print raw filter values for diagnostics ***
         debug_log(f"Cirrus Filter 1 (filtx1): {filtx1.iloc[-1]:.4f}") 
         debug_log(f"Cirrus Filter 2 (filtx12): {filtx12.iloc[-1]:.4f}") 
         
@@ -464,8 +466,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"  MACD > Signal: {macd_above_signal}")
         debug_log(f"  Close > RMA50: {close_above_rma50}")
         debug_log(f"  Close > RMA200: {close_above_rma200}")
-        debug_log(f"  Upw (Cirrus): {upw_curr}")
-        debug_log(f"  Dnw (Cirrus): {dnw_curr}")
+        debug_log(f"  Upw (Cirrus): {upw_curr}") # Now means GREEN
+        debug_log(f"  Dnw (Cirrus): {dnw_curr}") # Now means RED
         
         current_state = None
         
@@ -475,7 +477,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Upw (Cirrus Cloud)
+        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Cirrus Cloud is GREEN (Upw)
         if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "buy"
             debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
@@ -485,7 +487,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
         
-        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Dnw (Cirrus Cloud)
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Cirrus Cloud is RED (Dnw)
         elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "sell"
             debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
@@ -495,7 +497,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
         
-        # LONG: PPO > Signal AND PPO crosses above 0 AND Upw (Cirrus Cloud)
+        # LONG: PPO > Signal AND PPO crosses above 0 AND Cirrus Cloud is GREEN (Upw)
         elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_zero"
             debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
@@ -505,7 +507,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
         
-        # LONG: PPO > Signal AND PPO crosses above 0.11 AND Upw (Cirrus Cloud)
+        # LONG: PPO > Signal AND PPO crosses above 0.11 AND Cirrus Cloud is GREEN (Upw)
         elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_011"
             debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
@@ -515,7 +517,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT: PPO < Signal AND PPO crosses below 0 AND Dnw (Cirrus Cloud)
+        # SHORT: PPO < Signal AND PPO crosses below 0 AND Cirrus Cloud is RED (Dnw)
         elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_zero"
             debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
@@ -525,7 +527,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Dnw (Cirrus Cloud)
+        # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Cirrus Cloud is RED (Dnw)
         elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_011"
             debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
@@ -578,30 +580,23 @@ def main():
     alerts_sent = 0
     
     # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
-    # We limit workers to 10 to avoid hitting the API too hard all at once.
     with ThreadPoolExecutor(max_workers=10) as executor:
         
-        # Create a dictionary to map a running "future" (thread) to its pair_name
         future_to_pair = {}
         
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Submit the task to the thread pool.
-                # The executor runs 'check_pair(pair_name, pair_info, last_alerts)' in the background.
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
                 future_to_pair[future] = pair_name
 
-        # As each thread finishes, process its result
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
             try:
-                # Get the return value from the check_pair function
                 new_state = future.result() 
                 if new_state:
                     last_alerts[pair_name] = new_state
                     alerts_sent += 1
             except Exception as e:
-                # Catch any error that happened inside the thread
                 print(f"Error processing {pair_name} in thread: {e}")
                 if DEBUG_MODE:
                     import traceback
@@ -618,4 +613,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                             
