@@ -318,7 +318,7 @@ def rngfilt(x, r):
 def calculate_cirrus_cloud(df):
     """
     Calculate Cirrus Cloud Upw and Dnw conditions
-    *** CRITICAL FIX APPLIED: Reverted cloud logic to match user's explicit AAVEUSD observation. ***
+    *** FINAL CONFIRMED FIX: Based on LTCUSD False Alert (LONG on RED cloud). ***
     """
     close = df['close'].copy()
     
@@ -330,13 +330,14 @@ def calculate_cirrus_cloud(df):
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     
-    # Calculate Upw and Dnw conditions
-    # Logic confirmed: AAVEUSD (filtx1 < filtx12) is GREEN.
+    # Final determination: 
+    # LTCUSD log showed (filtx1 < filtx12) produced an Upw=True on a RED chart.
+    # Therefore, we must define Upw as the opposite.
     
-    # Chart is GREEN (Upw) when filtx1 line is BELOW filtx12 line.
-    upw = filtx1 < filtx12 # Revert to < 
-    # Chart is RED (Dnw) when filtx1 line is ABOVE filtx12 line.
-    dnw = filtx1 > filtx12 # Revert to >
+    # Chart is GREEN (Upw) when filter 1 line is ABOVE filter 2 line.
+    upw = filtx1 > filtx12 
+    # Chart is RED (Dnw) when filter 1 line is BELOW filter 2 line.
+    dnw = filtx1 < filtx12 
     
     return upw, dnw, filtx1, filtx12 
 
@@ -420,7 +421,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"Cirrus Filter 1 (filtx1): {filtx1.iloc[-1]:.4f}") 
         debug_log(f"Cirrus Filter 2 (filtx12): {filtx12.iloc[-1]:.4f}") 
         
-        # This will now reflect the user's color logic: Upw is GREEN, Dnw is RED
         debug_log(f"Cirrus Cloud - Upw: {upw_curr}, Dnw: {dnw_curr}")
         
         # Detect PPO crossovers
@@ -612,4 +612,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                           
