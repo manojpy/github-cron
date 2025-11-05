@@ -14,6 +14,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIH
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
 # Enable debug mode - set to True to see detailed logs
+# KEEP THIS AS 'True' FOR YOUR NEXT TEST RUNS
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
 # Send test message on startup
@@ -283,30 +284,45 @@ def smoothrng(x, t, m):
     return smoothrng
 
 def rngfilt(x, r):
-    """Implements rngfiltx1x1 from Pine Script"""
-    result = x.copy()
-    result.iloc[0] = x.iloc[0]
+    """
+    *** UPDATED: Implements rngfiltx1x1 from Pine Script using robust array iteration. ***
+    This translation handles the recursive nature of the filter more stably 
+    than direct Pandas assignment for better floating-point accuracy.
+    """
+    # Use a list to store the results, starting with the first value
+    result_list = [x.iloc[0]] 
     
+    # prev_f is the equivalent of 'f[1]' in Pine Script
     for i in range(1, len(x)):
-        prev_result = result.iloc[i-1]
+        prev_f = result_list[-1]
         curr_x = x.iloc[i]
         curr_r = r.iloc[i]
         
-        if curr_x > prev_result:
-            if curr_x - curr_r < prev_result:
-                result.iloc[i] = prev_result
+        f = 0.0 # Initialize current filter value
+
+        if curr_x > prev_f:
+            # Pine: f := x - r < f ? f : x - r
+            if curr_x - curr_r < prev_f:
+                f = prev_f
             else:
-                result.iloc[i] = curr_x - curr_r
+                f = curr_x - curr_r
         else:
-            if curr_x + curr_r > prev_result:
-                result.iloc[i] = prev_result
+            # Pine: f := x + r > f ? f : x + r
+            if curr_x + curr_r > prev_f:
+                f = prev_f
             else:
-                result.iloc[i] = curr_x + curr_r
-    
-    return result
+                f = curr_x + curr_r
+        
+        result_list.append(f)
+        
+    # Convert the list back to a Pandas Series, matching the original index
+    return pd.Series(result_list, index=x.index)
 
 def calculate_cirrus_cloud(df):
-    """Calculate Cirrus Cloud Upw and Dnw conditions"""
+    """
+    *** UPDATED: Now returns filtx1 and filtx12 for debugging. ***
+    Calculate Cirrus Cloud Upw and Dnw conditions
+    """
     close = df['close'].copy()
     
     # Calculate smoothed ranges
@@ -321,7 +337,7 @@ def calculate_cirrus_cloud(df):
     upw = filtx1 < filtx12
     dnw = filtx1 > filtx12
     
-    return upw, dnw
+    return upw, dnw, filtx1, filtx12 # NEW return signature
 
 def check_pair(pair_name, pair_info, last_alerts):
     """Check PPO and MACD crossover conditions for a pair"""
@@ -368,7 +384,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
         # Calculate Cirrus Cloud on 15min timeframe
-        upw, dnw = calculate_cirrus_cloud(df_15m)
+        # *** UPDATED: Now receives filtx1 and filtx12 as well. ***
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         
         # Get latest values from 15min
         ppo_curr = ppo.iloc[-1]
@@ -398,6 +415,11 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"MACD: {macd_curr:.4f}, Signal: {macd_signal_curr:.4f}")
         debug_log(f"RMA50 (15m): {rma50_curr:.2f}, Close: {close_curr:.2f}")
         debug_log(f"RMA200 (5m): {rma200_curr:.2f}, Close: {close_5m_curr:.2f}")
+        
+        # *** NEW DEBUG LINES: Print raw filter values for diagnostics ***
+        debug_log(f"Cirrus Filter 1 (filtx1): {filtx1.iloc[-1]:.4f}") 
+        debug_log(f"Cirrus Filter 2 (filtx12): {filtx12.iloc[-1]:.4f}") 
+        
         debug_log(f"Cirrus Cloud - Upw: {upw_curr}, Dnw: {dnw_curr}")
         
         # Detect PPO crossovers
@@ -596,3 +618,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                             
