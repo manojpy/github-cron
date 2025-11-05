@@ -111,13 +111,8 @@ def send_telegram_alert(message):
             "parse_mode": None  # No HTML formatting
         }
         
-        debug_log(f"Telegram URL: {url[:50]}...")
-        debug_log(f"Chat ID: {TELEGRAM_CHAT_ID}")
-        
         response = requests.post(url, data=data, timeout=10)
         response_data = response.json()
-        
-        debug_log(f"Telegram API response: {response_data}")
         
         if response_data.get('ok'):
             print(f"✓ Alert sent successfully")
@@ -232,6 +227,7 @@ def get_candles(product_id, resolution="15", limit=150):
 
 def calculate_ema(data, period):
     """Calculate Exponential Moving Average"""
+    # Uses adjust=False for closer match to Pine ta.ema
     return data.ewm(span=period, adjust=False).mean()
 
 def calculate_sma(data, period):
@@ -240,6 +236,7 @@ def calculate_sma(data, period):
 
 def calculate_rma(data, period):
     """Calculate RMA (Smoothed Moving Average) - same as ta.rma in Pine Script"""
+    # Uses alpha=1/period for closer match to Pine ta.rma
     return data.ewm(alpha=1/period, adjust=False).mean()
 
 def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
@@ -279,24 +276,30 @@ def calculate_macd(df, fast=100, slow=200, signal=50):
 def smoothrng(x, t, m):
     """Implements smoothrngX1 from Pine Script"""
     wper = t * 2 - 1
+    # avrng = ta.ema(math.abs(x - x[1]), t)
     avrng = calculate_ema(np.abs(x.diff()), t)
+    # smoothrng = ta.ema(avrng, wper) * m
     smoothrng = calculate_ema(avrng, wper) * m
     return smoothrng
 
 def rngfilt(x, r):
     """
     Implements rngfiltx1x1 from Pine Script using robust array iteration.
+    This is the complex, self-referential filter logic.
     """
     # Use a list to store the results, starting with the first value
+    # Pine: rngfiltx1x1 = x (Initialization for the first bar)
     result_list = [x.iloc[0]] 
     
     for i in range(1, len(x)):
+        # Previous filtered value (nz(rngfiltx1x1[1]))
         prev_f = result_list[-1]
-        curr_x = x.iloc[i]
-        curr_r = r.iloc[i]
+        curr_x = x.iloc[i] # Current close price (x)
+        curr_r = r.iloc[i] # Current smoothed range (r)
         
         f = 0.0 # Initialize current filter value
 
+        # Pine: x > nz(rngfiltx1x1[1]) 
         if curr_x > prev_f:
             # Pine: f := x - r < f ? f : x - r
             if curr_x - curr_r < prev_f:
@@ -304,7 +307,7 @@ def rngfilt(x, r):
             else:
                 f = curr_x - curr_r
         else:
-            # Pine: f := x + r > f ? f : x + r
+            # Pine: x + r > f ? f : x + r
             if curr_x + curr_r > prev_f:
                 f = prev_f
             else:
@@ -315,10 +318,11 @@ def rngfilt(x, r):
     # Convert the list back to a Pandas Series, matching the original index
     return pd.Series(result_list, index=x.index)
 
+
 def calculate_cirrus_cloud(df):
     """
-    Calculate Cirrus Cloud Upw and Dnw conditions
-    *** FINAL CONFIRMED FIX: Based on LTCUSD False Alert (LONG on RED cloud). ***
+    Calculate Cirrus Cloud Upw and Dnw conditions.
+    *** FINAL CONFIRMED LOGIC: Based on Pine Script source code (`filtx1 < filtx12 ? colorUp : colorDown`) ***
     """
     close = df['close'].copy()
     
@@ -330,15 +334,13 @@ def calculate_cirrus_cloud(df):
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     
-    # Final determination: 
-    # LTCUSD log showed (filtx1 < filtx12) produced an Upw=True on a RED chart.
-    # Therefore, we must define Upw as the opposite.
+    # The Pine Script color logic: filtx1 < filtx12 ? colorUp : colorDown
+    # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
+    upw = filtx1 < filtx12 
+    # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
+    dnw = filtx1 > filtx12 
     
-    # Chart is GREEN (Upw) when filter 1 line is ABOVE filter 2 line.
-    upw = filtx1 > filtx12 
-    # Chart is RED (Dnw) when filter 1 line is BELOW filter 2 line.
-    dnw = filtx1 < filtx12 
-    
+    # Return filter lines for better debugging
     return upw, dnw, filtx1, filtx12 
 
 def check_pair(pair_name, pair_info, last_alerts):
@@ -385,7 +387,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
-        # Calculate Cirrus Cloud on 15min timeframe
+        # Calculate Cirrus Cloud on 15min timeframe (now returns filtx1/filtx12 for debug)
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         
         # Get latest values from 15min
