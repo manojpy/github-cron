@@ -38,7 +38,6 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        # Debug/Test messages are now OFF
         DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
       run: python macd_bot.py
@@ -48,22 +47,23 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        # Debug/Test messages are now OFF
-        DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'True'
+        DEBUG_MODE: 'False'
+        SEND_TEST_MESSAGE: 'False'
       run: python fibonacci_pivot_bot.py
-    
-    # --- 3. Commit and Push state files (CRITICAL FIX) ---
+      
+    # --- 3. Stage Files Manually (CRITICAL NEW STEP) ---
+    - name: Manually Stage State Files
+      # This forces Git to track the newly created fib_alert_state.json file
+      run: |
+        git add alert_state.json fib_alert_state.json
+        
+    # --- 4. Commit and Push staged files ---
     - name: Commit and Push state files
+      # This action commits and pushes whatever was staged in the previous step
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update alert states [skip ci]"
-        # Track both state files
+        # file_pattern is now less critical but kept for completeness
         file_pattern: |
           alert_state.json
           fib_alert_state.json
-      # Removed 'continue-on-error: true' to ensure the new file is committed.
-
-
-
-
