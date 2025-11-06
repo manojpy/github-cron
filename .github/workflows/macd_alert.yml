@@ -52,15 +52,19 @@ jobs:
         DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
       run: python fibonacci_pivot_bot.py
-    
-    # --- 3. Commit and Push state files (MODIFIED STEP) ---
+        # --- 3. Commit and Push state files (MODIFIED STEP) ---
     - name: Commit and Push state files
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update alert states [skip ci]"
-        # Now committing state files for both bots
+        # This line is the most important: ensure both file names are EXACTLY correct.
         file_pattern: |
           alert_state.json
           fib_alert_state.json
-      continue-on-error: true
+        # The default behavior is to skip CI, but let's ensure it doesn't cause issues
+        skip_ci: true 
+      # REMOVE 'continue-on-error: true' TEMPORARILY
+      # This forces the action to fail if the commit fails, so you can see the error in the log.
+      # continue-on-error: true 
+
 
