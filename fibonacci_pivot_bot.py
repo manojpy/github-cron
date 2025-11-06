@@ -55,7 +55,7 @@ VOLUME_SMA_PERIOD = 20
 PIVOT_LOOKBACK_PERIOD = 15 # Lookback in days for daily high/low/close
 
 # File to store last alert state (separate file for this bot)
-STATE_FILE = 'fib_alert_state.json' 
+STATE_FILE = 'alert_state.json' 
 
 # ============ UTILITY FUNCTIONS (Extracted from macd_bot.txt) ============
 
