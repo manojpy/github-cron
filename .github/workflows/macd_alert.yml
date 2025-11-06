@@ -1,4 +1,4 @@
-name: MACD Alert Bot
+name: Trading Alert Bots
 
 on:
  # schedule:
@@ -33,24 +33,33 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
+    # --- 1. Run MACD Bot ---
     - name: Run MACD Bot
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'False'
-        SEND_TEST_MESSAGE: 'False'
+        DEBUG_MODE: 'True'
+        SEND_TEST_MESSAGE: 'True'
+      # Assuming you have renamed macd_bot.txt to macd_bot.py
       run: python macd_bot.py
     
-    - name: Commit and Push state file
+    # --- 2. Run Fibonacci Pivot Bot (NEW STEP) ---
+    - name: Run Fibonacci Pivot Bot
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # Set DEBUG_MODE and SEND_TEST_MESSAGE as needed for this bot
+        DEBUG_MODE: 'True'
+        SEND_TEST_MESSAGE: 'True'
+      run: python fibonacci_pivot_bot.py
+    
+    # --- 3. Commit and Push state files (MODIFIED STEP) ---
+    - name: Commit and Push state files
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
-        commit_message: "Update alert state [skip ci]"
-        file_pattern: alert_state.json
+        commit_message: "Update alert states [skip ci]"
+        # Now committing state files for both bots
+        file_pattern: |
+          alert_state.json
+          fib_alert_state.json
       continue-on-error: true
-
-
-
-
-
-
-
