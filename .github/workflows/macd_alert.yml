@@ -38,33 +38,31 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # Debug/Test messages are now OFF
         DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
-      # Assuming you have renamed macd_bot.txt to macd_bot.py
       run: python macd_bot.py
     
-    # --- 2. Run Fibonacci Pivot Bot (NEW STEP) ---
+    # --- 2. Run Fibonacci Pivot Bot ---
     - name: Run Fibonacci Pivot Bot
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        # Set DEBUG_MODE and SEND_TEST_MESSAGE as needed for this bot
+        # Debug/Test messages are now OFF
         DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
       run: python fibonacci_pivot_bot.py
-        # --- 3. Commit and Push state files (MODIFIED STEP) ---
+    
+    # --- 3. Commit and Push state files (CRITICAL FIX) ---
     - name: Commit and Push state files
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update alert states [skip ci]"
-        # This line is the most important: ensure both file names are EXACTLY correct.
+        # Track both state files
         file_pattern: |
           alert_state.json
           fib_alert_state.json
-        # The default behavior is to skip CI, but let's ensure it doesn't cause issues
-        skip_ci: true 
-      # REMOVE 'continue-on-error: true' TEMPORARILY
-      # This forces the action to fail if the commit fails, so you can see the error in the log.
-      # continue-on-error: true 
+      # Removed 'continue-on-error: true' to ensure the new file is committed.
+
 
 
