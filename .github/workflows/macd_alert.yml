@@ -51,19 +51,12 @@ jobs:
         SEND_TEST_MESSAGE: 'False'
       run: python fibonacci_pivot_bot.py
       
-    # --- 3. Stage Files Manually (CRITICAL NEW STEP) ---
-    - name: Manually Stage State Files
-      # This forces Git to track the newly created fib_alert_state.json file
-      run: |
-        git add alert_state.json fib_alert_state.json
-        
-    # --- 4. Commit and Push staged files ---
-    - name: Commit and Push state files
-      # This action commits and pushes whatever was staged in the previous step
+    # --- 3. Commit and Push the single shared state file ---
+    - name: Commit and Push state file
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
-        commit_message: "Update alert states [skip ci]"
-        # file_pattern is now less critical but kept for completeness
-        file_pattern: |
-          alert_state.json
-          fib_alert_state.json
+        commit_message: "Update shared alert state [skip ci]"
+        # Only track the existing, single file
+        file_pattern: alert_state.json
+      # We rely on this file being successfully tracked
+      continue-on-error: true
