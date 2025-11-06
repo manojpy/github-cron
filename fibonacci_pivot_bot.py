@@ -40,9 +40,9 @@ PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
 
-MACD_F = 28
-MACD_S = 64
-MACD_SG = 20
+MACD_F = 30
+MACD_S = 65
+MACD_SG = 23
 
 # Cirrus Cloud settings (Reused from macd_bot)
 X1 = 22
@@ -240,7 +240,7 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     
     return ppo, ppo_signal
 
-def calculate_macd(df, fast=28, slow=64, signal=20):
+def calculate_macd(df, fast=30, slow=65, signal=23):
     """Calculate MACD"""
     close = df['close']
     
