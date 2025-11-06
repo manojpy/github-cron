@@ -466,7 +466,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # 6. Upper wick check (upper_wick_check)
         if (upw_curr and 
             (macd_curr > macd_signal_curr) and 
-            (ppo_curr < 0) and 
+            (ppo_curr < 0.20) and 
             long_crossover_line and 
             vol_check and 
             upper_wick_check):
@@ -495,7 +495,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # 6. Lower wick check (lower_wick_check)
         elif (dnw_curr and 
               (macd_curr < macd_signal_curr) and 
-              (ppo_curr > 0) and 
+              (ppo_curr > -0.20) and 
               short_crossover_line and 
               vol_check and 
               lower_wick_check):
