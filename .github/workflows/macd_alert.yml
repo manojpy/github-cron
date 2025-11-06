@@ -38,7 +38,7 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
+        DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
       run: python macd_bot.py
     
@@ -47,7 +47,7 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
+        DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
       run: python fibonacci_pivot_bot.py
       
@@ -60,6 +60,7 @@ jobs:
         file_pattern: alert_state.json
       # We rely on this file being successfully tracked
       continue-on-error: true
+
 
 
 
