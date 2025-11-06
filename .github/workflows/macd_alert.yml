@@ -49,8 +49,8 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         # Debug/Test messages are now OFF
-        DEBUG_MODE: 'False'
-        SEND_TEST_MESSAGE: 'False'
+        DEBUG_MODE: 'True'
+        SEND_TEST_MESSAGE: 'True'
       run: python fibonacci_pivot_bot.py
     
     # --- 3. Commit and Push state files (CRITICAL FIX) ---
@@ -63,6 +63,7 @@ jobs:
           alert_state.json
           fib_alert_state.json
       # Removed 'continue-on-error: true' to ensure the new file is committed.
+
 
 
 
