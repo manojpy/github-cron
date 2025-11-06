@@ -38,8 +38,8 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'True'
+        DEBUG_MODE: 'False'
+        SEND_TEST_MESSAGE: 'False'
       # Assuming you have renamed macd_bot.txt to macd_bot.py
       run: python macd_bot.py
     
@@ -49,8 +49,8 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         # Set DEBUG_MODE and SEND_TEST_MESSAGE as needed for this bot
-        DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'True'
+        DEBUG_MODE: 'False'
+        SEND_TEST_MESSAGE: 'False'
       run: python fibonacci_pivot_bot.py
     
     # --- 3. Commit and Push state files (MODIFIED STEP) ---
@@ -63,3 +63,4 @@ jobs:
           alert_state.json
           fib_alert_state.json
       continue-on-error: true
+
