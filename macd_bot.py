@@ -258,8 +258,7 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     """Calculate PPO (Percentage Price Oscillator) - matches Pine Script"""
     close = df['close']
     
-    # Calculate fast and slow 
-    MAs
+    # Calculate fast and slow MAs
     if use_sma:
         fast_ma = calculate_sma(close, fast)
         slow_ma = calculate_sma(close, slow)
