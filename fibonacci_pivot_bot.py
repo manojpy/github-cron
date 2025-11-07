@@ -33,40 +33,34 @@ PAIRS = {
     "DOTUSD": None, "ADAUSD": None, "SUIUSD": None, "AAVEUSD": None
 }
 
-# Special data requirements for pairs with limited history (Reused from macd_bot)
+# Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 250, "min_required_5m": 183}
 }
 
-# Indicator settings (Reused from macd_bot)
+# Indicator settings
+# PPO settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
 
-MACD_F = 30
-MACD_S = 65
-MACD_SG = 23
-# NEW: Smoothed RSI (SRSI) settings
+# Smoothed RSI (SRSI) settings
 SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
-# Midline is 50 for the condition check
 
-# Cirrus Cloud settings (Reused from macd_bot)
+# Cirrus Cloud settings
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
 
-# Volume and Pivot settings (New/Specific)
+# Pivot settings
 PIVOT_LOOKBACK_PERIOD = 15 # Lookback in days for daily high/low/close
 
 STATE_FILE = 'alert_state.json' 
 
-# ============ UTILITY FUNCTIONS (Corrected for Thread-Safety) ============
-
-# NOTE: The previous global debug_log function is removed to avoid interleaving.
-# Logging is now handled internally by check_pair.
+# ============ UTILITY FUNCTIONS ============
 
 def load_state():
     """Load previous alert state from file"""
@@ -129,7 +123,7 @@ def send_test_message():
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
     
-    test_msg = f"🔔 Fibonacci Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    test_msg = f"🔔 Fibonacci Pivot Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
     
     print("\n" + "="*50)
     print("SENDING TEST MESSAGE")
@@ -248,18 +242,7 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     
     return ppo, ppo_signal
 
-def calculate_macd(df, fast=30, slow=65, signal=23):
-    """Calculate MACD - Returns line, signal, and histogram"""
-    close = df['close']
-    
-    ema_fast = calculate_ema(close, fast)
-    ema_slow = calculate_ema(close, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line, signal)
-    
-    macd_hist = macd_line - signal_line
-    
-    return macd_line, signal_line, macd_hist
+# --- REMOVED: calculate_macd function ---
 
 def smoothrng(x, t, m):
     """Implements smoothrngX1 from Pine Script"""
@@ -366,7 +349,8 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     # Use RMA for Wilder's smoothing
     avg_gain = calculate_rma(gain, rsi_len)
-    avg_loss = calculate_rma(loss, rsi_len)
+    # Use replace to handle division by zero safely
+    avg_loss = calculate_rma(loss, rsi_len) 
     
     # Avoid division by zero
     rs = avg_gain / avg_loss.replace(0, 1e-9) 
@@ -377,7 +361,7 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# ============ FIBONACCI PIVOT FUNCTIONS (New) ============
+# ============ FIBONACCI PIVOT FUNCTIONS ============
 
 def get_previous_day_ohlc(product_id, days_back_limit=15):
     """Fetch 1-day candles to get the previous day's H, L, C for pivot calculation."""
@@ -422,14 +406,12 @@ def check_pair(pair_name, pair_info, last_alerts):
     # --- 1. Internal Log Collector ---
     thread_log = []
     
-    # Define a local logging function that appends to the list
     def log(message):
         if DEBUG_MODE:
             thread_log.append(f"[DEBUG] {message}")
 
     try:
         if pair_info is None:
-            # Return an empty log string for clean handling in main
             return last_alerts.get(pair_name), "" 
         
         log(f"\n{'='*60}")
@@ -439,7 +421,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 1. Get Pivot Data (Previous Day) ---
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
-            # Critical failure print
             print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") 
             return last_alerts.get(pair_name), '\n'.join(thread_log)
           
@@ -460,11 +441,10 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         # Calculate indicators
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
-        macd, macd_signal, macd_hist = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m)
         
-        if len(ppo) < 3 or len(macd_hist) < 3 or len(smooth_rsi) < 3:
+        if len(ppo) < 3 or len(smooth_rsi) < 3:
             print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
@@ -477,17 +457,13 @@ def check_pair(pair_name, pair_info, last_alerts):
  
         
         ppo_curr = ppo.iloc[-2] 
-        macd_curr = macd.iloc[-2]
-        macd_signal_curr = macd_signal.iloc[-2]
-        macd_hist_curr = macd_hist.iloc[-2]
-        macd_hist_prev = macd_hist.iloc[-3] 
         smooth_rsi_curr = smooth_rsi.iloc[-2]
 
-        log(f"15m SRSI: {smooth_rsi_curr:.2f}, MACD: {macd_curr:.4f}, Signal: {macd_signal_curr:.4f}, Hist: {macd_hist_curr:.4f} (Prev Hist: {macd_hist_prev:.4f})")
+        log(f"15m PPO: {ppo_curr:.4f}, SRSI: {smooth_rsi_curr:.2f}")
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
 
-        # --- NEW: Get 5-Minute Candles and PPO ---
+        # --- Get 5-Minute Candles and PPO ---
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 250)
         min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 183), 16)
         
@@ -505,12 +481,11 @@ def check_pair(pair_name, pair_info, last_alerts):
                 log(f"5m PPO: {ppo_5m_curr:.4f}")
             else:
                 log("5m PPO calculation failed to produce a valid value.")
-        # --- END NEW 5M PPO BLOCK ---
+        # --- END 5M PPO BLOCK ---
         
         
         # --- 3. Define Alert Conditions ---
-        macd_hist_rising = macd_hist_curr > macd_hist_prev
-        macd_hist_falling = macd_hist_curr < macd_hist_prev
+        # MACD conditions removed, only SRSI remains
         srsi_above_50 = smooth_rsi_curr > 50
         srsi_below_50 = smooth_rsi_curr < 50
         
@@ -531,6 +506,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             lower_wick_check = (lower_wick_length / candle_range) < 0.20
         
         # --- 4. Pivot Crossover Logic ---
+        # R3 and S3 are usually high/low extension pivots, P, R1, R2, S1, S2 are the key reversal/continuation levels
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = False
         long_crossover_name = None
@@ -580,9 +556,9 @@ def check_pair(pair_name, pair_info, last_alerts):
             except Exception as e:
                 log(f"Error parsing saved state {updated_state}: {e}")
                 
-        # 🟢 FINAL LONG SIGNAL CHECK
+        # 🟢 FINAL LONG SIGNAL CHECK (MACD condition removed and simplified)
         if (upw_curr and (not dnw_curr) and 
-            (macd_hist_rising and srsi_above_50) and 
+            srsi_above_50 and 
             (not np.isnan(ppo_5m_curr) and (ppo_curr < 0.20 or ppo_5m_curr < 0.05)) and 
             long_crossover_line and 
             upper_wick_check): 
@@ -604,9 +580,9 @@ def check_pair(pair_name, pair_info, last_alerts):
             updated_state = current_signal
             
 
-        # 🔴 FINAL SHORT SIGNAL CHECK
+        # 🔴 FINAL SHORT SIGNAL CHECK (MACD condition removed and simplified)
         elif (dnw_curr and (not upw_curr) and 
-              (macd_hist_falling and srsi_below_50) and 
+              srsi_below_50 and 
               (not np.isnan(ppo_5m_curr) and (ppo_curr > -0.20 or ppo_5m_curr > -0.05)) and 
               short_crossover_line and 
               lower_wick_check): 
@@ -634,12 +610,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         return updated_state, '\n'.join(thread_log)
 
     except Exception as e:
-        # Direct print for errors as they are critical and should not be swallowed by logs
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             traceback.print_exc()
         
-        # Still return the original state and the thread log
         return last_alerts.get(pair_name), '\n'.join(thread_log) 
 
 
