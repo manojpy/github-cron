@@ -133,8 +133,8 @@ def send_test_message():
     test_msg = f"🔔 Fibonacci Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
     
     print("\n" + "="*50)
-    print("SENDING TEST 
-MESSAGE")
+    # FIX APPLIED HERE: COMBINING THE PRINT STATEMENT
+    print("SENDING TEST MESSAGE")
     print("="*50)
     
     success = send_telegram_alert(test_msg)
@@ -159,8 +159,7 @@ def get_product_ids():
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
             
-            for product in 
-                products:
+            for product in products:
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
                 
                 if product.get('contract_type') == 'perpetual_futures':
@@ -173,8 +172,7 @@ def get_product_ids():
                                 'symbol': product['symbol'],
                                 'contract_type': product['contract_type']
                             }
-                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: 
-                                {product['id']})")
+                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
             return True
         else:
             print(f"API Error: {data}")
@@ -183,8 +181,7 @@ def get_product_ids():
     except Exception as e:
         print(f"Error fetching products: {e}")
         if DEBUG_MODE:
-            import 
-                traceback
+            import traceback
             traceback.print_exc()
         return False
 
@@ -236,8 +233,7 @@ def calculate_ema(data, period):
     return data.ewm(span=period, adjust=False).mean()
 
 def calculate_sma(data, period):
-    """Calculate 
-    Simple Moving Average"""
+    """Calculate Simple Moving Average"""
     return data.rolling(window=period).mean()
 
 def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
@@ -251,8 +247,7 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
         fast_ma = calculate_ema(close, fast)
         slow_ma = calculate_ema(close, slow)
     
-    ppo = (fast_ma - slow_ma) 
-    / slow_ma * 100
+    ppo = (fast_ma - slow_ma) / slow_ma * 100
     
     if use_sma:
         ppo_signal = calculate_sma(ppo, signal)
@@ -286,8 +281,7 @@ def rngfilt(x, r):
     
     for i in range(1, len(x)):
         prev_f = result_list[-1]
-        curr_x 
-        = x.iloc[i] 
+        curr_x = x.iloc[i] 
         curr_r = r.iloc[i]
         
         f = 0.0
@@ -366,8 +360,7 @@ def calculate_fibonacci_pivots(h, l, c):
     
     return {
         'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 
-        'S1': s1, 'S2': 
-        s2, 'S3': s3
+        'S1': s1, 'S2': s2, 'S3': s3
     }
     
 # Removed: calculate_volume_sma function
@@ -413,8 +406,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Get values for the last closed 15m candle (index -2)
         open_prev = df_15m['open'].iloc[-2]
         close_prev = df_15m['close'].iloc[-2]
-        high_prev = 
-        df_15m['high'].iloc[-2]
+        high_prev = df_15m['high'].iloc[-2]
         low_prev = df_15m['low'].iloc[-2]
         # Removed: volume_prev and vol_sma_prev
         
@@ -424,8 +416,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
 
-        debug_log(f"PPO: {ppo_curr:.4f}, MACD: 
-        {macd_curr:.4f}, MACD Signal: {macd_signal_curr:.4f}")
+        debug_log(f"PPO: {ppo_curr:.4f}, MACD: {macd_curr:.4f}, MACD Signal: {macd_signal_curr:.4f}")
         
         # --- 3. Define Alert Conditions ---
         
@@ -448,8 +439,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             
             # Check 6 (Long): Upper wick < 20% of total candle length 
             upper_wick_check = (upper_wick_length / candle_range) < 0.20 
-            # Check 6 (Short): Lower wick < 
-            20% of total candle length 
+            # Check 6 (Short): Lower wick < 20% of total candle length 
             lower_wick_check = (lower_wick_length / candle_range) < 0.20 
         
         # --- 4. Pivot Crossover Logic ---
@@ -500,29 +490,25 @@ def check_pair(pair_name, pair_info, last_alerts):
                 alert_type, pivot_name = updated_state.split('_')[-2:]
                 pivot_value = pivots.get(pivot_name)
                 
-                if pivot_value is 
-                    not None:
+                if pivot_value is not None:
                     
                     if alert_type == "long":
                         # Exclude R3 from reset logic
-                        if pivot_name != 
-                            'R3':
+                        if pivot_name != 'R3':
                             # Reset if price closes BELOW the line that triggered the original alert
                             if close_prev < pivot_value:
                              
                                 updated_state = None
                                 debug_log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
                                 
-                    elif alert_type 
-                        == "short":
+                    elif alert_type == "short":
                         # Exclude S3 from reset logic
                         if pivot_name != 'S3':
                             # Reset if price closes ABOVE the line that triggered the original alert
    
                             if close_prev > pivot_value:
                                 updated_state = None
-                                debug_log(f"\nALERT STATE RESET: {pair_name} Short (Close 
-                                    ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
+                                debug_log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
             except Exception as e:
                 debug_log(f"Error parsing saved state {updated_state}: {e}")
                 # If parsing fails, just keep the state as is.
@@ -531,7 +517,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             (macd_curr > macd_signal_curr) and 
             (ppo_curr < 0.20) and 
             long_crossover_line and 
-            upper_wick_check): # Removed: vol_check
+            upper_wick_check): # vol_check removed
             
             
             # The current state to save if an alert is sent
@@ -562,7 +548,7 @@ def check_pair(pair_name, pair_info, last_alerts):
               (ppo_curr > -0.20) and 
     
               short_crossover_line and 
-              lower_wick_check): # Removed: vol_check
+              lower_wick_check): # vol_check removed
               
             # The current state to save if an alert is sent
             current_signal = f"fib_short_{short_crossover_name}"
@@ -616,8 +602,7 @@ def main():
 
     # === APPLIED RESET STATE LOGIC ===
     if RESET_STATE and os.path.exists(STATE_FILE):
-        print(f"ATTENTION: RESET_STATE is True.
-        Deleting {STATE_FILE} to clear previous alerts.")
+        print(f"ATTENTION: RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
     # =================================
     
@@ -676,8 +661,7 @@ def main():
     # Save state for next run
     save_state(last_alerts)
     
-    end_time 
-    = datetime.now(ist)
+    end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
     print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
