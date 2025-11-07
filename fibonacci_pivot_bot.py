@@ -419,7 +419,7 @@ def check_pair(pair_name, pair_info, last_alerts):
     """Check Fibonacci Pivot conditions for a pair"""
     try:
         if pair_info is None:
-            return None
+            return last_alerts.get(pair_name) 
         
         debug_log(f"\n{'='*60}")
         debug_log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
@@ -438,12 +438,13 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         # --- 2. Get 15-Minute Candles and Indicators ---
         limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 210)
-        min_required = SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 200)
+        # Ensure we have at least enough data for MACD, PPO and safe iloc[-3] access
+        min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 200), 65)
 
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
   
         if df_15m is None or len(df_15m) < min_required:
-            print(f"Not enough 15m data for {pair_name}.")
+            print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.")
             return last_alerts.get(pair_name) 
 
         # Calculate indicators
@@ -452,6 +453,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         macd, macd_signal, macd_hist = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m) # Upw is Green, Dnw is Red
         smooth_rsi = calculate_smooth_rsi(df_15m)
+        
+        # --- IMPORTANT INDEX CHECK ---
+        # Ensure the indicator Series has at least 3 values for safe iloc[-2] and iloc[-3] access
+        if len(ppo) < 3 or len(macd_hist) < 3 or len(smooth_rsi) < 3:
+            print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
+            return last_alerts.get(pair_name)
+
 
         # Get values for the last closed 15m candle (index -2)
         open_prev = df_15m['open'].iloc[-2]
@@ -477,26 +485,28 @@ def check_pair(pair_name, pair_info, last_alerts):
   
         # Using default values from SOLUSD for consistency if not specified
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 250)
-        min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 183)
-        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
+        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 183), 16) # PPO_SLOW is 16
         
         ppo_5m_curr = np.nan # Initialize as NaN for safety
+        
+        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         
         if df_5m is None or len(df_5m) < min_required_5m:
             debug_log(f"Not enough 5m data for {pair_name}. PPO 5m check will be ignored.")
         else:
             # Re-use the existing calculate_ppo function
             ppo_5m, _ = calculate_ppo(df_5m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
+            
             # Take the PPO value from the last completed candle (index -2)
-            if len(ppo_5m) >= 2:
+            if len(ppo_5m) >= 2 and not np.isnan(ppo_5m.iloc[-2]):
                 ppo_5m_curr = ppo_5m.iloc[-2]
                 debug_log(f"5m PPO: {ppo_5m_curr:.4f}")
             else:
-                debug_log("5m PPO calculation failed to produce enough values.")
+                debug_log("5m PPO calculation failed to produce a valid value.")
         # --- END NEW 5M PPO BLOCK ---
         
         
-        # --- 3. Define Alert Conditions ---  <--- FIX APPLIED HERE: Corrected the unindentation
+        # --- 3. Define Alert Conditions ---
         # --- NEW Indicator Conditions ---
         macd_hist_rising = macd_hist_curr > macd_hist_prev # NEW: Histogram is rising (up-slope)
         macd_hist_falling = macd_hist_curr < macd_hist_prev # NEW: Histogram is falling (down-slope)
@@ -614,7 +624,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- PPO CONDITION MODIFIED HERE: (ppo_15m < 0.20) OR (ppo_5m < 0.05) ---
         if (upw_curr and (not dnw_curr) and 
             (macd_hist_rising and srsi_above_50) and 
-            ((ppo_curr < 0.20) or (ppo_5m_curr < 0.05)) and 
+            (not np.isnan(ppo_5m_curr) and (ppo_curr < 0.20 or ppo_5m_curr < 0.05)) and 
             long_crossover_line and 
             upper_wick_check): 
             
@@ -630,13 +640,13 @@ def check_pair(pair_name, pair_info, last_alerts):
                 message = (
  
                 
-                    f"🟢 {pair_name} - FIB LONG\\n"
-                    f"Crossed & Closed Above {long_crossover_name} (${long_crossover_line:,.2f})\\n"
+                    f"🟢 {pair_name} - **FIB LONG**\n"
+                    f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f})\n"
                     # --- ALERT MESSAGE MODIFIED HERE ---
          
-                    f"PPO 15m: {ppo_curr:.2f}\\n" 
-                    f"PPO 5m: {ppo_5m_curr:.2f}\\n"
-                    f"Price: ${price:,.2f}\\n"
+                    f"PPO 15m: {ppo_curr:.2f}\n" 
+                    f"PPO 5m: {ppo_5m_curr:.2f}\n"
+                    f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
       
                 )
@@ -653,7 +663,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- PPO CONDITION MODIFIED HERE: (ppo_15m > -0.20) OR (ppo_5m > -0.05) ---
         elif (dnw_curr and (not upw_curr) and 
               (macd_hist_falling and srsi_below_50) and 
-              ((ppo_curr > -0.20) or (ppo_5m_curr > -0.05)) and 
+              (not np.isnan(ppo_5m_curr) and (ppo_curr > -0.20 or ppo_5m_curr > -0.05)) and 
               short_crossover_line and 
               lower_wick_check): 
               
@@ -667,15 +677,15 @@ def check_pair(pair_name, pair_info, last_alerts):
             # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
-                    f"🔴 {pair_name} - FIB SHORT\\n"
+                    f"🔴 {pair_name} - **FIB SHORT**\n"
               
             
-                    f"Crossed & Closed Below {short_crossover_name} (${short_crossover_line:,.2f})\\n"
+                    f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f})\n"
                     # --- ALERT MESSAGE MODIFIED HERE ---
-                    f"PPO 15m: {ppo_curr:.2f}\\n"
-                    f"PPO 5m: {ppo_5m_curr:.2f}\\n"
+                    f"PPO 15m: {ppo_curr:.2f}\n"
+                    f"PPO 5m: {ppo_5m_curr:.2f}\n"
    
-                    f"Price: ${price:,.2f}\\n"
+                    f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
            
@@ -718,10 +728,9 @@ def main():
         send_test_message()
 
     # === APPLIED RESET STATE LOGIC ===
- 
+    # CORRECTED: Used \n for newline within the f-string to fix SyntaxError
     if RESET_STATE and os.path.exists(STATE_FILE):
-        print(f"ATTENTION: 
- RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
+        print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
     # =================================
     
@@ -734,8 +743,7 @@ def main():
         return
     
     found_count = sum(1 for v in PAIRS.values() if v is not None)
-    print(f"✓ Monitoring 
- {found_count} pairs")
+    print(f"✓ Monitoring {found_count} pairs")
   
     
     if found_count == 0:
