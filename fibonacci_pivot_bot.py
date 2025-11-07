@@ -129,7 +129,7 @@ def send_test_message():
     print("\n" + "="*50)
     print("SENDING TEST MESSAGE")
     print("="*50)
-    
+   
     success = send_telegram_alert(test_msg)
     
     if success:
@@ -157,7 +157,7 @@ def get_product_ids():
                 
                 if product.get('contract_type') == 'perpetual_futures':
                     for pair_name in PAIRS.keys():
-                      
+                    
                         if symbol == pair_name or symbol.replace('_', '') == pair_name:
                             PAIRS[pair_name] = {
                                 'id': product['id'],
@@ -265,6 +265,7 @@ def smoothrng(x, t, m):
 def rngfilt(x, r):
     """Implements rngfiltx1x1 from Pine Script using robust array iteration."""
     result_list = [x.iloc[0]] 
+    
     
     for i in range(1, len(x)):
         prev_f = result_list[-1]
@@ -397,7 +398,28 @@ def check_pair(pair_name, pair_info, last_alerts):
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
 
-        debug_log(f"PPO: {ppo_curr:.4f}, MACD: {macd_curr:.4f}, MACD Signal: {macd_signal_curr:.4f}")
+        debug_log(f"15m PPO: {ppo_curr:.4f}, MACD: {macd_curr:.4f}, MACD Signal: {macd_signal_curr:.4f}")
+        
+        # --- NEW: Get 5-Minute Candles and PPO ---
+        # Using default values from SOLUSD for consistency if not specified
+        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 250)
+        min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 183)
+        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
+        
+        ppo_5m_curr = np.nan # Initialize as NaN for safety
+        
+        if df_5m is None or len(df_5m) < min_required_5m:
+            debug_log(f"Not enough 5m data for {pair_name}. PPO 5m check will be ignored.")
+        else:
+            # Re-use the existing calculate_ppo function
+            ppo_5m, _ = calculate_ppo(df_5m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
+            # Take the PPO value from the last completed candle (index -2)
+            if len(ppo_5m) >= 2:
+                ppo_5m_curr = ppo_5m.iloc[-2]
+                debug_log(f"5m PPO: {ppo_5m_curr:.4f}")
+            else:
+                debug_log("5m PPO calculation failed to produce enough values.")
+        # --- END NEW 5M PPO BLOCK ---
         
         
         # --- 3. Define Alert Conditions ---
@@ -423,6 +445,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             # Check 6 (Short): Lower wick < 20% of total candle length 
             lower_wick_check = (lower_wick_length / candle_range) < 0.20 
         
+      
         # --- 4. Pivot Crossover Logic ---
         
         # LONG Crossover Check: Green candle crosses and closes ABOVE a pivot line (P, R1, R2, S1, S2)
@@ -432,6 +455,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         long_crossover_name = None
  
         if is_green:
+        
             for name, line in long_pivot_lines.items():
                 # Candle opens below the pivot line AND closes above the pivot line
                 if open_prev <= line and close_prev > line: 
@@ -457,6 +481,7 @@ def check_pair(pair_name, pair_info, last_alerts):
      
         current_signal = None
         updated_state = last_alerts.get(pair_name) 
+  
         
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
@@ -466,12 +491,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         if updated_state and updated_state.startswith('fib_'):
     
             try:
+            
                 # updated_state format is "fib_long_R1"
                 alert_type, pivot_name = updated_state.split('_')[-2:]
                 pivot_value = pivots.get(pivot_name)
                 
            
                 if pivot_value is not None:
+        
                     
                     if alert_type == "long":
                         # Exclude R3 from reset logic
@@ -479,39 +506,48 @@ def check_pair(pair_name, pair_info, last_alerts):
                             # Reset if price closes BELOW the line that triggered the original alert
                             if close_prev < pivot_value:
                                 updated_state = None
+    
                                 debug_log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
                  
                     elif alert_type == "short":
+                       
                         # Exclude S3 from reset logic
                         if pivot_name != 'S3':
                             # Reset if price closes ABOVE the line that triggered the original alert
+                           
                             if close_prev > pivot_value:
                                 updated_state = None
                                 debug_log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
             except Exception as e:
+      
                 debug_log(f"Error parsing saved state {updated_state}: {e}")
                 
         # 🟢 FINAL LONG SIGNAL CHECK
-        # --- MUTUAL EXCLUSION FIX APPLIED HERE: (not dnw_curr) ---
+        # --- PPO CONDITION MODIFIED HERE: (ppo_15m < 0.20) OR (ppo_5m < 0.05) ---
         if (upw_curr and (not dnw_curr) and 
             (macd_curr > macd_signal_curr) and 
-            (ppo_curr < 0.20) and 
+            ((ppo_curr < 0.20) or (ppo_5m_curr < 0.05)) and 
             long_crossover_line and 
             upper_wick_check): 
             
       
             # The current state to save if an alert is sent
             current_signal = f"fib_long_{long_crossover_name}"
+            
             debug_log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             
             # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
+                 
                     f"🟢 {pair_name} - FIB LONG\n"
                     f"Crossed & Closed Above {long_crossover_name} (${long_crossover_line:,.2f})\n"
-                    f"PPO: {ppo_curr:.2f}\n"
+                    # --- ALERT MESSAGE MODIFIED HERE ---
+                    f"PPO 15m: {ppo_curr:.2f}\n" 
+                    f"PPO 5m: {ppo_5m_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
+      
                 )
                 send_telegram_alert(message)
                 
@@ -520,11 +556,12 @@ def check_pair(pair_name, pair_info, last_alerts):
             updated_state = current_signal
             
 
+  
         # 🔴 FINAL SHORT SIGNAL CHECK
-        # --- MUTUAL EXCLUSION FIX APPLIED HERE: (not upw_curr) ---
+        # --- PPO CONDITION MODIFIED HERE: (ppo_15m > -0.20) OR (ppo_5m > -0.05) ---
         elif (dnw_curr and (not upw_curr) and 
               (macd_curr < macd_signal_curr) and 
-              (ppo_curr > -0.20) and 
+              ((ppo_curr > -0.20) or (ppo_5m_curr > -0.05)) and 
               short_crossover_line and 
               lower_wick_check): 
               
@@ -533,15 +570,20 @@ def check_pair(pair_name, pair_info, last_alerts):
         
             debug_log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             
+   
             # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
                     f"🔴 {pair_name} - FIB SHORT\n"
+              
                     f"Crossed & Closed Below {short_crossover_name} (${short_crossover_line:,.2f})\n"
-                    f"PPO: {ppo_curr:.2f}\n"
+                    # --- ALERT MESSAGE MODIFIED HERE ---
+                    f"PPO 15m: {ppo_curr:.2f}\n"
+                    f"PPO 5m: {ppo_5m_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
+           
                 send_telegram_alert(message)
                 
   
@@ -560,6 +602,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
+        
         return last_alerts.get(pair_name) 
 
 def main():
@@ -578,6 +621,7 @@ def main():
         send_test_message()
 
     # === APPLIED RESET STATE LOGIC ===
+ 
     if RESET_STATE and os.path.exists(STATE_FILE):
         print(f"ATTENTION: RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
