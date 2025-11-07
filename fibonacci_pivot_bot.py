@@ -19,6 +19,9 @@ DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 # Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 
+# Reset state flag - set to 'True' to clear the alert_state.json file on startup
+RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
+
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
 
@@ -360,7 +363,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
             print(f"Skipping {pair_name}: Failed to get previous day OHLC data.")
-            return None
+            return last_alerts.get(pair_name) # Return current state to maintain lock
             
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
@@ -374,7 +377,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         if df_15m is None or len(df_15m) < min_required:
             print(f"Not enough 15m data for {pair_name}.")
-            return None
+            return last_alerts.get(pair_name) # Return current state to maintain lock
 
         # Calculate indicators
         # Note: We use .iloc[-2] for all indicators and candle data to check the last fully CLOSED 15m candle.
@@ -449,21 +452,45 @@ def check_pair(pair_name, pair_info, last_alerts):
                     short_crossover_name = name
                     break
         
-        # --- 5. Signal Detection ---
+        # --- 5. Signal Detection and State Management ---
         
-        current_state = None
+        current_signal = None
+        updated_state = last_alerts.get(pair_name) # Start with the current saved state
+        
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
         
-        
+        # === ADVANCED STATE RESET LOGIC ===
+        if updated_state and updated_state.startswith('fib_'):
+            try:
+                # updated_state format is "fib_long_R1"
+                alert_type, pivot_name = updated_state.split('_')[-2:]
+                pivot_value = pivots.get(pivot_name)
+                
+                if pivot_value is not None:
+                    
+                    if alert_type == "long":
+                        # Exclude R3 from reset logic
+                        if pivot_name != 'R3':
+                            # Reset if price closes BELOW the line that triggered the original alert
+                            if close_prev < pivot_value:
+                                updated_state = None
+                                debug_log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
+                                
+                    elif alert_type == "short":
+                        # Exclude S3 from reset logic
+                        if pivot_name != 'S3':
+                            # Reset if price closes ABOVE the line that triggered the original alert
+                            if close_prev > pivot_value:
+                                updated_state = None
+                                debug_log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
+            except Exception as e:
+                debug_log(f"Error parsing saved state {updated_state}: {e}")
+                # If parsing fails, just keep the state as is.
+
+
         # 🟢 FINAL LONG SIGNAL CHECK
-        # 1. Cirrus Cloud is Green (upw_curr)
-        # 2. Macd is above signal (macd_curr > macd_signal_curr)
-        # 3. PPO is below 0 (ppo_curr < 0)
-        # 4. Long Crossover (long_crossover_line is not False)
-        # 5. Volume check (vol_check)
-        # 6. Upper wick check (upper_wick_check)
         if (upw_curr and 
             (macd_curr > macd_signal_curr) and 
             (ppo_curr < 0.20) and 
@@ -471,9 +498,12 @@ def check_pair(pair_name, pair_info, last_alerts):
             vol_check and 
             upper_wick_check):
             
-            current_state = "fib_long"
+            # The current state to save if an alert is sent
+            current_signal = f"fib_long_{long_crossover_name}"
             debug_log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
-            if last_alerts.get(pair_name) != "fib_long":
+            
+            # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
+            if updated_state != current_signal:
                 message = (
                     f"🟢 {pair_name} - FIB LONG\n"
                     f"Crossed & Closed Above {long_crossover_name} (${long_crossover_line:,.2f})\n"
@@ -482,17 +512,12 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
-            else:
-                debug_log(f"FIB LONG already alerted for {pair_name}, skipping duplicate")
-
+                
+            # Update the state to the new signal string
+            updated_state = current_signal
+            
 
         # 🔴 FINAL SHORT SIGNAL CHECK
-        # 1. Cirrus Cloud is Red (dnw_curr)
-        # 2. Macd is below signal (macd_curr < macd_signal_curr)
-        # 3. PPO is above 0 (ppo_curr > 0)
-        # 4. Short Crossover (short_crossover_line is not False)
-        # 5. Volume check (vol_check)
-        # 6. Lower wick check (lower_wick_check)
         elif (dnw_curr and 
               (macd_curr < macd_signal_curr) and 
               (ppo_curr > -0.20) and 
@@ -500,9 +525,12 @@ def check_pair(pair_name, pair_info, last_alerts):
               vol_check and 
               lower_wick_check):
               
-            current_state = "fib_short"
+            # The current state to save if an alert is sent
+            current_signal = f"fib_short_{short_crossover_name}"
             debug_log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
-            if last_alerts.get(pair_name) != "fib_short":
+            
+            # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
+            if updated_state != current_signal:
                 message = (
                     f"🔴 {pair_name} - FIB SHORT\n"
                     f"Crossed & Closed Below {short_crossover_name} (${short_crossover_line:,.2f})\n"
@@ -511,20 +539,22 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
-            else:
-                debug_log(f"FIB SHORT already alerted for {pair_name}, skipping duplicate")
+                
+            # Update the state to the new signal string
+            updated_state = current_signal
                 
         else:
             debug_log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         
-        return current_state
-        
+        # Return the final state for the main function to save (string for signal, None for reset/no signal)
+        return updated_state
+      
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
-        return None
+        return last_alerts.get(pair_name) # Return last good state on unexpected error
 
 def main():
     """Main function - runs once per GitHub Actions execution"""
@@ -538,6 +568,12 @@ def main():
     # Send test message if enabled
     if SEND_TEST_MESSAGE:
         send_test_message()
+
+    # === APPLIED RESET STATE LOGIC ===
+    if RESET_STATE and os.path.exists(STATE_FILE):
+        print(f"ATTENTION: RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
+        os.remove(STATE_FILE)
+    # =================================
     
     # Load previous state
     last_alerts = load_state()
@@ -555,7 +591,7 @@ def main():
         return
     
     # Check all pairs in parallel
-    alerts_sent = 0
+    updates_processed = 0
     
     # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -564,16 +600,23 @@ def main():
         
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
+                # Pass a copy of last_alerts for thread safety, though check_pair now only 
+                # reads from it at the start and returns the new state.
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts.copy()) 
+                
                 future_to_pair[future] = pair_name
 
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
             try:
+                # new_state can be "fib_long_R1" (new signal) or None (reset/no change)
                 new_state = future.result() 
-                if new_state:
+                
+                # Always save the result, even if it's None to clear a previous state.
+                # Only increment updates if the state has changed.
+                if new_state != last_alerts.get(pair_name):
                     last_alerts[pair_name] = new_state
-                    alerts_sent += 1
+                    updates_processed += 1
             except Exception as e:
                 print(f"Error processing {pair_name} in thread: {e}")
                 if DEBUG_MODE:
@@ -586,7 +629,7 @@ def main():
     
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
-    print(f"✓ Check complete. {alerts_sent} alerts sent. ({elapsed:.1f}s)")
+    print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
