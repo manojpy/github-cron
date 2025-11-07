@@ -49,7 +49,7 @@ SPECIAL_PAIRS = {
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
-PPO_USE_SMA = False  # False = use EMA (as per your script)
+PPO_USE_SMA = False  # False = use EMA
 
 # MACD settings
 MACD_F = 30
@@ -70,7 +70,7 @@ X4 = 5
 # File to store last alert state
 STATE_FILE = 'alert_state.json'
 
-# ============ FUNCTIONS ============
+# ============ UTILITY FUNCTIONS ============
 
 def debug_log(message):
     """Print debug messages if DEBUG_MODE is enabled"""
@@ -342,7 +342,6 @@ def calculate_cirrus_cloud(df):
     """
    
     Calculate Cirrus Cloud Upw and Dnw conditions.
-    *** FINAL CONFIRMED LOGIC: Based on Pine Script source code (`filtx1 < filtx12 ? colorUp : colorDown`) ***
     """
     close = df['close'].copy()
     
@@ -354,8 +353,6 @@ def calculate_cirrus_cloud(df):
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     
-    # The Pine Script color 
-    # logic: filtx1 < filtx12 ? colorUp : colorDown
     # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
     upw = filtx1 < filtx12 
     # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
@@ -388,7 +385,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             limit_5m = 210
             min_required_5m = 200
         
-        # Fetch 15-minute candles for PPO, MACD, EMA100
+        # Fetch 15-minute candles for PPO, MACD, RMA50
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         
         # Fetch 5-minute candles for RMA200
@@ -628,7 +625,9 @@ def main():
         
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
+                # IMPORTANT: Pass a copy of last_alerts for thread safety 
+                # (although check_pair only reads from it for the initial state).
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts.copy())
                 
                 future_to_pair[future] = pair_name
 
@@ -636,10 +635,13 @@ def main():
             pair_name = future_to_pair[future]
             try:
                 new_state = future.result() 
-                if new_state:
+                # Only update the state if a new signal was detected
+                if new_state: 
+                    # new_state is the signal type (e.g., "buy", "short_011")
                     last_alerts[pair_name] = new_state
-   
-                    alerts_sent += 1
+                    # The alert is sent inside check_pair if the state changes, 
+                    # so we just track that an update was processed here.
+                    alerts_sent += 1 
             except Exception as e:
                 print(f"Error processing {pair_name} in thread: {e}")
                 if DEBUG_MODE:
@@ -653,7 +655,7 @@ def main():
     
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
-    print(f"✓ Check complete. {alerts_sent} alerts sent. ({elapsed:.1f}s)")
+    print(f"✓ Check complete. {alerts_sent} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
