@@ -506,8 +506,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_5m_cross_down = (ppo_5m_prev >= ppo_signal_5m_prev) and (ppo_5m_curr < ppo_signal_5m_curr)
         
         # PPO value conditions (5m)
-        ppo_5m_below_020 = ppo_5m_curr < 0.20
-        ppo_5m_above_minus020 = ppo_5m_curr > -0.20
+        ppo_5m_below_020 = ppo_5m_curr < 0.05
+        ppo_5m_above_minus020 = ppo_5m_curr > -0.05
         ppo_5m_above_minus005 = ppo_5m_curr > -0.05
         # =================================================
 
@@ -569,12 +569,12 @@ def check_pair(pair_name, pair_info, last_alerts):
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
 
         # 3. NEW BUY ALERT (TREND CONTINUATION) ===
-        # 15m PPO > 0.20 AND 5m PPO Cross Up AND 5m PPO < 0.20 AND other conditions
+        # 15m PPO > 0.20 AND 5m PPO Cross Up AND 5m PPO < 0.05 AND other conditions
         elif (ppo_curr > 0.20 and ppo_5m_cross_up and ppo_5m_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and (not dnw_curr) and strong_bullish_close):
             current_state = "buy_trend"
             debug_log(f"\n🟢 BUY (TREND) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy_trend":
-                message = f"🟢 {pair_name} - BUY (TREND)\n15m PPO > 0.20 ({ppo_curr:.2f}), 5m PPO Cross Up < 0.20 ({ppo_5m_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                message = f"🟢 {pair_name} - BUY (TREND)\n15m PPO > 0.20 ({ppo_curr:.2f}), 5m PPO Cross Up < 0.05 ({ppo_5m_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
             else:
                 debug_log(f"BUY (TREND) already alerted for {pair_name}, skipping duplicate")
