@@ -429,6 +429,46 @@ def check_pair(pair_name, pair_info, last_alerts):
         dnw_curr = dnw.iloc[-1]
     
         dnw_prev = dnw.iloc[-2]
+
+        # --- NEW CANDLE STRUCTURE CHECKS ---
+        open_curr = df_15m['open'].iloc[-1]
+        high_curr = df_15m['high'].iloc[-1]
+        low_curr = df_15m['low'].iloc[-1]
+        
+        # Candle Metrics
+        total_range = high_curr - low_curr
+        # Upper Wick: High - Max(Open, Close)
+        upper_wick = high_curr - max(open_curr, close_curr)
+        # Lower Wick: Min(Open, Close) - Low
+        lower_wick = min(open_curr, close_curr) - low_curr
+        
+        # Basic candle type check
+        bullish_candle = close_curr > open_curr
+        bearish_candle = close_curr < open_curr
+
+        # 20% Wick conditions
+        wick_check_valid = total_range > 0
+        
+        # Strong Bullish Close: Bullish Candle AND Upper Wick < 20% of Total Range
+        strong_bullish_close = False
+        # Strong Bearish Close: Bearish Candle AND Lower Wick < 20% of Total Range
+        strong_bearish_close = False
+
+        if wick_check_valid:
+            strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
+            strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
+        
+        # Debug logs for new variables
+        debug_log(f"\nCandle Metrics (15m):")
+        debug_log(f"  O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
+        debug_log(f"  Range: {total_range:.2f}, UW: {upper_wick:.2f}, LW: {lower_wick:.2f}")
+        
+        if wick_check_valid:
+            debug_log(f"  Strong Bullish Close (20% Rule): {strong_bullish_close}")
+            debug_log(f"  Strong Bearish Close (20% Rule): {strong_bearish_close}")
+        else:
+            debug_log("  Candle range is zero, skipping wick checks.")
+        # --- END NEW CANDLE STRUCTURE CHECKS ---
         
         # Get latest values from 5min
         close_5m_curr = df_5m['close'].iloc[-1]
@@ -507,8 +547,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Cirrus Cloud is GREEN (Upw)
-        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Cirrus Cloud is GREEN (Upw) AND Strong Bullish Candle
+        if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and strong_bullish_close:
    
             current_state = "buy"
             debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
@@ -519,8 +559,8 @@ def check_pair(pair_name, pair_info, last_alerts):
   
                 debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
         
-        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Cirrus Cloud is RED (Dnw)
-        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
+        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Cirrus Cloud is RED (Dnw) AND Strong Bearish Candle
+        elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr and strong_bearish_close:
             current_state = "sell"
      
             debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
@@ -530,8 +570,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
         
-        # LONG: PPO > Signal AND PPO crosses above 0 AND Cirrus Cloud is GREEN (Upw)
-        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+        # LONG (0): PPO > Signal AND PPO crosses above 0 AND Cirrus Cloud is GREEN (Upw) AND Strong Bullish Candle
+        elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and strong_bullish_close:
             current_state = "long_zero"
             debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_zero":
@@ -540,9 +580,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
         
-        # LONG: PPO > Signal AND 
-        # PPO crosses above 0.11 AND Cirrus Cloud is GREEN (Upw)
-        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+        # LONG (0.11): PPO > Signal AND PPO crosses above 0.11 AND Cirrus Cloud is GREEN (Upw) AND Strong Bullish Candle
+        elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and strong_bullish_close:
             current_state = "long_011"
             debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_011":
@@ -551,8 +590,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT: PPO < Signal AND PPO crosses below 0 AND Cirrus Cloud is RED (Dnw)
-        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
+        # SHORT (0): PPO < Signal AND PPO crosses below 0 AND Cirrus Cloud is RED (Dnw) AND Strong Bearish Candle
+        elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr and strong_bearish_close:
             current_state = "short_zero"
             debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_zero":
@@ -562,8 +601,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Cirrus Cloud is RED (Dnw)
-        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
+        # SHORT (-0.11): PPO < Signal AND PPO crosses below -0.11 AND Cirrus Cloud is RED (Dnw) AND Strong Bearish Candle
+        elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr and strong_bearish_close:
             current_state = "short_011"
           
             debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
