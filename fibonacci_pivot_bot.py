@@ -496,8 +496,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- END NEW 5M PPO BLOCK ---
         
         
-        # --- 3. 
- Define Alert Conditions ---
+        # --- 3. Define Alert Conditions ---  <--- FIX APPLIED HERE: Corrected the unindentation
         # --- NEW Indicator Conditions ---
         macd_hist_rising = macd_hist_curr > macd_hist_prev # NEW: Histogram is rising (up-slope)
         macd_hist_falling = macd_hist_curr < macd_hist_prev # NEW: Histogram is falling (down-slope)
