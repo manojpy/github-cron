@@ -58,8 +58,7 @@ MACD_S = 65
 MACD_SG = 23
 
 # RMA settings
-RMA_50_PERIOD = 50   # 
-RMA50 on 15min
+RMA_50_PERIOD = 50   # RMA50 on 15min
 RMA_200_PERIOD = 200   # RMA200 on 5min
 
 # Cirrus Cloud settings
