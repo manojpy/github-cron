@@ -92,7 +92,6 @@ def load_state():
 
 def save_state(state):
     """Save alert state to file"""
-    
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
@@ -136,7 +135,6 @@ def send_test_message():
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
     
     test_msg = f"🔔 Bot Started\nTest message from MACD Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
-    
     
     print("\n" + "="*50)
     print("SENDING TEST MESSAGE")
@@ -341,7 +339,7 @@ def calculate_cirrus_cloud(df):
     
     # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
     upw = filtx1 < filtx12 
-    # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
+    # Dnw (Red) is True when filter 1 
     dnw = filtx1 > filtx12 
     
     # Return filter lines for better debugging
@@ -389,6 +387,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         macd, macd_signal = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
         rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
         
+        # === NEW: Calculate PPO on 5min timeframe ===
+        ppo_5m, ppo_signal_5m = calculate_ppo(df_5m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
+        # ===========================================
+
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
@@ -412,6 +414,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         upw_prev = upw.iloc[-2]
         dnw_curr = dnw.iloc[-1]
         dnw_prev = dnw.iloc[-2]
+        
+        # === NEW: Get latest values from 5min PPO ===
+        ppo_5m_curr = ppo_5m.iloc[-1]
+        ppo_5m_prev = ppo_5m.iloc[-2]
+        ppo_signal_5m_curr = ppo_signal_5m.iloc[-1]
+        ppo_signal_5m_prev = ppo_signal_5m.iloc[-2]
+        # ===========================================
 
         # --- NEW CANDLE STRUCTURE CHECKS ---
         open_curr = df_15m['open'].iloc[-1]
@@ -457,10 +466,17 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_5m_curr = df_5m['close'].iloc[-1]
         rma200_curr = rma_200.iloc[-1]
         
+        
         # Debug: Print all indicator values
         debug_log(f"Price: ${close_curr:,.2f}")
         debug_log(f"PPO: {ppo_curr:.4f} (prev: {ppo_prev:.4f})")
         debug_log(f"PPO Signal: {ppo_signal_curr:.4f} (prev: {ppo_signal_prev:.4f})")
+        
+        # === NEW: 5m PPO Debug Logs ===
+        debug_log(f"PPO 5m: {ppo_5m_curr:.4f} (prev: {ppo_5m_prev:.4f})")
+        debug_log(f"PPO 5m Signal: {ppo_signal_5m_curr:.4f} (prev: {ppo_signal_5m_prev:.4f})")
+        # ===============================
+
         debug_log(f"MACD: {macd_curr:.4f}, Signal: {macd_signal_curr:.4f}")
         debug_log(f"RMA50 (15m): {rma50_curr:.2f}, Close: {close_curr:.2f}")
         debug_log(f"RMA200 (5m): {rma200_curr:.2f}, Close: {close_5m_curr:.2f}")
@@ -471,21 +487,32 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         debug_log(f"Cirrus Cloud - Upw: {upw_curr}, Dnw: {dnw_curr}")
         
-        # Detect PPO crossovers
+        # Detect PPO crossovers (15m)
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
-        # Detect PPO zero-line crossovers
+        # Detect PPO zero-line crossovers (15m)
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
         ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
         ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
         ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
         
-        # PPO value conditions
+        # PPO value conditions (15m)
         ppo_below_020 = ppo_curr < 0.20
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
         ppo_below_signal = ppo_curr < ppo_signal_curr
+        
+        # === NEW: 5m PPO Crossover and Value Conditions ===
+        ppo_5m_cross_up = (ppo_5m_prev <= ppo_signal_5m_prev) and (ppo_5m_curr > ppo_signal_5m_curr)
+        ppo_5m_cross_down = (ppo_5m_prev >= ppo_signal_5m_prev) and (ppo_5m_curr < ppo_signal_5m_curr)
+        
+        ppo_15m_above_020 = ppo_curr > 0.20 
+        ppo_15m_below_minus020 = ppo_curr < -0.20 
+        
+        ppo_5m_below_005 = ppo_5m_curr < 0.05
+        ppo_5m_above_minus005 = ppo_5m_curr > -0.05
+        # =================================================
         
         # MACD conditions
         macd_above_signal = macd_curr > macd_signal_curr
@@ -499,17 +526,17 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         # Debug: Print crossover detections
         debug_log(f"\nCrossover Checks:")
-        debug_log(f"  PPO cross up: {ppo_cross_up}")
-        debug_log(f"  PPO cross down: {ppo_cross_down}")
-        debug_log(f"  PPO above 0: {ppo_cross_above_zero}")
-        debug_log(f"  PPO below 0: {ppo_cross_below_zero}")
-        debug_log(f"  PPO above 0.11: {ppo_cross_above_011}")
-        debug_log(f"  PPO below -0.11: {ppo_cross_below_minus011}")
+        debug_log(f"  PPO 15m cross up: {ppo_cross_up}")
+        debug_log(f"  PPO 15m cross down: {ppo_cross_down}")
+        debug_log(f"  PPO 5m cross up: {ppo_5m_cross_up}")
+        debug_log(f"  PPO 5m cross down: {ppo_5m_cross_down}")
+        debug_log(f"  PPO 15m above 0.20: {ppo_15m_above_020}")
+        debug_log(f"  PPO 15m below -0.20: {ppo_15m_below_minus020}")
         
         debug_log(f"\nCondition Checks:")
-        debug_log(f"  PPO < 0.20: {ppo_below_020}")
-        debug_log(f"  PPO > -0.20: {ppo_above_minus020}")
-        debug_log(f"  PPO > Signal: {ppo_above_signal}")
+        debug_log(f"  PPO 15m < 0.20: {ppo_below_020}")
+        debug_log(f"  PPO 15m > -0.20: {ppo_above_minus020}")
+        debug_log(f"  PPO 15m > Signal: {ppo_above_signal}")
         debug_log(f"  MACD > Signal: {macd_above_signal}")
         debug_log(f"  Close > RMA50: {close_above_rma50}")
         debug_log(f"  Close > RMA200: {close_above_rma200}")
@@ -524,7 +551,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Cirrus Cloud is GREEN (Upw) AND Strong Bullish Candle
+        # 1. ORIGINAL BUY: PPO crosses up AND PPO < 0.20 AND ...
         if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and (not dnw_curr) and strong_bullish_close:
             current_state = "buy"
             debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
@@ -534,7 +561,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
         
-        # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Cirrus Cloud is RED (Dnw) AND Strong Bearish Candle
+        # 2. ORIGINAL SELL: PPO crosses down AND PPO > -0.20 AND ...
         elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr and (not upw_curr) and strong_bearish_close:
             current_state = "sell"
             debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
@@ -543,8 +570,42 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
-        
-        # LONG (0): PPO > Signal AND PPO crosses above 0 AND Cirrus Cloud is GREEN (Upw) AND Strong Bullish Candle
+
+        # 3. === NEW BUY ALERT (TREND CONTINUATION) ===
+        elif (ppo_15m_above_020 and 
+              ppo_5m_cross_up and 
+              ppo_5m_below_005 and 
+              macd_above_signal and 
+              close_above_rma50 and 
+              close_above_rma200 and 
+              upw_curr and (not dnw_curr) and 
+              strong_bullish_close):
+            current_state = "buy_trend"
+            debug_log(f"\n🟢 BUY (TREND) SIGNAL DETECTED for {pair_name}!")
+            if last_alerts.get(pair_name) != "buy_trend":
+                message = f"🟢 {pair_name} - BUY (TREND)\n15m PPO > 0.20 ({ppo_curr:.2f}), 5m PPO Cross Up < 0.05 ({ppo_5m_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+            else:
+                debug_log(f"BUY (TREND) already alerted for {pair_name}, skipping duplicate")
+            
+        # 4. === NEW SELL ALERT (TREND CONTINUATION) ===
+        elif (ppo_15m_below_minus020 and 
+              ppo_5m_cross_down and 
+              ppo_5m_above_minus005 and 
+              macd_below_signal and 
+              close_below_rma50 and 
+              close_below_rma200 and 
+              dnw_curr and (not upw_curr) and 
+              strong_bearish_close):
+            current_state = "sell_trend"
+            debug_log(f"\n🔴 SELL (TREND) SIGNAL DETECTED for {pair_name}!")
+            if last_alerts.get(pair_name) != "sell_trend":
+                message = f"🔴 {pair_name} - SELL (TREND)\n15m PPO < -0.20 ({ppo_curr:.2f}), 5m PPO Cross Down > -0.05 ({ppo_5m_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+                send_telegram_alert(message)
+            else:
+                debug_log(f"SELL (TREND) already alerted for {pair_name}, skipping duplicate")
+
+        # 5. LONG (0): PPO > Signal AND PPO crosses above 0 AND ...
         elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and (not dnw_curr) and strong_bullish_close:
             current_state = "long_zero"
             debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
@@ -554,7 +615,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
         
-        # LONG (0.11): PPO > Signal AND PPO crosses above 0.11 AND Cirrus Cloud is GREEN (Upw) AND Strong Bullish Candle
+        # 6. LONG (0.11): PPO > Signal AND PPO crosses above 0.11 AND ...
         elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr and (not dnw_curr) and strong_bullish_close:
             current_state = "long_011"
             debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
@@ -564,7 +625,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT (0): PPO < Signal AND PPO crosses below 0 AND Cirrus Cloud is RED (Dnw) AND Strong Bearish Candle
+        # 7. SHORT (0): PPO < Signal AND PPO crosses below 0 AND ...
         elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr and (not upw_curr) and strong_bearish_close:
             current_state = "short_zero"
             debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
@@ -574,7 +635,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT (-0.11): PPO < Signal AND PPO crosses below -0.11 AND Cirrus Cloud is RED (Dnw) AND Strong Bearish Candle
+        # 8. SHORT (-0.11): PPO < Signal AND PPO crosses below -0.11 AND ...
         elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr and (not upw_curr) and strong_bearish_close:
             current_state = "short_011"
             debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
@@ -583,6 +644,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
             else:
                 debug_log(f"SHORT (-0.11) already alerted for {pair_name}, skipping duplicate")
+        
         else:
             debug_log(f"No signal conditions met for {pair_name}")
         
@@ -646,7 +708,8 @@ def main():
                 new_state = future.result() 
                 # Only update the state if a new signal was detected
                 if new_state: 
-                    # new_state is the signal type (e.g., "buy", "short_011")
+                    # new_state is the signal 
+                    # type (e.g., "buy", "short_011", "buy_trend")
                     last_alerts[pair_name] = new_state
                     # The alert is sent inside check_pair if the state changes, 
                     # so we just track that an update was processed here.
