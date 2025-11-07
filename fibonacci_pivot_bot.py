@@ -63,9 +63,10 @@ PIVOT_LOOKBACK_PERIOD = 15 # Lookback in days for daily high/low/close
 
 STATE_FILE = 'alert_state.json' 
 
-# ============ UTILITY FUNCTIONS (Extracted from macd_bot.txt) ============
+# ============ UTILITY FUNCTIONS (Corrected for Thread-Safety) ============
 
-### CORRECTION START: REMOVED GLOBAL debug_log() FUNCTION
+# NOTE: The previous global debug_log function is removed to avoid interleaving.
+# Logging is now handled internally by check_pair.
 
 def load_state():
     """Load previous alert state from file"""
@@ -73,14 +74,13 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
-                # Since we removed debug_log, we print directly here
                 if DEBUG_MODE:
                     print(f"[DEBUG] Loaded state: {state}")
                 return state
     except Exception as e:
         print(f"Error loading state: {e}")
     if DEBUG_MODE:
-        print("No previous state found, starting fresh")
+        print("[DEBUG] No previous state found, starting fresh")
     return {}
 
 def save_state(state):
@@ -96,7 +96,6 @@ def save_state(state):
 def send_telegram_alert(message):
     """Send alert message via Telegram"""
     try:
-        # Re-introducing a direct print for sending attempt, as this is critical
         if DEBUG_MODE:
             print(f"[DEBUG] Attempting to send message: {message[:100]}...")
         
@@ -124,20 +123,39 @@ def send_telegram_alert(message):
             traceback.print_exc()
         return False
 
-# ... other utility functions (send_test_message, get_product_ids, get_candles, etc. remain unchanged) ...
+def send_test_message():
+    """Send a test message to verify Telegram connectivity"""
+    ist = pytz.timezone('Asia/Kolkata')
+    current_dt = datetime.now(ist)
+    formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
+    
+    test_msg = f"🔔 Fibonacci Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    
+    print("\n" + "="*50)
+    print("SENDING TEST MESSAGE")
+    print("="*50)
+    success = send_telegram_alert(test_msg)
+    
+    if success:
+        print("✓ Test message sent successfully!")
+    else:
+        print("❌ Test message failed - check your bot token and chat ID")
+    
+    print("="*50 + "\n")
+    return success
 
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange and populate PAIRS dict"""
     try:
         if DEBUG_MODE:
-            print("Fetching product IDs from Delta Exchange...")
+            print("[DEBUG] Fetching product IDs from Delta Exchange...")
         response = requests.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
         data = response.json()
         
         if data.get('success'):
             products = data['result']
             if DEBUG_MODE:
-                print(f"Received {len(products)} products from API")
+                print(f"[DEBUG] Received {len(products)} products from API")
             
             for product in products:
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
@@ -151,7 +169,7 @@ def get_product_ids():
                                 'contract_type': product['contract_type']
                             }
                             if DEBUG_MODE:
-                                print(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
+                                print(f"[DEBUG] Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
             return True
         else:
             print(f"API Error: {data}")
@@ -160,25 +178,214 @@ def get_product_ids():
     except Exception as e:
         print(f"Error fetching products: {e}")
         if DEBUG_MODE:
-            import traceback
             traceback.print_exc()
         return False
 
-# NOTE: All indicator functions (calculate_ema, calculate_ppo, etc.) are fine as they don't use debug_log
-# The main change is in check_pair:
-### CORRECTION END: UPDATED GLOBAL UTILITIES
+def get_candles(product_id, resolution="15", limit=150):
+    """Fetch OHLCV candles from Delta Exchange"""
+    try:
+        to_time = int(time.time())
+        # resolution is in minutes, except for "D" (Daily)
+        if resolution == "D":
+            from_time = to_time - (limit * 24 * 60 * 60) # Approx
+        else:
+            from_time = to_time - (limit * int(resolution) * 60)
+        
+        url = f"{DELTA_API_BASE}/v2/chart/history"
+        params = {
+            'resolution': resolution,
+            'symbol': product_id,
+            'from': from_time,
+            'to': to_time
+        }
+        
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+        
+        if data.get('success'):
+            result = data['result']
+            df = pd.DataFrame({
+                'timestamp': result['t'],
+                'open': result['o'],
+                'high': result['h'],
+                'low': result['l'],
+                'close': result['c'],
+                'volume': result['v']
+            })
+            return df
+        else:
+            return None
+            
+    except Exception as e:
+        print(f"Exception fetching candles for {product_id}: {e}")
+        return None
+
+def calculate_ema(data, period):
+    """Calculate Exponential Moving Average"""
+    return data.ewm(span=period, adjust=False).mean()
+
+def calculate_sma(data, period):
+    """Calculate Simple Moving Average"""
+    return data.rolling(window=period).mean()
+
+def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
+    """Calculate PPO (Percentage Price Oscillator) - matches Pine Script"""
+    close = df['close']
+    
+    if use_sma:
+        fast_ma = calculate_sma(close, fast)
+        slow_ma = calculate_sma(close, slow)
+    else:
+        fast_ma = calculate_ema(close, fast)
+        slow_ma = calculate_ema(close, slow)
+    
+    ppo = (fast_ma - slow_ma) / slow_ma * 100
+    
+    if use_sma:
+        ppo_signal = calculate_sma(ppo, signal)
+    else:
+        ppo_signal = calculate_ema(ppo, signal)
+    
+    return ppo, ppo_signal
+
+def calculate_macd(df, fast=30, slow=65, signal=23):
+    """Calculate MACD - Returns line, signal, and histogram"""
+    close = df['close']
+    
+    ema_fast = calculate_ema(close, fast)
+    ema_slow = calculate_ema(close, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = calculate_ema(macd_line, signal)
+    
+    macd_hist = macd_line - signal_line
+    
+    return macd_line, signal_line, macd_hist
+
+def smoothrng(x, t, m):
+    """Implements smoothrngX1 from Pine Script"""
+    wper = t * 2 - 1
+    avrng = calculate_ema(np.abs(x.diff()), t)
+    smoothrng = calculate_ema(avrng, wper) * m
+    return smoothrng
+
+def rngfilt(x, r):
+    """Implements rngfiltx1x1 from Pine Script using robust array iteration."""
+    result_list = [x.iloc[0]] 
+    
+    for i in range(1, len(x)):
+        prev_f = result_list[-1]
+        curr_x = x.iloc[i] 
+        curr_r = r.iloc[i]
+        
+        f = 0.0
+
+        if curr_x > prev_f:
+            if curr_x - curr_r < prev_f:
+                f = prev_f
+            else:
+                f = curr_x - curr_r
+        else:
+            if curr_x + curr_r > prev_f:
+                f = prev_f
+            else:
+                f = curr_x + curr_r
+        
+        result_list.append(f)
+        
+    return pd.Series(result_list, index=x.index)
+
+def calculate_cirrus_cloud(df):
+    """Calculate Cirrus Cloud Upw (Green) and Dnw (Red) conditions."""
+    close = df['close'].copy()
+    
+    smrngx1x = smoothrng(close, X1, X2)
+    smrngx1x2 = smoothrng(close, X3, X4)
+    
+    filtx1 = rngfilt(close, smrngx1x)
+    filtx12 = rngfilt(close, smrngx1x2)
+    
+    # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
+    upw = filtx1 < filtx12 
+    # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
+    dnw = filtx1 > filtx12 
+    
+    return upw, dnw, filtx1, filtx12 
+
+def calculate_rma(data, period):
+    """Calculate RMA (Smoothed Moving Average) - matches Pine Script's ta.rma"""
+    # Uses alpha=1/period for closer match to Pine ta.rma
+    return data.ewm(alpha=1/period, adjust=False).mean()
+
+def kalman_filter(src, length, R = 0.01, Q = 0.1):
+    """Implements the kalman_filter function from Pine Script"""
+    result_list = []
+    
+    estimate = np.nan
+    error_est = 1.0
+    
+    error_meas = R * length
+    Q_div_length = Q / length
+
+    # Use a loop to mimic bar-by-bar 'var' behavior in Pine Script
+    for i in range(len(src)):
+        current_src = src.iloc[i]
+        
+        if np.isnan(current_src):
+            result_list.append(np.nan)
+            continue
+        
+        if np.isnan(estimate):
+            if i > 0 and not np.isnan(src.iloc[i-1]):
+                estimate = src.iloc[i-1]
+            else:
+                result_list.append(np.nan)
+                continue
+
+        prediction = estimate
+        
+        kalman_gain = error_est / (error_est + error_meas)
+        
+        estimate = prediction + kalman_gain * (current_src - prediction)
+        
+        error_est = (1 - kalman_gain) * error_est + Q_div_length
+        
+        result_list.append(estimate)
+
+    # Pad with NaNs at the beginning to ensure series is the same length
+    num_nan_pad = len(src) - len(result_list)
+    final_list = [np.nan] * num_nan_pad + result_list
+    
+    return pd.Series(final_list, index=src.index)
+
+def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
+    """Calculate Smoothed RSI using Kalman Filter"""
+    close = df['close']
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # Use RMA for Wilder's smoothing
+    avg_gain = calculate_rma(gain, rsi_len)
+    avg_loss = calculate_rma(loss, rsi_len)
+    
+    # Avoid division by zero
+    rs = avg_gain / avg_loss.replace(0, 1e-9) 
+    rsi_value = 100 - (100 / (1 + rs))
+    
+    # Smooth RSI using Kalman Filter
+    smooth_rsi = kalman_filter(rsi_value, kalman_len)
+    
+    return smooth_rsi
 
 # ============ FIBONACCI PIVOT FUNCTIONS (New) ============
 
 def get_previous_day_ohlc(product_id, days_back_limit=15):
     """Fetch 1-day candles to get the previous day's H, L, C for pivot calculation."""
-    # Fetch enough data to ensure the last complete daily candle is captured
     df_daily = get_candles(product_id, resolution="D", limit=days_back_limit + 5)
     
     if df_daily is None or len(df_daily) < 2:
         return None
     
-    # The last row is often the current, incomplete day. We need the one before it.
     prev_day_candle = df_daily.iloc[-2]
     
     return {
@@ -209,8 +416,6 @@ def calculate_fibonacci_pivots(h, l, c):
     }
     
 
-### CORRECTION START: MODIFIED check_pair FOR THREAD-SAFE LOGGING
-
 def check_pair(pair_name, pair_info, last_alerts):
     """Check Fibonacci Pivot conditions for a pair and return new state and log output."""
     
@@ -224,7 +429,7 @@ def check_pair(pair_name, pair_info, last_alerts):
 
     try:
         if pair_info is None:
-            # We still return an empty log string for clean handling in main
+            # Return an empty log string for clean handling in main
             return last_alerts.get(pair_name), "" 
         
         log(f"\n{'='*60}")
@@ -234,13 +439,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 1. Get Pivot Data (Previous Day) ---
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
-            print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") # Direct print for critical failure
+            # Critical failure print
+            print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") 
             return last_alerts.get(pair_name), '\n'.join(thread_log)
           
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
-        # All debug_log() calls are replaced with log()
         log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, S1={pivots['S1']:.2f}")
 
         # --- 2. Get 15-Minute Candles and Indicators ---
@@ -250,7 +455,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
   
         if df_15m is None or len(df_15m) < min_required:
-            print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.") # Direct print for critical failure
+            print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.")
             return last_alerts.get(pair_name), '\n'.join(thread_log) 
 
         # Calculate indicators
@@ -260,7 +465,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         smooth_rsi = calculate_smooth_rsi(df_15m)
         
         if len(ppo) < 3 or len(macd_hist) < 3 or len(smooth_rsi) < 3:
-            print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).") # Direct print for critical failure
+            print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
 
@@ -432,15 +637,11 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Direct print for errors as they are critical and should not be swallowed by logs
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
-            import traceback
             traceback.print_exc()
         
         # Still return the original state and the thread log
         return last_alerts.get(pair_name), '\n'.join(thread_log) 
 
-### CORRECTION END: MODIFIED check_pair
-
-### CORRECTION START: MODIFIED main TO PROCESS LOGS
 
 def main():
  
@@ -489,8 +690,7 @@ def main():
     
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Pass pair_info instead of a copy of last_alerts to check_pair
-                # check_pair now only needs name, info, and the alerts to check against
+                # Submit the task. check_pair now returns (new_state, log_output)
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts) 
                 
                 future_to_pair[future] = pair_name
@@ -501,9 +701,8 @@ def main():
             try:
                 # --- CAPTURE BOTH RETURN VALUES ---
                 new_state, log_output = future.result() 
-                pair_logs.append(log_output) # Store the clean log output
+                pair_logs.append(log_output) # Store the clean log output for sequential printing
                 
-                # Always save the result, even if it's None to clear a previous state.
                 # Only increment updates if the state has changed.
                 if new_state != last_alerts.get(pair_name):
                     last_alerts[pair_name] = new_state
@@ -513,14 +712,20 @@ def main():
                 # This catches errors in the executor framework itself, not the logic inside check_pair
                 print(f"Error processing {pair_name} in thread: {e}") 
                 if DEBUG_MODE:
-                    import traceback
                     traceback.print_exc()
                 continue
             
-    # --- NEW: PRINT COLLECTED LOGS SEQUENTIALLY ---
-    for log_output in pair_logs:
-        # Use end='' to prevent extra newlines if log_output already ends with one
-        print(log_output, end='') 
+    # --- PRINT COLLECTED LOGS SEQUENTIALLY (Fixes Interleaving) ---
+    if DEBUG_MODE:
+        print("\n\n" + "="*50)
+        print("SEQUENTIAL DEBUG LOGS START")
+        print("="*50)
+        for log_output in pair_logs:
+            # Print the full, non-interleaved block of logs for this pair
+            print(log_output, end='') 
+        print("\n" + "="*50)
+        print("SEQUENTIAL DEBUG LOGS END")
+        print("="*50)
         
     # Save state for next run
     save_state(last_alerts)
@@ -533,5 +738,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-### CORRECTION END: MODIFIED main TO PROCESS LOGS
