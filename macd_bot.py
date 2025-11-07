@@ -92,6 +92,7 @@ def load_state():
 
 def save_state(state):
     """Save alert state to file"""
+    
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
@@ -105,7 +106,7 @@ def send_telegram_alert(message):
         debug_log(f"Attempting to send message: {message[:100]}...")
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
+    
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
@@ -115,6 +116,7 @@ def send_telegram_alert(message):
         response = requests.post(url, data=data, timeout=10)
         response_data = response.json()
         
+    
         if response_data.get('ok'):
             print(f"✓ Alert sent successfully")
             return True
@@ -124,6 +126,7 @@ def send_telegram_alert(message):
         
     except Exception as e:
         print(f"❌ Error sending Telegram message: {e}")
+   
         import traceback
         if DEBUG_MODE:
             traceback.print_exc()
@@ -136,6 +139,7 @@ def send_test_message():
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
     
     test_msg = f"🔔 Bot Started\nTest message from MACD Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    
     
     print("\n" + "="*50)
     print("SENDING TEST MESSAGE")
@@ -154,6 +158,7 @@ def send_test_message():
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange"""
     try:
+    
         debug_log("Fetching product IDs from Delta Exchange...")
         response = requests.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
         data = response.json()
@@ -162,14 +167,17 @@ def get_product_ids():
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
             
+           
             for product in products:
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
                 
                 if product.get('contract_type') == 'perpetual_futures':
                     for pair_name in PAIRS.keys():
+                  
                         if symbol == pair_name or symbol.replace('_', '') == pair_name:
                             PAIRS[pair_name] = {
                                 'id': product['id'],
+                       
                                 'symbol': product['symbol'],
                                 'contract_type': product['contract_type']
                             }
@@ -182,6 +190,7 @@ def get_product_ids():
             
     except Exception as e:
         print(f"Error fetching products: {e}")
+      
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
@@ -194,6 +203,7 @@ def get_candles(product_id, resolution="15", limit=150):
         from_time = to_time - (limit * int(resolution) * 60)
         
         url = f"{DELTA_API_BASE}/v2/chart/history"
+   
         params = {
             'resolution': resolution,
             'symbol': product_id,
@@ -203,6 +213,7 @@ def get_candles(product_id, resolution="15", limit=150):
         
         debug_log(f"Fetching {resolution}m candles for {product_id}, limit={limit}")
         
+    
         response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
@@ -211,12 +222,14 @@ def get_candles(product_id, resolution="15", limit=150):
             df = pd.DataFrame({
                 'timestamp': result['t'],
                 'open': result['o'],
+   
                 'high': result['h'],
                 'low': result['l'],
                 'close': result['c'],
                 'volume': result['v']
             })
             debug_log(f"Received {len(df)} candles for {product_id} ({resolution}m)")
+      
             return df
         else:
             print(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
@@ -228,6 +241,7 @@ def get_candles(product_id, resolution="15", limit=150):
 
 def calculate_ema(data, period):
     """Calculate Exponential Moving Average"""
+   
     # Uses adjust=False for closer match to Pine ta.ema
     return data.ewm(span=period, adjust=False).mean()
 
@@ -244,7 +258,8 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     """Calculate PPO (Percentage Price Oscillator) - matches Pine Script"""
     close = df['close']
     
-    # Calculate fast and slow MAs
+    # Calculate fast and slow 
+    MAs
     if use_sma:
         fast_ma = calculate_sma(close, fast)
         slow_ma = calculate_sma(close, slow)
@@ -276,6 +291,7 @@ def calculate_macd(df, fast=30, slow=65, signal=23):
 
 def smoothrng(x, t, m):
     """Implements smoothrngX1 from Pine Script"""
+    
     wper = t * 2 - 1
     # avrng = ta.ema(math.abs(x - x[1]), t)
     avrng = calculate_ema(np.abs(x.diff()), t)
@@ -305,12 +321,14 @@ def rngfilt(x, r):
         if curr_x > prev_f:
             # Pine: f := x - r < f ? f : x - r
             if curr_x - curr_r < prev_f:
+   
                 f = prev_f
             else:
                 f = curr_x - curr_r
         else:
             # Pine: x + r > f ? f : x + r
             if curr_x + curr_r > prev_f:
+    
                 f = prev_f
             else:
                 f = curr_x + curr_r
@@ -323,6 +341,7 @@ def rngfilt(x, r):
 
 def calculate_cirrus_cloud(df):
     """
+   
     Calculate Cirrus Cloud Upw and Dnw conditions.
     *** FINAL CONFIRMED LOGIC: Based on Pine Script source code (`filtx1 < filtx12 ? colorUp : colorDown`) ***
     """
@@ -336,7 +355,8 @@ def calculate_cirrus_cloud(df):
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     
-    # The Pine Script color logic: filtx1 < filtx12 ? colorUp : colorDown
+    # The Pine Script color 
+    # logic: filtx1 < filtx12 ? colorUp : colorDown
     # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
     upw = filtx1 < filtx12 
     # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
@@ -346,7 +366,8 @@ def calculate_cirrus_cloud(df):
     return upw, dnw, filtx1, filtx12 
 
 def check_pair(pair_name, pair_info, last_alerts):
-    """Check PPO and MACD crossover conditions for a pair and handle state reset"""
+    """Check PPO and MACD crossover conditions for a pair"""
+   
     try:
         if pair_info is None:
             return None
@@ -357,6 +378,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         # Check if this pair has special requirements
         if pair_name in SPECIAL_PAIRS:
+        
             limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
             min_required = SPECIAL_PAIRS[pair_name]["min_required"]
             limit_5m = SPECIAL_PAIRS[pair_name].get("limit_5m", 210)
@@ -367,7 +389,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             limit_5m = 210
             min_required_5m = 200
         
-        # Fetch 15-minute candles for PPO, MACD, RMA50, Cirrus
+        # Fetch 15-minute candles for PPO, MACD, EMA100
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         
         # Fetch 5-minute candles for RMA200
@@ -379,6 +401,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             
         if df_5m is None or len(df_5m) < min_required_5m:
             print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/{min_required_5m})")
+     
             return None
         
         # Calculate indicators on 15min timeframe
@@ -389,13 +412,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
-        # Calculate Cirrus Cloud on 15min timeframe
+        # Calculate Cirrus Cloud on 15min timeframe (now returns filtx1/filtx12 for debug)
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         
         # Get latest values from 15min
         ppo_curr = ppo.iloc[-1]
         ppo_prev = ppo.iloc[-2]
         ppo_signal_curr = ppo_signal.iloc[-1]
+        
         ppo_signal_prev = ppo_signal.iloc[-2]
         
         macd_curr = macd.iloc[-1]
@@ -405,9 +429,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma50_curr = rma_50.iloc[-1]
         
         upw_curr = upw.iloc[-1]
-        # upw_prev = upw.iloc[-2] # Not needed for pullback logic
+        upw_prev = upw.iloc[-2]
         dnw_curr = dnw.iloc[-1]
-        # dnw_prev = dnw.iloc[-2] # Not needed for pullback logic
+    
+        dnw_prev = dnw.iloc[-2]
         
         # Get latest values from 5min
         close_5m_curr = df_5m['close'].iloc[-1]
@@ -425,14 +450,16 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"Cirrus Filter 1 (filtx1): {filtx1.iloc[-1]:.4f}") 
         debug_log(f"Cirrus Filter 2 (filtx12): {filtx12.iloc[-1]:.4f}") 
         
+     
         debug_log(f"Cirrus Cloud - Upw: {upw_curr}, Dnw: {dnw_curr}")
         
-        # Detect PPO crossovers (PPO is the entry signal)
+        # Detect PPO crossovers
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         
         # Detect PPO zero-line crossovers
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
+    
         ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
         ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
         ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
@@ -441,15 +468,17 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_below_020 = ppo_curr < 0.20
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
+ 
         ppo_below_signal = ppo_curr < ppo_signal_curr
         
-        # MACD conditions (MACD is the primary trend filter)
+        # MACD conditions
         macd_above_signal = macd_curr > macd_signal_curr
         macd_below_signal = macd_curr < macd_signal_curr
         
-        # RMA conditions (RMA/Cirrus provide confluence filters)
+        # RMA conditions
         close_above_rma50 = close_curr > rma50_curr
         close_below_rma50 = close_curr < rma50_curr
+     
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
@@ -467,34 +496,37 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"  PPO > -0.20: {ppo_above_minus020}")
         debug_log(f"  PPO > Signal: {ppo_above_signal}")
         debug_log(f"  MACD > Signal: {macd_above_signal}")
+     
         debug_log(f"  Close > RMA50: {close_above_rma50}")
         debug_log(f"  Close > RMA200: {close_above_rma200}")
-        debug_log(f"  Upw (Cirrus): {upw_curr}")
-        debug_log(f"  Dnw (Cirrus): {dnw_curr}")
+        debug_log(f"  Upw (Cirrus): {upw_curr}") # Now means GREEN
+        debug_log(f"  Dnw (Cirrus): {dnw_curr}") # Now means RED
         
-        current_state = None # Holds the new state if an alert fires
+        current_state = None
+        
+        # Get IST time in correct format
+       
         ist = pytz.timezone('Asia/Kolkata')
         current_dt = datetime.now(ist)
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
         
-        # ==========================================================
-        # 1. ALERT LOGIC: Check for New Signals
-        # ==========================================================
-        
         # BUY: PPO crosses up AND PPO < 0.20 AND MACD > Signal AND Close > RMA50 AND Close > RMA200 AND Cirrus Cloud is GREEN (Upw)
         if ppo_cross_up and ppo_below_020 and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
+   
             current_state = "buy"
             debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy":
                 message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
             else:
+  
                 debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
         
         # SELL: PPO crosses down AND PPO > -0.20 AND MACD < Signal AND Close < RMA50 AND Close < RMA200 AND Cirrus Cloud is RED (Dnw)
         elif ppo_cross_down and ppo_above_minus020 and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "sell"
+     
             debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "sell":
                 message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
@@ -502,7 +534,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
         
-        # LONG ZERO: PPO > Signal AND PPO crosses above 0 AND MACD > Signal AND RMAs/Cirrus Confluence (Trend Follow after Retracement)
+        # LONG: PPO > Signal AND PPO crosses above 0 AND Cirrus Cloud is GREEN (Upw)
         elif ppo_cross_above_zero and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_zero"
             debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
@@ -512,7 +544,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
         
-        # LONG 0.11: PPO > Signal AND PPO crosses above 0.11 AND MACD > Signal AND RMAs/Cirrus Confluence
+        # LONG: PPO > Signal AND 
+        # PPO crosses above 0.11 AND Cirrus Cloud is GREEN (Upw)
         elif ppo_cross_above_011 and ppo_above_signal and macd_above_signal and close_above_rma50 and close_above_rma200 and upw_curr:
             current_state = "long_011"
             debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
@@ -522,72 +555,37 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT ZERO: PPO < Signal AND PPO crosses below 0 AND MACD < Signal AND RMAs/Cirrus Confluence
+        # SHORT: PPO < Signal AND PPO crosses below 0 AND Cirrus Cloud is RED (Dnw)
         elif ppo_cross_below_zero and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_zero"
             debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_zero":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
+         
             else:
                 debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
         
-        # SHORT -0.11: PPO < Signal AND PPO crosses below -0.11 AND MACD < Signal AND RMAs/Cirrus Confluence
+        # SHORT: PPO < Signal AND PPO crosses below -0.11 AND Cirrus Cloud is RED (Dnw)
         elif ppo_cross_below_minus011 and ppo_below_signal and macd_below_signal and close_below_rma50 and close_below_rma200 and dnw_curr:
             current_state = "short_011"
+          
             debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_011":
                 message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
                 send_telegram_alert(message)
             else:
                 debug_log(f"SHORT (-0.11) already alerted for {pair_name}, skipping duplicate")
-        
-        # If no alert fired, current_state is None
-        
-        # ==========================================================
-        # 2. STATE RESET LOGIC: Enable New Pullback Alerts
-        # ==========================================================
-        
-        # Reset any LONG/BUY state if PPO crosses DOWN, but the MACD/RMA trend is still bullish.
-        # This signals the start of a pullback, clearing the previous alert state.
-        if last_alerts.get(pair_name) in ["buy", "long_zero", "long_011"]:
-            # Check for PPO cross down (the start of the pullback)
-            if ppo_cross_down:
-                # Confirm MACD and RMAs are still bullish (trend is still UP)
-                if macd_above_signal and close_above_rma50 and close_above_rma200:
-                    current_state = "long_reset" # Temporary placeholder state
-                    debug_log(f"🟢 LONG state reset for {pair_name} due to PPO cross down/pullback start.")
-
-        # Reset any SHORT/SELL state if PPO crosses UP, but the MACD/RMA trend is still bearish.
-        # This signals the start of a bounce, clearing the previous alert state.
-        elif last_alerts.get(pair_name) in ["sell", "short_zero", "short_011"]:
-            # Check for PPO cross up (the start of the bounce)
-            if ppo_cross_up:
-                # Confirm MACD and RMAs are still bearish (trend is still DOWN)
-                if macd_below_signal and close_below_rma50 and close_below_rma200:
-                    current_state = "short_reset" # Temporary placeholder state
-                    debug_log(f"🔴 SHORT state reset for {pair_name} due to PPO cross up/bounce start.")
-
-        
-        # Final return logic: If a signal fired, return the signal name. If a reset fired, return None to clear the state.
-        if current_state and ("reset" in current_state):
-            # Do not save "reset" states, which effectively removes the previous signal state from the JSON file
-            return None 
-            
-        elif current_state:
-            # Save the new "buy", "sell", "long_zero", etc. state
-            return current_state
-            
         else:
             debug_log(f"No signal conditions met for {pair_name}")
-            # If no signal or reset fired, the state remains what it was (e.g., "buy")
-            # This is important to ensure the trend state doesn't get cleared between checks
-            return last_alerts.get(pair_name) # Return previous state if no change
-
+        
+        return current_state
+        
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             import traceback
+          
             traceback.print_exc()
         return None
 
@@ -604,6 +602,7 @@ def main():
     if SEND_TEST_MESSAGE:
         send_test_message()
     
+ 
     # Load previous state
     last_alerts = load_state()
     
@@ -622,40 +621,36 @@ def main():
     # Check all pairs in parallel
     alerts_sent = 0
     
-    # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
+    # Use a ThreadPoolExecutor to run all 'check_pair' 
+    # calls in parallel.
     with ThreadPoolExecutor(max_workers=10) as executor:
         
         future_to_pair = {}
         
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Pass the last_alerts state dictionary to the thread
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
+                
                 future_to_pair[future] = pair_name
-
-        new_alerts_state = {} # New dictionary to hold the state for saving
 
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
             try:
-                # The result is the new state (e.g., "buy") or None (if state was reset)
-                result_state = future.result() 
-                
-                # Check if the result state is a valid signal state
-                if result_state:
-                    new_alerts_state[pair_name] = result_state
-                # If result_state is None, it was a reset, so we don't add it to new_alerts_state, 
-                # effectively removing the old alert state from the pair in the JSON file.
-                
+                new_state = future.result() 
+                if new_state:
+                    last_alerts[pair_name] = new_state
+   
+                    alerts_sent += 1
             except Exception as e:
                 print(f"Error processing {pair_name} in thread: {e}")
                 if DEBUG_MODE:
                     import traceback
+       
                     traceback.print_exc()
                 continue
             
-    # Save the new state map for next run (only contains active signals)
-    save_state(new_alerts_state)
+    # Save state for next run
+    save_state(last_alerts)
     
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
@@ -664,13 +659,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
-
-# Delta Exchange API
-DELTA_API_BASE = "https://api.delta.exchange"
-
-# Trading pairs to monitor
-PAIRS = { as (f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
-            
-             
-            
