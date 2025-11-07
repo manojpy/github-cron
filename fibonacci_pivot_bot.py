@@ -55,10 +55,9 @@ X3 = 15
 X4 = 5
 
 # Volume and Pivot settings (New/Specific)
-PIVOT_LOOKBACK_PERIOD = 15 # Lookback in days for 
-daily high/low/close
+# --- SYNTAX FIX APPLIED HERE ---
+PIVOT_LOOKBACK_PERIOD = 15 # Lookback in days for daily high/low/close
 
-# 
 STATE_FILE = 'alert_state.json' 
 
 # ============ UTILITY FUNCTIONS (Extracted from macd_bot.txt) ============
@@ -300,9 +299,9 @@ def calculate_cirrus_cloud(df):
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     
-    # [span_0](start_span)Upw (Green) is True when filter 1 line is BELOW filter 2 line.[span_0](end_span)
+    # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
     upw = filtx1 < filtx12 
-    # [span_1](start_span)Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.[span_1](end_span)
+    # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
     dnw = filtx1 > filtx12 
     
     return upw, dnw, filtx1, filtx12 
@@ -317,7 +316,7 @@ def get_previous_day_ohlc(product_id, days_back_limit=15):
     if df_daily is None or len(df_daily) < 2:
         return None
     
-    # The last row is often the current, incomplete day. [span_2](start_span)We need the one before it.[span_2](end_span)
+    # The last row is often the current, incomplete day. We need the one before it.
     prev_day_candle = df_daily.iloc[-2]
     
     return {
@@ -347,7 +346,6 @@ def calculate_fibonacci_pivots(h, l, c):
         'S1': s1, 'S2': s2, 'S3': s3
     }
     
-# Removed: calculate_volume_sma function
 
 def check_pair(pair_name, pair_info, last_alerts):
     """Check Fibonacci Pivot conditions for a pair"""
@@ -363,7 +361,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
             print(f"Skipping {pair_name}: Failed to get previous day OHLC data.")
-            return last_alerts.get(pair_name) # Return current state to maintain lock
+            return last_alerts.get(pair_name) 
           
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
@@ -378,7 +376,7 @@ def check_pair(pair_name, pair_info, last_alerts):
   
         if df_15m is None or len(df_15m) < min_required:
             print(f"Not enough 15m data for {pair_name}.")
-            return last_alerts.get(pair_name) # Return current state to maintain lock
+            return last_alerts.get(pair_name) 
 
         # Calculate indicators
         # Note: We use .iloc[-2] for all indicators and candle data to check the last fully CLOSED 15m candle.
@@ -386,13 +384,12 @@ def check_pair(pair_name, pair_info, last_alerts):
         macd, macd_signal = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m) # Upw is Green, Dnw is Red
 
-        # [span_3](start_span)Get values for the last closed 15m candle (index -2)[span_3](end_span)
+        # Get values for the last closed 15m candle (index -2)
         open_prev = df_15m['open'].iloc[-2]
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
         low_prev = df_15m['low'].iloc[-2]
  
-        # Removed: volume_prev and vol_sma_prev
         
         ppo_curr = ppo.iloc[-2] 
         macd_curr = macd.iloc[-2]
@@ -406,27 +403,25 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 3. Define Alert Conditions ---
         
         # Candle Characteristics
-        [span_4](start_span)is_green = close_prev > open_prev[span_4](end_span)
-        [span_5](start_span)is_red = close_prev < open_prev[span_5](end_span)
-        
-        # Removed: vol_check
+        is_green = close_prev > open_prev
+        is_red = close_prev < open_prev
         
         # Wick Checks
         candle_range = high_prev - low_prev
     
-        [span_6](start_span)if candle_range <= 0:[span_6](end_span)
+        if candle_range <= 0:
             debug_log("Candle range is zero or negative, skipping wick checks.")
             upper_wick_check = False
             lower_wick_check = False
         else:
         
-            [span_7](start_span)upper_wick_length = high_prev - max(open_prev, close_prev)[span_7](end_span)
-            [span_8](start_span)lower_wick_length = min(open_prev, close_prev) - low_prev[span_8](end_span)
+            upper_wick_length = high_prev - max(open_prev, close_prev)
+            lower_wick_length = min(open_prev, close_prev) - low_prev
             
             # Check 6 (Long): Upper wick < 20% of total candle length 
-            [span_9](start_span)upper_wick_check = (upper_wick_length / candle_range) < 0.20[span_9](end_span)
+            upper_wick_check = (upper_wick_length / candle_range) < 0.20 
             # Check 6 (Short): Lower wick < 20% of total candle length 
-            [span_10](start_span)lower_wick_check = (lower_wick_length / candle_range) < 0.20[span_10](end_span)
+            lower_wick_check = (lower_wick_length / candle_range) < 0.20 
         
         # --- 4. Pivot Crossover Logic ---
         
@@ -436,9 +431,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         long_crossover_line = False
         long_crossover_name = None
  
-        [span_11](start_span)if is_green:[span_11](end_span)
+        if is_green:
             for name, line in long_pivot_lines.items():
-                # [span_12](start_span)Candle opens below the pivot line AND closes above the pivot line[span_12](end_span)
+                # Candle opens below the pivot line AND closes above the pivot line
                 if open_prev <= line and close_prev > line: 
                     long_crossover_line = line
                     long_crossover_name = name
@@ -446,12 +441,12 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         # SHORT Crossover Check: Red candle crosses and closes BELOW a pivot line (P, S1, S2, R1, R2)
         short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 
-            [span_13](start_span)'R1': pivots['R1'], 'R2': pivots['R2']}[span_13](end_span)
+            'R1': pivots['R1'], 'R2': pivots['R2']}
         short_crossover_line = False
         short_crossover_name = None
-        [span_14](start_span)if is_red:[span_14](end_span)
+        if is_red:
             for name, line in short_pivot_lines.items():
-                # [span_15](start_span)Candle opens above the pivot line AND closes below the pivot line[span_15](end_span)
+                # Candle opens above the pivot line AND closes below the pivot line
                 if open_prev >= line and close_prev < line:
                     short_crossover_line = line
                     short_crossover_name = name
@@ -460,66 +455,65 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 5. Signal Detection and State Management ---
         
      
-        [span_16](start_span)current_signal = None[span_16](end_span)
-        [span_17](start_span)updated_state = last_alerts.get(pair_name) # Start with the current saved state[span_17](end_span)
+        current_signal = None
+        updated_state = last_alerts.get(pair_name) 
         
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
         
         # === ADVANCED STATE RESET LOGIC ===
-        [span_18](start_span)if updated_state and updated_state.startswith('fib_'):[span_18](end_span)
+        if updated_state and updated_state.startswith('fib_'):
     
             try:
                 # updated_state format is "fib_long_R1"
-                [span_19](start_span)alert_type, pivot_name = updated_state.split('_')[-2:][span_19](end_span)
+                alert_type, pivot_name = updated_state.split('_')[-2:]
                 pivot_value = pivots.get(pivot_name)
                 
            
-                [span_20](start_span)if pivot_value is not None:[span_20](end_span)
+                if pivot_value is not None:
                     
                     if alert_type == "long":
-                        # [span_21](start_span)Exclude R3 from reset logic[span_21](end_span)
+                        # Exclude R3 from reset logic
                         if pivot_name != 'R3':
-                            # [span_22](start_span)Reset if price closes BELOW the line that triggered the original alert[span_22](end_span)
+                            # Reset if price closes BELOW the line that triggered the original alert
                             if close_prev < pivot_value:
                                 updated_state = None
                                 debug_log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
                  
                     elif alert_type == "short":
-                        # [span_23](start_span)Exclude S3 from reset logic[span_23](end_span)
-                        [span_24](start_span)if pivot_name != 'S3':[span_24](end_span)
-                            # [span_25](start_span)Reset if price closes ABOVE the line that triggered the original alert[span_25](end_span)
+                        # Exclude S3 from reset logic
+                        if pivot_name != 'S3':
+                            # Reset if price closes ABOVE the line that triggered the original alert
                             if close_prev > pivot_value:
-                                [span_26](start_span)updated_state = None[span_26](end_span)
+                                updated_state = None
                                 debug_log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
             except Exception as e:
                 debug_log(f"Error parsing saved state {updated_state}: {e}")
-                # [span_27](start_span)If parsing fails, just keep the state as is.[span_27](end_span)
-        
+                
         # 🟢 FINAL LONG SIGNAL CHECK
-        # ADDED MUTUAL EXCLUSION CHECK: (not dnw_curr)
+        # --- MUTUAL EXCLUSION FIX APPLIED HERE: (not dnw_curr) ---
         if (upw_curr and (not dnw_curr) and 
             (macd_curr > macd_signal_curr) and 
             (ppo_curr < 0.20) and 
             long_crossover_line and 
-            upper_wick_check): # vol_check removed
+            upper_wick_check): 
             
       
             # The current state to save if an alert is sent
             current_signal = f"fib_long_{long_crossover_name}"
             debug_log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             
-            # [span_28](start_span)Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)[span_28](end_span)
+            # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
                     f"🟢 {pair_name} - FIB LONG\n"
                     f"Crossed & Closed Above {long_crossover_name} (${long_crossover_line:,.2f})\n"
-                    [span_29](start_span)f"PPO: {ppo_curr:.2f}\n"[span_29](end_span)
+                    f"PPO: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
-                [span_30](start_span)send_telegram_alert(message)[span_30](end_span)
+                send_telegram_alert(message)
                 
           
             # Update the state to the new signal string
@@ -527,51 +521,50 @@ def check_pair(pair_name, pair_info, last_alerts):
             
 
         # 🔴 FINAL SHORT SIGNAL CHECK
-        # ADDED MUTUAL EXCLUSION CHECK: (not upw_curr)
+        # --- MUTUAL EXCLUSION FIX APPLIED HERE: (not upw_curr) ---
         elif (dnw_curr and (not upw_curr) and 
               (macd_curr < macd_signal_curr) and 
               (ppo_curr > -0.20) and 
               short_crossover_line and 
-              lower_wick_check): # vol_check removed
+              lower_wick_check): 
               
-            # [span_31](start_span)The current state to save if an alert is sent[span_31](end_span)
+            # The current state to save if an alert is sent
             current_signal = f"fib_short_{short_crossover_name}"
         
             debug_log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             
-            # [span_32](start_span)Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)[span_32](end_span)
+            # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
                     f"🔴 {pair_name} - FIB SHORT\n"
                     f"Crossed & Closed Below {short_crossover_name} (${short_crossover_line:,.2f})\n"
-                    [span_33](start_span)f"PPO: {ppo_curr:.2f}\n"[span_33](end_span)
+                    f"PPO: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
                 
   
-            # [span_34](start_span)Update the state to the new signal string[span_34](end_span)
+            # Update the state to the new signal string
             updated_state = current_signal
                 
     
         else:
-            [span_35](start_span)debug_log(f"No Fibonacci Pivot signal conditions met for {pair_name}")[span_35](end_span)
+            debug_log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         
         # Return the final state 
-        [span_36](start_span)return updated_state[span_36](end_span)
+        return updated_state
       
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
-  
             import traceback
             traceback.print_exc()
-        return last_alerts.get(pair_name) # Return last good state on unexpected error
+        return last_alerts.get(pair_name) 
 
 def main():
  
-    [span_37](start_span)"""Main function - runs once per GitHub Actions execution"""[span_37](end_span)
+    """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
@@ -585,8 +578,8 @@ def main():
         send_test_message()
 
     # === APPLIED RESET STATE LOGIC ===
-    [span_38](start_span)if RESET_STATE and os.path.exists(STATE_FILE):[span_38](end_span)
-        [span_39](start_span)print(f"ATTENTION: RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")[span_39](end_span)
+    if RESET_STATE and os.path.exists(STATE_FILE):
+        print(f"ATTENTION: RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
     # =================================
     
@@ -599,7 +592,7 @@ def main():
         return
     
     found_count = sum(1 for v in PAIRS.values() if v is not None)
-    [span_40](start_span)print(f"✓ Monitoring {found_count} pairs")[span_40](end_span)
+    print(f"✓ Monitoring {found_count} pairs")
   
     
     if found_count == 0:
@@ -612,14 +605,14 @@ def main():
     # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
     with ThreadPoolExecutor(max_workers=10) as executor:
         
-        [span_41](start_span)future_to_pair = {}[span_41](end_span)
+        future_to_pair = {}
        
  
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
                 # Pass a copy of last_alerts for thread safety, though check_pair now only 
                 # reads from it at the start and returns the new state.
-                [span_42](start_span)future = executor.submit(check_pair, pair_name, pair_info, last_alerts.copy())[span_42](end_span) 
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts.copy()) 
                 
                 future_to_pair[future] = pair_name
 
@@ -627,15 +620,15 @@ def main():
             pair_name = future_to_pair[future]
             try:
                 # new_state can be "fib_long_R1" (new signal) 
-                [span_43](start_span)new_state = future.result()[span_43](end_span)
+                new_state = future.result() 
                 
                 # Always save the result, even if it's None to clear a previous state.
-                # [span_44](start_span)Only increment updates if the state has changed.[span_44](end_span)
+                # Only increment updates if the state has changed.
                 if new_state != last_alerts.get(pair_name):
                     last_alerts[pair_name] = new_state
                     updates_processed += 1
             except Exception as e:
-                [span_45](start_span)print(f"Error processing {pair_name} in thread: {e}")[span_45](end_span)
+                print(f"Error processing {pair_name} in thread: {e}")
         
  
                 if DEBUG_MODE:
@@ -649,7 +642,7 @@ def main():
     
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
-    [span_46](start_span)print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")[span_46](end_span)
+    print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
