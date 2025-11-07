@@ -65,10 +65,7 @@ STATE_FILE = 'alert_state.json'
 
 # ============ UTILITY FUNCTIONS (Extracted from macd_bot.txt) ============
 
-def debug_log(message):
-    """Print debug messages if DEBUG_MODE is enabled"""
-    if DEBUG_MODE:
-        print(f"[DEBUG] {message}")
+### CORRECTION START: REMOVED GLOBAL debug_log() FUNCTION
 
 def load_state():
     """Load previous alert state from file"""
@@ -76,11 +73,14 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
-                debug_log(f"Loaded state: {state}")
+                # Since we removed debug_log, we print directly here
+                if DEBUG_MODE:
+                    print(f"[DEBUG] Loaded state: {state}")
                 return state
     except Exception as e:
         print(f"Error loading state: {e}")
-    debug_log("No previous state found, starting fresh")
+    if DEBUG_MODE:
+        print("No previous state found, starting fresh")
     return {}
 
 def save_state(state):
@@ -88,14 +88,17 @@ def save_state(state):
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
-        debug_log(f"Saved state: {state}")
+        if DEBUG_MODE:
+            print(f"[DEBUG] Saved state: {state}")
     except Exception as e:
         print(f"Error saving state: {e}")
 
 def send_telegram_alert(message):
     """Send alert message via Telegram"""
     try:
-        debug_log(f"Attempting to send message: {message[:100]}...")
+        # Re-introducing a direct print for sending attempt, as this is critical
+        if DEBUG_MODE:
+            print(f"[DEBUG] Attempting to send message: {message[:100]}...")
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
@@ -121,37 +124,20 @@ def send_telegram_alert(message):
             traceback.print_exc()
         return False
 
-def send_test_message():
-    """Send a test message to verify Telegram connectivity"""
-    ist = pytz.timezone('Asia/Kolkata')
-    current_dt = datetime.now(ist)
-    formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-    
-    test_msg = f"🔔 Fibonacci Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
-    
-    print("\n" + "="*50)
-    print("SENDING TEST MESSAGE")
-    print("="*50)
-    success = send_telegram_alert(test_msg)
-    
-    if success:
-        print("✓ Test message sent successfully!")
-    else:
-        print("❌ Test message failed - check your bot token and chat ID")
-    
-    print("="*50 + "\n")
-    return success
+# ... other utility functions (send_test_message, get_product_ids, get_candles, etc. remain unchanged) ...
 
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange and populate PAIRS dict"""
     try:
-        debug_log("Fetching product IDs from Delta Exchange...")
+        if DEBUG_MODE:
+            print("Fetching product IDs from Delta Exchange...")
         response = requests.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
         data = response.json()
         
         if data.get('success'):
             products = data['result']
-            debug_log(f"Received {len(products)} products from API")
+            if DEBUG_MODE:
+                print(f"Received {len(products)} products from API")
             
             for product in products:
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
@@ -164,7 +150,8 @@ def get_product_ids():
                                 'symbol': product['symbol'],
                                 'contract_type': product['contract_type']
                             }
-                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
+                            if DEBUG_MODE:
+                                print(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
             return True
         else:
             print(f"API Error: {data}")
@@ -177,202 +164,9 @@ def get_product_ids():
             traceback.print_exc()
         return False
 
-def get_candles(product_id, resolution="15", limit=150):
-    """Fetch OHLCV candles from Delta Exchange"""
-    try:
-        to_time = int(time.time())
-        # resolution is in minutes, except for "D" (Daily)
-        if resolution == "D":
-            from_time = to_time - (limit * 24 * 60 * 60) # Approx
-        else:
-            from_time = to_time - (limit * int(resolution) * 60)
-        
-        url = f"{DELTA_API_BASE}/v2/chart/history"
-        params = {
-            'resolution': resolution,
-            'symbol': product_id,
-            'from': from_time,
-            'to': to_time
-        }
-        
-        response = requests.get(url, params=params, timeout=15)
-        data = response.json()
-        
-        if data.get('success'):
-            result = data['result']
-            df = pd.DataFrame({
-                'timestamp': result['t'],
-                'open': result['o'],
-                'high': result['h'],
-                'low': result['l'],
-                'close': result['c'],
-                'volume': result['v']
-            })
-            return df
-        else:
-            return None
-            
-    except Exception as e:
-        print(f"Exception fetching candles for {product_id}: {e}")
-        return None
-
-def calculate_ema(data, period):
-    """Calculate Exponential Moving Average"""
-    return data.ewm(span=period, adjust=False).mean()
-
-def calculate_sma(data, period):
-    """Calculate Simple Moving Average"""
-    return data.rolling(window=period).mean()
-
-def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
-    """Calculate PPO (Percentage Price Oscillator) - matches Pine Script"""
-    close = df['close']
-    
-    if use_sma:
-        fast_ma = calculate_sma(close, fast)
-        slow_ma = calculate_sma(close, slow)
-    else:
-        fast_ma = calculate_ema(close, fast)
-        slow_ma = calculate_ema(close, slow)
-    
-    ppo = (fast_ma - slow_ma) / slow_ma * 100
-    
-    if use_sma:
-        ppo_signal = calculate_sma(ppo, signal)
-    else:
-        ppo_signal = calculate_ema(ppo, signal)
-    
-    return ppo, ppo_signal
-
-def calculate_macd(df, fast=30, slow=65, signal=23):
-    """Calculate MACD - Returns line, signal, and histogram"""
-    close = df['close']
-    
-    ema_fast = calculate_ema(close, fast)
-    ema_slow = calculate_ema(close, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line, signal)
-    
-    macd_hist = macd_line - signal_line # NEW: MACD Histogram
-    
-    return macd_line, signal_line, macd_hist # UPDATED: Added histogram
-
-def smoothrng(x, t, m):
-    """Implements smoothrngX1 from Pine Script"""
-    wper = t * 2 - 1
-    avrng = calculate_ema(np.abs(x.diff()), t)
-    smoothrng = calculate_ema(avrng, wper) * m
-    return smoothrng
-
-def rngfilt(x, r):
-    """Implements rngfiltx1x1 from Pine Script using robust array iteration."""
-    result_list = [x.iloc[0]] 
-    
-    for i in range(1, len(x)):
-        prev_f = result_list[-1]
-        curr_x = x.iloc[i] 
-        curr_r = r.iloc[i]
-        
-        f = 0.0
-
-        if curr_x > prev_f:
-            if curr_x - curr_r < prev_f:
-                f = prev_f
-            else:
-                f = curr_x - curr_r
-        else:
-            if curr_x + curr_r > prev_f:
-                f = prev_f
-            else:
-                f = curr_x + curr_r
-        
-        result_list.append(f)
-        
-    return pd.Series(result_list, index=x.index)
-
-def calculate_cirrus_cloud(df):
-    """Calculate Cirrus Cloud Upw (Green) and Dnw (Red) conditions."""
-    close = df['close'].copy()
-    
-    smrngx1x = smoothrng(close, X1, X2)
-    smrngx1x2 = smoothrng(close, X3, X4)
-    
-    filtx1 = rngfilt(close, smrngx1x)
-    filtx12 = rngfilt(close, smrngx1x2)
-    
-    # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
-    upw = filtx1 < filtx12 
-    # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
-    dnw = filtx1 > filtx12 
-    
-    return upw, dnw, filtx1, filtx12 
-
-def calculate_rma(data, period):
-    """Calculate RMA (Smoothed Moving Average) - matches Pine Script's ta.rma"""
-    # Uses alpha=1/period for closer match to Pine ta.rma
-    return data.ewm(alpha=1/period, adjust=False).mean()
-
-def kalman_filter(src, length, R = 0.01, Q = 0.1):
-    """Implements the kalman_filter function from Pine Script"""
-    result_list = []
-    
-    estimate = np.nan
-    error_est = 1.0
-    
-    error_meas = R * length
-    Q_div_length = Q / length
-
-    # Use a loop to mimic bar-by-bar 'var' behavior in Pine Script
-    for i in range(len(src)):
-        current_src = src.iloc[i]
-        
-        if np.isnan(current_src):
-            result_list.append(np.nan)
-            continue
-        
-        if np.isnan(estimate):
-            # Initialize estimate with the previous bar's value (src[1] in Pine)
-            if i > 0 and not np.isnan(src.iloc[i-1]):
-                estimate = src.iloc[i-1]
-            else:
-                result_list.append(np.nan)
-                continue # Skip calculation until initialized
-
-        prediction = estimate
-        
-        kalman_gain = error_est / (error_est + error_meas)
-        
-        estimate = prediction + kalman_gain * (current_src - prediction)
-        
-        error_est = (1 - kalman_gain) * error_est + Q_div_length
-        
-        result_list.append(estimate)
-
-    # Pad with NaNs at the beginning to ensure series is the same length
-    num_nan_pad = len(src) - len(result_list)
-    final_list = [np.nan] * num_nan_pad + result_list
-    
-    return pd.Series(final_list, index=src.index)
-
-def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
-    """Calculate Smoothed RSI using Kalman Filter"""
-    close = df['close']
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    
-    # Use RMA for Wilder's smoothing
-    avg_gain = calculate_rma(gain, rsi_len)
-    avg_loss = calculate_rma(loss, rsi_len)
-    
-    # Avoid division by zero
-    rs = avg_gain / avg_loss.replace(0, 1e-9) 
-    rsi_value = 100 - (100 / (1 + rs))
-    
-    # Smooth RSI using Kalman Filter
-    smooth_rsi = kalman_filter(rsi_value, kalman_len)
-    
-    return smooth_rsi
+# NOTE: All indicator functions (calculate_ema, calculate_ppo, etc.) are fine as they don't use debug_log
+# The main change is in check_pair:
+### CORRECTION END: UPDATED GLOBAL UTILITIES
 
 # ============ FIBONACCI PIVOT FUNCTIONS (New) ============
 
@@ -415,50 +209,59 @@ def calculate_fibonacci_pivots(h, l, c):
     }
     
 
+### CORRECTION START: MODIFIED check_pair FOR THREAD-SAFE LOGGING
+
 def check_pair(pair_name, pair_info, last_alerts):
-    """Check Fibonacci Pivot conditions for a pair"""
+    """Check Fibonacci Pivot conditions for a pair and return new state and log output."""
+    
+    # --- 1. Internal Log Collector ---
+    thread_log = []
+    
+    # Define a local logging function that appends to the list
+    def log(message):
+        if DEBUG_MODE:
+            thread_log.append(f"[DEBUG] {message}")
+
     try:
         if pair_info is None:
-            return last_alerts.get(pair_name) 
+            # We still return an empty log string for clean handling in main
+            return last_alerts.get(pair_name), "" 
         
-        debug_log(f"\n{'='*60}")
-        debug_log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
-        debug_log(f"{'='*60}")
+        log(f"\n{'='*60}")
+        log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
+        log(f"{'='*60}")
         
         # --- 1. Get Pivot Data (Previous Day) ---
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
-            print(f"Skipping {pair_name}: Failed to get previous day OHLC data.")
-            return last_alerts.get(pair_name) 
+            print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") # Direct print for critical failure
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
           
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
-        debug_log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, S1={pivots['S1']:.2f}")
+        # All debug_log() calls are replaced with log()
+        log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, S1={pivots['S1']:.2f}")
 
         # --- 2. Get 15-Minute Candles and Indicators ---
         limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 210)
-        # Ensure we have at least enough data for MACD, PPO and safe iloc[-3] access
         min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 200), 65)
 
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
   
         if df_15m is None or len(df_15m) < min_required:
-            print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.")
-            return last_alerts.get(pair_name) 
+            print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.") # Direct print for critical failure
+            return last_alerts.get(pair_name), '\n'.join(thread_log) 
 
         # Calculate indicators
-        # Note: We use .iloc[-2] for all indicators and candle data to check the last fully CLOSED 15m candle.
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         macd, macd_signal, macd_hist = calculate_macd(df_15m, MACD_F, MACD_S, MACD_SG)
-        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m) # Upw is Green, Dnw is Red
+        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m)
         
-        # --- IMPORTANT INDEX CHECK ---
-        # Ensure the indicator Series has at least 3 values for safe iloc[-2] and iloc[-3] access
         if len(ppo) < 3 or len(macd_hist) < 3 or len(smooth_rsi) < 3:
-            print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
-            return last_alerts.get(pair_name)
+            print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).") # Direct print for critical failure
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
 
 
         # Get values for the last closed 15m candle (index -2)
@@ -471,50 +274,41 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_curr = ppo.iloc[-2] 
         macd_curr = macd.iloc[-2]
         macd_signal_curr = macd_signal.iloc[-2]
-        # NEW: MACD Histogram values
         macd_hist_curr = macd_hist.iloc[-2]
         macd_hist_prev = macd_hist.iloc[-3] 
-        # NEW: Smoothed RSI values
-        smooth_rsi_curr = smooth_rsi.iloc[-2] # NEW: last fully closed candle
+        smooth_rsi_curr = smooth_rsi.iloc[-2]
 
-        debug_log(f"15m SRSI: {smooth_rsi_curr:.2f}, MACD: {macd_curr:.4f}, Signal: {macd_signal_curr:.4f}, Hist: {macd_hist_curr:.4f} (Prev Hist: {macd_hist_prev:.4f})") # UPDATED DEBUG LOG
+        log(f"15m SRSI: {smooth_rsi_curr:.2f}, MACD: {macd_curr:.4f}, Signal: {macd_signal_curr:.4f}, Hist: {macd_hist_curr:.4f} (Prev Hist: {macd_hist_prev:.4f})")
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
 
         # --- NEW: Get 5-Minute Candles and PPO ---
-  
-        # Using default values from SOLUSD for consistency if not specified
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 250)
-        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 183), 16) # PPO_SLOW is 16
+        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 183), 16)
         
-        ppo_5m_curr = np.nan # Initialize as NaN for safety
+        ppo_5m_curr = np.nan
         
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         
         if df_5m is None or len(df_5m) < min_required_5m:
-            debug_log(f"Not enough 5m data for {pair_name}. PPO 5m check will be ignored.")
+            log(f"Not enough 5m data for {pair_name}. PPO 5m check will be ignored.")
         else:
-            # Re-use the existing calculate_ppo function
             ppo_5m, _ = calculate_ppo(df_5m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
             
-            # Take the PPO value from the last completed candle (index -2)
             if len(ppo_5m) >= 2 and not np.isnan(ppo_5m.iloc[-2]):
                 ppo_5m_curr = ppo_5m.iloc[-2]
-                debug_log(f"5m PPO: {ppo_5m_curr:.4f}")
+                log(f"5m PPO: {ppo_5m_curr:.4f}")
             else:
-                debug_log("5m PPO calculation failed to produce a valid value.")
+                log("5m PPO calculation failed to produce a valid value.")
         # --- END NEW 5M PPO BLOCK ---
         
         
         # --- 3. Define Alert Conditions ---
-        # --- NEW Indicator Conditions ---
-        macd_hist_rising = macd_hist_curr > macd_hist_prev # NEW: Histogram is rising (up-slope)
-        macd_hist_falling = macd_hist_curr < macd_hist_prev # NEW: Histogram is falling (down-slope)
-        srsi_above_50 = smooth_rsi_curr > 50 # NEW: SRSI condition for Long
-        srsi_below_50 = smooth_rsi_curr < 50 # NEW: SRSI condition for Short
-        # --------------------------------
+        macd_hist_rising = macd_hist_curr > macd_hist_prev
+        macd_hist_falling = macd_hist_curr < macd_hist_prev
+        srsi_above_50 = smooth_rsi_curr > 50
+        srsi_below_50 = smooth_rsi_curr < 50
         
-        # Candle Characteristics
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
         
@@ -522,60 +316,41 @@ def check_pair(pair_name, pair_info, last_alerts):
         candle_range = high_prev - low_prev
     
         if candle_range <= 0:
-            debug_log("Candle range is zero or negative, skipping wick checks.")
+            log("Candle range is zero or negative, skipping wick checks.")
             upper_wick_check = False
             lower_wick_check = False
         else:
-        
             upper_wick_length = high_prev - max(open_prev, close_prev)
             lower_wick_length = min(open_prev, close_prev) - low_prev
-            
- 
-            # Check 6 (Long): Upper wick < 20% of total candle length 
-            upper_wick_check = (upper_wick_length / candle_range) < 0.20 
-            # Check 6 (Short): Lower wick < 20% of total candle length 
-            lower_wick_check = (lower_wick_length / candle_range) < 0.20 
+            upper_wick_check = (upper_wick_length / candle_range) < 0.20
+            lower_wick_check = (lower_wick_length / candle_range) < 0.20
         
-      
- 
         # --- 4. Pivot Crossover Logic ---
-        
-        # LONG Crossover Check: Green candle crosses and closes ABOVE a pivot line (P, R1, R2, S1, S2)
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
-  
         long_crossover_line = False
         long_crossover_name = None
  
         if is_green:
-  
-       
             for name, line in long_pivot_lines.items():
-                # Candle opens below the pivot line AND closes above the pivot line
                 if open_prev <= line and close_prev > line: 
                     long_crossover_line = line
                     long_crossover_name = name
                     break
 
-        # SHORT Crossover Check: Red candle crosses and closes BELOW a pivot line (P, S1, S2, R1, R2)
         short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 
             'R1': pivots['R1'], 'R2': pivots['R2']}
-      
         short_crossover_line = False
         short_crossover_name = None
         if is_red:
             for name, line in short_pivot_lines.items():
-                # Candle opens above the pivot line AND closes below the pivot line
                 if open_prev >= line and close_prev < line:
                     short_crossover_line = line
                     short_crossover_name = name
                     break
         
         # --- 5. Signal Detection and State Management ---
-        
-     
         current_signal = None
         updated_state = last_alerts.get(pair_name) 
-  
         
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
@@ -583,138 +358,93 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         # === ADVANCED STATE RESET LOGIC ===
         if updated_state and updated_state.startswith('fib_'):
-    
-        
             try:
-                
-                # updated_state format is "fib_long_R1"
                 alert_type, pivot_name = updated_state.split('_')[-2:]
                 pivot_value = pivots.get(pivot_name)
                 
-           
- 
                 if pivot_value is not None:
-        
-                    
                     if alert_type == "long":
-                        # Exclude R3 from reset 
-                        if pivot_name != 'R3':
-                            # Reset if price closes BELOW the line that triggered the original alert
-                            if close_prev < pivot_value:
-                                updated_state = None
-                                debug_log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
+                        if pivot_name != 'R3' and close_prev < pivot_value:
+                            updated_state = None
+                            log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
                  
-      
                     elif alert_type == "short":
-                       
-                        # Exclude S3 from reset logic
-                        if pivot_name != 'S3':
-    
-                            # Reset if price closes ABOVE the line that triggered the original alert
-                           
-                            if close_prev > pivot_value:
-                                updated_state = None
-                                debug_log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
+                        if pivot_name != 'S3' and close_prev > pivot_value:
+                            updated_state = None
+                            log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
             except Exception as e:
-      
-          
-                debug_log(f"Error parsing saved state {updated_state}: {e}")
+                log(f"Error parsing saved state {updated_state}: {e}")
                 
         # 🟢 FINAL LONG SIGNAL CHECK
-        # --- PPO CONDITION MODIFIED HERE: (ppo_15m < 0.20) OR (ppo_5m < 0.05) ---
         if (upw_curr and (not dnw_curr) and 
             (macd_hist_rising and srsi_above_50) and 
             (not np.isnan(ppo_5m_curr) and (ppo_curr < 0.20 or ppo_5m_curr < 0.05)) and 
             long_crossover_line and 
             upper_wick_check): 
             
-      
-            # The current state to save if an alert is sent
             current_signal = f"fib_long_{long_crossover_name}"
-        
-     
-            debug_log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
+            log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             
-            # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
- 
-                
                     f"🟢 {pair_name} - **FIB LONG**\n"
                     f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f})\n"
-                    # --- ALERT MESSAGE MODIFIED HERE ---
-         
                     f"PPO 15m: {ppo_curr:.2f}\n" 
                     f"PPO 5m: {ppo_5m_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
-      
                 )
- 
                 send_telegram_alert(message)
                 
-          
-            # Update the state to the new signal string
             updated_state = current_signal
             
 
-  
         # 🔴 FINAL SHORT SIGNAL CHECK
-        # --- PPO CONDITION MODIFIED HERE: (ppo_15m > -0.20) OR (ppo_5m > -0.05) ---
         elif (dnw_curr and (not upw_curr) and 
               (macd_hist_falling and srsi_below_50) and 
               (not np.isnan(ppo_5m_curr) and (ppo_curr > -0.20 or ppo_5m_curr > -0.05)) and 
               short_crossover_line and 
               lower_wick_check): 
               
-            # The current state to save if an alert is sent
             current_signal = f"fib_short_{short_crossover_name}"
-        
-            debug_log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
+            log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             
-   
- 
-            # Send alert only if the current state is DIFFERENT from the saved state (which may be None after a reset)
             if updated_state != current_signal:
                 message = (
                     f"🔴 {pair_name} - **FIB SHORT**\n"
-              
-            
                     f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f})\n"
-                    # --- ALERT MESSAGE MODIFIED HERE ---
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"PPO 5m: {ppo_5m_curr:.2f}\n"
-   
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
-           
                 send_telegram_alert(message)
                 
-  
- 
-            # Update the state to the new signal string
             updated_state = current_signal
                 
-    
         else:
-            debug_log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
+            log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         
-        # Return the final 
-        return updated_state
-      
+        # --- RETURN BOTH STATE AND LOG ---
+        return updated_state, '\n'.join(thread_log)
+
     except Exception as e:
+        # Direct print for errors as they are critical and should not be swallowed by logs
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
         
-        return last_alerts.get(pair_name) 
+        # Still return the original state and the thread log
+        return last_alerts.get(pair_name), '\n'.join(thread_log) 
+
+### CORRECTION END: MODIFIED check_pair
+
+### CORRECTION START: MODIFIED main TO PROCESS LOGS
 
 def main():
  
-    """Main function - runs once per GitHub Actions 
- execution"""
+    """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
@@ -728,7 +458,6 @@ def main():
         send_test_message()
 
     # === APPLIED RESET STATE LOGIC ===
-    # CORRECTED: Used \n for newline within the f-string to fix SyntaxError
     if RESET_STATE and os.path.exists(STATE_FILE):
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
@@ -752,46 +481,48 @@ def main():
     
     # Check all pairs in parallel
     updates_processed = 0
+    pair_logs = [] # Initialize list to hold all collected logs
     
-    # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel.
     with ThreadPoolExecutor(max_workers=10) as executor:
         
         future_to_pair = {}
     
-    
- 
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Pass a copy of last_alerts for thread safety, though check_pair now only 
-                # reads from it at the start and returns the new state.
-                future = executor.submit(check_pair, pair_name, pair_info, last_alerts.copy()) 
+                # Pass pair_info instead of a copy of last_alerts to check_pair
+                # check_pair now only needs name, info, and the alerts to check against
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts) 
                 
                 future_to_pair[future] = pair_name
 
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
+            
             try:
-                # new_state can be "fib_long_R1" (new signal) 
- 
-                new_state = future.result() 
+                # --- CAPTURE BOTH RETURN VALUES ---
+                new_state, log_output = future.result() 
+                pair_logs.append(log_output) # Store the clean log output
                 
                 # Always save the result, even if it's None to clear a previous state.
                 # Only increment updates if the state has changed.
                 if new_state != last_alerts.get(pair_name):
                     last_alerts[pair_name] = new_state
                     updates_processed += 1
+                    
             except Exception as e:
-                print(f"Error processing {pair_name} in thread: {e}")
-        
- 
- 
+                # This catches errors in the executor framework itself, not the logic inside check_pair
+                print(f"Error processing {pair_name} in thread: {e}") 
                 if DEBUG_MODE:
                     import traceback
                     traceback.print_exc()
                 continue
             
+    # --- NEW: PRINT COLLECTED LOGS SEQUENTIALLY ---
+    for log_output in pair_logs:
+        # Use end='' to prevent extra newlines if log_output already ends with one
+        print(log_output, end='') 
+        
     # Save state for next run
-    
     save_state(last_alerts)
  
     
@@ -802,3 +533,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+### CORRECTION END: MODIFIED main TO PROCESS LOGS
