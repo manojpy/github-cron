@@ -35,7 +35,8 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 150, "min_required": 74}
+    # Added min_required_5m to ensure enough data for RMA 200
+    "SOLUSD": {"limit_15m": 210, "min_required": 74, "limit_5m": 450, "min_required_5m": 201}
 }
 
 # Indicator settings
@@ -113,6 +114,7 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"❌ Error sending Telegram message: {e}")
         if DEBUG_MODE:
+            import traceback
             traceback.print_exc()
         return False
 
@@ -139,7 +141,6 @@ def send_test_message():
 
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange and populate PAIRS dict"""
-    
     try:
         if DEBUG_MODE:
             print("[DEBUG] Fetching product IDs from Delta Exchange...")
@@ -172,6 +173,7 @@ def get_product_ids():
     except Exception as e:
         print(f"Error fetching products: {e}")
         if DEBUG_MODE:
+            import traceback
             traceback.print_exc()
         return False
 
@@ -333,9 +335,10 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
         result_list.append(estimate)
 
     # Pad with NaNs at the beginning to ensure series is the same length
-    final_list = pd.Series(result_list, index=src.index)
+    num_nan_pad = len(src) - len(result_list)
+    final_list = [np.nan] * num_nan_pad + result_list
     
-    return final_list
+    return pd.Series(final_list, index=src.index)
 
 def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     """Calculate Smoothed RSI using Kalman Filter"""
@@ -420,7 +423,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         if prev_day_ohlc is None:
             print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") 
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-          
+            
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
@@ -431,7 +434,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 200), 65)
 
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
-  
+    
         if df_15m is None or len(df_15m) < min_required:
             print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.")
             return last_alerts.get(pair_name), '\n'.join(thread_log) 
@@ -441,7 +444,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m)
         
-        if len(ppo) < 3 or len(smooth_rsi) < 3:
+        # Calculate 15m RMA 50
+        rma_50_15m = calculate_rma(df_15m['close'], 50)
+        
+        if len(ppo) < 3 or len(smooth_rsi) < 3 or len(rma_50_15m) < 3:
             print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
@@ -451,24 +457,48 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
         low_prev = df_15m['low'].iloc[-2]
- 
+
+        
         ppo_curr = ppo.iloc[-2] 
         smooth_rsi_curr = smooth_rsi.iloc[-2]
+        rma_50_15m_curr = rma_50_15m.iloc[-2]
 
-        log(f"15m PPO: {ppo_curr:.4f}, SRSI: {smooth_rsi_curr:.2f}")
+        log(f"15m PPO: {ppo_curr:.4f}, SRSI: {smooth_rsi_curr:.2f}, RMA 50: {rma_50_15m_curr:.2f}")
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
-
-        # --- REMOVED: Get 5-Minute Candles and PPO Block ---
+        
+        # --- Get 5-Minute Candles and RMA 200 ---
+        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 450)
+        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 201), 201)
+        
+        rma_200_5m_curr = np.nan
+        
+        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
+        
+        if df_5m is None or len(df_5m) < min_required_5m:
+            log(f"Not enough 5m data for {pair_name}. RMA 200 5m check will be ignored (Need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0}).")
+        else:
+            rma_200_5m = calculate_rma(df_5m['close'], 200)
+            
+            if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
+                rma_200_5m_curr = rma_200_5m.iloc[-2]
+                log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
+            else:
+                log("5m RMA 200 calculation failed to produce a valid value.")
+        # --- END 5M RMA 200 BLOCK ---
+        
         
         # --- 3. Define Alert Conditions ---
-        
         srsi_above_50 = smooth_rsi_curr > 50
         srsi_below_50 = smooth_rsi_curr < 50
         
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
         
+        # New MA conditions
+        rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
+        rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
+
         # Wick Checks
         candle_range = high_prev - low_prev
     
@@ -532,14 +562,14 @@ def check_pair(pair_name, pair_info, last_alerts):
             except Exception as e:
                 log(f"Error parsing saved state {updated_state}: {e}")
                 
-  
-        # 🟢 FINAL LONG SIGNAL CHECK (Simplified: 5m PPO condition removed)
+        # 🟢 FINAL LONG SIGNAL CHECK (RMA 50 & RMA 200 added)
         if (upw_curr and (not dnw_curr) and 
             srsi_above_50 and 
-            (ppo_curr < 0.20) and # Simplified PPO check
+            (ppo_curr < 0.20) and 
             long_crossover_line and 
-            upper_wick_check): 
-      
+            upper_wick_check and
+            rma_long_ok): # <-- NEW CONDITION
+        
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             
@@ -548,7 +578,8 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"🟢 {pair_name} - **FIB LONG**\n"
                     f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f})\n"
                     f"PPO 15m: {ppo_curr:.2f}\n" 
-                    # Removed PPO 5m line
+                    f"RMA 50 (15m): ${rma_50_15m_curr:,.2f}\n" # <-- NEW INFO
+                    f"RMA 200 (5m): ${rma_200_5m_curr:,.2f}\n" # <-- NEW INFO
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
@@ -557,14 +588,14 @@ def check_pair(pair_name, pair_info, last_alerts):
             updated_state = current_signal
             
 
-        
-        # 🔴 FINAL SHORT SIGNAL CHECK (Simplified: 5m PPO condition removed)
+        # 🔴 FINAL SHORT SIGNAL CHECK (RMA 50 & RMA 200 added)
         elif (dnw_curr and (not upw_curr) and 
               srsi_below_50 and 
-              (ppo_curr > -0.20) and # Simplified PPO check
+              (ppo_curr > -0.20) and 
               short_crossover_line and 
-              lower_wick_check): 
-    
+              lower_wick_check and
+              rma_short_ok): # <-- NEW CONDITION
+        
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             
@@ -573,7 +604,8 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"🔴 {pair_name} - **FIB SHORT**\n"
                     f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f})\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
-                    # Removed PPO 5m line
+                    f"RMA 50 (15m): ${rma_50_15m_curr:,.2f}\n" # <-- NEW INFO
+                    f"RMA 200 (5m): ${rma_200_5m_curr:,.2f}\n" # <-- NEW INFO
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
@@ -581,7 +613,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                 
             updated_state = current_signal
                 
- 
         else:
             log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         
@@ -591,9 +622,9 @@ def check_pair(pair_name, pair_info, last_alerts):
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
+            import traceback
             traceback.print_exc()
         
-        # This is the line that caused the SyntaxError due to bad formatting
         return last_alerts.get(pair_name), '\n'.join(thread_log) 
 
 
@@ -628,7 +659,7 @@ def main():
     
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
-  
+ 
     
     if found_count == 0:
         print("No valid pairs found. Exiting.")
@@ -670,7 +701,6 @@ def main():
                     traceback.print_exc()
                 continue
             
-  
     # --- PRINT COLLECTED LOGS SEQUENTIALLY (Fixes Interleaving) ---
     if DEBUG_MODE:
         print("\n\n" + "="*50)
