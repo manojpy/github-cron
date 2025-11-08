@@ -578,8 +578,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"🟢 {pair_name} - **FIB LONG**\n"
                     f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f})\n"
                     f"PPO 15m: {ppo_curr:.2f}\n" 
-                    f"RMA 50 (15m): ${rma_50_15m_curr:,.2f}\n" # <-- NEW INFO
-                    f"RMA 200 (5m): ${rma_200_5m_curr:,.2f}\n" # <-- NEW INFO
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
@@ -604,8 +602,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"🔴 {pair_name} - **FIB SHORT**\n"
                     f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f})\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
-                    f"RMA 50 (15m): ${rma_50_15m_curr:,.2f}\n" # <-- NEW INFO
-                    f"RMA 200 (5m): ${rma_200_5m_curr:,.2f}\n" # <-- NEW INFO
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
