@@ -68,7 +68,10 @@ SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
 SRSI_EMA_LEN = 5 
 
-# Magical Momentum Indicator settings are REMOVED
+# Magical Momentum Indicator settings
+MOMENTUM_RESPONSIVENESS = 0.9
+MOMENTUM_PERIOD = 144
+MOMENTUM_SD_PERIOD = 50
 
 # File to store last alert state
 STATE_FILE = 'alert_state.json'
@@ -355,8 +358,6 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
         
         result_list.append(estimate)
         
-    # Prepend NaNs to match original Series length and index alignment
-    # This part is often tricky with Pandas/Pine script ports. Use reindexing for safety.
     return pd.Series(result_list, index=src.index)
 
 # Function to calculate Smoothed RSI
@@ -381,10 +382,84 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# === calculate_magical_momentum is REMOVED ===
+def calculate_magical_momentum(df, responsiveness=MOMENTUM_RESPONSIVENESS, period=MOMENTUM_PERIOD, sd_period=MOMENTUM_SD_PERIOD):
+    """
+    Calculate Magical Momentum Indicator (hist value) - matches Pine Script exactly
+    """
+    source = df['close'].copy()
+    
+    # Calculate standard deviation with responsiveness
+    sd = source.rolling(window=sd_period).std() * max(0.00001, responsiveness)
+    
+    # Initialize worm series (var worm = source in Pine)
+    worm = pd.Series(index=source.index, dtype=float)
+    worm.iloc[0] = source.iloc[0]
+    
+    # Calculate worm iteratively (self-referential: worm := worm + delta)
+    for i in range(1, len(source)):
+        diff = source.iloc[i] - worm.iloc[i-1]
+        sd_val = sd.iloc[i]
+        
+        # delta = math.abs(diff) > sd ? math.sign(diff) * sd : diff
+        if pd.notna(sd_val) and abs(diff) > sd_val:
+            delta = np.sign(diff) * sd_val
+        else:
+            delta = diff
+            
+        worm.iloc[i] = worm.iloc[i-1] + delta
+    
+    # Calculate moving average (ta.sma)
+    ma = source.rolling(window=period).mean()
+    
+    # Calculate raw momentum
+    raw_momentum = (worm - ma) / worm
+    
+    # Find min and max over period
+    current_med = raw_momentum
+    min_med = current_med.rolling(window=period).min()
+    max_med = current_med.rolling(window=period).max()
+    
+    # Calculate temp (normalized value)
+    temp = (current_med - min_med) / (max_med - min_med)
+    temp = temp.fillna(0)
+    
+    # Initialize value series (value = 0.5 * 2 in Pine)
+    value = pd.Series(index=source.index, dtype=float)
+    value.iloc[0] = 0.5 * 2  # = 1.0
+    
+    # Calculate value iteratively (self-referential with previous value)
+    for i in range(1, len(source)):
+        prev_value = value.iloc[i-1]
+        # value := value * (temp - .5 + .5 * nz(value[1]))
+        value.iloc[i] = (0.5 * 2) * (temp.iloc[i] - 0.5 + 0.5 * prev_value)
+        
+        # Clamp values
+        if value.iloc[i] > 0.9999:
+            value.iloc[i] = 0.9999
+        elif value.iloc[i] < -0.9999:
+            value.iloc[i] = -0.9999
+    
+    # Calculate temp2 and momentum
+    # temp2 = (1 + value) / (1 - value)
+    temp2 = (1 + value) / (1 - value)
+    # momentum = .25 * math.log(temp2)
+    momentum = 0.25 * np.log(temp2)
+    
+    # Smooth momentum (self-referential: momentum := momentum + .5 * nz(momentum[1]))
+    momentum_smoothed = pd.Series(index=source.index, dtype=float)
+    momentum_smoothed.iloc[0] = momentum.iloc[0]
+    
+    for i in range(1, len(momentum)):
+        prev_momentum = momentum_smoothed.iloc[i-1]
+        momentum_smoothed.iloc[i] = momentum.iloc[i] + 0.5 * prev_momentum
+    
+    # hist = momentum (final value)
+    hist = momentum_smoothed
+    
+    return hist
 
 def check_pair(pair_name, pair_info, last_alerts):
-    """Check PPO and RMA/Cirrus/SRSI conditions for a pair"""
+    """Check PPO and RMA/Cirrus/SRSI/Momentum conditions for a pair"""
     
     try:
         if pair_info is None:
@@ -428,12 +503,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         
-        
         # Calculate Cirrus Cloud on 15min timeframe 
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
       
         # Calculate Smoothed RSI on 15min timeframe
         smooth_rsi = calculate_smooth_rsi(df_15m)
+        
+        # Calculate Magical Momentum on 15min timeframe
+        momentum_hist = calculate_magical_momentum(df_15m)
         
         # Get latest values from 15min
         ppo_curr = ppo.iloc[-1]
@@ -444,6 +521,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Smoothed RSI values
         smooth_rsi_curr = smooth_rsi.iloc[-1]
         smooth_rsi_prev = smooth_rsi.iloc[-2] 
+        
+        # Magical Momentum values
+        momentum_hist_curr = momentum_hist.iloc[-1]
         
         close_curr = df_15m['close'].iloc[-1]
         rma50_curr = rma_50.iloc[-1]
@@ -508,6 +588,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Smoothed RSI Debug Log
         debug_log(f"Smoothed RSI (15m): {smooth_rsi_curr:.2f} (prev: {smooth_rsi_prev:.2f})") 
         
+        # Magical Momentum Debug Log
+        debug_log(f"Magical Momentum Hist (15m): {momentum_hist_curr:.6f}")
+        
         # *** DEBUG LINES: Print raw filter values for diagnostics ***
         debug_log(f"Cirrus Filter 1 (filtx1): {filtx1.iloc[-1]:.4f}") 
         debug_log(f"Cirrus Filter 2 (filtx12): {filtx12.iloc[-1]:.4f}") 
@@ -541,9 +624,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
-        # Smoothed RSI Crossover Conditions (Explicitly requested)
+        # Smoothed RSI Crossover Conditions
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
+        
+        # Magical Momentum Conditions
+        momentum_above_zero = momentum_hist_curr > 0
+        momentum_below_zero = momentum_hist_curr < 0
         
         # Debug: Print crossover detections
         debug_log(f"\nCrossover Checks:")
@@ -554,7 +641,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"  SRSI cross down 50: {srsi_cross_down_50}") 
         
         debug_log(f"\nCondition Checks:")
-        debug_log(f"  Magical Momentum is removed. Alerts rely only on PPO/RMA/Cirrus/Candle conditions.") 
+        debug_log(f"  Momentum Hist > 0: {momentum_above_zero}")
+        debug_log(f"  Momentum Hist < 0: {momentum_below_zero}")
 
         current_state = None
         
@@ -565,132 +653,145 @@ def check_pair(pair_name, pair_info, last_alerts):
         price = df_15m['close'].iloc[-1]
         
         
-        # --- ALERT LOGIC (8 SIGNALS, NO MOMENTUM) ---
+        # --- ALERT LOGIC (8 SIGNALS WITH MOMENTUM FILTER) ---
         
-        # 1. ORIGINAL BUY: PPO crosses up AND PPO < 0.20 AND ... 
+        # 1. ORIGINAL BUY: PPO crosses up AND PPO < 0.20 AND ... AND Momentum > 0
         if (ppo_cross_up and 
             ppo_below_020 and 
             close_above_rma50 and 
             close_above_rma200 and 
             upw_curr and (not dnw_curr) and 
-            strong_bullish_close): 
+            strong_bullish_close and
+            momentum_above_zero):  # NEW CONDITION
+            
             current_state = "buy"
             debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy":
-                message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
         
-        # 2. ORIGINAL SELL: PPO crosses down AND PPO > -0.20 AND ...
-        
+        # 2. ORIGINAL SELL: PPO crosses down AND PPO > -0.20 AND ... AND Momentum < 0
         elif (ppo_cross_down and 
               ppo_above_minus020 and 
               close_below_rma50 and 
               close_below_rma200 and 
               dnw_curr and (not upw_curr) and 
-              strong_bearish_close): 
+              strong_bearish_close and
+              momentum_below_zero):  # NEW CONDITION
+            
             current_state = "sell"
             debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "sell":
-                message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
                
-        # 3. SRSI BUY ALERT (SRSI CROSS UP 50) - Only SRSI Cross is the trigger
+        # 3. SRSI BUY ALERT (SRSI CROSS UP 50) AND Momentum > 0
         elif (srsi_cross_up_50 and 
               ppo_above_signal and 
               ppo_below_030 and 
               close_above_rma50 and 
               close_above_rma200 and 
               upw_curr and (not dnw_curr) and 
-              strong_bullish_close): 
+              strong_bullish_close and
+              momentum_above_zero):  # NEW CONDITION
+            
             current_state = "buy_srsi50" 
             debug_log(f"\n⬆️ BUY (SRSI 50) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy_srsi50": 
-                message = f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"BUY (SRSI 50) already alerted for {pair_name}, skipping duplicate") 
                 
-        # 4. SRSI SELL ALERT (SRSI CROSS DOWN 50) - Only SRSI Cross is the trigger
+        # 4. SRSI SELL ALERT (SRSI CROSS DOWN 50) AND Momentum < 0
         elif (srsi_cross_down_50 and 
               ppo_below_signal and 
               ppo_above_minus030 and 
               close_below_rma50 and 
               close_below_rma200 and 
               dnw_curr and (not upw_curr) and 
-              strong_bearish_close): 
+              strong_bearish_close and
+              momentum_below_zero):  # NEW CONDITION
+            
             current_state = "sell_srsi50" 
             debug_log(f"\n⬇️ SELL (SRSI 50) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "sell_srsi50": 
-                message = f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"SELL (SRSI 50) already alerted for {pair_name}, skipping duplicate") 
 
         
-        # 5. LONG (0): PPO > Signal AND PPO crosses above 0 AND ...
+        # 5. LONG (0): PPO > Signal AND PPO crosses above 0 AND ... AND Momentum > 0
         elif (ppo_cross_above_zero and 
               ppo_above_signal and 
               close_above_rma50 and 
               close_above_rma200 and 
               upw_curr and (not dnw_curr) and 
-              strong_bullish_close): 
+              strong_bullish_close and
+              momentum_above_zero):  # NEW CONDITION
+            
             current_state = "long_zero"
             debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_zero":
-                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
        
-        # 6. LONG (0.11): PPO > Signal AND PPO crosses above 0.11 AND ...
-        
+        # 6. LONG (0.11): PPO > Signal AND PPO crosses above 0.11 AND ... AND Momentum > 0
         elif (ppo_cross_above_011 and 
               ppo_above_signal and 
               close_above_rma50 and 
               close_above_rma200 and 
               upw_curr and (not dnw_curr) and 
-              strong_bullish_close): 
+              strong_bullish_close and
+              momentum_above_zero):  # NEW CONDITION
+            
             current_state = "long_011"
             debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_011":
-                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
         
-        # 7. SHORT (0): PPO < Signal AND PPO crosses below 0 AND ...
+        # 7. SHORT (0): PPO < Signal AND PPO crosses below 0 AND ... AND Momentum < 0
         elif (ppo_cross_below_zero and 
               ppo_below_signal and 
               close_below_rma50 and 
               close_below_rma200 and 
               dnw_curr and (not upw_curr) and 
-              strong_bearish_close): 
+              strong_bearish_close and
+              momentum_below_zero):  # NEW CONDITION
             
             current_state = "short_zero"
             debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
             
             if last_alerts.get(pair_name) != "short_zero":
-                message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
         
         
-        # 8. SHORT (-0.11): PPO < Signal AND PPO crosses below -0.11 AND ...
+        # 8. SHORT (-0.11): PPO < Signal AND PPO crosses below -0.11 AND ... AND Momentum < 0
         elif (ppo_cross_below_minus011 and 
               ppo_below_signal and 
               close_below_rma50 and 
               close_below_rma200 and 
               dnw_curr and (not upw_curr) and 
-              strong_bearish_close): 
+              strong_bearish_close and
+              momentum_below_zero):  # NEW CONDITION
+            
             current_state = "short_011"
             debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_011":
-                message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
+                message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nMomentum: {momentum_hist_curr:.4f}\nPrice: ${price:,.2f}\n{formatted_time}" 
                 send_telegram_alert(message)
             else:
                 debug_log(f"SHORT (-0.11) already alerted for {pair_name}, skipping duplicate")
@@ -713,7 +814,7 @@ def main():
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
-    print(f"PPO/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
+    print(f"PPO/Cirrus Cloud/Momentum Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
     print("=" * 50)
     
