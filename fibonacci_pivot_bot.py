@@ -35,8 +35,8 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    # Increased minimum requirements for better stability
-    "SOLUSD": {"limit_15m": 250, "min_required": 150, "limit_5m": 500, "min_required_5m": 250}
+    # Adjusted for pairs with limited historical data
+    "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
 }
 
 # Indicator settings
@@ -512,11 +512,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         current_signal = None
         updated_state = last_alerts.get(pair_name) 
         
+        if updated_state:
+            log(f"Previous state loaded: {updated_state}")
+        
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
         
-        # IMPROVED: State Reset Logic
+        # IMPROVED: State Reset Logic - Check and reset BEFORE evaluating new signals
         if updated_state and updated_state.startswith('fib_'):
             try:
                 parts = updated_state.split('_')
@@ -525,20 +528,31 @@ def check_pair(pair_name, pair_info, last_alerts):
                     pivot_name = parts[2]  # 'R1', 'S1', etc.
                     pivot_value = pivots.get(pivot_name)
                     
+                    log(f"Checking state reset: type={alert_type}, pivot={pivot_name} (${pivot_value}), current_price=${close_prev:,.2f}")
+                    
                     if pivot_value is not None:
                         if alert_type == "long":
                             # Reset long position if price falls below the original pivot
                             if close_prev < pivot_value:
                                 updated_state = None
                                 log(f"🔄 STATE RESET: {pair_name} Long - Price ${close_prev:,.2f} fell below {pivot_name} ${pivot_value:,.2f}")
+                            else:
+                                log(f"State maintained: Price ${close_prev:,.2f} still above {pivot_name} ${pivot_value:,.2f}")
                      
                         elif alert_type == "short":
                             # Reset short position if price rises above the original pivot
                             if close_prev > pivot_value:
                                 updated_state = None
                                 log(f"🔄 STATE RESET: {pair_name} Short - Price ${close_prev:,.2f} rose above {pivot_name} ${pivot_value:,.2f}")
+                            else:
+                                log(f"State maintained: Price ${close_prev:,.2f} still below {pivot_name} ${pivot_value:,.2f}")
+                    else:
+                        # Pivot name not found in current pivots, reset state
+                        log(f"⚠️  Invalid pivot name '{pivot_name}' in state, resetting")
+                        updated_state = None
             except Exception as e:
-                log(f"Error parsing saved state {updated_state}: {e}")
+                log(f"Error parsing saved state '{updated_state}': {e}")
+                updated_state = None  # Reset on parse error
     
         # --- 7. Final Signal Checks ---
         # 🟢 LONG SIGNAL
@@ -623,13 +637,21 @@ def main():
     # Load previous state
     last_alerts = load_state()
 
-    # --- STATE CLEANUP: Purge old SRSI state traces for a clean slate ---
-    # This specifically targets old entries like 'sell_srsi45' loaded from the JSON state file.
-    keys_to_purge = [k for k, v in list(last_alerts.items()) if v and 'srsi' in str(v).lower()]
+    # --- STATE CLEANUP: Purge old/invalid state traces for a clean slate ---
+    # Remove old state formats: 'srsi', 'buy', 'sell', 'short_zero', etc.
+    # Only keep valid 'fib_long_X' or 'fib_short_X' formats
+    keys_to_purge = []
+    for key, value in list(last_alerts.items()):
+        if value:
+            value_str = str(value).lower()
+            # Purge if it doesn't match the 'fib_long_' or 'fib_short_' pattern
+            if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_')):
+                keys_to_purge.append(key)
+    
     if keys_to_purge:
-        print(f"\n[INFO] 🧹 Purging old SRSI-related states (e.g., 'sell_srsi45') for: {', '.join(keys_to_purge)}")
+        print(f"\n[INFO] 🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
-            last_alerts[key] = None # Set to None/clean state
+            last_alerts[key] = None  # Set to None/clean state
     # -------------------------------------------------------------------
     
     # Fetch product IDs
