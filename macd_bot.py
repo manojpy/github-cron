@@ -94,7 +94,7 @@ def send_telegram_alert(message):
         response = requests.post(url, data=data, timeout=10)
         response_data = response.json()
         if response_data.get('ok'):
-            print(f"✓ Alert sent successfully")
+            print("✓ Alert sent successfully")
             return True
         else:
             print(f"❌ Telegram error: {response_data}")
@@ -109,10 +109,15 @@ def send_test_message():
     ist = pytz.timezone('Asia/Kolkata')
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-    test_msg = f"🔔 Bot Started
-Test message from PPO Bot
-Time: {formatted_time}
-Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    test_msg = (
+        f"🔔 Bot Started
+"
+        f"Test message from PPO Bot
+"
+        f"Time: {formatted_time}
+"
+        f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    )
     print("
 " + "="*50)
     print("SENDING TEST MESSAGE")
@@ -281,7 +286,6 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     smooth_rsi = kalman_filter(rsi_value, kalman_len)
     return smooth_rsi
 
-# ===== Magical Momentum hist calculation =====
 def calculate_magical_momentum_hist(close, responsiveness=0.9, period=144):
     responsiveness = max(0.00001, responsiveness)
     sd = close.rolling(50).std() * responsiveness
@@ -331,7 +335,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             limit_5m = 210
             min_required_5m = 200
 
-        # Fetch 15-minute candles 
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         if df_15m is None or len(df_15m) < min_required:
@@ -341,18 +344,15 @@ def check_pair(pair_name, pair_info, last_alerts):
             print(f"Not enough 5m data for {pair_name} ({len(df_5m) if df_5m is not None else 0}/{min_required_5m})")
             return None
 
-        # Calculate indicators on 15min timeframe
         ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m)
 
-        # MAGICAL MOMENTUM HIST CALCULATION
         magical_momentum_hist = calculate_magical_momentum_hist(df_15m["close"])
         magical_momentum_hist_curr = magical_momentum_hist.iloc[-1]
 
-        # Get latest values from 15min
         ppo_curr = ppo.iloc[-1]
         ppo_prev = ppo.iloc[-2]
         ppo_signal_curr = ppo_signal.iloc[-1]
@@ -407,7 +407,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         current_state = None
 
         # ====== ALERT LOGIC WITH MOMENTUM FILTER ======
-
         # BUY
         if (ppo_cross_up and 
             ppo_below_020 and
@@ -415,15 +414,20 @@ def check_pair(pair_name, pair_info, last_alerts):
             close_above_rma200 and 
             upw_curr and (not dnw_curr) and 
             strong_bullish_close and
-            magical_momentum_hist_curr > 0):  # Momentum hist must be > 0
+            magical_momentum_hist_curr > 0):
             current_state = "buy"
             debug_log(f"
 🟢 BUY SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy":
-                message = f"🟢 {pair_name} - BUY
-PPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}" 
+                message = (
+                    f"🟢 {pair_name} - BUY
+"
+                    f"PPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}" 
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
@@ -435,15 +439,20 @@ Price: ${price:,.2f}
             close_below_rma200 and 
             dnw_curr and (not upw_curr) and 
             strong_bearish_close and
-            magical_momentum_hist_curr < 0):  # Momentum hist must be < 0
+            magical_momentum_hist_curr < 0):
             current_state = "sell"
             debug_log(f"
 🔴 SELL SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "sell":
-                message = f"🔴 {pair_name} - SELL
-PPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}" 
+                message = (
+                    f"🔴 {pair_name} - SELL
+"
+                    f"PPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}"
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
@@ -456,15 +465,20 @@ Price: ${price:,.2f}
               close_above_rma200 and 
               upw_curr and (not dnw_curr) and 
               strong_bullish_close and
-              magical_momentum_hist_curr > 0):  # Momentum hist must be > 0
+              magical_momentum_hist_curr > 0):
             current_state = "buy_srsi50"
             debug_log(f"
 ⬆️ BUY (SRSI 50) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "buy_srsi50":
-                message = f"⬆️ {pair_name} - BUY (SRSI 50)
-SRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}" 
+                message = (
+                    f"⬆️ {pair_name} - BUY (SRSI 50)
+"
+                    f"SRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}" 
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"BUY (SRSI 50) already alerted for {pair_name}, skipping duplicate")
@@ -477,15 +491,20 @@ Price: ${price:,.2f}
                 close_below_rma200 and 
                 dnw_curr and (not upw_curr) and 
                 strong_bearish_close and
-                magical_momentum_hist_curr < 0):  # Momentum hist must be < 0
+                magical_momentum_hist_curr < 0):
             current_state = "sell_srsi50"
             debug_log(f"
 ⬇️ SELL (SRSI 50) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "sell_srsi50":
-                message = f"⬇️ {pair_name} - SELL (SRSI 50)
-SRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}" 
+                message = (
+                    f"⬇️ {pair_name} - SELL (SRSI 50)
+"
+                    f"SRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}"
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"SELL (SRSI 50) already alerted for {pair_name}, skipping duplicate")
@@ -502,10 +521,15 @@ Price: ${price:,.2f}
             debug_log(f"
 🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_zero":
-                message = f"🟢 {pair_name} - LONG
-PPO crossing above 0 ({ppo_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}"
+                message = (
+                    f"🟢 {pair_name} - LONG
+"
+                    f"PPO crossing above 0 ({ppo_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}"
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
@@ -522,10 +546,15 @@ Price: ${price:,.2f}
             debug_log(f"
 🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "long_011":
-                message = f"🟢 {pair_name} - LONG
-PPO crossing above 0.11 ({ppo_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}" 
+                message = (
+                    f"🟢 {pair_name} - LONG
+"
+                    f"PPO crossing above 0.11 ({ppo_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}" 
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
@@ -542,10 +571,15 @@ Price: ${price:,.2f}
             debug_log(f"
 🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_zero":
-                message = f"🔴 {pair_name} - SHORT
-PPO crossing below 0 ({ppo_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}"
+                message = (
+                    f"🔴 {pair_name} - SHORT
+"
+                    f"PPO crossing below 0 ({ppo_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}"
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
@@ -562,10 +596,15 @@ Price: ${price:,.2f}
             debug_log(f"
 🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             if last_alerts.get(pair_name) != "short_011":
-                message = f"🔴 {pair_name} - SHORT
-PPO crossing below -0.11 ({ppo_curr:.2f})
-Price: ${price:,.2f}
-{formatted_time}" 
+                message = (
+                    f"🔴 {pair_name} - SHORT
+"
+                    f"PPO crossing below -0.11 ({ppo_curr:.2f})
+"
+                    f"Price: ${price:,.2f}
+"
+                    f"{formatted_time}" 
+                )
                 send_telegram_alert(message)
             else:
                 debug_log(f"SHORT (-0.11) already alerted for {pair_name}, skipping duplicate")
