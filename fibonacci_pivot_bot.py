@@ -300,7 +300,6 @@ def calculate_rma(data, period):
 
 def kalman_filter(src, length, R = 0.01, Q = 0.1):
     """Implements the kalman_filter function from Pine Script"""
-    # *** KEPT FOR POTENTIAL FUTURE USE BUT SRSI FUNCTION REMOVED ***
     result_list = []
     
     estimate = np.nan
@@ -342,10 +341,9 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
     
     return pd.Series(final_list, index=src.index)
 
-def calculate_smooth_rsi(df, rsi_len, kalman_len): # <--- REMOVED FUNCTION BODY
+def calculate_smooth_rsi(df, rsi_len=21, kalman_len=5): # <--- FUNCTION NO LONGER USED/NEEDED
     """Calculate Smoothed RSI using Kalman Filter"""
-    # This function is now redundant as it's not called, 
-    # but the placeholder is kept to show the removal point.
+    # This function's logic is no longer required and is omitted.
     pass
 
 
@@ -433,7 +431,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         # smooth_rsi = calculate_smooth_rsi(df_15m) <--- REMOVED SRSI CALCULATION
         
-        # Calculate 15m 
+        # Calculate 15m RMA 50
         rma_50_15m = calculate_rma(df_15m['close'], 50)
         
         # Check only for PPO and RMA 50 length
@@ -452,10 +450,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         ppo_curr = ppo.iloc[-2] 
         # smooth_rsi_curr = smooth_rsi.iloc[-2] <--- REMOVED SRSI VARIABLE
+
         rma_50_15m_curr = rma_50_15m.iloc[-2]
 
-        # Log SRSI removed
-        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") 
+        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") # <-- UPDATED LOG MESSAGE
         upw_curr = upw.iloc[-2]
    
         dnw_curr = dnw.iloc[-2]
@@ -562,11 +560,10 @@ def check_pair(pair_name, pair_info, last_alerts):
             
         # 🟢 FINAL LONG SIGNAL CHECK (SRSI removed)
         if (upw_curr and (not dnw_curr) and 
-            # srsi_above_50 and <--- REMOVED SRSI CONDITION
             (ppo_curr < 0.20) and 
             long_crossover_line and 
             upper_wick_check and
-            rma_long_ok): 
+            rma_long_ok): # <-- SRSI condition removed
         
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
@@ -586,11 +583,10 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         # 🔴 FINAL SHORT SIGNAL CHECK (SRSI removed)
         elif (dnw_curr and (not upw_curr) and 
-              # srsi_below_50 and <--- REMOVED SRSI CONDITION
               (ppo_curr > -0.20) and 
               short_crossover_line and 
               lower_wick_check and
-              rma_short_ok): 
+              rma_short_ok): # <-- SRSI condition removed
         
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
