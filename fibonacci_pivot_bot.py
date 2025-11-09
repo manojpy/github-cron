@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
+
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
@@ -35,8 +36,7 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    # Added min_required_5m to ensure enough data for RMA 200
-    "SOLUSD": {"limit_15m": 210, "min_required": 74, "limit_5m": 450, "min_required_5m": 201}
+    # SOLUSD entry removed. The RMA 200 check is now bypassed in check_pair logic.
 }
 
 # Indicator settings
@@ -439,12 +439,10 @@ def check_pair(pair_name, pair_info, last_alerts):
 
 
         # Get values for the last closed 15m candle (index -2)
-        
         open_prev = df_15m['open'].iloc[-2]
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
         low_prev = df_15m['low'].iloc[-2]
-
         
         ppo_curr = ppo.iloc[-2] 
 
@@ -453,30 +451,37 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") 
         
         upw_curr = upw.iloc[-2]
-   
         dnw_curr = dnw.iloc[-2]
         
         # --- Get 5-Minute Candles and RMA 200 ---
-        # CORRECTION: Set a robust default limit_5m (450) and min_required_5m (201)
-        # to ensure enough data for RMA 200 for all pairs, even if not in SPECIAL_PAIRS.
-        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 450)
-        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 201), 201)
+        # Initialize
+        rma_200_5m_curr = np.nan 
         
-        rma_200_5m_curr = np.nan
-        
-        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-      
-        if df_5m is None or len(df_5m) < min_required_5m:
-            log(f"Not enough 5m data for {pair_name}. RMA 200 5m check will be ignored (Need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0}).")
+        # **START SOLUSD EXCEPTION LOGIC**
+        if pair_name == "SOLUSD":
+            # Set rma_200_5m_curr equal to rma_50_15m_curr to force rma_long_ok/rma_short_ok
+            # to rely solely on the 15m RMA 50 condition for this pair.
+            rma_200_5m_curr = rma_50_15m_curr
+            log("SOLUSD EXCEPTION: Bypassing 5m RMA 200 check; relying on 15m RMA 50 only.")
+        # **END SOLUSD EXCEPTION LOGIC**
         else:
-            rma_200_5m = calculate_rma(df_5m['close'], 200)
+            # Normal 5m RMA 200 check for all other pairs
+            limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 450)
+            min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 201), 201)
             
-            if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
-                rma_200_5m_curr = rma_200_5m.iloc[-2]
-            
-                log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
+            df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
+          
+            if df_5m is None or len(df_5m) < min_required_5m:
+                log(f"Not enough 5m data for {pair_name}. RMA 200 5m check will be ignored (Need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0}).")
             else:
-                log("5m RMA 200 calculation failed to produce a valid value.")
+                rma_200_5m = calculate_rma(df_5m['close'], 200)
+                
+                if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
+                    rma_200_5m_curr = rma_200_5m.iloc[-2]
+                
+                    log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
+                else:
+                    log("5m RMA 200 calculation failed to produce a valid value.")
         # --- END 5M RMA 200 BLOCK ---
         
         
@@ -486,6 +491,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         is_red = close_prev < open_prev
         
         # New MA conditions
+        # If SOLUSD, rma_200_5m_curr == rma_50_15m_curr, making the condition dependent only on RMA 50
         rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
         rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
 
@@ -568,7 +574,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             (ppo_curr < 0.20) and 
             long_crossover_line and 
             upper_wick_check and
-            rma_long_ok): # <-- SRSI condition removed
+            rma_long_ok): # Now only relies on 15m RMA 50 for SOLUSD
         
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
@@ -591,7 +597,7 @@ def check_pair(pair_name, pair_info, last_alerts):
               (ppo_curr > -0.20) and 
               short_crossover_line and 
               lower_wick_check and
-              rma_short_ok): # <-- SRSI condition removed
+              rma_short_ok): # Now only relies on 15m RMA 50 for SOLUSD
         
        
             current_signal = f"fib_short_{short_crossover_name}"
