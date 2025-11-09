@@ -7,7 +7,7 @@ import json
 import pytz
 import traceback
 from datetime import datetime
-import math 
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ CONFIGURATION ============
@@ -55,7 +55,7 @@ PPO_USE_SMA = False  # False = use EMA
 
 # RMA settings
 RMA_50_PERIOD = 50   # RMA50 on 15min
-RMA_200_PERIOD = 200 # RMA200 on 5min # SYNTAX ERROR FIXED HERE
+RMA_200_PERIOD = 200 # RMA200 on 5min 
 
 # Cirrus Cloud settings
 CIRRUS_CLOUD_ENABLED = True
@@ -421,56 +421,52 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# Function to calculate Magical Momentum Indicator (NEW)
+# === CORRECTED Magical Momentum Indicator ===
 def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENTUM_RESPONSIVENESS, stdev_period=MOMENTUM_STDEV_PERIOD):
     """
-    Implements the Magical Momentum Indicator logic from Pine Script.
-    The final 'hist' value is the 'momentum' component.
+    Implements the Magical Momentum Indicator logic from Pine Script, corrected
+    for initialization and recursive variable handling.
     """
     close = df['close'].copy()
-    
-    # --- Pass 1: Worm and Raw Momentum (Requires iteration for worm) ---
-    
-    # Pre-calculated variables:
-    # sd = ta.stdev(source, 50) * responsiveness
+    n = len(close)
+    if n == 0:
+        return pd.Series([], dtype=float)
+
+    # --- Pass 1: Worm and Raw Momentum Initialization ---
     sd_series = close.rolling(window=stdev_period).std() * responsiveness
-    # ma = ta.sma(source, period)
     ma_series = calculate_sma(close, period)
 
-    # Initialize results lists
     worm_list = []
     raw_momentum_list = []
     
-    # Initialization based on Pine vars
-    # var worm = source (worm initialized to close.iloc[0])
-    worm_prev = close.iloc[0] if len(close) > 0 else np.nan
-    
-    # Recursive worm calculation loop
-    for i in range(len(close)):
+    # Initialize 'var worm' to the first 'source' (close) value
+    worm_prev = close.iloc[0] 
+
+    # --- Pass 1: Recursive Worm Calculation ---
+    for i in range(n):
         current_close = close.iloc[i]
         current_ma = ma_series.iloc[i]
         current_sd = sd_series.iloc[i]
         
-        # Worm logic
         if i == 0:
-            worm_list.append(current_close)
-            raw_momentum_list.append(np.nan)
-            continue
-        
-        # Pine: diff = source - worm[1]
-        diff = current_close - worm_prev
-        
-        # Pine: delta = math.abs(diff) > sd ? math.sign(diff) * sd : diff
-        if np.isnan(current_sd) or current_sd == 0.0:
-            delta = diff
-        elif np.abs(diff) > current_sd:
-            delta = np.sign(diff) * current_sd
+            new_worm = current_close
+            worm_list.append(new_worm)
         else:
-            delta = diff
+            # Pine: diff = source - worm[1]
+            diff = current_close - worm_prev
             
-        # Pine: worm := worm[1] + delta
-        new_worm = worm_prev + delta
-        worm_list.append(new_worm)
+            # Pine: delta = math.abs(diff) > sd ? math.sign(diff) * sd : diff
+            if np.isnan(current_sd) or current_sd == 0.0:
+                delta = diff
+            elif np.abs(diff) > current_sd:
+                delta = np.sign(diff) * current_sd
+            else:
+                delta = diff
+                
+            # Pine: worm := worm[1] + delta
+            new_worm = worm_prev + delta
+            worm_list.append(new_worm)
+        
         worm_prev = new_worm
         
         # Pine: raw_momentum = (worm - ma) / worm
@@ -480,32 +476,29 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             raw_momentum = (new_worm - current_ma) / new_worm
         raw_momentum_list.append(raw_momentum)
 
-    raw_momentum = pd.Series(raw_momentum_list, index=close.index)
+    raw_momentum_series = pd.Series(raw_momentum_list, index=close.index)
     
     # --- Post-Pass 1 calculations ---
-    current_med = raw_momentum
-    # min_med = ta.lowest(current_med, period)
+    current_med = raw_momentum_series
     min_med = current_med.rolling(window=period).min()
-    # max_med = ta.highest(current_med, period)
     max_med = current_med.rolling(window=period).max()
     
     # Pine: temp = (current_med - min_med) / (max_med - min_med)
     diff_med = max_med - min_med
-    temp = (current_med - min_med).divide(diff_med.replace(0, np.nan))
-    temp = temp.fillna(0.5).replace([np.inf, -np.inf], 0.5)
+    # Replace division by zero with NaN, then fill NaNs (usually where min=max) with 0.5
+    temp_series = (current_med - min_med).divide(diff_med.replace(0, np.nan))
+    temp_series = temp_series.fillna(0.5).replace([np.inf, -np.inf], 0.5)
 
     # --- Pass 2: Recursive Value and Momentum ---
     value_list = []
     momentum_list = []
     
-    # Initialization based on Pine vars
-    # Pine: value = 0.5 * 2 = 1.0 (Initial assignment for first bar)
-    
-    value_prev = 0.0 # nz(value[1]) for the first bar is 0.0
-    momentum_prev = 0.0 # nz(momentum[1]) for the first bar is 0.0
+    # Pine: var value = 0.5 * 2 = 1.0 (Initialization for the first bar)
+    value_prev = 0.0 # Emulates nz(value[1]) for the first bar
+    momentum_prev = 0.0 # Emulates nz(momentum[1]) for the first bar
 
-    for i in range(len(close)):
-        current_temp = temp.iloc[i]
+    for i in range(n):
+        current_temp = temp_series.iloc[i]
         
         if np.isnan(current_temp):
             value_list.append(np.nan)
@@ -513,22 +506,23 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             continue
     
         # --- 7. Value (Recursive) ---
-        if i == 0:
-            base_multiplier = 1.0 
-        else:
-            base_multiplier = value_list[-1] 
-        
-        nz_prev_value = value_list[-1] if i > 0 else 0.0
         
         # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
-        new_value = base_multiplier * (current_temp - 0.5 + 0.5 * nz_prev_value)
+        if i == 0:
+            # First bar initialization: value = 1.0. 
+            base_multiplier = 1.0 
+        else:
+            # Subsequent bars: value := value[1] * ...
+            base_multiplier = value_list[-1] 
+        
+        # nz(value[1]) emulation: value_prev is the previous *final* value
+        new_value = base_multiplier * (current_temp - 0.5 + 0.5 * value_prev)
 
         # Apply limits
-        # Pine: value := value > .9999 ? .9999 : value
-        # Pine: value := value < -0.9999 ? -0.9999 : value
         new_value = min(0.9999, max(-0.9999, new_value))
         
         value_list.append(new_value)
+        value_prev = new_value # Update previous value for the next iteration
 
         # --- 8. Momentum (Recursive) ---
         
@@ -542,18 +536,19 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             momentum_unfiltered = 0.25 * np.log(temp2)
             
             # Pine: momentum := momentum + .5 * nz(momentum[1])
+            # nz(momentum[1]) emulation: momentum_prev is the previous final momentum
             new_momentum = momentum_unfiltered + 0.5 * momentum_prev
             
         momentum_list.append(new_momentum)
         
-        # Update previous values for the next iteration
+        # Update previous momentum for the next iteration
         momentum_prev = new_momentum
     
-    # The final output is 'hist'
-    # Pine: hist = momentum
+    # The final output is 'hist' / 'momentum'
     hist = pd.Series(momentum_list, index=close.index)
     
     return hist
+# === END CORRECTED Magical Momentum Indicator ===
 
 
 def check_pair(pair_name, pair_info, last_alerts):
@@ -937,8 +932,7 @@ def check_pair(pair_name, pair_info, last_alerts):
     except Exception as e:
         print(f"Error checking {pair_name}: {e}")
         if DEBUG_MODE:
-            # traceback.print_exc() # Removed import for brevity
-            pass
+            traceback.print_exc()
         return None
 
 # ... (rest of the script: main function) ...
@@ -1005,8 +999,7 @@ def main():
             except Exception as e:
                 print(f"Error processing {pair_name} in thread: {e}")
                 if DEBUG_MODE:
-                    # traceback.print_exc() # Removed import for brevity
-                    pass
+                    traceback.print_exc()
                 continue
             
     # Save state for next run
