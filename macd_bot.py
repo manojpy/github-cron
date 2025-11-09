@@ -16,7 +16,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIH
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
 # Enable debug mode - set to True to see detailed logs
-# You can set this to 'False' after the next successful run
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
 # Send test message on startup
@@ -134,7 +133,6 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"❌ Error sending Telegram message: {e}")
         if DEBUG_MODE:
-            # traceback.print_exc() # Removed import for brevity
             pass
         return False
 
@@ -195,7 +193,6 @@ def get_product_ids():
     except Exception as e:
         print(f"Error fetching products: {e}")
         if DEBUG_MODE:
-            # traceback.print_exc() # Removed import for brevity
             pass
         return False
 
@@ -421,28 +418,27 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# === CORRECTED Magical Momentum Indicator ===
+# === FINAL CORRECTED Magical Momentum Indicator ===
 def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENTUM_RESPONSIVENESS, stdev_period=MOMENTUM_STDEV_PERIOD):
     """
     Implements the Magical Momentum Indicator logic from Pine Script, corrected
-    for initialization and recursive variable handling.
+    for initialization and recursive variable handling to prevent zero output.
     """
     close = df['close'].copy()
     n = len(close)
     if n == 0:
         return pd.Series([], dtype=float)
 
-    # --- Pass 1: Worm and Raw Momentum Initialization ---
+    # --- Pass 1: Worm and Raw Momentum ---
     sd_series = close.rolling(window=stdev_period).std() * responsiveness
     ma_series = calculate_sma(close, period)
 
     worm_list = []
     raw_momentum_list = []
     
-    # Initialize 'var worm' to the first 'source' (close) value
+    # Initialize 'var worm = source'
     worm_prev = close.iloc[0] 
 
-    # --- Pass 1: Recursive Worm Calculation ---
     for i in range(n):
         current_close = close.iloc[i]
         current_ma = ma_series.iloc[i]
@@ -450,12 +446,9 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
         
         if i == 0:
             new_worm = current_close
-            worm_list.append(new_worm)
         else:
-            # Pine: diff = source - worm[1]
             diff = current_close - worm_prev
             
-            # Pine: delta = math.abs(diff) > sd ? math.sign(diff) * sd : diff
             if np.isnan(current_sd) or current_sd == 0.0:
                 delta = diff
             elif np.abs(diff) > current_sd:
@@ -463,13 +456,11 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             else:
                 delta = diff
                 
-            # Pine: worm := worm[1] + delta
             new_worm = worm_prev + delta
-            worm_list.append(new_worm)
-        
+            
+        worm_list.append(new_worm)
         worm_prev = new_worm
         
-        # Pine: raw_momentum = (worm - ma) / worm
         if np.isnan(new_worm) or new_worm == 0.0 or np.isnan(current_ma):
             raw_momentum = np.nan
         else:
@@ -483,19 +474,19 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
     min_med = current_med.rolling(window=period).min()
     max_med = current_med.rolling(window=period).max()
     
-    # Pine: temp = (current_med - min_med) / (max_med - min_med)
     diff_med = max_med - min_med
-    # Replace division by zero with NaN, then fill NaNs (usually where min=max) with 0.5
+    # Pine: temp = (current_med - min_med) / (max_med - min_med)
     temp_series = (current_med - min_med).divide(diff_med.replace(0, np.nan))
     temp_series = temp_series.fillna(0.5).replace([np.inf, -np.inf], 0.5)
 
-    # --- Pass 2: Recursive Value and Momentum ---
+    # --- Pass 2: Recursive Value and Momentum (CRITICAL CORRECTION) ---
     value_list = []
     momentum_list = []
     
-    # Pine: var value = 0.5 * 2 = 1.0 (Initialization for the first bar)
-    value_prev = 0.0 # Emulates nz(value[1]) for the first bar
-    momentum_prev = 0.0 # Emulates nz(momentum[1]) for the first bar
+    # Pine initialization: var value = 0.5 * 2 = 1.0 
+    value_prev = 0.0       # Emulates nz(value[1]) on the first *calculation* bar
+    momentum_prev = 0.0    # Emulates nz(momentum[1])
+    base_value_initial = 1.0 # The initial value for the first recursive step
 
     for i in range(n):
         current_temp = temp_series.iloc[i]
@@ -504,25 +495,24 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             value_list.append(np.nan)
             momentum_list.append(np.nan)
             continue
-    
+            
         # --- 7. Value (Recursive) ---
         
         # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
         if i == 0:
-            # First bar initialization: value = 1.0. 
-            base_multiplier = 1.0 
+            # First non-NaN bar: uses the initial 'var value=1.0' as the multiplier 
+            # and nz(value[1])=0.0 as the recursive term.
+            new_value = base_value_initial * (current_temp - 0.5 + 0.5 * value_prev)
         else:
-            # Subsequent bars: value := value[1] * ...
-            base_multiplier = value_list[-1] 
-        
-        # nz(value[1]) emulation: value_prev is the previous *final* value
-        new_value = base_multiplier * (current_temp - 0.5 + 0.5 * value_prev)
+            # Subsequent bars: uses value_{i-1} as both the multiplier (value) 
+            # and the recursive term (nz(value[1]))
+            new_value = value_prev * (current_temp - 0.5 + 0.5 * value_prev)
 
         # Apply limits
         new_value = min(0.9999, max(-0.9999, new_value))
         
         value_list.append(new_value)
-        value_prev = new_value # Update previous value for the next iteration
+        value_prev = new_value # Update value_prev for the next iteration
 
         # --- 8. Momentum (Recursive) ---
         
@@ -532,23 +522,25 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             # Pine: temp2 = (1 + value) / (1 - value)
             temp2 = (1 + new_value) / (1 - new_value)
             
-            # Pine: momentum = .25 * math.log(temp2)
-            momentum_unfiltered = 0.25 * np.log(temp2)
-            
-            # Pine: momentum := momentum + .5 * nz(momentum[1])
-            # nz(momentum[1]) emulation: momentum_prev is the previous final momentum
-            new_momentum = momentum_unfiltered + 0.5 * momentum_prev
+            if temp2 <= 0:
+                 new_momentum = np.nan
+            else:
+                # Pine: momentum = .25 * math.log(temp2)
+                momentum_unfiltered = 0.25 * np.log(temp2)
+                
+                # Pine: momentum := momentum + .5 * nz(momentum[1])
+                new_momentum = momentum_unfiltered + 0.5 * momentum_prev
             
         momentum_list.append(new_momentum)
         
-        # Update previous momentum for the next iteration
         momentum_prev = new_momentum
     
-    # The final output is 'hist' / 'momentum'
     hist = pd.Series(momentum_list, index=close.index)
     
-    return hist
-# === END CORRECTED Magical Momentum Indicator ===
+    # Masking out the first MOMENTUM_PERIOD bars where min/max are likely NaN 
+    # to better emulate Pine indicator rendering.
+    return hist.mask(hist.index.to_series().rank(method='first') <= period, other=0.0)
+# === END FINAL CORRECTED Magical Momentum Indicator ===
 
 
 def check_pair(pair_name, pair_info, last_alerts):
