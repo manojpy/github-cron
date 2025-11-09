@@ -13,9 +13,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
-
-
-
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
