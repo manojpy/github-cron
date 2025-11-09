@@ -46,8 +46,6 @@ PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
 
-# Smoothed RSI (SRSI) settings <--- REMOVED
-
 # Cirrus Cloud settings
 X1 = 22
 X2 = 9
@@ -192,7 +190,7 @@ def get_candles(product_id, resolution="15", limit=150):
             'from': from_time,
             'to': to_time
         }
-        
+     
         response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
@@ -325,7 +323,6 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
                 continue
 
         prediction = estimate
-        
  
         kalman_gain = error_est / (error_est + error_meas)
         
@@ -376,6 +373,7 @@ def calculate_fibonacci_pivots(h, l, c):
     r2 = pivot + (diff * 0.618)
     r1 = pivot + (diff * 0.382)
 
+   
     # Support levels
     s1 = pivot - (diff * 0.382)
     s2 = pivot - (diff * 0.618)
@@ -389,7 +387,7 @@ def calculate_fibonacci_pivots(h, l, c):
 
 def check_pair(pair_name, pair_info, last_alerts):
     """Check Fibonacci Pivot conditions for a pair and return new state and log output."""
-    
+   
     # --- 1. Internal Log Collector ---
     thread_log = []
     
@@ -410,7 +408,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         if prev_day_ohlc is None:
             print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") 
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-            
+          
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
@@ -420,6 +418,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 210)
         min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 200), 65)
 
+      
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
     
         if df_15m is None or len(df_15m) < min_required:
@@ -429,7 +428,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate indicators
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
-        # SRSI CALCULATION REMOVED
         
         # Calculate 15m RMA 50
         rma_50_15m = calculate_rma(df_15m['close'], 50)
@@ -441,7 +439,7 @@ def check_pair(pair_name, pair_info, last_alerts):
 
 
         # Get values for the last closed 15m candle (index -2)
-       
+        
         open_prev = df_15m['open'].iloc[-2]
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
@@ -449,16 +447,18 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         
         ppo_curr = ppo.iloc[-2] 
-        # SRSI VARIABLE REMOVED
 
         rma_50_15m_curr = rma_50_15m.iloc[-2]
 
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") 
+        
         upw_curr = upw.iloc[-2]
    
         dnw_curr = dnw.iloc[-2]
         
         # --- Get 5-Minute Candles and RMA 200 ---
+        # CORRECTION: Set a robust default limit_5m (450) and min_required_5m (201)
+        # to ensure enough data for RMA 200 for all pairs, even if not in SPECIAL_PAIRS.
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 450)
         min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 201), 201)
         
@@ -481,7 +481,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         
         # --- 3. Define Alert Conditions ---
-        # SRSI CONDITIONS REMOVED
         
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
@@ -499,13 +498,14 @@ def check_pair(pair_name, pair_info, last_alerts):
             upper_wick_check = False
             lower_wick_check = False
         else:
-           
+        
             upper_wick_length = high_prev - max(open_prev, close_prev)
             lower_wick_length = min(open_prev, close_prev) - low_prev
             upper_wick_check = (upper_wick_length / candle_range) < 0.20
             lower_wick_check = (lower_wick_length / candle_range) < 0.20
         
         # --- 4. Pivot Crossover Logic ---
+     
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = False
         long_crossover_name = None
@@ -521,12 +521,14 @@ def check_pair(pair_name, pair_info, last_alerts):
             'R1': pivots['R1'], 'R2': pivots['R2']}
         short_crossover_line = False
         short_crossover_name = None
+ 
         if is_red:
       
             for name, line in short_pivot_lines.items():
                 if open_prev >= line and close_prev < line:
                     short_crossover_line = line
                     short_crossover_name = name
+   
                     break
    
         # --- 5. Signal Detection and State Management ---
@@ -536,13 +538,15 @@ def check_pair(pair_name, pair_info, last_alerts):
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
-        
+  
+       
         # === ADVANCED STATE RESET LOGIC ===
         if updated_state and updated_state.startswith('fib_'):
             try:
                 alert_type, pivot_name = updated_state.split('_')[-2:]
                 pivot_value = pivots.get(pivot_name)
                 
+    
                 if pivot_value is not None:
                     if alert_type == "long":
                         if pivot_name != 'R3' and close_prev < pivot_value:
@@ -550,10 +554,12 @@ def check_pair(pair_name, pair_info, last_alerts):
                             log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
                  
                     elif alert_type == "short":
+                       
                         if pivot_name != 'S3' and close_prev > pivot_value:
                             updated_state = None
                             log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
             except Exception as e:
+          
                 log(f"Error parsing saved state {updated_state}: {e}")
     
             
@@ -587,6 +593,7 @@ def check_pair(pair_name, pair_info, last_alerts):
               lower_wick_check and
               rma_short_ok): # <-- SRSI condition removed
         
+       
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             
@@ -598,6 +605,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
+  
                 send_telegram_alert(message)
                 
             updated_state = current_signal
@@ -605,6 +613,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         else:
             log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         
+     
         # --- RETURN BOTH STATE AND LOG ---
         return updated_state, '\n'.join(thread_log)
 
@@ -635,6 +644,7 @@ def main():
  
     # === APPLIED RESET STATE LOGIC ===
     if RESET_STATE and os.path.exists(STATE_FILE):
+     
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
     # =================================
@@ -646,6 +656,7 @@ def main():
     # This specifically targets old entries like 'sell_srsi45' loaded from the JSON state file.
     keys_to_purge = [k for k, v in list(last_alerts.items()) if v and 'srsi' in str(v).lower()]
     if keys_to_purge:
+  
         print(f"\n[INFO] 🧹 Purging old SRSI-related states (e.g., 'sell_srsi45') for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None # Set to None/clean state
@@ -675,6 +686,7 @@ def main():
     
     
         for pair_name, pair_info in PAIRS.items():
+          
             if pair_info is not None:
                 # Submit the task. check_pair now returns (new_state, log_output)
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts) 
@@ -689,6 +701,7 @@ def main():
                 # --- CAPTURE BOTH RETURN VALUES ---
                 new_state, log_output = future.result() 
      
+    
                 pair_logs.append(log_output) # Store the clean log output for sequential printing
                 
                 # Only increment updates if the state has changed.
