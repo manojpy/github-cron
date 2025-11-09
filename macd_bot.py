@@ -419,57 +419,45 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# === FINAL CORRECTED Magical Momentum Indicator v2.0 ===
+# === FINAL CORRECTED Magical Momentum Indicator v3.0 (Worm fix) ===
 def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENTUM_RESPONSIVENESS, stdev_period=MOMENTUM_STDEV_PERIOD):
     """
-    Implements the Magical Momentum Indicator logic from Pine Script, corrected
-    for initialization and recursive variable handling (v2.0 fix).
+    Implements the Magical Momentum Indicator logic from Pine Script, with fixes
+    for initialization and recursive variable handling (v3.0 fix).
     """
     close = df['close'].copy()
     n = len(close)
-    if n < period: # Need enough data for SMA and rolling functions
+    if n < period:
         return pd.Series([0.0] * n, index=close.index)
 
     # --- Pass 1: Worm and Raw Momentum ---
     sd_series = close.rolling(window=stdev_period).std() * responsiveness
     ma_series = calculate_sma(close, period)
 
-    worm_list = []
-    worm_prev = close.iloc[0] 
-
-    # Calculate worm and raw_momentum in a single loop
-    raw_momentum_list = []
-    for i in range(n):
+    worm_list = [close.iloc[0]]  # Initialize worm with the first close price
+    
+    for i in range(1, n):
         current_close = close.iloc[i]
-        current_ma = ma_series.iloc[i]
+        worm_prev = worm_list[-1]
         current_sd = sd_series.iloc[i]
         
-        # 1. Worm Calculation
-        if i == 0:
-            new_worm = current_close
-        else:
-            diff = current_close - worm_prev
-            
-            if np.isnan(current_sd) or current_sd == 0.0:
-                delta = diff
-            elif np.abs(diff) > current_sd:
-                delta = np.sign(diff) * current_sd
-            else:
-                delta = diff
-                
-            new_worm = worm_prev + delta
-            
-        worm_list.append(new_worm)
-        worm_prev = new_worm
+        diff = current_close - worm_prev
         
-        # 2. Raw Momentum Calculation
-        if np.isnan(new_worm) or new_worm == 0.0 or np.isnan(current_ma):
-            raw_momentum = np.nan
+        # Calculate delta
+        if np.isnan(current_sd) or current_sd == 0.0:
+            delta = diff
+        elif np.abs(diff) > current_sd:
+            delta = np.sign(diff) * current_sd
         else:
-            raw_momentum = (new_worm - current_ma) / new_worm
-        raw_momentum_list.append(raw_momentum)
-
-    raw_momentum_series = pd.Series(raw_momentum_list, index=close.index)
+            delta = diff
+            
+        new_worm = worm_prev + delta # Pine: worm := nz(worm[1]) + delta
+        worm_list.append(new_worm)
+        
+    worm_series = pd.Series(worm_list, index=close.index)
+    
+    # Calculate Raw Momentum (vectorized)
+    raw_momentum_series = (worm_series - ma_series) / worm_series
     
     # --- Post-Pass 1 calculations ---
     current_med = raw_momentum_series
@@ -477,77 +465,64 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
     max_med = current_med.rolling(window=period).max()
     
     diff_med = max_med - min_med
-    # temp = (current_med - min_med) / (max_med - min_med)
     temp_series = (current_med - min_med).divide(diff_med.replace(0, np.nan))
-    temp_series = temp_series.fillna(0.5).replace([np.inf, -np.inf], 0.5)
+    # CRITICAL: Forward fill NaN values (which are usually at the start) with 0.5 before the recursive calc
+    temp_series = temp_series.ffill().fillna(0.5).replace([np.inf, -np.inf], 0.5)
 
     # --- Pass 2: Recursive Value and Momentum (FINAL FIX HERE) ---
     value_list = []
     momentum_list = []
     
-    # Initial 'var' states for the recursive loop
-    value_prev = 0.0       # This acts as nz(value[1])
-    momentum_prev = 0.0    # This acts as nz(momentum[1])
+    value_prev = 0.0
+    momentum_prev = 0.0
     
-    # Determine the starting index for calculation (where temp_series starts being non-NaN)
-    start_index = temp_series.first_valid_index()
-    start_i = close.index.get_loc(start_index) if start_index is not None else n
-
+    # Find the index where temp_series is first calculated (after nans)
+    start_index = temp_series[temp_series.index.to_series().rank(method='first') >= period].index[0]
+    start_i = close.index.get_loc(start_index)
+    
     for i in range(n):
         current_temp = temp_series.iloc[i]
         
-        if np.isnan(current_temp) or i < start_i:
-            # Pad the beginning with NaNs for alignment before the calculation starts
-            value_list.append(np.nan)
-            momentum_list.append(np.nan)
+        # If the series has not started yet, pad with 0.0 (or NaN if you prefer to wait)
+        if i < start_i:
+            value_list.append(0.0)
+            momentum_list.append(0.0)
             continue
             
-        # --- 7. Value (Recursive) ---
+        # --- Value (Recursive) ---
         
-        # Pine: var value = 1.0 (Initialization for the very first calculated bar)
-        # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
-        if i == start_i:
-            # First calculated bar: uses the initial var state (1.0)
-            value_to_use = 1.0 
-        else:
-            # Subsequent bars: 'value' on the right side of ':=' is value_prev.
-            value_to_use = value_prev
-            
+        # The true "var" initialization happens here: value=1.0 for the very first calculated bar
+        value_to_use = 1.0 if i == start_i else value_prev
+        
         new_value = value_to_use * (current_temp - 0.5 + 0.5 * value_prev)
 
-        # Apply limits
         new_value = min(0.9999, max(-0.9999, new_value))
         
         value_list.append(new_value)
-        value_prev = new_value # Update value_prev for the next iteration
+        value_prev = new_value
 
-        # --- 8. Momentum (Recursive) ---
+        # --- Momentum (Recursive) ---
         
-        if np.abs(new_value) >= 1.0:
-            new_momentum = np.nan
+        if np.abs(new_value) >= 1.0 or new_value == -1.0: # Check for division by zero risk
+            new_momentum = 0.0
         else:
-            # Pine: temp2 = (1 + value) / (1 - value)
             temp2 = (1 + new_value) / (1 - new_value)
             
             if temp2 <= 0:
-                 new_momentum = np.nan
+                 momentum_unfiltered = 0.0
             else:
-                # Pine: momentum = .25 * math.log(temp2)
                 momentum_unfiltered = 0.25 * np.log(temp2)
                 
-                # Pine: momentum := momentum + .5 * nz(momentum[1])
-                new_momentum = momentum_unfiltered + 0.5 * momentum_prev
+            # Pine: momentum := momentum + .5 * nz(momentum[1])
+            new_momentum = momentum_unfiltered + 0.5 * momentum_prev
             
         momentum_list.append(new_momentum)
-        
-        # Momentum also becomes the previous value for the next bar
-        momentum_prev = new_momentum if not np.isnan(new_momentum) else 0.0 
+        momentum_prev = new_momentum
     
-    hist = pd.Series(momentum_list, index=close.index)
+    hist = pd.Series(momentum_list, index=close.index).fillna(0.0) # Fill any remaining NaNs with 0.0
     
-    # Masking out the first MOMENTUM_PERIOD bars where min/max are likely NaN 
-    return hist.mask(hist.index.to_series().rank(method='first') <= period, other=0.0)
-# === END FINAL CORRECTED Magical Momentum Indicator v2.0 ===
+    return hist
+# === END FINAL CORRECTED Magical Momentum Indicator v3.0 ===
 
 
 def check_pair(pair_name, pair_info, last_alerts):
@@ -728,8 +703,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
         
         # Magical Momentum Hist conditions
-        magical_hist_bullish = magical_hist_curr > 0 
-        magical_hist_bearish = magical_hist_curr < 0 
+        # FIX: The indicator is fixed to return 0.0 before the data window is complete.
+        # We need to make sure the value is not mathematically 0.0 from an early calculation.
+        magical_hist_bullish = magical_hist_curr > 0.0001 # Check if value is truly positive
+        magical_hist_bearish = magical_hist_curr < -0.0001 # Check if value is truly negative
 
         # Debug: Print crossover detections
         debug_log(f"\nCrossover Checks:")
@@ -741,8 +718,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         debug_log(f"\nCondition Checks:")
         
-        debug_log(f"  Magical Hist > 0: {magical_hist_bullish}") 
-        debug_log(f"  Magical Hist < 0: {magical_hist_bearish}") 
+        # Use the adjusted checks for robustness against floating-point zero
+        debug_log(f"  Magical Hist > 0 (Robust): {magical_hist_bullish}") 
+        debug_log(f"  Magical Hist < 0 (Robust): {magical_hist_bearish}") 
         
  
         current_state = None
