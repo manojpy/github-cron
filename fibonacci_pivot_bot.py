@@ -46,9 +46,7 @@ PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
 
-# Smoothed RSI (SRSI) settings
-SRSI_RSI_LEN = 21
-SRSI_KALMAN_LEN = 5
+# Smoothed RSI (SRSI) settings <--- REMOVED
 
 # Cirrus Cloud settings
 X1 = 22
@@ -57,8 +55,7 @@ X3 = 15
 X4 = 5
 
 # Pivot settings
-PIVOT_LOOKBACK_PERIOD = 15 # Lookback in days for daily high/low/close
-
+PIVOT_LOOKBACK_PERIOD = 15 
 STATE_FILE = 'alert_state.json' 
 
 # ============ UTILITY FUNCTIONS ============
@@ -103,7 +100,7 @@ def send_telegram_alert(message):
         
         response = requests.post(url, data=data, timeout=10)
         response_data = response.json()
-        
+  
         if response_data.get('ok'):
             print(f"✓ Alert sent successfully")
             return True
@@ -149,6 +146,7 @@ def get_product_ids():
         
         if data.get('success'):
             products = data['result']
+        
             if DEBUG_MODE:
                 print(f"[DEBUG] Received {len(products)} products from API")
             
@@ -208,6 +206,7 @@ def get_candles(product_id, resolution="15", limit=150):
                 'close': result['c'],
                 'volume': result['v']
             })
+          
             return df
         else:
             return None
@@ -254,7 +253,7 @@ def smoothrng(x, t, m):
 def rngfilt(x, r):
     """Implements rngfiltx1x1 from Pine Script using robust array iteration."""
     result_list = [x.iloc[0]] 
-    
+  
     for i in range(1, len(x)):
         prev_f = result_list[-1]
         curr_x = x.iloc[i] 
@@ -286,7 +285,7 @@ def calculate_cirrus_cloud(df):
     
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
-    
+ 
     # Upw (Green) is True when filter 1 line is BELOW filter 2 line.
     upw = filtx1 < filtx12 
     # Dnw (Red) is True when filter 1 line is ABOVE filter 2 line.
@@ -301,6 +300,7 @@ def calculate_rma(data, period):
 
 def kalman_filter(src, length, R = 0.01, Q = 0.1):
     """Implements the kalman_filter function from Pine Script"""
+    # *** KEPT FOR POTENTIAL FUTURE USE BUT SRSI FUNCTION REMOVED ***
     result_list = []
     
     estimate = np.nan
@@ -317,6 +317,7 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
             result_list.append(np.nan)
             continue
         
+        
         if np.isnan(estimate):
             if i > 0 and not np.isnan(src.iloc[i-1]):
                 estimate = src.iloc[i-1]
@@ -326,6 +327,7 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
 
         prediction = estimate
         
+ 
         kalman_gain = error_est / (error_est + error_meas)
         
         estimate = prediction + kalman_gain * (current_src - prediction)
@@ -340,26 +342,12 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
     
     return pd.Series(final_list, index=src.index)
 
-def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
+def calculate_smooth_rsi(df, rsi_len, kalman_len): # <--- REMOVED FUNCTION BODY
     """Calculate Smoothed RSI using Kalman Filter"""
-    close = df['close']
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    
-    # Use RMA for Wilder's smoothing
-    avg_gain = calculate_rma(gain, rsi_len)
-    # Use replace to handle division by zero safely
-    avg_loss = calculate_rma(loss, rsi_len) 
-    
-    # Avoid division by zero
-    rs = avg_gain / avg_loss.replace(0, 1e-9) 
-    rsi_value = 100 - (100 / (1 + rs))
-    
-    # Smooth RSI using Kalman Filter
-    smooth_rsi = kalman_filter(rsi_value, kalman_len)
-    
-    return smooth_rsi
+    # This function is now redundant as it's not called, 
+    # but the placeholder is kept to show the removal point.
+    pass
+
 
 # ============ FIBONACCI PIVOT FUNCTIONS ============
 
@@ -380,6 +368,7 @@ def get_previous_day_ohlc(product_id, days_back_limit=15):
 
 def calculate_fibonacci_pivots(h, l, c):
     """Calculate Fibonacci Pivots for the next day based on H, L, C of the previous day."""
+   
     pivot = (h + l + c) / 3
     
     diff = h - l
@@ -393,7 +382,7 @@ def calculate_fibonacci_pivots(h, l, c):
     s1 = pivot - (diff * 0.382)
     s2 = pivot - (diff * 0.618)
     s3 = pivot - (diff * 1.000)
-    
+   
     return {
         'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 
         'S1': s1, 'S2': s2, 'S3': s3
@@ -442,17 +431,19 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate indicators
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
-        smooth_rsi = calculate_smooth_rsi(df_15m)
+        # smooth_rsi = calculate_smooth_rsi(df_15m) <--- REMOVED SRSI CALCULATION
         
-        # Calculate 15m RMA 50
+        # Calculate 15m 
         rma_50_15m = calculate_rma(df_15m['close'], 50)
         
-        if len(ppo) < 3 or len(smooth_rsi) < 3 or len(rma_50_15m) < 3:
+        # Check only for PPO and RMA 50 length
+        if len(ppo) < 3 or len(rma_50_15m) < 3: 
             print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
 
         # Get values for the last closed 15m candle (index -2)
+       
         open_prev = df_15m['open'].iloc[-2]
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
@@ -460,11 +451,13 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         
         ppo_curr = ppo.iloc[-2] 
-        smooth_rsi_curr = smooth_rsi.iloc[-2]
+        # smooth_rsi_curr = smooth_rsi.iloc[-2] <--- REMOVED SRSI VARIABLE
         rma_50_15m_curr = rma_50_15m.iloc[-2]
 
-        log(f"15m PPO: {ppo_curr:.4f}, SRSI: {smooth_rsi_curr:.2f}, RMA 50: {rma_50_15m_curr:.2f}")
+        # Log SRSI removed
+        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") 
         upw_curr = upw.iloc[-2]
+   
         dnw_curr = dnw.iloc[-2]
         
         # --- Get 5-Minute Candles and RMA 200 ---
@@ -474,7 +467,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_200_5m_curr = np.nan
         
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-        
+      
         if df_5m is None or len(df_5m) < min_required_5m:
             log(f"Not enough 5m data for {pair_name}. RMA 200 5m check will be ignored (Need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0}).")
         else:
@@ -482,6 +475,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             
             if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
                 rma_200_5m_curr = rma_200_5m.iloc[-2]
+            
                 log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
                 log("5m RMA 200 calculation failed to produce a valid value.")
@@ -489,8 +483,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         
         # --- 3. Define Alert Conditions ---
-        srsi_above_50 = smooth_rsi_curr > 50
-        srsi_below_50 = smooth_rsi_curr < 50
+        # srsi_above_50 = smooth_rsi_curr > 50 <--- REMOVED SRSI CONDITION
+        # srsi_below_50 = smooth_rsi_curr < 50 <--- REMOVED SRSI CONDITION
         
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
@@ -499,6 +493,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
         rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
 
+    
         # Wick Checks
         candle_range = high_prev - low_prev
     
@@ -507,6 +502,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             upper_wick_check = False
             lower_wick_check = False
         else:
+           
             upper_wick_length = high_prev - max(open_prev, close_prev)
             lower_wick_length = min(open_prev, close_prev) - low_prev
             upper_wick_check = (upper_wick_length / candle_range) < 0.20
@@ -529,12 +525,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         short_crossover_line = False
         short_crossover_name = None
         if is_red:
+      
             for name, line in short_pivot_lines.items():
                 if open_prev >= line and close_prev < line:
                     short_crossover_line = line
                     short_crossover_name = name
                     break
-        
+   
         # --- 5. Signal Detection and State Management ---
         current_signal = None
         updated_state = last_alerts.get(pair_name) 
@@ -561,14 +558,15 @@ def check_pair(pair_name, pair_info, last_alerts):
                             log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
             except Exception as e:
                 log(f"Error parsing saved state {updated_state}: {e}")
-                
-        # 🟢 FINAL LONG SIGNAL CHECK (RMA 50 & RMA 200 added)
+    
+            
+        # 🟢 FINAL LONG SIGNAL CHECK (SRSI removed)
         if (upw_curr and (not dnw_curr) and 
-            srsi_above_50 and 
+            # srsi_above_50 and <--- REMOVED SRSI CONDITION
             (ppo_curr < 0.20) and 
             long_crossover_line and 
             upper_wick_check and
-            rma_long_ok): # <-- NEW CONDITION
+            rma_long_ok): 
         
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
@@ -586,13 +584,13 @@ def check_pair(pair_name, pair_info, last_alerts):
             updated_state = current_signal
             
 
-        # 🔴 FINAL SHORT SIGNAL CHECK (RMA 50 & RMA 200 added)
+        # 🔴 FINAL SHORT SIGNAL CHECK (SRSI removed)
         elif (dnw_curr and (not upw_curr) and 
-              srsi_below_50 and 
+              # srsi_below_50 and <--- REMOVED SRSI CONDITION
               (ppo_curr > -0.20) and 
               short_crossover_line and 
               lower_wick_check and
-              rma_short_ok): # <-- NEW CONDITION
+              rma_short_ok): 
         
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
@@ -620,7 +618,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
-        
+       
         return last_alerts.get(pair_name), '\n'.join(thread_log) 
 
 
@@ -639,6 +637,7 @@ def main():
     if SEND_TEST_MESSAGE:
         send_test_message()
 
+ 
     # === APPLIED RESET STATE LOGIC ===
     if RESET_STATE and os.path.exists(STATE_FILE):
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
@@ -656,6 +655,7 @@ def main():
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
  
+ 
     
     if found_count == 0:
         print("No valid pairs found. Exiting.")
@@ -669,11 +669,13 @@ def main():
         
         future_to_pair = {}
     
+    
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
                 # Submit the task. check_pair now returns (new_state, log_output)
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts) 
                 
+              
                 future_to_pair[future] = pair_name
 
         for future in as_completed(future_to_pair):
@@ -682,6 +684,7 @@ def main():
             try:
                 # --- CAPTURE BOTH RETURN VALUES ---
                 new_state, log_output = future.result() 
+     
                 pair_logs.append(log_output) # Store the clean log output for sequential printing
                 
                 # Only increment updates if the state has changed.
@@ -695,6 +698,7 @@ def main():
                 if DEBUG_MODE:
                     import traceback
                     traceback.print_exc()
+         
                 continue
             
     # --- PRINT COLLECTED LOGS SEQUENTIALLY (Fixes Interleaving) ---
