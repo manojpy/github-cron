@@ -289,6 +289,7 @@ def calculate_magical_momentum(df, responsiveness=0.9, period=144):
     max_med = raw_momentum.rolling(window=period, min_periods=1).max()
 
     value = np.zeros(n)
+    value[0] = 1.0 # <-- CORRECTION: Initialize first element to 1.0 to match Pine Script
     momentum = np.zeros(n)
 
     for i in range(1, n):
