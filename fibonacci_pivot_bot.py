@@ -341,9 +341,9 @@ def kalman_filter(src, length, R = 0.01, Q = 0.1):
     
     return pd.Series(final_list, index=src.index)
 
-def calculate_smooth_rsi(df, rsi_len=21, kalman_len=5): # <--- FUNCTION NO LONGER USED/NEEDED
+def calculate_smooth_rsi(df, rsi_len=21, kalman_len=5):
     """Calculate Smoothed RSI using Kalman Filter"""
-    # This function's logic is no longer required and is omitted.
+    # Function body removed to eliminate SRSI trace.
     pass
 
 
@@ -429,7 +429,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate indicators
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
-        # smooth_rsi = calculate_smooth_rsi(df_15m) <--- REMOVED SRSI CALCULATION
+        # SRSI CALCULATION REMOVED
         
         # Calculate 15m RMA 50
         rma_50_15m = calculate_rma(df_15m['close'], 50)
@@ -449,11 +449,11 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         
         ppo_curr = ppo.iloc[-2] 
-        # smooth_rsi_curr = smooth_rsi.iloc[-2] <--- REMOVED SRSI VARIABLE
+        # SRSI VARIABLE REMOVED
 
         rma_50_15m_curr = rma_50_15m.iloc[-2]
 
-        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") # <-- UPDATED LOG MESSAGE
+        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") 
         upw_curr = upw.iloc[-2]
    
         dnw_curr = dnw.iloc[-2]
@@ -481,8 +481,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         
         # --- 3. Define Alert Conditions ---
-        # srsi_above_50 = smooth_rsi_curr > 50 <--- REMOVED SRSI CONDITION
-        # srsi_below_50 = smooth_rsi_curr < 50 <--- REMOVED SRSI CONDITION
+        # SRSI CONDITIONS REMOVED
         
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
@@ -642,6 +641,15 @@ def main():
     
     # Load previous state
     last_alerts = load_state()
+
+    # --- STATE CLEANUP: Purge old SRSI state traces for a clean slate ---
+    # This specifically targets old entries like 'sell_srsi45' loaded from the JSON state file.
+    keys_to_purge = [k for k, v in list(last_alerts.items()) if v and 'srsi' in str(v).lower()]
+    if keys_to_purge:
+        print(f"\n[INFO] 🧹 Purging old SRSI-related states (e.g., 'sell_srsi45') for: {', '.join(keys_to_purge)}")
+        for key in keys_to_purge:
+            last_alerts[key] = None # Set to None/clean state
+    # -------------------------------------------------------------------
     
     # Fetch product IDs
     if not get_product_ids():
