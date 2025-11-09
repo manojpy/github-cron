@@ -172,6 +172,7 @@ def get_product_ids():
             debug_log(f"Received {len(products)} products from API")
         
             for product in products:
+                # Normalizing symbol for PAIRS dict matching
                 symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
                 
                 if product.get('contract_type') == 'perpetual_futures':
@@ -418,32 +419,32 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# === FINAL CORRECTED Magical Momentum Indicator ===
+# === FINAL CORRECTED Magical Momentum Indicator v2.0 ===
 def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENTUM_RESPONSIVENESS, stdev_period=MOMENTUM_STDEV_PERIOD):
     """
     Implements the Magical Momentum Indicator logic from Pine Script, corrected
-    for initialization and recursive variable handling to prevent zero output.
+    for initialization and recursive variable handling (v2.0 fix).
     """
     close = df['close'].copy()
     n = len(close)
-    if n == 0:
-        return pd.Series([], dtype=float)
+    if n < period: # Need enough data for SMA and rolling functions
+        return pd.Series([0.0] * n, index=close.index)
 
     # --- Pass 1: Worm and Raw Momentum ---
     sd_series = close.rolling(window=stdev_period).std() * responsiveness
     ma_series = calculate_sma(close, period)
 
     worm_list = []
-    raw_momentum_list = []
-    
-    # Initialize 'var worm = source'
     worm_prev = close.iloc[0] 
 
+    # Calculate worm and raw_momentum in a single loop
+    raw_momentum_list = []
     for i in range(n):
         current_close = close.iloc[i]
         current_ma = ma_series.iloc[i]
         current_sd = sd_series.iloc[i]
         
+        # 1. Worm Calculation
         if i == 0:
             new_worm = current_close
         else:
@@ -461,6 +462,7 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
         worm_list.append(new_worm)
         worm_prev = new_worm
         
+        # 2. Raw Momentum Calculation
         if np.isnan(new_worm) or new_worm == 0.0 or np.isnan(current_ma):
             raw_momentum = np.nan
         else:
@@ -475,38 +477,43 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
     max_med = current_med.rolling(window=period).max()
     
     diff_med = max_med - min_med
-    # Pine: temp = (current_med - min_med) / (max_med - min_med)
+    # temp = (current_med - min_med) / (max_med - min_med)
     temp_series = (current_med - min_med).divide(diff_med.replace(0, np.nan))
     temp_series = temp_series.fillna(0.5).replace([np.inf, -np.inf], 0.5)
 
-    # --- Pass 2: Recursive Value and Momentum (CRITICAL CORRECTION) ---
+    # --- Pass 2: Recursive Value and Momentum (FINAL FIX HERE) ---
     value_list = []
     momentum_list = []
     
-    # Pine initialization: var value = 0.5 * 2 = 1.0 
-    value_prev = 0.0       # Emulates nz(value[1]) on the first *calculation* bar
-    momentum_prev = 0.0    # Emulates nz(momentum[1])
-    base_value_initial = 1.0 # The initial value for the first recursive step
+    # Initial 'var' states for the recursive loop
+    value_prev = 0.0       # This acts as nz(value[1])
+    momentum_prev = 0.0    # This acts as nz(momentum[1])
+    
+    # Determine the starting index for calculation (where temp_series starts being non-NaN)
+    start_index = temp_series.first_valid_index()
+    start_i = close.index.get_loc(start_index) if start_index is not None else n
 
     for i in range(n):
         current_temp = temp_series.iloc[i]
         
-        if np.isnan(current_temp):
+        if np.isnan(current_temp) or i < start_i:
+            # Pad the beginning with NaNs for alignment before the calculation starts
             value_list.append(np.nan)
             momentum_list.append(np.nan)
             continue
             
         # --- 7. Value (Recursive) ---
         
+        # Pine: var value = 1.0 (Initialization for the very first calculated bar)
         # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
-        if i == 0:
-            # First non-NaN bar: uses the initial 'var value=1.0' as the multiplier 
-            # and nz(value[1])=0.0 as the recursive term.
-            new_value = base_value_initial * (current_temp - 0.5 + 0.5 * value_prev)
+        if i == start_i:
+            # First calculated bar: uses the initial var state (1.0)
+            value_to_use = 1.0 
         else:
-            # Subsequent bars: uses value_{i-1} as both the multiplier (value) 
-            # and the recursive term (nz(value[1]))
-            new_value = value_prev * (current_temp - 0.5 + 0.5 * value_prev)
+            # Subsequent bars: 'value' on the right side of ':=' is value_prev.
+            value_to_use = value_prev
+            
+        new_value = value_to_use * (current_temp - 0.5 + 0.5 * value_prev)
 
         # Apply limits
         new_value = min(0.9999, max(-0.9999, new_value))
@@ -533,14 +540,14 @@ def calculate_magical_momentum(df, period=MOMENTUM_PERIOD, responsiveness=MOMENT
             
         momentum_list.append(new_momentum)
         
-        momentum_prev = new_momentum
+        # Momentum also becomes the previous value for the next bar
+        momentum_prev = new_momentum if not np.isnan(new_momentum) else 0.0 
     
     hist = pd.Series(momentum_list, index=close.index)
     
     # Masking out the first MOMENTUM_PERIOD bars where min/max are likely NaN 
-    # to better emulate Pine indicator rendering.
     return hist.mask(hist.index.to_series().rank(method='first') <= period, other=0.0)
-# === END FINAL CORRECTED Magical Momentum Indicator ===
+# === END FINAL CORRECTED Magical Momentum Indicator v2.0 ===
 
 
 def check_pair(pair_name, pair_info, last_alerts):
@@ -706,12 +713,9 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_above_signal = ppo_curr > ppo_signal_curr
         ppo_below_signal = ppo_curr < ppo_signal_curr
         
-        # Added: PPO conditions for new SRSI alerts
+        # PPO conditions for SRSI alerts
         ppo_below_030 = ppo_curr < 0.30
         ppo_above_minus030 = ppo_curr > -0.30
-        
-        ppo_15m_above_020 = ppo_curr > 0.20 
-        ppo_15m_below_minus020 = ppo_curr < -0.20 
         
         # RMA conditions
         close_above_rma50 = close_curr > rma50_curr
@@ -719,11 +723,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_above_rma200 = close_5m_curr > rma200_curr
         close_below_rma200 = close_5m_curr < rma200_curr
         
-        # Smoothed RSI conditions (REMOVED FROM LOGIC, KEPT FOR DEBUG)
-        srsi_above_50 = smooth_rsi_curr > 50
-        srsi_below_50 = smooth_rsi_curr < 50
-        
-        # Modified: Smoothed RSI Crossover Conditions
+        # Smoothed RSI Crossover Conditions (Explicitly requested)
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
         
@@ -736,27 +736,13 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         debug_log(f"  PPO 15m cross up: {ppo_cross_up}")
         debug_log(f"  PPO 15m cross down: {ppo_cross_down}")
-        debug_log(f"  SRSI cross up 50 (Modified): {srsi_cross_up_50}") 
-        debug_log(f"  SRSI cross down 50 (Modified): {srsi_cross_down_50}") 
-        debug_log(f"  PPO 15m above 0.20: {ppo_15m_above_020}")
-        debug_log(f"  PPO 15m below -0.20: {ppo_15m_below_minus020}")
+        debug_log(f"  SRSI cross up 50: {srsi_cross_up_50}") 
+        debug_log(f"  SRSI cross down 50: {srsi_cross_down_50}") 
         
         debug_log(f"\nCondition Checks:")
         
-        debug_log(f"  PPO 15m < 0.20: {ppo_below_020}")
-        debug_log(f"  PPO 15m > -0.20: {ppo_above_minus020}")
-        debug_log(f"  PPO 15m < 0.30: {ppo_below_030}")
-        debug_log(f"  PPO 15m > -0.30: {ppo_above_minus030}")
-        debug_log(f"  PPO 15m > Signal: {ppo_above_signal}")
-        debug_log(f"  Close > RMA50: {close_above_rma50}")
-        debug_log(f"  Close > RMA200: {close_above_rma200}")
-        debug_log(f"  Upw (Cirrus): {upw_curr}") 
-        
-        debug_log(f"  Dnw (Cirrus): {dnw_curr}") 
-        debug_log(f"  SRSI > 50: {srsi_above_50}") 
-        debug_log(f"  SRSI < 50: {srsi_below_50}") 
-        debug_log(f"  Magical Hist > 0 (NEW): {magical_hist_bullish}") 
-        debug_log(f"  Magical Hist < 0 (NEW): {magical_hist_bearish}") 
+        debug_log(f"  Magical Hist > 0: {magical_hist_bullish}") 
+        debug_log(f"  Magical Hist < 0: {magical_hist_bearish}") 
         
  
         current_state = None
@@ -768,6 +754,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         price = df_15m['close'].iloc[-1]
         
  
+        # --- ALERT LOGIC (8 SIGNALS) ---
+        
         # 1. ORIGINAL BUY: PPO crosses up AND PPO < 0.20 AND ... (Hist > 0 added)
         if (ppo_cross_up and 
             ppo_below_020 and 
@@ -805,9 +793,9 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
                
-        # 3. NEW BUY ALERT (SRSI CROSS UP 50) (Hist > 0 added)
+        # 3. SRSI BUY ALERT (SRSI CROSS UP 50) - ONLY SRSI CROSS IS THE CONDITION
         elif (srsi_cross_up_50 and 
-              ppo_above_signal and 
+              ppo_above_signal and # Keep supporting PPO signal above 
               ppo_below_030 and 
               close_above_rma50 and 
               close_above_rma200 and 
@@ -822,9 +810,9 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 debug_log(f"BUY (SRSI 50) already alerted for {pair_name}, skipping duplicate") 
                 
-        # 4. NEW SELL ALERT (SRSI CROSS DOWN 50) (Hist < 0 added)
+        # 4. SRSI SELL ALERT (SRSI CROSS DOWN 50) - ONLY SRSI CROSS IS THE CONDITION
         elif (srsi_cross_down_50 and 
-              ppo_below_signal and 
+              ppo_below_signal and # Keep supporting PPO signal below
               ppo_above_minus030 and 
               close_below_rma50 and 
               close_below_rma200 and 
