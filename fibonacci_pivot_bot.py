@@ -13,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
-
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
@@ -36,7 +35,8 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    # SOLUSD entry removed. The RMA 200 check is now bypassed in check_pair logic.
+    # Increased minimum requirements for better stability
+    "SOLUSD": {"limit_15m": 250, "min_required": 150, "limit_5m": 500, "min_required_5m": 250}
 }
 
 # Indicator settings
@@ -103,11 +103,11 @@ def send_telegram_alert(message):
             print(f"✓ Alert sent successfully")
             return True
         else:
-            print(f"❌ Telegram error: {response_data}")
+            print(f"✗ Telegram error: {response_data}")
             return False
         
     except Exception as e:
-        print(f"❌ Error sending Telegram message: {e}")
+        print(f"✗ Error sending Telegram message: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
@@ -129,7 +129,7 @@ def send_test_message():
     if success:
         print("✓ Test message sent successfully!")
     else:
-        print("❌ Test message failed - check your bot token and chat ID")
+        print("✗ Test message failed - check your bot token and chat ID")
     
     print("="*50 + "\n")
     return success
@@ -190,7 +190,7 @@ def get_candles(product_id, resolution="15", limit=150):
             'from': from_time,
             'to': to_time
         }
-     
+        
         response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
@@ -296,54 +296,6 @@ def calculate_rma(data, period):
     # Uses alpha=1/period for closer match to Pine ta.rma
     return data.ewm(alpha=1/period, adjust=False).mean()
 
-def kalman_filter(src, length, R = 0.01, Q = 0.1):
-    """Implements the kalman_filter function from Pine Script"""
-    result_list = []
-    
-    estimate = np.nan
-    error_est = 1.0
-    
-    error_meas = R * length
-    Q_div_length = Q / length
-
-    # Use a loop to mimic bar-by-bar 'var' behavior in Pine Script
-    for i in range(len(src)):
-        current_src = src.iloc[i]
-        
-        if np.isnan(current_src):
-            result_list.append(np.nan)
-            continue
-        
-        
-        if np.isnan(estimate):
-            if i > 0 and not np.isnan(src.iloc[i-1]):
-                estimate = src.iloc[i-1]
-            else:
-                result_list.append(np.nan)
-                continue
-
-        prediction = estimate
- 
-        kalman_gain = error_est / (error_est + error_meas)
-        
-        estimate = prediction + kalman_gain * (current_src - prediction)
-        
-        error_est = (1 - kalman_gain) * error_est + Q_div_length
-        
-        result_list.append(estimate)
-
-    # Pad with NaNs at the beginning to ensure series is the same length
-    num_nan_pad = len(src) - len(result_list)
-    final_list = [np.nan] * num_nan_pad + result_list
-    
-    return pd.Series(final_list, index=src.index)
-
-def calculate_smooth_rsi(df, rsi_len=21, kalman_len=5):
-    """Calculate Smoothed RSI using Kalman Filter"""
-    # Function body removed to eliminate SRSI trace.
-    pass
-
-
 # ============ FIBONACCI PIVOT FUNCTIONS ============
 
 def get_previous_day_ohlc(product_id, days_back_limit=15):
@@ -373,7 +325,6 @@ def calculate_fibonacci_pivots(h, l, c):
     r2 = pivot + (diff * 0.618)
     r1 = pivot + (diff * 0.382)
 
-   
     # Support levels
     s1 = pivot - (diff * 0.382)
     s2 = pivot - (diff * 0.618)
@@ -387,7 +338,7 @@ def calculate_fibonacci_pivots(h, l, c):
 
 def check_pair(pair_name, pair_info, last_alerts):
     """Check Fibonacci Pivot conditions for a pair and return new state and log output."""
-   
+    
     # --- 1. Internal Log Collector ---
     thread_log = []
     
@@ -406,37 +357,39 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 1. Get Pivot Data (Previous Day) ---
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
-            print(f"Skipping {pair_name}: Failed to get previous day OHLC data.") 
+            print(f"❌ {pair_name}: Failed to fetch previous day OHLC data") 
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-          
+            
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
-        log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, S1={pivots['S1']:.2f}")
+        log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, R2={pivots['R2']:.2f}, R3={pivots['R3']:.2f}")
+        log(f"             S1={pivots['S1']:.2f}, S2={pivots['S2']:.2f}, S3={pivots['S3']:.2f}")
 
         # --- 2. Get 15-Minute Candles and Indicators ---
-        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 210)
-        min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 200), 65)
+        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)  # Increased
+        min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150), 150)  # Increased
 
-      
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
     
-        if df_15m is None or len(df_15m) < min_required:
-            print(f"Not enough 15m data for {pair_name}. Need {min_required}, got {len(df_15m) if df_15m is not None else 0}.")
-            return last_alerts.get(pair_name), '\n'.join(thread_log) 
-
-        # Calculate indicators
-        ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
-        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
-        
-        # Calculate 15m RMA 50
-        rma_50_15m = calculate_rma(df_15m['close'], 50)
-        
-        # Check only for PPO and RMA 50 length
-        if len(ppo) < 3 or len(rma_50_15m) < 3: 
-            print(f"Skipping {pair_name}: Indicators did not produce enough data (need >= 3).")
+        if df_15m is None:
+            print(f"❌ {pair_name}: Failed to fetch 15m candle data")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+            
+        if len(df_15m) < min_required:
+            print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
+        # Calculate 15m indicators
+        ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
+        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
+        rma_50_15m = calculate_rma(df_15m['close'], 50)
+        
+        # Validate indicator lengths (FIXED: Added upw/dnw checks)
+        if (len(ppo) < 3 or len(rma_50_15m) < 3 or 
+            len(upw) < 3 or len(dnw) < 3):
+            print(f"⚠️  {pair_name}: Indicators produced insufficient data (<3 points)")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
 
         # Get values for the last closed 15m candle (index -2)
         open_prev = df_15m['open'].iloc[-2]
@@ -445,136 +398,155 @@ def check_pair(pair_name, pair_info, last_alerts):
         low_prev = df_15m['low'].iloc[-2]
         
         ppo_curr = ppo.iloc[-2] 
-
         rma_50_15m_curr = rma_50_15m.iloc[-2]
-
-        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}") 
-        
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
         
-        # --- Get 5-Minute Candles and RMA 200 ---
-        # Initialize
-        rma_200_5m_curr = np.nan 
+        # Validate for NaN values (ADDED)
+        if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr) or 
+            pd.isna(upw_curr) or pd.isna(dnw_curr)):
+            log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
         
-        # **START SOLUSD EXCEPTION LOGIC**
-        if pair_name == "SOLUSD":
-            # Set rma_200_5m_curr equal to rma_50_15m_curr to force rma_long_ok/rma_short_ok
-            # to rely solely on the 15m RMA 50 condition for this pair.
-            rma_200_5m_curr = rma_50_15m_curr
-            log("SOLUSD EXCEPTION: Bypassing 5m RMA 200 check; relying on 15m RMA 50 only.")
-        # **END SOLUSD EXCEPTION LOGIC**
+        # Validate price data (ADDED)
+        if close_prev <= 0 or open_prev <= 0:
+            log(f"Skipping {pair_name}: Invalid price data")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+
+        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
+        
+        # --- 3. Get 5-Minute Candles and RMA 200 ---
+        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)  # Increased
+        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250), 250)  # Increased
+        
+        rma_200_5m_curr = np.nan
+        rma_200_available = False
+        
+        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
+      
+        if df_5m is None or len(df_5m) < min_required_5m:
+            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0})")
+            log("RMA 200 5m check will be skipped - using only RMA 50 15m")
         else:
-            # Normal 5m RMA 200 check for all other pairs
-            limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 450)
-            min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 201), 201)
+            rma_200_5m = calculate_rma(df_5m['close'], 200)
             
-            df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-          
-            if df_5m is None or len(df_5m) < min_required_5m:
-                log(f"Not enough 5m data for {pair_name}. RMA 200 5m check will be ignored (Need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0}).")
+            if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
+                rma_200_5m_curr = rma_200_5m.iloc[-2]
+                rma_200_available = True
+                log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
-                rma_200_5m = calculate_rma(df_5m['close'], 200)
-                
-                if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
-                    rma_200_5m_curr = rma_200_5m.iloc[-2]
-                
-                    log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
-                else:
-                    log("5m RMA 200 calculation failed to produce a valid value.")
-        # --- END 5M RMA 200 BLOCK ---
+                log("5m RMA 200 calculation produced NaN - will be skipped")
         
-        
-        # --- 3. Define Alert Conditions ---
-        
+        # --- 4. Define Alert Conditions ---
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
         
-        # New MA conditions
-        # If SOLUSD, rma_200_5m_curr == rma_50_15m_curr, making the condition dependent only on RMA 50
-        rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
-        rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
-
+        # FIXED: Handle RMA 200 unavailability properly
+        if rma_200_available:
+            rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
+            rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
+            log(f"Using both RMA checks (50 15m + 200 5m)")
+        else:
+            rma_long_ok = rma_50_15m_curr < close_prev
+            rma_short_ok = rma_50_15m_curr > close_prev
+            log(f"Using only RMA 50 15m (RMA 200 5m unavailable)")
     
         # Wick Checks
         candle_range = high_prev - low_prev
     
         if candle_range <= 0:
-            log("Candle range is zero or negative, skipping wick checks.")
+            log("Candle range is zero or negative, skipping wick checks")
             upper_wick_check = False
             lower_wick_check = False
         else:
-        
             upper_wick_length = high_prev - max(open_prev, close_prev)
             lower_wick_length = min(open_prev, close_prev) - low_prev
             upper_wick_check = (upper_wick_length / candle_range) < 0.20
             lower_wick_check = (lower_wick_length / candle_range) < 0.20
         
-        # --- 4. Pivot Crossover Logic ---
-     
-        long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
+        # Optional: Add volatility filter (ADDED)
+        price_change_pct = abs((close_prev - open_prev) / open_prev) * 100
+        if price_change_pct > 10:  # More than 10% move in 15m
+            log(f"⚠️  Extreme volatility detected ({price_change_pct:.2f}%), skipping signal")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+        
+        # --- 5. Pivot Crossover Logic ---
+        # NEW: Block signals if candle closes above R3 or below S3
+        if close_prev > pivots['R3']:
+            log(f"⚠️  Price closed above R3 (${pivots['R3']:.2f}), blocking LONG signal")
+            # Allow state to continue but don't generate new signals
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+            
+        if close_prev < pivots['S3']:
+            log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
+            # Allow state to continue but don't generate new signals
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+        
+        long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 
+                           'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = False
         long_crossover_name = None
  
         if is_green:
+            # Check if candle crossed above any pivot (open below, close above)
             for name, line in long_pivot_lines.items():
                 if open_prev <= line and close_prev > line: 
                     long_crossover_line = line
                     long_crossover_name = name
-                    break
+                    break  # Only take first crossover
 
         short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 
-            'R1': pivots['R1'], 'R2': pivots['R2']}
+                            'R1': pivots['R1'], 'R2': pivots['R2']}
         short_crossover_line = False
         short_crossover_name = None
- 
+        
         if is_red:
-      
+            # Check if candle crossed below any pivot (open above, close below)
             for name, line in short_pivot_lines.items():
                 if open_prev >= line and close_prev < line:
                     short_crossover_line = line
                     short_crossover_name = name
+                    break  # Only take first crossover
    
-                    break
-   
-        # --- 5. Signal Detection and State Management ---
+        # --- 6. Signal Detection and State Management ---
         current_signal = None
         updated_state = last_alerts.get(pair_name) 
         
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
-  
-       
-        # === ADVANCED STATE RESET LOGIC ===
+        
+        # IMPROVED: State Reset Logic
         if updated_state and updated_state.startswith('fib_'):
             try:
-                alert_type, pivot_name = updated_state.split('_')[-2:]
-                pivot_value = pivots.get(pivot_name)
-                
-    
-                if pivot_value is not None:
-                    if alert_type == "long":
-                        if pivot_name != 'R3' and close_prev < pivot_value:
-                            updated_state = None
-                            log(f"\nALERT STATE RESET: {pair_name} Long (Close ${close_prev:,.2f} < {pivot_name} ${pivot_value:,.2f})")
-                 
-                    elif alert_type == "short":
-                       
-                        if pivot_name != 'S3' and close_prev > pivot_value:
-                            updated_state = None
-                            log(f"\nALERT STATE RESET: {pair_name} Short (Close ${close_prev:,.2f} > {pivot_name} ${pivot_value:,.2f})")
+                parts = updated_state.split('_')
+                if len(parts) >= 3:
+                    alert_type = parts[1]  # 'long' or 'short'
+                    pivot_name = parts[2]  # 'R1', 'S1', etc.
+                    pivot_value = pivots.get(pivot_name)
+                    
+                    if pivot_value is not None:
+                        if alert_type == "long":
+                            # Reset long position if price falls below the original pivot
+                            if close_prev < pivot_value:
+                                updated_state = None
+                                log(f"🔄 STATE RESET: {pair_name} Long - Price ${close_prev:,.2f} fell below {pivot_name} ${pivot_value:,.2f}")
+                     
+                        elif alert_type == "short":
+                            # Reset short position if price rises above the original pivot
+                            if close_prev > pivot_value:
+                                updated_state = None
+                                log(f"🔄 STATE RESET: {pair_name} Short - Price ${close_prev:,.2f} rose above {pivot_name} ${pivot_value:,.2f}")
             except Exception as e:
-          
                 log(f"Error parsing saved state {updated_state}: {e}")
     
-            
-        # 🟢 FINAL LONG SIGNAL CHECK (SRSI removed)
+        # --- 7. Final Signal Checks ---
+        # 🟢 LONG SIGNAL
         if (upw_curr and (not dnw_curr) and 
             (ppo_curr < 0.20) and 
             long_crossover_line and 
             upper_wick_check and
-            rma_long_ok): # Now only relies on 15m RMA 50 for SOLUSD
+            rma_long_ok):
         
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
@@ -590,16 +562,14 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
                 
             updated_state = current_signal
-            
 
-        # 🔴 FINAL SHORT SIGNAL CHECK (SRSI removed)
+        # 🔴 SHORT SIGNAL
         elif (dnw_curr and (not upw_curr) and 
               (ppo_curr > -0.20) and 
               short_crossover_line and 
               lower_wick_check and
-              rma_short_ok): # Now only relies on 15m RMA 50 for SOLUSD
+              rma_short_ok):
         
-       
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             
@@ -611,7 +581,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
-  
                 send_telegram_alert(message)
                 
             updated_state = current_signal
@@ -619,21 +588,18 @@ def check_pair(pair_name, pair_info, last_alerts):
         else:
             log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         
-     
-        # --- RETURN BOTH STATE AND LOG ---
         return updated_state, '\n'.join(thread_log)
 
     except Exception as e:
-        print(f"Error checking {pair_name}: {e}")
+        print(f"❌ Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
        
-        return last_alerts.get(pair_name), '\n'.join(thread_log) 
+        return last_alerts.get(pair_name), '\n'.join(thread_log)
 
 
 def main():
- 
     """Main function - runs once per GitHub Actions execution"""
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
@@ -650,7 +616,6 @@ def main():
  
     # === APPLIED RESET STATE LOGIC ===
     if RESET_STATE and os.path.exists(STATE_FILE):
-     
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
     # =================================
@@ -662,7 +627,6 @@ def main():
     # This specifically targets old entries like 'sell_srsi45' loaded from the JSON state file.
     keys_to_purge = [k for k, v in list(last_alerts.items()) if v and 'srsi' in str(v).lower()]
     if keys_to_purge:
-  
         print(f"\n[INFO] 🧹 Purging old SRSI-related states (e.g., 'sell_srsi45') for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None # Set to None/clean state
@@ -692,7 +656,6 @@ def main():
     
     
         for pair_name, pair_info in PAIRS.items():
-          
             if pair_info is not None:
                 # Submit the task. check_pair now returns (new_state, log_output)
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts) 
@@ -707,7 +670,6 @@ def main():
                 # --- CAPTURE BOTH RETURN VALUES ---
                 new_state, log_output = future.result() 
      
-    
                 pair_logs.append(log_output) # Store the clean log output for sequential printing
                 
                 # Only increment updates if the state has changed.
