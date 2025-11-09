@@ -289,7 +289,7 @@ def calculate_magical_momentum(df, responsiveness=0.9, period=144):
     max_med = raw_momentum.rolling(window=period, min_periods=1).max()
 
     value = np.zeros(n)
-    value[0] = 1.0 # <-- CORRECTION: Initialize first element to 1.0 to match Pine Script
+    value[0] = 1.0 # Initialisation fix
     momentum = np.zeros(n)
 
     for i in range(1, n):
@@ -299,22 +299,28 @@ def calculate_magical_momentum(df, responsiveness=0.9, period=144):
         else:
             temp = (raw_momentum.iloc[i] - min_med.iloc[i]) / denom
 
-        prev_value = value[i-1]
-        v = 1.0 * (temp - 0.5 + 0.5 * prev_value)
+        # ENHANCEMENT: Explicit casting for numerical stability
+        prev_value = float(value[i-1]) 
+        temp_float = float(temp) 
+        
+        # Value smoothing and clipping
+        v = float(temp_float - 0.5 + 0.5 * prev_value) # Use floats for arithmetic
         v = max(min(v, 0.9999), -0.9999)
         value[i] = v
 
         denom2 = (1.0 - v) if (1.0 - v) != 0 else 1e-12
         temp2 = (1.0 + v) / denom2
+        
         if temp2 <= 0 or np.isnan(temp2):
             mom = 0.0
         else:
             mom = 0.25 * np.log(temp2)
-        momentum[i] = mom + 0.5 * momentum[i-1]
+            
+        # Final recursive smoothing
+        momentum[i] = float(mom) + 0.5 * float(momentum[i-1]) # Use floats for arithmetic
 
     hist = pd.Series(momentum, index=df.index)
     return hist
-
 # === END Magical Momentum ===
 
 def check_pair(pair_name, pair_info, last_alerts):
