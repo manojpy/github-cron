@@ -15,6 +15,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
+LOG_FILE = "macd_bot_log.txt"
 
 DELTA_API_BASE = "https://api.delta.exchange"
 
@@ -36,9 +37,11 @@ STATE_FILE = 'alert_state.json'
 
 # ============ UTILITIES ============
 
-def debug_log(msg): 
-    if DEBUG_MODE: 
+def debug_log(msg):
+    if DEBUG_MODE:
         print(f"[DEBUG] {msg}")
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
 def load_state():
     try:
@@ -55,6 +58,7 @@ def save_state(s):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(s, f)
+        debug_log("State saved.")
     except Exception as e:
         print(f"Error saving state: {e}")
 
@@ -63,7 +67,7 @@ def send_telegram_alert(msg):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
         if r.json().get("ok"):
-            print("✓ Alert sent")
+            print(f"✓ Telegram alert sent: {msg[:40]}...")
             return True
         print("❌ Telegram error:", r.text)
     except Exception as e:
@@ -80,10 +84,12 @@ def send_test_message():
 def get_product_ids():
     try:
         r = requests.get(f"{DELTA_API_BASE}/v2/products", timeout=10).json()
-        if not r.get("success"): return False
+        if not r.get("success"):
+            return False
         for p in r["result"]:
             symbol = p["symbol"].replace("_USDT","USD").replace("USDT","USD")
-            if p.get("contract_type") != "perpetual_futures": continue
+            if p.get("contract_type") != "perpetual_futures":
+                continue
             for k in PAIRS:
                 if symbol == k or symbol.replace("_","") == k:
                     PAIRS[k] = {"id": p["id"], "symbol": p["symbol"]}
@@ -118,7 +124,7 @@ def rma(x,n): return x.ewm(alpha=1/n,adjust=False).mean()
 
 def ppo(df,f=7,s=16,signal=5,use_sma=False):
     c=df.close
-    fma,sma_ = (sma(c,f),sma(c,s)) if use_sma else (ema(c,f),ema(c,s))
+    fma,sma_= (sma(c,f),sma(c,s)) if use_sma else (ema(c,f),ema(c,s))
     p=(fma-sma_)/sma_*100
     sig=sma(p,signal) if use_sma else ema(p,signal)
     return p,sig
@@ -167,15 +173,22 @@ def srsi(df):
 
 def check_pair(name,info,last_alerts):
     try:
-        if not info: return None
+        if not info:
+            return None
         sp=SPECIAL_PAIRS.get(name,{})
         lim15,req15=sp.get("limit_15m",210),sp.get("min_required",150)
         lim5,req5=max(sp.get("limit_5m",300),RMA_200_PERIOD+50),max(sp.get("min_required_5m",250),RMA_200_PERIOD)
 
+        print(f"\n--- Checking {name} ---")
         d15=get_candles(info["symbol"],"15",lim15)
         d5=get_candles(info["symbol"],"5",lim5)
-        if d15 is None or len(d15)<req15: return None
-        if d5 is None or len(d5)<req5: return None
+        if d15 is None or len(d15)<req15:
+            print(f"⚠️ Not enough 15m data for {name}")
+            return None
+        if d5 is None or len(d5)<req5:
+            print(f"⚠️ Not enough 5m data for {name}")
+            return None
+        print(f"15m candles: {len(d15)}, 5m candles: {len(d5)}")
 
         p,sig=ppo(d15,PPO_FAST,PPO_SLOW,PPO_SIGNAL,PPO_USE_SMA)
         r50,r200=rma(d15.close,RMA_50_PERIOD),rma(d5.close,RMA_200_PERIOD)
@@ -183,6 +196,7 @@ def check_pair(name,info,last_alerts):
         rs=srsi(d15)
 
         if any(pd.isna(v) for v in [p.iloc[-1],r50.iloc[-1],r200.iloc[-1],rs.iloc[-1]]):
+            print(f"⚠️ Incomplete indicator data for {name}")
             return None
 
         ppo_c,ppo_p=p.iloc[-1],p.iloc[-2]
@@ -191,14 +205,14 @@ def check_pair(name,info,last_alerts):
         close_c=d15.close.iloc[-1]; open_c=d15.open.iloc[-1]
         high_c,low_c=d15.high.iloc[-1],d15.low.iloc[-1]
         upw_c,dnw_c=upw.iloc[-1],dnw.iloc[-1]
-        close_5=r200.index and d5.close.iloc[-1]; r200_c=r200.iloc[-1]
+        close_5=d5.close.iloc[-1]; r200_c=r200.iloc[-1]
 
-        # Candle structure
+        debug_log(f"{name} | PPO {ppo_c:.3f} | Sig {sig_c:.3f} | RSI {rsi_c:.2f} | Upw {upw_c} Dnw {dnw_c}")
+
         rng=high_c-low_c
         strong_bull=(close_c>open_c and rng>0 and (high_c-max(open_c,close_c))/rng<.2)
         strong_bear=(close_c<open_c and rng>0 and (min(open_c,close_c)-low_c)/rng<.2)
 
-        # PPO crosses
         x_up=(ppo_p<=sig_p and ppo_c>sig_c)
         x_dn=(ppo_p>=sig_p and ppo_c<sig_c)
         above0=(ppo_p<=0 and ppo_c>0)
@@ -221,7 +235,6 @@ def check_pair(name,info,last_alerts):
         price=close_c
 
         msg=None; state=None
-        # --- signals ---
         if x_up and cond["ppo_lt020"] and cond["c_abv50"] and cond["c_abv200"] and upw_c and not dnw_c and strong_bull:
             state="buy"; msg=f"🟢 {name} BUY\nPPO CrossUp\nPrice ${price:.2f}\n{t}"
         elif x_dn and cond["ppo_gtm020"] and cond["c_blw50"] and cond["c_blw200"] and dnw_c and not upw_c and strong_bear:
@@ -241,7 +254,10 @@ def check_pair(name,info,last_alerts):
 
         if msg and last_alerts.get(name)!=state:
             send_telegram_alert(msg)
+            print(f"📢 {name}: {state.upper()} alert sent.")
             return state
+        else:
+            print(f"No signal for {name}. PPO {ppo_c:.2f}, RSI {rsi_c:.1f}")
         return None
     except Exception as e:
         print("Error checking",name,":",e)
@@ -257,13 +273,18 @@ def main():
     print(f"PPO/Cirrus Bot - {start.strftime('%d-%m-%Y @ %H:%M IST')}")
     print(f"Debug: {'ON' if DEBUG_MODE else 'OFF'}")
     print("="*50)
-    if SEND_TEST_MESSAGE: send_test_message()
+    if SEND_TEST_MESSAGE:
+        send_test_message()
+
     state=load_state()
     if not get_product_ids():
-        print("Product load failed"); return
+        print("❌ Product load failed")
+        return
     valid=sum(1 for v in PAIRS.values() if v)
     print(f"✓ Monitoring {valid} pairs")
-    if valid==0: return
+    if valid==0:
+        return
+
     alerts=0
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs={ex.submit(check_pair,k,v,state.copy()):k for k,v in PAIRS.items() if v}
@@ -271,13 +292,20 @@ def main():
             k=futs[f]
             try:
                 new=f.result()
-                if new: state[k]=new; alerts+=1
+                if new:
+                    state[k]=new
+                    alerts+=1
             except Exception as e:
                 print("Thread error",k,":",e)
                 if DEBUG_MODE: traceback.print_exc()
+
     save_state(state)
     dur=(datetime.now(ist)-start).total_seconds()
-    print(f"✓ Done {alerts} updates in {dur:.1f}s")
+    print("\nSummary:")
+    print(f"  Total pairs checked: {valid}")
+    print(f"  Alerts sent: {alerts}")
+    print(f"  Execution time: {dur:.1f}s")
+    print(f"  Completed at: {datetime.now(ist).strftime('%H:%M:%S')}")
     print("="*50)
 
 if __name__=="__main__":
