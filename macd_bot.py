@@ -379,13 +379,14 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     
     return smooth_rsi
 
-# === Magical Momentum indicator implementation (ported from Pine Script) ===
+# === Magical Momentum indicator implementation (accurate recursive Pine-matching) ===
 def calculate_magical_momentum(df, responsiveness=0.9, period=144):
     """
-    Port of Magical Momentum Indicator (Pine Script v6).
-    Returns a pandas Series representing the 'hist' (momentum histogram).
+    Accurate port of Magical Momentum Indicator (Pine Script v6)
+    with recursive updates for value[] and momentum[] as in Pine's := behavior.
+    Returns a pandas Series representing the smoothed 'momentum' (hist).
     """
-    source = df['close'].copy().reset_index(drop=True)
+    source = df['close'].astype(float).reset_index(drop=True)
     n = len(source)
     if n == 0:
         return pd.Series([], dtype=float)
@@ -405,6 +406,7 @@ def calculate_magical_momentum(df, responsiveness=0.9, period=144):
         else:
             delta = diff
         worm.append(prev_w + delta)
+    # align index with df
     worm = pd.Series(worm, index=df.index)
 
     # SMA (ma)
@@ -419,47 +421,38 @@ def calculate_magical_momentum(df, responsiveness=0.9, period=144):
     min_med = raw_momentum.rolling(window=period, min_periods=1).min()
     max_med = raw_momentum.rolling(window=period, min_periods=1).max()
 
-    # temp with safe division
-    denom = (max_med - min_med).replace(0, np.nan)
-    temp = (raw_momentum - min_med).divide(denom).fillna(0.5)
+    # prepare arrays for recursive computation
+    value = np.zeros(n)
+    momentum = np.zeros(n)
 
-    # value recursive series
-    value = pd.Series(0.0, index=df.index)
-    # initialize same as Pine: value = 0.5 * 2  (==1) then used in recurrence, but we will set first element accordingly
-    # We'll follow similar recurrence: value[i] = base * (temp[i] - .5 + .5 * value[i-1])
-    base = 0.5 * 2.0  # equals 1.0
-    if len(value) > 0:
-        value.iloc[0] = 0.0  # start with 0.0 to avoid crazy initial spikes
+    # initial conditions: value[0] = 0, momentum[0] = 0 (keeps it stable)
     for i in range(1, n):
-        prev = value.iloc[i-1]
-        v = base * (temp.iloc[i] - 0.5 + 0.5 * prev)
-        # clamp
-        if v > 0.9999:
-            v = 0.9999
-        if v < -0.9999:
-            v = -0.9999
-        value.iloc[i] = v
+        # compute normalized temp safely
+        denom = (max_med.iloc[i] - min_med.iloc[i])
+        if denom == 0 or np.isnan(denom):
+            temp = 0.5
+        else:
+            temp = (raw_momentum.iloc[i] - min_med.iloc[i]) / denom
 
-    # temp2 and momentum
-    # avoid division by zero of (1 - value)
-    eps = 1e-12
-    denom2 = (1 - value).replace(0, eps)
-    temp2 = (1 + value).divide(denom2)
-    # guard invalid values
-    temp2 = temp2.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        prev_value = value[i-1]
+        # base is 1.0 (0.5*2)
+        v = 1.0 * (temp - 0.5 + 0.5 * prev_value)
+        v = max(min(v, 0.9999), -0.9999)
+        value[i] = v
 
-    momentum = 0.25 * np.log(temp2)
-    # smoothing: momentum := momentum + .5 * nz(momentum[1])
-    momentum = momentum.fillna(0.0)
-    momentum_smoothed = momentum.copy()
-    for i in range(1, n):
-        momentum_smoothed.iloc[i] = momentum.iloc[i] + 0.5 * momentum_smoothed.iloc[i-1]
+        # temp2 and momentum
+        # guard division by zero
+        denom2 = (1.0 - v) if (1.0 - v) != 0 else 1e-12
+        temp2 = (1.0 + v) / denom2
+        # guard invalid
+        if temp2 <= 0 or np.isnan(temp2):
+            mom = 0.0
+        else:
+            mom = 0.25 * np.log(temp2)
 
-    # hist according to the original script uses momentum variable as hist
-    hist = momentum_smoothed
+        momentum[i] = mom + 0.5 * momentum[i-1]
 
-    # ensure index matches original df index
-    hist.index = df.index
+    hist = pd.Series(momentum, index=df.index)
     return hist
 
 # === end Magical Momentum implementation ===
@@ -520,7 +513,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         magical_hist = calculate_magical_momentum(df_15m)
         # latest histogram value (may be NaN early in series)
         hist_curr = magical_hist.iloc[-1] if len(magical_hist) > 0 else np.nan
-        debug_log(f"Magical Momentum Hist (15m): {hist_curr:.6f}")
+        recent_vals = magical_hist.iloc[-3:].round(6).tolist() if len(magical_hist) >= 3 else magical_hist.round(6).tolist()
+        debug_log(f"Magical Momentum Hist (15m): {hist_curr:.6f} | Last3: {recent_vals}")
         
         # Get latest values from 15min
         ppo_curr = ppo.iloc[-1]
