@@ -40,6 +40,8 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'True'
+        # PASS UNIQUE FILENAME
+        STATE_FILE_PATH: macd_state.json 
       run: python macd_bot.py
     
     # --- 2. Run Fibonacci Pivot Bot ---
@@ -49,36 +51,17 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'True'
+        # PASS UNIQUE FILENAME
+        STATE_FILE_PATH: fibonacci_state.json
       run: python fibonacci_pivot_bot.py
       
-    # --- 3. Commit and Push the single shared state file ---
-    - name: Commit and Push state file
+    # --- 3. Commit and Push BOTH new state files ---
+    - name: Commit and Push state files
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
-        commit_message: "Update shared alert state [skip ci]"
-        # Only track the existing, single file
-        file_pattern: alert_state.json
-      # We rely on this file being successfully tracked
+        commit_message: "Update bot state JSONs [skip ci]"
+        # TRACK BOTH UNIQUE FILES
+        files: |
+          macd_state.json
+          fibonacci_state.json
       continue-on-error: true
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
