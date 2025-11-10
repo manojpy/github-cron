@@ -54,9 +54,10 @@ jobs:
         with:
           commit_message: "Update alert state files [skip ci]"
           file_pattern: |
-            alert_state.json
+            fib_alert_state.json
             ppo_alert_state.json
         continue-on-error: true
+
 
 
 
