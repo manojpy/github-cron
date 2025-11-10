@@ -1,85 +1,62 @@
 name: Trading Alert Bots
 
 on:
- # schedule:
-  #  - cron: '1,16,31,46 * * * *'
-  workflow_dispatch:  # Manual trigger (now used by the external cron)
-
+  workflow_dispatch:  # Manual trigger (used by external cron like Cron-Job.org)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.13'
-    
-    - name: Cache pip packages
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    # --- 1. Run MACD Bot ---
-    - name: Run MACD Bot
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'True'
-      run: python macd_bot.py
-    
-    # --- 2. Run Fibonacci Pivot Bot ---
-    - name: Run Fibonacci Pivot Bot
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
-        SEND_TEST_MESSAGE: 'True'
-      run: python fibonacci_pivot_bot.py
-      
-    # --- 3. Commit and Push the single shared state file ---
-    - name: Commit and Push state file
-      uses: stefanzweifel/git-auto-commit-action@v5
-      with:
-        commit_message: "Update shared alert state [skip ci]"
-        # Only track the existing, single file
-        file_pattern: alert_state.json
-      # We rely on this file being successfully tracked
-      continue-on-error: true
+      - name: Checkout code
+        uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
 
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
+      # --- 1. Run MACD/PPO Bot (uses ppo_alert_state.json) ---
+      - name: Run MACD Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_MODE: 'True'
+          SEND_TEST_MESSAGE: 'True'
+        run: python macd_bot.py
 
+      # --- 2. Run Fibonacci Pivot Bot (uses alert_state.json) ---
+      - name: Run Fibonacci Pivot Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_MODE: 'True'
+          SEND_TEST_MESSAGE: 'True'
+        run: python fibonacci_pivot_bot.py
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+      # --- 3. Commit BOTH state files to persist across runs ---
+      - name: Commit and Push state files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update alert state files [skip ci]"
+          file_pattern: |
+            alert_state.json
+            ppo_alert_state.json
+        continue-on-error: true
 
 
 
