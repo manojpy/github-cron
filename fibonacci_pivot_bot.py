@@ -46,7 +46,7 @@ X3 = 15
 X4 = 5
 # Pivot settings
 PIVOT_LOOKBACK_PERIOD = 15 
-STATE_FILE = 'alert_state.json' 
+STATE_FILE = 'fib_state.json' 
 
 # ============ UTILITY FUNCTIONS ============
 def load_state():
