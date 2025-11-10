@@ -126,7 +126,7 @@ def send_test_message():
     return success
 
 def get_product_ids():
-    """Fetch all product IDs from Delta Exchange and populate PAIRS dict with robust symbol matching"""
+    """Fetch all product IDs from Delta Exchange and populate PAIRS dict with robust symbol normalization"""
     try:
         if DEBUG_MODE:
             print("[DEBUG] Fetching product IDs from Delta Exchange...")
@@ -140,25 +140,26 @@ def get_product_ids():
                 if product.get('contract_type') != 'perpetual_futures':
                     continue
                 raw_symbol = product['symbol']
-                # Normalize Delta symbols to our naming convention (e.g., SOLUSD_PERP -> SOLUSD)
+                # Step 1: Remove _PERP suffix if present
                 if raw_symbol.endswith('_PERP'):
-                    normalized = raw_symbol[:-5]  # Remove '_PERP'
-                elif raw_symbol.endswith('USD'):
-                    normalized = raw_symbol
-                elif '_USD' in raw_symbol:
-                    normalized = raw_symbol.replace('_USD', 'USD')
+                    base_symbol = raw_symbol[:-5]
                 else:
-                    normalized = raw_symbol  # Fallback
-
+                    base_symbol = raw_symbol
+                # Step 2: Remove underscores to match PAIRS keys (e.g., SOL_USD → SOLUSD)
+                normalized = base_symbol.replace('_', '')
+                # Step 3: Skip if doesn't end with USD
+                if not normalized.endswith('USD'):
+                    continue
+                # Step 4: Match against PAIRS
                 for pair_name in PAIRS.keys():
                     if normalized == pair_name:
                         PAIRS[pair_name] = {
                             'id': product['id'],
-                            'symbol': product['symbol'],  # Use original symbol for API calls
+                            'symbol': product['symbol'],
                             'contract_type': product['contract_type']
                         }
                         if DEBUG_MODE:
-                            print(f"[DEBUG] Matched {pair_name} ← {product['symbol']} (ID: {product['id']})")
+                            print(f"[DEBUG] Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
                         break
             return True
         else:
@@ -505,7 +506,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             except Exception as e:
                 log(f"Error parsing saved state '{updated_state}': {e}")
                 updated_state = None
-        # 🟢 LONG SIGNAL
+        # 🟢 LONG SIGNAL (with HTML bold)
         if (upw_curr and (not dnw_curr) and 
             (ppo_curr < 0.20) and 
             long_crossover_line and 
