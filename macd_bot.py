@@ -344,8 +344,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     
     # Step 1: Compute sd = stdev(source, 50) * responsiveness
     sd = close.rolling(window=50).std() * responsiveness
-    sd = sd.fillna(method='bfill').fillna(0.001)  # handle early NaNs
-
+    sd = sd.bfill().fillna(0.001)
     # Step 2: Compute worm
     worm = close.copy()
     for i in range(1, len(close)):
