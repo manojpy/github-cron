@@ -18,13 +18,10 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
-
 # Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
-
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
-
 # Trading pairs to monitor
 PAIRS = {
     "BTCUSD": None,
@@ -40,42 +37,36 @@ PAIRS = {
     "SUIUSD": None,
     "AAVEUSD": None
 }
-
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 300, "min_required_5m": 250}
 }
-
 # Indicator settings
 # PPO settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False  # False = use EMA
-
 # RMA settings
 RMA_50_PERIOD = 50   # RMA50 on 15min
 RMA_200_PERIOD = 200 # RMA200 on 5min 
-
 # Cirrus Cloud settings
 CIRRUS_CLOUD_ENABLED = True
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
-
 # Smoothed RSI (SRSI) settings
 SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
 SRSI_EMA_LEN = 5 
-
 # File to store last alert state
-STATE_FILE = 'ppo_alert_state.json'
-
+STATE_FILE = 'alert_state.json'
 # Thread lock for state updates
 state_lock = Lock()
 
 # ============ UTILITY FUNCTIONS ============
+
 def debug_log(message):
     """Print debug messages if DEBUG_MODE is enabled"""
     if DEBUG_MODE:
@@ -83,33 +74,25 @@ def debug_log(message):
 
 def load_state():
     """Load previous alert state from file"""
-    with state_lock:
-        try:
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, 'r') as f:
-                    state = json.load(f)
-                    if not isinstance(state, dict):
-                        state = {}
-                    debug_log(f"Loaded state: {state}")
-                    return state
-        except Exception as e:
-            print(f"Error loading state: {e}")
-            if DEBUG_MODE:
-                traceback.print_exc()
-        debug_log("No previous state found, starting fresh")
-        return {}
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+                debug_log(f"Loaded state: {state}")
+                return state
+    except Exception as e:
+        print(f"Error loading state: {e}")
+    debug_log("No previous state found, starting fresh")
+    return {}
 
 def save_state(state):
     """Save alert state to file"""
-    with state_lock:
-        try:
-            with open(STATE_FILE, 'w') as f:
-                json.dump(state, f)
-            debug_log(f"Saved state: {state}")
-        except Exception as e:
-            print(f"Error saving state: {e}")
-            if DEBUG_MODE:
-                traceback.print_exc()
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+        debug_log(f"Saved state: {state}")
+    except Exception as e:
+        print(f"Error saving state: {e}")
 
 def send_telegram_alert(message):
     """Send alert message via Telegram"""
@@ -355,8 +338,10 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     """
     if len(df) < period + 50:
         return pd.Series([np.nan] * len(df), index=df.index)
+
     close = df['close'].astype(float)
     responsiveness = max(0.00001, responsiveness)
+    
     # Step 1: Compute sd = stdev(source, 50) * responsiveness
     sd = close.rolling(window=50).std() * responsiveness
     sd = sd.bfill().fillna(0.001)
@@ -370,11 +355,14 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         else:
             delta = diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
+
     # Step 3: Compute ma = sma(source, period)
     ma = close.rolling(window=period).mean()
+
     # Step 4: raw_momentum = (worm - ma) / worm
     raw_momentum = (worm - ma) / worm.replace(0, np.nan)
     raw_momentum = raw_momentum.fillna(0)
+
     # Step 5: Normalize raw_momentum
     min_med = raw_momentum.rolling(window=period).min()
     max_med = raw_momentum.rolling(window=period).max()
@@ -383,6 +371,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     temp = pd.Series(0.0, index=df.index)
     valid = rng > 1e-10
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
+
     # Step 6: Compute value with feedback
     value = pd.Series(0.0, index=df.index)
     value.iloc[0] = 0.0
@@ -390,17 +379,20 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         v_prev = value.iloc[i - 1]
         v_new = 1.0 * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
         value.iloc[i] = max(-0.9999, min(0.9999, v_new))
+
     # Step 7: Compute momentum
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
     log_temp2 = np.log(temp2)
     momentum = 0.25 * log_temp2
     momentum = momentum.fillna(0)
+
     # Step 8: Compute hist with feedback
     hist = pd.Series(0.0, index=df.index)
     hist.iloc[0] = momentum.iloc[0]
     for i in range(1, len(momentum)):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
+
     return hist
 
 def check_pair(pair_name, pair_info, last_alerts):
@@ -411,7 +403,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"\n{'='*60}")
         debug_log(f"Checking {pair_name}")
         debug_log(f"{'='*60}")
-
         # Check if this pair has special requirements
         if pair_name in SPECIAL_PAIRS:
             limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
@@ -423,12 +414,10 @@ def check_pair(pair_name, pair_info, last_alerts):
             min_required = 200
             limit_5m = 300
             min_required_5m = 250
-
         # Fetch 15-minute candles 
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         # Fetch 5-minute candles for RMA200
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-
         if df_15m is None or len(df_15m) < min_required:
             print(f"⚠️ Insufficient 15m data for {pair_name}: {len(df_15m) if df_15m is not None else 0}/{min_required} candles")
             return None
@@ -447,13 +436,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Calculate indicators on 15min timeframe
         ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
-
         # Calculate RMA200 on 5min timeframe
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
-
         # Calculate Cirrus Cloud on 15min timeframe 
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
-
         # Calculate Smoothed RSI on 15min timeframe
         smooth_rsi = calculate_smooth_rsi(df_15m)
 
@@ -471,7 +457,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Smoothed RSI values
         smooth_rsi_curr = smooth_rsi.iloc[-1]
         smooth_rsi_prev = smooth_rsi.iloc[-2]
-
         # NaN validation for Smoothed RSI
         if pd.isna(smooth_rsi_curr) or pd.isna(smooth_rsi_prev):
             debug_log(f"⚠️ NaN values in Smooth RSI for {pair_name}, skipping")
@@ -479,7 +464,6 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         close_curr = df_15m['close'].iloc[-1]
         rma50_curr = rma_50.iloc[-1]
-
         # NaN validation for RMA50
         if pd.isna(rma50_curr):
             debug_log(f"⚠️ NaN values in RMA50 for {pair_name}, skipping")
@@ -487,23 +471,19 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         upw_curr = upw.iloc[-1]
         dnw_curr = dnw.iloc[-1]
-
         # --- CANDLE STRUCTURE CHECKS ---
         open_curr = df_15m['open'].iloc[-1]
         high_curr = df_15m['high'].iloc[-1]
         low_curr = df_15m['low'].iloc[-1]
-
         # Candle Metrics
         total_range = high_curr - low_curr
         # Upper Wick: High - Max(Open, Close)
         upper_wick = high_curr - max(open_curr, close_curr)
         # Lower Wick: Min(Open, Close) - Low
         lower_wick = min(open_curr, close_curr) - low_curr
-
         # Basic candle type check
         bullish_candle = close_curr > open_curr
         bearish_candle = close_curr < open_curr
-
         # 20% Wick conditions
         wick_check_valid = total_range > 0
         # Strong Bullish Close: Bullish Candle AND Upper Wick < 20% of Total Range
@@ -526,7 +506,6 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         # Get latest values from 5min for RMA200
         rma200_curr = rma_200.iloc[-1]
-
         # NaN validation for RMA200
         if pd.isna(rma200_curr):
             debug_log(f"⚠️ NaN values in RMA200 for {pair_name}, skipping")
@@ -539,7 +518,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"PPO Signal: {ppo_signal_curr:.4f} (prev: {ppo_signal_prev:.4f})")
         debug_log(f"RMA50 (15m): {rma50_curr:.2f}, Close: {close_curr:.2f}")
         debug_log(f"RMA200 (5m): {rma200_curr:.2f}, Close (15m for comparison): {close_curr:.2f}")
-        debug_log(f"Smoothed RSI (15m): {smooth_rsi_curr:.2f} (prev: {smooth_rsi_prev:.2f}") 
+        debug_log(f"Smoothed RSI (15m): {smooth_rsi_curr:.2f} (prev: {smooth_rsi_prev:.2f})") 
         debug_log(f"Cirrus Filter 1 (filtx1): {filtx1.iloc[-1]:.4f}") 
         debug_log(f"Cirrus Filter 2 (filtx12): {filtx12.iloc[-1]:.4f}") 
         debug_log(f"Cirrus Cloud - Upw: {upw_curr}, Dnw: {dnw_curr}")
@@ -547,7 +526,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Detect PPO crossovers (15m)
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
-
         # Detect PPO zero-line crossovers (15m)
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
         ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
@@ -559,7 +537,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
         ppo_below_signal = ppo_curr < ppo_signal_curr
-
         # PPO conditions for SRSI alerts
         ppo_below_030 = ppo_curr < 0.30
         ppo_above_minus030 = ppo_curr > -0.30
@@ -588,7 +565,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         debug_log(f"  Close below RMA200: {close_below_rma200}")
 
         current_state = None
-
         # Get IST time in correct format
         ist = pytz.timezone('Asia/Kolkata')
         current_dt = datetime.now(ist)
@@ -728,7 +704,6 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         else:
             debug_log(f"No signal conditions met for {pair_name}")
-
         return current_state
 
     except Exception as e:
@@ -745,43 +720,37 @@ def main():
     print(f"PPO/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
     print("=" * 50)
-
     # Send test message if enabled
     if SEND_TEST_MESSAGE:
         send_test_message()
-
     # Load previous state
     last_alerts = load_state()
-
     # Fetch product IDs
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
-
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
-
     # Check all pairs in parallel
     alerts_sent = 0
     results = {}
-
     # Use a ThreadPoolExecutor to run all 'check_pair' calls in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_pair = {}
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Pass a copy of last_alerts to avoid thread mutation
-                future = executor.submit(check_pair, pair_name, pair_info, dict(last_alerts))
+                # Pass a copy of last_alerts for thread safety 
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts.copy())
                 future_to_pair[future] = pair_name
-
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
             try:
                 new_state = future.result() 
-                if new_state is not None: 
+                # Collect results instead of directly modifying shared state
+                if new_state: 
                     results[pair_name] = new_state
                     alerts_sent += 1 
             except Exception as e:
@@ -789,13 +758,10 @@ def main():
                 if DEBUG_MODE:
                     traceback.print_exc()
                 continue
-
     # Update state after all threads complete (thread-safe)
     with state_lock:
-        updated_state = load_state()  # Reload to avoid race with external changes
-        updated_state.update(results)
-        save_state(updated_state)
-
+        last_alerts.update(results)
+        save_state(last_alerts)
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
     print(f"✓ Check complete. {alerts_sent} state updates processed. ({elapsed:.1f}s)")
