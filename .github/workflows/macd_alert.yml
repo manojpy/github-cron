@@ -40,7 +40,7 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'True'
-        # Pass unique filename
+        # PASS UNIQUE FILENAME
         STATE_FILE_PATH: macd_state.json 
       run: python macd_bot.py
     
@@ -51,7 +51,7 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'True'
-        # Pass unique filename (Adjusted to 'fib_state.json' based on your last successful run)
+        # PASS UNIQUE FILENAME
         STATE_FILE_PATH: fib_state.json
       run: python fibonacci_pivot_bot.py
       
@@ -60,8 +60,7 @@ jobs:
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update bot state JSONs [skip ci]"
-        # CRITICAL FIX: Use 'file_pattern' instead of 'files' to remove the warning.
-        # This explicitly tells the action which files to commit.
+        # CRITICAL FIX: Changed 'files' to 'file_pattern' to remove the warning
         file_pattern: |
           macd_state.json
           fib_state.json
