@@ -33,22 +33,6 @@ PAIRS = {
     "DOTUSD": None, "ADAUSD": None, "SUIUSD": None, "AAVEUSD": None
 }
 
-# Explicit symbol mapping for Delta Exchange
-DELTA_SYMBOL_MAP = {
-    "BTCUSD": "BTC_USDT",
-    "ETHUSD": "ETH_USDT",
-    "SOLUSD": "SOL_USDT",      # Critical fix
-    "AVAXUSD": "AVAX_USDT",
-    "BCHUSD": "BCH_USDT",
-    "XRPUSD": "XRP_USDT",
-    "BNBUSD": "BNB_USDT",
-    "LTCUSD": "LTC_USDT",
-    "DOTUSD": "DOT_USDT",
-    "ADAUSD": "ADA_USDT",
-    "SUIUSD": "SUI_USDT",
-    "AAVEUSD": "AAVE_USDT",
-}
-
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
@@ -142,7 +126,7 @@ def send_test_message():
     return success
 
 def get_product_ids():
-    """Fetch all product IDs from Delta Exchange and populate PAIRS dict using explicit mapping"""
+    """Fetch all product IDs from Delta Exchange and populate PAIRS dict with robust symbol matching"""
     try:
         if DEBUG_MODE:
             print("[DEBUG] Fetching product IDs from Delta Exchange...")
@@ -155,16 +139,27 @@ def get_product_ids():
             for product in products:
                 if product.get('contract_type') != 'perpetual_futures':
                     continue
+                raw_symbol = product['symbol']
+                # Normalize Delta symbols to our naming convention (e.g., SOLUSD_PERP -> SOLUSD)
+                if raw_symbol.endswith('_PERP'):
+                    normalized = raw_symbol[:-5]  # Remove '_PERP'
+                elif raw_symbol.endswith('USD'):
+                    normalized = raw_symbol
+                elif '_USD' in raw_symbol:
+                    normalized = raw_symbol.replace('_USD', 'USD')
+                else:
+                    normalized = raw_symbol  # Fallback
+
                 for pair_name in PAIRS.keys():
-                    expected_symbol = DELTA_SYMBOL_MAP.get(pair_name, pair_name)
-                    if product['symbol'] == expected_symbol:
+                    if normalized == pair_name:
                         PAIRS[pair_name] = {
                             'id': product['id'],
-                            'symbol': product['symbol'],
+                            'symbol': product['symbol'],  # Use original symbol for API calls
                             'contract_type': product['contract_type']
                         }
                         if DEBUG_MODE:
-                            print(f"[DEBUG] Matched {pair_name} → Delta symbol: {product['symbol']} (ID: {product['id']})")
+                            print(f"[DEBUG] Matched {pair_name} ← {product['symbol']} (ID: {product['id']})")
+                        break
             return True
         else:
             print(f"API Error: {data}")
@@ -210,7 +205,6 @@ def get_candles(product_id, resolution="15", limit=150):
         print(f"Exception fetching candles for {product_id}: {e}")
         return None
 
-# === Rest of utility functions (EMA, PPO, Cirrus, etc.) remain unchanged ===
 def calculate_ema(data, period):
     return data.ewm(span=period, adjust=False).mean()
 
@@ -511,7 +505,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             except Exception as e:
                 log(f"Error parsing saved state '{updated_state}': {e}")
                 updated_state = None
-        # 🟢 LONG SIGNAL (with HTML bold)
+        # 🟢 LONG SIGNAL
         if (upw_curr and (not dnw_curr) and 
             (ppo_curr < 0.20) and 
             long_crossover_line and 
