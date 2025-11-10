@@ -21,8 +21,10 @@ if TELEGRAM_BOT_TOKEN == 'xxxx' or TELEGRAM_CHAT_ID == 'xxxx':
 
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
+
 # Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
+
 # Reset state flag - set to 'True' to clear the alert_state.json file on startup
 RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
 
@@ -58,14 +60,12 @@ X4 = 5
 PIVOT_LOOKBACK_PERIOD = 15
 STATE_FILE = 'fib_state.json'
 
-
 # ============ HTTP SESSION WITH RETRIES ============
 def create_session_with_retries():
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
-
 
 # ============ UTILITY FUNCTIONS ============
 def load_state():
@@ -214,7 +214,6 @@ def get_candles(product_id, resolution="15", limit=150):
         print(f"Exception fetching candles for {product_id}: {e}")
         return None
 
-# --- Rest of your original functions unchanged ---
 def calculate_ema(data, period):
     return data.ewm(span=period, adjust=False).mean()
 
@@ -353,51 +352,65 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"\n{'='*60}")
         log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
         log(f"{'='*60}")
+
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
             print(f"❌ {pair_name}: Failed to fetch previous day OHLC data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
         log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, R2={pivots['R2']:.2f}, R3={pivots['R3']:.2f}")
         log(f"             S1={pivots['S1']:.2f}, S2={pivots['S2']:.2f}, S3={pivots['S3']:.2f}")
+
         limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
         min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150), 150)
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         if df_15m is None:
             print(f"❌ {pair_name}: Failed to fetch 15m candle data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         if len(df_15m) < min_required:
             print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
+
         if (len(ppo) < 3 or len(rma_50_15m) < 3 or len(upw) < 3 or len(dnw) < 3):
             print(f"⚠️  {pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         open_prev = df_15m['open'].iloc[-2]
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
         low_prev = df_15m['low'].iloc[-2]
+
         ppo_curr = ppo.iloc[-2]
         rma_50_15m_curr = rma_50_15m.iloc[-2]
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
+
         if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr) or pd.isna(upw_curr) or pd.isna(dnw_curr)):
             log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         if close_prev <= 0 or open_prev <= 0:
             log(f"Skipping {pair_name}: Invalid price data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
+
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         magical_hist_curr = magical_hist.iloc[-2]
         if np.isnan(magical_hist_curr):
             log(f"⚠️  NaN in Magical Momentum Hist for {pair_name}, skipping")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
+
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
         min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250), 250)
         rma_200_5m_curr = np.nan
@@ -414,8 +427,10 @@ def check_pair(pair_name, pair_info, last_alerts):
                 log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
                 log("5m RMA 200 calculation produced NaN - will be skipped")
+
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
+
         if rma_200_available:
             rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
             rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
@@ -424,6 +439,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             rma_long_ok = rma_50_15m_curr < close_prev
             rma_short_ok = rma_50_15m_curr > close_prev
             log(f"Using only RMA 50 15m (RMA 200 5m unavailable)")
+
         candle_range = high_prev - low_prev
         if candle_range <= 0:
             upper_wick_check = False
@@ -433,18 +449,21 @@ def check_pair(pair_name, pair_info, last_alerts):
             lower_wick_length = min(open_prev, close_prev) - low_prev
             upper_wick_check = (upper_wick_length / candle_range) < 0.20
             lower_wick_check = (lower_wick_length / candle_range) < 0.20
+
         price_change_pct = abs((close_prev - open_prev) / open_prev) * 100
         if price_change_pct > 10:
             log(f"⚠️  Extreme volatility detected ({price_change_pct:.2f}%), skipping signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         if close_prev > pivots['R3']:
             log(f"⚠️  Price closed above R3 (${pivots['R3']:.2f}), blocking LONG signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         if close_prev < pivots['S3']:
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
-        long_crossover_line = False
+        long_crossover_line = None
         long_crossover_name = None
         if is_green:
             for name, line in long_pivot_lines.items():
@@ -452,8 +471,9 @@ def check_pair(pair_name, pair_info, last_alerts):
                     long_crossover_line = line
                     long_crossover_name = name
                     break
+
         short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 'R1': pivots['R1'], 'R2': pivots['R2']}
-        short_crossover_line = False
+        short_crossover_line = None
         short_crossover_name = None
         if is_red:
             for name, line in short_pivot_lines.items():
@@ -461,13 +481,16 @@ def check_pair(pair_name, pair_info, last_alerts):
                     short_crossover_line = line
                     short_crossover_name = name
                     break
+
         current_signal = None
         updated_state = last_alerts.get(pair_name)
         if updated_state:
             log(f"Previous state loaded: {updated_state}")
+
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
+
         if updated_state and updated_state.startswith('fib_'):
             try:
                 parts = updated_state.split('_')
@@ -495,49 +518,69 @@ def check_pair(pair_name, pair_info, last_alerts):
             except Exception as e:
                 log(f"Error parsing saved state '{updated_state}': {e}")
                 updated_state = None
-        if (upw_curr and (not dnw_curr) and
-            long_crossover_line and
+
+        # 🛡️ HARDENED LONG CONDITION – extra safety
+        long_conditions_met = (
+            upw_curr and (not dnw_curr) and
+            long_crossover_line is not None and
             upper_wick_check and
             rma_long_ok and
-            magical_hist_curr > 0):
+            magical_hist_curr > 0 and
+            is_green  # ⚠️ Explicit final check
+        )
+
+        short_conditions_met = (
+            dnw_curr and (not upw_curr) and
+            short_crossover_line is not None and
+            lower_wick_check and
+            rma_short_ok and
+            magical_hist_curr < 0 and
+            is_red  # ⚠️ Explicit final check
+        )
+
+        if long_conditions_met:
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
+                # 📝 Silent diagnostic included in alert even if DEBUG_MODE=False
+                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},R2:{pivots['R2']:.5f}]"
                 message = (
                     f"🟢 {pair_name} - **FIB LONG**\n"
-                    f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f})\n"
+                    f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
             updated_state = current_signal
-        elif (dnw_curr and (not upw_curr) and
-              short_crossover_line and
-              lower_wick_check and
-              rma_short_ok and
-              magical_hist_curr < 0):
+
+        elif short_conditions_met:
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
+                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},S2:{pivots['S2']:.5f}]"
                 message = (
                     f"🔴 {pair_name} - **FIB SHORT**\n"
-                    f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f})\n"
+                    f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
             updated_state = current_signal
+
         else:
             log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
+
         return updated_state, '\n'.join(thread_log)
+
     except Exception as e:
         print(f"❌ Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
         return last_alerts.get(pair_name), '\n'.join(thread_log)
+
 
 def main():
     print("=" * 50)
@@ -546,12 +589,16 @@ def main():
     print(f"Fibonacci Pivot Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
     print("=" * 50)
+
     if SEND_TEST_MESSAGE:
         send_test_message()
+
     if RESET_STATE and os.path.exists(STATE_FILE):
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
+
     last_alerts = load_state()
+
     keys_to_purge = []
     for key, value in list(last_alerts.items()):
         if value:
@@ -562,14 +609,17 @@ def main():
         print(f"\n[INFO] 🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None
+
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
+
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
+
     updates_processed = 0
     pair_logs = []
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -592,6 +642,7 @@ def main():
                     import traceback
                     traceback.print_exc()
                 continue
+
     if DEBUG_MODE:
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS START")
@@ -601,11 +652,13 @@ def main():
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS END")
         print("="*50)
+
     save_state(last_alerts)
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
     print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
