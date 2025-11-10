@@ -88,13 +88,13 @@ def send_telegram_alert(message):
         response = requests.post(url, data=data, timeout=10)
         response_data = response.json()
         if response_data.get('ok'):
-            print(f"✓ Alert sent successfully")
+            print(f"[OK] Alert sent successfully")
             return True
         else:
-            print(f"✗ Telegram error: {response_data}")
+            print(f"[ERROR] Telegram error: {response_data}")
             return False
     except Exception as e:
-        print(f"✗ Error sending Telegram message: {e}")
+        print(f"[ERROR] Error sending Telegram message: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
@@ -105,15 +105,15 @@ def send_test_message():
     ist = pytz.timezone('Asia/Kolkata')
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-    test_msg = f"🔔 Fibonacci Pivot Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    test_msg = f"[TEST] Fibonacci Pivot Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
     print("\n" + "="*50)
     print("SENDING TEST MESSAGE")
     print("="*50)
     success = send_telegram_alert(test_msg)
     if success:
-        print("✓ Test message sent successfully!")
+        print("[OK] Test message sent successfully!")
     else:
-        print("✗ Test message failed - check your bot token and chat ID")
+        print("[ERROR] Test message failed - check your bot token and chat ID")
     print("="*50 + "\n")
     return success
 
@@ -261,6 +261,8 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     """
     Replicates Pine Script v6 'Magical Momentum Indicator'
     Returns the 'hist' series (15m).
+    
+    CORRECTED VERSION - Fixed value calculation to match Pine Script
     """
     if len(df) < period + 50:
         return pd.Series([np.nan] * len(df), index=df.index)
@@ -270,7 +272,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     
     # Step 1: Compute sd = stdev(source, 50) * responsiveness
     sd = close.rolling(window=50).std() * responsiveness
-    sd = sd.bfill().fillna(0.001)  # Modern Pandas syntax
+    sd = sd.bfill().fillna(0.001)
 
     # Step 2: Compute worm
     worm = close.copy()
@@ -290,26 +292,34 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     raw_momentum = (worm - ma) / worm.replace(0, np.nan)
     raw_momentum = raw_momentum.fillna(0)
 
-    # Step 5: Normalize raw_momentum
+    # Step 5: Normalize raw_momentum with enhanced safety checks
     min_med = raw_momentum.rolling(window=period).min()
     max_med = raw_momentum.rolling(window=period).max()
     rng = max_med - min_med
+    
     temp = pd.Series(0.0, index=df.index)
-    valid = rng > 1e-10
+    # Enhanced validation: check both for near-zero range and NaN values
+    valid = (rng > 1e-10) & (~rng.isna()) & (~min_med.isna()) & (~max_med.isna())
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
 
-    # Step 6: Compute value with feedback
+    # Step 6: Compute value with feedback (CORRECTED)
+    # Pine Script: value = 0.5 * 2 (equals 1.0), then value := value * (temp - .5 + .5 * nz(value[1]))
+    # To match Pine Script exactly, initialize to 1.0
     value = pd.Series(0.0, index=df.index)
-    value.iloc[0] = 0.0
+    value.iloc[0] = 1.0  # Initialize to match Pine Script's 0.5 * 2
+    
     for i in range(1, len(temp)):
         v_prev = value.iloc[i - 1]
-        v_new = 1.0 * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
+        # FIXED: Use multiplication by v_prev as in Pine Script
+        v_new = v_prev * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
+        # Clamp to prevent overflow
         value.iloc[i] = max(-0.9999, min(0.9999, v_new))
 
     # Step 7: Compute momentum
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
-    log_temp2 = np.log(temp2)
+    log_temp2 = np.log(temp2.abs())  # Use abs to handle potential negative values
+    log_temp2 = log_temp2 * np.sign(temp2)  # Restore sign
     momentum = 0.25 * log_temp2
     momentum = momentum.fillna(0)
 
@@ -367,7 +377,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 1. Get Pivot Data (Previous Day) ---
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
-            print(f"❌ {pair_name}: Failed to fetch previous day OHLC data") 
+            print(f"[ERROR] {pair_name}: Failed to fetch previous day OHLC data") 
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
@@ -375,23 +385,23 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, R2={pivots['R2']:.2f}, R3={pivots['R3']:.2f}")
         log(f"             S1={pivots['S1']:.2f}, S2={pivots['S2']:.2f}, S3={pivots['S3']:.2f}")
         # --- 2. Get 15-Minute Candles and Indicators ---
-        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)  # Increased
-        min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150), 150)  # Increased
+        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
+        min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150), 150)
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         if df_15m is None:
-            print(f"❌ {pair_name}: Failed to fetch 15m candle data")
+            print(f"[ERROR] {pair_name}: Failed to fetch 15m candle data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         if len(df_15m) < min_required:
-            print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
+            print(f"[WARNING] {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         # Calculate 15m indicators
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
-        # Validate indicator lengths (FIXED: Added upw/dnw checks)
+        # Validate indicator lengths
         if (len(ppo) < 3 or len(rma_50_15m) < 3 or 
             len(upw) < 3 or len(dnw) < 3):
-            print(f"⚠️  {pair_name}: Indicators produced insufficient data (<3 points)")
+            print(f"[WARNING] {pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         # Get values for the last closed 15m candle (index -2)
         open_prev = df_15m['open'].iloc[-2]
@@ -402,12 +412,12 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_50_15m_curr = rma_50_15m.iloc[-2]
         upw_curr = upw.iloc[-2]
         dnw_curr = dnw.iloc[-2]
-        # Validate for NaN values (ADDED)
+        # Validate for NaN values
         if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr) or 
             pd.isna(upw_curr) or pd.isna(dnw_curr)):
             log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-        # Validate price data (ADDED)
+        # Validate price data
         if close_prev <= 0 or open_prev <= 0:
             log(f"Skipping {pair_name}: Invalid price data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -417,18 +427,18 @@ def check_pair(pair_name, pair_info, last_alerts):
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         magical_hist_curr = magical_hist.iloc[-2]  # Use same candle as other indicators (-2)
         if np.isnan(magical_hist_curr):
-            log(f"⚠️  NaN in Magical Momentum Hist for {pair_name}, skipping")
+            log(f"[WARNING] NaN in Magical Momentum Hist for {pair_name}, skipping")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
 
         # --- 3. Get 5-Minute Candles and RMA 200 ---
-        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)  # Increased
-        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250), 250)  # Increased
+        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
+        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250), 250)
         rma_200_5m_curr = np.nan
         rma_200_available = False
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         if df_5m is None or len(df_5m) < min_required_5m:
-            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0})")
+            log(f"[WARNING] 5m data insufficient for {pair_name} (need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0})")
             log("RMA 200 5m check will be skipped - using only RMA 50 15m")
         else:
             rma_200_5m = calculate_rma(df_5m['close'], 200)
@@ -442,7 +452,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         # --- 4. Define Alert Conditions ---
         is_green = close_prev > open_prev
         is_red = close_prev < open_prev
-        # FIXED: Handle RMA 200 unavailability properly
+        # Handle RMA 200 unavailability properly
         if rma_200_available:
             rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
             rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
@@ -462,20 +472,18 @@ def check_pair(pair_name, pair_info, last_alerts):
             lower_wick_length = min(open_prev, close_prev) - low_prev
             upper_wick_check = (upper_wick_length / candle_range) < 0.20
             lower_wick_check = (lower_wick_length / candle_range) < 0.20
-        # Optional: Add volatility filter (ADDED)
+        # Volatility filter
         price_change_pct = abs((close_prev - open_prev) / open_prev) * 100
         if price_change_pct > 10:  # More than 10% move in 15m
-            log(f"⚠️  Extreme volatility detected ({price_change_pct:.2f}%), skipping signal")
+            log(f"[WARNING] Extreme volatility detected ({price_change_pct:.2f}%), skipping signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         # --- 5. Pivot Crossover Logic ---
-        # NEW: Block signals if candle closes above R3 or below S3
+        # Block signals if candle closes above R3 or below S3
         if close_prev > pivots['R3']:
-            log(f"⚠️  Price closed above R3 (${pivots['R3']:.2f}), blocking LONG signal")
-            # Allow state to continue but don't generate new signals
+            log(f"[WARNING] Price closed above R3 (${pivots['R3']:.2f}), blocking LONG signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         if close_prev < pivots['S3']:
-            log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
-            # Allow state to continue but don't generate new signals
+            log(f"[WARNING] Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 
                            'S1': pivots['S1'], 'S2': pivots['S2']}
@@ -507,7 +515,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         ist = pytz.timezone('Asia/Kolkata')
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
-        # IMPROVED: State Reset Logic - Check and reset BEFORE evaluating new signals
+        # State Reset Logic - Check and reset BEFORE evaluating new signals
         if updated_state and updated_state.startswith('fib_'):
             try:
                 parts = updated_state.split('_')
@@ -521,36 +529,36 @@ def check_pair(pair_name, pair_info, last_alerts):
                             # Reset long position if price falls below the original pivot
                             if close_prev < pivot_value:
                                 updated_state = None
-                                log(f"🔄 STATE RESET: {pair_name} Long - Price ${close_prev:,.2f} fell below {pivot_name} ${pivot_value:,.2f}")
+                                log(f"[RESET] STATE RESET: {pair_name} Long - Price ${close_prev:,.2f} fell below {pivot_name} ${pivot_value:,.2f}")
                             else:
                                 log(f"State maintained: Price ${close_prev:,.2f} still above {pivot_name} ${pivot_value:,.2f}")
                         elif alert_type == "short":
                             # Reset short position if price rises above the original pivot
                             if close_prev > pivot_value:
                                 updated_state = None
-                                log(f"🔄 STATE RESET: {pair_name} Short - Price ${close_prev:,.2f} rose above {pivot_name} ${pivot_value:,.2f}")
+                                log(f"[RESET] STATE RESET: {pair_name} Short - Price ${close_prev:,.2f} rose above {pivot_name} ${pivot_value:,.2f}")
                             else:
                                 log(f"State maintained: Price ${close_prev:,.2f} still below {pivot_name} ${pivot_value:,.2f}")
                     else:
                         # Pivot name not found in current pivots, reset state
-                        log(f"⚠️  Invalid pivot name '{pivot_name}' in state, resetting")
+                        log(f"[WARNING] Invalid pivot name '{pivot_name}' in state, resetting")
                         updated_state = None
             except Exception as e:
                 log(f"Error parsing saved state '{updated_state}': {e}")
                 updated_state = None  # Reset on parse error
         # --- 7. Final Signal Checks ---
-        # 🟢 LONG SIGNAL
+        # LONG SIGNAL
         if (upw_curr and (not dnw_curr) and 
             (ppo_curr < 0.20) and 
             long_crossover_line and 
             upper_wick_check and
             rma_long_ok and
-            magical_hist_curr > 0):  # ✅ MAGICAL MOMENTUM FILTER
+            magical_hist_curr > 0):  # Magical Momentum Filter
             current_signal = f"fib_long_{long_crossover_name}"
-            log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
+            log(f"\n[LONG SIGNAL] FIB LONG SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
                 message = (
-                    f"🟢 {pair_name} - **FIB LONG**\n"
+                    f"[LONG] {pair_name} - **FIB LONG**\n"
                     f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f})\n"
                     f"PPO 15m: {ppo_curr:.2f}\n" 
                     f"Price: ${price:,.2f}\n"
@@ -558,18 +566,18 @@ def check_pair(pair_name, pair_info, last_alerts):
                 )
                 send_telegram_alert(message)
             updated_state = current_signal
-        # 🔴 SHORT SIGNAL
+        # SHORT SIGNAL
         elif (dnw_curr and (not upw_curr) and 
               (ppo_curr > -0.20) and 
               short_crossover_line and 
               lower_wick_check and
               rma_short_ok and
-              magical_hist_curr < 0):  # ✅ MAGICAL MOMENTUM FILTER
+              magical_hist_curr < 0):  # Magical Momentum Filter
             current_signal = f"fib_short_{short_crossover_name}"
-            log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
+            log(f"\n[SHORT SIGNAL] FIB SHORT SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
                 message = (
-                    f"🔴 {pair_name} - **FIB SHORT**\n"
+                    f"[SHORT] {pair_name} - **FIB SHORT**\n"
                     f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f})\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
@@ -581,7 +589,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
         return updated_state, '\n'.join(thread_log)
     except Exception as e:
-        print(f"❌ Error checking {pair_name}: {e}")
+        print(f"[ERROR] Error checking {pair_name}: {e}")
         if DEBUG_MODE:
             import traceback
             traceback.print_exc()
@@ -598,16 +606,13 @@ def main():
     # Send test message if enabled
     if SEND_TEST_MESSAGE:
         send_test_message()
-    # === APPLIED RESET STATE LOGIC ===
+    # Reset state logic
     if RESET_STATE and os.path.exists(STATE_FILE):
-        print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
+        print(f"[ATTENTION] RESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
-    # =================================
     # Load previous state
     last_alerts = load_state()
-    # --- STATE CLEANUP: Purge old/invalid state traces for a clean slate ---
-    # Remove old state formats: 'srsi', 'buy', 'sell', 'short_zero', etc.
-    # Only keep valid 'fib_long_X' or 'fib_short_X' formats
+    # State cleanup: Purge old/invalid state traces
     keys_to_purge = []
     for key, value in list(last_alerts.items()):
         if value:
@@ -616,54 +621,49 @@ def main():
             if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_')):
                 keys_to_purge.append(key)
     if keys_to_purge:
-        print(f"\n[INFO] 🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
+        print(f"\n[INFO] Purging old/invalid states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None  # Set to None/clean state
-    # -------------------------------------------------------------------
     # Fetch product IDs
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
     found_count = sum(1 for v in PAIRS.values() if v is not None)
-    print(f"✓ Monitoring {found_count} pairs")
+    print(f"[OK] Monitoring {found_count} pairs")
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
     # Check all pairs in parallel
     updates_processed = 0
-    pair_logs = [] # Initialize list to hold all collected logs
+    pair_logs = []
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_pair = {}
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
-                # Submit the task. check_pair now returns (new_state, log_output)
                 future = executor.submit(check_pair, pair_name, pair_info, last_alerts) 
                 future_to_pair[future] = pair_name
         for future in as_completed(future_to_pair):
             pair_name = future_to_pair[future]
             try:
-                # --- CAPTURE BOTH RETURN VALUES ---
                 new_state, log_output = future.result() 
-                pair_logs.append(log_output) # Store the clean log output for sequential printing
-                # Only increment updates if the state has changed.
+                pair_logs.append(log_output)
+                # Only increment updates if the state has changed
                 if new_state != last_alerts.get(pair_name):
                     last_alerts[pair_name] = new_state
                     updates_processed += 1
             except Exception as e:
-                # This catches errors in the executor framework itself, not the logic inside check_pair
-                print(f"Error processing {pair_name} in thread: {e}") 
+                print(f"[ERROR] Error processing {pair_name} in thread: {e}") 
                 if DEBUG_MODE:
                     import traceback
                     traceback.print_exc()
                 continue
-    # --- PRINT COLLECTED LOGS SEQUENTIALLY (Fixes Interleaving) ---
+    # Print collected logs sequentially
     if DEBUG_MODE:
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS START")
         print("="*50)
         for log_output in pair_logs:
-            # Print the full, non-interleaved block of logs for this pair
-            print(log_output, end='') 
+            print(log_output, end='')
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS END")
         print("="*50)
@@ -671,7 +671,7 @@ def main():
     save_state(last_alerts)
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
-    print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
+    print(f"[OK] Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
