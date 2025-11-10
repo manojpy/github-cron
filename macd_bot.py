@@ -72,7 +72,7 @@ SRSI_KALMAN_LEN = 5
 SRSI_EMA_LEN = 5 
 
 # File to store last alert state
-STATE_FILE = 'alert_state.json'
+STATE_FILE = 'ppo_alert_state.json'
 
 # Thread lock for state updates
 state_lock = Lock()
