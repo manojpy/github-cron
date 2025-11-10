@@ -56,7 +56,7 @@ X4 = 5
 
 # Pivot settings
 PIVOT_LOOKBACK_PERIOD = 15
-STATE_FILE = 'alert_state.json'
+STATE_FILE = 'fib_alert_state.json'
 
 
 # ============ HTTP SESSION WITH RETRIES ============
