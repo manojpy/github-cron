@@ -496,7 +496,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                 log(f"Error parsing saved state '{updated_state}': {e}")
                 updated_state = None
         if (upw_curr and (not dnw_curr) and
-            (ppo_curr < 0.20) and
             long_crossover_line and
             upper_wick_check and
             rma_long_ok and
@@ -514,7 +513,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
             updated_state = current_signal
         elif (dnw_curr and (not upw_curr) and
-              (ppo_curr > -0.20) and
               short_crossover_line and
               lower_wick_check and
               rma_short_ok and
