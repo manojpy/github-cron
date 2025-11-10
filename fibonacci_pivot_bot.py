@@ -261,8 +261,6 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     """
     Replicates Pine Script v6 'Magical Momentum Indicator'
     Returns the 'hist' series (15m).
-    
-    CORRECTED VERSION - Fixed value calculation to match Pine Script
     """
     if len(df) < period + 50:
         return pd.Series([np.nan] * len(df), index=df.index)
@@ -302,24 +300,22 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     valid = (rng > 1e-10) & (~rng.isna()) & (~min_med.isna()) & (~max_med.isna())
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
 
-    # Step 6: Compute value with feedback (CORRECTED)
-    # Pine Script: value = 0.5 * 2 (equals 1.0), then value := value * (temp - .5 + .5 * nz(value[1]))
-    # To match Pine Script exactly, initialize to 1.0
+    # Step 6: Compute value with feedback - FIXED TO MATCH PINE SCRIPT
+    # Pine Script: value = 0.5 * 2, then value := value * (temp - .5 + .5 * nz(value[1]))
+    # This means: current_value = previous_value * (temp - 0.5 + 0.5 * previous_value)
     value = pd.Series(0.0, index=df.index)
-    value.iloc[0] = 1.0  # Initialize to match Pine Script's 0.5 * 2
+    value.iloc[0] = 1.0  # Initialize to 1.0 (0.5 * 2 in Pine Script)
     
     for i in range(1, len(temp)):
         v_prev = value.iloc[i - 1]
-        # FIXED: Use multiplication by v_prev as in Pine Script
+        # CRITICAL: Multiply BY v_prev, not by 1.0!
         v_new = v_prev * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
-        # Clamp to prevent overflow
         value.iloc[i] = max(-0.9999, min(0.9999, v_new))
 
     # Step 7: Compute momentum
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
-    log_temp2 = np.log(temp2.abs())  # Use abs to handle potential negative values
-    log_temp2 = log_temp2 * np.sign(temp2)  # Restore sign
+    log_temp2 = np.log(temp2)
     momentum = 0.25 * log_temp2
     momentum = momentum.fillna(0)
 
@@ -429,7 +425,12 @@ def check_pair(pair_name, pair_info, last_alerts):
         if np.isnan(magical_hist_curr):
             log(f"[WARNING] NaN in Magical Momentum Hist for {pair_name}, skipping")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-        log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
+        log(f"Magical Momentum Hist (15m): {magical_hist_curr:.10f}")  # Show 10 decimal places
+        
+        # Add diagnostic info for very small values
+        if abs(magical_hist_curr) < 0.001:
+            log(f"  WARNING: Magical Hist is very small (near zero)")
+            log(f"  Last 5 hist values: {[f'{v:.10f}' for v in magical_hist.iloc[-5:].values]}")
 
         # --- 3. Get 5-Minute Candles and RMA 200 ---
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
