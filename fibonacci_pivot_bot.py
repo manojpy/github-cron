@@ -45,7 +45,9 @@ X3 = 15
 X4 = 5
 
 PIVOT_LOOKBACK_PERIOD = 15
-STATE_FILE = 'fib_state.json'
+# State file paths (read from environment, fallback to defaults)
+STATE_FILE = os.environ.get("STATE_FILE_PATH", "fib_state.json")
+STATE_FILE_BAK =  "fib_state.bak"
 
 
 # ============ HTTP SESSION WITH RETRIES ============
