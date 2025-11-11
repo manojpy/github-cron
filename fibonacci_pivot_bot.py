@@ -18,19 +18,14 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 # Fail fast if secrets are missing
 if TELEGRAM_BOT_TOKEN == 'xxxx' or TELEGRAM_CHAT_ID == 'xxxx':
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in GitHub Secrets.")
-
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
-
 # Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
-
 # Reset state flag - set to 'True' to clear the alert_state.json file on startup
 RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
-
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
-
 # Trading pairs to monitor
 PAIRS = {
     "BTCUSD": None, "ETHUSD": None,
@@ -38,24 +33,20 @@ PAIRS = {
     "BCHUSD": None, "XRPUSD": None, "BNBUSD": None, "LTCUSD": None,
     "DOTUSD": None, "ADAUSD": None, "SUIUSD": None, "AAVEUSD": None
 }
-
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
 }
-
 # Indicator settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
-
 # Cirrus Cloud settings
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
-
 # Pivot settings
 PIVOT_LOOKBACK_PERIOD = 15
 STATE_FILE = 'fib_state.json'
@@ -66,6 +57,26 @@ def create_session_with_retries():
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
+
+# ============ VWAP WITH DAILY RESET ============
+def calculate_vwap_daily_reset(df):
+    """
+    Calculate VWAP reset at 00:00 UTC each day using hlc3.
+    Assumes 'timestamp' is in seconds (Unix).
+    """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+    df['date'] = df['datetime'].dt.date
+    hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
+    df['hlc3_vol'] = hlc3 * df['volume']
+    
+    # Group by date and compute cumulative sums per day
+    df['cum_vol'] = df.groupby('date')['volume'].cumsum()
+    df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
+    
+    # Avoid division by zero
+    df['vwap'] = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
+    return df['vwap']
 
 # ============ UTILITY FUNCTIONS ============
 def load_state():
@@ -352,12 +363,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"\n{'='*60}")
         log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
         log(f"{'='*60}")
-
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
             print(f"❌ {pair_name}: Failed to fetch previous day OHLC data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
@@ -370,15 +379,22 @@ def check_pair(pair_name, pair_info, last_alerts):
         if df_15m is None:
             print(f"❌ {pair_name}: Failed to fetch 15m candle data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-
         if len(df_15m) < min_required:
             print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
+        # ========== NEW: VWAP with daily reset ==========
+        vwap_15m = calculate_vwap_daily_reset(df_15m)
+        vwap_curr = vwap_15m.iloc[-2]
+        if np.isnan(vwap_curr):
+            log("⚠️  VWAP is NaN, skipping VBuy/VSel signals")
+            vwap_curr = None
+        else:
+            log(f"15m VWAP (UTC-reset): {vwap_curr:.4f}")
+
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
-
         if (len(ppo) < 3 or len(rma_50_15m) < 3 or len(upw) < 3 or len(dnw) < 3):
             print(f"⚠️  {pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -387,7 +403,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         close_prev = df_15m['close'].iloc[-2]
         high_prev = df_15m['high'].iloc[-2]
         low_prev = df_15m['low'].iloc[-2]
-
         ppo_curr = ppo.iloc[-2]
         rma_50_15m_curr = rma_50_15m.iloc[-2]
         upw_curr = upw.iloc[-2]
@@ -408,7 +423,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         if np.isnan(magical_hist_curr):
             log(f"⚠️  NaN in Magical Momentum Hist for {pair_name}, skipping")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-
         log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
 
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
@@ -462,6 +476,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
+        # 🔁 Fibonacci crossover detection (for original signals only)
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = None
         long_crossover_name = None
@@ -482,6 +497,30 @@ def check_pair(pair_name, pair_info, last_alerts):
                     short_crossover_name = name
                     break
 
+        # 🛡️ Base conditions WITHOUT crossover (for VWAP alerts)
+        base_long_ok = (
+            upw_curr and (not dnw_curr) and
+            upper_wick_check and
+            rma_long_ok and
+            magical_hist_curr > 0 and
+            is_green
+        )
+        base_short_ok = (
+            dnw_curr and (not upw_curr) and
+            lower_wick_check and
+            rma_short_ok and
+            magical_hist_curr < 0 and
+            is_red
+        )
+
+        # 🔔 VWAP signals (NO crossover required)
+        vbuy_conditions_met = base_long_ok and (vwap_curr is not None) and (close_prev > vwap_curr)
+        vsell_conditions_met = base_short_ok and (vwap_curr is not None) and (close_prev < vwap_curr)
+
+        # 🔔 Original Fib signals (with crossover)
+        fib_long_met = base_long_ok and long_crossover_line is not None
+        fib_short_met = base_short_ok and short_crossover_line is not None
+
         current_signal = None
         updated_state = last_alerts.get(pair_name)
         if updated_state:
@@ -491,58 +530,70 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
 
-        if updated_state and updated_state.startswith('fib_'):
-            try:
-                parts = updated_state.split('_')
-                if len(parts) >= 3:
-                    alert_type = parts[1]
-                    pivot_name = parts[2]
-                    pivot_value = pivots.get(pivot_name)
-                    log(f"Checking state reset: type={alert_type}, pivot={pivot_name} (${pivot_value}), current_price=${close_prev:,.2f}")
-                    if pivot_value is not None:
-                        if alert_type == "long":
-                            if close_prev < pivot_value:
+        # 🔁 State reset logic for all signal types
+        if updated_state:
+            if updated_state.startswith('fib_'):
+                try:
+                    parts = updated_state.split('_')
+                    if len(parts) >= 3:
+                        alert_type = parts[1]
+                        pivot_name = parts[2]
+                        pivot_value = pivots.get(pivot_name)
+                        if pivot_value is not None:
+                            if alert_type == "long" and close_prev < pivot_value:
                                 updated_state = None
-                                log(f"🔄 STATE RESET: {pair_name} Long - Price ${close_prev:,.2f} fell below {pivot_name} ${pivot_value:,.2f}")
-                            else:
-                                log(f"State maintained: Price ${close_prev:,.2f} still above {pivot_name} ${pivot_value:,.2f}")
-                        elif alert_type == "short":
-                            if close_prev > pivot_value:
+                                log(f"🔄 STATE RESET: {pair_name} Long - Price fell below {pivot_name}")
+                            elif alert_type == "short" and close_prev > pivot_value:
                                 updated_state = None
-                                log(f"🔄 STATE RESET: {pair_name} Short - Price ${close_prev:,.2f} rose above {pivot_name} ${pivot_value:,.2f}")
-                            else:
-                                log(f"State maintained: Price ${close_prev:,.2f} still below {pivot_name} ${pivot_value:,.2f}")
-                    else:
-                        log(f"⚠️  Invalid pivot name '{pivot_name}' in state, resetting")
-                        updated_state = None
-            except Exception as e:
-                log(f"Error parsing saved state '{updated_state}': {e}")
+                                log(f"🔄 STATE RESET: {pair_name} Short - Price rose above {pivot_name}")
+                        else:
+                            updated_state = None
+                except Exception as e:
+                    log(f"Error parsing fib state: {e}")
+                    updated_state = None
+            elif updated_state == 'vbuy' and close_prev <= vwap_curr:
                 updated_state = None
+                log(f"🔄 STATE RESET: {pair_name} VBuy - Price dropped below VWAP")
+            elif updated_state == 'vsell' and close_prev >= vwap_curr:
+                updated_state = None
+                log(f"🔄 STATE RESET: {pair_name} VSell - Price rose above VWAP")
 
-        # 🛡️ HARDENED LONG CONDITION – extra safety
-        long_conditions_met = (
-            upw_curr and (not dnw_curr) and
-            long_crossover_line is not None and
-            upper_wick_check and
-            rma_long_ok and
-            magical_hist_curr > 0 and
-            is_green  # ⚠️ Explicit final check
-        )
+        # 🔔 Handle NEW VWAP signals first (priority optional; you can reorder)
+        if vbuy_conditions_met:
+            current_signal = 'vbuy'
+            log(f"\n🔵 VBuy SIGNAL DETECTED for {pair_name}!")
+            if updated_state != current_signal:
+                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
+                message = (
+                    f"🔵 {pair_name} - **VBuy**\n"
+                    f"Closed Above VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
+                    f"PPO 15m: {ppo_curr:.2f}\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
+                )
+                send_telegram_alert(message)
+            updated_state = current_signal
 
-        short_conditions_met = (
-            dnw_curr and (not upw_curr) and
-            short_crossover_line is not None and
-            lower_wick_check and
-            rma_short_ok and
-            magical_hist_curr < 0 and
-            is_red  # ⚠️ Explicit final check
-        )
+        elif vsell_conditions_met:
+            current_signal = 'vsell'
+            log(f"\n🟠 VSell SIGNAL DETECTED for {pair_name}!")
+            if updated_state != current_signal:
+                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
+                message = (
+                    f"🟠 {pair_name} - **VSell**\n"
+                    f"Closed Below VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
+                    f"PPO 15m: {ppo_curr:.2f}\n"
+                    f"Price: ${price:,.2f}\n"
+                    f"{formatted_time}"
+                )
+                send_telegram_alert(message)
+            updated_state = current_signal
 
-        if long_conditions_met:
+        # 🔔 Original Fibonacci signals
+        elif fib_long_met:
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
-                # 📝 Silent diagnostic included in alert even if DEBUG_MODE=False
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},R2:{pivots['R2']:.5f}]"
                 message = (
                     f"🟢 {pair_name} - **FIB LONG**\n"
@@ -554,7 +605,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
             updated_state = current_signal
 
-        elif short_conditions_met:
+        elif fib_short_met:
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
@@ -570,7 +621,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             updated_state = current_signal
 
         else:
-            log(f"No Fibonacci Pivot signal conditions met for {pair_name}")
+            log(f"No signal conditions met for {pair_name}")
 
         return updated_state, '\n'.join(thread_log)
 
@@ -581,7 +632,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             traceback.print_exc()
         return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-
 def main():
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
@@ -589,37 +639,30 @@ def main():
     print(f"Fibonacci Pivot Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
     print("=" * 50)
-
     if SEND_TEST_MESSAGE:
         send_test_message()
-
     if RESET_STATE and os.path.exists(STATE_FILE):
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
-
     last_alerts = load_state()
-
     keys_to_purge = []
     for key, value in list(last_alerts.items()):
         if value:
             value_str = str(value).lower()
-            if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_')):
+            if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_') or value_str in ['vbuy', 'vsell']):
                 keys_to_purge.append(key)
     if keys_to_purge:
         print(f"\n[INFO] 🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None
-
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
-
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
-
     updates_processed = 0
     pair_logs = []
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -642,7 +685,6 @@ def main():
                     import traceback
                     traceback.print_exc()
                 continue
-
     if DEBUG_MODE:
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS START")
@@ -652,13 +694,11 @@ def main():
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS END")
         print("="*50)
-
     save_state(last_alerts)
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
     print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
-
 
 if __name__ == "__main__":
     main()
