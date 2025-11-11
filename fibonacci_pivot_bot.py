@@ -32,7 +32,7 @@ PAIRS = {
 }
 
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
+    "SOLUSD": {"limit_15m": 300, "min_required": 200, "limit_5m": 600, "min_required_5m": 400}
 }
 
 PPO_FAST = 7
@@ -240,6 +240,7 @@ def get_candles(product_id, resolution="15", limit=150):
     except Exception as e:
         logger.exception(f"Exception fetching candles for {product_id}: {e}")
         return None
+logger.debug(f"{product_id} {resolution}m candles fetched: {len(df)} rows")
 
 # ============ INDICATORS ============
 def calculate_ema(data, period):
