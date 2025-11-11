@@ -210,7 +210,6 @@ def get_candles(product_id, resolution="15", limit=150):
             traceback.print_exc()
         return None
 
-# --- Indicator Functions ---
 def calculate_ema(data, period): return data.ewm(span=period, adjust=False).mean()
 def calculate_sma(data, period): return data.rolling(window=period).mean()
 def calculate_rma(data, period): return data.ewm(alpha=1/period, adjust=False).mean()
@@ -297,7 +296,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     raw_momentum = raw_momentum.fillna(0)
     min_med = raw_momentum.rolling(window=period).min().fillna(0)
     max_med = raw_momentum.rolling(window=period).max().fillna(0)
-    rng = np.maximum(1e-10, max_med - min_med)  # ←←← NaN-safe
+    rng = np.maximum(1e-10, max_med - min_med)
     temp = (raw_momentum - min_med) / rng
     value = pd.Series(0.0, index=df.index)
     value.iloc[0] = 0.0
@@ -314,7 +313,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     hist.iloc[0] = momentum.iloc[0]
     for i in range(1, len(momentum)):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-    return hist.fillna(0)  # ←←← Final NaN safety
+    return hist.fillna(0)
 
 def diagnose_failure(pair_name, **kwargs):
     missing = []
@@ -392,7 +391,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             strong_bullish_close = bullish and (upper_wick / total_range) < 0.20
             strong_bearish_close = bearish and (lower_wick / total_range) < 0.20
         else:
-            # ←←← FIXED: Handle zero-range candles
+            # FIXED: Handle zero-range candles
             strong_bullish_close = bullish
             strong_bearish_close = bearish
 
@@ -511,7 +510,7 @@ def main():
         return
 
     results = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:  # ←←← Reduced to 6
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_pair = {
             executor.submit(check_pair, name, info, last_alerts.get(name)): name
             for name, info in PAIRS.items() if info is not None
