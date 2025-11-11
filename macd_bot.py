@@ -16,6 +16,7 @@ from urllib3.util.retry import Retry
 # ============ CONFIGURATION ============
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
+
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 DELTA_API_BASE = "https://api.delta.exchange"
@@ -39,7 +40,6 @@ SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 300, "min_required_5m": 250}
 }
 
-# Indicator settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
@@ -297,7 +297,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     raw_momentum = raw_momentum.fillna(0)
     min_med = raw_momentum.rolling(window=period).min().fillna(0)
     max_med = raw_momentum.rolling(window=period).max().fillna(0)
-    rng = np.maximum(1e-10, max_med - min_med)
+    rng = np.maximum(1e-10, max_med - min_med)  # ←←← NaN-safe
     temp = (raw_momentum - min_med) / rng
     value = pd.Series(0.0, index=df.index)
     value.iloc[0] = 0.0
@@ -314,7 +314,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     hist.iloc[0] = momentum.iloc[0]
     for i in range(1, len(momentum)):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-    return hist.fillna(0)
+    return hist.fillna(0)  # ←←← Final NaN safety
 
 def diagnose_failure(pair_name, **kwargs):
     missing = []
@@ -392,8 +392,27 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             strong_bullish_close = bullish and (upper_wick / total_range) < 0.20
             strong_bearish_close = bearish and (lower_wick / total_range) < 0.20
         else:
+            # ←←← FIXED: Handle zero-range candles
             strong_bullish_close = bullish
             strong_bearish_close = bearish
+
+        debug_log(f"\nCandle Metrics (15m):")
+        debug_log(f"  O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
+        if total_range > 1e-10:
+            debug_log(f"  Strong Bullish Close (20% Rule): {strong_bullish_close}")
+            debug_log(f"  Strong Bearish Close (20% Rule): {strong_bearish_close}")
+        else:
+            debug_log("  Candle range is zero; using directional close only.")
+
+        debug_log(f"\nIndicator Values:")
+        debug_log(f"Price (15m): ${close_curr:,.2f}")
+        debug_log(f"PPO: {ppo_curr:.4f} (prev: {ppo_prev:.4f})")
+        debug_log(f"PPO Signal: {sig_curr:.4f} (prev: {sig_prev:.4f})")
+        debug_log(f"RMA50 (15m): {rma50_curr:.2f}")
+        debug_log(f"RMA200 (5m): {rma200_curr:.2f}")
+        debug_log(f"Smoothed RSI (15m): {smooth_curr:.2f} (prev: {smooth_prev:.2f})")
+        debug_log(f"Cirrus Filter 1: {filtx1.iloc[-1]:.4f}, Filter 2: {filtx12.iloc[-1]:.4f}")
+        debug_log(f"Cirrus Cloud - Upw: {upw.iloc[-1]}, Dnw: {dnw.iloc[-1]}")
 
         ppo_cross_up = (ppo_prev <= sig_prev) and (ppo_curr > sig_curr)
         ppo_cross_down = (ppo_prev >= sig_prev) and (ppo_curr < sig_curr)
@@ -406,10 +425,11 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         magical_hist_positive = magical_hist_curr > 0
         magical_hist_negative = magical_hist_curr < 0
 
-        debug_log(f"\nCandle Metrics (15m): O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
-        debug_log(f"Strong Bullish Close: {strong_bullish_close}, Strong Bearish Close: {strong_bearish_close}")
-        debug_log(f"Magical Hist: {magical_hist_curr:.4f}, PPO: {ppo_curr:.4f}, Signal: {sig_curr:.4f}")
-        debug_log(f"RMA50: {rma50_curr:.2f}, RMA200: {rma200_curr:.2f}, Cloud: Upw={upw.iloc[-1]}, Dnw={dnw.iloc[-1]}")
+        debug_log(f"\nCrossover Checks:")
+        debug_log(f"  PPO 15m cross up: {ppo_cross_up}")
+        debug_log(f"  PPO 15m cross down: {ppo_cross_down}")
+        debug_log(f"  SRSI cross up 50: {srsi_cross_up_50}")
+        debug_log(f"  SRSI cross down 50: {srsi_cross_down_50}")
 
         current_state = None
         ist = pytz.timezone('Asia/Kolkata')
@@ -491,7 +511,7 @@ def main():
         return
 
     results = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:  # ←←← Reduced to 6
         future_to_pair = {
             executor.submit(check_pair, name, info, last_alerts.get(name)): name
             for name, info in PAIRS.items() if info is not None
