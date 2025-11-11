@@ -249,6 +249,7 @@ def calculate_ema(data, period):
 def calculate_sma(data, period):
     if len(data) < period or period <= 0:
         return pd.Series([np.nan] * len(data), index=data.index)
+    # ✅ Updated: explicit min_periods
     return data.rolling(window=period, min_periods=period).mean()
 
 def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
@@ -302,12 +303,15 @@ def calculate_rma(data, period):
 def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     if len(df) < period + 50:
         return pd.Series([np.nan] * len(df), index=df.index)
+
     close = df['close'].astype(float)
     if close.isnull().all():
         return pd.Series([np.nan] * len(df), index=df.index)
+
     responsiveness = max(0.00001, responsiveness)
     sd = close.rolling(window=50, min_periods=1).std() * responsiveness
     sd = sd.bfill().fillna(0.001)
+
     worm = close.copy()
     worm.iloc[0] = close.iloc[0]
     for i in range(1, len(close)):
@@ -315,16 +319,20 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         abs_diff = abs(diff)
         delta = np.sign(diff) * sd.iloc[i] if abs_diff > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
+
     ma = close.rolling(window=period, min_periods=1).mean()
     with np.errstate(divide='ignore', invalid='ignore'):
         raw_momentum = (worm - ma) / worm.replace(0, np.nan)
+
     raw_momentum = raw_momentum.fillna(0)
     min_med = raw_momentum.rolling(window=period, min_periods=1).min()
     max_med = raw_momentum.rolling(window=period, min_periods=1).max()
     rng = max_med - min_med
+
     temp = pd.Series(0.0, index=df.index)
     valid = rng > 1e-10
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
+
     value = pd.Series(0.0, index=df.index)
     if len(value) > 0:
         value.iloc[0] = 0.0
@@ -332,17 +340,21 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
             v_prev = value.iloc[i - 1]
             v_new = (temp.iloc[i] - 0.5 + 0.5 * v_prev)
             value.iloc[i] = max(-0.9999, min(0.9999, v_new))
+
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
     log_temp2 = np.log(temp2)
     momentum = 0.25 * log_temp2
     momentum = momentum.fillna(0)
+
     hist = pd.Series(0.0, index=df.index)
     if len(hist) > 0:
         hist.iloc[0] = momentum.iloc[0]
         for i in range(1, len(momentum)):
             hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
+
     return hist
+
 
 # ============ PIVOTS ============
 def get_previous_day_ohlc(product_id, days_back_limit=15):
