@@ -213,7 +213,12 @@ def get_product_ids():
     try:
         debug_log("Fetching product IDs from Delta Exchange...")
         response = SESSION.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception:
+            print(f"API Error: Non-JSON response: {response.status_code} {response.text[:200]}")
+            return False
+
         if data.get('success'):
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
@@ -252,23 +257,31 @@ def get_candles(product_id, resolution="15", limit=150):
         }
         debug_log(f"Fetching {resolution}m candles for {product_id}, limit={limit}")
         response = SESSION.get(url, params=params, timeout=15)
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception:
+            print(f"Error fetching candles for {product_id}: Non-JSON response {response.status_code} {response.text[:200]}")
+            return None
+
         if data.get('success'):
             result = data['result']
-            df = pd.DataFrame({
-                'timestamp': result.get('t', []),
-                'open': result.get('o', []),
-                'high': result.get('h', []),
-                'low': result.get('l', []),
-                'close': result.get('c', []),
-                'volume': result.get('v', [])
-            })
-            if len(df) == 0:
+            # Verify lengths to avoid misaligned DataFrame
+            arrays = [result.get('t', []), result.get('o', []), result.get('h', []), result.get('l', []), result.get('c', []), result.get('v', [])]
+            min_len = min(map(len, arrays)) if arrays else 0
+            if min_len == 0:
                 debug_log(f"No candles returned for {product_id}")
                 return None
+            df = pd.DataFrame({
+                'timestamp': result.get('t', [])[:min_len],
+                'open': result.get('o', [])[:min_len],
+                'high': result.get('h', [])[:min_len],
+                'low': result.get('l', [])[:min_len],
+                'close': result.get('c', [])[:min_len],
+                'volume': result.get('v', [])[:min_len]
+            })
 
-            # Sort by timestamp just in case
-            df = df.sort_values('timestamp').reset_index(drop=True)
+            # Sort by timestamp just in case and drop duplicates
+            df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
 
             # Validate price data
             if df['close'].iloc[-1] <= 0:
