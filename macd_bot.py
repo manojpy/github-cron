@@ -16,7 +16,6 @@ from urllib3.util.retry import Retry
 # ============ CONFIGURATION ============
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
-
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 DELTA_API_BASE = "https://api.delta.exchange"
@@ -74,16 +73,13 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 raw = json.load(f)
-                # Validate structure
                 if isinstance(raw, dict):
                     clean = {k: v for k, v in raw.items() if k in PAIRS and isinstance(v, str)}
                     debug_log(f"Loaded state: {clean}")
                     return clean
-                else:
-                    debug_log("State file invalid format")
-        debug_log("No previous state found, starting fresh")
     except Exception as e:
         print(f"Error loading state: {e}")
+    debug_log("No previous state found, starting fresh")
     return {}
 
 def save_state(state):
@@ -139,17 +135,23 @@ def get_product_ids():
         if data.get('success'):
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
+            product_map = {}
             for product in products:
-                symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
                 if product.get('contract_type') == 'perpetual_futures':
-                    for pair_name in PAIRS.keys():
-                        if symbol == pair_name or symbol.replace('_', '') == pair_name:
-                            PAIRS[pair_name] = {
-                                'id': product['id'],
-                                'symbol': product['symbol'],
-                                'contract_type': product['contract_type']
-                            }
-                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
+                    product_map[product['symbol']] = product
+
+            for pair_name in list(PAIRS.keys()):
+                delta_symbol = pair_name.replace('USD', 'USDT')
+                if delta_symbol in product_map:
+                    product = product_map[delta_symbol]
+                    PAIRS[pair_name] = {
+                        'id': product['id'],
+                        'symbol': product['symbol'],
+                        'contract_type': product['contract_type']
+                    }
+                    debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
+                else:
+                    debug_log(f"No match found for {pair_name} (tried {delta_symbol})")
             return True
         else:
             print(f"API Error: {data}")
@@ -315,11 +317,10 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     return hist.fillna(0)
 
 def diagnose_failure(pair_name, **kwargs):
-    """Log why a near-miss didn't trigger"""
     missing = []
-    if not kwargs.get('strong_bearish_close') and kwargs.get('bearish_intent'):
+    if not kwargs.get('strong_bearish_close') and kwargs.get('short_intent'):
         missing.append("strong_bearish_close")
-    if not kwargs.get('strong_bullish_close') and kwargs.get('bullish_intent'):
+    if not kwargs.get('strong_bullish_close') and kwargs.get('long_intent'):
         missing.append("strong_bullish_close")
     if not kwargs.get('ppo_cross_down') and kwargs.get('short_intent'):
         missing.append("ppo_cross_down")
@@ -358,7 +359,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m)
 
-        # Get latest values with safety
         def safe_get(series, idx=-1):
             val = series.iloc[idx]
             return float(val) if not pd.isna(val) else np.nan
@@ -395,7 +395,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             strong_bullish_close = bullish
             strong_bearish_close = bearish
 
-        # Conditions
         ppo_cross_up = (ppo_prev <= sig_prev) and (ppo_curr > sig_curr)
         ppo_cross_down = (ppo_prev >= sig_prev) and (ppo_curr < sig_curr)
         close_above_rma50 = close_curr > rma50_curr
@@ -417,7 +416,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_curr
 
-        # === SIGNAL CHECKS ===
         short_intent = (close_below_rma50 and close_below_rma200 and dnw.iloc[-1] and magical_hist_negative)
         long_intent = (close_above_rma50 and close_above_rma200 and upw.iloc[-1] and magical_hist_positive)
 
@@ -454,7 +452,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             if last_state_for_pair != "short_011":
                 send_telegram_alert(f"🔴 {pair_name} - SHORT (-0.11)\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
         else:
-            # === DIAGNOSTIC: Log near misses ===
             if short_intent and ppo_curr < sig_curr and not ppo_cross_down:
                 diagnose_failure(pair_name, short_intent=True, ppo_cross_down=False,
                                 strong_bearish_close=strong_bearish_close, magical_hist_negative=magical_hist_negative)
@@ -494,7 +491,6 @@ def main():
         return
 
     results = {}
-    # Reduce workers to avoid Delta API throttling
     with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_pair = {
             executor.submit(check_pair, name, info, last_alerts.get(name)): name
@@ -503,17 +499,18 @@ def main():
         for future in as_completed(future_to_pair):
             name = future_to_pair[future]
             try:
-                results[name] = future.result()
+                res = future.result()
+                if res is not None:
+                    results[name] = res
             except Exception as e:
                 print(f"Thread error for {name}: {e}")
 
     with state_lock:
-        # Only update non-None results
-        last_alerts.update({k: v for k, v in results.items() if v is not None})
+        last_alerts.update(results)
         save_state(last_alerts)
 
     elapsed = (datetime.now(ist) - start_time).total_seconds()
-    print(f"✓ Check complete. {len({k:v for k,v in results.items() if v is not None})} state updates. ({elapsed:.1f}s)")
+    print(f"✓ Check complete. {len(results)} state updates. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
