@@ -38,8 +38,8 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'False'
-        SEND_TEST_MESSAGE: 'False'
+        DEBUG_MODE: 'True'
+        SEND_TEST_MESSAGE: 'True'
         # PASS UNIQUE FILENAME
         STATE_FILE_PATH: macd_state.json 
       run: python macd_bot.py
@@ -65,5 +65,6 @@ jobs:
           macd_state.json
           fib_state.json
       continue-on-error: true
+
 
 
