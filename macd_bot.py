@@ -44,7 +44,7 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 300, "min_required": 200, "limit_5m": 600, "min_required_5m": 400}
+    "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 300, "min_required_5m": 250}
 }
 
 # Indicator settings
@@ -540,7 +540,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         # Candle metrics (zero-range safe)
         total_range = high_curr - low_curr
         if total_range <= 0:
-            # Zero or negative range (data glitch) — treat wick ratios as neutral
             upper_wick = 0.0
             lower_wick = 0.0
             strong_bullish_close = False
@@ -623,6 +622,14 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         current_state = None
         send_message = None
 
+        # Cirrus Cloud state (exclusive)
+        cloud_state = "neutral"
+        if CIRRUS_CLOUD_ENABLED:
+            cloud_state = ("green" if (bool(upw.iloc[last_i]) and not bool(dnw.iloc[last_i]))
+                           else "red" if (bool(dnw.iloc[last_i]) and not bool(upw.iloc[last_i]))
+                           else "neutral")
+        debug_log(f"Cirrus Cloud State: {cloud_state}")
+
         # --- ALERT LOGIC (8 SIGNALS) ---
         # BUY
         buy_conds = {
@@ -630,8 +637,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_below_020": ppo_below_020,
             "close_above_rma50": close_above_rma50,
             "close_above_rma200": close_above_rma200,
-            "upw": bool(upw.iloc[last_i]),
-            "dnw": not bool(dnw.iloc[last_i]),
+            "cloud_green": (cloud_state == "green"),
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
@@ -647,8 +653,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_above_minus020": ppo_above_minus020,
             "close_below_rma50": close_below_rma50,
             "close_below_rma200": close_below_rma200,
-            "dnw": bool(dnw.iloc[last_i]),
-            "upw": not bool(upw.iloc[last_i]),
+            "cloud_red": (cloud_state == "red"),
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
@@ -665,8 +670,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_below_030": ppo_below_030,
             "close_above_rma50": close_above_rma50,
             "close_above_rma200": close_above_rma200,
-            "upw": bool(upw.iloc[last_i]),
-            "dnw": not bool(dnw.iloc[last_i]),
+            "cloud_green": (cloud_state == "green"),
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
@@ -683,8 +687,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_above_minus030": ppo_above_minus030,
             "close_below_rma50": close_below_rma50,
             "close_below_rma200": close_below_rma200,
-            "dnw": bool(dnw.iloc[last_i]),
-            "upw": not bool(upw.iloc[last_i]),
+            "cloud_red": (cloud_state == "red"),
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
@@ -700,8 +703,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_above_signal": ppo_above_signal,
             "close_above_rma50": close_above_rma50,
             "close_above_rma200": close_above_rma200,
-            "upw": bool(upw.iloc[last_i]),
-            "dnw": not bool(dnw.iloc[last_i]),
+            "cloud_green": (cloud_state == "green"),
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
@@ -717,8 +719,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_above_signal": ppo_above_signal,
             "close_above_rma50": close_above_rma50,
             "close_above_rma200": close_above_rma200,
-            "upw": bool(upw.iloc[last_i]),
-            "dnw": not bool(dnw.iloc[last_i]),
+            "cloud_green": (cloud_state == "green"),
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
@@ -734,8 +735,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_below_signal": ppo_below_signal,
             "close_below_rma50": close_below_rma50,
             "close_below_rma200": close_below_rma200,
-            "dnw": bool(dnw.iloc[last_i]),
-            "upw": not bool(upw.iloc[last_i]),
+            "cloud_red": (cloud_state == "red"),
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
@@ -751,8 +751,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "ppo_below_signal": ppo_below_signal,
             "close_below_rma50": close_below_rma50,
             "close_below_rma200": close_below_rma200,
-            "dnw": bool(dnw.iloc[last_i]),
-            "upw": not bool(upw.iloc[last_i]),
+            "cloud_red": (cloud_state == "red"),
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
