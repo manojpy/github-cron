@@ -72,7 +72,8 @@ SRSI_EMA_LEN = 5
 
 # State file paths (read from environment, fallback to defaults)
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "macd_state.json")
-STATE_FILE_BAK = STATE_FILE + "macd_state.bak"
+STATE_FILE_BAK = STATE_FILE + ".bak"
+
 COOLDOWN_SECONDS = 600  # 10 minutes per signal
 
 # Thread lock for state updates
