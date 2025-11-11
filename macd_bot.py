@@ -14,20 +14,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ============ CONFIGURATION ============
-# Telegram settings - reads from environment variables (GitHub Secrets)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
-# Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
-
-# Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
-
-# Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
 
-# Trading pairs to monitor (user-facing names end with USD)
 PAIRS = {
     "BTCUSD": None,
     "ETHUSD": None,
@@ -43,12 +36,6 @@ PAIRS = {
     "AAVEUSD": None
 }
 
-# Map user-facing pair names to actual Delta symbols (USDT-margined)
-def to_delta_symbol(pair_name):
-    # All pairs are USDT-margined on Delta for alts
-    return pair_name.replace('USD', 'USDT')
-
-# Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 300, "min_required_5m": 250}
 }
@@ -58,19 +45,14 @@ PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
-
 RMA_50_PERIOD = 50
 RMA_200_PERIOD = 200
-
-CIRRUS_CLOUD_ENABLED = True
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
-
 SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
-
 STATE_FILE = 'macd_state.json'
 state_lock = Lock()
 
@@ -91,12 +73,17 @@ def load_state():
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-                debug_log(f"Loaded state: {state}")
-                return state
+                raw = json.load(f)
+                # Validate structure
+                if isinstance(raw, dict):
+                    clean = {k: v for k, v in raw.items() if k in PAIRS and isinstance(v, str)}
+                    debug_log(f"Loaded state: {clean}")
+                    return clean
+                else:
+                    debug_log("State file invalid format")
+        debug_log("No previous state found, starting fresh")
     except Exception as e:
         print(f"Error loading state: {e}")
-    debug_log("No previous state found, starting fresh")
     return {}
 
 def save_state(state):
@@ -145,7 +132,6 @@ def send_test_message():
     return success
 
 def get_product_ids():
-    """Fetch product IDs and map USD-named pairs to USDT symbols"""
     try:
         debug_log("Fetching product IDs from Delta Exchange...")
         response = SESSION.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
@@ -153,23 +139,17 @@ def get_product_ids():
         if data.get('success'):
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
-            product_map = {}
             for product in products:
+                symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
                 if product.get('contract_type') == 'perpetual_futures':
-                    product_map[product['symbol']] = product
-
-            for pair_name in list(PAIRS.keys()):
-                delta_symbol = to_delta_symbol(pair_name)
-                if delta_symbol in product_map:
-                    product = product_map[delta_symbol]
-                    PAIRS[pair_name] = {
-                        'id': product['id'],
-                        'symbol': product['symbol'],
-                        'contract_type': product['contract_type']
-                    }
-                    debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
-                else:
-                    debug_log(f"No match found for {pair_name} (tried {delta_symbol})")
+                    for pair_name in PAIRS.keys():
+                        if symbol == pair_name or symbol.replace('_', '') == pair_name:
+                            PAIRS[pair_name] = {
+                                'id': product['id'],
+                                'symbol': product['symbol'],
+                                'contract_type': product['contract_type']
+                            }
+                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
             return True
         else:
             print(f"API Error: {data}")
@@ -228,70 +208,43 @@ def get_candles(product_id, resolution="15", limit=150):
             traceback.print_exc()
         return None
 
-# --- ALL INDICATOR FUNCTIONS REMAIN IDENTICAL ---
-# (calculate_ema, calculate_sma, calculate_rma, calculate_ppo, smoothrng, rngfilt,
-#  calculate_cirrus_cloud, kalman_filter, calculate_smooth_rsi, calculate_magical_momentum_hist)
-# → No changes needed; they work on price data regardless of symbol
-
-def calculate_ema(data, period):
-    return data.ewm(span=period, adjust=False).mean()
-
-def calculate_sma(data, period):
-    return data.rolling(window=period).mean()
-
-def calculate_rma(data, period):
-    return data.ewm(alpha=1/period, adjust=False).mean()
+# --- Indicator Functions ---
+def calculate_ema(data, period): return data.ewm(span=period, adjust=False).mean()
+def calculate_sma(data, period): return data.rolling(window=period).mean()
+def calculate_rma(data, period): return data.ewm(alpha=1/period, adjust=False).mean()
 
 def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     close = df['close']
-    if use_sma:
-        fast_ma = calculate_sma(close, fast)
-        slow_ma = calculate_sma(close, slow)
-    else:
-        fast_ma = calculate_ema(close, fast)
-        slow_ma = calculate_ema(close, slow)
+    fast_ma = calculate_sma(close, fast) if use_sma else calculate_ema(close, fast)
+    slow_ma = calculate_sma(close, slow) if use_sma else calculate_ema(close, slow)
     ppo = (fast_ma - slow_ma) / slow_ma * 100
-    if use_sma:
-        ppo_signal = calculate_sma(ppo, signal)
-    else:
-        ppo_signal = calculate_ema(ppo, signal)
+    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
     return ppo, ppo_signal
 
 def smoothrng(x, t, m):
     wper = t * 2 - 1
     avrng = calculate_ema(np.abs(x.diff()), t)
-    smoothrng = calculate_ema(avrng, wper) * m
-    return smoothrng
+    return calculate_ema(avrng, wper) * m
 
 def rngfilt(x, r):
-    result_list = [x.iloc[0]] 
+    result_list = [x.iloc[0]]
     for i in range(1, len(x)):
         prev_f = result_list[-1]
-        curr_x = x.iloc[i] 
-        curr_r = r.iloc[i] 
-        f = 0.0 
+        curr_x, curr_r = x.iloc[i], r.iloc[i]
         if curr_x > prev_f:
-            if curr_x - curr_r < prev_f:
-                f = prev_f
-            else:
-                f = curr_x - curr_r
+            f = prev_f if (curr_x - curr_r) < prev_f else (curr_x - curr_r)
         else:
-            if curr_x + curr_r > prev_f:
-                f = prev_f
-            else:
-                f = curr_x + curr_r
+            f = prev_f if (curr_x + curr_r) > prev_f else (curr_x + curr_r)
         result_list.append(f)
     return pd.Series(result_list, index=x.index)
 
 def calculate_cirrus_cloud(df):
     close = df['close'].copy()
-    smrngx1x = smoothrng(close, X1, X2)
-    smrngx1x2 = smoothrng(close, X3, X4)
-    filtx1 = rngfilt(close, smrngx1x)
-    filtx12 = rngfilt(close, smrngx1x2)
-    upw = filtx1 < filtx12 
-    dnw = filtx1 > filtx12 
-    return upw, dnw, filtx1, filtx12 
+    filtx1 = rngfilt(close, smoothrng(close, X1, X2))
+    filtx12 = rngfilt(close, smoothrng(close, X3, X4))
+    upw = filtx1 < filtx12
+    dnw = filtx1 > filtx12
+    return upw, dnw, filtx1, filtx12
 
 def kalman_filter(src, length, R=0.01, Q=0.1):
     result_list = []
@@ -300,16 +253,15 @@ def kalman_filter(src, length, R=0.01, Q=0.1):
     error_meas = R * length
     Q_div_length = Q / length
     for i in range(len(src)):
-        current_src = src.iloc[i]
+        curr = src.iloc[i]
         if np.isnan(estimate):
-            if i > 0:
-                estimate = src.iloc[i-1]
-            else:
+            estimate = src.iloc[i-1] if i > 0 else np.nan
+            if np.isnan(estimate):
                 result_list.append(np.nan)
                 continue
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current_src - prediction)
+        estimate = prediction + kalman_gain * (curr - prediction)
         error_est = (1 - kalman_gain) * error_est + Q_div_length
         result_list.append(estimate)
     return pd.Series(result_list, index=src.index)
@@ -321,10 +273,9 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     loss = -delta.where(delta < 0, 0)
     avg_gain = calculate_rma(gain, rsi_len)
     avg_loss = calculate_rma(loss, rsi_len)
-    rs = avg_gain.divide(avg_loss.replace(0, np.nan)) 
+    rs = avg_gain.divide(avg_loss.replace(0, np.nan))
     rsi_value = 100 - (100 / (1 + rs))
-    smooth_rsi = kalman_filter(rsi_value, kalman_len)
-    return smooth_rsi
+    return kalman_filter(rsi_value, kalman_len)
 
 def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     if len(df) < period + 50:
@@ -337,20 +288,15 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     for i in range(1, len(close)):
         diff = close.iloc[i] - worm.iloc[i - 1]
         abs_diff = abs(diff)
-        if abs_diff > sd.iloc[i]:
-            delta = np.sign(diff) * sd.iloc[i]
-        else:
-            delta = diff
+        delta = np.sign(diff) * sd.iloc[i] if abs_diff > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
     ma = close.rolling(window=period).mean()
     raw_momentum = (worm - ma) / worm.replace(0, np.nan)
     raw_momentum = raw_momentum.fillna(0)
-    min_med = raw_momentum.rolling(window=period).min()
-    max_med = raw_momentum.rolling(window=period).max()
-    rng = max_med - min_med
-    temp = pd.Series(0.0, index=df.index)
-    valid = rng > 1e-10
-    temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
+    min_med = raw_momentum.rolling(window=period).min().fillna(0)
+    max_med = raw_momentum.rolling(window=period).max().fillna(0)
+    rng = np.maximum(1e-10, max_med - min_med)
+    temp = (raw_momentum - min_med) / rng
     value = pd.Series(0.0, index=df.index)
     value.iloc[0] = 0.0
     for i in range(1, len(temp)):
@@ -366,9 +312,26 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     hist.iloc[0] = momentum.iloc[0]
     for i in range(1, len(momentum)):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-    return hist
+    return hist.fillna(0)
 
-# --- ZERO-RANGE CANDLE HANDLING ADDED HERE ---
+def diagnose_failure(pair_name, **kwargs):
+    """Log why a near-miss didn't trigger"""
+    missing = []
+    if not kwargs.get('strong_bearish_close') and kwargs.get('bearish_intent'):
+        missing.append("strong_bearish_close")
+    if not kwargs.get('strong_bullish_close') and kwargs.get('bullish_intent'):
+        missing.append("strong_bullish_close")
+    if not kwargs.get('ppo_cross_down') and kwargs.get('short_intent'):
+        missing.append("ppo_cross_down")
+    if not kwargs.get('ppo_cross_up') and kwargs.get('long_intent'):
+        missing.append("ppo_cross_up")
+    if not kwargs.get('magical_hist_positive') and kwargs.get('long_intent'):
+        missing.append("magical_hist > 0")
+    if not kwargs.get('magical_hist_negative') and kwargs.get('short_intent'):
+        missing.append("magical_hist < 0")
+    if missing:
+        debug_log(f"⚠️ NEAR-MISS {pair_name}: missing {', '.join(missing)}")
+
 def check_pair(pair_name, pair_info, last_state_for_pair):
     try:
         if pair_info is None:
@@ -377,257 +340,127 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         debug_log(f"Checking {pair_name}")
         debug_log(f"{'='*60}")
 
-        if pair_name in SPECIAL_PAIRS:
-            limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
-            min_required = SPECIAL_PAIRS[pair_name]["min_required"]
-            limit_5m = SPECIAL_PAIRS[pair_name].get("limit_5m", 300)
-            min_required_5m = SPECIAL_PAIRS[pair_name].get("min_required_5m", 250)
-        else:
-            limit_15m = 210
-            min_required = 200
-            limit_5m = 300
-            min_required_5m = 250
-
-        df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
-        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-
-        if df_15m is None or len(df_15m) < min_required:
-            print(f"⚠️ Insufficient 15m data for {pair_name}: {len(df_15m) if df_15m is not None else 0}/{min_required} candles")
+        cfg = SPECIAL_PAIRS.get(pair_name,
+            {"limit_15m": 210, "min_required": 200, "limit_5m": 300, "min_required_5m": 250})
+        df_15m = get_candles(pair_info['symbol'], "15", limit=cfg["limit_15m"])
+        df_5m = get_candles(pair_info['symbol'], "5", limit=cfg["limit_5m"])
+        if df_15m is None or len(df_15m) < cfg["min_required"]:
+            print(f"⚠️ Insufficient 15m data for {pair_name}: {len(df_15m) if df_15m is not None else 0}/{cfg['min_required']}")
             return None
-        if df_5m is None or len(df_5m) < min_required_5m:
-            print(f"⚠️ Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{min_required_5m} candles")
+        if df_5m is None or len(df_5m) < cfg["min_required_5m"]:
+            print(f"⚠️ Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{cfg['min_required_5m']}")
             return None
 
-        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
-        magical_hist_curr = magical_hist.iloc[-1]
-        if pd.isna(magical_hist_curr):
-            debug_log(f"⚠️ NaN in Magical Momentum Hist for {pair_name}, skipping")
-            return None
-        debug_log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
-
+        magical_hist = calculate_magical_momentum_hist(df_15m)
         ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
         rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m)
 
-        ppo_curr = ppo.iloc[-1]
-        ppo_prev = ppo.iloc[-2]
-        ppo_signal_curr = ppo_signal.iloc[-1]
-        ppo_signal_prev = ppo_signal.iloc[-2]
-        if pd.isna(ppo_curr) or pd.isna(ppo_signal_curr) or pd.isna(ppo_prev) or pd.isna(ppo_signal_prev):
-            debug_log(f"⚠️ NaN values in PPO for {pair_name}, skipping")
-            return None
+        # Get latest values with safety
+        def safe_get(series, idx=-1):
+            val = series.iloc[idx]
+            return float(val) if not pd.isna(val) else np.nan
 
-        smooth_rsi_curr = smooth_rsi.iloc[-1]
-        smooth_rsi_prev = smooth_rsi.iloc[-2]
-        if pd.isna(smooth_rsi_curr) or pd.isna(smooth_rsi_prev):
-            debug_log(f"⚠️ NaN values in Smooth RSI for {pair_name}, skipping")
-            return None
+        ppo_curr, ppo_prev = safe_get(ppo, -1), safe_get(ppo, -2)
+        sig_curr, sig_prev = safe_get(ppo_signal, -1), safe_get(ppo_signal, -2)
+        smooth_curr, smooth_prev = safe_get(smooth_rsi, -1), safe_get(smooth_rsi, -2)
+        rma50_curr = safe_get(rma_50)
+        rma200_curr = safe_get(rma_200)
+        magical_hist_curr = safe_get(magical_hist)
 
-        close_curr = df_15m['close'].iloc[-1]
-        rma50_curr = rma_50.iloc[-1]
-        if pd.isna(rma50_curr):
-            debug_log(f"⚠️ NaN values in RMA50 for {pair_name}, skipping")
-            return None
-        rma200_curr = rma_200.iloc[-1]
-        if pd.isna(rma200_curr):
-            debug_log(f"⚠️ NaN values in RMA200 for {pair_name}, skipping")
-            return None
+        for v in [ppo_curr, sig_curr, smooth_curr, rma50_curr, rma200_curr, magical_hist_curr]:
+            if pd.isna(v):
+                debug_log(f"⚠️ NaN in indicators for {pair_name}, skipping")
+                return None
 
         open_curr = df_15m['open'].iloc[-1]
         high_curr = df_15m['high'].iloc[-1]
         low_curr = df_15m['low'].iloc[-1]
+        close_curr = df_15m['close'].iloc[-1]
         total_range = high_curr - low_curr
-        upper_wick = high_curr - max(open_curr, close_curr)
-        lower_wick = min(open_curr, close_curr) - low_curr
-        bullish_candle = close_curr > open_curr
-        bearish_candle = close_curr < open_curr
 
+        bullish = close_curr > open_curr
+        bearish = close_curr < open_curr
         strong_bullish_close = False
         strong_bearish_close = False
 
-        if total_range > 0:
-            strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
-            strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
+        if total_range > 1e-10:
+            upper_wick = high_curr - max(open_curr, close_curr)
+            lower_wick = min(open_curr, close_curr) - low_curr
+            strong_bullish_close = bullish and (upper_wick / total_range) < 0.20
+            strong_bearish_close = bearish and (lower_wick / total_range) < 0.20
         else:
-            # Handle flat candles: allow directional close
-            strong_bullish_close = bullish_candle
-            strong_bearish_close = bearish_candle
+            strong_bullish_close = bullish
+            strong_bearish_close = bearish
 
-        debug_log(f"\nCandle Metrics (15m):")
-        debug_log(f"  O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
-        if total_range > 0:
-            debug_log(f"  Strong Bullish Close (20% Rule): {strong_bullish_close}")
-            debug_log(f"  Strong Bearish Close (20% Rule): {strong_bearish_close}")
-        else:
-            debug_log("  Candle range is zero; using directional close only.")
-
-        debug_log(f"\nIndicator Values:")
-        debug_log(f"Price (15m): ${close_curr:,.2f}")
-        debug_log(f"PPO: {ppo_curr:.4f} (prev: {ppo_prev:.4f})")
-        debug_log(f"PPO Signal: {ppo_signal_curr:.4f} (prev: {ppo_signal_prev:.4f})")
-        debug_log(f"RMA50 (15m): {rma50_curr:.2f}")
-        debug_log(f"RMA200 (5m): {rma200_curr:.2f}")
-        debug_log(f"Smoothed RSI (15m): {smooth_rsi_curr:.2f} (prev: {smooth_rsi_prev:.2f})")
-        debug_log(f"Cirrus Filter 1: {filtx1.iloc[-1]:.4f}, Filter 2: {filtx12.iloc[-1]:.4f}")
-        debug_log(f"Cirrus Cloud - Upw: {upw.iloc[-1]}, Dnw: {dnw.iloc[-1]}")
-
-        ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
-        ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
-        ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
-        ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
-        ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
-        ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
-        ppo_below_020 = ppo_curr < 0.20
-        ppo_above_minus020 = ppo_curr > -0.20
-        ppo_above_signal = ppo_curr > ppo_signal_curr
-        ppo_below_signal = ppo_curr < ppo_signal_curr
-        ppo_below_030 = ppo_curr < 0.30
-        ppo_above_minus030 = ppo_curr > -0.30
+        # Conditions
+        ppo_cross_up = (ppo_prev <= sig_prev) and (ppo_curr > sig_curr)
+        ppo_cross_down = (ppo_prev >= sig_prev) and (ppo_curr < sig_curr)
         close_above_rma50 = close_curr > rma50_curr
         close_below_rma50 = close_curr < rma50_curr
         close_above_rma200 = close_curr > rma200_curr
         close_below_rma200 = close_curr < rma200_curr
-        srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
-        srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
+        srsi_cross_up_50 = (smooth_prev <= 50) and (smooth_curr > 50)
+        srsi_cross_down_50 = (smooth_prev >= 50) and (smooth_curr < 50)
+        magical_hist_positive = magical_hist_curr > 0
+        magical_hist_negative = magical_hist_curr < 0
 
-        debug_log(f"\nCrossover Checks:")
-        debug_log(f"  PPO 15m cross up: {ppo_cross_up}")
-        debug_log(f"  PPO 15m cross down: {ppo_cross_down}")
-        debug_log(f"  SRSI cross up 50: {srsi_cross_up_50}")
-        debug_log(f"  SRSI cross down 50: {srsi_cross_down_50}")
+        debug_log(f"\nCandle Metrics (15m): O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
+        debug_log(f"Strong Bullish Close: {strong_bullish_close}, Strong Bearish Close: {strong_bearish_close}")
+        debug_log(f"Magical Hist: {magical_hist_curr:.4f}, PPO: {ppo_curr:.4f}, Signal: {sig_curr:.4f}")
+        debug_log(f"RMA50: {rma50_curr:.2f}, RMA200: {rma200_curr:.2f}, Cloud: Upw={upw.iloc[-1]}, Dnw={dnw.iloc[-1]}")
 
         current_state = None
         ist = pytz.timezone('Asia/Kolkata')
-        current_dt = datetime.now(ist)
-        formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-        price = df_15m['close'].iloc[-1]
+        formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
+        price = close_curr
 
-        # --- ALERT LOGIC (8 SIGNALS) - UNCHANGED ---
-        if (ppo_cross_up and 
-            ppo_below_020 and 
-            close_above_rma50 and 
-            close_above_rma200 and 
-            upw.iloc[-1] and (not dnw.iloc[-1]) and 
-            strong_bullish_close and
-            magical_hist_curr > 0): 
+        # === SIGNAL CHECKS ===
+        short_intent = (close_below_rma50 and close_below_rma200 and dnw.iloc[-1] and magical_hist_negative)
+        long_intent = (close_above_rma50 and close_above_rma200 and upw.iloc[-1] and magical_hist_positive)
+
+        if (ppo_cross_up and ppo_curr < 0.20 and long_intent and strong_bullish_close):
             current_state = "buy"
-            debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
             if last_state_for_pair != "buy":
-                message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"BUY already alerted for {pair_name}, skipping duplicate")
-
-        elif (ppo_cross_down and 
-              ppo_above_minus020 and 
-              close_below_rma50 and 
-              close_below_rma200 and 
-              dnw.iloc[-1] and (not upw.iloc[-1]) and 
-              strong_bearish_close and
-              magical_hist_curr < 0): 
+                send_telegram_alert(f"🟢 {pair_name} - BUY\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif (ppo_cross_down and ppo_curr > -0.20 and short_intent and strong_bearish_close):
             current_state = "sell"
-            debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
             if last_state_for_pair != "sell":
-                message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"SELL already alerted for {pair_name}, skipping duplicate")
-
-        elif (srsi_cross_up_50 and 
-              ppo_above_signal and 
-              ppo_below_030 and 
-              close_above_rma50 and 
-              close_above_rma200 and 
-              upw.iloc[-1] and (not dnw.iloc[-1]) and 
-              strong_bullish_close and
-              magical_hist_curr > 0): 
-            current_state = "buy_srsi50" 
-            debug_log(f"\n⬆️ BUY (SRSI 50) SIGNAL DETECTED for {pair_name}!")
-            if last_state_for_pair != "buy_srsi50": 
-                message = f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"BUY (SRSI 50) already alerted for {pair_name}, skipping duplicate") 
-
-        elif (srsi_cross_down_50 and 
-              ppo_below_signal and 
-              ppo_above_minus030 and 
-              close_below_rma50 and 
-              close_below_rma200 and 
-              dnw.iloc[-1] and (not upw.iloc[-1]) and 
-              strong_bearish_close and
-              magical_hist_curr < 0): 
-            current_state = "sell_srsi50" 
-            debug_log(f"\n⬇️ SELL (SRSI 50) SIGNAL DETECTED for {pair_name}!")
-            if last_state_for_pair != "sell_srsi50": 
-                message = f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"SELL (SRSI 50) already alerted for {pair_name}, skipping duplicate") 
-
-        elif (ppo_cross_above_zero and 
-              ppo_above_signal and 
-              close_above_rma50 and 
-              close_above_rma200 and 
-              upw.iloc[-1] and (not dnw.iloc[-1]) and 
-              strong_bullish_close and
-              magical_hist_curr > 0): 
+                send_telegram_alert(f"🔴 {pair_name} - SELL\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif (srsi_cross_up_50 and ppo_curr > sig_curr and ppo_curr < 0.30 and long_intent and strong_bullish_close):
+            current_state = "buy_srsi50"
+            if last_state_for_pair != "buy_srsi50":
+                send_telegram_alert(f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI: {smooth_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif (srsi_cross_down_50 and ppo_curr < sig_curr and ppo_curr > -0.30 and short_intent and strong_bearish_close):
+            current_state = "sell_srsi50"
+            if last_state_for_pair != "sell_srsi50":
+                send_telegram_alert(f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI: {smooth_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif ( (ppo_prev <= 0 and ppo_curr > 0) and ppo_curr > sig_curr and long_intent and strong_bullish_close):
             current_state = "long_zero"
-            debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
             if last_state_for_pair != "long_zero":
-                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"LONG (0) already alerted for {pair_name}, skipping duplicate")
-
-        elif (ppo_cross_above_011 and 
-              ppo_above_signal and 
-              close_above_rma50 and 
-              close_above_rma200 and 
-              upw.iloc[-1] and (not dnw.iloc[-1]) and 
-              strong_bullish_close and
-              magical_hist_curr > 0): 
+                send_telegram_alert(f"🟢 {pair_name} - LONG (0)\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif ( (ppo_prev <= 0.11 and ppo_curr > 0.11) and ppo_curr > sig_curr and long_intent and strong_bullish_close):
             current_state = "long_011"
-            debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
             if last_state_for_pair != "long_011":
-                message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"LONG (0.11) already alerted for {pair_name}, skipping duplicate")
-
-        elif (ppo_cross_below_zero and 
-              ppo_below_signal and 
-              close_below_rma50 and 
-              close_below_rma200 and 
-              dnw.iloc[-1] and (not upw.iloc[-1]) and 
-              strong_bearish_close and
-              magical_hist_curr < 0): 
+                send_telegram_alert(f"🟢 {pair_name} - LONG (0.11)\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif ( (ppo_prev >= 0 and ppo_curr < 0) and ppo_curr < sig_curr and short_intent and strong_bearish_close):
             current_state = "short_zero"
-            debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
             if last_state_for_pair != "short_zero":
-                message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"SHORT (0) already alerted for {pair_name}, skipping duplicate")
-
-        elif (ppo_cross_below_minus011 and 
-              ppo_below_signal and 
-              close_below_rma50 and 
-              close_below_rma200 and 
-              dnw.iloc[-1] and (not upw.iloc[-1]) and 
-              strong_bearish_close and
-              magical_hist_curr < 0): 
+                send_telegram_alert(f"🔴 {pair_name} - SHORT (0)\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
+        elif ( (ppo_prev >= -0.11 and ppo_curr < -0.11) and ppo_curr < sig_curr and short_intent and strong_bearish_close):
             current_state = "short_011"
-            debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             if last_state_for_pair != "short_011":
-                message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}" 
-                send_telegram_alert(message)
-            else:
-                debug_log(f"SHORT (-0.11) already alerted for {pair_name}, skipping duplicate")
-
+                send_telegram_alert(f"🔴 {pair_name} - SHORT (-0.11)\nPPO: {ppo_curr:.2f}\nPrice: ${price:,.2f}\n{formatted_time}")
         else:
+            # === DIAGNOSTIC: Log near misses ===
+            if short_intent and ppo_curr < sig_curr and not ppo_cross_down:
+                diagnose_failure(pair_name, short_intent=True, ppo_cross_down=False,
+                                strong_bearish_close=strong_bearish_close, magical_hist_negative=magical_hist_negative)
+            if long_intent and ppo_curr > sig_curr and not ppo_cross_up:
+                diagnose_failure(pair_name, long_intent=True, ppo_cross_up=False,
+                                strong_bullish_close=strong_bullish_close, magical_hist_positive=magical_hist_positive)
             debug_log(f"No signal conditions met for {pair_name}")
 
         return current_state
@@ -661,33 +494,26 @@ def main():
         return
 
     results = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_pair = {}
-        for pair_name, pair_info in PAIRS.items():
-            if pair_info is not None:
-                last_state_for_pair = last_alerts.get(pair_name)
-                future = executor.submit(check_pair, pair_name, pair_info, last_state_for_pair)
-                future_to_pair[future] = pair_name
-
+    # Reduce workers to avoid Delta API throttling
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_to_pair = {
+            executor.submit(check_pair, name, info, last_alerts.get(name)): name
+            for name, info in PAIRS.items() if info is not None
+        }
         for future in as_completed(future_to_pair):
-            pair_name = future_to_pair[future]
+            name = future_to_pair[future]
             try:
-                new_state = future.result()
-                if new_state is not None:
-                    results[pair_name] = new_state
+                results[name] = future.result()
             except Exception as e:
-                print(f"Error processing {pair_name} in thread: {e}")
-                if DEBUG_MODE:
-                    traceback.print_exc()
-                continue
+                print(f"Thread error for {name}: {e}")
 
     with state_lock:
-        last_alerts.update(results)
+        # Only update non-None results
+        last_alerts.update({k: v for k, v in results.items() if v is not None})
         save_state(last_alerts)
 
-    end_time = datetime.now(ist)
-    elapsed = (end_time - start_time).total_seconds()
-    print(f"✓ Check complete. {len(results)} state updates processed. ({elapsed:.1f}s)")
+    elapsed = (datetime.now(ist) - start_time).total_seconds()
+    print(f"✓ Check complete. {len({k:v for k,v in results.items() if v is not None})} state updates. ({elapsed:.1f}s)")
     print("=" * 50)
 
 if __name__ == "__main__":
