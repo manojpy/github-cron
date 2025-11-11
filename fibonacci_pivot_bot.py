@@ -21,7 +21,7 @@ DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
 
-DELTA_API_BASE = "https://api.delta.exchange"
+DELTA_API_BASE = "https://api.india.delta.exchange"
 
 PAIRS = {
     "BTCUSD": None, "ETHUSD": None,
