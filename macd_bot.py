@@ -78,7 +78,6 @@ STATE_FILE = 'macd_state.json'
 state_lock = Lock()
 
 # ============ UTILITY FUNCTIONS ============
-
 def create_session():
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -167,10 +166,14 @@ def get_product_ids():
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
             for product in products:
-                symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
-                if product.get('contract_type') == 'perpetual_futures':
+                symbol = product['symbol']
+                # Only consider perpetual futures that END with 'USD' and do NOT contain 'USDT'
+                if (product.get('contract_type') == 'perpetual_futures' and
+                    symbol.endswith('USD') and
+                    'USDT' not in symbol and
+                    '_' not in symbol):  # Avoid 'BTC_USD', only 'BTCUSD'
                     for pair_name in PAIRS.keys():
-                        if symbol == pair_name or symbol.replace('_', '') == pair_name:
+                        if symbol == pair_name:
                             PAIRS[pair_name] = {
                                 'id': product['id'],
                                 'symbol': product['symbol'],
@@ -215,25 +218,17 @@ def get_candles(product_id, resolution="15", limit=150):
             if len(df) == 0:
                 debug_log(f"No candles returned for {product_id}")
                 return None
-
-            # Sort by timestamp just in case
             df = df.sort_values('timestamp').reset_index(drop=True)
-
-            # Validate price data
             if df['close'].iloc[-1] <= 0:
                 debug_log(f"Invalid price (≤0) for {product_id}, skipping")
                 return None
-
             debug_log(f"Received {len(df)} candles for {product_id} ({resolution}m)")
-
-            # Check data freshness
             last_candle_time = df['timestamp'].iloc[-1]
             time_diff = time.time() - last_candle_time
-            max_age = int(resolution) * 60 * 3  # 3 candles max age
+            max_age = int(resolution) * 60 * 3
             if time_diff > max_age:
                 print(f"⚠️ Warning: Stale data for {product_id} ({resolution}m) - {time_diff/60:.1f} min old")
-                return None  # ←←← Skip stale data
-
+                return None
             return df
         else:
             print(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
@@ -441,7 +436,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         if pd.isna(rma50_curr):
             debug_log(f"⚠️ NaN values in RMA50 for {pair_name}, skipping")
             return None
-
         rma200_curr = rma_200.iloc[-1]
         if pd.isna(rma200_curr):
             debug_log(f"⚠️ NaN values in RMA200 for {pair_name}, skipping")
@@ -458,9 +452,14 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
 
         strong_bullish_close = False
         strong_bearish_close = False
+
         if total_range > 0:
             strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
             strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
+        else:
+            # Handle zero-range candles: allow signal if directional
+            strong_bullish_close = bullish_candle
+            strong_bearish_close = bearish_candle
 
         debug_log(f"\nCandle Metrics (15m):")
         debug_log(f"  O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
@@ -468,7 +467,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             debug_log(f"  Strong Bullish Close (20% Rule): {strong_bullish_close}")
             debug_log(f"  Strong Bearish Close (20% Rule): {strong_bearish_close}")
         else:
-            debug_log("  Candle range is zero, skipping wick checks.")
+            debug_log("  Candle range is zero; using directional close only.")
 
         debug_log(f"\nIndicator Values:")
         debug_log(f"Price (15m): ${close_curr:,.2f}")
@@ -486,20 +485,16 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         ppo_cross_below_zero = (ppo_prev >= 0) and (ppo_curr < 0)
         ppo_cross_above_011 = (ppo_prev <= 0.11) and (ppo_curr > 0.11)
         ppo_cross_below_minus011 = (ppo_prev >= -0.11) and (ppo_curr < -0.11)
-
         ppo_below_020 = ppo_curr < 0.20
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
         ppo_below_signal = ppo_curr < ppo_signal_curr
-
         ppo_below_030 = ppo_curr < 0.30
         ppo_above_minus030 = ppo_curr > -0.30
-
         close_above_rma50 = close_curr > rma50_curr
         close_below_rma50 = close_curr < rma50_curr
         close_above_rma200 = close_curr > rma200_curr
         close_below_rma200 = close_curr < rma200_curr
-
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
 
@@ -661,7 +656,6 @@ def main():
         send_test_message()
 
     last_alerts = load_state()
-
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
