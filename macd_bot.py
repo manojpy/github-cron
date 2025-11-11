@@ -44,7 +44,7 @@ PAIRS = {
 
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 210, "min_required": 160, "limit_5m": 450, "min_required_5m": 220}
+    "SOLUSD": {"limit_15m": 210, "min_required": 160, "limit_5m": 300, "min_required_5m": 200}
 }
 
 # Indicator settings
