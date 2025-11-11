@@ -374,7 +374,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"             S1={pivots['S1']:.2f}, S2={pivots['S2']:.2f}, S3={pivots['S3']:.2f}")
 
         limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
-        min_required = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150), 150)
+        min_required = SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150)
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
         if df_15m is None:
             print(f"❌ {pair_name}: Failed to fetch 15m candle data")
@@ -426,7 +426,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
 
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
-        min_required_5m = max(SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250), 250)
+        min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250)
         rma_200_5m_curr = np.nan
         rma_200_available = False
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
