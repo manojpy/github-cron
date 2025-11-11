@@ -31,7 +31,7 @@ PAIRS = {
 }
 
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
+    "SOLUSD": {"limit_15m": 210, "min_required": 160, "limit_5m": 450, "min_required_5m": 220}
 }
 
 # PPO settings (used in diagnostics)
