@@ -11,7 +11,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ============ CONFIGURATION ============
-# Telegram settings - reads from environment variables (GitHub Secrets)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
@@ -57,16 +56,19 @@ def create_session_with_retries():
     return session
 
 
-# ============ ROLLING VWAP (INSTEAD OF DAILY RESET) ============
-def calculate_rolling_vwap(df, window=60):
+# ============ VWAP WITH DAILY RESET (00:00 UTC = 5:30 IST) ============
+def calculate_vwap_daily_reset(df):
     """
-    Rolling VWAP over last 'window' candles (e.g., 60 x 15m = 15 hours).
-    More responsive to recent price action — avoids stale UTC-day VWAP.
+    Calculate VWAP reset at 00:00 UTC each day using hlc3.
+    Matches Pine Script behavior and aligns with 5:30 AM IST reset.
     """
+    df = df.copy()
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+    df['date'] = df['datetime'].dt.date
     hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
     df['hlc3_vol'] = hlc3 * df['volume']
-    df['cum_vol'] = df['volume'].rolling(window=window, min_periods=1).sum()
-    df['cum_hlc3_vol'] = df['hlc3_vol'].rolling(window=window, min_periods=1).sum()
+    df['cum_vol'] = df.groupby('date')['volume'].cumsum()
+    df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
     df['vwap'] = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
     return df['vwap']
 
@@ -403,14 +405,14 @@ def check_pair(pair_name, pair_info, last_alerts):
             print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # ========== VWAP: NOW USING ROLLING (INSTEAD OF DAILY RESET) ==========
-        vwap_15m = calculate_rolling_vwap(df_15m, window=60)
+        # ========== VWAP with DAILY RESET (00:00 UTC = 5:30 IST) ==========
+        vwap_15m = calculate_vwap_daily_reset(df_15m)
         vwap_curr = vwap_15m.iloc[-2]
         if np.isnan(vwap_curr):
             log("⚠️  VWAP is NaN, skipping VBuy/VSel signals")
             vwap_curr = None
         else:
-            log(f"15m Rolling VWAP (60 candles): {vwap_curr:.4f}")
+            log(f"15m VWAP (UTC-reset = 5:30 AM IST): {vwap_curr:.4f}")
 
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
@@ -533,9 +535,23 @@ def check_pair(pair_name, pair_info, last_alerts):
             is_red
         )
 
-        vbuy_conditions_met = base_long_ok and (vwap_curr is not None) and (close_prev > vwap_curr)
-        vsell_conditions_met = base_short_ok and (vwap_curr is not None) and (close_prev < vwap_curr)
+        # 🔔 VWAP SIGNALS — REQUIRE CROSSOVER + CLOSE (Pine Script style)
+        vbuy_conditions_met = False
+        vsell_conditions_met = False
 
+        if vwap_curr is not None and len(df_15m) >= 3:
+            close_prev2 = df_15m['close'].iloc[-3]  # previous closed candle
+            vwap_prev = vwap_15m.iloc[-3]           # VWAP of that candle
+
+            if not (np.isnan(close_prev2) or np.isnan(vwap_prev)):
+                # VBuy: crossed UP through VWAP and closed above
+                if base_long_ok and (close_prev2 <= vwap_prev) and (close_prev > vwap_curr):
+                    vbuy_conditions_met = True
+                # VSell: crossed DOWN through VWAP and closed below
+                if base_short_ok and (close_prev2 >= vwap_prev) and (close_prev < vwap_curr):
+                    vsell_conditions_met = True
+
+        # 🔔 Original Fib signals (with crossover)
         fib_long_met = base_long_ok and long_crossover_line is not None
         fib_short_met = base_short_ok and short_crossover_line is not None
 
@@ -569,13 +585,14 @@ def check_pair(pair_name, pair_info, last_alerts):
                 except Exception as e:
                     log(f"Error parsing fib state: {e}")
                     updated_state = None
-            elif updated_state == 'vbuy' and (vwap_curr is not None) and close_prev <= vwap_curr:
+            elif updated_state == 'vbuy' and close_prev < vwap_curr:
                 updated_state = None
-                log(f"🔄 STATE RESET: {pair_name} VBuy - Price dropped below VWAP")
-            elif updated_state == 'vsell' and (vwap_curr is not None) and close_prev >= vwap_curr:
+                log(f"🔄 STATE RESET: {pair_name} VBuy - Price closed below VWAP")
+            elif updated_state == 'vsell' and close_prev > vwap_curr:
                 updated_state = None
-                log(f"🔄 STATE RESET: {pair_name} VSell - Price rose above VWAP")
+                log(f"🔄 STATE RESET: {pair_name} VSell - Price closed above VWAP")
 
+        # 🔔 Handle signals
         if vbuy_conditions_met:
             current_signal = 'vbuy'
             log(f"\n🔵 VBuy SIGNAL DETECTED for {pair_name}!")
@@ -583,7 +600,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
                 message = (
                     f"🔵 {pair_name} - **VBuy**\n"
-                    f"Closed Above VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
+                    f"Crossed & Closed Above VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
@@ -598,7 +615,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
                 message = (
                     f"🟠 {pair_name} - **VSell**\n"
-                    f"Closed Below VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
+                    f"Crossed & Closed Below VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
