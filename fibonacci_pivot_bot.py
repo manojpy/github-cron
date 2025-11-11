@@ -15,21 +15,15 @@ from urllib3.util.retry import Retry
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
-# Fail fast if secrets are missing
 if TELEGRAM_BOT_TOKEN == 'xxxx' or TELEGRAM_CHAT_ID == 'xxxx':
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in GitHub Secrets.")
 
-# Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
-# Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
-# Reset state flag - set to 'True' to clear the alert_state.json file on startup
 RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
 
-# Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
 
-# Trading pairs to monitor
 PAIRS = {
     "BTCUSD": None, "ETHUSD": None,
     "SOLUSD": None, "AVAXUSD": None,
@@ -37,24 +31,20 @@ PAIRS = {
     "DOTUSD": None, "ADAUSD": None, "SUIUSD": None, "AAVEUSD": None
 }
 
-# Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
 }
 
-# Indicator settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
 
-# Cirrus Cloud settings
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
 
-# Pivot settings
 PIVOT_LOOKBACK_PERIOD = 15
 STATE_FILE = 'fib_state.json'
 
@@ -67,26 +57,22 @@ def create_session_with_retries():
     return session
 
 
-# ============ VWAP WITH DAILY RESET ============
-def calculate_vwap_daily_reset(df):
+# ============ ROLLING VWAP (INSTEAD OF DAILY RESET) ============
+def calculate_rolling_vwap(df, window=60):
     """
-    Calculate VWAP reset at 00:00 UTC each day using hlc3.
-    Assumes 'timestamp' is in seconds (Unix).
+    Rolling VWAP over last 'window' candles (e.g., 60 x 15m = 15 hours).
+    More responsive to recent price action — avoids stale UTC-day VWAP.
     """
-    df = df.copy()
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
-    df['date'] = df['datetime'].dt.date
     hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
     df['hlc3_vol'] = hlc3 * df['volume']
-    df['cum_vol'] = df.groupby('date')['volume'].cumsum()
-    df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
+    df['cum_vol'] = df['volume'].rolling(window=window, min_periods=1).sum()
+    df['cum_hlc3_vol'] = df['hlc3_vol'].rolling(window=window, min_periods=1).sum()
     df['vwap'] = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
     return df['vwap']
 
 
 # ============ UTILITY FUNCTIONS ============
 def load_state():
-    """Load previous alert state from file"""
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
@@ -107,7 +93,6 @@ def load_state():
 
 
 def save_state(state):
-    """Save alert state to file"""
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
@@ -118,7 +103,6 @@ def save_state(state):
 
 
 def send_telegram_alert(message):
-    """Send alert message via Telegram"""
     try:
         if DEBUG_MODE:
             print(f"[DEBUG] Attempting to send message: {message[:100]}...")
@@ -146,7 +130,6 @@ def send_telegram_alert(message):
 
 
 def send_test_message():
-    """Send a test message to verify Telegram connectivity"""
     ist = pytz.timezone('Asia/Kolkata')
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
@@ -167,7 +150,6 @@ Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}"""
 
 
 def get_product_ids():
-    """Fetch all product IDs from Delta Exchange and populate PAIRS dict"""
     try:
         if DEBUG_MODE:
             print("[DEBUG] Fetching product IDs from Delta Exchange...")
@@ -203,7 +185,6 @@ def get_product_ids():
 
 
 def get_candles(product_id, resolution="15", limit=150):
-    """Fetch OHLCV candles from Delta Exchange"""
     try:
         to_time = int(time.time())
         if resolution == "D":
@@ -271,8 +252,6 @@ def smoothrng(x, t, m):
 
 
 def rngfilt(x, r):
-    if len(x) == 0:
-        return pd.Series([], dtype='float64')
     result_list = [x.iloc[0]]
     for i in range(1, len(x)):
         prev_f = result_list[-1]
@@ -304,15 +283,12 @@ def calculate_rma(data, period):
 def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     if len(df) < period + 50:
         return pd.Series([np.nan] * len(df), index=df.index)
-    
     close = df['close'].astype(float)
     if close.isnull().all():
         return pd.Series([np.nan] * len(df), index=df.index)
-
     responsiveness = max(0.00001, responsiveness)
     sd = close.rolling(window=50).std() * responsiveness
     sd = sd.bfill().fillna(0.001)
-    
     worm = close.copy()
     worm.iloc[0] = close.iloc[0]
     for i in range(1, len(close)):
@@ -323,18 +299,15 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         else:
             delta = diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
-
     ma = close.rolling(window=period).mean()
     raw_momentum = (worm - ma) / worm.replace(0, np.nan)
     raw_momentum = raw_momentum.fillna(0)
-    
     min_med = raw_momentum.rolling(window=period).min()
     max_med = raw_momentum.rolling(window=period).max()
     rng = max_med - min_med
     temp = pd.Series(0.0, index=df.index)
     valid = rng > 1e-10
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
-    
     value = pd.Series(0.0, index=df.index)
     if len(value) > 0:
         value.iloc[0] = 0.0
@@ -342,13 +315,11 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
             v_prev = value.iloc[i - 1]
             v_new = 1.0 * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
             value.iloc[i] = max(-0.9999, min(0.9999, v_new))
-    
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
     log_temp2 = np.log(temp2)
     momentum = 0.25 * log_temp2
     momentum = momentum.fillna(0)
-    
     hist = pd.Series(0.0, index=df.index)
     if len(hist) > 0:
         hist.iloc[0] = momentum.iloc[0]
@@ -362,12 +333,9 @@ def get_previous_day_ohlc(product_id, days_back_limit=15):
     if df_daily is None or len(df_daily) < 2:
         return None
 
-    # Convert timestamps to UTC dates
     df_daily['date'] = pd.to_datetime(df_daily['timestamp'], unit='s', utc=True).dt.date
     today = datetime.now(timezone.utc).date()
     yesterday = today - pd.Timedelta(days=1)
-
-    # Look for yesterday's candle
     prev_day_row = df_daily[df_daily['date'] == yesterday]
     if not prev_day_row.empty:
         prev_day_candle = prev_day_row.iloc[-1]
@@ -377,7 +345,6 @@ def get_previous_day_ohlc(product_id, days_back_limit=15):
             'close': prev_day_candle['close']
         }
     else:
-        # Fallback: use second last if yesterday missing (e.g., weekends)
         return {
             'high': df_daily.iloc[-2]['high'],
             'low': df_daily.iloc[-2]['low'],
@@ -436,14 +403,14 @@ def check_pair(pair_name, pair_info, last_alerts):
             print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # ========== NEW: VWAP with daily reset ==========
-        vwap_15m = calculate_vwap_daily_reset(df_15m)
+        # ========== VWAP: NOW USING ROLLING (INSTEAD OF DAILY RESET) ==========
+        vwap_15m = calculate_rolling_vwap(df_15m, window=60)
         vwap_curr = vwap_15m.iloc[-2]
         if np.isnan(vwap_curr):
             log("⚠️  VWAP is NaN, skipping VBuy/VSel signals")
             vwap_curr = None
         else:
-            log(f"15m VWAP (UTC-reset): {vwap_curr:.4f}")
+            log(f"15m Rolling VWAP (60 candles): {vwap_curr:.4f}")
 
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
@@ -531,7 +498,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # 🔁 Fibonacci crossover detection
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = None
         long_crossover_name = None
@@ -552,7 +518,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                     short_crossover_name = name
                     break
 
-        # 🛡️ Base conditions WITHOUT crossover (for VWAP alerts)
         base_long_ok = (
             upw_curr and (not dnw_curr) and
             upper_wick_check and
@@ -568,11 +533,9 @@ def check_pair(pair_name, pair_info, last_alerts):
             is_red
         )
 
-        # 🔔 VWAP signals
         vbuy_conditions_met = base_long_ok and (vwap_curr is not None) and (close_prev > vwap_curr)
         vsell_conditions_met = base_short_ok and (vwap_curr is not None) and (close_prev < vwap_curr)
 
-        # 🔔 Original Fib signals
         fib_long_met = base_long_ok and long_crossover_line is not None
         fib_short_met = base_short_ok and short_crossover_line is not None
 
@@ -585,7 +548,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
 
-        # 🔁 State reset logic with protection
+        # 🔁 State reset logic with validation
         if updated_state:
             if updated_state.startswith('fib_'):
                 try:
@@ -603,8 +566,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                                 log(f"🔄 STATE RESET: {pair_name} Short - Price rose above {pivot_name}")
                         else:
                             updated_state = None
-                    else:
-                        updated_state = None
                 except Exception as e:
                     log(f"Error parsing fib state: {e}")
                     updated_state = None
@@ -615,7 +576,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VSell - Price rose above VWAP")
 
-        # 🔔 Handle signals
         if vbuy_conditions_met:
             current_signal = 'vbuy'
             log(f"\n🔵 VBuy SIGNAL DETECTED for {pair_name}!")
@@ -728,7 +688,7 @@ def main():
 
     updates_processed = 0
     pair_logs = []
-    with ThreadPoolExecutor(max_workers=6) as executor:  # Reduced from 10 → safer for API
+    with ThreadPoolExecutor(max_workers=6) as executor:  # reduced from 10
         future_to_pair = {}
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
