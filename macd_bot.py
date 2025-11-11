@@ -70,9 +70,9 @@ SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
 SRSI_EMA_LEN = 5
 
-# File to store last alert state
-STATE_FILE = 'macd_state.json'
-STATE_FILE_BAK = 'macd_state.bak'
+# State file paths (read from environment, fallback to defaults)
+STATE_FILE = os.environ.get("STATE_FILE_PATH", "macd_state.json")
+STATE_FILE_BAK = STATE_FILE + ".bak"
 COOLDOWN_SECONDS = 600  # 10 minutes per signal
 
 # Thread lock for state updates
