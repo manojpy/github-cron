@@ -73,10 +73,12 @@ def create_session_with_retries():
 # ============ VWAP WITH DAILY RESET (00:00 UTC = 5:30 IST) ============
 def calculate_vwap_daily_reset(df):
     """
-    VWAP reset at 00:00 UTC using hlc3.
+    Calculate VWAP reset at 00:00 UTC each day using hlc3.
+    Matches Pine Script behavior and aligns with 5:30 AM IST reset.
     """
     if df is None or df.empty:
         return pd.Series(dtype=float)
+
     df = df.copy()
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
     df['date'] = df['datetime'].dt.date
@@ -85,7 +87,10 @@ def calculate_vwap_daily_reset(df):
     df['cum_vol'] = df.groupby('date')['volume'].cumsum()
     df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
     vwap = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
-    return vwap.fillna(method='ffill').fillna(method='bfill')
+
+    # ✅ Updated to use ffill/bfill instead of deprecated fillna(method=...)
+    return vwap.ffill().bfill()
+
 
 # ============ STATE MANAGEMENT ============
 def load_state():
