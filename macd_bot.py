@@ -24,7 +24,7 @@ DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 
 # Delta Exchange API
-DELTA_API_BASE = "https://api.delta.exchange"
+DELTA_API_BASE = "https://api.india.delta.exchange"
 
 # Trading pairs to monitor
 PAIRS = {
