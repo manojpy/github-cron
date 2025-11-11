@@ -5,7 +5,7 @@ import time
 import os
 import json
 import pytz
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -18,14 +18,17 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 # Fail fast if secrets are missing
 if TELEGRAM_BOT_TOKEN == 'xxxx' or TELEGRAM_CHAT_ID == 'xxxx':
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in GitHub Secrets.")
+
 # Enable debug mode - set to True to see detailed logs
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 # Send test message on startup
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 # Reset state flag - set to 'True' to clear the alert_state.json file on startup
 RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
+
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
+
 # Trading pairs to monitor
 PAIRS = {
     "BTCUSD": None, "ETHUSD": None,
@@ -33,23 +36,28 @@ PAIRS = {
     "BCHUSD": None, "XRPUSD": None, "BNBUSD": None, "LTCUSD": None,
     "DOTUSD": None, "ADAUSD": None, "SUIUSD": None, "AAVEUSD": None
 }
+
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
 }
+
 # Indicator settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
+
 # Cirrus Cloud settings
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
+
 # Pivot settings
 PIVOT_LOOKBACK_PERIOD = 15
 STATE_FILE = 'fib_state.json'
+
 
 # ============ HTTP SESSION WITH RETRIES ============
 def create_session_with_retries():
@@ -57,6 +65,7 @@ def create_session_with_retries():
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
+
 
 # ============ VWAP WITH DAILY RESET ============
 def calculate_vwap_daily_reset(df):
@@ -69,14 +78,11 @@ def calculate_vwap_daily_reset(df):
     df['date'] = df['datetime'].dt.date
     hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
     df['hlc3_vol'] = hlc3 * df['volume']
-    
-    # Group by date and compute cumulative sums per day
     df['cum_vol'] = df.groupby('date')['volume'].cumsum()
     df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
-    
-    # Avoid division by zero
     df['vwap'] = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
     return df['vwap']
+
 
 # ============ UTILITY FUNCTIONS ============
 def load_state():
@@ -99,6 +105,7 @@ def load_state():
         print("[DEBUG] No valid previous state found, starting fresh")
     return {}
 
+
 def save_state(state):
     """Save alert state to file"""
     try:
@@ -108,6 +115,7 @@ def save_state(state):
             print(f"[DEBUG] Saved state: {state}")
     except Exception as e:
         print(f"Error saving state: {e}")
+
 
 def send_telegram_alert(message):
     """Send alert message via Telegram"""
@@ -136,12 +144,16 @@ def send_telegram_alert(message):
             traceback.print_exc()
         return False
 
+
 def send_test_message():
     """Send a test message to verify Telegram connectivity"""
     ist = pytz.timezone('Asia/Kolkata')
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-    test_msg = f"🔔 Fibonacci Pivot Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    test_msg = f"""🔔 Fibonacci Pivot Bot Started
+Test message from Fibonacci Pivot Bot
+Time: {formatted_time}
+Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}"""
     print("\n" + "="*50)
     print("SENDING TEST MESSAGE")
     print("="*50)
@@ -152,6 +164,7 @@ def send_test_message():
         print("✗ Test message failed - check your bot token and chat ID")
     print("="*50 + "\n")
     return success
+
 
 def get_product_ids():
     """Fetch all product IDs from Delta Exchange and populate PAIRS dict"""
@@ -188,6 +201,7 @@ def get_product_ids():
             traceback.print_exc()
         return False
 
+
 def get_candles(product_id, resolution="15", limit=150):
     """Fetch OHLCV candles from Delta Exchange"""
     try:
@@ -216,7 +230,6 @@ def get_candles(product_id, resolution="15", limit=150):
                 'close': result['c'],
                 'volume': result['v']
             })
-            # 🔒 CRITICAL SAFETY: Ensure candles are time-ordered
             df = df.sort_values('timestamp').reset_index(drop=True)
             return df
         else:
@@ -225,11 +238,14 @@ def get_candles(product_id, resolution="15", limit=150):
         print(f"Exception fetching candles for {product_id}: {e}")
         return None
 
+
 def calculate_ema(data, period):
     return data.ewm(span=period, adjust=False).mean()
 
+
 def calculate_sma(data, period):
     return data.rolling(window=period).mean()
+
 
 def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     close = df['close']
@@ -246,31 +262,29 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
         ppo_signal = calculate_ema(ppo, signal)
     return ppo, ppo_signal
 
+
 def smoothrng(x, t, m):
     wper = t * 2 - 1
     avrng = calculate_ema(np.abs(x.diff()), t)
     smoothrng = calculate_ema(avrng, wper) * m
     return smoothrng
 
+
 def rngfilt(x, r):
+    if len(x) == 0:
+        return pd.Series([], dtype='float64')
     result_list = [x.iloc[0]]
     for i in range(1, len(x)):
         prev_f = result_list[-1]
         curr_x = x.iloc[i]
         curr_r = r.iloc[i]
-        f = 0.0
         if curr_x > prev_f:
-            if curr_x - curr_r < prev_f:
-                f = prev_f
-            else:
-                f = curr_x - curr_r
+            f = prev_f if (curr_x - curr_r < prev_f) else (curr_x - curr_r)
         else:
-            if curr_x + curr_r > prev_f:
-                f = prev_f
-            else:
-                f = curr_x + curr_r
+            f = prev_f if (curr_x + curr_r > prev_f) else (curr_x + curr_r)
         result_list.append(f)
     return pd.Series(result_list, index=x.index)
+
 
 def calculate_cirrus_cloud(df):
     close = df['close'].copy()
@@ -282,17 +296,25 @@ def calculate_cirrus_cloud(df):
     dnw = filtx1 > filtx12
     return upw, dnw, filtx1, filtx12
 
+
 def calculate_rma(data, period):
     return data.ewm(alpha=1/period, adjust=False).mean()
+
 
 def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     if len(df) < period + 50:
         return pd.Series([np.nan] * len(df), index=df.index)
+    
     close = df['close'].astype(float)
+    if close.isnull().all():
+        return pd.Series([np.nan] * len(df), index=df.index)
+
     responsiveness = max(0.00001, responsiveness)
     sd = close.rolling(window=50).std() * responsiveness
     sd = sd.bfill().fillna(0.001)
+    
     worm = close.copy()
+    worm.iloc[0] = close.iloc[0]
     for i in range(1, len(close)):
         diff = close.iloc[i] - worm.iloc[i - 1]
         abs_diff = abs(diff)
@@ -301,42 +323,67 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         else:
             delta = diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
+
     ma = close.rolling(window=period).mean()
     raw_momentum = (worm - ma) / worm.replace(0, np.nan)
     raw_momentum = raw_momentum.fillna(0)
+    
     min_med = raw_momentum.rolling(window=period).min()
     max_med = raw_momentum.rolling(window=period).max()
     rng = max_med - min_med
     temp = pd.Series(0.0, index=df.index)
     valid = rng > 1e-10
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
+    
     value = pd.Series(0.0, index=df.index)
-    value.iloc[0] = 0.0
-    for i in range(1, len(temp)):
-        v_prev = value.iloc[i - 1]
-        v_new = 1.0 * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
-        value.iloc[i] = max(-0.9999, min(0.9999, v_new))
+    if len(value) > 0:
+        value.iloc[0] = 0.0
+        for i in range(1, len(temp)):
+            v_prev = value.iloc[i - 1]
+            v_new = 1.0 * (temp.iloc[i] - 0.5 + 0.5 * v_prev)
+            value.iloc[i] = max(-0.9999, min(0.9999, v_new))
+    
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
     log_temp2 = np.log(temp2)
     momentum = 0.25 * log_temp2
     momentum = momentum.fillna(0)
+    
     hist = pd.Series(0.0, index=df.index)
-    hist.iloc[0] = momentum.iloc[0]
-    for i in range(1, len(momentum)):
-        hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
+    if len(hist) > 0:
+        hist.iloc[0] = momentum.iloc[0]
+        for i in range(1, len(momentum)):
+            hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
     return hist
+
 
 def get_previous_day_ohlc(product_id, days_back_limit=15):
     df_daily = get_candles(product_id, resolution="D", limit=days_back_limit + 5)
     if df_daily is None or len(df_daily) < 2:
         return None
-    prev_day_candle = df_daily.iloc[-2]
-    return {
-        'high': prev_day_candle['high'],
-        'low': prev_day_candle['low'],
-        'close': prev_day_candle['close']
-    }
+
+    # Convert timestamps to UTC dates
+    df_daily['date'] = pd.to_datetime(df_daily['timestamp'], unit='s', utc=True).dt.date
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - pd.Timedelta(days=1)
+
+    # Look for yesterday's candle
+    prev_day_row = df_daily[df_daily['date'] == yesterday]
+    if not prev_day_row.empty:
+        prev_day_candle = prev_day_row.iloc[-1]
+        return {
+            'high': prev_day_candle['high'],
+            'low': prev_day_candle['low'],
+            'close': prev_day_candle['close']
+        }
+    else:
+        # Fallback: use second last if yesterday missing (e.g., weekends)
+        return {
+            'high': df_daily.iloc[-2]['high'],
+            'low': df_daily.iloc[-2]['low'],
+            'close': df_daily.iloc[-2]['close']
+        }
+
 
 def calculate_fibonacci_pivots(h, l, c):
     pivot = (h + l + c) / 3
@@ -352,21 +399,26 @@ def calculate_fibonacci_pivots(h, l, c):
         'S1': s1, 'S2': s2, 'S3': s3
     }
 
+
 def check_pair(pair_name, pair_info, last_alerts):
     thread_log = []
     def log(message):
         if DEBUG_MODE:
             thread_log.append(f"[DEBUG] {message}")
+
     try:
         if pair_info is None:
             return last_alerts.get(pair_name), ""
+
         log(f"\n{'='*60}")
         log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
         log(f"{'='*60}")
+
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
             print(f"❌ {pair_name}: Failed to fetch previous day OHLC data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         pivots = calculate_fibonacci_pivots(
             prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close']
         )
@@ -379,6 +431,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         if df_15m is None:
             print(f"❌ {pair_name}: Failed to fetch 15m candle data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         if len(df_15m) < min_required:
             print(f"⚠️  {pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -395,6 +448,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
+
         if (len(ppo) < 3 or len(rma_50_15m) < 3 or len(upw) < 3 or len(dnw) < 3):
             print(f"⚠️  {pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -423,6 +477,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         if np.isnan(magical_hist_curr):
             log(f"⚠️  NaN in Magical Momentum Hist for {pair_name}, skipping")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
+
         log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
 
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
@@ -476,7 +531,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # 🔁 Fibonacci crossover detection (for original signals only)
+        # 🔁 Fibonacci crossover detection
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = None
         long_crossover_name = None
@@ -513,11 +568,11 @@ def check_pair(pair_name, pair_info, last_alerts):
             is_red
         )
 
-        # 🔔 VWAP signals (NO crossover required)
+        # 🔔 VWAP signals
         vbuy_conditions_met = base_long_ok and (vwap_curr is not None) and (close_prev > vwap_curr)
         vsell_conditions_met = base_short_ok and (vwap_curr is not None) and (close_prev < vwap_curr)
 
-        # 🔔 Original Fib signals (with crossover)
+        # 🔔 Original Fib signals
         fib_long_met = base_long_ok and long_crossover_line is not None
         fib_short_met = base_short_ok and short_crossover_line is not None
 
@@ -530,12 +585,12 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
 
-        # 🔁 State reset logic for all signal types
+        # 🔁 State reset logic with protection
         if updated_state:
             if updated_state.startswith('fib_'):
                 try:
                     parts = updated_state.split('_')
-                    if len(parts) >= 3:
+                    if len(parts) >= 3 and parts[2] in ['P', 'R1', 'R2', 'S1', 'S2']:
                         alert_type = parts[1]
                         pivot_name = parts[2]
                         pivot_value = pivots.get(pivot_name)
@@ -548,17 +603,19 @@ def check_pair(pair_name, pair_info, last_alerts):
                                 log(f"🔄 STATE RESET: {pair_name} Short - Price rose above {pivot_name}")
                         else:
                             updated_state = None
+                    else:
+                        updated_state = None
                 except Exception as e:
                     log(f"Error parsing fib state: {e}")
                     updated_state = None
-            elif updated_state == 'vbuy' and close_prev <= vwap_curr:
+            elif updated_state == 'vbuy' and (vwap_curr is not None) and close_prev <= vwap_curr:
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VBuy - Price dropped below VWAP")
-            elif updated_state == 'vsell' and close_prev >= vwap_curr:
+            elif updated_state == 'vsell' and (vwap_curr is not None) and close_prev >= vwap_curr:
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VSell - Price rose above VWAP")
 
-        # 🔔 Handle NEW VWAP signals first (priority optional; you can reorder)
+        # 🔔 Handle signals
         if vbuy_conditions_met:
             current_signal = 'vbuy'
             log(f"\n🔵 VBuy SIGNAL DETECTED for {pair_name}!")
@@ -589,7 +646,6 @@ def check_pair(pair_name, pair_info, last_alerts):
                 send_telegram_alert(message)
             updated_state = current_signal
 
-        # 🔔 Original Fibonacci signals
         elif fib_long_met:
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
@@ -632,6 +688,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             traceback.print_exc()
         return last_alerts.get(pair_name), '\n'.join(thread_log)
 
+
 def main():
     print("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
@@ -639,11 +696,14 @@ def main():
     print(f"Fibonacci Pivot Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
     print("=" * 50)
+
     if SEND_TEST_MESSAGE:
         send_test_message()
+
     if RESET_STATE and os.path.exists(STATE_FILE):
         print(f"ATTENTION: \nRESET_STATE is True. Deleting {STATE_FILE} to clear previous alerts.")
         os.remove(STATE_FILE)
+
     last_alerts = load_state()
     keys_to_purge = []
     for key, value in list(last_alerts.items()):
@@ -655,17 +715,20 @@ def main():
         print(f"\n[INFO] 🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None
+
     if not get_product_ids():
         print("Failed to fetch products. Exiting.")
         return
+
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     print(f"✓ Monitoring {found_count} pairs")
     if found_count == 0:
         print("No valid pairs found. Exiting.")
         return
+
     updates_processed = 0
     pair_logs = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:  # Reduced from 10 → safer for API
         future_to_pair = {}
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
@@ -685,6 +748,7 @@ def main():
                     import traceback
                     traceback.print_exc()
                 continue
+
     if DEBUG_MODE:
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS START")
@@ -694,11 +758,13 @@ def main():
         print("\n" + "="*50)
         print("SEQUENTIAL DEBUG LOGS END")
         print("="*50)
+
     save_state(last_alerts)
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
     print(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
