@@ -16,7 +16,6 @@ from urllib3.util.retry import Retry
 # ============ CONFIGURATION ============
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
-
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 DELTA_API_BASE = "https://api.delta.exchange"
