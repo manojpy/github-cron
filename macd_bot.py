@@ -328,7 +328,7 @@ def smoothrng(x, t, m):
     avrng = calculate_ema(np.abs(x.diff().fillna(0)), t)
     smoothrng = calculate_ema(avrng, max(1, wper)) * m
     # Avoid zeros to prevent flat filter behavior
-    return smoothrng.clip(lower=1e-8).fillna(method='bfill').fillna(method='ffill')
+    return smoothrng.clip(lower=1e-8).bfill().ffill()
 
 def rngfilt(x, r):
     result_list = [x.iloc[0]]
