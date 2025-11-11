@@ -265,7 +265,9 @@ def smoothrng(x, t, m):
     wper = t * 2 - 1
     avrng = calculate_ema(np.abs(x.diff()), t)
     val = calculate_ema(avrng, wper) * m
-    return val.fillna(method='bfill').fillna(method='ffill')
+
+    # ✅ Updated to use ffill/bfill instead of deprecated fillna(method=...)
+    return val.bfill().ffill()
 
 def rngfilt(x, r):
     if len(x) == 0:
