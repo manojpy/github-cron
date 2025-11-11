@@ -17,7 +17,6 @@ from urllib3.util.retry import Retry
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
 
-
 DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
 RESET_STATE = os.environ.get('RESET_STATE', 'False').lower() == 'true'
@@ -32,14 +31,16 @@ PAIRS = {
 }
 
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 300, "min_required": 200, "limit_5m": 600, "min_required_5m": 400}
+    "SOLUSD": {"limit_15m": 210, "min_required": 140, "limit_5m": 450, "min_required_5m": 220}
 }
 
+# PPO settings (used in diagnostics)
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
 PPO_USE_SMA = False
 
+# Cirrus Cloud settings
 X1 = 22
 X2 = 9
 X3 = 15
@@ -71,15 +72,10 @@ def create_session_with_retries():
     session.mount("http://", adapter)
     return session
 
-# ============ VWAP WITH DAILY RESET (00:00 UTC = 5:30 IST) ============
+# ============ VWAP WITH DAILY RESET ============
 def calculate_vwap_daily_reset(df):
-    """
-    Calculate VWAP reset at 00:00 UTC each day using hlc3.
-    Matches Pine Script behavior and aligns with 5:30 AM IST reset.
-    """
     if df is None or df.empty:
         return pd.Series(dtype=float)
-
     df = df.copy()
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
     df['date'] = df['datetime'].dt.date
@@ -88,10 +84,7 @@ def calculate_vwap_daily_reset(df):
     df['cum_vol'] = df.groupby('date')['volume'].cumsum()
     df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
     vwap = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
-
-    # ✅ Updated to use ffill/bfill instead of deprecated fillna(method=...)
     return vwap.ffill().bfill()
-
 
 # ============ STATE MANAGEMENT ============
 def load_state():
@@ -132,6 +125,9 @@ def save_state(state):
 # ============ TELEGRAM ALERTS ============
 def send_telegram_alert(message):
     try:
+        if TELEGRAM_BOT_TOKEN == 'xxxx' or TELEGRAM_CHAT_ID == 'xxxx':
+            logger.warning("Telegram not configured. Skipping send.")
+            return False
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
         session = create_session_with_retries()
@@ -231,7 +227,6 @@ def get_candles(product_id, resolution="15", limit=150):
                 'volume': result['v']
             })
             df = df.sort_values('timestamp').reset_index(drop=True)
-            logger.debug(f"{product_id} {resolution}m candles fetched: {len(df)} rows")
             # Basic sanity checks
             if df.empty or df[['open', 'high', 'low', 'close']].isnull().any().any():
                 logger.warning(f"NaNs in candle data for {product_id} {resolution}m")
@@ -242,7 +237,6 @@ def get_candles(product_id, resolution="15", limit=150):
         logger.exception(f"Exception fetching candles for {product_id}: {e}")
         return None
 
-
 # ============ INDICATORS ============
 def calculate_ema(data, period):
     if len(data) < 1 or period <= 0:
@@ -252,7 +246,6 @@ def calculate_ema(data, period):
 def calculate_sma(data, period):
     if len(data) < period or period <= 0:
         return pd.Series([np.nan] * len(data), index=data.index)
-    # ✅ Updated: explicit min_periods
     return data.rolling(window=period, min_periods=period).mean()
 
 def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
@@ -269,8 +262,6 @@ def smoothrng(x, t, m):
     wper = t * 2 - 1
     avrng = calculate_ema(np.abs(x.diff()), t)
     val = calculate_ema(avrng, wper) * m
-
-    # ✅ Updated to use ffill/bfill instead of deprecated fillna(method=...)
     return val.bfill().ffill()
 
 def rngfilt(x, r):
@@ -358,6 +349,22 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
 
     return hist
 
+# ============ CIRRUS CLOUD STATE HELPER ============
+def get_cloud_state(upw, dnw, idx=-2):
+    """
+    Exclusive Cirrus Cloud state:
+    - 'green' if upw=True and dnw=False
+    - 'red' if dnw=True and upw=False
+    - 'neutral' otherwise
+    """
+    u = bool(upw.iloc[idx])
+    d = bool(dnw.iloc[idx])
+    if u and not d:
+        return "green"
+    elif d and not u:
+        return "red"
+    else:
+        return "neutral"
 
 # ============ PIVOTS ============
 def get_previous_day_ohlc(product_id, days_back_limit=15):
@@ -448,8 +455,6 @@ def check_pair(pair_name, pair_info, last_alerts):
         low_prev = float(df_15m['low'].iloc[-2])
         ppo_curr = float(ppo.iloc[-2]) if not np.isnan(ppo.iloc[-2]) else np.nan
         rma_50_15m_curr = float(rma_50_15m.iloc[-2]) if not np.isnan(rma_50_15m.iloc[-2]) else np.nan
-        upw_curr = bool(upw.iloc[-2])
-        dnw_curr = bool(dnw.iloc[-2])
 
         if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr)):
             log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
@@ -469,6 +474,7 @@ def check_pair(pair_name, pair_info, last_alerts):
 
         log(f"Magical Momentum Hist (15m): {float(magical_hist_curr):.6f}")
 
+        # 5m RMA200 (optional gate)
         limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
         min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250)
         rma_200_5m_curr = np.nan
@@ -486,16 +492,17 @@ def check_pair(pair_name, pair_info, last_alerts):
             else:
                 log("5m RMA 200 calculation produced NaN - will be skipped")
 
-        is_green = close_prev > open_prev
-        is_red = close_prev < open_prev
+        # Candle characterization
+        is_green_candle = close_prev > open_prev
+        is_red_candle = close_prev < open_prev
 
         if rma_200_available:
-            rma_long_ok = rma_50_15m_curr < close_prev and rma_200_5m_curr < close_prev
-            rma_short_ok = rma_50_15m_curr > close_prev and rma_200_5m_curr > close_prev
+            rma_long_ok = (rma_50_15m_curr < close_prev) and (rma_200_5m_curr < close_prev)
+            rma_short_ok = (rma_50_15m_curr > close_prev) and (rma_200_5m_curr > close_prev)
             log("Using both RMA checks (50 15m + 200 5m)")
         else:
-            rma_long_ok = rma_50_15m_curr < close_prev
-            rma_short_ok = rma_50_15m_curr > close_prev
+            rma_long_ok = (rma_50_15m_curr < close_prev)
+            rma_short_ok = (rma_50_15m_curr > close_prev)
             log("Using only RMA 50 15m (RMA 200 5m unavailable)")
 
         candle_range = high_prev - low_prev
@@ -520,10 +527,15 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
+        # Cirrus Cloud state (exclusive) and gating
+        cloud_state = get_cloud_state(upw, dnw, idx=-2)
+        log(f"Cirrus Cloud State: {cloud_state}")
+
+        # Pivot crossovers
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = None
         long_crossover_name = None
-        if is_green:
+        if is_green_candle:
             for name, line in long_pivot_lines.items():
                 if open_prev <= line and close_prev > line:
                     long_crossover_line = line
@@ -533,26 +545,27 @@ def check_pair(pair_name, pair_info, last_alerts):
         short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 'R1': pivots['R1'], 'R2': pivots['R2']}
         short_crossover_line = None
         short_crossover_name = None
-        if is_red:
+        if is_red_candle:
             for name, line in short_pivot_lines.items():
                 if open_prev >= line and close_prev < line:
                     short_crossover_line = line
                     short_crossover_name = name
                     break
 
+        # Base gates with Cirrus exclusivity
         base_long_ok = (
-            upw_curr and (not dnw_curr) and
+            (cloud_state == "green") and
             upper_wick_check and
             rma_long_ok and
             (magical_hist_curr > 0) and
-            is_green
+            is_green_candle
         )
         base_short_ok = (
-            dnw_curr and (not upw_curr) and
+            (cloud_state == "red") and
             lower_wick_check and
             rma_short_ok and
             (magical_hist_curr < 0) and
-            is_red
+            is_red_candle
         )
 
         # VWAP signals
@@ -567,8 +580,8 @@ def check_pair(pair_name, pair_info, last_alerts):
                 if base_short_ok and (close_prev2 >= vwap_prev) and (close_prev < vwap_curr):
                     vsell_conditions_met = True
 
-        fib_long_met = base_long_ok and long_crossover_line is not None
-        fib_short_met = base_short_ok and short_crossover_line is not None
+        fib_long_met = base_long_ok and (long_crossover_line is not None)
+        fib_short_met = base_short_ok and (short_crossover_line is not None)
 
         current_signal = None
         updated_state = last_alerts.get(pair_name)
@@ -614,7 +627,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             if updated_state != current_signal:
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
                 message = (
-                    f"🔵 {pair_name} - **VBuy**\n"
+                    f"🔵 {pair_name} - VBuy\n"
                     f"Crossed & Closed Above VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
@@ -629,7 +642,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             if updated_state != current_signal:
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
                 message = (
-                    f"🟠 {pair_name} - **VSell**\n"
+                    f"🟠 {pair_name} - VSell\n"
                     f"Crossed & Closed Below VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
@@ -644,8 +657,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             if updated_state != current_signal:
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},R2:{pivots['R2']:.5f}]"
                 message = (
-                    f"🟢 {pair_name} - **FIB LONG**\n"
-                    f"Crossed & Closed Above **{long_crossover_name}** (${long_crossover_line:,.2f}) {diagnostic}\n"
+                    f"🟢 {pair_name} - FIB LONG\n"
+                    f"Closed Above {long_crossover_name} (${long_crossover_line:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
@@ -659,8 +672,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             if updated_state != current_signal:
                 diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},S2:{pivots['S2']:.5f}]"
                 message = (
-                    f"🔴 {pair_name} - **FIB SHORT**\n"
-                    f"Crossed & Closed Below **{short_crossover_name}** (${short_crossover_line:,.2f}) {diagnostic}\n"
+                    f"🔴 {pair_name} - FIB SHORT\n"
+                    f"Closed Below {short_crossover_name} (${short_crossover_line:,.2f}) {diagnostic}\n"
                     f"PPO 15m: {ppo_curr:.2f}\n"
                     f"Price: ${price:,.2f}\n"
                     f"{formatted_time}"
