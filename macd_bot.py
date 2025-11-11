@@ -27,7 +27,7 @@ SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true
 # Delta Exchange API
 DELTA_API_BASE = "https://api.delta.exchange"
 
-# Trading pairs to monitor
+# Trading pairs to monitor (user-facing names end with USD)
 PAIRS = {
     "BTCUSD": None,
     "ETHUSD": None,
@@ -43,38 +43,35 @@ PAIRS = {
     "AAVEUSD": None
 }
 
+# Map user-facing pair names to actual Delta symbols (USDT-margined)
+def to_delta_symbol(pair_name):
+    # All pairs are USDT-margined on Delta for alts
+    return pair_name.replace('USD', 'USDT')
+
 # Special data requirements for pairs with limited history
 SPECIAL_PAIRS = {
     "SOLUSD": {"limit_15m": 150, "min_required": 74, "limit_5m": 300, "min_required_5m": 250}
 }
 
 # Indicator settings
-# PPO settings
 PPO_FAST = 7
 PPO_SLOW = 16
 PPO_SIGNAL = 5
-PPO_USE_SMA = False  # False = use EMA
+PPO_USE_SMA = False
 
-# RMA settings
-RMA_50_PERIOD = 50   # RMA50 on 15min
-RMA_200_PERIOD = 200 # RMA200 on 5min 
+RMA_50_PERIOD = 50
+RMA_200_PERIOD = 200
 
-# Cirrus Cloud settings
 CIRRUS_CLOUD_ENABLED = True
 X1 = 22
 X2 = 9
 X3 = 15
 X4 = 5
 
-# Smoothed RSI (SRSI) settings
 SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
-SRSI_EMA_LEN = 5 
 
-# File to store last alert state
 STATE_FILE = 'macd_state.json'
-
-# Thread lock for state updates
 state_lock = Lock()
 
 # ============ UTILITY FUNCTIONS ============
@@ -87,12 +84,10 @@ def create_session():
 SESSION = create_session()
 
 def debug_log(message):
-    """Print debug messages if DEBUG_MODE is enabled"""
     if DEBUG_MODE:
         print(f"[DEBUG] {message}")
 
 def load_state():
-    """Load previous alert state from file"""
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
@@ -105,26 +100,20 @@ def load_state():
     return {}
 
 def save_state(state):
-    """Save alert state to file atomically"""
     try:
         temp_file = STATE_FILE + '.tmp'
         with open(temp_file, 'w') as f:
             json.dump(state, f)
-        os.replace(temp_file, STATE_FILE)  # Atomic on POSIX
+        os.replace(temp_file, STATE_FILE)
         debug_log(f"Saved state: {state}")
     except Exception as e:
         print(f"Error saving state: {e}")
 
 def send_telegram_alert(message):
-    """Send alert message via Telegram"""
     try:
         debug_log(f"Attempting to send message: {message[:100]}...")
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": None  # No HTML formatting
-        }
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
         response = SESSION.post(url, data=data, timeout=10)
         response_data = response.json()
         if response_data.get('ok'):
@@ -140,7 +129,6 @@ def send_telegram_alert(message):
         return False
 
 def send_test_message():
-    """Send a test message to verify Telegram connectivity"""
     ist = pytz.timezone('Asia/Kolkata')
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
@@ -152,12 +140,12 @@ def send_test_message():
     if success:
         print("✓ Test message sent successfully!")
     else:
-        print("✗ Test message failed - check your bot token and chat ID")
+        print("✗ Test message failed")
     print("="*50 + "\n")
     return success
 
 def get_product_ids():
-    """Fetch all product IDs from Delta Exchange"""
+    """Fetch product IDs and map USD-named pairs to USDT symbols"""
     try:
         debug_log("Fetching product IDs from Delta Exchange...")
         response = SESSION.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
@@ -165,21 +153,23 @@ def get_product_ids():
         if data.get('success'):
             products = data['result']
             debug_log(f"Received {len(products)} products from API")
+            product_map = {}
             for product in products:
-                symbol = product['symbol']
-                # Only consider perpetual futures that END with 'USD' and do NOT contain 'USDT'
-                if (product.get('contract_type') == 'perpetual_futures' and
-                    symbol.endswith('USD') and
-                    'USDT' not in symbol and
-                    '_' not in symbol):  # Avoid 'BTC_USD', only 'BTCUSD'
-                    for pair_name in PAIRS.keys():
-                        if symbol == pair_name:
-                            PAIRS[pair_name] = {
-                                'id': product['id'],
-                                'symbol': product['symbol'],
-                                'contract_type': product['contract_type']
-                            }
-                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
+                if product.get('contract_type') == 'perpetual_futures':
+                    product_map[product['symbol']] = product
+
+            for pair_name in list(PAIRS.keys()):
+                delta_symbol = to_delta_symbol(pair_name)
+                if delta_symbol in product_map:
+                    product = product_map[delta_symbol]
+                    PAIRS[pair_name] = {
+                        'id': product['id'],
+                        'symbol': product['symbol'],
+                        'contract_type': product['contract_type']
+                    }
+                    debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
+                else:
+                    debug_log(f"No match found for {pair_name} (tried {delta_symbol})")
             return True
         else:
             print(f"API Error: {data}")
@@ -191,7 +181,6 @@ def get_product_ids():
         return False
 
 def get_candles(product_id, resolution="15", limit=150):
-    """Fetch OHLCV candles from Delta Exchange"""
     try:
         to_time = int(time.time())
         from_time = to_time - (limit * int(resolution) * 60)
@@ -238,6 +227,11 @@ def get_candles(product_id, resolution="15", limit=150):
         if DEBUG_MODE:
             traceback.print_exc()
         return None
+
+# --- ALL INDICATOR FUNCTIONS REMAIN IDENTICAL ---
+# (calculate_ema, calculate_sma, calculate_rma, calculate_ppo, smoothrng, rngfilt,
+#  calculate_cirrus_cloud, kalman_filter, calculate_smooth_rsi, calculate_magical_momentum_hist)
+# → No changes needed; they work on price data regardless of symbol
 
 def calculate_ema(data, period):
     return data.ewm(span=period, adjust=False).mean()
@@ -374,8 +368,8 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
     return hist
 
+# --- ZERO-RANGE CANDLE HANDLING ADDED HERE ---
 def check_pair(pair_name, pair_info, last_state_for_pair):
-    """Check PPO and RMA/Cirrus/SRSI conditions for a pair"""
     try:
         if pair_info is None:
             return None
@@ -457,7 +451,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
             strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
         else:
-            # Handle zero-range candles: allow signal if directional
+            # Handle flat candles: allow directional close
             strong_bullish_close = bullish_candle
             strong_bearish_close = bearish_candle
 
@@ -510,7 +504,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
         price = df_15m['close'].iloc[-1]
 
-        # --- ALERT LOGIC (8 SIGNALS) ---
+        # --- ALERT LOGIC (8 SIGNALS) - UNCHANGED ---
         if (ppo_cross_up and 
             ppo_below_020 and 
             close_above_rma50 and 
