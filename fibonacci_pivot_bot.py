@@ -231,6 +231,7 @@ def get_candles(product_id, resolution="15", limit=150):
                 'volume': result['v']
             })
             df = df.sort_values('timestamp').reset_index(drop=True)
+            logger.debug(f"{product_id} {resolution}m candles fetched: {len(df)} rows")
             # Basic sanity checks
             if df.empty or df[['open', 'high', 'low', 'close']].isnull().any().any():
                 logger.warning(f"NaNs in candle data for {product_id} {resolution}m")
@@ -240,7 +241,7 @@ def get_candles(product_id, resolution="15", limit=150):
     except Exception as e:
         logger.exception(f"Exception fetching candles for {product_id}: {e}")
         return None
-logger.debug(f"{product_id} {resolution}m candles fetched: {len(df)} rows")
+
 
 # ============ INDICATORS ============
 def calculate_ema(data, period):
