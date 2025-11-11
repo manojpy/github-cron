@@ -1,10 +1,13 @@
 name: Trading Alert Bots
 
 on:
- # schedule:
-  #  - cron: '1,16,31,46 * * * *'
-  workflow_dispatch:  # Manual trigger (now used by the external cron)
+  workflow_dispatch:  # Manual trigger (external cron can call this)
+  # schedule:
+  #   - cron: '1,16,31,46 * * * *'
 
+concurrency:
+  group: trading-alert-bots
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -18,7 +21,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.13'
+        python-version: '3.12'
     
     - name: Cache pip packages
       uses: actions/cache@v3
@@ -40,7 +43,6 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'True'
-        # PASS UNIQUE FILENAME
         STATE_FILE_PATH: macd_state.json 
       run: python macd_bot.py
     
@@ -51,7 +53,6 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'True'
-        # PASS UNIQUE FILENAME
         STATE_FILE_PATH: fib_state.json
       run: python fibonacci_pivot_bot.py
       
@@ -60,11 +61,6 @@ jobs:
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update bot state JSONs [skip ci]"
-        # CRITICAL FIX: Changed 'files' to 'file_pattern' to remove the warning
         file_pattern: |
           macd_state.json
           fib_state.json
-      continue-on-error: true
-
-
-
