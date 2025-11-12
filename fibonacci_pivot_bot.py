@@ -32,7 +32,7 @@ PAIRS = {
 
 SPECIAL_PAIRS = {
     "SOLUSD": 
-{"limit_15m": 210, "min_required": 160, "limit_5m": 300, "min_required_5m": 200}
+{"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
 }
 
 # PPO settings (used in diagnostics)
@@ -80,48 +80,87 @@ def calculate_vwap_daily_reset(df):
     df = df.copy()
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
     df['date'] = df['datetime'].dt.date
-    hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
+    hlc3 = (df['high'] + df['low'] + df['close']) 
+    / 3.0
     df['hlc3_vol'] = hlc3 * df['volume']
     df['cum_vol'] = df.groupby('date')['volume'].cumsum()
     df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
     vwap = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
     return vwap.ffill().bfill()
 
-# ============ STATE MANAGEMENT ============
+# ============ STATE MANAGEMENT (IMPROVED) ============
 def load_state():
+    """
+    Load the state from the primary JSON file, the backup file, or return an empty dict if all fail.
+    Handles FileNotFoundError and JSONDecodeError for robustness.
+    """
+    # 1. Try loading from primary file
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 content = f.read().strip()
+            
             if not content:
-                logger.debug("State file empty. Starting fresh.")
-                return {}
+                logger.debug(f"State file '{STATE_FILE}' empty. Starting fresh.")
+                # Treat empty file as a failure to find valid state and proceed to backup check
+                raise FileNotFoundError 
+
             state = json.loads(content)
             logger.debug(f"Loaded state: {state}")
             return state
+
+    except FileNotFoundError:
+        # Catches missing file or empty file from the raise above
+        logger.warning(f"Primary state file '{STATE_FILE}' not found or empty. Attempting backup.")
+    except json.JSONDecodeError as e:
+        logger.warning(f"State file corrupted (JSONDecodeError): {e}. Attempting backup.")
     except Exception as e:
-        logger.warning(f"State file corrupted/unreadable: {e}. Attempting backup.")
-        try:
-            if os.path.exists(STATE_FILE_BAK):
-                with open(STATE_FILE_BAK, 'r') as f:
-                    return json.loads(f.read())
-        except Exception as e2:
-            logger.warning(f"Backup state also invalid: {e2}. Starting fresh.")
+        logger.warning(f"State file unreadable/IO error: {e}. Attempting backup.")
+
+    # 2. Try loading from backup file
+    try:
+        if os.path.exists(STATE_FILE_BAK):
+            with open(STATE_FILE_BAK, 'r') as f_bak:
+                logger.warning("Primary file failed. Loading state from backup.")
+                return json.load(f_bak)
+    except Exception as e2:
+        logger.warning(f"Backup state also invalid: {e2}. Starting fresh.")
+        
+    # 3. All failed, start fresh
     return {}
 
 def save_state(state):
+    """
+    Atomically save the state data to a JSON file and create a backup.
+    Uses temp file -> shutil.move (atomic replacement) for robustness.
+    """
+    temp_file_name = STATE_FILE + '.tmp'
+    
     try:
+        # 1. Write to temporary file
         with tempfile.NamedTemporaryFile('w', delete=False) as tmp:
             json.dump(state, tmp)
             temp_name = tmp.name
+            
+        # 2. Atomically replace the final state file
         shutil.move(temp_name, STATE_FILE)
+        
+        # 3. Create backup
         try:
             shutil.copy(STATE_FILE, STATE_FILE_BAK)
         except Exception as e:
             logger.debug(f"Could not write backup state: {e}")
+            
         logger.info(f"Saved state to {STATE_FILE}: {state}")
+        
     except Exception as e:
         logger.error(f"Error saving state: {e}")
+        # Clean up temporary file if left behind
+        if os.path.exists(temp_file_name):
+            try:
+                os.remove(temp_file_name)
+            except Exception:
+                pass # Ignore cleanup failure
 
 # ============ TELEGRAM ALERTS ============
 def send_telegram_alert(message):
@@ -244,7 +283,8 @@ def calculate_ema(data, period):
         return pd.Series([np.nan] * len(data), index=data.index)
     return data.ewm(span=period, adjust=False).mean()
 
-def calculate_sma(data, period):
+def calculate_sma(data, 
+period):
     if len(data) < period or period <= 0:
         return pd.Series([np.nan] * len(data), index=data.index)
     return data.rolling(window=period, min_periods=period).mean()
@@ -256,7 +296,8 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     with np.errstate(divide='ignore', invalid='ignore'):
         ppo = (fast_ma - slow_ma) / slow_ma * 100
     ppo = ppo.replace([np.inf, -np.inf], np.nan)
-    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
+    ppo_signal = 
+calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
     return ppo, ppo_signal
 
 def smoothrng(x, t, m):
@@ -281,7 +322,8 @@ def rngfilt(x, r):
     return pd.Series(result_list, index=x.index)
 
 def calculate_cirrus_cloud(df):
-    close = df['close'].astype(float).copy()
+    close 
+= df['close'].astype(float).copy()
     smrngx1x = smoothrng(close, X1, X2)
     smrngx1x2 = smoothrng(close, X3, X4)
     filtx1 = rngfilt(close, smrngx1x)
@@ -336,6 +378,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
             v_new = (temp.iloc[i] - 0.5 + 0.5 * v_prev)
             value.iloc[i] = max(-0.9999, min(0.9999, v_new))
 
+    
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan)
     log_temp2 = np.log(temp2)
@@ -350,7 +393,8 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
 
     return hist
 
-# ============ CIRRUS CLOUD STATE HELPER ============
+# ============ CIRRUS 
+CLOUD STATE HELPER ============
 def get_cloud_state(upw, dnw, idx=-1):
     """
     Exclusive Cirrus Cloud state for the latest closed candle:
@@ -364,6 +408,7 @@ def get_cloud_state(upw, dnw, idx=-1):
         return "green"
     elif d and not u:
         return "red"
+    
     else:
         return "neutral"
 
@@ -392,7 +437,8 @@ def calculate_fibonacci_pivots(h, l, c):
     r3 = pivot + (diff * 1.000)
     r2 = pivot + (diff * 0.618)
     r1 = pivot + (diff * 0.382)
-    s1 = pivot - (diff * 0.382)
+    s1 = pivot 
+- (diff * 0.382)
     s2 = pivot - (diff * 0.618)
     s3 = pivot - (diff * 1.000)
     return {'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 'S1': s1, 'S2': s2, 'S3': s3}
@@ -417,6 +463,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
         min_required = SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150)
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
+        
         if df_15m is None:
             logger.warning(f"{pair_name}: Failed to fetch 15m candle data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -439,7 +486,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         is_last_15m_candle_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_interval_start_ts
 
         if is_last_15m_candle_incomplete:
-            # The last candle (index -1) is incomplete. Use index -2 as the signal candle.
+            # The last candle (index -1) is incomplete.
+            # Use index -2 as the signal candle.
             last_i_15m = -2
             log(f"Current 15m candle (idx -1) is incomplete. Using closed candle at idx {last_i_15m}")
         else:
@@ -491,6 +539,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_50_15m = calculate_rma(df_15m['close'], 50)
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
 
+        
         if (len(ppo) < 3 or len(rma_50_15m) < 3 or len(upw) < 3 or len(dnw) < 3):
             logger.warning(f"{pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -523,18 +572,19 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
         log(f"Magical Momentum Hist (15m): {float(magical_hist_curr):.6f}")
 
-        # 5m RMA200 calculation using the correct CLOSED candle index (last_i_5m)
+        # 5m RMA200 calculation using the correct CLOSED candle 
+        index (last_i_5m)
         rma_200_5m_curr = np.nan
         if df_5m is not None and len(df_5m) >= min_required_5m:
             rma_200_5m = calculate_rma(df_5m['close'], 200)
             if len(rma_200_5m) >= 1 and not np.isnan(rma_200_5m.iloc[last_i_5m]):
                 rma_200_5m_curr = float(rma_200_5m.iloc[last_i_5m])
                 rma_200_available = True
-                log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
+            log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
                 log("5m RMA 200 calculation produced NaN - will be skipped")
         else:
-             log("RMA 200 5m check will be skipped - using only RMA 50 15m")
+            log("RMA 200 5m check will be skipped - using only RMA 50 15m")
 
 
         # Candle characterization on latest closed candle
@@ -545,6 +595,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             rma_long_ok = (rma_50_15m_curr < close_prev) and (rma_200_5m_curr < close_prev)
             rma_short_ok = (rma_50_15m_curr > close_prev) and (rma_200_5m_curr > close_prev)
             log("Using both RMA checks (50 15m + 200 5m)")
+        
         else:
             rma_long_ok = (rma_50_15m_curr < close_prev)
             rma_short_ok = (rma_50_15m_curr > close_prev)
@@ -559,7 +610,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             upper_wick_length = high_prev - max(open_prev, close_prev)
             lower_wick_length = min(open_prev, close_prev) - low_prev
             
-            # Wick checks are correct for a strong close: small upper wick for long, small lower wick for short
+            # Wick checks are correct for a strong close: small upper wick for long, small 
+            # lower wick for short
             upper_wick_check = (upper_wick_length / candle_range) < 0.20
             lower_wick_check = (lower_wick_length / candle_range) < 0.20
 
@@ -575,7 +627,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        log(f"Cirrus Cloud State: {cloud_state}")
+        log(f"Cirrus 
+Cloud State: {cloud_state}")
 
         # Pivot crossovers on latest closed candle
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
@@ -583,7 +636,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         long_crossover_name = None
         if is_green_candle:
             for name, line in long_pivot_lines.items():
-                if open_prev <= line and close_prev > line:
+                if open_prev <= line 
+                and close_prev > line:
                     long_crossover_line = line
                     long_crossover_name = name
                     break
@@ -610,7 +664,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             (cloud_state == "red") and
             lower_wick_check and # Correct: Small Lower Wick means close near Low
             rma_short_ok and
-            (magical_hist_curr < 0) and
+            (magical_hist_curr < 
+            0) and
             is_red_candle
         )
 
@@ -623,7 +678,8 @@ def check_pair(pair_name, pair_info, last_alerts):
             vwap_prev = float(vwap_15m.iloc[last_i_15m - 1]) if not np.isnan(vwap_15m.iloc[last_i_15m - 1]) else np.nan
             if not (np.isnan(close_prev2) or np.isnan(vwap_prev)):
                 if base_long_ok and (close_prev2 <= vwap_prev) and (close_prev > vwap_curr):
-                    vbuy_conditions_met = True
+                    vbuy_conditions_met 
+= True
                 if base_short_ok and (close_prev2 >= vwap_prev) and (close_prev < vwap_curr):
                     vsell_conditions_met = True
 
@@ -642,7 +698,8 @@ def check_pair(pair_name, pair_info, last_alerts):
         
         # State reset logic against latest closed candle
         if updated_state:
-            if updated_state.startswith('fib_'):
+            if 
+updated_state.startswith('fib_'):
                 try:
                     parts = updated_state.split('_')
                     if len(parts) >= 3 and parts[2] in ['P', 'R1', 'R2', 'S1', 'S2']:
@@ -653,18 +710,21 @@ def check_pair(pair_name, pair_info, last_alerts):
                             if alert_type == "long" and close_prev < pivot_value:
                                 updated_state = None
                                 log(f"🔄 STATE RESET: {pair_name} Long - Price fell below {pivot_name}")
+                            
                             elif alert_type == "short" and close_prev > pivot_value:
                                 updated_state = None
                                 log(f"🔄 STATE RESET: {pair_name} Short - Price rose above {pivot_name}")
+                        
                         else:
                             updated_state = None
                 except Exception as e:
                     log(f"Error parsing fib state: {e}")
-                    updated_state = None
+            
             elif updated_state == 'vbuy' and (vwap_curr is not None and close_prev < vwap_curr):
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VBuy - Price closed below VWAP")
-            elif updated_state == 'vsell' and (vwap_curr is not None and close_prev > vwap_curr):
+            elif updated_state == 'vsell' and (vwap_curr is 
+            not None and close_prev > vwap_curr):
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VSell - Price closed above VWAP")
 
@@ -682,6 +742,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
+            
             updated_state = current_signal
 
         elif vsell_conditions_met:
@@ -712,6 +773,7 @@ def check_pair(pair_name, pair_info, last_alerts):
                     f"{formatted_time}"
                 )
                 send_telegram_alert(message)
+            
             updated_state = current_signal
 
         elif fib_short_met:
@@ -769,7 +831,8 @@ def main():
             if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_') or value_str in ['vbuy', 'vsell']):
                 keys_to_purge.append(key)
     if keys_to_purge:
-        logger.info(f"🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
+        logger.info(f"🧹 Purging old/invalid 
+        states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None
 
@@ -808,7 +871,8 @@ def main():
                     continue
     finally:
         if DEBUG_MODE and pair_logs:
-            logger.debug("SEQUENTIAL DEBUG LOGS START")
+            logger.debug("SEQUENTIAL DEBUG 
+            LOGS START")
             for log_output in pair_logs:
                 if log_output:
                     print(log_output, end='')
@@ -817,8 +881,10 @@ def main():
     # Always save, even if no updates, to ensure file exists and is tracked
     save_state(last_alerts)
     end_time = datetime.now(ist)
+    
     elapsed = (end_time - start_time).total_seconds()
-    logger.info(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
+    logger.info(f"✓ Check complete. {updates_processed} state updates processed. 
+    ({elapsed:.1f}s)")
 
 if __name__ == "__main__":
     try:
