@@ -1,7 +1,7 @@
 {
     "BTCUSD": {
-        "state": "LONG_S1_BREAK",
-        "ts": 1762965887
+        "state": "NO_SIGNAL",
+        "ts": 1762965991
     },
     "ETHUSD": {
         "state": "NO_SIGNAL",
@@ -16,8 +16,8 @@
         "ts": 0
     },
     "BCHUSD": {
-        "state": "LONG_S1_BREAK",
-        "ts": 1762965887
+        "state": "NO_SIGNAL",
+        "ts": 1762965991
     },
     "XRPUSD": {
         "state": "NO_SIGNAL",
@@ -40,11 +40,11 @@
         "ts": 0
     },
     "SUIUSD": {
-        "state": "NO_SIGNAL",
-        "ts": 1762965888
+        "state": "LONG_R1_BREAK",
+        "ts": 1762965992
     },
     "AAVEUSD": {
-        "state": "LONG_S1_BREAK",
-        "ts": 1762965888
+        "state": "NO_SIGNAL",
+        "ts": 1762965992
     }
 }
