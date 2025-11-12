@@ -7,8 +7,9 @@ import random
 import logging
 import sqlite3
 import signal
+import traceback
 from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -16,11 +17,11 @@ import pandas as pd
 import numpy as np
 import pytz
 from aiohttp import ClientConnectorError, ClientResponseError
+from logging.handlers import RotatingFileHandler
 
 # -------------------------
-# Configuration and Logger
+# Default configuration
 # -------------------------
-
 DEFAULT_CONFIG = {
     "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc"),
     "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", "203813932"),
@@ -47,7 +48,9 @@ DEFAULT_CONFIG = {
     "CANDLE_FETCH_RETRIES": 3,
     "CANDLE_FETCH_BACKOFF": 1.5,
     "JITTER_MIN": 0.05,
-    "JITTER_MAX": 0.6
+    "JITTER_MAX": 0.6,
+    # daily prune: number of days to retain (0 disables pruning)
+    "STATE_EXPIRY_DAYS": int(os.environ.get("STATE_EXPIRY_DAYS", "30"))
 }
 
 # Load config.json (optional) and overlay defaults
@@ -62,7 +65,9 @@ if Path(CONFIG_PATH).exists():
 
 cfg = DEFAULT_CONFIG
 
-# Setup logging
+# -------------------------
+# Logger setup
+# -------------------------
 logger = logging.getLogger("macd_bot")
 logger.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else logging.INFO)
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -75,7 +80,6 @@ logger.addHandler(ch)
 
 # Rotating file handler
 try:
-    from logging.handlers import RotatingFileHandler
     fh = RotatingFileHandler(cfg["LOG_FILE"], maxBytes=2_000_000, backupCount=5, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
@@ -84,12 +88,15 @@ except Exception as e:
     logger.warning(f"Could not set up rotating log file: {e}")
 
 # -------------------------
-# Utility: SQLite state store
+# SQLite state store (StateDB)
 # -------------------------
-
 class StateDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        # Ensure directory exists if path includes directories
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._ensure_table()
 
@@ -100,6 +107,13 @@ class StateDB:
                 pair TEXT PRIMARY KEY,
                 state TEXT,
                 ts INTEGER
+            )
+        """)
+        # metadata table uses for pruning schedule
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
         self._conn.commit()
@@ -129,14 +143,97 @@ class StateDB:
     def close(self):
         self._conn.close()
 
+    # metadata helpers
+    def get_metadata(self, key: str) -> Optional[str]:
+        cur = self._conn.cursor()
+        cur.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+        r = cur.fetchone()
+        return r[0] if r else None
+
+    def set_metadata(self, key: str, value: str):
+        cur = self._conn.cursor()
+        cur.execute("INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        self._conn.commit()
+
+# -------------------------
+# Pruning logic (daily)
+# -------------------------
+def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: logging.Logger = None):
+    """
+    Run pruning once per UTC day. Uses metadata.last_prune ISO date to prevent
+    repeated pruning within same day.
+    Deletes rows where ts < cutoff. VACUUM only if deleted > 0.
+    """
+    try:
+        if expiry_days <= 0:
+            if logger_local:
+                logger_local.debug("STATE_EXPIRY_DAYS <= 0 -> pruning disabled.")
+            return
+
+        if not os.path.exists(db_path):
+            if logger_local:
+                logger_local.info(f"State DB not found at {db_path}, skipping prune.")
+            return
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        # ensure metadata table exists
+        cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("SELECT value FROM metadata WHERE key='last_prune'")
+        row = cur.fetchone()
+        today = datetime.utcnow().date()
+        if row:
+            try:
+                last_prune_date = datetime.fromisoformat(row[0]).date()
+                if last_prune_date >= today:
+                    if logger_local:
+                        logger_local.debug("Daily prune already completed — skipping.")
+                    conn.close()
+                    return
+            except Exception:
+                # malformed metadata -> continue and overwrite
+                pass
+
+        # ensure states table exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='states';")
+        if not cur.fetchone():
+            if logger_local:
+                logger_local.debug("No 'states' table yet — skipping prune.")
+            conn.close()
+            return
+
+        cutoff = int(time.time()) - (expiry_days * 86400)
+        cur.execute("DELETE FROM states WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+
+        # write last_prune metadata
+        cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_prune', ?)", (datetime.utcnow().isoformat(),))
+        conn.commit()
+
+        if deleted > 0:
+            try:
+                cur.execute("VACUUM;")
+                conn.commit()
+            except Exception as e:
+                if logger_local:
+                    logger_local.warning(f"VACUUM failed or skipped: {e}")
+
+        conn.close()
+        if logger_local:
+            logger_local.info(f"Pruned {deleted} old state entries (> {expiry_days} days) from {db_path}.")
+    except Exception as e:
+        if logger_local:
+            logger_local.warning(f"Error pruning old state records: {e}")
+            if cfg.get("DEBUG_MODE"):
+                logger_local.debug(traceback.format_exc())
 
 # -------------------------
 # HTTP helpers (async)
 # -------------------------
-
 async def async_fetch_json(session: aiohttp.ClientSession, url: str, params: dict = None,
                            retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Optional[dict]:
-    """Fetch JSON with retry/backoff and simple error handling."""
+    """Fetch JSON with retry/backoff and error handling."""
     for attempt in range(1, retries + 1):
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
@@ -144,7 +241,6 @@ async def async_fetch_json(session: aiohttp.ClientSession, url: str, params: dic
                 try:
                     data = await resp.json()
                 except Exception:
-                    # Try fallback parse
                     data = None
                 if resp.status >= 400:
                     logger.debug(f"HTTP {resp.status} for {url} (attempt {attempt}): {text[:200]}")
@@ -161,17 +257,15 @@ async def async_fetch_json(session: aiohttp.ClientSession, url: str, params: dic
             return None
     return None
 
-
 # -------------------------
-# Data fetching + caching
+# DataFetcher (async)
 # -------------------------
-
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: int = 8, timeout: int = 15):
         self.api_base = api_base.rstrip("/")
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = timeout
-        self._cache = {}  # key -> (timestamp, data); simple in-memory cache (per run)
+        self._cache = {}  # simple per-run cache
 
     async def fetch_products(self, session: aiohttp.ClientSession) -> Optional[dict]:
         url = f"{self.api_base}/v2/products"
@@ -185,31 +279,27 @@ class DataFetcher:
         limit: number of candles
         """
         key = f"candles:{symbol}:{resolution}:{limit}"
-        # Per-run caching to avoid duplicate calls
         if key in self._cache:
             return self._cache[key][1]
 
-        # small jitter to reduce thundering
+        # jitter to reduce thundering herd
         await asyncio.sleep(random.uniform(cfg["JITTER_MIN"], cfg["JITTER_MAX"]))
 
         url = f"{self.api_base}/v2/chart/history"
         params = {"resolution": resolution, "symbol": symbol, "from": int(time.time()) - (limit * int(resolution) * 60), "to": int(time.time())}
         async with self.semaphore:
             data = await async_fetch_json(session, url, params=params, retries=cfg["CANDLE_FETCH_RETRIES"], backoff=cfg["CANDLE_FETCH_BACKOFF"], timeout=cfg["HTTP_TIMEOUT"])
-        # Cache result (even if None) for the run
         self._cache[key] = (time.time(), data)
         return data
 
-
 # -------------------------
-# Indicator functions (mostly preserved)
+# Indicator functions (preserved)
 # -------------------------
-
 def calculate_ema(data: pd.Series, period: int) -> pd.Series:
     return data.ewm(span=period, adjust=False).mean()
 
 def calculate_sma(data: pd.Series, period: int) -> pd.Series:
-    return data.rolling(window=period, min_periods=max(2, period // 3)).mean()
+    return data.rolling(window=period, min_periods=max(2, period//3)).mean()
 
 def calculate_rma(data: pd.Series, period: int) -> pd.Series:
     r = data.ewm(alpha=1/period, adjust=False).mean()
@@ -344,11 +434,9 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
 
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
 
-
 # -------------------------
 # Validation helpers
 # -------------------------
-
 def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
     """Convert Delta API candle response to pandas DataFrame, with safety checks."""
     if not result or not isinstance(result, dict):
@@ -377,12 +465,8 @@ def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
 # -------------------------
 # Evaluation logic (modular)
 # -------------------------
-
 def determine_closed_indices(df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Tuple[int, int, int]:
-    """
-    Determine the correct closed candle indices for 15m and 5m using timestamps.
-    Returns (last_i_15m, prev_i_15m, last_i_5m)
-    """
+    """Determine indices for last closed candles across 15m and 5m timeframes."""
     now_ts = time.time()
     resolution_sec_15m = 15 * 60
     current_15m_interval_start_ts = now_ts - (now_ts % resolution_sec_15m)
@@ -399,18 +483,11 @@ def determine_closed_indices(df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Tuple
 
     return last_i, prev_i, last_i_5m
 
-
 def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Evaluate all indicators and conditions for a pair. Return new state dict if changed or NO_SIGNAL transition.
-    """
+    """Evaluate indicators and conditions; return new state dict if changed (with optional message)."""
     try:
-        # determine special limits
-        sp = cfg["SPECIAL_PAIRS"].get(pair_name, None)
-        # guard minimal lengths
         last_i, prev_i, last_i_5m = determine_closed_indices(df_15m, df_5m)
 
-        # compute indicators
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         if magical_hist.empty:
             logger.debug("MMH empty -> skip")
@@ -422,15 +499,18 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m, cfg["SRSI_RSI_LEN"], cfg["SRSI_KALMAN_LEN"])
 
-        # extract last closed
+        # extract last closed values
         ppo_curr = float(ppo.iloc[last_i]); ppo_prev = float(ppo.iloc[prev_i])
         ppo_signal_curr = float(ppo_signal.iloc[last_i]); ppo_signal_prev = float(ppo_signal.iloc[prev_i])
         smooth_rsi_curr = float(smooth_rsi.iloc[last_i]); smooth_rsi_prev = float(smooth_rsi.iloc[prev_i])
 
-        # candle values
-        close_curr = float(df_15m['close'].iloc[last_i]); open_curr = float(df_15m['open'].iloc[last_i])
-        high_curr = float(df_15m['high'].iloc[last_i]); low_curr = float(df_15m['low'].iloc[last_i])
-        rma50_curr = float(rma_50.iloc[last_i]); rma200_curr = float(rma_200.iloc[last_i_5m])
+        close_curr = float(df_15m['close'].iloc[last_i])
+        open_curr = float(df_15m['open'].iloc[last_i])
+        high_curr = float(df_15m['high'].iloc[last_i])
+        low_curr = float(df_15m['low'].iloc[last_i])
+
+        rma50_curr = float(rma_50.iloc[last_i])
+        rma200_curr = float(rma_200.iloc[last_i_5m])
 
         # safety checks
         if any(pd.isna(x) for x in [ppo_curr, ppo_prev, ppo_signal_curr, ppo_signal_prev, smooth_rsi_curr, smooth_rsi_prev, rma50_curr, rma200_curr]):
@@ -449,7 +529,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
             strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
 
-        # cross and band checks
+        # cross/band logic (same as original)
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
@@ -461,6 +541,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
         ppo_below_signal = ppo_curr < ppo_signal_curr
+
         ppo_below_030 = ppo_curr < 0.30
         ppo_above_minus030 = ppo_curr > -0.30
 
@@ -472,14 +553,13 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
 
-        # cloud state
         cloud_state = "neutral"
         if cfg["CIRRUS_CLOUD_ENABLED"]:
             cloud_state = ("green" if (bool(upw.iloc[last_i]) and not bool(dnw.iloc[last_i]))
                            else "red" if (bool(dnw.iloc[last_i]) and not bool(upw.iloc[last_i]))
                            else "neutral")
 
-        # prepare conditions sets (kept same as original logic)
+        # condition sets
         buy_conds = {
             "ppo_cross_up": ppo_cross_up,
             "ppo_below_020": ppo_below_020,
@@ -555,7 +635,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
 
-        # state determination
+        # state determination & idempotency
         current_state = None
         send_message = None
         price = close_curr
@@ -588,7 +668,6 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             current_state = "short_011"
             send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
-        # idempotency and transitions
         now_ts = int(time.time())
         last_state_value = None
         if isinstance(last_state_for_pair, dict):
@@ -596,41 +675,41 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         elif isinstance(last_state_for_pair, str):
             last_state_value = last_state_for_pair
 
-        # No signal found => possibly go to NO_SIGNAL
         if current_state is None:
-            if last_state_value and last_state_value != "NO_SIGNAL":
-                logger.debug(f"{pair_name}: transitioning to NO_SIGNAL")
+            # transition back to NO_SIGNAL if previously was a signal
+            if last_state_value != 'NO_SIGNAL' and last_state_value is not None:
                 return {"state": "NO_SIGNAL", "ts": now_ts}
             return last_state_for_pair
 
-        # If same as previous => skip
+        # idempotency check
         if current_state == last_state_value:
-            logger.debug(f"{pair_name}: no state change ({current_state})")
+            logger.debug(f"Idempotency: {pair_name} signal remains {current_state}.")
             return last_state_for_pair
 
-        # else new signal detected -> produce state (and send alert outside)
+        # return new signal and message (message popped & sent by caller)
         return {"state": current_state, "ts": now_ts, "message": send_message}
 
     except Exception as e:
         logger.exception(f"Error evaluating logic for {pair_name}: {e}")
         return None
 
-
 # -------------------------
-# Telegram alert sender (keeps same formatting)
+# Telegram sender (async)
 # -------------------------
-
 async def send_telegram_alert_async(session: aiohttp.ClientSession, message: str) -> bool:
     token = cfg["TELEGRAM_BOT_TOKEN"]
     chat_id = cfg["TELEGRAM_CHAT_ID"]
-    if not token or token == "xxxx" or not chat_id or chat_id == "xxxx":
+    if not token or token == 'xxxx' or not chat_id or chat_id == 'xxxx':
         logger.warning("Telegram not configured; skipping alert.")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = {"chat_id": chat_id, "text": message}
     try:
         async with session.post(url, data=data, timeout=10) as resp:
-            js = await resp.json(content_type=None)
+            try:
+                js = await resp.json(content_type=None)
+            except Exception:
+                js = {"ok": False, "status_code": resp.status, "text": await resp.text()}
             ok = js.get("ok", False)
             if ok:
                 logger.info("Alert sent successfully")
@@ -642,29 +721,26 @@ async def send_telegram_alert_async(session: aiohttp.ClientSession, message: str
         logger.exception(f"Error sending telegram alert: {e}")
         return False
 
-
 # -------------------------
 # Orchestration: check a single pair
 # -------------------------
-
 async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, products_map: Dict[str, dict],
                      pair_name: str, last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Orchestrate fetch -> parse -> evaluate -> (send alert) -> return new state"""
+    """Fetch candles, compute indicators, evaluate conditions, send alert if needed, return new state."""
     try:
         prod = products_map.get(pair_name)
         if not prod:
             logger.debug(f"No product mapping for {pair_name}")
             return None
 
-        # special pair limits
         sp = cfg["SPECIAL_PAIRS"].get(pair_name, {})
         limit_15m = sp.get("limit_15m", 210)
         min_required = sp.get("min_required", 200)
         limit_5m = sp.get("limit_5m", 300)
         min_required_5m = sp.get("min_required_5m", 250)
 
-        # fetch candles concurrently (via fetcher)
         symbol = prod['symbol']
+        # fetch both timeframes
         res15_task = asyncio.create_task(fetcher.fetch_candles(session, symbol, "15", limit_15m))
         res5_task = asyncio.create_task(fetcher.fetch_candles(session, symbol, "5", limit_5m))
         res15 = await res15_task
@@ -680,17 +756,14 @@ async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, produ
             logger.warning(f"Insufficient 5m data for {pair_name}: {0 if df_5m is None else len(df_5m)}/{min_required_5m + 2}")
             return None
 
-        # convert to numeric types (ensure safety)
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df_15m[col] = pd.to_numeric(df_15m[col], errors='coerce')
             df_5m[col] = pd.to_numeric(df_5m[col], errors='coerce')
 
-        # evaluate logic
         new_state = evaluate_pair_logic(pair_name, df_15m, df_5m, last_state_for_pair)
         if new_state is None:
             return None
 
-        # if there's a message to send, do it (and keep same simple format)
         message = new_state.pop("message", None)
         if message:
             await send_telegram_alert_async(session, message)
@@ -701,11 +774,9 @@ async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, produ
         logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
 
-
 # -------------------------
-# Product mapping
+# Product mapping helper
 # -------------------------
-
 def build_products_map_from_api_result(api_products: dict) -> Dict[str, dict]:
     products_map = {}
     if not api_products or not api_products.get("result"):
@@ -715,7 +786,6 @@ def build_products_map_from_api_result(api_products: dict) -> Dict[str, dict]:
             symbol = p.get('symbol', '')
             symbol_norm = symbol.replace('_USDT', 'USD').replace('USDT', 'USD')
             if p.get('contract_type') == 'perpetual_futures':
-                # match to requested PAIRS using exact match on normalized symbol or without underscore
                 for pair_name in cfg["PAIRS"]:
                     if symbol_norm == pair_name or symbol_norm.replace('_', '') == pair_name:
                         products_map[pair_name] = {'id': p.get('id'), 'symbol': p.get('symbol'), 'contract_type': p.get('contract_type')}
@@ -723,41 +793,50 @@ def build_products_map_from_api_result(api_products: dict) -> Dict[str, dict]:
             continue
     return products_map
 
-
 # -------------------------
-# Main runner
+# Runner
 # -------------------------
-
 async def run_once(send_test: bool = True):
     logger.info("Starting run_once")
+
+    # --- Smart daily pruning before DB open ---
+    expiry_days = int(cfg.get("STATE_EXPIRY_DAYS", 0))
+    try:
+        prune_old_state_records(cfg["STATE_DB_PATH"], expiry_days, logger)
+    except Exception as e:
+        logger.warning(f"Prune step failed: {e}")
+
+    # Load last alerts
     state_db = StateDB(cfg["STATE_DB_PATH"])
     last_alerts = state_db.load_all()
 
     fetcher = DataFetcher(cfg["DELTA_API_BASE"], max_parallel=cfg["MAX_PARALLEL_FETCH"], timeout=cfg["HTTP_TIMEOUT"])
     async with aiohttp.ClientSession() as session:
-        # optionally send startup test message
-        if send_test and cfg["SEND_TEST_MESSAGE"] and cfg["TELEGRAM_BOT_TOKEN"] != "xxxx" and cfg["TELEGRAM_CHAT_ID"] != "xxxx":
+        # startup test message
+        if send_test and cfg["SEND_TEST_MESSAGE"] and cfg["TELEGRAM_BOT_TOKEN"] != 'xxxx' and cfg["TELEGRAM_CHAT_ID"] != 'xxxx':
             ist = pytz.timezone('Asia/Kolkata')
             current_dt = datetime.now(ist)
             formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
             test_msg = f"🔔 Bot Started\nTest message from PPO Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if cfg['DEBUG_MODE'] else 'OFF'}"
             await send_telegram_alert_async(session, test_msg)
-        elif send_test and (cfg["TELEGRAM_BOT_TOKEN"] == "xxxx" or cfg["TELEGRAM_CHAT_ID"] == "xxxx"):
+        elif send_test and (cfg["TELEGRAM_BOT_TOKEN"] == 'xxxx' or cfg["TELEGRAM_CHAT_ID"] == 'xxxx'):
             logger.info("Skipping test message: Telegram not configured.")
 
         # fetch products
         prod_resp = await fetcher.fetch_products(session)
         if not prod_resp:
             logger.error("Failed to fetch products. Aborting run.")
+            state_db.close()
             return
         products_map = build_products_map_from_api_result(prod_resp)
         found_count = len(products_map)
         logger.info(f"Found {found_count} tradable pairs mapped to configuration.")
         if found_count == 0:
             logger.error("No pairs found. Exiting.")
+            state_db.close()
             return
 
-        # prepare tasks for each pair
+        # prepare tasks
         tasks = []
         sem = asyncio.Semaphore(cfg["MAX_PARALLEL_FETCH"])
         for pair_name in cfg["PAIRS"]:
@@ -765,17 +844,15 @@ async def run_once(send_test: bool = True):
             if not prod_info:
                 continue
             last_state = last_alerts.get(pair_name)
-            # wrap call with semaphore to control concurrency
             async def run_check(pair=pair_name, prod=prod_info, last_state_for_pair=last_state):
                 async with sem:
-                    # small jitter before each pair to spread load
                     await asyncio.sleep(random.uniform(cfg["JITTER_MIN"], cfg["JITTER_MAX"]))
                     return await check_pair(session, fetcher, products_map, pair, last_state_for_pair)
             tasks.append(asyncio.create_task(run_check()))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # process results and persist changes
+        # persist changes
         updates = 0
         for item in results:
             if isinstance(item, Exception):
@@ -787,7 +864,6 @@ async def run_once(send_test: bool = True):
             if not isinstance(new_state, dict):
                 continue
             prev = state_db.get(pair_name)
-            # compare and update
             if prev != new_state:
                 state_db.set(pair_name, new_state.get("state"), new_state.get("ts"))
                 updates += 1
@@ -795,13 +871,10 @@ async def run_once(send_test: bool = True):
         logger.info(f"Run complete. {updates} state updates applied.")
         state_db.close()
 
-
 # -------------------------
 # CLI loop and graceful shutdown
 # -------------------------
-
 stop_requested = False
-
 def request_stop(signum, frame):
     global stop_requested
     logger.info(f"Received signal {signum}, stopping gracefully...")
@@ -830,7 +903,6 @@ def main():
             except Exception:
                 logger.exception("Unhandled exception in run_once")
             elapsed = time.time() - start
-            # sleep until next interval unless stop requested
             to_sleep = max(0, interval - elapsed)
             if to_sleep > 0:
                 logger.debug(f"Sleeping {to_sleep:.1f}s until next run")
