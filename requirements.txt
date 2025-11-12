@@ -1,7 +1,6 @@
-requests
-pandas
-numpy
-pytz
-urllib3
-aiohttp
-python-dateutil
+aiohttp==3.10.5
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+python-dateutil==2.9.0.post0
+pytz==2024.1
