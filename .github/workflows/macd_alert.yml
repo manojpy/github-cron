@@ -68,6 +68,5 @@ jobs:
         file_pattern: |
           macd_state.json
           fib_state.json
-        add_options: ''          # Ensures modified files are staged
-        skip_dirty_check: true   # Prevents failure if no changes
-
+        add_options: '--force'     # NEW: force‑add modified files
+        skip_dirty_check: true     # Prevents failure if no changes
