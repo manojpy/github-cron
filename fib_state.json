@@ -1,1 +1,50 @@
-{"BTCUSD": null, "ETHUSD": null, "SOLUSD": null, "AVAXUSD": null, "BCHUSD": null, "XRPUSD": null, "BNBUSD": null, "LTCUSD": null, "DOTUSD": null, "ADAUSD": null, "SUIUSD": "fib_short_S1", "AAVEUSD": "fib_short_S1"}
+{
+    "BTCUSD": {
+        "state": "LONG_S1_BREAK",
+        "ts": 1762965887
+    },
+    "ETHUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "SOLUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "AVAXUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "BCHUSD": {
+        "state": "LONG_S1_BREAK",
+        "ts": 1762965887
+    },
+    "XRPUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "BNBUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "LTCUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "DOTUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "ADAUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 0
+    },
+    "SUIUSD": {
+        "state": "NO_SIGNAL",
+        "ts": 1762965888
+    },
+    "AAVEUSD": {
+        "state": "LONG_S1_BREAK",
+        "ts": 1762965888
+    }
+}
