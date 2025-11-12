@@ -348,9 +348,9 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
     return hist
 
 # ============ CIRRUS CLOUD STATE HELPER ============
-def get_cloud_state(upw, dnw, idx=-2):
+def get_cloud_state(upw, dnw, idx=-1):
     """
-    Exclusive Cirrus Cloud state:
+    Exclusive Cirrus Cloud state for the latest closed candle:
     - 'green' if upw=True and dnw=False
     - 'red' if dnw=True and upw=False
     - 'neutral' otherwise
@@ -430,9 +430,9 @@ def check_pair(pair_name, pair_info, last_alerts):
             logger.warning(f"{pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # VWAP with DAILY RESET
+        # VWAP with DAILY RESET — use latest closed candle
         vwap_15m = calculate_vwap_daily_reset(df_15m)
-        vwap_curr = vwap_15m.iloc[-2] if len(vwap_15m) >= 2 else np.nan
+        vwap_curr = vwap_15m.iloc[-1] if len(vwap_15m) >= 1 else np.nan
         if np.isnan(vwap_curr):
             log("⚠️  VWAP is NaN, skipping VBuy/VSell signals")
             vwap_curr = None
@@ -447,12 +447,13 @@ def check_pair(pair_name, pair_info, last_alerts):
             logger.warning(f"{pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        open_prev = float(df_15m['open'].iloc[-2])
-        close_prev = float(df_15m['close'].iloc[-2])
-        high_prev = float(df_15m['high'].iloc[-2])
-        low_prev = float(df_15m['low'].iloc[-2])
-        ppo_curr = float(ppo.iloc[-2]) if not np.isnan(ppo.iloc[-2]) else np.nan
-        rma_50_15m_curr = float(rma_50_15m.iloc[-2]) if not np.isnan(rma_50_15m.iloc[-2]) else np.nan
+        # Use latest closed candle for signal evaluation
+        open_prev = float(df_15m['open'].iloc[-1])
+        close_prev = float(df_15m['close'].iloc[-1])
+        high_prev = float(df_15m['high'].iloc[-1])
+        low_prev = float(df_15m['low'].iloc[-1])
+        ppo_curr = float(ppo.iloc[-1]) if not np.isnan(ppo.iloc[-1]) else np.nan
+        rma_50_15m_curr = float(rma_50_15m.iloc[-1]) if not np.isnan(rma_50_15m.iloc[-1]) else np.nan
 
         if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr)):
             log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
@@ -465,7 +466,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
 
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
-        magical_hist_curr = magical_hist.iloc[-2] if len(magical_hist) >= 2 else np.nan
+        magical_hist_curr = magical_hist.iloc[-1] if len(magical_hist) >= 1 else np.nan
         if np.isnan(magical_hist_curr):
             log(f"⚠️  NaN in Magical Momentum Hist for {pair_name}, skipping")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
@@ -479,18 +480,19 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_200_available = False
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         if df_5m is None or len(df_5m) < min_required_5m:
-            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {len[df_5m] if df_5m is not None else 0})")
+            got_5m = len(df_5m) if df_5m is not None else 0
+            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {got_5m})")
             log("RMA 200 5m check will be skipped - using only RMA 50 15m")
         else:
             rma_200_5m = calculate_rma(df_5m['close'], 200)
-            if len(rma_200_5m) >= 2 and not np.isnan(rma_200_5m.iloc[-2]):
-                rma_200_5m_curr = float(rma_200_5m.iloc[-2])
+            if len(rma_200_5m) >= 1 and not np.isnan(rma_200_5m.iloc[-1]):
+                rma_200_5m_curr = float(rma_200_5m.iloc[-1])
                 rma_200_available = True
                 log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
                 log("5m RMA 200 calculation produced NaN - will be skipped")
 
-        # Candle characterization
+        # Candle characterization on latest closed candle
         is_green_candle = close_prev > open_prev
         is_red_candle = close_prev < open_prev
 
@@ -525,11 +527,11 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # Cirrus Cloud state (exclusive) and gating
-        cloud_state = get_cloud_state(upw, dnw, idx=-2)
+        # Cirrus Cloud state (exclusive) — latest closed candle
+        cloud_state = get_cloud_state(upw, dnw, idx=-1)
         log(f"Cirrus Cloud State: {cloud_state}")
 
-        # Pivot crossovers
+        # Pivot crossovers on latest closed candle
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
         long_crossover_line = None
         long_crossover_name = None
@@ -566,12 +568,12 @@ def check_pair(pair_name, pair_info, last_alerts):
             is_red_candle
         )
 
-        # VWAP signals
+        # VWAP signals: previous candle vs VWAP_prev, current candle vs VWAP_curr
         vbuy_conditions_met = False
         vsell_conditions_met = False
-        if vwap_curr is not None and len(df_15m) >= 3:
-            close_prev2 = float(df_15m['close'].iloc[-3])
-            vwap_prev = float(vwap_15m.iloc[-3]) if not np.isnan(vwap_15m.iloc[-3]) else np.nan
+        if vwap_curr is not None and len(df_15m) >= 2:
+            close_prev2 = float(df_15m['close'].iloc[-2])
+            vwap_prev = float(vwap_15m.iloc[-2]) if not np.isnan(vwap_15m.iloc[-2]) else np.nan
             if not (np.isnan(close_prev2) or np.isnan(vwap_prev)):
                 if base_long_ok and (close_prev2 <= vwap_prev) and (close_prev > vwap_curr):
                     vbuy_conditions_met = True
@@ -590,7 +592,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
 
-        # State reset logic
+        # State reset logic against latest closed candle
         if updated_state:
             if updated_state.startswith('fib_'):
                 try:
