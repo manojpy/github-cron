@@ -74,8 +74,6 @@ SRSI_EMA_LEN = 5
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "macd_state.json")
 STATE_FILE_BAK = STATE_FILE + ".bak"
 
-#COOLDOWN_SECONDS = 600  # 10 minutes per signal
-
 # Thread lock for state updates
 state_lock = Lock()
 
@@ -810,12 +808,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             debug_log(f"No signal conditions met for {pair_name}")
             return None
 
-        # Cooldown and duplicate suppression
-        #should_send = (last_state_value != current_state) or (now_ts - last_ts >= COOLDOWN_SECONDS)
-        #if should_send and send_message:
-            #send_telegram_alert(send_message)
-        #else:
-            #debug_log(f"{pair_name}: Suppressing alert; cooldown active or state unchanged (last={last_state_value}, now={current_state})")
         if send_message:
             send_telegram_alert(send_message)
 
