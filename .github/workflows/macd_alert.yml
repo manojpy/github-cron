@@ -1,9 +1,9 @@
 name: Trading Alert Bots
 
 on:
-  workflow_dispatch:  # Manual trigger (external cron can call this)
-  # schedule:
-  #   - cron: '1,16,31,46 * * * *'
+  workflow_dispatch:   # Manual trigger (external cron can call this)
+  #schedule:            # Uncomment if you want GitHub-native scheduling
+    #- cron: '1,16,31,46 * * * *'   # Runs every 15 minutes at :01, :16, :31, :46
 
 concurrency:
   group: trading-alert-bots
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10   # Allow a bit more time in case of API slowness
     
     steps:
     - name: Checkout code
@@ -64,4 +64,4 @@ jobs:
         file_pattern: |
           macd_state.json
           fib_state.json
-
+        skip_dirty_check: true   # Prevents failure if no changes
