@@ -65,5 +65,8 @@ jobs:
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
         commit_message: "Update bot state JSONs [skip ci]"
-        add_options: '--all'        # Stage all tracked changes
-        skip_dirty_check: true      # Prevents failure if no changes
+        file_pattern: |
+          macd_state.json
+          fib_state.json
+        add_options: '--force'     # Ensures modified files are staged
+        skip_dirty_check: true     # Prevents failure if no changes
