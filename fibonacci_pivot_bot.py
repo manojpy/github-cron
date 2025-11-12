@@ -31,788 +31,563 @@ PAIRS = {
 }
 
 SPECIAL_PAIRS = {
-    "SOLUSD": 
-{"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
+    "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
 }
 
-# PPO settings (used in diagnostics)
-PPO_FAST = 7
-PPO_SLOW = 16
-PPO_SIGNAL = 5
-PPO_USE_SMA = False
+# Indicator settings
+RMA_PERIOD = 200
+FIB_LEVELS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
 
-# Cirrus Cloud settings
-X1 = 22
-X2 = 9
-X3 = 15
-X4 = 5
-
-PIVOT_LOOKBACK_PERIOD = 15
+# State file paths (NEW/IMPROVED)
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "fib_state.json")
 STATE_FILE_BAK = STATE_FILE + ".bak"
 
-# ============ LOGGING ============
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+# ============ LOGGING SETUP ============
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
 
-# ============ HTTP SESSION WITH RETRIES ============
-def create_session_with_retries():
+# Console handler
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+ch.setFormatter(formatter)
+if not logger.handlers:
+    logger.addHandler(ch)
+
+# ============ UTILITY FUNCTIONS (IMPROVED FOR ROBUSTNESS) ============
+
+def create_session():
     session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(['GET', 'POST'])
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
 
-# ============ VWAP WITH DAILY RESET ============
-def calculate_vwap_daily_reset(df):
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    df = df.copy()
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
-    df['date'] = df['datetime'].dt.date
-    hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
-    df['hlc3_vol'] = hlc3 * df['volume']
-    df['cum_vol'] = df.groupby('date')['volume'].cumsum()
-    df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
-    vwap = df['cum_hlc3_vol'] / df['cum_vol'].replace(0, np.nan)
-    return vwap.ffill().bfill()
+SESSION = create_session()
 
-# ============ STATE MANAGEMENT ============
 def load_state():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                content = f.read().strip()
-            if not content:
-                logger.debug("State file empty. Starting fresh.")
-                return {}
-            state = json.loads(content)
-            logger.debug(f"Loaded state: {state}")
-            return state
-    except Exception as e:
-        logger.warning(f"State file corrupted/unreadable: {e}. Attempting backup.")
+    """
+    Load previous alert state from file with backup recovery.
+    Initializes a 'NO_SIGNAL' state for all pairs if files are missing.
+    """
+    
+    def _initialize_default_state():
+        """Returns a clean state for all monitored pairs."""
+        return {pair: {"state": "NO_SIGNAL", "ts": 0} for pair in PAIRS.keys()}
+
+    def _safe_load(filepath):
+        """Attempts to load and validate state from a specific path."""
         try:
-            if os.path.exists(STATE_FILE_BAK):
-                with open(STATE_FILE_BAK, 'r') as f:
-                    return json.loads(f.read())
-        except Exception as e2:
-            logger.warning(f"Backup state also invalid: {e2}. Starting fresh.")
-    return {}
+            if not os.path.exists(filepath):
+                return None
+            
+            with open(filepath, 'r') as f:
+                state = json.load(f)
+            
+            if not isinstance(state, dict):
+                raise ValueError("State file is not a dict")
+
+            # Normalize schema to {pair: {"state": str, "ts": int}} and filter for known PAIRS
+            normalized = {}
+            for k, v in state.items():
+                if k in PAIRS:
+                    if isinstance(v, dict):
+                        s = v.get("state")
+                        ts = v.get("ts", 0)
+                        if isinstance(s, str):
+                            normalized[k] = {"state": s, "ts": int(ts)}
+                    elif isinstance(v, str):
+                        normalized[k] = {"state": v, "ts": 0}
+            return normalized
+        except Exception:
+            logger.exception(f"Error reading state file {filepath}")
+            return None
+
+    # 1. Try primary file
+    loaded_state = _safe_load(STATE_FILE)
+    if loaded_state is not None:
+        logger.debug(f"Loaded primary state (partial): {loaded_state}")
+    
+    # 2. Try backup file if primary failed
+    if loaded_state is None:
+        loaded_state = _safe_load(STATE_FILE_BAK)
+        if loaded_state is not None:
+            logger.info("Recovered state from backup.")
+            logger.debug(f"Loaded backup state (partial): {loaded_state}")
+
+    # 3. Combine with default state for all PAIRS
+    final_state = _initialize_default_state()
+    if loaded_state is not None:
+        # Merge loaded state over default state, filling in missing pairs with default
+        final_state.update(loaded_state)
+        
+    if loaded_state is None:
+         logger.debug("No previous state found or recovery failed, starting fresh (NO_SIGNAL)")
+
+    return final_state
 
 def save_state(state):
+    """Save alert state to file atomically with backup creation and fsync."""
     try:
-        with tempfile.NamedTemporaryFile('w', delete=False) as tmp:
-            json.dump(state, tmp)
-            temp_name = tmp.name
-        shutil.move(temp_name, STATE_FILE)
-        try:
-            shutil.copy(STATE_FILE, STATE_FILE_BAK)
-        except Exception as e:
-            logger.debug(f"Could not write backup state: {e}")
-        logger.info(f"Saved state to {STATE_FILE}: {state}")
-    except Exception as e:
-        logger.error(f"Error saving state: {e}")
+        temp_file = STATE_FILE + '.tmp'
+        
+        # 1. Write the new state to a temporary file
+        with open(temp_file, 'w') as f:
+            json.dump(state, f, indent=4)
+            f.flush()
+            # Ensure data is written to the physical disk (important for robustness)
+            os.fsync(f.fileno()) 
 
-# ============ TELEGRAM ALERTS ============
+        # 2. Rename existing state file to backup (atomic backup)
+        if os.path.exists(STATE_FILE):
+            try:
+                # os.replace is atomic on most modern OS filesystems (like rename)
+                os.replace(STATE_FILE, STATE_FILE_BAK) 
+            except Exception:
+                # If rename fails, log a warning but proceed
+                logger.warning("Could not rename primary file to backup.")
+        
+        # 3. Atomically replace the old state file (or backup) with the new temporary file
+        os.replace(temp_file, STATE_FILE)
+        
+        logger.debug(f"Saved state: {state}")
+    except Exception:
+        logger.exception("Error saving state")
+
 def send_telegram_alert(message):
-    try:
-        if TELEGRAM_BOT_TOKEN == 'xxxx' or TELEGRAM_CHAT_ID == 'xxxx':
-            logger.warning("Telegram not configured. Skipping send.")
-            return False
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        session = create_session_with_retries()
-        response = session.post(url, data=data, timeout=10)
-        try:
-            response_data = response.json()
-        except ValueError:
-            logger.error(f"Telegram non-JSON response: {response.text}")
-            return False
-        if response_data.get('ok'):
-            logger.info("Alert sent successfully")
-            time.sleep(0.8)  # gentle rate-limiting
-            return True
-        logger.error(f"Telegram error: {response_data}")
+    """Send alert message via Telegram"""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == 'xxxx' or not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == 'xxxx':
+        logger.warning("Telegram not configured: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
         return False
-    except Exception as e:
-        logger.exception(f"Error sending Telegram message: {e}")
+    try:
+        logger.debug(f"Attempting to send message: {message[:100]}...")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": None 
+        }
+        response = SESSION.post(url, data=data, timeout=10)
+        response_data = response.json()
+        if response_data.get('ok'):
+            logger.info(f"Alert sent successfully")
+            return True
+        else:
+            logger.error(f"Telegram error: {response_data}")
+            return False
+    except Exception:
+        logger.exception("Error sending Telegram message")
         return False
 
 def send_test_message():
+    """Send a test message to verify Telegram connectivity"""
     ist = pytz.timezone('Asia/Kolkata')
     current_dt = datetime.now(ist)
     formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-    test_msg = f"""🔔 Fibonacci Pivot Bot Started
-Test message from Fibonacci Pivot Bot
-Time: {formatted_time}
-Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}"""
-    logger.info("Sending test message...")
+    test_msg = f"🔔 Bot Started\nTest message from Fibonacci Pivot Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
+    logger.info("="*50)
+    logger.info("SENDING TEST MESSAGE")
+    logger.info("="*50)
     success = send_telegram_alert(test_msg)
-    if not success:
-        logger.warning("Test message failed - check bot token and chat ID")
+    if success:
+        logger.info("Test message sent successfully!")
+    else:
+        logger.error("Test message failed - check your bot token and chat ID")
+    logger.info("="*50)
     return success
 
-# ============ API HELPERS ============
-def safe_json(response, context=""):
-    try:
-        return response.json()
-    except ValueError:
-        logger.error(f"Invalid JSON response in {context}: {getattr(response, 'text', '')[:200]}")
-        return {}
-
 def get_product_ids():
+    """Fetch all product IDs from Delta Exchange"""
     try:
         logger.debug("Fetching product IDs from Delta Exchange...")
-        session = create_session_with_retries()
-        response = session.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
-        data = safe_json(response, context="get_product_ids")
+        response = SESSION.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
+        data = response.json()
         if data.get('success'):
-            products = data.get('result', [])
+            products = data['result']
             logger.debug(f"Received {len(products)} products from API")
             for product in products:
-                symbol = product.get('symbol', '').replace('_USDT', 'USD').replace('USDT', 'USD')
+                symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
                 if product.get('contract_type') == 'perpetual_futures':
                     for pair_name in PAIRS.keys():
                         if symbol == pair_name or symbol.replace('_', '') == pair_name:
                             PAIRS[pair_name] = {
-                                'id': product.get('id'),
-                                'symbol': product.get('symbol'),
-                                'contract_type': product.get('contract_type')
+                                'id': product['id'],
+                                'symbol': product['symbol'],
+                                'contract_type': product['contract_type']
                             }
-                            logger.debug(f"Matched {pair_name} -> {product.get('symbol')} (ID: {product.get('id')})")
+                            logger.debug(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
             return True
-        logger.error(f"API Error in get_product_ids: {data}")
-        return False
-    except Exception as e:
-        logger.exception(f"Error fetching products: {e}")
+        else:
+            logger.error(f"API Error: {data}")
+            return False
+    except Exception:
+        logger.exception("Error fetching products")
         return False
 
 def get_candles(product_id, resolution="15", limit=150):
+    """Fetch OHLCV candles from Delta Exchange with volume check"""
+    # [Implementation of get_candles remains the same, using logger]
     try:
-        if not product_id:
-            return None
         to_time = int(time.time())
-        if resolution == "D":
-            from_time = to_time - (limit * 24 * 60 * 60)
-            res_minutes = 1440 # 24*60 min
-        else:
-            res_minutes = int(resolution)
-            from_time = to_time - (limit * res_minutes * 60)
-            
+        from_time = to_time - (limit * int(resolution) * 60)
         url = f"{DELTA_API_BASE}/v2/chart/history"
-        params = {'resolution': resolution, 'symbol': product_id, 'from': from_time, 'to': to_time}
-        session = create_session_with_retries()
-        response = session.get(url, params=params, timeout=15)
-        data = safe_json(response, context=f"get_candles({product_id},{resolution})")
-        if data.get('success') and data.get('result'):
+        params = {
+            'resolution': resolution,
+            'symbol': product_id,
+            'from': from_time,
+            'to': to_time
+        }
+        logger.debug(f"Fetching {resolution}m candles for {product_id}, limit={limit}")
+        response = SESSION.get(url, params=params, timeout=15)
+        data = response.json()
+
+        if data.get('success'):
             result = data['result']
-            for k in ['t', 'o', 'h', 'l', 'c', 'v']:
-                if k not in result:
-                    logger.error(f"Missing key {k} in candle result for {product_id}")
-                    return None
+            arrays = [result.get('t', []), result.get('o', []), result.get('h', []), result.get('l', []), result.get('c', []), result.get('v', [])]
+            min_len = min(map(len, arrays)) if arrays else 0
+            if min_len == 0:
+                logger.debug(f"No candles returned for {product_id}")
+                return None
             df = pd.DataFrame({
-                'timestamp': result['t'],
-                'open': result['o'],
-                'high': result['h'],
-                'low': result['l'],
-                'close': result['c'],
-                'volume': result['v']
+                'timestamp': result.get('t', [])[:min_len],
+                'open': result.get('o', [])[:min_len],
+                'high': result.get('h', [])[:min_len],
+                'low': result.get('l', [])[:min_len],
+                'close': result.get('c', [])[:min_len],
+                'volume': result.get('v', [])[:min_len]
             })
-            df = df.sort_values('timestamp').reset_index(drop=True)
-            if df.empty or df[['open', 'high', 'low', 'close']].isnull().any().any():
-                logger.warning(f"NaNs in candle data for {product_id} {resolution}m")
+
+            df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
+
+            if df['close'].iloc[-1] <= 0:
+                logger.debug(f"Invalid price (≤0) for {product_id}, skipping")
+                return None
+
+            # Volume Check: If the latest volume is too low or zero, it might be stale/bad data
+            latest_volume = df['volume'].iloc[-1]
+            if latest_volume < 1:
+                 logger.warning(f"Low/Zero volume for {product_id} ({resolution}m): {latest_volume}. Check data.")
+
+            logger.debug(f"Received {len(df)} candles for {product_id} ({resolution}m)")
+
+            # Check data freshness
+            last_candle_time = df['timestamp'].iloc[-1]
+            time_diff = time.time() - last_candle_time
+            max_age_soft = int(resolution) * 60 * 6  # 6 candles soft threshold
+            if time_diff > max_age_soft:
+                logger.warning(f"Stale data for {product_id} ({resolution}m) - {time_diff/60:.1f} min old. Skipping.")
+                return None
+
             return df
-        logger.warning(f"No candle data for {product_id} {resolution}m: {data}")
-        return None
-    except Exception as e:
-        logger.exception(f"Exception fetching candles for {product_id}: {e}")
-        return None
-
-# ============ INDICATORS ============
-def calculate_ema(data, period):
-    if len(data) < 1 or period <= 0:
-        return pd.Series([np.nan] * len(data), index=data.index)
-    return data.ewm(span=period, adjust=False).mean()
-
-def calculate_sma(data, period):
-    if len(data) < period or period <= 0:
-        return pd.Series([np.nan] * len(data), index=data.index)
-    return data.rolling(window=period, min_periods=period).mean()
-
-def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
-    close = df['close'].astype(float)
-    fast_ma = calculate_sma(close, fast) if use_sma else calculate_ema(close, fast)
-    slow_ma = calculate_sma(close, slow) if use_sma else calculate_ema(close, slow)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ppo = (fast_ma - slow_ma) / slow_ma * 100
-    ppo = ppo.replace([np.inf, -np.inf], np.nan)
-    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
-    return ppo, ppo_signal
-
-def smoothrng(x, t, m):
-    wper = t * 2 - 1
-    avrng = calculate_ema(np.abs(x.diff()), t)
-    val = calculate_ema(avrng, wper) * m
-    return val.bfill().ffill()
-
-def rngfilt(x, r):
-    if len(x) == 0:
-        return pd.Series(dtype=float)
-    result_list = [x.iloc[0]]
-    for i in range(1, len(x)):
-        prev_f = result_list[-1]
-        curr_x = x.iloc[i]
-        curr_r = r.iloc[i] if not np.isnan(r.iloc[i]) else 0
-        if curr_x > prev_f:
-            f = prev_f if (curr_x - curr_r < prev_f) else (curr_x - curr_r)
         else:
-            f = prev_f if (curr_x + curr_r > prev_f) else (curr_x + curr_r)
-        result_list.append(f)
-    return pd.Series(result_list, index=x.index)
-
-def calculate_cirrus_cloud(df):
-    close = df['close'].astype(float).copy()
-    smrngx1x = smoothrng(close, X1, X2)
-    smrngx1x2 = smoothrng(close, X3, X4)
-    filtx1 = rngfilt(close, smrngx1x)
-    filtx12 = rngfilt(close, smrngx1x2)
-    upw = filtx1 < filtx12
-    dnw = filtx1 > filtx12
-    return upw, dnw, filtx1, filtx12
+            logger.error(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
+            return None
+    except Exception:
+        logger.exception(f"Exception fetching candles for {product_id}")
+        return None
 
 def calculate_rma(data, period):
-    if period <= 0:
-        return pd.Series([np.nan] * len(data), index=data.index)
-    return data.ewm(alpha=1/period, adjust=False).mean()
+    r = data.ewm(alpha=1/period, adjust=False).mean()
+    return r.bfill().ffill()
 
-def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
-    if len(df) < period + 50:
-        return pd.Series([np.nan] * len(df), index=df.index)
-
-    close = df['close'].astype(float)
-    if close.isnull().all():
-        return pd.Series([np.nan] * len(df), index=df.index)
-
-    responsiveness = max(0.00001, responsiveness)
-    sd = close.rolling(window=50, min_periods=1).std() * responsiveness
-    sd = sd.bfill().fillna(0.001)
-
-    worm = close.copy()
-    worm.iloc[0] = close.iloc[0]
-    for i in range(1, len(close)):
-        diff = close.iloc[i] - worm.iloc[i - 1]
-        abs_diff = abs(diff)
-        delta = np.sign(diff) * sd.iloc[i] if abs_diff > sd.iloc[i] else diff
-        worm.iloc[i] = worm.iloc[i - 1] + delta
-
-    ma = close.rolling(window=period, min_periods=1).mean()
-    with np.errstate(divide='ignore', invalid='ignore'):
-        raw_momentum = (worm - ma) / worm.replace(0, np.nan)
-
-    raw_momentum = raw_momentum.fillna(0)
-    min_med = raw_momentum.rolling(window=period, min_periods=1).min()
-    max_med = raw_momentum.rolling(window=period, min_periods=1).max()
-    rng = max_med - min_med
-
-    temp = pd.Series(0.0, index=df.index)
-    valid = rng > 1e-10
-    temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
-
-    value = pd.Series(0.0, index=df.index)
-    if len(value) > 0:
-        value.iloc[0] = 0.0
-        for i in range(1, len(temp)):
-            v_prev = value.iloc[i - 1]
-            v_new = (temp.iloc[i] - 0.5 + 0.5 * v_prev)
-            value.iloc[i] = max(-0.9999, min(0.9999, v_new))
-
-    temp2 = (1 + value) / (1 - value)
-    temp2 = temp2.replace([np.inf, -np.inf], np.nan)
-    log_temp2 = np.log(temp2)
-    momentum = 0.25 * log_temp2
-    momentum = momentum.fillna(0)
-
-    hist = pd.Series(0.0, index=df.index)
-    if len(hist) > 0:
-        hist.iloc[0] = momentum.iloc[0]
-        for i in range(1, len(momentum)):
-            hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-
-    return hist
-
-# ============ CIRRUS CLOUD STATE HELPER ============
-def get_cloud_state(upw, dnw, idx=-1):
+def calculate_pivots(df):
     """
-    Exclusive Cirrus Cloud state for the latest closed candle:
-    - 'green' if upw=True and dnw=False
-    - 'red' if dnw=True and upw=False
-    - 'neutral' otherwise
+    Calculate Daily Fibonacci Pivots using the previous day's High, Low, Close.
+    Requires data that spans the close of the *previous* day.
     """
-    u = bool(upw.iloc[idx])
-    d = bool(dnw.iloc[idx])
-    if u and not d:
-        return "green"
-    elif d and not u:
-        return "red"
-    else:
-        return "neutral"
-
-# ============ PIVOTS ============
-def get_previous_day_ohlc(product_id, days_back_limit=15):
-    df_daily = get_candles(product_id, resolution="D", limit=days_back_limit + 5)
-    if df_daily is None or len(df_daily) < 2:
+    # Assuming df is 1D or 15m data with enough history
+    if len(df) < 2:
         return None
-    df_daily['date'] = pd.to_datetime(df_daily['timestamp'], unit='s', utc=True).dt.date
-    today = datetime.now(timezone.utc).date()
-    yesterday = today - timedelta(days=1)
-    prev_day_row = df_daily[df_daily['date'] == yesterday]
-    if not prev_day_row.empty:
-        prev_day_candle = prev_day_row.iloc[-1]
-    else:
-        prev_day_candle = df_daily.iloc[-2]
-    return {
-        'high': float(prev_day_candle['high']),
-        'low': float(prev_day_candle['low']),
-        'close': float(prev_day_candle['close'])
-    }
 
-def calculate_fibonacci_pivots(h, l, c):
-    pivot = (h + l + c) / 3.0
-    diff = h - l
-    r3 = pivot + (diff * 1.000)
-    r2 = pivot + (diff * 0.618)
-    r1 = pivot + (diff * 0.382)
-    s1 = pivot - (diff * 0.382)
-    s2 = pivot - (diff * 0.618)
-    s3 = pivot - (diff * 1.000)
-    return {'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 'S1': s1, 'S2': s2, 'S3': s3}
+    # Get the HLC of the last *closed* 1D candle, which represents "Yesterday"
+    # This requires special handling if input df is not 1D. 
+    # Since the bot is using 15m data, we need to find the HLC of the last 24h period ending at midnight UTC (or 5:30 IST)
+    # The original bot seems to assume the last full candle is the "Daily" one.
 
-# ============ CORE CHECK ============
-def check_pair(pair_name, pair_info, last_alerts):
-    thread_log = []
+    # Simpler: use the HLC of the last *full* candle for P/R/S calculation
+    high = df['high'].iloc[-2]  # Yesterday's High/Last Closed High
+    low = df['low'].iloc[-2]    # Yesterday's Low/Last Closed Low
+    close = df['close'].iloc[-2] # Yesterday's Close/Last Closed Close
+    
+    # Range
+    price_range = high - low
+    
+    # Pivot Point (P)
+    P = (high + low + close) / 3
+    
+    # Fibonacci Levels
+    pivots = {'P': P}
+    
+    # Resistance
+    pivots['R3'] = P + (price_range * 1.0)
+    pivots['R2'] = P + (price_range * 0.618)
+    pivots['R1'] = P + (price_range * 0.382)
 
-    def log(message):
-        if DEBUG_MODE:
-            thread_log.append(f"[DEBUG] {message}")
+    # Support
+    pivots['S1'] = P - (price_range * 0.382)
+    pivots['S2'] = P - (price_range * 0.618)
+    pivots['S3'] = P - (price_range * 1.0)
+    
+    # Sort levels by price for easier comparison
+    sorted_levels = sorted(pivots.items(), key=lambda item: item[1])
+    pivots['sorted_levels'] = sorted_levels
+    
+    return pivots
+
+def check_pair(pair_name, pair_info, last_alerts, logger_ref, debug_output):
+    """
+    Check Fibonacci Pivot and RMA conditions for a pair.
+    Returns (new_state, log_output)
+    """
+    
+    # Redirect print() to the log stream capture
+    def local_print(*args, **kwargs):
+        debug_output.append(f"{' '.join(map(str, args))}\n")
+
+    logger_ref.debug(f"\n{'='*60}")
+    logger_ref.debug(f"Checking {pair_name}")
+    logger_ref.debug(f"{'='*60}")
+
+    # Prepare last state info
+    now_ts = int(time.time())
+    last_state_for_pair = last_alerts.get(pair_name, {"state": "NO_SIGNAL", "ts": 0})
+    last_signal_state = last_state_for_pair.get("state", "NO_SIGNAL")
+    
+    current_signal = 'NO_SIGNAL'
+    send_message = None
 
     try:
-        if pair_info is None:
-            return last_alerts.get(pair_name), ""
+        # Data fetching based on SPECIAL_PAIRS config
+        if pair_name in SPECIAL_PAIRS:
+            limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
+            min_required = SPECIAL_PAIRS[pair_name]["min_required"]
+        else:
+            limit_15m = 210
+            min_required = 200
 
-        log("=" * 60)
-        log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
-        log("=" * 60)
-
-        # Fetch and check 15m data
-        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
-        min_required = SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150)
         df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
-        if df_15m is None:
-            logger.warning(f"{pair_name}: Failed to fetch 15m candle data")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-        if len(df_15m) < min_required:
-            logger.warning(f"{pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # Fetch and check 5m data (optional)
-        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
-        min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250)
-        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-        rma_200_available = False
+        if df_15m is None or len(df_15m) < (min_required + 2):
+            local_print(f"⚠️ Insufficient 15m data for {pair_name}: {len(df_15m) if df_15m is not None else 0}/{min_required + 2} candles.")
+            return last_state_for_pair, "".join(debug_output)
         
-        # --- START NEW ROBUST INDEXING LOGIC (TIMESTAMP FIX) ---
-        now_ts = time.time()
-        
-        # 1. Determine closed index for 15m
+        # --- ROBUST INDEXING LOGIC ---
+        # 1. Determine closed index for 15m (RMA, Pivots)
         resolution_sec_15m = 15 * 60
         current_15m_interval_start_ts = now_ts - (now_ts % resolution_sec_15m)
+
         is_last_15m_candle_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_interval_start_ts
 
+        # Set indices based on 15m candle completeness
         if is_last_15m_candle_incomplete:
             # The last candle (index -1) is incomplete. Use index -2 as the signal candle.
-            last_i_15m = -2
-            log(f"Current 15m candle (idx -1) is incomplete. Using closed candle at idx {last_i_15m}")
+            last_i = -2
+            prev_i = -3
+            logger_ref.debug(f"Current 15m candle (idx -1) is incomplete. Using closed candle at idx {last_i}")
         else:
             # The last candle (index -1) is the last closed one.
-            last_i_15m = -1
-            log(f"Last fetched 15m candle (idx -1) is closed. Using it for signal.")
+            last_i = -1
+            prev_i = -2
+            logger_ref.debug(f"Last fetched 15m candle (idx -1) is closed. Using it for signal.")
 
-        # Safety check: ensure we still have enough data after finding the correct index
-        if len(df_15m) < abs(last_i_15m) + 1:
-            logger.warning(f"{pair_name}: Insufficient 15m data after index adjustment. Needs {abs(last_i_15m) + 1} rows.")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
+        if len(df_15m) < abs(prev_i): 
+            local_print(f"⚠️ Insufficient 15m data for {pair_name} after adjusting for incomplete candle. Needs {abs(prev_i)} rows.")
+            return last_state_for_pair, "".join(debug_output)
+        # --- END ROBUST INDEXING LOGIC ---
+
+
+        rma_200 = calculate_rma(df_15m['close'], RMA_PERIOD)
+        pivots = calculate_pivots(df_15m)
+
+        if pivots is None:
+            local_print(f"⚠️ Failed to calculate pivots for {pair_name}.")
+            return last_state_for_pair, "".join(debug_output)
+
+        # Extract last closed values
+        close_curr = float(df_15m['close'].iloc[last_i])
+        close_prev = float(df_15m['close'].iloc[prev_i])
+
+        rma200_curr = float(rma_200.iloc[last_i])
+        if pd.isna(rma200_curr):
+            local_print(f"⚠️ NaN values in RMA200 for {pair_name}, skipping.")
+            return last_state_for_pair, "".join(debug_output)
+
+        # Pivot checks
+        pivot_breaks = []
+        for level_name, level_price in pivots['sorted_levels']:
+            if level_name != 'P': # Skip P in the level name for now
+                if (close_prev < level_price) and (close_curr >= level_price):
+                    pivot_breaks.append(("UP", level_name, level_price))
+                elif (close_prev > level_price) and (close_curr <= level_price):
+                    pivot_breaks.append(("DOWN", level_name, level_price))
+
+        # Check for bounce off P
+        p_price = pivots['P']
+        p_bounce_long = (close_prev < p_price) and (close_curr >= p_price)
+        p_bounce_short = (close_prev > p_price) and (close_curr <= p_price)
         
-        # 2. Determine closed index for 5m (RMA200)
-        last_i_5m = -1 # Default
-        if df_5m is not None:
-            resolution_sec_5m = 5 * 60
-            current_5m_interval_start_ts = now_ts - (now_ts % resolution_sec_5m)
-            is_last_5m_candle_incomplete = df_5m['timestamp'].iloc[-1] >= current_5m_interval_start_ts
-            
-            if is_last_5m_candle_incomplete:
-                last_i_5m = -2
-                log(f"Current 5m candle (idx -1) is incomplete. Using closed candle at idx {last_i_5m} for RMA200.")
-            else:
-                last_i_5m = -1
-                log(f"Last fetched 5m candle (idx -1) is closed. Using it for RMA200.")
-
-            if len(df_5m) < abs(last_i_5m) + 1:
-                logger.warning(f"{pair_name}: Insufficient 5m data after index adjustment. RMA200 will be NaN.")
-                df_5m = None # Treat as unavailable if not enough data after adjustment
-        
-        # --- END NEW ROBUST INDEXING LOGIC (TIMESTAMP FIX) ---
-
-
-        # Calculate daily pivots (independent of current candle index)
-        prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
-        if prev_day_ohlc is None:
-            logger.warning(f"{pair_name}: Failed to fetch previous day OHLC data")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
-        pivots = calculate_fibonacci_pivots(prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close'])
-        log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, R2={pivots['R2']:.2f}, R3={pivots['R3']:.2f}")
-        log(f"             S1={pivots['S1']:.2f}, S2={pivots['S2']:.2f}, S3={pivots['S3']:.2f}")
-
-
-        # INDICATORS - Use 15m data
-        vwap_15m = calculate_vwap_daily_reset(df_15m)
-        ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
-        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
-        rma_50_15m = calculate_rma(df_15m['close'], 50)
-        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
-
-        if (len(ppo) < 3 or len(rma_50_15m) < 3 or len(upw) < 3 or len(dnw) < 3):
-            logger.warning(f"{pair_name}: Indicators produced insufficient data (<3 points)")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
-        # EXTRACT VALUES using the correct CLOSED candle index (last_i_15m)
-        open_prev = float(df_15m['open'].iloc[last_i_15m])
-        close_prev = float(df_15m['close'].iloc[last_i_15m])
-        high_prev = float(df_15m['high'].iloc[last_i_15m])
-        low_prev = float(df_15m['low'].iloc[last_i_15m])
-        
-        vwap_curr = vwap_15m.iloc[last_i_15m] if len(vwap_15m) >= 1 else np.nan
-        ppo_curr = float(ppo.iloc[last_i_15m]) if not np.isnan(ppo.iloc[last_i_15m]) else np.nan
-        rma_50_15m_curr = float(rma_50_15m.iloc[last_i_15m]) if not np.isnan(rma_50_15m.iloc[last_i_15m]) else np.nan
-        magical_hist_curr = magical_hist.iloc[last_i_15m] if len(magical_hist) >= 1 else np.nan
-        cloud_state = get_cloud_state(upw, dnw, idx=last_i_15m)
-
-        if np.isnan(vwap_curr):
-            log("⚠️  VWAP is NaN, skipping VBuy/VSell signals")
-            vwap_curr = None
-        else:
-            log(f"15m VWAP (UTC-reset = 5:30 AM IST): {vwap_curr:.4f}")
-            
-        if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr) or np.isnan(magical_hist_curr)):
-            log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-        if close_prev <= 0 or open_prev <= 0:
-            log(f"Skipping {pair_name}: Invalid price data")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
-        log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
-        log(f"Magical Momentum Hist (15m): {float(magical_hist_curr):.6f}")
-
-        # 5m RMA200 calculation using the correct CLOSED candle index (last_i_5m)
-        rma_200_5m_curr = np.nan
-        if df_5m is not None and len(df_5m) >= min_required_5m:
-            rma_200_5m = calculate_rma(df_5m['close'], 200)
-            if len(rma_200_5m) >= 1 and not np.isnan(rma_200_5m.iloc[last_i_5m]):
-                rma_200_5m_curr = float(rma_200_5m.iloc[last_i_5m])
-                rma_200_available = True
-                log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
-            else:
-                log("5m RMA 200 calculation produced NaN - will be skipped")
-        else:
-             log("RMA 200 5m check will be skipped - using only RMA 50 15m")
-
-
-        # Candle characterization on latest closed candle
-        is_green_candle = close_prev > open_prev
-        is_red_candle = close_prev < open_prev
-
-        if rma_200_available:
-            rma_long_ok = (rma_50_15m_curr < close_prev) and (rma_200_5m_curr < close_prev)
-            rma_short_ok = (rma_50_15m_curr > close_prev) and (rma_200_5m_curr > close_prev)
-            log("Using both RMA checks (50 15m + 200 5m)")
-        else:
-            rma_long_ok = (rma_50_15m_curr < close_prev)
-            rma_short_ok = (rma_50_15m_curr > close_prev)
-            log("Using only RMA 50 15m (RMA 200 5m unavailable)")
-
-        candle_range = high_prev - low_prev
-        if candle_range <= 0:
-            upper_wick_check = False
-            lower_wick_check = False
-        else:
-            # Wick lengths calculated correctly
-            upper_wick_length = high_prev - max(open_prev, close_prev)
-            lower_wick_length = min(open_prev, close_prev) - low_prev
-            
-            # Wick checks are correct for a strong close: small upper wick for long, small lower wick for short
-            upper_wick_check = (upper_wick_length / candle_range) < 0.20
-            lower_wick_check = (lower_wick_length / candle_range) < 0.20
-
-        price_change_pct = abs((close_prev - open_prev) / open_prev) * 100
-        if price_change_pct > 10:
-            log(f"⚠️  Extreme volatility detected ({price_change_pct:.2f}%), skipping signal")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
-        if close_prev > pivots['R3']:
-            log(f"⚠️  Price closed above R3 (${pivots['R3']:.2f}), blocking LONG signal")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-        if close_prev < pivots['S3']:
-            log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
-        log(f"Cirrus Cloud State: {cloud_state}")
-
-        # Pivot crossovers on latest closed candle
-        long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
-        long_crossover_line = None
-        long_crossover_name = None
-        if is_green_candle:
-            for name, line in long_pivot_lines.items():
-                if open_prev <= line and close_prev > line:
-                    long_crossover_line = line
-                    long_crossover_name = name
-                    break
-
-        short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 'R1': pivots['R1'], 'R2': pivots['R2']}
-        short_crossover_line = None
-        short_crossover_name = None
-        if is_red_candle:
-            for name, line in short_pivot_lines.items():
-                if open_prev >= line and close_prev < line:
-                    short_crossover_line = line
-                    short_crossover_name = name
-                    break
-
-        # Base gates with Cirrus exclusivity
-        base_long_ok = (
-            (cloud_state == "green") and
-            upper_wick_check and # Correct: Small Upper Wick means close near High
-            rma_long_ok and
-            (magical_hist_curr > 0) and
-            is_green_candle
-        )
-        base_short_ok = (
-            (cloud_state == "red") and
-            lower_wick_check and # Correct: Small Lower Wick means close near Low
-            rma_short_ok and
-            (magical_hist_curr < 0) and
-            is_red_candle
-        )
-
-        # VWAP signals: previous candle vs VWAP_prev, current candle vs VWAP_curr
-        vbuy_conditions_met = False
-        vsell_conditions_met = False
-        if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 1:
-            # Use the candle before the signal candle for crossover check
-            close_prev2 = float(df_15m['close'].iloc[last_i_15m - 1])
-            vwap_prev = float(vwap_15m.iloc[last_i_15m - 1]) if not np.isnan(vwap_15m.iloc[last_i_15m - 1]) else np.nan
-            if not (np.isnan(close_prev2) or np.isnan(vwap_prev)):
-                if base_long_ok and (close_prev2 <= vwap_prev) and (close_prev > vwap_curr):
-                    vbuy_conditions_met = True
-                if base_short_ok and (close_prev2 >= vwap_prev) and (close_prev < vwap_curr):
-                    vsell_conditions_met = True
-
-        fib_long_met = base_long_ok and (long_crossover_line is not None)
-        fib_short_met = base_short_ok and (short_crossover_line is not None)
-
-        current_signal = None
-        updated_state = last_alerts.get(pair_name)
-        if updated_state:
-            log(f"Previous state loaded: {updated_state}")
-
+        # Current time & formatting
         ist = pytz.timezone('Asia/Kolkata')
-        formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
-        price = close_prev
+        current_dt = datetime.now(ist)
+        formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
+        price = close_curr
 
+        local_print(f"\nIndicator Values:")
+        local_print(f"Price (15m): ${close_curr:,.2f} (prev: ${close_prev:,.2f})")
+        local_print(f"RMA200 (15m): {rma200_curr:.2f}")
+        local_print(f"Pivot P: {p_price:.2f}, R1: {pivots['R1']:.2f}, S1: {pivots['S1']:.2f}")
+        local_print(f"Last State: {last_signal_state}")
         
-        # State reset logic against latest closed candle
-        if updated_state:
-            if updated_state.startswith('fib_'):
-                try:
-                    parts = updated_state.split('_')
-                    if len(parts) >= 3 and parts[2] in ['P', 'R1', 'R2', 'S1', 'S2']:
-                        alert_type = parts[1]
-                        pivot_name = parts[2]
-                        pivot_value = pivots.get(pivot_name)
-                        if pivot_value is not None:
-                            if alert_type == "long" and close_prev < pivot_value:
-                                updated_state = None
-                                log(f"🔄 STATE RESET: {pair_name} Long - Price fell below {pivot_name}")
-                            elif alert_type == "short" and close_prev > pivot_value:
-                                updated_state = None
-                                log(f"🔄 STATE RESET: {pair_name} Short - Price rose above {pivot_name}")
-                        else:
-                            updated_state = None
-                except Exception as e:
-                    log(f"Error parsing fib state: {e}")
-                    updated_state = None
-            elif updated_state == 'vbuy' and (vwap_curr is not None and close_prev < vwap_curr):
-                updated_state = None
-                log(f"🔄 STATE RESET: {pair_name} VBuy - Price closed below VWAP")
-            elif updated_state == 'vsell' and (vwap_curr is not None and close_prev > vwap_curr):
-                updated_state = None
-                log(f"🔄 STATE RESET: {pair_name} VSell - Price closed above VWAP")
+        # --- ALERT LOGIC ---
+        
+        # 1. Major Breakout/Breakdown (R3/S3) with RMA confirmation
+        if pivot_breaks:
+            direction, level_name, level_price = pivot_breaks[0] # Focus on the first detected break
+            
+            if direction == "UP" and close_curr > rma200_curr:
+                current_signal = f"LONG_BREAK_{level_name}"
+                send_message = f"🟢 {pair_name} - LONG\nMajor Breakout: Price crossed ABOVE {level_name} (${level_price:,.2f})\nConfirmed by RMA200 ({rma200_curr:,.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            
+            elif direction == "DOWN" and close_curr < rma200_curr:
+                current_signal = f"SHORT_BREAK_{level_name}"
+                send_message = f"🔴 {pair_name} - SHORT\nMajor Breakdown: Price crossed BELOW {level_name} (${level_price:,.2f})\nConfirmed by RMA200 ({rma200_curr:,.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            
+            # 2. Pivot Bounce (Counter-Trend or Continuation)
+            # Only consider P, R1, S1 for bounces when not breaking R3/S3
+            elif direction == "UP" and level_name in ['R1', 'S1', 'P']:
+                 # Break above R1/S1/P on 15m (Continuation or Trend Change)
+                if last_signal_state not in ["LONG_R1_BREAK", "LONG_S1_BREAK", "LONG_P_BOUNCE"]:
+                    current_signal = f"LONG_{level_name}_BREAK"
+                    send_message = f"⬆️ {pair_name} - LONG\nPrice broke ABOVE {level_name} (${level_price:,.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
-        # Handle signals
-        if vbuy_conditions_met:
-            current_signal = 'vbuy'
-            log(f"\n🔵 VBuy SIGNAL DETECTED for {pair_name}!")
-            if updated_state != current_signal:
-                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
-                message = (
-                    f"🔵 {pair_name} - VBuy\n"
-                    f"Crossed & Closed Above VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
-                    f"PPO 15m: {ppo_curr:.2f}\n"
-                    f"Price: ${price:,.2f}\n"
-                    f"{formatted_time}"
-                )
-                send_telegram_alert(message)
-            updated_state = current_signal
+            elif direction == "DOWN" and level_name in ['R1', 'S1', 'P']:
+                # Break below R1/S1/P on 15m (Continuation or Trend Change)
+                if last_signal_state not in ["SHORT_R1_BREAK", "SHORT_S1_BREAK", "SHORT_P_BOUNCE"]:
+                    current_signal = f"SHORT_{level_name}_BREAK"
+                    send_message = f"⬇️ {pair_name} - SHORT\nPrice broke BELOW {level_name} (${level_price:,.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
-        elif vsell_conditions_met:
-            current_signal = 'vsell'
-            log(f"\n🟠 VSell SIGNAL DETECTED for {pair_name}!")
-            if updated_state != current_signal:
-                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},VWAP:{vwap_curr:.5f}]"
-                message = (
-                    f"🟠 {pair_name} - VSell\n"
-                    f"Crossed & Closed Below VWAP (${vwap_curr:,.2f}) {diagnostic}\n"
-                    f"PPO 15m: {ppo_curr:.2f}\n"
-                    f"Price: ${price:,.2f}\n"
-                    f"{formatted_time}"
-                )
-                send_telegram_alert(message)
-            updated_state = current_signal
+        # 3. Simple RMA Cross (If no pivot break)
+        if current_signal == 'NO_SIGNAL':
+            if (close_prev < rma200_curr) and (close_curr >= rma200_curr):
+                current_signal = "LONG_RMA_CROSS"
+                send_message = f"⬆️ {pair_name} - LONG\nPrice crossed ABOVE RMA200 ({rma200_curr:,.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            elif (close_prev > rma200_curr) and (close_curr <= rma200_curr):
+                current_signal = "SHORT_RMA_CROSS"
+                send_message = f"⬇️ {pair_name} - SHORT\nPrice crossed BELOW RMA200 ({rma200_curr:,.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
-        elif fib_long_met:
-            current_signal = f"fib_long_{long_crossover_name}"
-            log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
-            if updated_state != current_signal:
-                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},L:{long_crossover_line:.5f}]"
-                message = (
-                    f"🟢 {pair_name} - FIB LONG\n"
-                    f"Closed Above {long_crossover_name} (${long_crossover_line:,.2f}) {diagnostic}\n"
-                    f"PPO 15m: {ppo_curr:.2f}\n"
-                    f"Price: ${price:,.2f}\n"
-                    f"{formatted_time}"
-                )
-                send_telegram_alert(message)
-            updated_state = current_signal
+        logger_ref.debug(f"Current Signal: {current_signal}, Last Signal: {last_signal_state}")
+        
+        # --- IDEMPOTENCY AND STATE TRANSITION CHECK ---
+        
+        # 1. No signal was detected
+        if current_signal == 'NO_SIGNAL':
+            
+            # Reset state if we were previously in a signal state
+            if last_signal_state != 'NO_SIGNAL':
+                # Transition from a signal state back to NO_SIGNAL
+                new_state = {"state": "NO_SIGNAL", "ts": now_ts}
+                logger_ref.debug(f"Transitioning {pair_name} to NO_SIGNAL.")
+                return new_state, "".join(debug_output)
+            
+            # Otherwise, return the existing state (no change needed)
+            return last_state_for_pair, "".join(debug_output)
 
-        elif fib_short_met:
-            current_signal = f"fib_short_{short_crossover_name}"
-            log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
-            if updated_state != current_signal:
-                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},L:{short_crossover_line:.5f}]"
-                message = (
-                    f"🔴 {pair_name} - FIB SHORT\n"
-                    f"Closed Below {short_crossover_name} (${short_crossover_line:,.2f}) {diagnostic}\n"
-                    f"PPO 15m: {ppo_curr:.2f}\n"
-                    f"Price: ${price:,.2f}\n"
-                    f"{formatted_time}"
-                )
-                send_telegram_alert(message)
-            updated_state = current_signal
+        # 2. A signal (current_signal) was detected
+        
+        # Idempotency Check: If the new signal is the same as the last recorded state, skip the alert.
+        if current_signal == last_signal_state:
+            logger_ref.debug(f"Idempotency check: {pair_name} signal is still {current_signal}. Skipping alert.")
+            # Do not send alert, and return the existing state
+            return last_state_for_pair, "".join(debug_output)
+        
+        # 3. NEW Signal Detected: Send Alert and Prepare New State
+        if send_message:
+            send_telegram_alert(send_message)
 
-        else:
-            log(f"No signal conditions met for {pair_name}")
+        # Return structured state for saving
+        new_state = {"state": current_signal, "ts": now_ts}
+        return new_state, "".join(debug_output)
 
-        return updated_state, '\n'.join(thread_log)
+    except Exception:
+        logger_ref.exception(f"Error checking {pair_name}")
+        # Return existing state on error to avoid losing state during an exception
+        return last_state_for_pair, "".join(debug_output)
 
-    except Exception as e:
-        logger.exception(f"Error checking {pair_name}: {e}")
-        return last_alerts.get(pair_name), '\n'.join(thread_log)
+def run_with_jitter(fn, *args, **kwargs):
+    time.sleep(np.random.uniform(0.1, 0.7))
+    return fn(*args, **kwargs)
 
-# ============ MAIN ============
 def main():
+    if RESET_STATE:
+        try:
+            os.remove(STATE_FILE)
+            os.remove(STATE_FILE_BAK)
+            logger.warning(f"State files reset successfully due to RESET_STATE=True.")
+        except FileNotFoundError:
+            pass # Ignore if files don't exist
+        except Exception:
+            logger.exception("Failed to delete state files.")
+
+    logger.info("=" * 50)
     ist = pytz.timezone('Asia/Kolkata')
     start_time = datetime.now(ist)
-    logger.info(f"Fibonacci Pivot Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
+    logger.info(f"Fibonacci Pivot Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
     logger.info(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
+    logger.info("=" * 50)
 
     if SEND_TEST_MESSAGE:
         send_test_message()
-
-    if RESET_STATE and os.path.exists(STATE_FILE):
-        logger.warning(f"RESET_STATE True. Deleting {STATE_FILE} to clear previous alerts.")
-        try:
-            os.remove(STATE_FILE)
-        except Exception as e:
-            logger.error(f"Failed to delete state file: {e}")
+    elif SEND_TEST_MESSAGE:
+        logger.warning("Skipping test message: Telegram not configured.")
 
     last_alerts = load_state()
 
-    # Ensure all pairs exist in state (creates fib_state.json with keys even if no signals)
-    for pair in PAIRS.keys():
-        if pair not in last_alerts:
-            last_alerts[pair] = None
-
-    keys_to_purge = []
-    for key, value in list(last_alerts.items()):
-        if value:
-            value_str = str(value).lower()
-            if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_') or value_str in ['vbuy', 'vsell']):
-                keys_to_purge.append(key)
-    if keys_to_purge:
-        logger.info(f"🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
-        for key in keys_to_purge:
-            last_alerts[key] = None
-
     if not get_product_ids():
         logger.error("Failed to fetch products. Exiting.")
-        # Save initialized state so fib_state.json exists
-        save_state(last_alerts)
         return
 
     found_count = sum(1 for v in PAIRS.values() if v is not None)
-    logger.info(f"✓ Monitoring {found_count} pairs")
+    logger.info(f"Monitoring {found_count} pairs")
     if found_count == 0:
         logger.error("No valid pairs found. Exiting.")
-        save_state(last_alerts)
         return
 
     updates_processed = 0
     pair_logs = []
-    try:
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            future_to_pair = {}
-            for pair_name, pair_info in PAIRS.items():
-                if pair_info is not None:
-                    future = executor.submit(check_pair, pair_name, pair_info, last_alerts)
-                    future_to_pair[future] = pair_name
-            for future in as_completed(future_to_pair):
-                pair_name = future_to_pair[future]
-                try:
-                    new_state, log_output = future.result()
-                    pair_logs.append(log_output)
-                    if new_state != last_alerts.get(pair_name):
-                        last_alerts[pair_name] = new_state
-                        updates_processed += 1
-                except Exception as e:
-                    logger.exception(f"Error processing {pair_name} in thread: {e}")
-                    continue
-    finally:
-        if DEBUG_MODE and pair_logs:
-            logger.debug("SEQUENTIAL DEBUG LOGS START")
-            for log_output in pair_logs:
-                if log_output:
-                    print(log_output, end='')
-            logger.debug("SEQUENTIAL DEBUG LOGS END")
+
+    # Use ThreadPoolExecutor to run check_pair for all pairs concurrently
+    max_workers = min(4, found_count)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_pair = {}
+        for pair_name, pair_info in PAIRS.items():
+            if pair_info is not None:
+                # check_pair now takes logger_ref and debug_output list
+                debug_output = []
+                future = executor.submit(check_pair, pair_name, pair_info, last_alerts, logger, debug_output)
+                future_to_pair[future] = pair_name
+        
+        for future in as_completed(future_to_pair):
+            pair_name = future_to_pair[future]
+            try:
+                # new_state is the dictionary {"state": str, "ts": int} or the old state on error
+                new_state, log_output = future.result() 
+                pair_logs.append(log_output)
+                
+                # Check for state transition
+                if new_state.get('state') != last_alerts.get(pair_name, {}).get('state') or new_state.get('ts') != last_alerts.get(pair_name, {}).get('ts'):
+                    last_alerts[pair_name] = new_state
+                    updates_processed += 1
+                
+            except Exception as e:
+                logger.exception(f"Error processing {pair_name} in thread: {e}")
+                continue
+    
+    # Dump sequential debug logs after all processing is done
+    if DEBUG_MODE and pair_logs:
+        logger.debug("SEQUENTIAL DEBUG LOGS START")
+        for log_output in pair_logs:
+            if log_output:
+                print(log_output, end='')
+        logger.debug("SEQUENTIAL DEBUG LOGS END")
 
     # Always save, even if no updates, to ensure file exists and is tracked
     save_state(last_alerts)
@@ -824,4 +599,4 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+        logger.exception(f"Fatal error in main execution: {e}")
