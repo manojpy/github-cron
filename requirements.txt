@@ -3,3 +3,5 @@ pandas
 numpy
 pytz
 urllib3
+aiohttp
+python-dateutil
