@@ -47,7 +47,9 @@ jobs:
           SEND_TEST_MESSAGE: 'True'
           STATE_DB_PATH: macd_state.sqlite
           LOG_FILE: macd_bot.log
+          CONFIG_FILE: config_macd.json        # 👈 added this line
         run: python macd_bot_improved.py --once
+
 
       # --- 2️⃣ Run Fibonacci Pivot Bot (Improved) ---
       - name: Run Fibonacci Pivot Bot (Improved)
@@ -58,6 +60,7 @@ jobs:
           SEND_TEST_MESSAGE: 'True'
           STATE_DB_PATH: fib_state.sqlite
           LOG_FILE: fibonacci_pivot_bot.log
+          CONFIG_FILE: config_fib.json
         run: python fibonacci_pivot_bot_improved.py --once
 
       # --- 3️⃣ Debug step: verify logs and state files ---
@@ -88,3 +91,4 @@ jobs:
           status_options: '--untracked-files=no'
           commit_options: '--allow-empty'
           skip_dirty_check: true
+
