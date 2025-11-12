@@ -68,7 +68,6 @@ X4 = 5
 # Smoothed RSI (SRSI) settings
 SRSI_RSI_LEN = 21
 SRSI_KALMAN_LEN = 5
-SRSI_EMA_LEN = 5
 
 # State file paths (read from environment, fallback to defaults)
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "macd_state.json")
@@ -488,7 +487,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             print(f"⚠️ Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{min_required_5m + 2} candles (needs +2 for closed indexing)")
             return None
 
-        # Use most recent fully closed candle indices (Option 1)
+        # Use most recent fully closed candle indices
         last_i = -1
         prev_i = -2
 
@@ -537,25 +536,44 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             debug_log(f"⚠️ NaN values in RMA200 for {pair_name}, skipping")
             return None
 
-        # Candle metrics (zero-range safe)
+        # Candle metrics (candle-aware wick logic)
         total_range = high_curr - low_curr
         if total_range <= 0:
             upper_wick = 0.0
             lower_wick = 0.0
             strong_bullish_close = False
             strong_bearish_close = False
+            bullish_candle = False
+            bearish_candle = False
             debug_log("  Candle range is zero or negative, skipping wick checks.")
         else:
-            upper_wick = max(0.0, high_curr - max(open_curr, close_curr))
-            lower_wick = max(0.0, min(open_curr, close_curr) - low_curr)
             bullish_candle = close_curr > open_curr
             bearish_candle = close_curr < open_curr
-            strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
-            strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
+
+            if bullish_candle:
+                # Green: upper = high - close, lower = open - low
+                upper_wick = max(0.0, high_curr - close_curr)
+                lower_wick = max(0.0, open_curr - low_curr)
+                strong_bullish_close = (upper_wick / total_range) < 0.20
+                strong_bearish_close = False
+            elif bearish_candle:
+                # Red: upper = high - open, lower = close - low
+                upper_wick = max(0.0, high_curr - open_curr)
+                lower_wick = max(0.0, close_curr - low_curr)
+                strong_bearish_close = (lower_wick / total_range) < 0.20
+                strong_bullish_close = False
+            else:
+                # Doji/neutral fallback
+                upper_wick = max(0.0, high_curr - max(open_curr, close_curr))
+                lower_wick = max(0.0, min(open_curr, close_curr) - low_curr)
+                strong_bullish_close = (upper_wick / total_range) < 0.20
+                strong_bearish_close = (lower_wick / total_range) < 0.20
 
         debug_log(f"\nCandle Metrics (15m):")
-        debug_log(f"  O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
+        debug_log(f"  O:{open_curr:.4f} H:{high_curr:.4f} L:{low_curr:.4f} C:{close_curr:.4f}")
         if total_range > 0:
+            debug_log(f"  bullish={bullish_candle}, bearish={bearish_candle}, range={total_range:.6f}")
+            debug_log(f"  upper_wick={upper_wick:.6f} ({(upper_wick/total_range):.2%}), lower_wick={lower_wick:.6f} ({(lower_wick/total_range):.2%})")
             debug_log(f"  Strong Bullish Close (20% Rule): {strong_bullish_close}")
             debug_log(f"  Strong Bearish Close (20% Rule): {strong_bearish_close}")
 
@@ -563,10 +581,10 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         debug_log(f"Price (15m): ${close_curr:,.2f}")
         debug_log(f"PPO: {ppo_curr:.4f} (prev: {ppo_prev:.4f})")
         debug_log(f"PPO Signal: {ppo_signal_curr:.4f} (prev: {ppo_signal_prev:.4f})")
-        debug_log(f"RMA50 (15m): {rma50_curr:.2f}")
-        debug_log(f"RMA200 (5m): {rma200_curr:.2f}")
+        debug_log(f"RMA50 (15m): {rma50_curr:.4f}")
+        debug_log(f"RMA200 (5m): {rma200_curr:.4f}")
         debug_log(f"Smoothed RSI (15m): {smooth_rsi_curr:.2f} (prev: {smooth_rsi_prev:.2f})")
-        debug_log(f"Cirrus Filter 1: {filtx1.iloc[last_i]:.4f}, Filter 2: {filtx12.iloc[last_i]:.4f}")
+        debug_log(f"Cirrus Filter 1: {filtx1.iloc[last_i]:.6f}, Filter 2: {filtx12.iloc[last_i]:.6f}")
         debug_log(f"Cirrus Cloud - Upw: {bool(upw.iloc[last_i])}, Dnw: {bool(dnw.iloc[last_i])}")
 
         # Crossovers and bands
@@ -762,7 +780,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
         # Summary and final decision
-        debug_log(f"{pair_name} summary: C={close_curr:.2f}, RMA50={rma50_curr:.2f}, RMA200(5m)={rma200_curr:.2f}, PPO={ppo_curr:.3f}/{ppo_signal_curr:.3f}, SRSI={smooth_rsi_curr:.1f}, MMH={magical_hist_curr:.4f}")
+        debug_log(f"{pair_name} summary: C={close_curr:.4f}, RMA50={rma50_curr:.4f}, RMA200(5m)={rma200_curr:.4f}, PPO={ppo_curr:.4f}/{ppo_signal_curr:.4f}, SRSI={smooth_rsi_curr:.2f}, MMH={magical_hist_curr:.6f}")
 
         if current_state is None:
             debug_log(f"No signal conditions met for {pair_name}")
