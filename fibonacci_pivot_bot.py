@@ -80,8 +80,8 @@ def calculate_vwap_daily_reset(df):
     df = df.copy()
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
     df['date'] = df['datetime'].dt.date
-    hlc3 = (df['high'] + df['low'] + df['close']) 
-    / 3.0
+    # FIX: Combined hlc3 calculation onto a single line to resolve SyntaxError
+    hlc3 = (df['high'] + df['low'] + df['close']) / 3.0
     df['hlc3_vol'] = hlc3 * df['volume']
     df['cum_vol'] = df.groupby('date')['volume'].cumsum()
     df['cum_hlc3_vol'] = df.groupby('date')['hlc3_vol'].cumsum()
@@ -95,6 +95,10 @@ def load_state():
     Handles FileNotFoundError and JSONDecodeError for robustness.
     """
     # 1. Try loading from primary file
+    if RESET_STATE:
+        logger.warning("RESET_STATE is True. Starting with an empty state.")
+        return {}
+    
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
@@ -102,7 +106,6 @@ def load_state():
             
             if not content:
                 logger.debug(f"State file '{STATE_FILE}' empty. Starting fresh.")
-                # Treat empty file as a failure to find valid state and proceed to backup check
                 raise FileNotFoundError 
 
             state = json.loads(content)
@@ -219,6 +222,7 @@ def get_product_ids():
             products = data.get('result', [])
             logger.debug(f"Received {len(products)} products from API")
             for product in products:
+                # Original logic for mapping symbol names
                 symbol = product.get('symbol', '').replace('_USDT', 'USD').replace('USDT', 'USD')
                 if product.get('contract_type') == 'perpetual_futures':
                     for pair_name in PAIRS.keys():
@@ -283,8 +287,7 @@ def calculate_ema(data, period):
         return pd.Series([np.nan] * len(data), index=data.index)
     return data.ewm(span=period, adjust=False).mean()
 
-def calculate_sma(data, 
-period):
+def calculate_sma(data, period):
     if len(data) < period or period <= 0:
         return pd.Series([np.nan] * len(data), index=data.index)
     return data.rolling(window=period, min_periods=period).mean()
@@ -296,8 +299,7 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     with np.errstate(divide='ignore', invalid='ignore'):
         ppo = (fast_ma - slow_ma) / slow_ma * 100
     ppo = ppo.replace([np.inf, -np.inf], np.nan)
-    ppo_signal = 
-calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
+    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
     return ppo, ppo_signal
 
 def smoothrng(x, t, m):
@@ -322,8 +324,7 @@ def rngfilt(x, r):
     return pd.Series(result_list, index=x.index)
 
 def calculate_cirrus_cloud(df):
-    close 
-= df['close'].astype(float).copy()
+    close = df['close'].astype(float).copy()
     smrngx1x = smoothrng(close, X1, X2)
     smrngx1x2 = smoothrng(close, X3, X4)
     filtx1 = rngfilt(close, smrngx1x)
@@ -393,8 +394,7 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
 
     return hist
 
-# ============ CIRRUS 
-CLOUD STATE HELPER ============
+# ============ CIRRUS CLOUD STATE HELPER ============
 def get_cloud_state(upw, dnw, idx=-1):
     """
     Exclusive Cirrus Cloud state for the latest closed candle:
@@ -437,8 +437,7 @@ def calculate_fibonacci_pivots(h, l, c):
     r3 = pivot + (diff * 1.000)
     r2 = pivot + (diff * 0.618)
     r1 = pivot + (diff * 0.382)
-    s1 = pivot 
-- (diff * 0.382)
+    s1 = pivot - (diff * 0.382)
     s2 = pivot - (diff * 0.618)
     s3 = pivot - (diff * 1.000)
     return {'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 'S1': s1, 'S2': s2, 'S3': s3}
@@ -572,15 +571,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
         log(f"Magical Momentum Hist (15m): {float(magical_hist_curr):.6f}")
 
-        # 5m RMA200 calculation using the correct CLOSED candle 
-        index (last_i_5m)
+        # 5m RMA200 calculation using the correct CLOSED candle index (last_i_5m)
         rma_200_5m_curr = np.nan
         if df_5m is not None and len(df_5m) >= min_required_5m:
             rma_200_5m = calculate_rma(df_5m['close'], 200)
             if len(rma_200_5m) >= 1 and not np.isnan(rma_200_5m.iloc[last_i_5m]):
                 rma_200_5m_curr = float(rma_200_5m.iloc[last_i_5m])
                 rma_200_available = True
-            log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
+                log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
                 log("5m RMA 200 calculation produced NaN - will be skipped")
         else:
@@ -627,8 +625,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        log(f"Cirrus 
-Cloud State: {cloud_state}")
+        log(f"Cirrus Cloud State: {cloud_state}")
 
         # Pivot crossovers on latest closed candle
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
@@ -636,8 +633,7 @@ Cloud State: {cloud_state}")
         long_crossover_name = None
         if is_green_candle:
             for name, line in long_pivot_lines.items():
-                if open_prev <= line 
-                and close_prev > line:
+                if open_prev <= line and close_prev > line:
                     long_crossover_line = line
                     long_crossover_name = name
                     break
@@ -664,8 +660,7 @@ Cloud State: {cloud_state}")
             (cloud_state == "red") and
             lower_wick_check and # Correct: Small Lower Wick means close near Low
             rma_short_ok and
-            (magical_hist_curr < 
-            0) and
+            (magical_hist_curr < 0) and
             is_red_candle
         )
 
@@ -678,8 +673,7 @@ Cloud State: {cloud_state}")
             vwap_prev = float(vwap_15m.iloc[last_i_15m - 1]) if not np.isnan(vwap_15m.iloc[last_i_15m - 1]) else np.nan
             if not (np.isnan(close_prev2) or np.isnan(vwap_prev)):
                 if base_long_ok and (close_prev2 <= vwap_prev) and (close_prev > vwap_curr):
-                    vbuy_conditions_met 
-= True
+                    vbuy_conditions_met = True
                 if base_short_ok and (close_prev2 >= vwap_prev) and (close_prev < vwap_curr):
                     vsell_conditions_met = True
 
@@ -698,8 +692,7 @@ Cloud State: {cloud_state}")
         
         # State reset logic against latest closed candle
         if updated_state:
-            if 
-updated_state.startswith('fib_'):
+            if updated_state.startswith('fib_'):
                 try:
                     parts = updated_state.split('_')
                     if len(parts) >= 3 and parts[2] in ['P', 'R1', 'R2', 'S1', 'S2']:
@@ -723,8 +716,7 @@ updated_state.startswith('fib_'):
             elif updated_state == 'vbuy' and (vwap_curr is not None and close_prev < vwap_curr):
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VBuy - Price closed below VWAP")
-            elif updated_state == 'vsell' and (vwap_curr is 
-            not None and close_prev > vwap_curr):
+            elif updated_state == 'vsell' and (vwap_curr is not None and close_prev > vwap_curr):
                 updated_state = None
                 log(f"🔄 STATE RESET: {pair_name} VSell - Price closed above VWAP")
 
@@ -831,8 +823,7 @@ def main():
             if not (value_str.startswith('fib_long_') or value_str.startswith('fib_short_') or value_str in ['vbuy', 'vsell']):
                 keys_to_purge.append(key)
     if keys_to_purge:
-        logger.info(f"🧹 Purging old/invalid 
-        states for: {', '.join(keys_to_purge)}")
+        logger.info(f"🧹 Purging old/invalid states for: {', '.join(keys_to_purge)}")
         for key in keys_to_purge:
             last_alerts[key] = None
 
@@ -871,8 +862,7 @@ def main():
                     continue
     finally:
         if DEBUG_MODE and pair_logs:
-            logger.debug("SEQUENTIAL DEBUG 
-            LOGS START")
+            logger.debug("SEQUENTIAL DEBUG LOGS START")
             for log_output in pair_logs:
                 if log_output:
                     print(log_output, end='')
@@ -883,8 +873,7 @@ def main():
     end_time = datetime.now(ist)
     
     elapsed = (end_time - start_time).total_seconds()
-    logger.info(f"✓ Check complete. {updates_processed} state updates processed. 
-    ({elapsed:.1f}s)")
+    logger.info(f"✓ Check complete. {updates_processed} state updates processed. ({elapsed:.1f}s)")
 
 if __name__ == "__main__":
     try:
