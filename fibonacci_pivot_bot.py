@@ -31,7 +31,8 @@ PAIRS = {
 }
 
 SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 210, "min_required": 160, "limit_5m": 300, "min_required_5m": 200}
+    "SOLUSD": 
+{"limit_15m": 210, "min_required": 160, "limit_5m": 300, "min_required_5m": 200}
 }
 
 # PPO settings (used in diagnostics)
@@ -92,12 +93,12 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 content = f.read().strip()
-                if not content:
-                    logger.debug("State file empty. Starting fresh.")
-                    return {}
-                state = json.loads(content)
-                logger.debug(f"Loaded state: {state}")
-                return state
+            if not content:
+                logger.debug("State file empty. Starting fresh.")
+                return {}
+            state = json.loads(content)
+            logger.debug(f"Loaded state: {state}")
+            return state
     except Exception as e:
         logger.warning(f"State file corrupted/unreadable: {e}. Attempting backup.")
         try:
@@ -203,9 +204,11 @@ def get_candles(product_id, resolution="15", limit=150):
         to_time = int(time.time())
         if resolution == "D":
             from_time = to_time - (limit * 24 * 60 * 60)
+            res_minutes = 1440 # 24*60 min
         else:
             res_minutes = int(resolution)
             from_time = to_time - (limit * res_minutes * 60)
+            
         url = f"{DELTA_API_BASE}/v2/chart/history"
         params = {'resolution': resolution, 'symbol': product_id, 'from': from_time, 'to': to_time}
         session = create_session_with_retries()
@@ -410,6 +413,67 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"Checking {pair_name} for Fibonacci Pivot Alerts")
         log("=" * 60)
 
+        # Fetch and check 15m data
+        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
+        min_required = SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150)
+        df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
+        if df_15m is None:
+            logger.warning(f"{pair_name}: Failed to fetch 15m candle data")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+        if len(df_15m) < min_required:
+            logger.warning(f"{pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+
+        # Fetch and check 5m data (optional)
+        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
+        min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250)
+        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
+        rma_200_available = False
+        
+        # --- START NEW ROBUST INDEXING LOGIC (TIMESTAMP FIX) ---
+        now_ts = time.time()
+        
+        # 1. Determine closed index for 15m
+        resolution_sec_15m = 15 * 60
+        current_15m_interval_start_ts = now_ts - (now_ts % resolution_sec_15m)
+        is_last_15m_candle_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_interval_start_ts
+
+        if is_last_15m_candle_incomplete:
+            # The last candle (index -1) is incomplete. Use index -2 as the signal candle.
+            last_i_15m = -2
+            log(f"Current 15m candle (idx -1) is incomplete. Using closed candle at idx {last_i_15m}")
+        else:
+            # The last candle (index -1) is the last closed one.
+            last_i_15m = -1
+            log(f"Last fetched 15m candle (idx -1) is closed. Using it for signal.")
+
+        # Safety check: ensure we still have enough data after finding the correct index
+        if len(df_15m) < abs(last_i_15m) + 1:
+            logger.warning(f"{pair_name}: Insufficient 15m data after index adjustment. Needs {abs(last_i_15m) + 1} rows.")
+            return last_alerts.get(pair_name), '\n'.join(thread_log)
+        
+        # 2. Determine closed index for 5m (RMA200)
+        last_i_5m = -1 # Default
+        if df_5m is not None:
+            resolution_sec_5m = 5 * 60
+            current_5m_interval_start_ts = now_ts - (now_ts % resolution_sec_5m)
+            is_last_5m_candle_incomplete = df_5m['timestamp'].iloc[-1] >= current_5m_interval_start_ts
+            
+            if is_last_5m_candle_incomplete:
+                last_i_5m = -2
+                log(f"Current 5m candle (idx -1) is incomplete. Using closed candle at idx {last_i_5m} for RMA200.")
+            else:
+                last_i_5m = -1
+                log(f"Last fetched 5m candle (idx -1) is closed. Using it for RMA200.")
+
+            if len(df_5m) < abs(last_i_5m) + 1:
+                logger.warning(f"{pair_name}: Insufficient 5m data after index adjustment. RMA200 will be NaN.")
+                df_5m = None # Treat as unavailable if not enough data after adjustment
+        
+        # --- END NEW ROBUST INDEXING LOGIC (TIMESTAMP FIX) ---
+
+
+        # Calculate daily pivots (independent of current candle index)
         prev_day_ohlc = get_previous_day_ohlc(pair_info['symbol'], PIVOT_LOOKBACK_PERIOD)
         if prev_day_ohlc is None:
             logger.warning(f"{pair_name}: Failed to fetch previous day OHLC data")
@@ -419,113 +483,64 @@ def check_pair(pair_name, pair_info, last_alerts):
         log(f"Daily Pivots: P={pivots['P']:.2f}, R1={pivots['R1']:.2f}, R2={pivots['R2']:.2f}, R3={pivots['R3']:.2f}")
         log(f"             S1={pivots['S1']:.2f}, S2={pivots['S2']:.2f}, S3={pivots['S3']:.2f}")
 
-        limit_15m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 250)
-        min_required = SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 150)
-        df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
-        if df_15m is None:
-            logger.warning(f"{pair_name}: Failed to fetch 15m candle data")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        if len(df_15m) < min_required:
-            logger.warning(f"{pair_name}: Insufficient 15m data (need {min_required}, got {len(df_15m)})")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
-        # VWAP with DAILY RESET — use latest closed candle
+        # INDICATORS - Use 15m data
         vwap_15m = calculate_vwap_daily_reset(df_15m)
-        vwap_curr = vwap_15m.iloc[-1] if len(vwap_15m) >= 1 else np.nan
-        if np.isnan(vwap_curr):
-            log("⚠️  VWAP is NaN, skipping VBuy/VSell signals")
-            vwap_curr = None
-        else:
-            log(f"15m VWAP (UTC-reset = 5:30 AM IST): {vwap_curr:.4f}")
-
         ppo, _ = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
+        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
 
         if (len(ppo) < 3 or len(rma_50_15m) < 3 or len(upw) < 3 or len(dnw) < 3):
             logger.warning(f"{pair_name}: Indicators produced insufficient data (<3 points)")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # Use latest closed candle for signal evaluation
-        open_prev = float(df_15m['open'].iloc[-1])
-        close_prev = float(df_15m['close'].iloc[-1])
-        high_prev = float(df_15m['high'].iloc[-1])
-        low_prev = float(df_15m['low'].iloc[-1])
-        ppo_curr = float(ppo.iloc[-1]) if not np.isnan(ppo.iloc[-1]) else np.nan
-        rma_50_15m_curr = float(rma_50_15m.iloc[-1]) if not np.isnan(rma_50_15m.iloc[-1]) else np.nan
+        # EXTRACT VALUES using the correct CLOSED candle index (last_i_15m)
+        open_prev = float(df_15m['open'].iloc[last_i_15m])
+        close_prev = float(df_15m['close'].iloc[last_i_15m])
+        high_prev = float(df_15m['high'].iloc[last_i_15m])
+        low_prev = float(df_15m['low'].iloc[last_i_15m])
+        
+        vwap_curr = vwap_15m.iloc[last_i_15m] if len(vwap_15m) >= 1 else np.nan
+        ppo_curr = float(ppo.iloc[last_i_15m]) if not np.isnan(ppo.iloc[last_i_15m]) else np.nan
+        rma_50_15m_curr = float(rma_50_15m.iloc[last_i_15m]) if not np.isnan(rma_50_15m.iloc[last_i_15m]) else np.nan
+        magical_hist_curr = magical_hist.iloc[last_i_15m] if len(magical_hist) >= 1 else np.nan
+        cloud_state = get_cloud_state(upw, dnw, idx=last_i_15m)
 
-        if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr)):
+        if np.isnan(vwap_curr):
+            log("⚠️  VWAP is NaN, skipping VBuy/VSell signals")
+            vwap_curr = None
+        else:
+            log(f"15m VWAP (UTC-reset = 5:30 AM IST): {vwap_curr:.4f}")
+            
+        if (np.isnan(ppo_curr) or np.isnan(rma_50_15m_curr) or np.isnan(magical_hist_curr)):
             log(f"Skipping {pair_name}: NaN values detected in 15m indicators")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
-
         if close_prev <= 0 or open_prev <= 0:
             log(f"Skipping {pair_name}: Invalid price data")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
         log(f"15m PPO: {ppo_curr:.4f}, RMA 50: {rma_50_15m_curr:.2f}")
-
-        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
-        magical_hist_curr = magical_hist.iloc[-1] if len(magical_hist) >= 1 else np.nan
-        if np.isnan(magical_hist_curr):
-            log(f"⚠️  NaN in Magical Momentum Hist for {pair_name}, skipping")
-            return last_alerts.get(pair_name), '\n'.join(thread_log)
-
         log(f"Magical Momentum Hist (15m): {float(magical_hist_curr):.6f}")
 
-        # 5m RMA200 (optional gate)
-        limit_5m = SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 500)
-        min_required_5m = SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 250)
+        # 5m RMA200 calculation using the correct CLOSED candle index (last_i_5m)
         rma_200_5m_curr = np.nan
-        rma_200_available = False
-        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-        if df_5m is None or len(df_5m) < min_required_5m:
-            got_5m = len(df_5m) if df_5m is not None else 0
-            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {got_5m})")
-            log("RMA 200 5m check will be skipped - using only RMA 50 15m")
-        else:
+        if df_5m is not None and len(df_5m) >= min_required_5m:
             rma_200_5m = calculate_rma(df_5m['close'], 200)
-            if len(rma_200_5m) >= 1 and not np.isnan(rma_200_5m.iloc[-1]):
-                rma_200_5m_curr = float(rma_200_5m.iloc[-1])
+            if len(rma_200_5m) >= 1 and not np.isnan(rma_200_5m.iloc[last_i_5m]):
+                rma_200_5m_curr = float(rma_200_5m.iloc[last_i_5m])
                 rma_200_available = True
                 log(f"5m RMA 200: {rma_200_5m_curr:.4f}")
             else:
                 log("5m RMA 200 calculation produced NaN - will be skipped")
+        else:
+             log("RMA 200 5m check will be skipped - using only RMA 50 15m")
+
 
         # Candle characterization on latest closed candle
         is_green_candle = close_prev > open_prev
         is_red_candle = close_prev < open_prev
 
-        # Candle-aware wick checks: 20% threshold relative to total range
-        candle_range = high_prev - low_prev
-        upper_wick_ok = False
-        lower_wick_ok = False
-        upper_wick_ratio = np.nan
-        lower_wick_ratio = np.nan
-
-        if candle_range > 0:
-            if is_green_candle:
-                upper_wick_length = high_prev - close_prev
-                upper_wick_ratio = upper_wick_length / candle_range
-                upper_wick_ok = upper_wick_ratio < 0.20
-                lower_wick_ok = True  # not used for green candles
-            elif is_red_candle:
-                lower_wick_length = close_prev - low_prev
-                lower_wick_ratio = lower_wick_length / candle_range
-                lower_wick_ok = lower_wick_ratio < 0.20
-                upper_wick_ok = True  # not used for red candles
-            else:
-                # Doji/neutral fallback (rare)
-                upper_wick_length = high_prev - max(open_prev, close_prev)
-                lower_wick_length = min(open_prev, close_prev) - low_prev
-                upper_wick_ratio = upper_wick_length / candle_range
-                lower_wick_ratio = lower_wick_length / candle_range
-                upper_wick_ok = upper_wick_ratio < 0.20
-                lower_wick_ok = lower_wick_ratio < 0.20
-        else:
-            upper_wick_ok = lower_wick_ok = False
-
-        # RMA gates
         if rma_200_available:
             rma_long_ok = (rma_50_15m_curr < close_prev) and (rma_200_5m_curr < close_prev)
             rma_short_ok = (rma_50_15m_curr > close_prev) and (rma_200_5m_curr > close_prev)
@@ -534,6 +549,19 @@ def check_pair(pair_name, pair_info, last_alerts):
             rma_long_ok = (rma_50_15m_curr < close_prev)
             rma_short_ok = (rma_50_15m_curr > close_prev)
             log("Using only RMA 50 15m (RMA 200 5m unavailable)")
+
+        candle_range = high_prev - low_prev
+        if candle_range <= 0:
+            upper_wick_check = False
+            lower_wick_check = False
+        else:
+            # Wick lengths calculated correctly
+            upper_wick_length = high_prev - max(open_prev, close_prev)
+            lower_wick_length = min(open_prev, close_prev) - low_prev
+            
+            # Wick checks are correct for a strong close: small upper wick for long, small lower wick for short
+            upper_wick_check = (upper_wick_length / candle_range) < 0.20
+            lower_wick_check = (lower_wick_length / candle_range) < 0.20
 
         price_change_pct = abs((close_prev - open_prev) / open_prev) * 100
         if price_change_pct > 10:
@@ -547,19 +575,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             log(f"⚠️  Price closed below S3 (${pivots['S3']:.2f}), blocking SHORT signal")
             return last_alerts.get(pair_name), '\n'.join(thread_log)
 
-        # Cirrus Cloud state (exclusive) — latest closed candle
-        cloud_state = get_cloud_state(upw, dnw, idx=-1)
         log(f"Cirrus Cloud State: {cloud_state}")
-
-        # Gate summary (compact)
-        log(
-            f"Gates: cloud={cloud_state}, "
-            f"red={is_red_candle}, green={is_green_candle}, "
-            f"upper_wick_ok={upper_wick_ok}({upper_wick_ratio if not np.isnan(upper_wick_ratio) else 'n/a'}), "
-            f"lower_wick_ok={lower_wick_ok}({lower_wick_ratio if not np.isnan(lower_wick_ratio) else 'n/a'}), "
-            f"rma_long_ok={rma_long_ok}, rma_short_ok={rma_short_ok}, "
-            f"hist={magical_hist_curr:.4f}"
-        )
 
         # Pivot crossovers on latest closed candle
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
@@ -585,14 +601,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Base gates with Cirrus exclusivity
         base_long_ok = (
             (cloud_state == "green") and
-            upper_wick_ok and
+            upper_wick_check and # Correct: Small Upper Wick means close near High
             rma_long_ok and
             (magical_hist_curr > 0) and
             is_green_candle
         )
         base_short_ok = (
             (cloud_state == "red") and
-            lower_wick_ok and
+            lower_wick_check and # Correct: Small Lower Wick means close near Low
             rma_short_ok and
             (magical_hist_curr < 0) and
             is_red_candle
@@ -601,9 +617,10 @@ def check_pair(pair_name, pair_info, last_alerts):
         # VWAP signals: previous candle vs VWAP_prev, current candle vs VWAP_curr
         vbuy_conditions_met = False
         vsell_conditions_met = False
-        if vwap_curr is not None and len(df_15m) >= 2:
-            close_prev2 = float(df_15m['close'].iloc[-2])
-            vwap_prev = float(vwap_15m.iloc[-2]) if not np.isnan(vwap_15m.iloc[-2]) else np.nan
+        if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 1:
+            # Use the candle before the signal candle for crossover check
+            close_prev2 = float(df_15m['close'].iloc[last_i_15m - 1])
+            vwap_prev = float(vwap_15m.iloc[last_i_15m - 1]) if not np.isnan(vwap_15m.iloc[last_i_15m - 1]) else np.nan
             if not (np.isnan(close_prev2) or np.isnan(vwap_prev)):
                 if base_long_ok and (close_prev2 <= vwap_prev) and (close_prev > vwap_curr):
                     vbuy_conditions_met = True
@@ -622,6 +639,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         formatted_time = datetime.now(ist).strftime('%d-%m-%Y @ %H:%M IST')
         price = close_prev
 
+        
         # State reset logic against latest closed candle
         if updated_state:
             if updated_state.startswith('fib_'):
@@ -685,7 +703,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             current_signal = f"fib_long_{long_crossover_name}"
             log(f"\n🟢 FIB LONG SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
-                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},R2:{pivots['R2']:.5f}]"
+                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},L:{long_crossover_line:.5f}]"
                 message = (
                     f"🟢 {pair_name} - FIB LONG\n"
                     f"Closed Above {long_crossover_name} (${long_crossover_line:,.2f}) {diagnostic}\n"
@@ -700,7 +718,7 @@ def check_pair(pair_name, pair_info, last_alerts):
             current_signal = f"fib_short_{short_crossover_name}"
             log(f"\n🔴 FIB SHORT SIGNAL DETECTED for {pair_name}!")
             if updated_state != current_signal:
-                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},S2:{pivots['S2']:.5f}]"
+                diagnostic = f"[O:{open_prev:.5f},C:{close_prev:.5f},L:{short_crossover_line:.5f}]"
                 message = (
                     f"🔴 {pair_name} - FIB SHORT\n"
                     f"Closed Below {short_crossover_name} (${short_crossover_line:,.2f}) {diagnostic}\n"
