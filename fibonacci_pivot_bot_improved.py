@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
 }
 
 # load config.json overrides if present
-CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
 if Path(CONFIG_PATH).exists():
     try:
         with open(CONFIG_PATH, "r") as f:
