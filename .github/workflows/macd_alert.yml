@@ -68,5 +68,6 @@ jobs:
         file_pattern: |
           macd_state.json
           fib_state.json
-        add_options: '--force'   # NEW: ensures untracked files are added
+        add_options: '--all'   # NEW: ensures untracked files are added
         skip_dirty_check: true   # Prevents failure if no changes
+
