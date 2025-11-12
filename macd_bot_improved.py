@@ -55,9 +55,9 @@ DEFAULT_CONFIG = {
 
 # Load config.json (optional) and overlay defaults
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json") 
-if Path(CONFIG_PATH).exists():
+if Path(CONFIG_FILE).exists():
     try:
-        with open(CONFIG_PATH, "r") as f:
+        with open(CONFIG_FILE, "r") as f:
             user_cfg = json.load(f)
         DEFAULT_CONFIG.update(user_cfg)
     except Exception as e:
