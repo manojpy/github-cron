@@ -41,7 +41,7 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
+        DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
         STATE_FILE_PATH: macd_state.json 
       run: python macd_bot.py
@@ -51,12 +51,12 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'True'
+        DEBUG_MODE: 'False'
         SEND_TEST_MESSAGE: 'False'
         STATE_FILE_PATH: fib_state.json
       run: python fibonacci_pivot_bot.py
 
-    # --- NEW: Debug step to confirm JSON files exist ---
+    # --- Debug step to confirm JSON files exist ---
     - name: List files after run
       run: ls -l
     
@@ -68,4 +68,5 @@ jobs:
         file_pattern: |
           macd_state.json
           fib_state.json
+        add_options: '--force'   # NEW: ensures untracked files are added
         skip_dirty_check: true   # Prevents failure if no changes
