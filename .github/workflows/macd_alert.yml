@@ -44,7 +44,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DEBUG_MODE: 'True'
-          SEND_TEST_MESSAGE: 'False'
+          SEND_TEST_MESSAGE: 'True'
           STATE_FILE_PATH: macd_state.json
         run: python macd_bot.py
 
@@ -54,7 +54,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DEBUG_MODE: 'True'
-          SEND_TEST_MESSAGE: 'False'
+          SEND_TEST_MESSAGE: 'True'
           STATE_FILE_PATH: fib_state.json
         run: python fibonacci_pivot_bot.py
 
@@ -77,6 +77,7 @@ jobs:
           status_options: '--untracked-files=no'  # ignore untracked files (e.g., transient)
           commit_options: '--allow-empty'      # avoid failure if no diffs
           skip_dirty_check: true               # prevents failure when there are no changes
+
 
 
 
