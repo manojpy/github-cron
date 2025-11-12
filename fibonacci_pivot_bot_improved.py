@@ -62,6 +62,7 @@ if Path(CONFIG_FILE).exists():
         with open(CONFIG_FILE, "r") as f:
             user_cfg = json.load(f)
         DEFAULT_CONFIG.update(user_cfg)
+        print(f"Loaded configuration from {CONFIG_FILE}")
     except Exception as e:
         print(f"Warning: unable to parse config.json: {e}")
 
