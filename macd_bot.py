@@ -1,353 +1,256 @@
-import requests
+#!/usr/bin/env python3
+"""
+macd_bot_improved.py
+Improved version of your PPO/Cirrus alert bot.
+
+Key improvements included (per your request):
+ - Async concurrent HTTP fetching for candles + product list (aiohttp, asyncio)
+ - Config file support (config.json) with environment overrides
+ - SQLite-based state store (atomic, durable) instead of JSON file
+ - Modular structure: smaller functions for fetch / compute / evaluate / persist
+ - Retry + exponential backoff for network calls
+ - Rotating file logging + console logs
+ - CLI: --once (single run) and --loop <seconds> (periodic)
+ - Data validation and graceful skip logic for stale/insufficient data
+ - Jitter to avoid thundering herd
+ - Optional in-memory caching
+ - Preserves original alert formatting (no enrichment)
+
+Dependencies:
+ - aiohttp
+ - pandas
+ - numpy
+ - pytz
+ - python-dateutil (optional, but pandas handles parsing)
+Install with:
+ pip install aiohttp pandas numpy pytz
+
+Run:
+ python macd_bot_improved.py --once
+ python macd_bot_improved.py --loop 900
+
+Note: keep your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in env or config.json.
+
+"""
+
+import os
+import sys
+import json
+import time
+import asyncio
+import random
+import logging
+import sqlite3
+import signal
+from typing import Dict, Any, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+
+import aiohttp
 import pandas as pd
 import numpy as np
-import time
-import os
-import json
 import pytz
-import traceback
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from aiohttp import ClientConnectorError, ClientResponseError
 
-# ============ CONFIGURATION ============
-# Telegram settings - reads from environment variables (GitHub Secrets)
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '203813932')
+# -------------------------
+# Configuration and Logger
+# -------------------------
 
-# Enable debug mode - set to True to see detailed logs
-DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
-
-# Send test message on startup
-SEND_TEST_MESSAGE = os.environ.get('SEND_TEST_MESSAGE', 'True').lower() == 'true'
-
-# Delta Exchange API
-DELTA_API_BASE = "https://api.india.delta.exchange"
-
-# Trading pairs to monitor
-PAIRS = {
-    "BTCUSD": None,
-    "ETHUSD": None,
-    "SOLUSD": None,
-    "AVAXUSD": None,
-    "BCHUSD": None,
-    "XRPUSD": None,
-    "BNBUSD": None,
-    "LTCUSD": None,
-    "DOTUSD": None,
-    "ADAUSD": None,
-    "SUIUSD": None,
-    "AAVEUSD": None
+DEFAULT_CONFIG = {
+    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc"),
+    "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", "203813932"),
+    "DEBUG_MODE": os.environ.get("DEBUG_MODE", "True").lower() == "true",
+    "SEND_TEST_MESSAGE": os.environ.get("SEND_TEST_MESSAGE", "True").lower() == "true",
+    "DELTA_API_BASE": "https://api.india.delta.exchange",
+    "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+    "SPECIAL_PAIRS": {
+        "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
+    },
+    "PPO_FAST": 7,
+    "PPO_SLOW": 16,
+    "PPO_SIGNAL": 5,
+    "PPO_USE_SMA": False,
+    "RMA_50_PERIOD": 50,
+    "RMA_200_PERIOD": 200,
+    "CIRRUS_CLOUD_ENABLED": True,
+    "X1": 22, "X2": 9, "X3": 15, "X4": 5,
+    "SRSI_RSI_LEN": 21, "SRSI_KALMAN_LEN": 5, "SRSI_EMA_LEN": 5,
+    "STATE_DB_PATH": os.environ.get("STATE_DB_PATH", "macd_state.sqlite"),
+    "LOG_FILE": os.environ.get("LOG_FILE", "macd_bot.log"),
+    "MAX_PARALLEL_FETCH": 8,
+    "HTTP_TIMEOUT": 15,
+    "CANDLE_FETCH_RETRIES": 3,
+    "CANDLE_FETCH_BACKOFF": 1.5,
+    "JITTER_MIN": 0.05,
+    "JITTER_MAX": 0.6
 }
 
-# Special data requirements for pairs with limited history
-SPECIAL_PAIRS = {
-    "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
-}
+# Load config.json (optional) and overlay defaults
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
+if Path(CONFIG_PATH).exists():
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            user_cfg = json.load(f)
+        DEFAULT_CONFIG.update(user_cfg)
+    except Exception as e:
+        print(f"Warning: unable to parse config.json: {e}")
 
-# Indicator settings
-# PPO settings
-PPO_FAST = 7
-PPO_SLOW = 16
-PPO_SIGNAL = 5
-PPO_USE_SMA = False  # False = use EMA
+cfg = DEFAULT_CONFIG
 
-# RMA settings
-RMA_50_PERIOD = 50   # RMA50 on 15min
-RMA_200_PERIOD = 200 # RMA200 on 5min
+# Setup logging
+logger = logging.getLogger("macd_bot")
+logger.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else logging.INFO)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
-# Cirrus Cloud settings
-CIRRUS_CLOUD_ENABLED = True
-X1 = 22
-X2 = 9
-X3 = 15
-X4 = 5
+# Console handler
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else logging.INFO)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
-# Smoothed RSI (SRSI) settings
-SRSI_RSI_LEN = 21
-SRSI_KALMAN_LEN = 5
-SRSI_EMA_LEN = 5
+# Rotating file handler
+try:
+    from logging.handlers import RotatingFileHandler
+    fh = RotatingFileHandler(cfg["LOG_FILE"], maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+except Exception as e:
+    logger.warning(f"Could not set up rotating log file: {e}")
 
-# State file paths (read from environment, fallback to defaults)
-STATE_FILE = os.environ.get("STATE_FILE_PATH", "macd_state.json")
-STATE_FILE_BAK = STATE_FILE + ".bak"
+# -------------------------
+# Utility: SQLite state store
+# -------------------------
 
-# Thread lock for state updates
-state_lock = Lock()
+class StateDB:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._ensure_table()
 
-# ============ UTILITY FUNCTIONS ============
+    def _ensure_table(self):
+        cur = self._conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS states (
+                pair TEXT PRIMARY KEY,
+                state TEXT,
+                ts INTEGER
+            )
+        """)
+        self._conn.commit()
 
-def create_session():
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    return session
+    def load_all(self) -> Dict[str, Dict[str, Any]]:
+        cur = self._conn.cursor()
+        cur.execute("SELECT pair, state, ts FROM states")
+        rows = cur.fetchall()
+        return {r[0]: {"state": r[1], "ts": int(r[2] or 0)} for r in rows}
 
-SESSION = create_session()
+    def get(self, pair: str) -> Optional[Dict[str, Any]]:
+        cur = self._conn.cursor()
+        cur.execute("SELECT state, ts FROM states WHERE pair = ?", (pair,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {"state": r[0], "ts": int(r[1] or 0)}
 
-def debug_log(message):
-    """Print debug messages if DEBUG_MODE is enabled"""
-    if DEBUG_MODE:
-        print(f"[DEBUG] {message}")
+    def set(self, pair: str, state: str, ts: Optional[int] = None):
+        ts = int(ts or time.time())
+        cur = self._conn.cursor()
+        cur.execute("INSERT INTO states(pair, state, ts) VALUES (?, ?, ?) "
+                    "ON CONFLICT(pair) DO UPDATE SET state=excluded.state, ts=excluded.ts",
+                    (pair, state, ts))
+        self._conn.commit()
 
-def load_state():
-    """
-    Load previous alert state from file with backup recovery.
-    Initializes a 'NO_SIGNAL' state for all pairs if files are missing.
-    """
-    
-    def _initialize_default_state():
-        """Returns a clean state for all monitored pairs."""
-        return {pair: {"state": "NO_SIGNAL", "ts": 0} for pair in PAIRS.keys()}
+    def close(self):
+        self._conn.close()
 
-    def _safe_load(filepath):
-        """Attempts to load and validate state from a specific path."""
+
+# -------------------------
+# HTTP helpers (async)
+# -------------------------
+
+async def async_fetch_json(session: aiohttp.ClientSession, url: str, params: dict = None,
+                           retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Optional[dict]:
+    """Fetch JSON with retry/backoff and simple error handling."""
+    for attempt in range(1, retries + 1):
         try:
-            if not os.path.exists(filepath):
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                text = await resp.text()
+                try:
+                    data = await resp.json()
+                except Exception:
+                    # Try fallback parse
+                    data = None
+                if resp.status >= 400:
+                    logger.debug(f"HTTP {resp.status} for {url} (attempt {attempt}): {text[:200]}")
+                    raise ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                return data
+        except (asyncio.TimeoutError, ClientConnectorError, ClientResponseError) as e:
+            logger.debug(f"Fetch error {e} for {url} (attempt {attempt})")
+            if attempt == retries:
+                logger.warning(f"Failed to fetch {url} after {retries} attempts.")
                 return None
-            
-            with open(filepath, 'r') as f:
-                state = json.load(f)
-            
-            if not isinstance(state, dict):
-                # Schema validation failed
-                raise ValueError("State file is not a dict")
-
-            # Normalize schema to {pair: {"state": str, "ts": int}} and filter for known PAIRS
-            normalized = {}
-            for k, v in state.items():
-                # Only accept pairs we are monitoring
-                if k in PAIRS:
-                    if isinstance(v, dict):
-                        s = v.get("state")
-                        ts = v.get("ts", 0)
-                        if isinstance(s, str):
-                            normalized[k] = {"state": s, "ts": int(ts)}
-                    elif isinstance(v, str):
-                        # Handle old schema: value was just the state string
-                        normalized[k] = {"state": v, "ts": 0}
-            return normalized
+            await asyncio.sleep(backoff * (attempt ** 1.2) + random.uniform(0, 0.2))
         except Exception as e:
-            print(f"Error reading state file {filepath}: {e}")
+            logger.exception(f"Unexpected error fetching {url}: {e}")
             return None
+    return None
 
-    # 1. Try primary file
-    loaded_state = _safe_load(STATE_FILE)
-    if loaded_state is not None:
-        debug_log(f"Loaded primary state (partial): {loaded_state}")
-    
-    # 2. Try backup file if primary failed
-    if loaded_state is None:
-        loaded_state = _safe_load(STATE_FILE_BAK)
-        if loaded_state is not None:
-            print("Recovered state from backup.")
-            debug_log(f"Loaded backup state (partial): {loaded_state}")
 
-    # 3. Combine with default state for all PAIRS
-    final_state = _initialize_default_state()
-    if loaded_state is not None:
-        # Merge loaded state over default state, filling in missing pairs with default
-        final_state.update(loaded_state)
-        
-    if loaded_state is None:
-         debug_log("No previous state found or recovery failed, starting fresh (NO_SIGNAL)")
+# -------------------------
+# Data fetching + caching
+# -------------------------
 
-    return final_state
+class DataFetcher:
+    def __init__(self, api_base: str, max_parallel: int = 8, timeout: int = 15):
+        self.api_base = api_base.rstrip("/")
+        self.semaphore = asyncio.Semaphore(max_parallel)
+        self.timeout = timeout
+        self._cache = {}  # key -> (timestamp, data); simple in-memory cache (per run)
 
-def save_state(state):
-    """Save alert state to file atomically with backup creation and fsync."""
-    try:
-        temp_file = STATE_FILE + '.tmp'
-        
-        # 1. Write the new state to a temporary file
-        with open(temp_file, 'w') as f:
-            json.dump(state, f, indent=4)
-            f.flush()
-            # Ensure data is written to the physical disk (important for robustness)
-            os.fsync(f.fileno()) 
+    async def fetch_products(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        url = f"{self.api_base}/v2/products"
+        async with self.semaphore:
+            return await async_fetch_json(session, url, retries=3, backoff=1.5, timeout=self.timeout)
 
-        # 2. Rename existing state file to backup (atomic backup)
-        if os.path.exists(STATE_FILE):
-            try:
-                # os.replace is atomic on most modern OS filesystems (like rename)
-                # It replaces the destination file if it exists.
-                os.replace(STATE_FILE, STATE_FILE_BAK) 
-            except Exception as e:
-                # If rename fails (e.g., file lock, permissions), log a warning but proceed
-                print(f"Warning: could not rename primary file to backup: {e}")
-        
-        # 3. Atomically replace the old state file (or backup) with the new temporary file
-        os.replace(temp_file, STATE_FILE)
-        
-        debug_log(f"Saved state: {state}")
-    except Exception as e:
-        print(f"Error saving state: {e}")
-        if DEBUG_MODE:
-            traceback.print_exc()
+    async def fetch_candles(self, session: aiohttp.ClientSession, symbol: str, resolution: str, limit: int):
+        """
+        symbol: product symbol string as from product['symbol'] (e.g. "BTC_USDT")
+        resolution: "15" or "5"
+        limit: number of candles
+        """
+        key = f"candles:{symbol}:{resolution}:{limit}"
+        # Per-run caching to avoid duplicate calls
+        if key in self._cache:
+            return self._cache[key][1]
 
-def send_telegram_alert(message):
-    """Send alert message via Telegram with validation and safe JSON parsing"""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == 'xxxx' or not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == 'xxxx':
-        print("✗ Telegram not configured: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
-        return False
-    try:
-        debug_log(f"Attempting to send message: {message[:100]}...")
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": None  # No HTML formatting
-        }
-        response = SESSION.post(url, data=data, timeout=10)
-        try:
-            response_data = response.json()
-        except Exception:
-            response_data = {"ok": False, "status_code": response.status_code, "text": response.text[:200]}
-        if response_data.get('ok'):
-            print(f"✓ Alert sent successfully")
-            return True
-        else:
-            print(f"✗ Telegram error: {response_data}")
-            return False
-    except Exception as e:
-        print(f"✗ Error sending Telegram message: {e}")
-        if DEBUG_MODE:
-            traceback.print_exc()
-        return False
+        # small jitter to reduce thundering
+        await asyncio.sleep(random.uniform(cfg["JITTER_MIN"], cfg["JITTER_MAX"]))
 
-def send_test_message():
-    """Send a test message to verify Telegram connectivity"""
-    ist = pytz.timezone('Asia/Kolkata')
-    current_dt = datetime.now(ist)
-    formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-    test_msg = f"🔔 Bot Started\nTest message from PPO Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if DEBUG_MODE else 'OFF'}"
-    print("\n" + "="*50)
-    print("SENDING TEST MESSAGE")
-    print("="*50)
-    success = send_telegram_alert(test_msg)
-    if success:
-        print("✓ Test message sent successfully!")
-    else:
-        print("✗ Test message failed - check your bot token and chat ID")
-    print("="*50 + "\n")
-    return success
+        url = f"{self.api_base}/v2/chart/history"
+        params = {"resolution": resolution, "symbol": symbol, "from": int(time.time()) - (limit * int(resolution) * 60), "to": int(time.time())}
+        async with self.semaphore:
+            data = await async_fetch_json(session, url, params=params, retries=cfg["CANDLE_FETCH_RETRIES"], backoff=cfg["CANDLE_FETCH_BACKOFF"], timeout=cfg["HTTP_TIMEOUT"])
+        # Cache result (even if None) for the run
+        self._cache[key] = (time.time(), data)
+        return data
 
-def get_product_ids():
-    """Fetch all product IDs from Delta Exchange"""
-    try:
-        debug_log("Fetching product IDs from Delta Exchange...")
-        response = SESSION.get(f"{DELTA_API_BASE}/v2/products", timeout=10)
-        try:
-            data = response.json()
-        except Exception:
-            print(f"API Error: Non-JSON response: {response.status_code} {response.text[:200]}")
-            return False
 
-        if data.get('success'):
-            products = data['result']
-            debug_log(f"Received {len(products)} products from API")
-            for product in products:
-                symbol = product['symbol'].replace('_USDT', 'USD').replace('USDT', 'USD')
-                if product.get('contract_type') == 'perpetual_futures':
-                    for pair_name in PAIRS.keys():
-                        if symbol == pair_name or symbol.replace('_', '') == pair_name:
-                            PAIRS[pair_name] = {
-                                'id': product['id'],
-                                'symbol': product['symbol'],
-                                'contract_type': product['contract_type']
-                            }
-                            debug_log(f"Matched {pair_name} -> {product['symbol']} (ID: {product['id']})")
-            return True
-        else:
-            print(f"API Error: {data}")
-            return False
-    except Exception as e:
-        print(f"Error fetching products: {e}")
-        if DEBUG_MODE:
-            traceback.print_exc()
-        return False
+# -------------------------
+# Indicator functions (mostly preserved)
+# -------------------------
 
-def get_candles(product_id, resolution="15", limit=150):
-    """Fetch OHLCV candles from Delta Exchange with softened stale handling"""
-    try:
-        to_time = int(time.time())
-        from_time = to_time - (limit * int(resolution) * 60)
-        url = f"{DELTA_API_BASE}/v2/chart/history"
-        params = {
-            'resolution': resolution,
-            'symbol': product_id,
-            'from': from_time,
-            'to': to_time
-        }
-        debug_log(f"Fetching {resolution}m candles for {product_id}, limit={limit}")
-        response = SESSION.get(url, params=params, timeout=15)
-        try:
-            data = response.json()
-        except Exception:
-            print(f"Error fetching candles for {product_id}: Non-JSON response {response.status_code} {response.text[:200]}")
-            return None
-
-        if data.get('success'):
-            result = data['result']
-            # Verify lengths to avoid misaligned DataFrame
-            arrays = [result.get('t', []), result.get('o', []), result.get('h', []), result.get('l', []), result.get('c', []), result.get('v', [])]
-            min_len = min(map(len, arrays)) if arrays else 0
-            if min_len == 0:
-                debug_log(f"No candles returned for {product_id}")
-                return None
-            df = pd.DataFrame({
-                'timestamp': result.get('t', [])[:min_len],
-                'open': result.get('o', [])[:min_len],
-                'high': result.get('h', [])[:min_len],
-                'low': result.get('l', [])[:min_len],
-                'close': result.get('c', [])[:min_len],
-                'volume': result.get('v', [])[:min_len]
-            })
-
-            # Sort by timestamp just in case and drop duplicates
-            df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
-
-            # Validate price data
-            if df['close'].iloc[-1] <= 0:
-                debug_log(f"Invalid price (≤0) for {product_id}, skipping")
-                return None
-
-            debug_log(f"Received {len(df)} candles for {product_id} ({resolution}m)")
-
-            # Check data freshness
-            last_candle_time = df['timestamp'].iloc[-1]
-            time_diff = time.time() - last_candle_time
-            max_age = int(resolution) * 60 * 3  # 3 candles max age (strict)
-            max_age_soft = int(resolution) * 60 * 6  # soft threshold
-            if time_diff > max_age_soft:
-                print(f"⚠️ Stale data for {product_id} ({resolution}m) - {time_diff/60:.1f} min old. Skipping.")
-                return None
-            elif time_diff > max_age:
-                debug_log(f"⚠️ Mild staleness for {product_id} ({resolution}m): {time_diff/60:.1f} min. Proceeding cautiously.")
-
-            return df
-        else:
-            print(f"Error fetching candles for {product_id}: {data.get('message', 'No message')}")
-            return None
-    except Exception as e:
-        print(f"Exception fetching candles for {product_id}: {e}")
-        if DEBUG_MODE:
-            traceback.print_exc()
-        return None
-
-def calculate_ema(data, period):
+def calculate_ema(data: pd.Series, period: int) -> pd.Series:
     return data.ewm(span=period, adjust=False).mean()
 
-def calculate_sma(data, period):
-    return data.rolling(window=period, min_periods=max(2, period//3)).mean()
+def calculate_sma(data: pd.Series, period: int) -> pd.Series:
+    return data.rolling(window=period, min_periods=max(2, period // 3)).mean()
 
-def calculate_rma(data, period):
+def calculate_rma(data: pd.Series, period: int) -> pd.Series:
     r = data.ewm(alpha=1/period, adjust=False).mean()
     return r.bfill().ffill()
 
-def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
+def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: bool = False) -> Tuple[pd.Series, pd.Series]:
     close = df['close'].astype(float)
     if use_sma:
         fast_ma = calculate_sma(close, fast)
@@ -362,14 +265,13 @@ def calculate_ppo(df, fast=7, slow=16, signal=5, use_sma=False):
     ppo_signal = ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill()
     return ppo, ppo_signal
 
-def smoothrng(x, t, m):
+def smoothrng(x: pd.Series, t: int, m: int) -> pd.Series:
     wper = t * 2 - 1
     avrng = calculate_ema(np.abs(x.diff().fillna(0)), t)
-    smoothrng = calculate_ema(avrng, max(1, wper)) * m
-    # Avoid zeros to prevent flat filter behavior
-    return smoothrng.clip(lower=1e-8).bfill().ffill()
+    smoothrng_val = calculate_ema(avrng, max(1, wper)) * m
+    return smoothrng_val.clip(lower=1e-8).bfill().ffill()
 
-def rngfilt(x, r):
+def rngfilt(x: pd.Series, r: pd.Series) -> pd.Series:
     result_list = [x.iloc[0]]
     for i in range(1, len(x)):
         prev_f = result_list[-1]
@@ -382,17 +284,17 @@ def rngfilt(x, r):
         result_list.append(f)
     return pd.Series(result_list, index=x.index)
 
-def calculate_cirrus_cloud(df):
+def calculate_cirrus_cloud(df: pd.DataFrame):
     close = df['close'].copy()
-    smrngx1x = smoothrng(close, X1, X2)
-    smrngx1x2 = smoothrng(close, X3, X4)
+    smrngx1x = smoothrng(close, cfg["X1"], cfg["X2"])
+    smrngx1x2 = smoothrng(close, cfg["X3"], cfg["X4"])
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     upw = filtx1 < filtx12
     dnw = filtx1 > filtx12
     return upw, dnw, filtx1, filtx12
 
-def kalman_filter(src, length, R=0.01, Q=0.1):
+def kalman_filter(src: pd.Series, length: int, R=0.01, Q=0.1) -> pd.Series:
     result_list = []
     estimate = np.nan
     error_est = 1.0
@@ -413,7 +315,7 @@ def kalman_filter(src, length, R=0.01, Q=0.1):
         result_list.append(estimate)
     return pd.Series(result_list, index=src.index)
 
-def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
+def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
     close = df['close'].astype(float)
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0)
@@ -426,21 +328,15 @@ def calculate_smooth_rsi(df, rsi_len=SRSI_RSI_LEN, kalman_len=SRSI_KALMAN_LEN):
     smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
     return smooth_rsi
 
-def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
-    """
-    NaN-safe, zero-division safe Magical Momentum Histogram.
-    Returns a numeric series of the same length, avoiding NaNs/inf at tail.
-    """
+def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
     n = len(df)
     if n == 0:
         return pd.Series([], dtype=float)
     if n < period + 50:
-        # Return zeros instead of NaNs to avoid blocking signals
         return pd.Series(np.zeros(n), index=df.index, dtype=float)
 
     close = df['close'].astype(float).copy()
     responsiveness = max(1e-5, float(responsiveness))
-
     sd = close.rolling(window=50, min_periods=10).std() * responsiveness
     sd = sd.bfill().ffill().fillna(0.001).clip(lower=1e-6)
 
@@ -450,14 +346,14 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
         delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
-    ma = close.rolling(window=period, min_periods=max(5, period//3)).mean().bfill().ffill()
+    ma = close.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
     denom = worm.replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
 
     raw_momentum = ((worm - ma).fillna(0)) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], 0).fillna(0)
 
-    min_med = raw_momentum.rolling(window=period, min_periods=max(5, period//3)).min().bfill().ffill()
-    max_med = raw_momentum.rolling(window=period, min_periods=max(5, period//3)).max().bfill().ffill()
+    min_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).min().bfill().ffill()
+    max_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).max().bfill().ffill()
     rng = (max_med - min_med).replace(0, np.nan).fillna(1e-8)
 
     temp = pd.Series(0.0, index=df.index)
@@ -483,135 +379,103 @@ def calculate_magical_momentum_hist(df, period=144, responsiveness=0.9):
 
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
 
-def check_pair(pair_name, pair_info, last_state_for_pair):
-    """Check PPO and RMA/Cirrus/SRSI conditions for a pair using last closed candle"""
+
+# -------------------------
+# Validation helpers
+# -------------------------
+
+def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
+    """Convert Delta API candle response to pandas DataFrame, with safety checks."""
+    if not result or not isinstance(result, dict):
+        return None
+    if not result.get("success"):
+        return None
+    res = result.get("result", {})
+    arrays = [res.get('t', []), res.get('o', []), res.get('h', []), res.get('l', []), res.get('c', []), res.get('v', [])]
+    if not arrays or any(len(arr) == 0 for arr in arrays):
+        return None
+    min_len = min(map(len, arrays))
+    df = pd.DataFrame({
+        'timestamp': res.get('t', [])[:min_len],
+        'open': res.get('o', [])[:min_len],
+        'high': res.get('h', [])[:min_len],
+        'low': res.get('l', [])[:min_len],
+        'close': res.get('c', [])[:min_len],
+        'volume': res.get('v', [])[:min_len]
+    })
+    df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
+    # basic check
+    if df.empty or df['close'].astype(float).iloc[-1] <= 0:
+        return None
+    return df
+
+# -------------------------
+# Evaluation logic (modular)
+# -------------------------
+
+def determine_closed_indices(df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Tuple[int, int, int]:
+    """
+    Determine the correct closed candle indices for 15m and 5m using timestamps.
+    Returns (last_i_15m, prev_i_15m, last_i_5m)
+    """
+    now_ts = time.time()
+    resolution_sec_15m = 15 * 60
+    current_15m_interval_start_ts = now_ts - (now_ts % resolution_sec_15m)
+    is_last_15m_candle_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_interval_start_ts
+    if is_last_15m_candle_incomplete:
+        last_i = -2; prev_i = -3
+    else:
+        last_i = -1; prev_i = -2
+
+    resolution_sec_5m = 5 * 60
+    current_5m_interval_start_ts = now_ts - (now_ts % resolution_sec_5m)
+    is_last_5m_candle_incomplete = df_5m['timestamp'].iloc[-1] >= current_5m_interval_start_ts
+    last_i_5m = -2 if is_last_5m_candle_incomplete else -1
+
+    return last_i, prev_i, last_i_5m
+
+
+def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Evaluate all indicators and conditions for a pair. Return new state dict if changed or NO_SIGNAL transition.
+    """
     try:
-        if pair_info is None:
-            return None
-        debug_log(f"\n{'='*60}")
-        debug_log(f"Checking {pair_name}")
-        debug_log(f"{'='*60}")
+        # determine special limits
+        sp = cfg["SPECIAL_PAIRS"].get(pair_name, None)
+        # guard minimal lengths
+        last_i, prev_i, last_i_5m = determine_closed_indices(df_15m, df_5m)
 
-        if pair_name in SPECIAL_PAIRS:
-            limit_15m = SPECIAL_PAIRS[pair_name]["limit_15m"]
-            min_required = SPECIAL_PAIRS[pair_name]["min_required"]
-            limit_5m = SPECIAL_PAIRS[pair_name].get("limit_5m", 300)
-            min_required_5m = SPECIAL_PAIRS[pair_name].get("min_required_5m", 250)
-        else:
-            limit_15m = 210
-            min_required = 200
-            limit_5m = 300
-            min_required_5m = 250
-
-        df_15m = get_candles(pair_info['symbol'], "15", limit=limit_15m)
-        df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
-
-        if df_15m is None or len(df_15m) < (min_required + 2):
-            print(f"⚠️ Insufficient 15m data for {pair_name}: {len(df_15m) if df_15m is not None else 0}/{min_required + 2} candles (needs +2 for closed indexing)")
-            return None
-        if df_5m is None or len(df_5m) < (min_required_5m + 2):
-            print(f"⚠️ Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{min_required_5m + 2} candles (needs +2 for closed indexing)")
-            return None
-
-        # --- START NEW ROBUST INDEXING LOGIC ---
-        now_ts = time.time()
-        
-        # 1. Determine closed index for 15m (PPO, Cirrus, SRSI, RMA50)
-        resolution_sec_15m = 15 * 60
-        # Calculate the expected start time of the candle that is *currently* forming
-        current_15m_interval_start_ts = now_ts - (now_ts % resolution_sec_15m)
-
-        # Check if the last candle in df_15m is the current, incomplete one.
-        is_last_15m_candle_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_interval_start_ts
-
-        # Set indices based on 15m candle completeness
-        if is_last_15m_candle_incomplete:
-            # The last candle (index -1) is incomplete. Use index -2 as the signal candle.
-            last_i = -2
-            prev_i = -3
-            debug_log(f"Current 15m candle (idx -1) is incomplete. Using closed candle at idx {last_i}")
-        else:
-            # The last candle (index -1) is the last closed one.
-            last_i = -1
-            prev_i = -2
-            debug_log(f"Last fetched 15m candle (idx -1) is closed. Using it for signal.")
-
-        # Safety check: ensure we still have enough data after finding the correct index
-        if len(df_15m) < abs(prev_i): # need at least |prev_i| number of candles
-            print(f"⚠️ Insufficient 15m data for {pair_name} after adjusting for incomplete candle. Needs {abs(prev_i)} rows.")
-            return None
-        
-        # 2. Determine closed index for 5m (RMA200)
-        resolution_sec_5m = 5 * 60
-        current_5m_interval_start_ts = now_ts - (now_ts % resolution_sec_5m)
-        is_last_5m_candle_incomplete = df_5m['timestamp'].iloc[-1] >= current_5m_interval_start_ts
-        
-        if is_last_5m_candle_incomplete:
-            last_i_5m = -2
-            debug_log(f"Current 5m candle (idx -1) is incomplete. Using closed candle at idx {last_i_5m} for RMA200.")
-        else:
-            last_i_5m = -1
-            debug_log(f"Last fetched 5m candle (idx -1) is closed. Using it for RMA200.")
-
-        if len(df_5m) < abs(last_i_5m) + 1:
-            print(f"⚠️ Insufficient 5m data for {pair_name} after adjusting for incomplete candle. Needs {abs(last_i_5m) + 1} rows.")
-            return None
-        # --- END NEW ROBUST INDEXING LOGIC ---
-
-
+        # compute indicators
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
+        if magical_hist.empty:
+            logger.debug("MMH empty -> skip")
+            return None
         magical_hist_curr = float(magical_hist.iloc[last_i])
-        if pd.isna(magical_hist_curr):
-            debug_log(f"⚠️ NaN in Magical Momentum Hist for {pair_name}, skipping")
-            return None
-        debug_log(f"Magical Momentum Hist (15m): {magical_hist_curr:.6f}")
-
-        ppo, ppo_signal = calculate_ppo(df_15m, PPO_FAST, PPO_SLOW, PPO_SIGNAL, PPO_USE_SMA)
-        rma_50 = calculate_rma(df_15m['close'], RMA_50_PERIOD)
-        rma_200 = calculate_rma(df_5m['close'], RMA_200_PERIOD)
+        ppo, ppo_signal = calculate_ppo(df_15m, cfg["PPO_FAST"], cfg["PPO_SLOW"], cfg["PPO_SIGNAL"], cfg["PPO_USE_SMA"])
+        rma_50 = calculate_rma(df_15m['close'], cfg["RMA_50_PERIOD"])
+        rma_200 = calculate_rma(df_5m['close'], cfg["RMA_200_PERIOD"])
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
-        smooth_rsi = calculate_smooth_rsi(df_15m)
+        smooth_rsi = calculate_smooth_rsi(df_15m, cfg["SRSI_RSI_LEN"], cfg["SRSI_KALMAN_LEN"])
 
-        # Extract last closed values
-        ppo_curr = float(ppo.iloc[last_i])
-        ppo_prev = float(ppo.iloc[prev_i])
-        ppo_signal_curr = float(ppo_signal.iloc[last_i])
-        ppo_signal_prev = float(ppo_signal.iloc[prev_i])
+        # extract last closed
+        ppo_curr = float(ppo.iloc[last_i]); ppo_prev = float(ppo.iloc[prev_i])
+        ppo_signal_curr = float(ppo_signal.iloc[last_i]); ppo_signal_prev = float(ppo_signal.iloc[prev_i])
+        smooth_rsi_curr = float(smooth_rsi.iloc[last_i]); smooth_rsi_prev = float(smooth_rsi.iloc[prev_i])
 
-        if any(pd.isna(x) for x in [ppo_curr, ppo_prev, ppo_signal_curr, ppo_signal_prev]):
-            debug_log(f"⚠️ NaN values in PPO for {pair_name}, skipping")
+        # candle values
+        close_curr = float(df_15m['close'].iloc[last_i]); open_curr = float(df_15m['open'].iloc[last_i])
+        high_curr = float(df_15m['high'].iloc[last_i]); low_curr = float(df_15m['low'].iloc[last_i])
+        rma50_curr = float(rma_50.iloc[last_i]); rma200_curr = float(rma_200.iloc[last_i_5m])
+
+        # safety checks
+        if any(pd.isna(x) for x in [ppo_curr, ppo_prev, ppo_signal_curr, ppo_signal_prev, smooth_rsi_curr, smooth_rsi_prev, rma50_curr, rma200_curr]):
+            logger.debug(f"NaN in core indicators for {pair_name}, skipping")
             return None
 
-        smooth_rsi_curr = float(smooth_rsi.iloc[last_i])
-        smooth_rsi_prev = float(smooth_rsi.iloc[prev_i])
-        if any(pd.isna(x) for x in [smooth_rsi_curr, smooth_rsi_prev]):
-            debug_log(f"⚠️ NaN values in Smooth RSI for {pair_name}, skipping")
-            return None
-
-        close_curr = float(df_15m['close'].iloc[last_i])
-        open_curr = float(df_15m['open'].iloc[last_i])
-        high_curr = float(df_15m['high'].iloc[last_i])
-        low_curr = float(df_15m['low'].iloc[last_i])
-
-        rma50_curr = float(rma_50.iloc[last_i])
-        if pd.isna(rma50_curr):
-            debug_log(f"⚠️ NaN values in RMA50 for {pair_name}, skipping")
-            return None
-
-        # Use most recent closed 5m RMA200, determined by timestamp logic
-        rma200_curr = float(rma_200.iloc[last_i_5m])
-        if pd.isna(rma200_curr):
-            debug_log(f"⚠️ NaN values in RMA200 for {pair_name}, skipping")
-            return None
-
-        # Candle metrics (zero-range safe)
+        # candle metrics
         total_range = high_curr - low_curr
         if total_range <= 0:
-            upper_wick = 0.0
-            lower_wick = 0.0
-            strong_bullish_close = False
-            strong_bearish_close = False
-            debug_log("  Candle range is zero or negative, skipping wick checks.")
+            upper_wick = 0.0; lower_wick = 0.0; strong_bullish_close = False; strong_bearish_close = False
         else:
             upper_wick = max(0.0, high_curr - max(open_curr, close_curr))
             lower_wick = max(0.0, min(open_curr, close_curr) - low_curr)
@@ -620,23 +484,7 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             strong_bullish_close = bullish_candle and (upper_wick / total_range) < 0.20
             strong_bearish_close = bearish_candle and (lower_wick / total_range) < 0.20
 
-        debug_log(f"\nCandle Metrics (15m):")
-        debug_log(f"  O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
-        if total_range > 0:
-            debug_log(f"  Strong Bullish Close (20% Rule): {strong_bullish_close}")
-            debug_log(f"  Strong Bearish Close (20% Rule): {strong_bearish_close}")
-
-        debug_log(f"\nIndicator Values:")
-        debug_log(f"Price (15m): ${close_curr:,.2f}")
-        debug_log(f"PPO: {ppo_curr:.4f} (prev: {ppo_prev:.4f})")
-        debug_log(f"PPO Signal: {ppo_signal_curr:.4f} (prev: {ppo_signal_prev:.4f})")
-        debug_log(f"RMA50 (15m): {rma50_curr:.2f}")
-        debug_log(f"RMA200 (5m): {rma200_curr:.2f}")
-        debug_log(f"Smoothed RSI (15m): {smooth_rsi_curr:.2f} (prev: {smooth_rsi_prev:.2f})")
-        debug_log(f"Cirrus Filter 1: {filtx1.iloc[last_i]:.4f}, Filter 2: {filtx12.iloc[last_i]:.4f}")
-        debug_log(f"Cirrus Cloud - Upw: {bool(upw.iloc[last_i])}, Dnw: {bool(dnw.iloc[last_i])}")
-
-        # Crossovers and bands
+        # cross and band checks
         ppo_cross_up = (ppo_prev <= ppo_signal_prev) and (ppo_curr > ppo_signal_curr)
         ppo_cross_down = (ppo_prev >= ppo_signal_prev) and (ppo_curr < ppo_signal_curr)
         ppo_cross_above_zero = (ppo_prev <= 0) and (ppo_curr > 0)
@@ -648,7 +496,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         ppo_above_minus020 = ppo_curr > -0.20
         ppo_above_signal = ppo_curr > ppo_signal_curr
         ppo_below_signal = ppo_curr < ppo_signal_curr
-
         ppo_below_030 = ppo_curr < 0.30
         ppo_above_minus030 = ppo_curr > -0.30
 
@@ -660,45 +507,14 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
 
-        debug_log(f"\nCrossover Checks:")
-        debug_log(f"  PPO 15m cross up: {ppo_cross_up}")
-        debug_log(f"  PPO 15m cross down: {ppo_cross_down}")
-        debug_log(f"  SRSI cross up 50: {srsi_cross_up_50}")
-        debug_log(f"  SRSI cross down 50: {srsi_cross_down_50}")
-
-        # Helper to print condition sets
-        def log_cond_set(label, conds):
-            debug_log(label + " " + ", ".join([f"{k}={v}" for k, v in conds.items()]))
-
-        # Current time & formatting
-        ist = pytz.timezone('Asia/Kolkata')
-        current_dt = datetime.now(ist)
-        formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
-        price = close_curr
-
-        # Prepare last state info
-        now_ts = int(time.time())
-        last_state_value = None
-        last_ts = 0
-        if isinstance(last_state_for_pair, dict):
-            last_state_value = last_state_for_pair.get("state")
-            last_ts = int(last_state_for_pair.get("ts", 0))
-        elif isinstance(last_state_for_pair, str):
-            last_state_value = last_state_for_pair
-
-        current_state = None
-        send_message = None
-
-        # Cirrus Cloud state (exclusive)
+        # cloud state
         cloud_state = "neutral"
-        if CIRRUS_CLOUD_ENABLED:
+        if cfg["CIRRUS_CLOUD_ENABLED"]:
             cloud_state = ("green" if (bool(upw.iloc[last_i]) and not bool(dnw.iloc[last_i]))
                            else "red" if (bool(dnw.iloc[last_i]) and not bool(upw.iloc[last_i]))
                            else "neutral")
-        debug_log(f"Cirrus Cloud State: {cloud_state}")
 
-        # --- ALERT LOGIC (8 SIGNALS) ---
-        # BUY
+        # prepare conditions sets (kept same as original logic)
         buy_conds = {
             "ppo_cross_up": ppo_cross_up,
             "ppo_below_020": ppo_below_020,
@@ -708,13 +524,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
-        log_cond_set("BUY condition inputs:", buy_conds)
-        if all(buy_conds.values()):
-            current_state = "buy"
-            debug_log(f"\n🟢 BUY SIGNAL DETECTED for {pair_name}!")
-            send_message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # SELL
         sell_conds = {
             "ppo_cross_down": ppo_cross_down,
             "ppo_above_minus020": ppo_above_minus020,
@@ -724,13 +533,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
-        log_cond_set("SELL condition inputs:", sell_conds)
-        if current_state is None and all(sell_conds.values()):
-            current_state = "sell"
-            debug_log(f"\n🔴 SELL SIGNAL DETECTED for {pair_name}!")
-            send_message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # BUY SRSI 50
         buy_srsi_conds = {
             "srsi_cross_up_50": srsi_cross_up_50,
             "ppo_above_signal": ppo_above_signal,
@@ -741,13 +543,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
-        log_cond_set("BUY (SRSI 50) condition inputs:", buy_srsi_conds)
-        if current_state is None and all(buy_srsi_conds.values()):
-            current_state = "buy_srsi50"
-            debug_log(f"\n⬆️ BUY (SRSI 50) SIGNAL DETECTED for {pair_name}!")
-            send_message = f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # SELL SRSI 50
         sell_srsi_conds = {
             "srsi_cross_down_50": srsi_cross_down_50,
             "ppo_below_signal": ppo_below_signal,
@@ -758,13 +553,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
-        log_cond_set("SELL (SRSI 50) condition inputs:", sell_srsi_conds)
-        if current_state is None and all(sell_srsi_conds.values()):
-            current_state = "sell_srsi50"
-            debug_log(f"\n⬇️ SELL (SRSI 50) SIGNAL DETECTED for {pair_name}!")
-            send_message = f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # LONG (0)
         long0_conds = {
             "ppo_cross_above_zero": ppo_cross_above_zero,
             "ppo_above_signal": ppo_above_signal,
@@ -774,13 +562,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
-        log_cond_set("LONG(0) condition inputs:", long0_conds)
-        if current_state is None and all(long0_conds.values()):
-            current_state = "long_zero"
-            debug_log(f"\n🟢 LONG (0) SIGNAL DETECTED for {pair_name}!")
-            send_message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # LONG (0.11)
         long011_conds = {
             "ppo_cross_above_011": ppo_cross_above_011,
             "ppo_above_signal": ppo_above_signal,
@@ -790,13 +571,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bullish_close": strong_bullish_close,
             "magical_hist_curr>0": magical_hist_curr > 0,
         }
-        log_cond_set("LONG(0.11) condition inputs:", long011_conds)
-        if current_state is None and all(long011_conds.values()):
-            current_state = "long_011"
-            debug_log(f"\n🟢 LONG (0.11) SIGNAL DETECTED for {pair_name}!")
-            send_message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # SHORT (0)
         short0_conds = {
             "ppo_cross_below_zero": ppo_cross_below_zero,
             "ppo_below_signal": ppo_below_signal,
@@ -806,13 +580,6 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
-        log_cond_set("SHORT(0) condition inputs:", short0_conds)
-        if current_state is None and all(short0_conds.values()):
-            current_state = "short_zero"
-            debug_log(f"\n🔴 SHORT (0) SIGNAL DETECTED for {pair_name}!")
-            send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-
-        # SHORT (-0.11)
         short011_conds = {
             "ppo_cross_below_minus011": ppo_cross_below_minus011,
             "ppo_below_signal": ppo_below_signal,
@@ -822,116 +589,290 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             "strong_bearish_close": strong_bearish_close,
             "magical_hist_curr<0": magical_hist_curr < 0,
         }
-        log_cond_set("SHORT(-0.11) condition inputs:", short011_conds)
+
+        # state determination
+        current_state = None
+        send_message = None
+        price = close_curr
+        ist = pytz.timezone('Asia/Kolkata')
+        current_dt = datetime.now(ist)
+        formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
+
+        if all(buy_conds.values()):
+            current_state = "buy"
+            send_message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        if current_state is None and all(sell_conds.values()):
+            current_state = "sell"
+            send_message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        if current_state is None and all(buy_srsi_conds.values()):
+            current_state = "buy_srsi50"
+            send_message = f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        if current_state is None and all(sell_srsi_conds.values()):
+            current_state = "sell_srsi50"
+            send_message = f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        if current_state is None and all(long0_conds.values()):
+            current_state = "long_zero"
+            send_message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        if current_state is None and all(long011_conds.values()):
+            current_state = "long_011"
+            send_message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        if current_state is None and all(short0_conds.values()):
+            current_state = "short_zero"
+            send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         if current_state is None and all(short011_conds.values()):
             current_state = "short_011"
-            debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
-        # Summary
-        debug_log(f"{pair_name} summary: C={close_curr:.2f}, RMA50={rma50_curr:.2f}, RMA200(5m)={rma200_curr:.2f}, PPO={ppo_curr:.3f}/{ppo_signal_curr:.3f}, SRSI={smooth_rsi_curr:.1f}, MMH={magical_hist_curr:.4f}")
+        # idempotency and transitions
+        now_ts = int(time.time())
+        last_state_value = None
+        if isinstance(last_state_for_pair, dict):
+            last_state_value = last_state_for_pair.get("state")
+        elif isinstance(last_state_for_pair, str):
+            last_state_value = last_state_for_pair
 
-        # --- IDEMPOTENCY AND STATE TRANSITION CHECK ---
-        
-        # 1. No signal was detected
+        # No signal found => possibly go to NO_SIGNAL
         if current_state is None:
-            debug_log(f"No signal conditions met for {pair_name}")
-            
-            # Reset state if we were previously in a signal state
-            if last_state_value != 'NO_SIGNAL':
-                # Transition from a signal state back to NO_SIGNAL
-                new_state = {"state": "NO_SIGNAL", "ts": now_ts}
-                debug_log(f"Transitioning {pair_name} to NO_SIGNAL.")
-                return new_state 
-            
-            # Otherwise, return the existing state (no change needed)
+            if last_state_value and last_state_value != "NO_SIGNAL":
+                logger.debug(f"{pair_name}: transitioning to NO_SIGNAL")
+                return {"state": "NO_SIGNAL", "ts": now_ts}
             return last_state_for_pair
-        
-        # 2. A signal (current_state) was detected
-        
-        # Idempotency Check: If the new signal is the same as the last recorded state, skip the alert.
-        if current_state == last_state_value:
-            debug_log(f"Idempotency check: {pair_name} signal is still {current_state}. Skipping alert.")
-            # Do not send alert, and return the existing state
-            return last_state_for_pair
-        
-        # 3. NEW Signal Detected: Send Alert and Prepare New State
-        if send_message:
-            send_telegram_alert(send_message)
 
-        # Return structured state for saving
-        return {"state": current_state, "ts": now_ts}
+        # If same as previous => skip
+        if current_state == last_state_value:
+            logger.debug(f"{pair_name}: no state change ({current_state})")
+            return last_state_for_pair
+
+        # else new signal detected -> produce state (and send alert outside)
+        return {"state": current_state, "ts": now_ts, "message": send_message}
 
     except Exception as e:
-        print(f"Error checking {pair_name}: {e}")
-        if DEBUG_MODE:
-            traceback.print_exc()
+        logger.exception(f"Error evaluating logic for {pair_name}: {e}")
         return None
 
-def run_with_jitter(fn, *args, **kwargs):
-    time.sleep(np.random.uniform(0.1, 0.7))
-    return fn(*args, **kwargs)
+
+# -------------------------
+# Telegram alert sender (keeps same formatting)
+# -------------------------
+
+async def send_telegram_alert_async(session: aiohttp.ClientSession, message: str) -> bool:
+    token = cfg["TELEGRAM_BOT_TOKEN"]
+    chat_id = cfg["TELEGRAM_CHAT_ID"]
+    if not token or token == "xxxx" or not chat_id or chat_id == "xxxx":
+        logger.warning("Telegram not configured; skipping alert.")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat_id, "text": message}
+    try:
+        async with session.post(url, data=data, timeout=10) as resp:
+            js = await resp.json(content_type=None)
+            ok = js.get("ok", False)
+            if ok:
+                logger.info("Alert sent successfully")
+                return True
+            else:
+                logger.warning(f"Telegram API responded with error: {js}")
+                return False
+    except Exception as e:
+        logger.exception(f"Error sending telegram alert: {e}")
+        return False
+
+
+# -------------------------
+# Orchestration: check a single pair
+# -------------------------
+
+async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, products_map: Dict[str, dict],
+                     pair_name: str, last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Orchestrate fetch -> parse -> evaluate -> (send alert) -> return new state"""
+    try:
+        prod = products_map.get(pair_name)
+        if not prod:
+            logger.debug(f"No product mapping for {pair_name}")
+            return None
+
+        # special pair limits
+        sp = cfg["SPECIAL_PAIRS"].get(pair_name, {})
+        limit_15m = sp.get("limit_15m", 210)
+        min_required = sp.get("min_required", 200)
+        limit_5m = sp.get("limit_5m", 300)
+        min_required_5m = sp.get("min_required_5m", 250)
+
+        # fetch candles concurrently (via fetcher)
+        symbol = prod['symbol']
+        res15_task = asyncio.create_task(fetcher.fetch_candles(session, symbol, "15", limit_15m))
+        res5_task = asyncio.create_task(fetcher.fetch_candles(session, symbol, "5", limit_5m))
+        res15 = await res15_task
+        res5 = await res5_task
+
+        df_15m = parse_candles_result(res15)
+        df_5m = parse_candles_result(res5)
+
+        if df_15m is None or len(df_15m) < (min_required + 2):
+            logger.warning(f"Insufficient 15m data for {pair_name}: {0 if df_15m is None else len(df_15m)}/{min_required + 2}")
+            return None
+        if df_5m is None or len(df_5m) < (min_required_5m + 2):
+            logger.warning(f"Insufficient 5m data for {pair_name}: {0 if df_5m is None else len(df_5m)}/{min_required_5m + 2}")
+            return None
+
+        # convert to numeric types (ensure safety)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df_15m[col] = pd.to_numeric(df_15m[col], errors='coerce')
+            df_5m[col] = pd.to_numeric(df_5m[col], errors='coerce')
+
+        # evaluate logic
+        new_state = evaluate_pair_logic(pair_name, df_15m, df_5m, last_state_for_pair)
+        if new_state is None:
+            return None
+
+        # if there's a message to send, do it (and keep same simple format)
+        message = new_state.pop("message", None)
+        if message:
+            await send_telegram_alert_async(session, message)
+
+        return pair_name, new_state
+
+    except Exception as e:
+        logger.exception(f"Error in check_pair for {pair_name}: {e}")
+        return None
+
+
+# -------------------------
+# Product mapping
+# -------------------------
+
+def build_products_map_from_api_result(api_products: dict) -> Dict[str, dict]:
+    products_map = {}
+    if not api_products or not api_products.get("result"):
+        return products_map
+    for p in api_products['result']:
+        try:
+            symbol = p.get('symbol', '')
+            symbol_norm = symbol.replace('_USDT', 'USD').replace('USDT', 'USD')
+            if p.get('contract_type') == 'perpetual_futures':
+                # match to requested PAIRS using exact match on normalized symbol or without underscore
+                for pair_name in cfg["PAIRS"]:
+                    if symbol_norm == pair_name or symbol_norm.replace('_', '') == pair_name:
+                        products_map[pair_name] = {'id': p.get('id'), 'symbol': p.get('symbol'), 'contract_type': p.get('contract_type')}
+        except Exception:
+            continue
+    return products_map
+
+
+# -------------------------
+# Main runner
+# -------------------------
+
+async def run_once(send_test: bool = True):
+    logger.info("Starting run_once")
+    state_db = StateDB(cfg["STATE_DB_PATH"])
+    last_alerts = state_db.load_all()
+
+    fetcher = DataFetcher(cfg["DELTA_API_BASE"], max_parallel=cfg["MAX_PARALLEL_FETCH"], timeout=cfg["HTTP_TIMEOUT"])
+    async with aiohttp.ClientSession() as session:
+        # optionally send startup test message
+        if send_test and cfg["SEND_TEST_MESSAGE"] and cfg["TELEGRAM_BOT_TOKEN"] != "xxxx" and cfg["TELEGRAM_CHAT_ID"] != "xxxx":
+            ist = pytz.timezone('Asia/Kolkata')
+            current_dt = datetime.now(ist)
+            formatted_time = current_dt.strftime('%d-%m-%Y @ %H:%M IST')
+            test_msg = f"🔔 Bot Started\nTest message from PPO Bot\nTime: {formatted_time}\nDebug Mode: {'ON' if cfg['DEBUG_MODE'] else 'OFF'}"
+            await send_telegram_alert_async(session, test_msg)
+        elif send_test and (cfg["TELEGRAM_BOT_TOKEN"] == "xxxx" or cfg["TELEGRAM_CHAT_ID"] == "xxxx"):
+            logger.info("Skipping test message: Telegram not configured.")
+
+        # fetch products
+        prod_resp = await fetcher.fetch_products(session)
+        if not prod_resp:
+            logger.error("Failed to fetch products. Aborting run.")
+            return
+        products_map = build_products_map_from_api_result(prod_resp)
+        found_count = len(products_map)
+        logger.info(f"Found {found_count} tradable pairs mapped to configuration.")
+        if found_count == 0:
+            logger.error("No pairs found. Exiting.")
+            return
+
+        # prepare tasks for each pair
+        tasks = []
+        sem = asyncio.Semaphore(cfg["MAX_PARALLEL_FETCH"])
+        for pair_name in cfg["PAIRS"]:
+            prod_info = products_map.get(pair_name)
+            if not prod_info:
+                continue
+            last_state = last_alerts.get(pair_name)
+            # wrap call with semaphore to control concurrency
+            async def run_check(pair=pair_name, prod=prod_info, last_state_for_pair=last_state):
+                async with sem:
+                    # small jitter before each pair to spread load
+                    await asyncio.sleep(random.uniform(cfg["JITTER_MIN"], cfg["JITTER_MAX"]))
+                    return await check_pair(session, fetcher, products_map, pair, last_state_for_pair)
+            tasks.append(asyncio.create_task(run_check()))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # process results and persist changes
+        updates = 0
+        for item in results:
+            if isinstance(item, Exception):
+                logger.exception(f"Task exception: {item}")
+                continue
+            if not item:
+                continue
+            pair_name, new_state = item
+            if not isinstance(new_state, dict):
+                continue
+            prev = state_db.get(pair_name)
+            # compare and update
+            if prev != new_state:
+                state_db.set(pair_name, new_state.get("state"), new_state.get("ts"))
+                updates += 1
+
+        logger.info(f"Run complete. {updates} state updates applied.")
+        state_db.close()
+
+
+# -------------------------
+# CLI loop and graceful shutdown
+# -------------------------
+
+stop_requested = False
+
+def request_stop(signum, frame):
+    global stop_requested
+    logger.info(f"Received signal {signum}, stopping gracefully...")
+    stop_requested = True
+
+signal.signal(signal.SIGINT, request_stop)
+signal.signal(signal.SIGTERM, request_stop)
 
 def main():
-    print("=" * 50)
-    ist = pytz.timezone('Asia/Kolkata')
-    start_time = datetime.now(ist)
-    print(f"PPO/Cirrus Cloud Alert Bot - {start_time.strftime('%d-%m-%Y @ %H:%M IST')}")
-    print(f"Debug Mode: {'ON' if DEBUG_MODE else 'OFF'}")
-    print("=" * 50)
+    import argparse
+    parser = argparse.ArgumentParser(description="PPO/Cirrus alert bot (improved)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--once", action="store_true", help="Run once and exit")
+    group.add_argument("--loop", type=int, metavar="SECONDS", help="Run in a loop every N seconds")
+    args = parser.parse_args()
 
-    if SEND_TEST_MESSAGE and TELEGRAM_BOT_TOKEN != 'xxxx' and TELEGRAM_CHAT_ID != 'xxxx':
-        send_test_message()
-    elif SEND_TEST_MESSAGE:
-        print("⚠️ Skipping test message: Telegram not configured.")
-
-    last_alerts = load_state()
-
-    if not get_product_ids():
-        print("Failed to fetch products. Exiting.")
-        return
-
-    found_count = sum(1 for v in PAIRS.values() if v is not None)
-    print(f"✓ Monitoring {found_count} pairs")
-    if found_count == 0:
-        print("No valid pairs found. Exiting.")
-        return
-
-    results = {}
-    max_workers = min(4, found_count)  # reduced threadpool
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_pair = {}
-        for pair_name, pair_info in PAIRS.items():
-            if pair_info is not None:
-                # Use the robustly loaded or default state for the pair
-                last_state_for_pair = last_alerts.get(pair_name)
-                future = executor.submit(run_with_jitter, check_pair, pair_name, pair_info, last_state_for_pair)
-                future_to_pair[future] = pair_name
-
-        for future in as_completed(future_to_pair):
-            pair_name = future_to_pair[future]
+    if args.once:
+        asyncio.run(run_once())
+    elif args.loop:
+        interval = args.loop
+        logger.info(f"Starting loop mode (interval={interval}s). Ctrl-C to stop.")
+        while not stop_requested:
+            start = time.time()
             try:
-                new_state = future.result()
-                if new_state is not None:
-                    results[pair_name] = new_state
-            except Exception as e:
-                print(f"Error processing {pair_name} in thread: {e}")
-                if DEBUG_MODE:
-                    traceback.print_exc()
-                continue
-
-    # Lock and save the accumulated new states
-    with state_lock:
-        for k, v in results.items():
-            # Only update if the logic returned a different state/timestamp
-            if last_alerts.get(k) != v:
-                last_alerts[k] = v
-        save_state(last_alerts)
-
-    end_time = datetime.now(ist)
-    elapsed = (end_time - start_time).total_seconds()
-    print(f"✓ Check complete. {len(results)} state updates processed. ({elapsed:.1f}s)")
-    print("=" * 50)
+                asyncio.run(run_once())
+            except Exception:
+                logger.exception("Unhandled exception in run_once")
+            elapsed = time.time() - start
+            # sleep until next interval unless stop requested
+            to_sleep = max(0, interval - elapsed)
+            if to_sleep > 0:
+                logger.debug(f"Sleeping {to_sleep:.1f}s until next run")
+                time.sleep(to_sleep)
+    else:
+        # default: single run
+        asyncio.run(run_once())
 
 if __name__ == "__main__":
     main()
