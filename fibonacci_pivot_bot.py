@@ -118,7 +118,7 @@ def save_state(state):
             shutil.copy(STATE_FILE, STATE_FILE_BAK)
         except Exception as e:
             logger.debug(f"Could not write backup state: {e}")
-        logger.debug(f"Saved state: {state}")
+        logger.info(f"Saved state to {STATE_FILE}: {state}")
     except Exception as e:
         logger.error(f"Error saving state: {e}")
 
@@ -213,7 +213,6 @@ def get_candles(product_id, resolution="15", limit=150):
         data = safe_json(response, context=f"get_candles({product_id},{resolution})")
         if data.get('success') and data.get('result'):
             result = data['result']
-            # Validate keys exist
             for k in ['t', 'o', 'h', 'l', 'c', 'v']:
                 if k not in result:
                     logger.error(f"Missing key {k} in candle result for {product_id}")
@@ -227,7 +226,6 @@ def get_candles(product_id, resolution="15", limit=150):
                 'volume': result['v']
             })
             df = df.sort_values('timestamp').reset_index(drop=True)
-            # Basic sanity checks
             if df.empty or df[['open', 'high', 'low', 'close']].isnull().any().any():
                 logger.warning(f"NaNs in candle data for {product_id} {resolution}m")
             return df
@@ -481,7 +479,7 @@ def check_pair(pair_name, pair_info, last_alerts):
         rma_200_available = False
         df_5m = get_candles(pair_info['symbol'], "5", limit=limit_5m)
         if df_5m is None or len(df_5m) < min_required_5m:
-            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {len(df_5m) if df_5m is not None else 0})")
+            log(f"⚠️  5m data insufficient for {pair_name} (need {min_required_5m}, got {len[df_5m] if df_5m is not None else 0})")
             log("RMA 200 5m check will be skipped - using only RMA 50 15m")
         else:
             rma_200_5m = calculate_rma(df_5m['close'], 200)
@@ -708,6 +706,12 @@ def main():
             logger.error(f"Failed to delete state file: {e}")
 
     last_alerts = load_state()
+
+    # Ensure all pairs exist in state (creates fib_state.json with keys even if no signals)
+    for pair in PAIRS.keys():
+        if pair not in last_alerts:
+            last_alerts[pair] = None
+
     keys_to_purge = []
     for key, value in list(last_alerts.items()):
         if value:
@@ -721,12 +725,15 @@ def main():
 
     if not get_product_ids():
         logger.error("Failed to fetch products. Exiting.")
+        # Save initialized state so fib_state.json exists
+        save_state(last_alerts)
         return
 
     found_count = sum(1 for v in PAIRS.values() if v is not None)
     logger.info(f"✓ Monitoring {found_count} pairs")
     if found_count == 0:
         logger.error("No valid pairs found. Exiting.")
+        save_state(last_alerts)
         return
 
     updates_processed = 0
@@ -757,6 +764,7 @@ def main():
                     print(log_output, end='')
             logger.debug("SEQUENTIAL DEBUG LOGS END")
 
+    # Always save, even if no updates, to ensure file exists and is tracked
     save_state(last_alerts)
     end_time = datetime.now(ist)
     elapsed = (end_time - start_time).total_seconds()
