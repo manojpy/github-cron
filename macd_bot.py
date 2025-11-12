@@ -488,9 +488,9 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             print(f"⚠️ Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{min_required_5m + 2} candles (needs +2 for closed indexing)")
             return None
 
-        # Use last fully closed candle indices
-        last_i = -2
-        prev_i = -3
+        # Use most recent fully closed candle indices (Option 1)
+        last_i = -1
+        prev_i = -2
 
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         magical_hist_curr = float(magical_hist.iloc[last_i])
@@ -531,8 +531,8 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             debug_log(f"⚠️ NaN values in RMA50 for {pair_name}, skipping")
             return None
 
-        # Use last closed 5m RMA200
-        rma200_curr = float(rma_200.iloc[-2])
+        # Use most recent closed 5m RMA200
+        rma200_curr = float(rma_200.iloc[-1])
         if pd.isna(rma200_curr):
             debug_log(f"⚠️ NaN values in RMA200 for {pair_name}, skipping")
             return None
