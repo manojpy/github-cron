@@ -1,0 +1,11 @@
+{"DEBUG_MODE": false,
+  "SEND_TEST_MESSAGE": false,
+  "STATE_DB_PATH": "macd_state.sqlite",
+  "LOG_FILE": "macd_bot.log",
+  "STATE_EXPIRY_DAYS": 30,
+  "DELTA_API_BASE": "https://api.india.delta.exchange",
+  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
+    "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
+    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+  "MAX_PARALLEL_FETCH": 8,
+  "HTTP_TIMEOUT": 15}
