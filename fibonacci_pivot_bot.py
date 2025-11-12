@@ -496,6 +496,36 @@ def check_pair(pair_name, pair_info, last_alerts):
         is_green_candle = close_prev > open_prev
         is_red_candle = close_prev < open_prev
 
+        # Candle-aware wick checks: 20% threshold relative to total range
+        candle_range = high_prev - low_prev
+        upper_wick_ok = False
+        lower_wick_ok = False
+        upper_wick_ratio = np.nan
+        lower_wick_ratio = np.nan
+
+        if candle_range > 0:
+            if is_green_candle:
+                upper_wick_length = high_prev - close_prev
+                upper_wick_ratio = upper_wick_length / candle_range
+                upper_wick_ok = upper_wick_ratio < 0.20
+                lower_wick_ok = True  # not used for green candles
+            elif is_red_candle:
+                lower_wick_length = close_prev - low_prev
+                lower_wick_ratio = lower_wick_length / candle_range
+                lower_wick_ok = lower_wick_ratio < 0.20
+                upper_wick_ok = True  # not used for red candles
+            else:
+                # Doji/neutral fallback (rare)
+                upper_wick_length = high_prev - max(open_prev, close_prev)
+                lower_wick_length = min(open_prev, close_prev) - low_prev
+                upper_wick_ratio = upper_wick_length / candle_range
+                lower_wick_ratio = lower_wick_length / candle_range
+                upper_wick_ok = upper_wick_ratio < 0.20
+                lower_wick_ok = lower_wick_ratio < 0.20
+        else:
+            upper_wick_ok = lower_wick_ok = False
+
+        # RMA gates
         if rma_200_available:
             rma_long_ok = (rma_50_15m_curr < close_prev) and (rma_200_5m_curr < close_prev)
             rma_short_ok = (rma_50_15m_curr > close_prev) and (rma_200_5m_curr > close_prev)
@@ -504,16 +534,6 @@ def check_pair(pair_name, pair_info, last_alerts):
             rma_long_ok = (rma_50_15m_curr < close_prev)
             rma_short_ok = (rma_50_15m_curr > close_prev)
             log("Using only RMA 50 15m (RMA 200 5m unavailable)")
-
-        candle_range = high_prev - low_prev
-        if candle_range <= 0:
-            upper_wick_check = False
-            lower_wick_check = False
-        else:
-            upper_wick_length = high_prev - max(open_prev, close_prev)
-            lower_wick_length = min(open_prev, close_prev) - low_prev
-            upper_wick_check = (upper_wick_length / candle_range) < 0.20
-            lower_wick_check = (lower_wick_length / candle_range) < 0.20
 
         price_change_pct = abs((close_prev - open_prev) / open_prev) * 100
         if price_change_pct > 10:
@@ -530,6 +550,16 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Cirrus Cloud state (exclusive) — latest closed candle
         cloud_state = get_cloud_state(upw, dnw, idx=-1)
         log(f"Cirrus Cloud State: {cloud_state}")
+
+        # Gate summary (compact)
+        log(
+            f"Gates: cloud={cloud_state}, "
+            f"red={is_red_candle}, green={is_green_candle}, "
+            f"upper_wick_ok={upper_wick_ok}({upper_wick_ratio if not np.isnan(upper_wick_ratio) else 'n/a'}), "
+            f"lower_wick_ok={lower_wick_ok}({lower_wick_ratio if not np.isnan(lower_wick_ratio) else 'n/a'}), "
+            f"rma_long_ok={rma_long_ok}, rma_short_ok={rma_short_ok}, "
+            f"hist={magical_hist_curr:.4f}"
+        )
 
         # Pivot crossovers on latest closed candle
         long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
@@ -555,14 +585,14 @@ def check_pair(pair_name, pair_info, last_alerts):
         # Base gates with Cirrus exclusivity
         base_long_ok = (
             (cloud_state == "green") and
-            upper_wick_check and
+            upper_wick_ok and
             rma_long_ok and
             (magical_hist_curr > 0) and
             is_green_candle
         )
         base_short_ok = (
             (cloud_state == "red") and
-            lower_wick_check and
+            lower_wick_ok and
             rma_short_ok and
             (magical_hist_curr < 0) and
             is_red_candle
