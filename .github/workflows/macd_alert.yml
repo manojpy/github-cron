@@ -41,7 +41,7 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'False'
+        DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'False'
         STATE_FILE_PATH: macd_state.json 
       run: python macd_bot.py
@@ -51,11 +51,15 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        DEBUG_MODE: 'False'
+        DEBUG_MODE: 'True'
         SEND_TEST_MESSAGE: 'False'
         STATE_FILE_PATH: fib_state.json
       run: python fibonacci_pivot_bot.py
-      
+
+    # --- NEW: Debug step to confirm JSON files exist ---
+    - name: List files after run
+      run: ls -l
+    
     # --- 3. Commit and Push ONLY main state files ---
     - name: Commit and Push state files
       uses: stefanzweifel/git-auto-commit-action@v5
