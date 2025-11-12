@@ -93,72 +93,99 @@ def debug_log(message):
         print(f"[DEBUG] {message}")
 
 def load_state():
-    """Load previous alert state from file with backup recovery and schema validation"""
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
+    """
+    Load previous alert state from file with backup recovery.
+    Initializes a 'NO_SIGNAL' state for all pairs if files are missing.
+    """
+    
+    def _initialize_default_state():
+        """Returns a clean state for all monitored pairs."""
+        return {pair: {"state": "NO_SIGNAL", "ts": 0} for pair in PAIRS.keys()}
+
+    def _safe_load(filepath):
+        """Attempts to load and validate state from a specific path."""
+        try:
+            if not os.path.exists(filepath):
+                return None
+            
+            with open(filepath, 'r') as f:
                 state = json.load(f)
+            
             if not isinstance(state, dict):
+                # Schema validation failed
                 raise ValueError("State file is not a dict")
-            # normalize schema: {pair: {"state": str, "ts": int}}
+
+            # Normalize schema to {pair: {"state": str, "ts": int}} and filter for known PAIRS
             normalized = {}
             for k, v in state.items():
-                if isinstance(v, dict):
-                    s = v.get("state")
-                    ts = v.get("ts", 0)
-                    if isinstance(s, str):
-                        normalized[k] = {"state": s, "ts": int(ts)}
-                elif isinstance(v, str):
-                    normalized[k] = {"state": v, "ts": 0}
-            debug_log(f"Loaded state: {normalized}")
+                # Only accept pairs we are monitoring
+                if k in PAIRS:
+                    if isinstance(v, dict):
+                        s = v.get("state")
+                        ts = v.get("ts", 0)
+                        if isinstance(s, str):
+                            normalized[k] = {"state": s, "ts": int(ts)}
+                    elif isinstance(v, str):
+                        # Handle old schema: value was just the state string
+                        normalized[k] = {"state": v, "ts": 0}
             return normalized
-    except Exception as e:
-        print(f"Error loading state: {e}")
-        # Try backup
-        try:
-            if os.path.exists(STATE_FILE_BAK):
-                with open(STATE_FILE_BAK, 'r') as f:
-                    state = json.load(f)
-                if isinstance(state, dict):
-                    print("Recovered state from backup.")
-                    normalized = {}
-                    for k, v in state.items():
-                        if isinstance(v, dict):
-                            s = v.get("state")
-                            ts = v.get("ts", 0)
-                            if isinstance(s, str):
-                                normalized[k] = {"state": s, "ts": int(ts)}
-                        elif isinstance(v, str):
-                            normalized[k] = {"state": v, "ts": 0}
-                    return normalized
-        except Exception as e2:
-            print(f"Backup state load failed: {e2}")
-    debug_log("No previous state found or recovery failed, starting fresh")
-    return {}
+        except Exception as e:
+            print(f"Error reading state file {filepath}: {e}")
+            return None
+
+    # 1. Try primary file
+    loaded_state = _safe_load(STATE_FILE)
+    if loaded_state is not None:
+        debug_log(f"Loaded primary state (partial): {loaded_state}")
+    
+    # 2. Try backup file if primary failed
+    if loaded_state is None:
+        loaded_state = _safe_load(STATE_FILE_BAK)
+        if loaded_state is not None:
+            print("Recovered state from backup.")
+            debug_log(f"Loaded backup state (partial): {loaded_state}")
+
+    # 3. Combine with default state for all PAIRS
+    final_state = _initialize_default_state()
+    if loaded_state is not None:
+        # Merge loaded state over default state, filling in missing pairs with default
+        final_state.update(loaded_state)
+        
+    if loaded_state is None:
+         debug_log("No previous state found or recovery failed, starting fresh (NO_SIGNAL)")
+
+    return final_state
 
 def save_state(state):
-    """Save alert state to file atomically with backup and fsync"""
+    """Save alert state to file atomically with backup creation and fsync."""
     try:
         temp_file = STATE_FILE + '.tmp'
+        
+        # 1. Write the new state to a temporary file
         with open(temp_file, 'w') as f:
-            json.dump(state, f)
+            json.dump(state, f, indent=4)
             f.flush()
-            os.fsync(f.fileno())
-        # Write backup from existing file
+            # Ensure data is written to the physical disk (important for robustness)
+            os.fsync(f.fileno()) 
+
+        # 2. Rename existing state file to backup (atomic backup)
         if os.path.exists(STATE_FILE):
             try:
-                with open(STATE_FILE, 'r') as f:
-                    existing = f.read()
-                with open(STATE_FILE_BAK, 'w') as fb:
-                    fb.write(existing)
-                    fb.flush()
-                    os.fsync(fb.fileno())
+                # os.replace is atomic on most modern OS filesystems (like rename)
+                # It replaces the destination file if it exists.
+                os.replace(STATE_FILE, STATE_FILE_BAK) 
             except Exception as e:
-                print(f"Warning: could not write backup: {e}")
-        os.replace(temp_file, STATE_FILE)  # Atomic on POSIX
+                # If rename fails (e.g., file lock, permissions), log a warning but proceed
+                print(f"Warning: could not rename primary file to backup: {e}")
+        
+        # 3. Atomically replace the old state file (or backup) with the new temporary file
+        os.replace(temp_file, STATE_FILE)
+        
         debug_log(f"Saved state: {state}")
     except Exception as e:
         print(f"Error saving state: {e}")
+        if DEBUG_MODE:
+            traceback.print_exc()
 
 def send_telegram_alert(message):
     """Send alert message via Telegram with validation and safe JSON parsing"""
@@ -801,17 +828,38 @@ def check_pair(pair_name, pair_info, last_state_for_pair):
             debug_log(f"\n🔴 SHORT (-0.11) SIGNAL DETECTED for {pair_name}!")
             send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
-        # Summary and final decision
+        # Summary
         debug_log(f"{pair_name} summary: C={close_curr:.2f}, RMA50={rma50_curr:.2f}, RMA200(5m)={rma200_curr:.2f}, PPO={ppo_curr:.3f}/{ppo_signal_curr:.3f}, SRSI={smooth_rsi_curr:.1f}, MMH={magical_hist_curr:.4f}")
 
+        # --- IDEMPOTENCY AND STATE TRANSITION CHECK ---
+        
+        # 1. No signal was detected
         if current_state is None:
             debug_log(f"No signal conditions met for {pair_name}")
-            return None
-
+            
+            # Reset state if we were previously in a signal state
+            if last_state_value != 'NO_SIGNAL':
+                # Transition from a signal state back to NO_SIGNAL
+                new_state = {"state": "NO_SIGNAL", "ts": now_ts}
+                debug_log(f"Transitioning {pair_name} to NO_SIGNAL.")
+                return new_state 
+            
+            # Otherwise, return the existing state (no change needed)
+            return last_state_for_pair
+        
+        # 2. A signal (current_state) was detected
+        
+        # Idempotency Check: If the new signal is the same as the last recorded state, skip the alert.
+        if current_state == last_state_value:
+            debug_log(f"Idempotency check: {pair_name} signal is still {current_state}. Skipping alert.")
+            # Do not send alert, and return the existing state
+            return last_state_for_pair
+        
+        # 3. NEW Signal Detected: Send Alert and Prepare New State
         if send_message:
             send_telegram_alert(send_message)
 
-        # Return structured state
+        # Return structured state for saving
         return {"state": current_state, "ts": now_ts}
 
     except Exception as e:
@@ -855,6 +903,7 @@ def main():
         future_to_pair = {}
         for pair_name, pair_info in PAIRS.items():
             if pair_info is not None:
+                # Use the robustly loaded or default state for the pair
                 last_state_for_pair = last_alerts.get(pair_name)
                 future = executor.submit(run_with_jitter, check_pair, pair_name, pair_info, last_state_for_pair)
                 future_to_pair[future] = pair_name
@@ -871,9 +920,12 @@ def main():
                     traceback.print_exc()
                 continue
 
+    # Lock and save the accumulated new states
     with state_lock:
         for k, v in results.items():
-            last_alerts[k] = v  # structured state
+            # Only update if the logic returned a different state/timestamp
+            if last_alerts.get(k) != v:
+                last_alerts[k] = v
         save_state(last_alerts)
 
     end_time = datetime.now(ist)
