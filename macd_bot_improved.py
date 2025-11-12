@@ -1,38 +1,3 @@
-#!/usr/bin/env python3
-"""
-macd_bot_improved.py
-Improved version of your PPO/Cirrus alert bot.
-
-Key improvements included (per your request):
- - Async concurrent HTTP fetching for candles + product list (aiohttp, asyncio)
- - Config file support (config.json) with environment overrides
- - SQLite-based state store (atomic, durable) instead of JSON file
- - Modular structure: smaller functions for fetch / compute / evaluate / persist
- - Retry + exponential backoff for network calls
- - Rotating file logging + console logs
- - CLI: --once (single run) and --loop <seconds> (periodic)
- - Data validation and graceful skip logic for stale/insufficient data
- - Jitter to avoid thundering herd
- - Optional in-memory caching
- - Preserves original alert formatting (no enrichment)
-
-Dependencies:
- - aiohttp
- - pandas
- - numpy
- - pytz
- - python-dateutil (optional, but pandas handles parsing)
-Install with:
- pip install aiohttp pandas numpy pytz
-
-Run:
- python macd_bot_improved.py --once
- python macd_bot_improved.py --loop 900
-
-Note: keep your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in env or config.json.
-
-"""
-
 import os
 import sys
 import json
