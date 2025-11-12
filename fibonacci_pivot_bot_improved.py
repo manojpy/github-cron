@@ -190,7 +190,7 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
         cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("SELECT value FROM metadata WHERE key='last_prune'")
         row = cur.fetchone()
-        today = datetime.utcnow().date()
+        today = datetime.now(datetime.UTC).date()
         if row:
             try:
                 last_prune_date = datetime.fromisoformat(row[0]).date()
