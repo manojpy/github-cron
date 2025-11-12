@@ -1,5 +1,0 @@
-{"STATE_EXPIRY_DAYS": 30,
-  "DEBUG_MODE": true,
-  "SEND_TEST_MESSAGE": true,
-  "STATE_DB_PATH": "macd_state.sqlite",
-  "LOG_FILE": "macd_bot.log"}
