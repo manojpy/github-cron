@@ -1,9 +1,9 @@
 name: Trading Alert Bots
 
 on:
-  workflow_dispatch:
-  # schedule:
-  #   - cron: '1,16,31,46 * * * *'
+  workflow_dispatch:     # Manual trigger
+  # schedule:            # Optional: Uncomment if you want GitHub-native scheduling
+  #   - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46
 
 concurrency:
   group: trading-alert-bots
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 10   # allow a bit more time if API is slow
 
     steps:
       - name: Checkout code
@@ -38,7 +38,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Run MACD Bot (Improved) ---
+      # --- 1️⃣ Run MACD Bot (Improved) ---
       - name: Run MACD Bot (Improved)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -49,38 +49,41 @@ jobs:
           LOG_FILE: macd_bot.log
         run: python macd_bot_improved.py --once
 
-      # --- Run Fibonacci Pivot Bot ---
-      - name: Run Fibonacci Pivot Bot
+      # --- 2️⃣ Run Fibonacci Pivot Bot (Improved) ---
+      - name: Run Fibonacci Pivot Bot (Improved)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DEBUG_MODE: 'True'
           SEND_TEST_MESSAGE: 'True'
-          STATE_FILE_PATH: fib_state.json
-        run: python fibonacci_pivot_bot.py
+          STATE_DB_PATH: fib_state.sqlite
+          LOG_FILE: fibonacci_pivot_bot.log
+        run: python fibonacci_pivot_bot_improved.py --once
 
-      # --- Debug / Inspect ---
+      # --- 3️⃣ Debug step: verify logs and state files ---
       - name: List files after run
         run: ls -l
 
-      # --- Upload Logs (optional) ---
-      - name: Upload MACD Bot Logs
+      # --- 4️⃣ Upload logs as artifacts (optional but helpful) ---
+      - name: Upload Bot Logs
         uses: actions/upload-artifact@v4
         with:
-          name: macd_bot_logs
-          path: macd_bot.log
+          name: bot_logs
+          path: |
+            macd_bot.log
+            fibonacci_pivot_bot.log
 
-      # --- Cleanup ---
+      # --- 5️⃣ Clean up backup files ---
       - name: Remove backup files
         run: |
           rm -f *.bak || true
 
-      # --- Commit and Push State Files ---
+      # --- 6️⃣ Commit and Push updated state DBs ---
       - name: Commit and Push state files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update bot states [skip ci]"
-          file_pattern: "*.json *.sqlite"
+          file_pattern: "*.sqlite"
           add_options: '--force'
           status_options: '--untracked-files=no'
           commit_options: '--allow-empty'
