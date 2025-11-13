@@ -5,11 +5,9 @@
   "STATE_EXPIRY_DAYS": 30,
   "DELTA_API_BASE": "https://api.india.delta.exchange",
 
-  "PAIRS": [
-    "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
+  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
     "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
-    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"
-  ],
+    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
 
   "MAX_PARALLEL_FETCH": 8,
   "HTTP_TIMEOUT": 15,
