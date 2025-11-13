@@ -11,6 +11,7 @@ import sqlite3
 import traceback
 import signal
 import html
+import fcntl  # FIXED: Explicitly imported
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List, Union
@@ -22,7 +23,7 @@ import pytz
 from aiohttp import ClientConnectorError, ClientResponseError
 from logging.handlers import RotatingFileHandler
 
-# NEW: Pydantic V2 imports
+# Pydantic V2 imports
 try:
     from pydantic import BaseModel, field_validator
 except ImportError:
@@ -30,7 +31,7 @@ except ImportError:
     sys.exit(4)
 
 # -------------------------
-# CONFIGURATION MODEL (Pydantic V2)
+# CONFIGURATION MODEL
 # -------------------------
 class Config(BaseModel):
     TELEGRAM_BOT_TOKEN: str
@@ -93,7 +94,6 @@ EXIT_API_FAILURE = 5
 # LOAD CONFIGURATION
 # -------------------------
 def load_config() -> Config:
-    """Load and validate configuration with environment override"""
     config_dict = {
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc"),
         "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "203813932"),
@@ -1244,10 +1244,11 @@ def request_stop(signum, frame):
 
 def main():
     """Entry point with process locking"""
-    # Register signal handlers inside main
+    # Register signal handlers
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     
+    # Acquire process lock
     lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
     if not lock.acquire():
         logger.error("❌ Another instance is running or stale lock exists. Exiting.")
