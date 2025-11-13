@@ -999,38 +999,52 @@ async def evaluate_pair_async(
         last_state_pair = last_state
         suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
 
+        # Replace the message construction section with this:
+
         if vbuy:
             current_signal = "vbuy"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
+                vwap_str = f"{vwap_curr:,.2f}"
+                ppo_str = f"{ppo_curr:.2f}"
+                price_str = f"{close_c:,.2f}"
                 message = (f"{up_sig} {sanitize_for_telegram(pair_name)} - VBuy\n"
-                          f"Closed Above VWAP (${sanitize_for_telegram(vwap_curr:,.2f)})\n"
-                          f"PPO 15m: {sanitize_for_telegram(ppo_curr:.2f)}\n"
-                          f"Price: ${sanitize_for_telegram(close_c:,.2f)}\n"
-                          f"{human_ts()}")
+                           f"Closed Above VWAP (${vwap_str})\n"
+                           f"PPO 15m: {ppo_str}\n"
+                           f"Price: ${price_str}\n"
+                           f"{human_ts()}")
         elif vsell:
             current_signal = "vsell"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
+                vwap_str = f"{vwap_curr:,.2f}"
+                ppo_str = f"{ppo_curr:.2f}"
+                price_str = f"{close_c:,.2f}"
                 message = (f"{down_sig} {sanitize_for_telegram(pair_name)} - VSell\n"
-                          f"Closed Below VWAP (${sanitize_for_telegram(vwap_curr:,.2f)})\n"
-                          f"PPO 15m: {sanitize_for_telegram(ppo_curr:.2f)}\n"
-                          f"Price: ${sanitize_for_telegram(close_c:,.2f)}\n"
-                          f"{human_ts()}")
+                           f"Closed Below VWAP (${vwap_str})\n"
+                           f"PPO 15m: {ppo_str}\n"
+                           f"Price: ${price_str}\n"
+                           f"{human_ts()}")
         elif fib_long:
             current_signal = f"fib_long_{long_crossover_name}"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
+                line_str = f"{long_crossover_line:,.2f}"
+                ppo_str = f"{ppo_curr:.2f}"
+                price_str = f"{close_c:,.2f}"
                 message = (f"{up_sig} {sanitize_for_telegram(pair_name)} - FIB LONG\n"
-                          f"Closed Above {sanitize_for_telegram(long_crossover_name)} (${sanitize_for_telegram(long_crossover_line:,.2f)})\n"
-                          f"PPO 15m: {sanitize_for_telegram(ppo_curr:.2f)}\n"
-                          f"Price: ${sanitize_for_telegram(close_c:,.2f)}\n"
-                          f"{human_ts()}")
+                           f"Closed Above {sanitize_for_telegram(long_crossover_name)} (${line_str})\n"
+                           f"PPO 15m: {ppo_str}\n"
+                           f"Price: ${price_str}\n"
+                           f"{human_ts()}")
         elif fib_short:
             current_signal = f"fib_short_{short_crossover_name}"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
+                line_str = f"{short_crossover_line:,.2f}"
+                ppo_str = f"{ppo_curr:.2f}"
+                price_str = f"{close_c:,.2f}"
                 message = (f"{down_sig} {sanitize_for_telegram(pair_name)} - FIB SHORT\n"
-                          f"Closed Below {sanitize_for_telegram(short_crossover_name)} (${sanitize_for_telegram(short_crossover_line:,.2f)})\n"
-                          f"PPO 15m: {sanitize_for_telegram(ppo_curr:.2f)}\n"
-                          f"Price: ${sanitize_for_telegram(close_c:,.2f)}\n"
-                          f"{human_ts()}")
+                           f"Closed Below {sanitize_for_telegram(short_crossover_name)} (${line_str})\n"
+                           f"PPO 15m: {ppo_str}\n"
+                           f"Price: ${price_str}\n"
+                           f"{human_ts()}")
 
         if current_signal is None:
             prev_state_val = last_state_pair.get("state") if last_state_pair else None
