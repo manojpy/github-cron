@@ -96,8 +96,8 @@ logger.addHandler(ch)
 # Rotating file handler
 try:
     fh = RotatingFileHandler(cfg["LOG_FILE"], maxBytes=2_000_000, backupCount=5, encoding="utf-8")
-
-fh.setLevel(logging.DEBUG)
+    # These lines must be indented inside the 'try' block
+    fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 except Exception as e:
