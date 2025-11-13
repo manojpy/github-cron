@@ -742,8 +742,8 @@ async def evaluate_pair_async(session: aiohttp.ClientSession, fetcher: DataFetch
         fib_short = base_short_ok and (short_crossover_line is not None)
 
         # compose signals with triangle emojis (user requested upward green and downward red triangles)
-        up_sig = "🟢🔺"  # upward green triangle visual: green circle + triangle
-        down_sig = "🔴🔻"  # downward red triangle
+        up_sig = "🟢⬆️"  # upward green triangle visual: green circle + triangle
+        down_sig = "🔴⬇️"  # downward red triangle
 
         # decide current_signal string identical to earlier naming for state persistence
         current_signal = None
