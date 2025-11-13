@@ -1,14 +1,13 @@
 name: Trading Alert Bots
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:     # Manual trigger
   #schedule:
-    # Run every 15 minutes (at :01, :16, :31, :46)
-   # - cron: '1,16,31,46 * * * *'
+  #  - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46
 
 concurrency:
   group: trading-alert-bots
-  cancel-in-progress: false  # Changed: Let previous run finish
+  cancel-in-progress: false  # Let previous runs finish
 
 jobs:
   run-bot:
@@ -45,13 +44,13 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'False'        # Change to False in production
+          DEBUG_MODE: 'False'
           SEND_TEST_MESSAGE: 'False'
           STATE_DB_PATH: macd_state.sqlite
           LOG_FILE: macd_bot.log
           CONFIG_FILE: config_macd.json
         run: python macd_bot_improved.py --once
-        continue-on-error: true      # Added: Don't stop if this fails
+        continue-on-error: true
 
       # --- Run Fibonacci Pivot Bot ---
       - name: Run Fibonacci Pivot Bot (Improved)
@@ -65,30 +64,36 @@ jobs:
           LOG_FILE: fibonacci_pivot_bot.log
           CONFIG_FILE: config_fib.json
         run: python fibonacci_pivot_bot_improved.py --once
-        continue-on-error: true      # Added: Don't stop if this fails
+        continue-on-error: true
 
-      # --- Upload logs (only if they exist) ---
+      # --- Upload logs (always) ---
       - name: Upload Bot Logs
         uses: actions/upload-artifact@v4
-        if: always()  # Run even if previous steps fail
+        if: always()
         with:
           name: bot_logs
           path: |
             macd_bot.log
             fibonacci_pivot_bot.log
-          retention-days: 7  # Auto-delete old logs
+          retention-days: 7
 
-      # --- Commit state files (with timestamp) ---
+      # --- Commit with retry logic ---
       - name: Commit and Push state files
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Update bot states [skip ci] - $(date)"
-          file_pattern: "*.sqlite"
-          add_options: '--force'
-          status_options: '--untracked-files=no'
-          commit_options: '--allow-empty'
-          skip_dirty_check: true
-
-      # --- Optional: Clean up old log backups ---
-      - name: Clean up old log backups
-        run: find . -name "*.log.*" -type f -mtime +7 -delete || true
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add *.sqlite --force
+          git commit -m "Update bot states [skip ci]" --allow-empty
+          
+          # Retry push up to 3 times
+          for i in {1..3}; do
+            if git push; then
+              echo "✅ Push successful"
+              exit 0
+            fi
+            echo "❌ Push failed, attempt $i/3. Retrying in 5 seconds..."
+            sleep 5
+          done
+          
+          echo "⚠️ Failed to push after 3 attempts. Continuing workflow..."
+        continue-on-error: true
