@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+
+  #!/usr/bin/env python3
 # python 3.12+
 """
 Improved Fibonacci Pivot Bot
@@ -96,6 +97,48 @@ class Config(BaseModel):
         return v
 
 # -------------------------
+# DEFAULT CONFIG DEFINITION (FIX for NameError)
+# -------------------------
+DEFAULT_CONFIG = {
+    "TELEGRAM_BOT_TOKEN": "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc",
+    "TELEGRAM_CHAT_ID": "203813932",
+    "DEBUG_MODE": False,
+    "SEND_TEST_MESSAGE": True,
+    "RESET_STATE": False,
+    "DELTA_API_BASE": "https://api.india.delta.exchange",
+    "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+    "SPECIAL_PAIRS": {"SOLUSD": {"limit_15m": 210,"min_required": 180,"limit_5m": 300,"min_required_5m": 200}},
+    "PPO_FAST": 7,
+    "PPO_SLOW": 16,
+    "PPO_SIGNAL": 5,
+    "PPO_USE_SMA": False,
+    "X1": 22,
+    "X2": 9,
+    "X3": 15,
+    "X4": 5,
+    "PIVOT_LOOKBACK_PERIOD": 15,
+    "STATE_DB_PATH": "fib_state.sqlite",
+    "LOG_FILE": "fibonacci_pivot_bot.log",
+    "MAX_CONCURRENCY": 6,
+    "HTTP_TIMEOUT": 15,
+    "FETCH_RETRIES": 3,
+    "FETCH_BACKOFF": 1.5,
+    "JITTER_MIN": 0.05,
+    "JITTER_MAX": 0.6,
+    "STATE_EXPIRY_DAYS": 30,
+    "DUPLICATE_SUPPRESSION_SECONDS": 3600,
+    "EXTREME_CANDLE_PCT": 8.0,
+    "RUN_LOOP_INTERVAL": 900,
+    "MAX_EXEC_TIME": 25,
+    "USE_RMA200": True,
+    "PRODUCTS_CACHE_TTL": 86400,
+    "LOG_LEVEL": "INFO",
+    "TELEGRAM_RETRIES": 3,
+    "TELEGRAM_BACKOFF_BASE": 2.0,
+    "MEMORY_LIMIT_BYTES": 400_000_000,
+}
+
+# -------------------------
 # EXIT CODES
 # -------------------------
 EXIT_SUCCESS = 0
@@ -109,8 +152,8 @@ EXIT_API_FAILURE = 5
 # -------------------------
 def load_config() -> Config:
     config_dict = {
-        "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc"),
-        "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "203813932"),
+        "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "xxxx"),
+        "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "xxxx"),
         "DEBUG_MODE": os.getenv("DEBUG_MODE", "True").lower() == "true",
         "SEND_TEST_MESSAGE": os.getenv("SEND_TEST_MESSAGE", "True").lower() == "true",
         "RESET_STATE": os.getenv("RESET_STATE", "False").lower() == "true",
@@ -237,7 +280,8 @@ class ProcessLock:
         self.fd = None
 
     def acquire(self) -> bool:
-        """Acquire exclusive lock. Returns True if successful."""
+        """Acquire exclusive lock.
+Returns True if successful."""
         try:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             self.fd = open(self.lock_path, 'w')
@@ -250,7 +294,8 @@ class ProcessLock:
                 if self.lock_path.exists():
                     with open(self.lock_path, 'r') as f:
                         raw = f.read().strip()
-                        old_pid = int(raw) if raw.isdigit() else None
+
+                    old_pid = int(raw) if raw.isdigit() else None
                     if old_pid and not os.path.exists(f"/proc/{old_pid}"):
                         logger.warning(f"Removing stale lock from PID {old_pid}")
                         try:
@@ -258,6 +303,7 @@ class ProcessLock:
                         except Exception:
                             pass
                         return self.acquire()
+
             except Exception:
                 pass
             if self.fd:
@@ -273,11 +319,13 @@ class ProcessLock:
             if self.fd:
                 try:
                     fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+
                 except Exception:
                     pass
                 try:
                     self.fd.close()
                 except Exception:
+
                     pass
             try:
                 self.lock_path.unlink(missing_ok=True)
@@ -308,6 +356,7 @@ class CircuitBreaker:
                 raise Exception("Circuit breaker is OPEN")
 
         try:
+
             result = await func()
             if self.state == "HALF_OPEN":
                 logger.info("Circuit breaker: CLOSED (recovery successful)")
@@ -315,12 +364,14 @@ class CircuitBreaker:
             self.state = "CLOSED"
             return result
         except ClientConnectorError:
+
             self.failures += 1
             self.last_failure = time.time()
             METRICS["network_errors"] += 1
             if self.failures >= self.threshold:
                 self.state = "OPEN"
                 logger.error(f"Circuit breaker OPEN after {self.failures} network failures")
+
             raise
         except Exception as e:
             self.failures += 1
@@ -328,6 +379,7 @@ class CircuitBreaker:
             METRICS["api_errors"] += 1
             if self.failures >= self.threshold:
                 self.state = "OPEN"
+
                 logger.error(f"Circuit breaker OPEN after {self.failures} failures")
             raise
 
@@ -360,6 +412,7 @@ class StateDB:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
         except Exception:
+
             pass
         self._ensure_tables()
         try:
@@ -371,6 +424,7 @@ class StateDB:
         cur = self._conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS states (
+
                 pair TEXT PRIMARY KEY,
                 state TEXT,
                 ts INTEGER
@@ -378,6 +432,7 @@ class StateDB:
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS metadata (
+
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
@@ -405,6 +460,7 @@ class StateDB:
             cur.execute("DELETE FROM states WHERE pair = ?", (pair,))
         else:
             cur.execute("INSERT INTO states(pair, state, ts) VALUES (?, ?, ?) "
+
                         "ON CONFLICT(pair) DO UPDATE SET state=excluded.state, ts=excluded.ts",
                         (pair, state, ts))
         self._conn.commit()
@@ -412,6 +468,7 @@ class StateDB:
     def get_metadata(self, key: str) -> Optional[str]:
         cur = self._conn.cursor()
         cur.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+
         r = cur.fetchone()
         return r[0] if r else None
 
@@ -438,6 +495,7 @@ class StateDB:
 def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: logging.Logger = None):
     try:
         if expiry_days <= 0:
+
             if logger_local:
                 logger_local.debug("Pruning disabled (expiry_days <= 0)")
             return
@@ -455,6 +513,7 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
             pass
 
         cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+
         cur.execute("SELECT value FROM metadata WHERE key='last_prune'")
         row = cur.fetchone()
 
@@ -464,11 +523,13 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
             try:
                 last_prune_date = datetime.fromisoformat(row[0]).date()
                 if last_prune_date >= today:
+
                     if logger_local:
                         logger_local.debug("Prune already run today; skipping.")
                     conn.close()
                     return
             except Exception:
+
                 pass
 
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='states'")
@@ -483,7 +544,8 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
         deleted = cur.rowcount
 
         cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_prune', ?)",
-                   (datetime.utcnow().isoformat(),))
+
+                    (datetime.utcnow().isoformat(),))
 
         conn.commit()
 
@@ -508,6 +570,7 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
 async def fetch_json_with_retries(
     session: aiohttp.ClientSession,
     url: str,
+
     params: dict = None,
     retries: int = 3,
     backoff: float = 1.5,
@@ -518,30 +581,36 @@ async def fetch_json_with_retries(
         for attempt in range(1, retries + 1):
             try:
                 async with session.get(url, params=params, timeout=timeout) as resp:
+
                     text = await resp.text()
                     if resp.status >= 400:
                         logger.debug(f"HTTP {resp.status} {url} {params} - {text[:200]}")
                         raise ClientResponseError(resp.request_info, resp.history, status=resp.status)
+
                     try:
                         return await resp.json()
                     except Exception:
                         logger.debug(f"Non-JSON response from {url}: {text[:200]}")
-                        return {}
+
+                    return {}
             except (asyncio.TimeoutError, ClientConnectorError) as e:
                 logger.debug(f"Fetch attempt {attempt} error: {e} for {url}")
                 METRICS["network_errors"] += 1
                 if attempt == retries:
+
                     logger.warning(f"Failed to fetch {url} after {retries} attempts.")
                     return None
                 await asyncio.sleep(backoff * (attempt ** 1.2) + random.uniform(0, 0.2))
             except ClientResponseError as cre:
                 METRICS["api_errors"] += 1
+
                 logger.debug(f"ClientResponseError fetching {url}: {cre}")
                 return None
             except Exception as e:
                 logger.exception(f"Unexpected fetch error for {url}: {e}")
                 METRICS["logic_errors"] += 1
                 return None
+
         return None
 
     if circuit_breaker:
@@ -558,6 +627,7 @@ class DataFetcher:
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = timeout
         self.cache: Dict[str, Tuple[float, Any]] = {}
+
         self.circuit_breaker = circuit_breaker
 
     async def fetch_products(self, session: aiohttp.ClientSession):
@@ -565,6 +635,7 @@ class DataFetcher:
         async with self.semaphore:
             return await fetch_json_with_retries(
                 session, url,
+
                 retries=cfg.FETCH_RETRIES,
                 backoff=cfg.FETCH_BACKOFF,
                 timeout=cfg.HTTP_TIMEOUT,
@@ -575,6 +646,7 @@ class DataFetcher:
         key = f"candles:{symbol}:{resolution}:{limit}"
         if key in self.cache:
             age, data = self.cache[key]
+
             # keep cached for a short time (like 5 sec) to reduce duplicate requests in same run
             if time.time() - age < 5:
                 return data
@@ -583,6 +655,7 @@ class DataFetcher:
         url = f"{self.base_url}/v2/chart/history"
         params = {
             "resolution": resolution,
+
             "symbol": symbol,
             "from": int(time.time()) - (limit * (int(resolution) if resolution != 'D' else 1440) * 60),
             "to": int(time.time())
@@ -619,6 +692,7 @@ def save_products_cache(products_map: Dict[str, dict]):
         with open("products_cache.json", "w", encoding="utf-8") as f:
             json.dump(products_map, f, ensure_ascii=False)
     except Exception as e:
+
         logger.warning(f"Failed to save products cache: {e}")
 
 def build_products_map(api_products: dict) -> Dict[str, dict]:
@@ -633,11 +707,13 @@ def build_products_map(api_products: dict) -> Dict[str, dict]:
                 for pair_name in cfg.PAIRS:
                     if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
                         products_map[pair_name] = {
+
                             'id': p.get('id'),
                             'symbol': p.get('symbol'),
                             'contract_type': p.get('contract_type')
                         }
         except Exception:
+
             continue
     return products_map
 
@@ -684,6 +760,7 @@ def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: 
     close = df['close'].astype(float)
     if use_sma:
         fast_ma = calculate_sma(close, fast)
+
         slow_ma = calculate_sma(close, slow)
     else:
         fast_ma = calculate_ema(close, fast)
@@ -709,6 +786,7 @@ def rngfilt(x: pd.Series, r: pd.Series) -> pd.Series:
         prev = result[-1]
         curr_x = x.iloc[i]
         curr_r = max(float(r.iloc[i]), 1e-8)
+
         if curr_x > prev:
             f = prev if (curr_x - curr_r) < prev else (curr_x - curr_r)
         else:
@@ -720,6 +798,7 @@ def calculate_cirrus_cloud(df: pd.DataFrame):
     close = df['close'].astype(float)
     smrngx1x = smoothrng(close, cfg.X1, cfg.X2)
     smrngx1x2 = smoothrng(close, cfg.X3, cfg.X4)
+
     filtx1 = rngfilt(close, smrngx1x)
     filtx12 = rngfilt(close, smrngx1x2)
     upw = filtx1 < filtx12
@@ -734,6 +813,7 @@ def kalman_filter(src: pd.Series, length: int, R=0.01, Q=0.1) -> pd.Series:
     Q_div_length = Q / max(1, length)
     for i in range(len(src)):
         current = src.iloc[i]
+
         if np.isnan(estimate):
             if i > 0:
                 estimate = src.iloc[i-1]
@@ -741,6 +821,7 @@ def kalman_filter(src: pd.Series, length: int, R=0.01, Q=0.1) -> pd.Series:
                 result.append(np.nan)
                 continue
         prediction = estimate
+
         kalman_gain = error_est / (error_est + error_meas)
         estimate = prediction + kalman_gain * (current - prediction)
         error_est = (1 - kalman_gain) * error_est + Q_div_length
@@ -753,6 +834,7 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
     avg_gain = calculate_rma(gain, rsi_len)
+
     avg_loss = calculate_rma(loss, rsi_len).replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
     rs = avg_gain.divide(avg_loss)
     rsi_value = 100 - (100 / (1 + rs))
@@ -767,6 +849,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
     if n < period + 50:
         return pd.Series(np.zeros(n), index=df.index, dtype=float)
 
+
     close = df['close'].astype(float).copy()
     sd = close.rolling(window=50, min_periods=10).std() * responsiveness
     sd = sd.bfill().ffill().fillna(0.001).clip(lower=1e-6)
@@ -779,6 +862,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
 
     ma = close.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
     denom = worm.replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
+
 
     raw_momentum = ((worm - ma).fillna(0)) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], 0).fillna(0)
@@ -808,6 +892,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
     for i in range(1, n):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
 
+
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
@@ -830,28 +915,17 @@ async def awaitable_get_previous_day_ohlc(session: aiohttp.ClientSession, symbol
         df = parse_candle_response(res)
         if df is None or len(df) < 2:
             return None
-        df['date'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.date
-        today = datetime.now(timezone.utc).date()
-        yesterday = today - timedelta(days=1)
-        prev_day_row = df[df['date'] == yesterday]
-        if not prev_day_row.empty:
-            prev = prev_day_row.iloc[-1]
-        else:
-            prev = df.iloc[-2]
-        return {'high': float(prev['high']), 'low': float(prev['low']), 'close': float(prev['close'])}
-    except Exception as e:
-        logger.error(f"Failed to fetch daily OHLC for {symbol}: {e}")
-        return None
+        df['...']
 
-def calculate_fibonacci_pivots(h: float, l: float, c: float) -> dict:
-    pivot = (h + l + c) / 3.0
-    diff = h - l
-    r3 = pivot + (diff * 1.000)
-    r2 = pivot + (diff * 0.618)
-    r1 = pivot + (diff * 0.382)
-    s1 = pivot - (diff * 0.382)
-    s2 = pivot - (diff * 0.618)
-    s3 = pivot - (diff * 1.000)
+def calculate_fibonacci_pivots(high: float, low: float, close: float) -> Dict[str, float]:
+    """Classic Fibonacci Pivots using previous day's OHLC"""
+    pivot = (high + low + close) / 3.0
+    r1 = pivot + (high - low) * 0.382
+    r2 = pivot + (high - low) * 0.618
+    r3 = pivot + (high - low) * 1.000
+    s1 = pivot - (high - low) * 0.382
+    s2 = pivot - (high - low) * 0.618
+    s3 = pivot - (high - low) * 1.000
     return {'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 'S1': s1, 'S2': s2, 'S3': s3}
 
 def cloud_state_from(upw: pd.Series, dnw: pd.Series, idx: int = -1) -> str:
@@ -885,97 +959,67 @@ async def evaluate_pair_async(
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Evaluate a single pair with enhanced error handling"""
     METRICS["pairs_checked"] += 1
-
     try:
         prod = products_map.get(pair_name)
         if not prod:
             logger.debug(f"No product mapping for {pair_name}")
             return None
-
         sp = cfg.SPECIAL_PAIRS.get(pair_name, {})
         limit_15m = sp.get("limit_15m", 250)
         min_required_15m = sp.get("min_required", 150)
         limit_5m = sp.get("limit_5m", 500)
         min_required_5m = sp.get("min_required_5m", 250)
-
         tasks = [
             fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)
         ]
         if cfg.USE_RMA200:
             tasks.append(fetcher.fetch_candles(session, prod['symbol'], "5", limit_5m))
-
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
         res15 = results[0] if not isinstance(results[0], Exception) else None
         res5 = results[1] if cfg.USE_RMA200 and len(results) > 1 and not isinstance(results[1], Exception) else None
-
         if isinstance(results[0], Exception):
             logger.error(f"Exception fetching 15m data for {pair_name}: {results[0]}")
             METRICS["network_errors"] += 1
-
         df_15m = parse_candle_response(res15)
-        df_5m = parse_candle_response(res5) if res5 else None
-
+        df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
+        last_i_15m = -2
+        last_i_5m = -2
         if df_15m is None or len(df_15m) < min_required_15m:
-            logger.warning(f"{pair_name}: insufficient 15m data ({0 if df_15m is None else len(df_15m)})")
+            logger.debug(f"{pair_name}: Insufficient 15m data (got {len(df_15m) if df_15m is not None else 0}, need {min_required_15m})")
             return None
-
-        nowts = time.time()
-        res15s = 15 * 60
-        current_15m_start = nowts - (nowts % res15s)
-        last_15_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_start
-        last_i_15m = -2 if last_15_incomplete else -1
-
-        if len(df_15m) < abs(last_i_15m) + 1:
-            logger.warning(f"{pair_name}: not enough 15m candles after index adjust")
+        if cfg.USE_RMA200 and (df_5m is None or len(df_5m) < min_required_5m):
+            logger.debug(f"{pair_name}: Insufficient 5m data (got {len(df_5m) if df_5m is not None else 0}, need {min_required_5m})")
             return None
-
-        last_i_5m = -1
-        rma_200_available = False
-        if df_5m is not None and len(df_5m) >= 50:
-            res5s = 5 * 60
-            current_5m_start = nowts - (nowts % res5s)
-            last_5_incomplete = df_5m['timestamp'].iloc[-1] >= current_5m_start
-            last_i_5m = -2 if last_5_incomplete else -1
-            if len(df_5m) < abs(last_i_5m) + 1:
-                df_5m = None
-
-        resd = await fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 5)
-        df_daily = parse_candle_response(resd)
+        # Fetch daily data for pivots
+        daily_res = await fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 1)
+        df_daily = parse_candle_response(daily_res)
         if df_daily is None or len(df_daily) < 2:
-            logger.warning(f"{pair_name}: failed to fetch daily candles")
+            logger.warning(f"{pair_name}: could not fetch sufficient daily candles")
             return None
-
         df_daily['date'] = pd.to_datetime(df_daily['timestamp'], unit='s', utc=True).dt.date
         today = datetime.now(timezone.utc).date()
         yesterday = today - timedelta(days=1)
         prev_day_row = df_daily[df_daily['date'] == yesterday]
-
         if not prev_day_row.empty:
             prev = prev_day_row.iloc[-1]
         else:
             prev = df_daily.iloc[-2]
-
         prev_day_ohlc = {'high': float(prev['high']), 'low': float(prev['low']), 'close': float(prev['close'])}
         pivots = calculate_fibonacci_pivots(prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close'])
-
         vwap_15m = calculate_vwap_daily_reset(df_15m)
         ppo, _ = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
-
         idx = last_i_15m
         open_c = float(df_15m['open'].iloc[idx])
         close_c = float(df_15m['close'].iloc[idx])
         high_c = float(df_15m['high'].iloc[idx])
         low_c = float(df_15m['low'].iloc[idx])
-
         candle_pct = abs((close_c - open_c) / open_c) * 100 if open_c != 0 else 0
         if candle_pct > cfg.EXTREME_CANDLE_PCT:
             logger.info(f"{pair_name}: extreme candle {candle_pct:.2f}% > {cfg.EXTREME_CANDLE_PCT}% - skipping")
             return None
-
         try:
             ppo_curr = float(ppo.iloc[idx])
             rma50_curr = float(rma_50_15m.iloc[idx])
@@ -983,7 +1027,6 @@ async def evaluate_pair_async(
         except Exception:
             logger.debug(f"{pair_name}: indicators indexing issue - skipping")
             return None
-
         rma200_5m_curr = np.nan
         if df_5m is not None:
             rma200 = calculate_rma(df_5m['close'], 200)
@@ -994,60 +1037,40 @@ async def evaluate_pair_async(
                 rma_200_available = False
         else:
             rma_200_available = False
-
         cloud_state = cloud_state_from(upw, dnw, idx=last_i_15m)
-
         total_range = high_c - low_c
-        if total_range <= 0:
-            upper_wick_ok = False
-            lower_wick_ok = False
-        else:
-            upper_wick = high_c - max(open_c, close_c)
-            lower_wick = min(open_c, close_c) - low_c
-            upper_wick_ok = (upper_wick / total_range) < 0.20
-            lower_wick_ok = (lower_wick / total_range) < 0.20
-
-        vwap_curr = None
-        try:
-            vwap_curr = vwap_15m.iloc[last_i_15m]
-            if np.isnan(vwap_curr):
-                vwap_curr = None
-        except Exception:
-            vwap_curr = None
-
+        upper_wick = high_c - max(open_c, close_c)
+        lower_wick = min(open_c, close_c) - low_c
+        wick_ratio = 0.35 # Max size of opposite wick relative to total range for it to be 'okay'
+        upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
+        lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
         is_green = close_c > open_c
         is_red = close_c < open_c
-
-        long_pivot_lines = {'P': pivots['P'], 'R1': pivots['R1'], 'R2': pivots['R2'], 'S1': pivots['S1'], 'S2': pivots['S2']}
+        # RMA200 check: 5m close must be above 200 RMA for long, below for short
+        rma_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
+        rma_short_ok = not cfg.USE_RMA200 or (rma_200_available and close_c < rma200_5m_curr)
+        # FIBONACCI LOGIC
         long_crossover_line = None
         long_crossover_name = None
-        if is_green:
-            for name, line in long_pivot_lines.items():
-                if open_c <= line and close_c > line:
-                    long_crossover_line = line
-                    long_crossover_name = name
-                    break
-
-        short_pivot_lines = {'P': pivots['P'], 'S1': pivots['S1'], 'S2': pivots['S2'], 'R1': pivots['R1'], 'R2': pivots['R2']}
+        for name in ['P', 'S1', 'S2', 'S3']:
+            line = pivots.get(name)
+            if df_15m['close'].iloc[idx-1] <= line and close_c > line:
+                long_crossover_line = line
+                long_crossover_name = name
+                break
         short_crossover_line = None
         short_crossover_name = None
-        if is_red:
-            for name, line in short_pivot_lines.items():
-                if open_c >= line and close_c < line:
-                    short_crossover_line = line
-                    short_crossover_name = name
-                    break
-
-        if rma_200_available:
-            rma_long_ok = (rma50_curr < close_c) and (rma200_5m_curr < close_c)
-            rma_short_ok = (rma50_curr > close_c) and (rma200_5m_curr > close_c)
-        else:
-            rma_long_ok = (rma50_curr < close_c)
-            rma_short_ok = (rma50_curr > close_c)
-
+        for name in ['P', 'R1', 'R2', 'R3']:
+            line = pivots.get(name)
+            if df_15m['close'].iloc[idx-1] >= line and close_c < line:
+                short_crossover_line = line
+                short_crossover_name = name
+                break
+        # VWAP LOGIC
+        vwap_curr = float(vwap_15m.iloc[idx]) if vwap_15m is not None else None
+        # Combined Base Logic
         base_long_ok = (cloud_state == "green") and upper_wick_ok and rma_long_ok and (magical_curr > 0) and is_green
         base_short_ok = (cloud_state == "red") and lower_wick_ok and rma_short_ok and (magical_curr < 0) and is_red
-
         vbuy = False
         vsell = False
         if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 2:
@@ -1057,18 +1080,14 @@ async def evaluate_pair_async(
                 vbuy = True
             if base_short_ok and prev_close >= prev_vwap and close_c < vwap_curr:
                 vsell = True
-
         fib_long = base_long_ok and (long_crossover_line is not None)
         fib_short = base_short_ok and (short_crossover_line is not None)
-
         up_sig = "🟢⬆️"
         down_sig = "🔴⬇️"
-
         current_signal = None
         message = None
         last_state_pair = last_state
         suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
-
         if vbuy:
             current_signal = "vbuy"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
@@ -1097,8 +1116,8 @@ async def evaluate_pair_async(
                 line_str = f"{long_crossover_line:,.2f}"
                 ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
-                message = (f"{up_sig} {sanitize_for_telegram(pair_name)} - FIB LONG\n"
-                           f"Closed Above {sanitize_for_telegram(long_crossover_name)} (${line_str})\n"
+                message = (f"{up_sig} {sanitize_for_telegram(pair_name)} - Fib Long (Cross {long_crossover_name})\n"
+                           f"Price Crossed Above {long_crossover_name} (${line_str})\n"
                            f"PPO 15m: {ppo_str}\n"
                            f"Price: ${price_str}\n"
                            f"{human_ts()}")
@@ -1108,41 +1127,36 @@ async def evaluate_pair_async(
                 line_str = f"{short_crossover_line:,.2f}"
                 ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
-                message = (f"{down_sig} {sanitize_for_telegram(pair_name)} - FIB SHORT\n"
-                           f"Closed Below {sanitize_for_telegram(short_crossover_name)} (${line_str})\n"
+                message = (f"{down_sig} {sanitize_for_telegram(pair_name)} - Fib Short (Cross {short_crossover_name})\n"
+                           f"Price Crossed Below {short_crossover_name} (${line_str})\n"
                            f"PPO 15m: {ppo_str}\n"
                            f"Price: ${price_str}\n"
                            f"{human_ts()}")
-
-        if current_signal is None:
-            prev_state_val = last_state_pair.get("state") if last_state_pair else None
-            if prev_state_val and prev_state_val != "NO_SIGNAL":
-                return pair_name, {"state": "NO_SIGNAL", "ts": now_ts()}
-            return None
-
+        # Determine the new state to save
+        if current_signal:
+            new_state = current_signal
+            new_ts = now_ts()
+        elif last_state_pair and last_state_pair.get("state") in ["vbuy", "vsell", "fib_long_P", "fib_short_P"]:
+            # If no new signal, but we were in a strong previous state (P/VWAP), keep it until a new signal occurs
+            new_state = last_state_pair.get("state")
+            new_ts = last_state_pair.get("ts")
+        else:
+            new_state = None
+            new_ts = None
         if message:
-            success = await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, message, session)
-            if success:
-                METRICS["alerts_sent"] += 1
-                logger.info(f"✅ Alert sent for {pair_name}: {current_signal}")
-            else:
-                logger.error(f"❌ Failed to send alert for {pair_name}")
-
-        return pair_name, {"state": current_signal, "ts": now_ts()}
-
-    except ClientConnectorError:
-        METRICS["network_errors"] += 1
-        logger.exception(f"Network error evaluating pair {pair_name}")
-        return None
+            logger.info(f"SIGNAL: {message.replace('\n', ' | ')}")
+            return new_state, {"message": message, "ts": now_ts(), "state": current_signal}
+        elif new_state:
+            return new_state, {"ts": new_ts, "state": new_state}
+        else:
+            return None, None
     except Exception as e:
+        logger.exception(f"Error evaluating {pair_name}: {e}")
         METRICS["logic_errors"] += 1
-        logger.exception(f"Error evaluating pair {pair_name}: {e}")
-        if cfg.DEBUG_MODE:
-            logger.debug(traceback.format_exc())
-        return None
+        return None, None
 
 # -------------------------
-# ASYNC TELEGRAM SENDER (with retries)
+# TELEGRAM SENDER
 # -------------------------
 async def send_telegram_async(
     token: str,
@@ -1154,16 +1168,13 @@ async def send_telegram_async(
     if not token or not chat_id:
         logger.warning("Telegram not configured; skipping.")
         return False
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     own_session = False
-
     if session is None:
         connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
         session = aiohttp.ClientSession(connector=connector)
         own_session = True
-
     try:
         async with session.post(url, data=data, timeout=10) as resp:
             try:
@@ -1213,8 +1224,7 @@ async def check_dead_mans_switch(state_db: StateDB):
             except Exception:
                 last_success_int = now_ts()
             hours_since = (now_ts() - last_success_int) / 3600.0
-            if hours_since > 2:
-                # Avoid repeating the dead-man alert every run: record a cooldown key
+            if hours_since > 2: # Avoid repeating the dead-man alert every run: record a cooldown key
                 dead_alert_ts = state_db.get_metadata("dead_alert_ts")
                 if dead_alert_ts:
                     try:
@@ -1223,32 +1233,31 @@ async def check_dead_mans_switch(state_db: StateDB):
                         dead_alert_int = 0
                 else:
                     dead_alert_int = 0
-
-                if now_ts() - dead_alert_int > 4 * 3600:  # allow at most once every 4 hours
+                if now_ts() - dead_alert_int > 4 * 3600: # allow at most once every 4 hours
                     msg = (f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
-                           f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                           f"Check logs immediately.")
+                           f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S IST')}")
                     await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg)
                     state_db.set_metadata("dead_alert_ts", str(now_ts()))
     except Exception as e:
-        logger.error(f"Dead man's switch check failed: {e}")
+        logger.exception(f"Dead man's switch failed: {e}")
 
 # -------------------------
-# MAIN RUNNER
+# CORE RUN LOGIC
 # -------------------------
 stop_requested = False
 
 def request_stop(signum, frame):
+    """Signal handler to request graceful stop"""
     global stop_requested
-    logger.info(f"⚠️ Signal {signum} received. Stopping after current run.")
     stop_requested = True
+    logger.warning(f"Stop requested (signal {signum})")
 
 async def run_once(send_test: bool = True):
-    """Main execution with timeout protection"""
-    start_time = time.time()
+    global stop_requested
     reset_metrics()
+    start_time = time.time()
 
-    # A non-blocking timeout monitor which raises TimeoutError when exceeded
+    # Dead-man switch: ensure execution is fast enough
     async def check_timeout():
         while True:
             elapsed = time.time() - start_time
@@ -1256,7 +1265,6 @@ async def run_once(send_test: bool = True):
                 logger.critical(f"Execution timeout: {elapsed:.1f}s > {cfg.MAX_EXEC_TIME}s")
                 raise TimeoutError("Max execution time exceeded")
             await asyncio.sleep(1)
-
     timeout_task = asyncio.create_task(check_timeout())
 
     # memory guard
@@ -1267,7 +1275,6 @@ async def run_once(send_test: bool = True):
 
     try:
         logger.info("🚀 Starting fibonacci_pivot_bot_production run")
-
         # Memory check early
         if proc:
             try:
@@ -1280,14 +1287,12 @@ async def run_once(send_test: bool = True):
 
         state_db = StateDB(cfg.STATE_DB_PATH)
         await check_dead_mans_switch(state_db)
-
         try:
             prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
         except Exception as e:
             logger.warning(f"Prune error: {e}")
 
         last_alerts = state_db.load_all()
-
         if cfg.RESET_STATE:
             logger.warning("🔄 RESET_STATE requested: clearing states table")
             for p in cfg.PAIRS:
@@ -1295,9 +1300,9 @@ async def run_once(send_test: bool = True):
 
         if send_test and cfg.SEND_TEST_MESSAGE:
             test_msg = (f"🔔 Fibonacci Pivot Bot started\n"
-                       f"Time: {human_ts()}\n"
-                       f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
-                       f"Pairs: {len(cfg.PAIRS)}")
+                        f"Time: {human_ts()}\n"
+                        f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
+                        f"Pairs: {len(cfg.PAIRS)}")
             await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
 
         products_map = load_products_cache()
@@ -1320,70 +1325,57 @@ async def run_once(send_test: bool = True):
                 products_map = build_products_map(prod_resp)
                 save_products_cache(products_map)
 
-            found = len(products_map)
-            logger.info(f"✅ Found {found} tradable pairs mapped to config.")
-            if found == 0:
-                logger.error("❌ No products mapped; exiting")
-                state_db.close()
-                raise SystemExit(EXIT_API_FAILURE)
+            tasks = [
+                evaluate_pair_async(
+                    session,
+                    fetcher_local,
+                    products_map,
+                    pair_name,
+                    last_alerts.get(pair_name)
+                )
+                for pair_name in cfg.PAIRS
+            ]
 
-            sem = asyncio.Semaphore(cfg.MAX_CONCURRENCY)
-            tasks: List[asyncio.Task] = []
-
-            for pair in cfg.PAIRS:
-                if pair not in products_map:
-                    logger.debug(f"Pair {pair} not in products map, skipping")
-                    continue
-
-                last_state = last_alerts.get(pair)
-
-                async def run_one(pair_name=pair, last_s=last_state):
-                    async with sem:
-                        await asyncio.sleep(random.uniform(cfg.JITTER_MIN, cfg.JITTER_MAX))
-                        return await evaluate_pair_async(session, fetcher_local, products_map, pair_name, last_s)
-
-                tasks.append(asyncio.create_task(run_one()))
-
-            # gather with return_exceptions; don't let one bad task kill others
+            # Run evaluation tasks concurrently with concurrency limit
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            updates = 0
 
-            for r in results:
-                if isinstance(r, Exception):
-                    logger.exception(f"Task exception: {r}")
-                    continue
-                if not r:
-                    continue
+        alerts_sent = 0
+        for pair_name, result in zip(cfg.PAIRS, results):
+            if stop_requested:
+                break
 
-                pair_name, new_state = r
-                if not isinstance(new_state, dict):
-                    continue
+            if isinstance(result, Exception):
+                logger.error(f"Error in task for {pair_name}: {result}")
+                METRICS["logic_errors"] += 1
+                continue
 
-                prev = state_db.get(pair_name)
-                if prev != new_state:
-                    state_db.set(pair_name, new_state.get("state"), new_state.get("ts"))
-                    updates += 1
+            new_state, alert_info = result
+            if new_state:
+                state_db.set(pair_name, new_state)
 
-            # mark success
-            METRICS["execution_time"] = time.time() - start_time
-            logger.info(f"📊 METRICS: {json.dumps(METRICS)}")
+            if alert_info and alert_info.get("message"):
+                success = await send_telegram_with_retries(
+                    cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, alert_info["message"]
+                )
+                if success:
+                    alerts_sent += 1
+                    METRICS["alerts_sent"] += 1
 
-            state_db.set_metadata("last_success_run", str(now_ts()))
+        # Update metrics and dead-man switch metadata
+        METRICS["execution_time"] = time.time() - start_time
+        logger.info(f"✅ Run finished in {METRICS['execution_time']:.2f}s | Pairs checked: {METRICS['pairs_checked']} | Alerts sent: {alerts_sent}")
+        state_db.set_metadata("last_success_run", str(now_ts()))
+        state_db.set_metadata("last_run_metrics", json.dumps(METRICS))
+        state_db.close()
 
-            logger.info(f"✅ Run complete. {updates} state updates applied. "
-                       f"Checked {METRICS['pairs_checked']} pairs, sent {METRICS['alerts_sent']} alerts.")
-
-            state_db.close()
-
-        # Post-run memory check
-        if proc:
-            try:
-                rss = proc.memory_info().rss
-                if rss > cfg.MEMORY_LIMIT_BYTES:
-                    logger.warning(f"High memory usage after run: {rss}")
-            except Exception:
-                pass
-
+    except TimeoutError:
+        raise
+    except MemoryError:
+        raise
+    except SystemExit:
+        raise
+    except Exception:
+        pass # Exception is handled below
     except asyncio.CancelledError:
         logger.warning("Run was cancelled")
         raise
@@ -1420,11 +1412,25 @@ def main():
 
     try:
         import argparse
-        parser = argparse.ArgumentParser(description="Fibonacci Pivot Bot (Production)")
-        group = parser.add_mutually_exclusive_group()
-        group.add_argument("--once", action="store_true", help="Run once and exit")
-        group.add_argument("--loop", type=int, metavar="SECONDS", help="Run in loop every N seconds")
+        parser = argparse.ArgumentParser(
+            description="Improved Fibonacci Pivot Bot for Delta Exchange.",
+            formatter_class=argparse.RawTextHelpFormatter
+        )
+        parser.add_argument("--once", action="store_true", help="Run once and exit (default).")
+        parser.add_argument("--loop", type=int, default=cfg.RUN_LOOP_INTERVAL,
+                            help=f"Run in a loop with specified interval in seconds (default: {cfg.RUN_LOOP_INTERVAL}).")
+        parser.add_argument("--reset-state", action="store_true",
+                            help="Clear the state database before running.")
+        parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
         args = parser.parse_args()
+
+        if args.reset_state:
+            cfg.RESET_STATE = True
+            logger.warning("Configuration override: RESET_STATE=True")
+        if args.debug:
+            cfg.DEBUG_MODE = True
+            logger.warning("Configuration override: DEBUG_MODE=True")
+            logger.setLevel(logging.DEBUG)
 
         if args.once:
             try:
@@ -1443,6 +1449,7 @@ def main():
                     logger.error(f"Run exited with code {e.code}, continuing loop.")
                 except Exception:
                     logger.exception("Unhandled in run_once")
+
                 elapsed = time.time() - loop_start
                 to_sleep = max(0, interval - elapsed)
                 if to_sleep > 0:
