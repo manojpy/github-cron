@@ -1,5 +1,4 @@
-
-  #!/usr/bin/env python3
+#!/usr/bin/env python3
 # python 3.12+
 """
 Improved Fibonacci Pivot Bot
@@ -100,7 +99,8 @@ class Config(BaseModel):
 # DEFAULT CONFIG DEFINITION (FIX for NameError)
 # -------------------------
 DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc",
+    "TELEGRAM_BOT_TOKEN":
+"8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc",
     "TELEGRAM_CHAT_ID": "203813932",
     "DEBUG_MODE": False,
     "SEND_TEST_MESSAGE": True,
@@ -908,15 +908,6 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     vwap = df2['cum_hlc3_vol'] / df2['cum_vol'].replace(0, np.nan)
     return vwap.ffill().bfill()
 
-async def awaitable_get_previous_day_ohlc(session: aiohttp.ClientSession, symbol: str, days_back_limit: int = 15):
-    """Get previous day's OHLC with error handling"""
-    try:
-        res = await fetcher.fetch_candles(session, symbol, "D", days_back_limit + 5)
-        df = parse_candle_response(res)
-        if df is None or len(df) < 2:
-            return None
-        df['...']
-
 def calculate_fibonacci_pivots(high: float, low: float, close: float) -> Dict[str, float]:
     """Classic Fibonacci Pivots using previous day's OHLC"""
     pivot = (high + low + close) / 3.0
@@ -1476,3 +1467,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
