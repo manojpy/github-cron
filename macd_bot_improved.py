@@ -82,27 +82,55 @@ DEFAULT_CONFIG = {
     "DEAD_MANS_COOLDOWN_SECONDS": int(os.environ.get("DEAD_MANS_COOLDOWN_SECONDS", str(4 * 3600)))  # 4 hours
 }
 
-CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+# ==========================================================
+# CONFIGURATION LOADER (Enhanced Boolean + Env Handling)
+# ==========================================================
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config_macd.json")
 cfg = DEFAULT_CONFIG.copy()
 
-# Load config file, if present
+def str_to_bool(value):
+    """Safely interpret string-based booleans."""
+    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
+
+# Load config file if present
 if Path(CONFIG_FILE).exists():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
             cfg.update(user_cfg)
-        print(f"✅ Loaded configuration from {CONFIG_FILE}")
+            print(f"✅ Loaded configuration from {CONFIG_FILE}")
     except Exception as e:
-        print(f"⚠️ Warning: unable to parse {CONFIG_FILE}: {e}")
-        # continue with env/defaults
+        print(f"⚠️ Warning: unable to parse config file: {e}")
 
-# Validate/normalize some config fields
+# Merge/override from environment variables with type casting
+def override(key, default=None, cast=None):
+    val = os.getenv(key)
+    if val is not None:
+        cfg[key] = cast(val) if cast else val
+    else:
+        cfg[key] = cfg.get(key, default)
+
+override("DEBUG_MODE", False, str_to_bool)
+override("SEND_TEST_MESSAGE", False, str_to_bool)
+override("STATE_DB_PATH")
+override("LOG_FILE")
+override("DELTA_API_BASE")
+override("MAX_PARALLEL_FETCH", 8, int)
+override("HTTP_TIMEOUT", 15, int)
+override("MAX_CONCURRENCY", 6, int)
+override("MAX_EXEC_TIME", 25, int)
+override("DEADMAN_HOURS", 2, int)
+
+# Validate critical config items
 if not cfg.get("PAIRS"):
     print("❌ PAIRS cannot be empty. Exiting.")
     sys.exit(1)
 
-if cfg["MAX_PARALLEL_FETCH"] < 1 or cfg["MAX_PARALLEL_FETCH"] > 50:
-    cfg["MAX_PARALLEL_FETCH"] = max(1, min(10, cfg["MAX_PARALLEL_FETCH"]))
+if cfg["MAX_PARALLEL_FETCH"] < 1 or cfg["MAX_PARALLEL_FETCH"] > 16:
+    cfg["MAX_PARALLEL_FETCH"] = max(1, min(16, cfg["MAX_PARALLEL_FETCH"]))
+
+print(f"DEBUG_MODE={cfg['DEBUG_MODE']}, SEND_TEST_MESSAGE={cfg['SEND_TEST_MESSAGE']}")
+# ==========================================================
 
 # -------------------------
 # Logger
