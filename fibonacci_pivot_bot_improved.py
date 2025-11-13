@@ -55,18 +55,29 @@ DEFAULT_CONFIG = {
     "RUN_LOOP_INTERVAL": int(os.getenv("RUN_LOOP_INTERVAL", "900"))  # default loop 15 minutes
 }
 
-# load config.json overrides if present
+# Load config.json (optional) and overlay defaults
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+
+config = DEFAULT_CONFIG.copy()
+
 if Path(CONFIG_FILE).exists():
     try:
         with open(CONFIG_FILE, "r") as f:
             user_cfg = json.load(f)
-        DEFAULT_CONFIG.update(user_cfg)
+        config.update(user_cfg)  # JSON baseline
         print(f"Loaded configuration from {CONFIG_FILE}")
     except Exception as e:
-        print(f"Warning: unable to parse config.json: {e}")
+        print(f"⚠️ Warning: unable to parse {CONFIG_FILE}: {e}")
+else:
+    print(f"⚠️ Warning: config file {CONFIG_FILE} not found, using defaults.")
 
-cfg = DEFAULT_CONFIG
+# Now override with environment variables (YAML wins)
+config["DEBUG_MODE"] = os.getenv("DEBUG_MODE", str(config.get("DEBUG_MODE", True))).lower() == "true"
+config["SEND_TEST_MESSAGE"] = os.getenv("SEND_TEST_MESSAGE", str(config.get("SEND_TEST_MESSAGE", True))).lower() == "true"
+config["STATE_DB_PATH"] = os.getenv("STATE_DB_PATH", config.get("STATE_DB_PATH", "state.sqlite"))
+config["LOG_FILE"] = os.getenv("LOG_FILE", config.get("LOG_FILE", "bot.log"))
+
+cfg = config
 
 # -------------------------
 # Logger
