@@ -1,11 +1,18 @@
 {"DEBUG_MODE": true,
   "SEND_TEST_MESSAGE": true,
-  "STATE_DB_PATH": "macd_state.sqlite",
-  "LOG_FILE": "macd_bot.log",
+  "STATE_DB_PATH": "fib_state.sqlite",
+  "LOG_FILE": "fibonacci_pivot_bot.log",
   "STATE_EXPIRY_DAYS": 30,
   "DELTA_API_BASE": "https://api.india.delta.exchange",
+
   "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
     "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
     "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+
   "MAX_PARALLEL_FETCH": 8,
-  "HTTP_TIMEOUT": 15}
+  "HTTP_TIMEOUT": 15,
+  "MAX_CONCURRENCY": 6,
+  "MAX_EXEC_TIME": 25,
+  "DEADMAN_HOURS": 2,
+
+  "BOT_NAME": "Fibonacci Pivot Bot"}
