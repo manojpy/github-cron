@@ -2,12 +2,12 @@ name: Trading Alert Bots
 
 on:
   workflow_dispatch:     # Manual trigger
-  #schedule:
-  #  - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46
+  # schedule:
+  #   - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46 UTC (commented since Cron-jobs.org handles timing)
 
 concurrency:
   group: trading-alert-bots
-  cancel-in-progress: false  # Let previous runs finish
+  cancel-in-progress: false  # Ensures previous runs finish fully
 
 jobs:
   run-bot:
@@ -15,16 +15,25 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # -------------------------
+      # Step 1: Checkout repository
+      # -------------------------
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # -------------------------
+      # Step 2: Setup Python 3.12
+      # -------------------------
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
+      # -------------------------
+      # Step 3: Cache pip packages
+      # -------------------------
       - name: Cache pip packages
         uses: actions/cache@v3
         with:
@@ -33,18 +42,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      # -------------------------
+      # Step 4: Install dependencies
+      # -------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Run MACD Bot ---
+      # -------------------------
+      # Step 5: Run MACD Bot
+      # -------------------------
       - name: Run MACD Bot (Improved)
         id: macd_bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'True'
+          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'True' }}
           SEND_TEST_MESSAGE: 'True'
           STATE_DB_PATH: macd_state.sqlite
           LOG_FILE: macd_bot.log
@@ -52,13 +66,26 @@ jobs:
         run: python macd_bot_improved.py --once
         continue-on-error: true
 
-      # --- Run Fibonacci Pivot Bot ---
+      # -------------------------
+      # Step 6: Cleanup after MACD Bot
+      # -------------------------
+      - name: Cleanup After MACD Bot
+        if: always()
+        run: |
+          echo "Cleaning up Python cache and session leftovers..."
+          rm -rf __pycache__ || true
+          rm -f aiohttp_cache.db || true
+          rm -rf ~/.aiohttp_cache || true
+
+      # -------------------------
+      # Step 7: Run Fibonacci Pivot Bot
+      # -------------------------
       - name: Run Fibonacci Pivot Bot (Improved)
         id: fib_bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'True'
+          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'True' }}
           SEND_TEST_MESSAGE: 'True'
           STATE_DB_PATH: fib_state.sqlite
           LOG_FILE: fibonacci_pivot_bot.log
@@ -66,10 +93,13 @@ jobs:
         run: python fibonacci_pivot_bot_improved.py --once
         continue-on-error: true
 
-      # --- Upload logs (always) ---
+      # -------------------------
+      # Step 8: Upload Logs (always, even on failure)
+      # -------------------------
       - name: Upload Bot Logs
         uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: bot_logs
           path: |
@@ -77,8 +107,11 @@ jobs:
             fibonacci_pivot_bot.log
           retention-days: 7
 
-      # --- Commit with retry logic ---
+      # -------------------------
+      # Step 9: Commit and Push State Files (with retries)
+      # -------------------------
       - name: Commit and Push state files
+        if: always()
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -97,4 +130,3 @@ jobs:
           
           echo "⚠️ Failed to push after 3 attempts. Continuing workflow..."
         continue-on-error: true
-
