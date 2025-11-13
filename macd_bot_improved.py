@@ -766,14 +766,6 @@ lower_wick = 0.0; strong_bullish_close = False; strong_bearish_close = False
             current_state = "sell_mmh_reversal"
             send_message = f"🔴 {pair_name} - SELL (MMH Reversal)\nMMH 15m Reversal Down ({mmh_curr:.5f})\nPrice: ${price:,.2f}\n{formatted_time}"
             
-        # --- OLD PPO-SIGNAL CROSSOVER REMOVED ---
-        # if all(buy_conds.values()):
-        #     current_state = "buy"
-        #     send_message = f"🟢 {pair_name} - BUY\nPPO - SIGNAL Crossover (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-        # if current_state is None and all(sell_conds.values()):
-        #     current_state = "sell"
-        #     send_message = f"🔴 {pair_name} - SELL\nPPO - SIGNAL Crossunder (PPO: {ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-     
    # Remaining existing alerts
         if current_state is None and all(buy_srsi_conds.values()):
             current_state = "buy_srsi50"
