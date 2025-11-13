@@ -2,17 +2,33 @@ name: Trading Alert Bots
 
 on:
   workflow_dispatch:     # Manual trigger
-  # schedule:            # Optional: Uncomment if you want GitHub-native scheduling
-  #   - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46
+  #schedule:
+  #  - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46
 
 concurrency:
   group: trading-alert-bots
-  cancel-in-progress: true
+  cancel-in-progress: false  # Let previous runs finish to avoid DB corruption
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10   # allow a bit more time if API is slow
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false  # If one bot fails, continue with the other
+      matrix:
+        bot: [macd, fib]
+        include:
+          - bot: macd
+            script: macd_bot_improved.py
+            config: config_macd.json
+            state_db: macd_state.sqlite
+            log_file: macd_bot.log
+          - bot: fib
+            script: fibonacci_pivot_bot_improved.py
+            config: config_fib.json
+            state_db: fib_state.sqlite
+            log_file: fibonacci_pivot_bot.log
 
     steps:
       - name: Checkout code
@@ -38,63 +54,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- 1️⃣ Run MACD Bot (Improved) ---
-      - name: Run MACD Bot (Improved)
+      - name: Run ${{ matrix.bot }} bot
+        id: run_bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'True'
-          SEND_TEST_MESSAGE: 'False'
-          STATE_DB_PATH: macd_state.sqlite
-          LOG_FILE: macd_bot.log
-          CONFIG_FILE: config_macd.json        # 👈 added this line
-        run: python macd_bot_improved.py --once
+          DEBUG_MODE: 'False'        # Set to True for verbose logging
+          SEND_TEST_MESSAGE: 'False' # Set to True to send startup message
+          STATE_DB_PATH: ${{ matrix.state_db }}
+          LOG_FILE: ${{ matrix.log_file }}
+          CONFIG_FILE: ${{ matrix.config }}
+        run: python ${{ matrix.script }} --once
+        continue-on-error: true      # Don't stop workflow if this bot fails
 
-
-      # --- 2️⃣ Run Fibonacci Pivot Bot (Improved) ---
-      - name: Run Fibonacci Pivot Bot (Improved)
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: 'True'
-          SEND_TEST_MESSAGE: 'False'
-          STATE_DB_PATH: fib_state.sqlite
-          LOG_FILE: fibonacci_pivot_bot.log
-          CONFIG_FILE: config_fib.json
-        run: python fibonacci_pivot_bot_improved.py --once
-
-      # --- 3️⃣ Debug step: verify logs and state files ---
-      - name: List files after run
-        run: ls -l
-
-      # --- 4️⃣ Upload logs as artifacts (optional but helpful) ---
-      - name: Upload Bot Logs
+      - name: Upload ${{ matrix.bot }} logs
         uses: actions/upload-artifact@v4
+        if: always()  # Upload logs even if bot failed
         with:
-          name: bot_logs
-          path: |
-            macd_bot.log
-            fibonacci_pivot_bot.log
+          name: ${{ matrix.bot }}-bot-logs
+          path: ${{ matrix.log_file }}
+          retention-days: 7  # Auto-delete old logs
 
-      # --- 5️⃣ Clean up backup files ---
-      - name: Remove backup files
-        run: |
-          rm -f *.bak || true
-
-      # --- 6️⃣ Commit and Push updated state DBs ---
-      - name: Commit and Push state files
+      - name: Commit ${{ matrix.bot }} state file
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update bot states [skip ci]"
-          file_pattern: "*.sqlite"
+          commit_message: "Update ${{ matrix.bot }} bot state [skip ci]"
+          file_pattern: ${{ matrix.state_db }}
           add_options: '--force'
           status_options: '--untracked-files=no'
           commit_options: '--allow-empty'
           skip_dirty_check: true
-
-
-
-
-
-
-
