@@ -65,12 +65,13 @@ if Path(CONFIG_FILE).exists():
         with open(CONFIG_FILE, "r") as f:
             user_cfg = json.load(f)
         config.update(user_cfg)  # JSON baseline
-        print(f"Loaded configuration from 
-{CONFIG_FILE}")
+        # CORRECTED: Ensure the f-string is on one line
+        print(f"Loaded configuration from {CONFIG_FILE}")
     except Exception as e:
         print(f"⚠️ Warning: unable to parse {CONFIG_FILE}: {e}")
 else:
     print(f"⚠️ Warning: config file {CONFIG_FILE} not found, using defaults.")
+
 
 # Now override with environment variables (YAML wins)
 config["DEBUG_MODE"] = os.getenv("DEBUG_MODE", str(config.get("DEBUG_MODE", True))).lower() == "true"
