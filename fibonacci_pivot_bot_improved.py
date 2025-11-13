@@ -999,9 +999,7 @@ async def evaluate_pair_async(
         last_state_pair = last_state
         suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
 
-        # Replace the message construction section with this:
-
-        if vbuy:
+                if vbuy:
             current_signal = "vbuy"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
                 vwap_str = f"{vwap_curr:,.2f}"
