@@ -19,6 +19,7 @@ import aiohttp
 import pandas as pd
 import numpy as np
 import pytz
+import signal
 from aiohttp import ClientConnectorError, ClientResponseError
 from logging.handlers import RotatingFileHandler
 
@@ -68,13 +69,15 @@ class Config(BaseModel):
     USE_RMA200: bool = True  # NEW: Control 5m data fetching
     PRODUCTS_CACHE_TTL: int = 86400  # NEW: Cache TTL in seconds
 
-    @validator("TELEGRAM_BOT_TOKEN")
+    @field_validator("TELEGRAM_BOT_TOKEN")
+    @classmethod
     def token_not_default(cls, v):
         if not v or v == "xxxx":
             raise ValueError("TELEGRAM_BOT_TOKEN must be set and not be 'xxxx'")
         return v
 
-    @validator("TELEGRAM_CHAT_ID")
+    @field_validator("TELEGRAM_CHAT_ID")
+    @classmethod
     def chat_id_not_default(cls, v):
         if not v or v == "xxxx":
             raise ValueError("TELEGRAM_CHAT_ID must be set and not be 'xxxx'")
@@ -1270,21 +1273,21 @@ async def run_once(send_test: bool = True):
 # -------------------------
 # CLI + SIGNAL HANDLING
 # -------------------------
-stop_requested = False
+stop_requested = False 
 
 def request_stop(signum, frame):
-    global stop_requested
-    logger.info(f"⚠️ Signal {signum} received. Stopping after current run.")
-    stop_requested = True
+    global stop_requested
+    logger.info(f"Signal {signum} received. Stopping after current run.")
+    stop_requested = True 
 
-# Register signal handlers
-signal.signal(signal.SIGINT, request_stop)
-signal.signal(signal.SIGTERM, request_stop)
-
+# Inside the main() function:
 def main():
-    """Entry point with process locking"""
-    # NEW: Acquire process lock
-    lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
+    """Entry point with process locking"""
+    # Move signal registration here
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    
+    lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
     if not lock.acquire():
         logger.error("❌ Another instance is running or stale lock exists. Exiting.")
         sys.exit(EXIT_LOCK_CONFLICT)
