@@ -122,25 +122,56 @@ def load_config() -> Config:
     }
 
     config_file = os.getenv("CONFIG_FILE", "config.json")
+    # ==========================================================
+# CONFIGURATION LOADER (Enhanced Boolean + Env Handling)
+# ==========================================================
+config_file = os.getenv("CONFIG_FILE", "config_fib.json")
+
+def str_to_bool(value):
+    """Safely interpret string-based booleans."""
+    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
+
+def load_config():
+    """Load JSON config file and merge with environment overrides."""
+    base = DEFAULT_CONFIG.copy()
+
+    # Load JSON config file if present
     if Path(config_file).exists():
         try:
             with open(config_file, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
-                config_dict.update(user_cfg)
-            print(f"✅ Loaded configuration from {config_file}")
+                base.update(user_cfg)
+                print(f"✅ Loaded configuration from {config_file}")
         except Exception as e:
             print(f"⚠️ Warning: unable to parse {config_file}: {e}")
-            sys.exit(EXIT_CONFIG_ERROR)
     else:
-        print(f"⚠️ Warning: config file {config_file} not found, using environment defaults.")
+        print(f"⚠️ Warning: config file {config_file} not found, using defaults.")
 
-    try:
-        return Config(**config_dict)
-    except Exception as e:
-        print(f"❌ Configuration validation failed: {e}")
-        sys.exit(EXIT_CONFIG_ERROR)
+    # Merge environment variables with proper type casting
+    def override(key, default=None, cast=None):
+        val = os.getenv(key)
+        if val is not None:
+            base[key] = cast(val) if cast else val
+        else:
+            base[key] = base.get(key, default)
 
+    override("DEBUG_MODE", False, str_to_bool)
+    override("SEND_TEST_MESSAGE", False, str_to_bool)
+    override("STATE_DB_PATH")
+    override("LOG_FILE")
+    override("DELTA_API_BASE")
+    override("MAX_PARALLEL_FETCH", 8, int)
+    override("HTTP_TIMEOUT", 15, int)
+    override("MAX_CONCURRENCY", 6, int)
+    override("MAX_EXEC_TIME", 25, int)
+    override("DEADMAN_HOURS", 2, int)
+
+    print(f"DEBUG_MODE={base['DEBUG_MODE']}, SEND_TEST_MESSAGE={base['SEND_TEST_MESSAGE']}")
+    return Config(**base)
+
+# ----------------------------------------------------------
 cfg = load_config()
+# ==========================================================
 
 # -------------------------
 # METRICS
