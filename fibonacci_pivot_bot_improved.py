@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import json
@@ -7,10 +9,8 @@ import random
 import logging
 import sqlite3
 import traceback
-import tempfile
-import shutil
-import fcntl  # NEW: For process locking
-import html   # NEW: For sanitization
+import signal
+import html
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List, Union
@@ -19,19 +19,18 @@ import aiohttp
 import pandas as pd
 import numpy as np
 import pytz
-import signal
 from aiohttp import ClientConnectorError, ClientResponseError
 from logging.handlers import RotatingFileHandler
 
-# NEW: Pydantic for config validation
+# NEW: Pydantic V2 imports
 try:
-    from pydantic import BaseModel, validator, Field
+    from pydantic import BaseModel, field_validator
 except ImportError:
-    print("⚠️  pydantic not found. Install with: pip install pydantic")
+    print("⚠️ pydantic not found. Install with: pip install pydantic>=2.5.0")
     sys.exit(4)
 
 # -------------------------
-# CONFIGURATION MODEL
+# CONFIGURATION MODEL (Pydantic V2)
 # -------------------------
 class Config(BaseModel):
     TELEGRAM_BOT_TOKEN: str
@@ -40,10 +39,8 @@ class Config(BaseModel):
     SEND_TEST_MESSAGE: bool = True
     RESET_STATE: bool = False
     DELTA_API_BASE: str = "https://api.india.delta.exchange"
-    PAIRS: List[str] = Field(default_factory=lambda: ["BTCUSD","ETHUSD","SOLUSD","AVAXUSD","BCHUSD","XRPUSD","BNBUSD","LTCUSD","DOTUSD","ADAUSD","SUIUSD","AAVEUSD"])
-    SPECIAL_PAIRS: Dict[str, Dict[str, int]] = Field(default_factory=lambda: {
-        "SOLUSD": {"limit_15m":210,"min_required":180,"limit_5m":300,"min_required_5m":200}
-    })
+    PAIRS: List[str] = ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"]
+    SPECIAL_PAIRS: Dict[str, Dict[str, int]] = {"SOLUSD": {"limit_15m": 210,"min_required": 180,"limit_5m": 300,"min_required_5m": 200}}
     PPO_FAST: int = 7
     PPO_SLOW: int = 16
     PPO_SIGNAL: int = 5
@@ -65,9 +62,9 @@ class Config(BaseModel):
     DUPLICATE_SUPPRESSION_SECONDS: int = 3600
     EXTREME_CANDLE_PCT: float = 8.0
     RUN_LOOP_INTERVAL: int = 900
-    MAX_EXEC_TIME: int = 25  # NEW: Max execution time for Cron-Jobs.org
-    USE_RMA200: bool = True  # NEW: Control 5m data fetching
-    PRODUCTS_CACHE_TTL: int = 86400  # NEW: Cache TTL in seconds
+    MAX_EXEC_TIME: int = 25
+    USE_RMA200: bool = True
+    PRODUCTS_CACHE_TTL: int = 86400
 
     @field_validator("TELEGRAM_BOT_TOKEN")
     @classmethod
@@ -97,7 +94,6 @@ EXIT_API_FAILURE = 5
 # -------------------------
 def load_config() -> Config:
     """Load and validate configuration with environment override"""
-    # Start with defaults
     config_dict = {
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc"),
         "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "203813932"),
@@ -110,7 +106,6 @@ def load_config() -> Config:
         "USE_RMA200": os.getenv("USE_RMA200", "True").lower() == "true",
     }
 
-    # Load from JSON if exists
     config_file = os.getenv("CONFIG_FILE", "config.json")
     if Path(config_file).exists():
         try:
@@ -124,7 +119,6 @@ def load_config() -> Config:
     else:
         print(f"⚠️ Warning: config file {config_file} not found, using environment defaults.")
 
-    # Validate with Pydantic
     try:
         return Config(**config_dict)
     except Exception as e:
@@ -159,7 +153,6 @@ def reset_metrics():
 logger = logging.getLogger("fibonacci_pivot_bot")
 logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else logging.INFO)
 
-# NEW: JSON formatter for Cron-Jobs.org parsing
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_obj = {
@@ -169,15 +162,12 @@ class JSONFormatter(logging.Formatter):
         }
         return json.dumps(log_obj)
 
-# Use text formatter for debug, JSON for production
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s") if cfg.DEBUG_MODE else JSONFormatter()
 
-# Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# Rotating file handler
 try:
     file_handler = RotatingFileHandler(cfg.LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(formatter)
@@ -201,24 +191,21 @@ class ProcessLock:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             self.fd = open(self.lock_path, 'w')
             
-            # Try non-blocking exclusive lock
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fd.write(str(os.getpid()))
             self.fd.flush()
             return True
         except (IOError, OSError):
-            # Check for stale lock
             try:
                 if self.lock_path.exists():
                     with open(self.lock_path) as f:
                         old_pid = int(f.read().strip())
-                    # If process doesn't exist, lock is stale
                     if not os.path.exists(f"/proc/{old_pid}"):
                         logger.warning(f"Removing stale lock from PID {old_pid}")
                         self.lock_path.unlink(missing_ok=True)
-                        return self.acquire()  # Retry
-            except Exception as e:
-                logger.debug(f"Stale lock check failed: {e}")
+                        return self.acquire()
+            except Exception:
+                pass
             
             if self.fd:
                 self.fd.close()
@@ -244,7 +231,7 @@ class CircuitBreaker:
         self.last_failure = 0.0
         self.threshold = failure_threshold
         self.timeout = timeout
-        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.state = "CLOSED"
 
     async def call(self, func):
         """Wrap an async function with circuit breaker logic"""
@@ -257,7 +244,6 @@ class CircuitBreaker:
 
         try:
             result = await func()
-            # Success: reset failures
             if self.state == "HALF_OPEN":
                 logger.info("Circuit breaker: CLOSED (recovery successful)")
             self.failures = 0
@@ -296,12 +282,9 @@ class StateDB:
             os.makedirs(db_dir, exist_ok=True)
         
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        # NEW: Enable WAL for concurrent access
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._ensure_tables()
-        
-        # Secure file permissions
         os.chmod(self.db_path, 0o600)
 
     def _ensure_tables(self):
@@ -364,7 +347,6 @@ class StateDB:
 # PRUNE (smart daily)
 # -------------------------
 def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: logging.Logger = None):
-    """Delete old states with stale lock protection"""
     try:
         if expiry_days <= 0:
             if logger_local:
@@ -378,15 +360,12 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
 
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        
-        # NEW: Use exclusive transaction to prevent corruption
         cur.execute("BEGIN EXCLUSIVE")
         
         cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("SELECT value FROM metadata WHERE key='last_prune'")
         row = cur.fetchone()
         
-        from datetime import timezone
         today = datetime.now(timezone.utc).date()
         
         if row:
@@ -444,7 +423,6 @@ async def fetch_json_with_retries(
     timeout: int = 15,
     circuit_breaker: Optional[CircuitBreaker] = None
 ):
-    """Fetch with retry logic and circuit breaker support"""
     async def _fetch():
         for attempt in range(1, retries + 1):
             try:
@@ -484,7 +462,7 @@ class DataFetcher:
         self.base_url = base_url.rstrip("/")
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = timeout
-        self.cache = {}  # per-run cache
+        self.cache = {}
         self.circuit_breaker = circuit_breaker
 
     async def fetch_products(self, session: aiohttp.ClientSession):
@@ -596,7 +574,7 @@ def parse_candle_response(res: dict) -> Optional[pd.DataFrame]:
     return df
 
 # -------------------------
-# INDICATORS (unchanged logic)
+# INDICATORS
 # -------------------------
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -750,10 +728,6 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     vwap = df2['cum_hlc3_vol'] / df2['cum_vol'].replace(0, np.nan)
     return vwap.ffill().bfill()
 
-def get_previous_day_ohlc_from_api(session: aiohttp.ClientSession, symbol: str, days_back_limit: int = 15) -> Optional[dict]:
-    # This function is unused in original code, keeping for compatibility
-    return None
-
 async def awaitable_get_previous_day_ohlc(session: aiohttp.ClientSession, symbol: str, days_back_limit: int = 15):
     """Get previous day's OHLC with error handling"""
     try:
@@ -829,7 +803,6 @@ async def evaluate_pair_async(
         limit_5m = sp.get("limit_5m", 500)
         min_required_5m = sp.get("min_required_5m", 250)
 
-        # NEW: Conditional 5m fetch
         tasks = [
             fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)
         ]
@@ -843,7 +816,7 @@ async def evaluate_pair_async(
         
         if isinstance(results[0], Exception):
             logger.error(f"Exception fetching 15m data for {pair_name}: {results[0]}")
-        
+
         df_15m = parse_candle_response(res15)
         df_5m = parse_candle_response(res5) if res5 else None
 
@@ -871,7 +844,6 @@ async def evaluate_pair_async(
             if len(df_5m) < abs(last_i_5m) + 1:
                 df_5m = None
 
-        # NEW: Error handling for daily candles
         resd = await fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 5)
         df_daily = parse_candle_response(resd)
         if df_daily is None or len(df_daily) < 2:
@@ -1001,7 +973,7 @@ async def evaluate_pair_async(
         message = None
         last_state_pair = last_state
         suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
-        # Check signals in priority order
+
         if vbuy:
             current_signal = "vbuy"
             if not should_suppress_duplicate(last_state_pair, current_signal, suppress_secs):
@@ -1101,7 +1073,7 @@ async def send_telegram_async(
             
             ok = js.get("ok", False)
             if ok:
-                await asyncio.sleep(0.2)  # Rate limiting
+                await asyncio.sleep(0.2)
                 return True
             else:
                 logger.warning(f"Telegram API error: {js}")
@@ -1122,7 +1094,7 @@ async def check_dead_mans_switch(state_db: StateDB):
         last_success = state_db.get_metadata("last_success_run")
         if last_success:
             hours_since = (now_ts() - int(last_success)) / 3600
-            if hours_since > 2:  # Alert if no success for 2+ hours
+            if hours_since > 2:
                 await send_telegram_async(
                     cfg.TELEGRAM_BOT_TOKEN, 
                     cfg.TELEGRAM_CHAT_ID,
@@ -1141,40 +1113,34 @@ async def run_once(send_test: bool = True):
     start_time = time.time()
     reset_metrics()
     
-    # NEW: Check execution time periodically
     async def check_timeout():
         while True:
             elapsed = time.time() - start_time
             if elapsed > cfg.MAX_EXEC_TIME:
                 logger.critical(f"Execution timeout: {elapsed:.1f}s > {cfg.MAX_EXEC_TIME}s")
                 sys.exit(EXIT_TIMEOUT)
-            await asyncio.sleep(1)  # Check every second
+            await asyncio.sleep(1)
     
     timeout_task = asyncio.create_task(check_timeout())
     
     try:
         logger.info("🚀 Starting fibonacci_pivot_bot_production run")
 
-        # Check dead man's switch first
         state_db = StateDB(cfg.STATE_DB_PATH)
         await check_dead_mans_switch(state_db)
 
-        # Prune old records
         try:
             prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
         except Exception as e:
             logger.warning(f"Prune error: {e}")
 
-        # Load last alerts
         last_alerts = state_db.load_all()
 
-        # Reset state if requested
         if cfg.RESET_STATE:
             logger.warning("🔄 RESET_STATE requested: clearing states table")
             for p in cfg.PAIRS:
                 state_db.set(p, None)
 
-        # Send test message
         if send_test and cfg.SEND_TEST_MESSAGE:
             test_msg = (f"🔔 Fibonacci Pivot Bot started\n"
                        f"Time: {human_ts()}\n"
@@ -1182,13 +1148,12 @@ async def run_once(send_test: bool = True):
                        f"Pairs: {len(cfg.PAIRS)}")
             await send_telegram_async(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
 
-        # Load products (with cache)
         products_map = load_products_cache()
         fetcher_local = DataFetcher(
             cfg.DELTA_API_BASE, 
             max_parallel=cfg.MAX_CONCURRENCY, 
             timeout=cfg.HTTP_TIMEOUT,
-            circuit_breaker=CircuitBreaker()  # NEW: Per-run circuit breaker
+            circuit_breaker=CircuitBreaker()
         )
         
         async with aiohttp.ClientSession() as session:
@@ -1208,7 +1173,6 @@ async def run_once(send_test: bool = True):
                 state_db.close()
                 sys.exit(EXIT_API_FAILURE)
 
-            # Execute pair evaluations with concurrency control
             sem = asyncio.Semaphore(cfg.MAX_CONCURRENCY)
             tasks = []
             
@@ -1245,11 +1209,9 @@ async def run_once(send_test: bool = True):
                     state_db.set(pair_name, new_state.get("state"), new_state.get("ts"))
                     updates += 1
 
-            # Log metrics
             METRICS["execution_time"] = time.time() - start_time
             logger.info(f"📊 METRICS: {json.dumps(METRICS)}")
             
-            # Update success timestamp
             state_db.set_metadata("last_success_run", str(now_ts()))
             
             logger.info(f"✅ Run complete. {updates} state updates applied. "
@@ -1273,26 +1235,26 @@ async def run_once(send_test: bool = True):
 # -------------------------
 # CLI + SIGNAL HANDLING
 # -------------------------
-stop_requested = False 
+stop_requested = False
 
 def request_stop(signum, frame):
-    global stop_requested
-    logger.info(f"Signal {signum} received. Stopping after current run.")
-    stop_requested = True 
+    global stop_requested
+    logger.info(f"⚠️ Signal {signum} received. Stopping after current run.")
+    stop_requested = True
 
-# Inside the main() function:
 def main():
-    """Entry point with process locking"""
-    # Move signal registration here
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
-    
-    lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
+    """Entry point with process locking"""
+    # Register signal handlers inside main
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    
+    lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
     if not lock.acquire():
         logger.error("❌ Another instance is running or stale lock exists. Exiting.")
         sys.exit(EXIT_LOCK_CONFLICT)
     
     try:
+        import argparse
         parser = argparse.ArgumentParser(description="Fibonacci Pivot Bot (Production)")
         group = parser.add_mutually_exclusive_group()
         group.add_argument("--once", action="store_true", help="Run once and exit")
