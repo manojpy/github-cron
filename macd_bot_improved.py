@@ -164,7 +164,7 @@ class StateDB:
 
     def set_metadata(self, key: str, value: str):
         cur = self._conn.cursor()
-        cur.execute("INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value))
         self._conn.commit()
 
 # -------------------------
@@ -476,30 +476,39 @@ def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
     return df
 
 # -------------------------
+# Timestamp / closed-index (replaced original determine_closed_indices)
+# -------------------------
+def get_last_closed_indices(df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Tuple[int, int, int]:
+    """Return safe indices for last closed candles across 15m and 5m timeframes."""
+    now_ts = int(time.time())
+
+    def closed_index_for(df: pd.DataFrame, resolution_min: int) -> int:
+        if df is None or df.empty:
+            return -1
+        # Last candle timestamp from API is usually the start of that candle's interval
+        last_ts = int(df['timestamp'].iloc[-1])
+        current_interval_start = now_ts - (now_ts % (resolution_min * 60))
+        # If latest candle timestamp is within current open interval, it's incomplete
+        if last_ts >= current_interval_start:
+            return -2  # use -2 to refer to previous closed candle
+        return -1  # most recent candle is closed; use -1
+
+    last_i = closed_index_for(df_15m, 15)
+    prev_i = last_i - 1
+    last_i_5m = closed_index_for(df_5m, 5)
+    return last_i, prev_i, last_i_5m
+
+# -------------------------
 # Evaluation logic (modular)
 # -------------------------
 def determine_closed_indices(df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Tuple[int, int, int]:
-    """Determine indices for last closed candles across 15m and 5m timeframes."""
-    now_ts = time.time()
-    resolution_sec_15m = 15 * 60
-    current_15m_interval_start_ts = now_ts - (now_ts % resolution_sec_15m)
-    is_last_15m_candle_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_interval_start_ts
-    if is_last_15m_candle_incomplete:
-        last_i = -2; prev_i = -3
-    else:
-        last_i = -1; prev_i = -2
-
-    resolution_sec_5m = 5 * 60
-    current_5m_interval_start_ts = now_ts - (now_ts % resolution_sec_5m)
-    is_last_5m_candle_incomplete = df_5m['timestamp'].iloc[-1] >= current_5m_interval_start_ts
-    last_i_5m = -2 if is_last_5m_candle_incomplete else -1
-
-    return last_i, prev_i, last_i_5m
+    # kept for backward compatibility if some modules call it; delegate to new function
+    return get_last_closed_indices(df_15m, df_5m)
 
 def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Evaluate indicators and conditions; return new state dict if changed (with optional message)."""
     try:
-        last_i, prev_i, last_i_5m = determine_closed_indices(df_15m, df_5m)
+        last_i, prev_i, last_i_5m = get_last_closed_indices(df_15m, df_5m)
 
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         if magical_hist.empty:
