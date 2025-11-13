@@ -32,7 +32,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python <<'PYCODE'
-          import os, time, requests, sys
+          import os, time, requests, json
 
           TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
           CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -45,22 +45,53 @@ jobs:
                       timeout=10
                   )
                   if r.status_code != 200:
-                      print("Telegram alert failed:", r.text)
+                      print("Telegram send failed:", r.text)
               except Exception as e:
                   print("Error sending Telegram:", e)
 
           def check_file_age(path, label, threshold_hours=2):
+              """Return (status, age_hours)."""
               if not os.path.exists(path):
                   send_alert(f"⚠️ Watchdog Alert: {label} state file not found!")
-                  return
+                  return False, None
               age_hours = (time.time() - os.path.getmtime(path)) / 3600
               if age_hours > threshold_hours:
                   send_alert(f"⚠️ Watchdog Alert: {label} last updated {age_hours:.1f}h ago.")
-              else:
-                  print(f"{label}: OK ({age_hours:.2f}h old)")
+                  return False, age_hours
+              print(f"{label}: OK ({age_hours:.2f}h old)")
+              return True, age_hours
 
-          check_file_age("macd_state.sqlite", "MACD Bot", threshold_hours=2)
-          check_file_age("fib_state.sqlite", "Fibonacci Pivot Bot", threshold_hours=2)
+          macd_ok, macd_age = check_file_age("macd_state.sqlite", "MACD Bot", 2)
+          fib_ok, fib_age   = check_file_age("fib_state.sqlite", "Fibonacci Pivot Bot", 2)
+
+          # ------------------------------------------------------------
+          # Daily heartbeat message — once every 24 hours
+          # ------------------------------------------------------------
+          state_file = ".watchdog_state.json"
+          now = time.time()
+          last_ping_time = 0
+          if os.path.exists(state_file):
+              try:
+                  with open(state_file, "r") as f:
+                      last_ping_time = json.load(f).get("last_ping", 0)
+              except Exception:
+                  last_ping_time = 0
+
+          hours_since_last_ping = (now - last_ping_time) / 3600
+          if hours_since_last_ping >= 24:
+              if macd_ok and fib_ok:
+                  msg = (
+                      "✅ <b>Watchdog Daily Health Check</b>\n"
+                      f"All systems OK.\n"
+                      f"• MACD Bot: {macd_age:.2f} h old\n"
+                      f"• Fibonacci Bot: {fib_age:.2f} h old\n"
+                      "Everything running smoothly 🚀"
+                  )
+                  send_alert(msg)
+              with open(state_file, "w") as f:
+                  json.dump({"last_ping": now}, f)
+          else:
+              print(f"Last heartbeat was {hours_since_last_ping:.1f} h ago; skipping daily ping.")
 
           print("✅ Watchdog check complete.")
           PYCODE
