@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# python 3.12+
+"""
+Improved Fibonacci Pivot Bot
+- Designed for cron-jobs.org / GitHub-run environment
+- Uses asyncio, aiohttp, sqlite (WAL), pydantic config validation
+- Robust: circuit breaker, retries, jitter, dead-man switch, graceful shutdown
+"""
+
+from __future__ import annotations
 
 import os
 import sys
@@ -11,7 +20,7 @@ import sqlite3
 import traceback
 import signal
 import html
-import fcntl  # FIXED: Explicitly imported
+import fcntl
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List, Union
@@ -20,15 +29,16 @@ import aiohttp
 import pandas as pd
 import numpy as np
 import pytz
-from aiohttp import ClientConnectorError, ClientResponseError
+import psutil
+from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
 from logging.handlers import RotatingFileHandler
 
 # Pydantic V2 imports
 try:
     from pydantic import BaseModel, field_validator
-except ImportError:
-    print("⚠️ pydantic not found. Install with: pip install pydantic>=2.5.0")
-    sys.exit(4)
+except Exception as e:
+    print("⚠️ pydantic not found. Install with: pip install 'pydantic>=2.5.0'")
+    raise
 
 # -------------------------
 # CONFIGURATION MODEL
@@ -66,6 +76,10 @@ class Config(BaseModel):
     MAX_EXEC_TIME: int = 25
     USE_RMA200: bool = True
     PRODUCTS_CACHE_TTL: int = 86400
+    LOG_LEVEL: str = "INFO"
+    TELEGRAM_RETRIES: int = 3
+    TELEGRAM_BACKOFF_BASE: float = 2.0
+    MEMORY_LIMIT_BYTES: int = 400_000_000  # ~400MB safe default for small hosts
 
     @field_validator("TELEGRAM_BOT_TOKEN")
     @classmethod
@@ -104,12 +118,13 @@ def load_config() -> Config:
         "LOG_FILE": os.getenv("LOG_FILE", "fibonacci_pivot_bot.log"),
         "MAX_EXEC_TIME": int(os.getenv("MAX_EXEC_TIME", "25")),
         "USE_RMA200": os.getenv("USE_RMA200", "True").lower() == "true",
+        "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").upper()
     }
 
     config_file = os.getenv("CONFIG_FILE", "config.json")
     if Path(config_file).exists():
         try:
-            with open(config_file, "r") as f:
+            with open(config_file, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
                 config_dict.update(user_cfg)
             print(f"✅ Loaded configuration from {config_file}")
@@ -130,10 +145,12 @@ cfg = load_config()
 # -------------------------
 # METRICS
 # -------------------------
-METRICS = {
+METRICS: Dict[str, Any] = {
     "pairs_checked": 0,
     "alerts_sent": 0,
     "api_errors": 0,
+    "logic_errors": 0,
+    "network_errors": 0,
     "execution_time": 0.0,
     "start_time": 0.0
 }
@@ -143,6 +160,8 @@ def reset_metrics():
         "pairs_checked": 0,
         "alerts_sent": 0,
         "api_errors": 0,
+        "logic_errors": 0,
+        "network_errors": 0,
         "execution_time": 0.0,
         "start_time": time.time()
     })
@@ -151,7 +170,8 @@ def reset_metrics():
 # LOGGER
 # -------------------------
 logger = logging.getLogger("fibonacci_pivot_bot")
-logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else logging.INFO)
+log_level = getattr(logging, cfg.LOG_LEVEL if isinstance(cfg.LOG_LEVEL, str) else "INFO", logging.INFO)
+logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else log_level)
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -160,7 +180,7 @@ class JSONFormatter(logging.Formatter):
             "level": record.levelname,
             "msg": record.getMessage()
         }
-        return json.dumps(log_obj)
+        return json.dumps(log_obj, ensure_ascii=False)
 
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s") if cfg.DEBUG_MODE else JSONFormatter()
 
@@ -190,7 +210,6 @@ class ProcessLock:
         try:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             self.fd = open(self.lock_path, 'w')
-            
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fd.write(str(os.getpid()))
             self.fd.flush()
@@ -198,26 +217,41 @@ class ProcessLock:
         except (IOError, OSError):
             try:
                 if self.lock_path.exists():
-                    with open(self.lock_path) as f:
-                        old_pid = int(f.read().strip())
-                    if not os.path.exists(f"/proc/{old_pid}"):
+                    with open(self.lock_path, 'r') as f:
+                        raw = f.read().strip()
+                        old_pid = int(raw) if raw.isdigit() else None
+                    if old_pid and not os.path.exists(f"/proc/{old_pid}"):
                         logger.warning(f"Removing stale lock from PID {old_pid}")
-                        self.lock_path.unlink(missing_ok=True)
+                        try:
+                            self.lock_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                         return self.acquire()
             except Exception:
                 pass
-            
             if self.fd:
-                self.fd.close()
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
             return False
 
     def release(self):
         """Release the lock"""
         try:
             if self.fd:
-                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
-                self.fd.close()
-            self.lock_path.unlink(missing_ok=True)
+                try:
+                    fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
+            try:
+                self.lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         except Exception as e:
             logger.debug(f"Error releasing lock: {e}")
 
@@ -249,9 +283,18 @@ class CircuitBreaker:
             self.failures = 0
             self.state = "CLOSED"
             return result
+        except ClientConnectorError:
+            self.failures += 1
+            self.last_failure = time.time()
+            METRICS["network_errors"] += 1
+            if self.failures >= self.threshold:
+                self.state = "OPEN"
+                logger.error(f"Circuit breaker OPEN after {self.failures} network failures")
+            raise
         except Exception as e:
             self.failures += 1
             self.last_failure = time.time()
+            METRICS["api_errors"] += 1
             if self.failures >= self.threshold:
                 self.state = "OPEN"
                 logger.error(f"Circuit breaker OPEN after {self.failures} failures")
@@ -280,12 +323,18 @@ class StateDB:
         db_dir = os.path.dirname(db_path)
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
-        
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
+        # Use WAL for concurrency
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         self._ensure_tables()
-        os.chmod(self.db_path, 0o600)
+        try:
+            os.chmod(self.db_path, 0o600)
+        except Exception:
+            pass
 
     def _ensure_tables(self):
         cur = self._conn.cursor()
@@ -341,7 +390,16 @@ class StateDB:
         self._conn.commit()
 
     def close(self):
-        self._conn.close()
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 # -------------------------
 # PRUNE (smart daily)
@@ -360,14 +418,17 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
 
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("BEGIN EXCLUSIVE")
-        
+        try:
+            cur.execute("BEGIN EXCLUSIVE")
+        except Exception:
+            pass
+
         cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("SELECT value FROM metadata WHERE key='last_prune'")
         row = cur.fetchone()
-        
+
         today = datetime.now(timezone.utc).date()
-        
+
         if row:
             try:
                 last_prune_date = datetime.fromisoformat(row[0]).date()
@@ -389,20 +450,19 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
         cutoff = int(time.time()) - (expiry_days * 86400)
         cur.execute("DELETE FROM states WHERE ts < ?", (cutoff,))
         deleted = cur.rowcount
-        
-        cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_prune', ?)", 
+
+        cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_prune', ?)",
                    (datetime.utcnow().isoformat(),))
-        
+
         conn.commit()
-        
+
         if deleted > 0:
             try:
                 cur.execute("VACUUM;")
-                conn.commit()
             except Exception as e:
                 if logger_local:
                     logger_local.warning(f"VACUUM failed: {e}")
-        
+
         conn.close()
         if logger_local:
             logger_local.info(f"Pruned {deleted} states older than {expiry_days} days from {db_path}.")
@@ -415,11 +475,11 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
 # ASYNC HTTP HELPERS
 # -------------------------
 async def fetch_json_with_retries(
-    session: aiohttp.ClientSession, 
-    url: str, 
-    params: dict = None, 
-    retries: int = 3, 
-    backoff: float = 1.5, 
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict = None,
+    retries: int = 3,
+    backoff: float = 1.5,
     timeout: int = 15,
     circuit_breaker: Optional[CircuitBreaker] = None
 ):
@@ -436,16 +496,20 @@ async def fetch_json_with_retries(
                     except Exception:
                         logger.debug(f"Non-JSON response from {url}: {text[:200]}")
                         return {}
-            except (asyncio.TimeoutError, ClientConnectorError, ClientResponseError) as e:
+            except (asyncio.TimeoutError, ClientConnectorError) as e:
                 logger.debug(f"Fetch attempt {attempt} error: {e} for {url}")
-                METRICS["api_errors"] += 1
+                METRICS["network_errors"] += 1
                 if attempt == retries:
                     logger.warning(f"Failed to fetch {url} after {retries} attempts.")
                     return None
                 await asyncio.sleep(backoff * (attempt ** 1.2) + random.uniform(0, 0.2))
+            except ClientResponseError as cre:
+                METRICS["api_errors"] += 1
+                logger.debug(f"ClientResponseError fetching {url}: {cre}")
+                return None
             except Exception as e:
                 logger.exception(f"Unexpected fetch error for {url}: {e}")
-                METRICS["api_errors"] += 1
+                METRICS["logic_errors"] += 1
                 return None
         return None
 
@@ -462,16 +526,16 @@ class DataFetcher:
         self.base_url = base_url.rstrip("/")
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = timeout
-        self.cache = {}
+        self.cache: Dict[str, Tuple[float, Any]] = {}
         self.circuit_breaker = circuit_breaker
 
     async def fetch_products(self, session: aiohttp.ClientSession):
         url = f"{self.base_url}/v2/products"
         async with self.semaphore:
             return await fetch_json_with_retries(
-                session, url, 
-                retries=cfg.FETCH_RETRIES, 
-                backoff=cfg.FETCH_BACKOFF, 
+                session, url,
+                retries=cfg.FETCH_RETRIES,
+                backoff=cfg.FETCH_BACKOFF,
                 timeout=cfg.HTTP_TIMEOUT,
                 circuit_breaker=self.circuit_breaker
             )
@@ -479,8 +543,11 @@ class DataFetcher:
     async def fetch_candles(self, session: aiohttp.ClientSession, symbol: str, resolution: str, limit: int):
         key = f"candles:{symbol}:{resolution}:{limit}"
         if key in self.cache:
-            return self.cache[key][1]
-        
+            age, data = self.cache[key]
+            # keep cached for a short time (like 5 sec) to reduce duplicate requests in same run
+            if time.time() - age < 5:
+                return data
+
         await asyncio.sleep(random.uniform(cfg.JITTER_MIN, cfg.JITTER_MAX))
         url = f"{self.base_url}/v2/chart/history"
         params = {
@@ -489,16 +556,14 @@ class DataFetcher:
             "from": int(time.time()) - (limit * (int(resolution) if resolution != 'D' else 1440) * 60),
             "to": int(time.time())
         }
-        
         async with self.semaphore:
             data = await fetch_json_with_retries(
-                session, url, params=params, 
-                retries=cfg.FETCH_RETRIES, 
-                backoff=cfg.FETCH_BACKOFF, 
+                session, url, params=params,
+                retries=cfg.FETCH_RETRIES,
+                backoff=cfg.FETCH_BACKOFF,
                 timeout=cfg.HTTP_TIMEOUT,
                 circuit_breaker=self.circuit_breaker
             )
-        
         self.cache[key] = (time.time(), data)
         return data
 
@@ -506,13 +571,12 @@ class DataFetcher:
 # PRODUCT CACHE
 # -------------------------
 def load_products_cache() -> Optional[Dict[str, dict]]:
-    """Load products from cache if fresh"""
     cache_path = Path("products_cache.json")
     if cache_path.exists():
         try:
             age = time.time() - cache_path.stat().st_mtime
             if age < cfg.PRODUCTS_CACHE_TTL:
-                with open(cache_path) as f:
+                with open(cache_path, "r", encoding="utf-8") as f:
                     logger.info(f"Using cached products ({age:.0f}s old)")
                     return json.load(f)
         except Exception as e:
@@ -520,16 +584,15 @@ def load_products_cache() -> Optional[Dict[str, dict]]:
     return None
 
 def save_products_cache(products_map: Dict[str, dict]):
-    """Save products to cache"""
     try:
-        with open("products_cache.json", "w") as f:
-            json.dump(products_map, f)
+        with open("products_cache.json", "w", encoding="utf-8") as f:
+            json.dump(products_map, f, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"Failed to save products cache: {e}")
 
 def build_products_map(api_products: dict) -> Dict[str, dict]:
-    products_map = {}
-    if not api_products:
+    products_map: Dict[str, dict] = {}
+    if not api_products or not isinstance(api_products, dict):
         return products_map
     for p in api_products.get("result", []):
         try:
@@ -539,8 +602,8 @@ def build_products_map(api_products: dict) -> Dict[str, dict]:
                 for pair_name in cfg.PAIRS:
                     if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
                         products_map[pair_name] = {
-                            'id': p.get('id'), 
-                            'symbol': p.get('symbol'), 
+                            'id': p.get('id'),
+                            'symbol': p.get('symbol'),
                             'contract_type': p.get('contract_type')
                         }
         except Exception:
@@ -553,9 +616,10 @@ def build_products_map(api_products: dict) -> Dict[str, dict]:
 def parse_candle_response(res: dict) -> Optional[pd.DataFrame]:
     if not res or not isinstance(res, dict):
         return None
-    if not res.get("success"):
+    # support some API shapes
+    if not res.get("success", True) and "result" not in res:
         return None
-    resr = res.get("result", {})
+    resr = res.get("result", {}) or {}
     arrays = [resr.get('t', []), resr.get('o', []), resr.get('h', []), resr.get('l', []), resr.get('c', []), resr.get('v', [])]
     if any(len(a) == 0 for a in arrays):
         return None
@@ -569,7 +633,7 @@ def parse_candle_response(res: dict) -> Optional[pd.DataFrame]:
         'volume': resr.get('v', [])[:min_len]
     })
     df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
-    if df.empty or df['close'].astype(float).iloc[-1] <= 0:
+    if df.empty or float(df['close'].astype(float).iloc[-1]) <= 0:
         return None
     return df
 
@@ -782,15 +846,15 @@ def should_suppress_duplicate(last_state: Optional[Dict[str, Any]], current_sign
 # CORE PAIR EVALUATION
 # -------------------------
 async def evaluate_pair_async(
-    session: aiohttp.ClientSession, 
-    fetcher: DataFetcher, 
-    products_map: Dict[str, dict], 
-    pair_name: str, 
+    session: aiohttp.ClientSession,
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    pair_name: str,
     last_state: Optional[Dict[str, Any]]
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Evaluate a single pair with enhanced error handling"""
     METRICS["pairs_checked"] += 1
-    
+
     try:
         prod = products_map.get(pair_name)
         if not prod:
@@ -808,14 +872,15 @@ async def evaluate_pair_async(
         ]
         if cfg.USE_RMA200:
             tasks.append(fetcher.fetch_candles(session, prod['symbol'], "5", limit_5m))
-        
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         res15 = results[0] if not isinstance(results[0], Exception) else None
         res5 = results[1] if cfg.USE_RMA200 and len(results) > 1 and not isinstance(results[1], Exception) else None
-        
+
         if isinstance(results[0], Exception):
             logger.error(f"Exception fetching 15m data for {pair_name}: {results[0]}")
+            METRICS["network_errors"] += 1
 
         df_15m = parse_candle_response(res15)
         df_5m = parse_candle_response(res5) if res5 else None
@@ -829,7 +894,7 @@ async def evaluate_pair_async(
         current_15m_start = nowts - (nowts % res15s)
         last_15_incomplete = df_15m['timestamp'].iloc[-1] >= current_15m_start
         last_i_15m = -2 if last_15_incomplete else -1
-        
+
         if len(df_15m) < abs(last_i_15m) + 1:
             logger.warning(f"{pair_name}: not enough 15m candles after index adjust")
             return None
@@ -849,17 +914,17 @@ async def evaluate_pair_async(
         if df_daily is None or len(df_daily) < 2:
             logger.warning(f"{pair_name}: failed to fetch daily candles")
             return None
-        
+
         df_daily['date'] = pd.to_datetime(df_daily['timestamp'], unit='s', utc=True).dt.date
         today = datetime.now(timezone.utc).date()
         yesterday = today - timedelta(days=1)
         prev_day_row = df_daily[df_daily['date'] == yesterday]
-        
+
         if not prev_day_row.empty:
             prev = prev_day_row.iloc[-1]
         else:
             prev = df_daily.iloc[-2]
-            
+
         prev_day_ohlc = {'high': float(prev['high']), 'low': float(prev['low']), 'close': float(prev['close'])}
         pivots = calculate_fibonacci_pivots(prev_day_ohlc['high'], prev_day_ohlc['low'], prev_day_ohlc['close'])
 
@@ -880,7 +945,6 @@ async def evaluate_pair_async(
             logger.info(f"{pair_name}: extreme candle {candle_pct:.2f}% > {cfg.EXTREME_CANDLE_PCT}% - skipping")
             return None
 
-        idx = last_i_15m
         try:
             ppo_curr = float(ppo.iloc[idx])
             rma50_curr = float(rma_50_15m.iloc[idx])
@@ -1026,7 +1090,7 @@ async def evaluate_pair_async(
             return None
 
         if message:
-            success = await send_telegram_async(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, message, session)
+            success = await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, message, session)
             if success:
                 METRICS["alerts_sent"] += 1
                 logger.info(f"✅ Alert sent for {pair_name}: {current_signal}")
@@ -1035,42 +1099,46 @@ async def evaluate_pair_async(
 
         return pair_name, {"state": current_signal, "ts": now_ts()}
 
+    except ClientConnectorError:
+        METRICS["network_errors"] += 1
+        logger.exception(f"Network error evaluating pair {pair_name}")
+        return None
     except Exception as e:
-        METRICS["api_errors"] += 1
+        METRICS["logic_errors"] += 1
         logger.exception(f"Error evaluating pair {pair_name}: {e}")
         if cfg.DEBUG_MODE:
             logger.debug(traceback.format_exc())
         return None
 
 # -------------------------
-# ASYNC TELEGRAM SENDER
+# ASYNC TELEGRAM SENDER (with retries)
 # -------------------------
 async def send_telegram_async(
-    token: str, 
-    chat_id: str, 
-    text: str, 
+    token: str,
+    chat_id: str,
+    text: str,
     session: Optional[aiohttp.ClientSession] = None
 ) -> bool:
-    """Send Telegram message with error handling"""
+    """Send Telegram message once"""
     if not token or not chat_id:
         logger.warning("Telegram not configured; skipping.")
         return False
-    
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     own_session = False
-    
+
     if session is None:
-        session = aiohttp.ClientSession()
+        connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
+        session = aiohttp.ClientSession(connector=connector)
         own_session = True
-    
+
     try:
         async with session.post(url, data=data, timeout=10) as resp:
             try:
                 js = await resp.json(content_type=None)
             except Exception:
                 js = {"ok": False, "status": resp.status, "text": await resp.text()}
-            
             ok = js.get("ok", False)
             if ok:
                 await asyncio.sleep(0.2)
@@ -1085,46 +1153,99 @@ async def send_telegram_async(
         if own_session:
             await session.close()
 
+async def send_telegram_with_retries(token: str, chat_id: str, text: str, session: Optional[aiohttp.ClientSession] = None) -> bool:
+    """Retries Telegram send with exponential backoff"""
+    last_exc = None
+    for attempt in range(1, max(1, cfg.TELEGRAM_RETRIES) + 1):
+        try:
+            ok = await send_telegram_async(token, chat_id, text, session)
+            if ok:
+                return True
+            last_exc = Exception("Telegram returned non-ok")
+        except Exception as e:
+            last_exc = e
+        sleep_for = cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)
+        await asyncio.sleep(sleep_for + random.uniform(0, 0.3))
+    logger.error(f"Telegram send failed after retries: {last_exc}")
+    return False
+
 # -------------------------
 # DEAD MAN'S SWITCH
 # -------------------------
 async def check_dead_mans_switch(state_db: StateDB):
-    """Alert if bot hasn't succeeded recently"""
+    """Alert if bot hasn't succeeded recently, with cooldown"""
     try:
         last_success = state_db.get_metadata("last_success_run")
         if last_success:
-            hours_since = (now_ts() - int(last_success)) / 3600
+            try:
+                last_success_int = int(last_success)
+            except Exception:
+                last_success_int = now_ts()
+            hours_since = (now_ts() - last_success_int) / 3600.0
             if hours_since > 2:
-                await send_telegram_async(
-                    cfg.TELEGRAM_BOT_TOKEN, 
-                    cfg.TELEGRAM_CHAT_ID,
-                    f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
-                    f"Last success: {datetime.fromtimestamp(int(last_success)).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                    f"Check logs immediately."
-                )
+                # Avoid repeating the dead-man alert every run: record a cooldown key
+                dead_alert_ts = state_db.get_metadata("dead_alert_ts")
+                if dead_alert_ts:
+                    try:
+                        dead_alert_int = int(dead_alert_ts)
+                    except Exception:
+                        dead_alert_int = 0
+                else:
+                    dead_alert_int = 0
+
+                if now_ts() - dead_alert_int > 4 * 3600:  # allow at most once every 4 hours
+                    msg = (f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
+                           f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                           f"Check logs immediately.")
+                    await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg)
+                    state_db.set_metadata("dead_alert_ts", str(now_ts()))
     except Exception as e:
         logger.error(f"Dead man's switch check failed: {e}")
 
 # -------------------------
 # MAIN RUNNER
 # -------------------------
+stop_requested = False
+
+def request_stop(signum, frame):
+    global stop_requested
+    logger.info(f"⚠️ Signal {signum} received. Stopping after current run.")
+    stop_requested = True
+
 async def run_once(send_test: bool = True):
     """Main execution with timeout protection"""
     start_time = time.time()
     reset_metrics()
-    
+
+    # A non-blocking timeout monitor which raises TimeoutError when exceeded
     async def check_timeout():
         while True:
             elapsed = time.time() - start_time
             if elapsed > cfg.MAX_EXEC_TIME:
                 logger.critical(f"Execution timeout: {elapsed:.1f}s > {cfg.MAX_EXEC_TIME}s")
-                sys.exit(EXIT_TIMEOUT)
+                raise TimeoutError("Max execution time exceeded")
             await asyncio.sleep(1)
-    
+
     timeout_task = asyncio.create_task(check_timeout())
-    
+
+    # memory guard
+    try:
+        proc = psutil.Process(os.getpid())
+    except Exception:
+        proc = None
+
     try:
         logger.info("🚀 Starting fibonacci_pivot_bot_production run")
+
+        # Memory check early
+        if proc:
+            try:
+                rss = proc.memory_info().rss
+                if rss > cfg.MEMORY_LIMIT_BYTES:
+                    logger.critical(f"High memory usage at start: {rss} bytes > {cfg.MEMORY_LIMIT_BYTES}")
+                    raise MemoryError("High memory usage")
+            except Exception as e:
+                logger.debug(f"Memory check failed: {e}")
 
         state_db = StateDB(cfg.STATE_DB_PATH)
         await check_dead_mans_switch(state_db)
@@ -1146,88 +1267,107 @@ async def run_once(send_test: bool = True):
                        f"Time: {human_ts()}\n"
                        f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
                        f"Pairs: {len(cfg.PAIRS)}")
-            await send_telegram_async(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
+            await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
 
         products_map = load_products_cache()
+        circuit = CircuitBreaker()
         fetcher_local = DataFetcher(
-            cfg.DELTA_API_BASE, 
-            max_parallel=cfg.MAX_CONCURRENCY, 
+            cfg.DELTA_API_BASE,
+            max_parallel=cfg.MAX_CONCURRENCY,
             timeout=cfg.HTTP_TIMEOUT,
-            circuit_breaker=CircuitBreaker()
+            circuit_breaker=circuit
         )
-        
-        async with aiohttp.ClientSession() as session:
+
+        connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
             if products_map is None:
                 prod_resp = await fetcher_local.fetch_products(session)
                 if not prod_resp:
                     logger.error("❌ Failed to fetch products from API")
                     state_db.close()
-                    sys.exit(EXIT_API_FAILURE)
+                    raise SystemExit(EXIT_API_FAILURE)
                 products_map = build_products_map(prod_resp)
                 save_products_cache(products_map)
-            
+
             found = len(products_map)
             logger.info(f"✅ Found {found} tradable pairs mapped to config.")
             if found == 0:
                 logger.error("❌ No products mapped; exiting")
                 state_db.close()
-                sys.exit(EXIT_API_FAILURE)
+                raise SystemExit(EXIT_API_FAILURE)
 
             sem = asyncio.Semaphore(cfg.MAX_CONCURRENCY)
-            tasks = []
-            
+            tasks: List[asyncio.Task] = []
+
             for pair in cfg.PAIRS:
                 if pair not in products_map:
                     logger.debug(f"Pair {pair} not in products map, skipping")
                     continue
-                
+
                 last_state = last_alerts.get(pair)
-                
+
                 async def run_one(pair_name=pair, last_s=last_state):
                     async with sem:
                         await asyncio.sleep(random.uniform(cfg.JITTER_MIN, cfg.JITTER_MAX))
                         return await evaluate_pair_async(session, fetcher_local, products_map, pair_name, last_s)
-                
+
                 tasks.append(asyncio.create_task(run_one()))
 
+            # gather with return_exceptions; don't let one bad task kill others
             results = await asyncio.gather(*tasks, return_exceptions=True)
             updates = 0
-            
+
             for r in results:
                 if isinstance(r, Exception):
                     logger.exception(f"Task exception: {r}")
                     continue
                 if not r:
                     continue
-                
+
                 pair_name, new_state = r
                 if not isinstance(new_state, dict):
                     continue
-                
+
                 prev = state_db.get(pair_name)
                 if prev != new_state:
                     state_db.set(pair_name, new_state.get("state"), new_state.get("ts"))
                     updates += 1
 
+            # mark success
             METRICS["execution_time"] = time.time() - start_time
             logger.info(f"📊 METRICS: {json.dumps(METRICS)}")
-            
+
             state_db.set_metadata("last_success_run", str(now_ts()))
-            
+
             logger.info(f"✅ Run complete. {updates} state updates applied. "
                        f"Checked {METRICS['pairs_checked']} pairs, sent {METRICS['alerts_sent']} alerts.")
-            
+
             state_db.close()
+
+        # Post-run memory check
+        if proc:
+            try:
+                rss = proc.memory_info().rss
+                if rss > cfg.MEMORY_LIMIT_BYTES:
+                    logger.warning(f"High memory usage after run: {rss}")
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
         logger.warning("Run was cancelled")
-        sys.exit(EXIT_TIMEOUT)
+        raise
+    except TimeoutError as te:
+        logger.critical(f"Timeout error: {te}")
+        raise SystemExit(EXIT_TIMEOUT)
+    except SystemExit:
+        raise
     except Exception as e:
         logger.exception(f"Unhandled error in run_once: {e}")
-        sys.exit(1)
+        raise
     finally:
-        timeout_task.cancel()
+        # ensure timeout_task is cancelled
         try:
+            timeout_task.cancel()
             await timeout_task
         except asyncio.CancelledError:
             pass
@@ -1235,25 +1375,18 @@ async def run_once(send_test: bool = True):
 # -------------------------
 # CLI + SIGNAL HANDLING
 # -------------------------
-stop_requested = False
-
-def request_stop(signum, frame):
-    global stop_requested
-    logger.info(f"⚠️ Signal {signum} received. Stopping after current run.")
-    stop_requested = True
-
 def main():
     """Entry point with process locking"""
     # Register signal handlers
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    
+
     # Acquire process lock
     lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
     if not lock.acquire():
         logger.error("❌ Another instance is running or stale lock exists. Exiting.")
         sys.exit(EXIT_LOCK_CONFLICT)
-    
+
     try:
         import argparse
         parser = argparse.ArgumentParser(description="Fibonacci Pivot Bot (Production)")
@@ -1263,7 +1396,11 @@ def main():
         args = parser.parse_args()
 
         if args.once:
-            asyncio.run(run_once())
+            try:
+                asyncio.run(run_once())
+            except SystemExit as e:
+                logger.error(f"Exited with code {e.code}")
+                sys.exit(e.code if isinstance(e.code, int) else 1)
         elif args.loop:
             interval = args.loop
             logger.info(f"🔄 Loop mode: interval={interval}s")
@@ -1271,18 +1408,31 @@ def main():
                 loop_start = time.time()
                 try:
                     asyncio.run(run_once(send_test=False))
+                except SystemExit as e:
+                    logger.error(f"Run exited with code {e.code}, continuing loop.")
                 except Exception:
                     logger.exception("Unhandled in run_once")
-                
                 elapsed = time.time() - loop_start
                 to_sleep = max(0, interval - elapsed)
                 if to_sleep > 0:
-                    time.sleep(to_sleep)
+                    # break early if stop requested during sleep
+                    for _ in range(int(to_sleep)):
+                        if stop_requested:
+                            break
+                        time.sleep(1)
+                    if not stop_requested:
+                        remainder = to_sleep - int(to_sleep)
+                        if remainder > 0:
+                            time.sleep(remainder)
         else:
-            asyncio.run(run_once())
-            
+            try:
+                asyncio.run(run_once())
+            except SystemExit as e:
+                logger.error(f"Exited with code {e.code}")
+                sys.exit(e.code if isinstance(e.code, int) else 1)
+
         sys.exit(EXIT_SUCCESS)
-        
+
     finally:
         lock.release()
 
