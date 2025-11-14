@@ -26,9 +26,9 @@ jobs:
         
     - name: Run global news alerter
       env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+        NEWS_BOT_TOKEN: ${{ secrets.NEWS_BOT_TOKEN }}      # New bot token
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}  # Same chat ID
+        NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}            # NewsAPI key
       run: |
         python news_alerter.py
         
