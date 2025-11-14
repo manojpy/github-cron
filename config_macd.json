@@ -1,4 +1,5 @@
-{"DEBUG_MODE": false,
+{
+  "DEBUG_MODE": false,
   "SEND_TEST_MESSAGE": true,
   "STATE_DB_PATH": "macd_state.sqlite",
   "LOG_FILE": "macd_bot.log",
@@ -6,9 +7,11 @@
   "STATE_EXPIRY_DAYS": 30,
   "DELTA_API_BASE": "https://api.india.delta.exchange",
   
-  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
+  "PAIRS": [
+    "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
     "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
-    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"
+  ],
 
   "SPECIAL_PAIRS": {
     "SOLUSD": {
@@ -65,4 +68,5 @@
   "MAX_DATA_AGE_SECONDS": 300,
   "MIN_REVERSAL_CONFIRMATION": 1,
 
-  "BOT_NAME": "MACD Alert Bot"}
+  "BOT_NAME": "MACD Alert Bot"
+}
