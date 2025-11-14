@@ -2,8 +2,8 @@ name: Bot Watchdog Monitor
 
 on:
   schedule:
-    - cron: '5 * * * *'   # Runs every hour at :05
-  workflow_dispatch:       # Allow manual trigger
+    - cron: '5 * * * *'   # Every hour at minute 5
+  workflow_dispatch:
 
 jobs:
   watchdog:
@@ -26,12 +26,71 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Watchdog Check Script
+      - name: Run Watchdog Check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python scripts/watchdog_check.py
+          python <<'PYCODE'
+import os, time, json, requests
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+STATE_FILE = ".watchdog_state.json"
+
+def send_alert(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram send failed:", e)
+
+def file_age_hours(path):
+    return (time.time() - os.path.getmtime(path)) / 3600
+
+ok = True
+
+# --- MACD BOT CHECK ---
+if not os.path.exists("macd_state.sqlite"):
+    ok = False
+    send_alert("⚠️ MACD Bot state file missing!")
+elif file_age_hours("macd_state.sqlite") > 2:
+    ok = False
+    send_alert(f"⚠️ MACD Bot has not updated for {file_age_hours('macd_state.sqlite'):.1f} hours.")
+
+# --- FIB BOT CHECK ---
+if not os.path.exists("fib_state.sqlite"):
+    ok = False
+    send_alert("⚠️ Fibonacci Bot state file missing!")
+elif file_age_hours("fib_state.sqlite") > 2:
+    ok = False
+    send_alert(f"⚠️ Fibonacci Bot has not updated for {file_age_hours('fib_state.sqlite'):.1f} hours.")
+
+# --- DAILY HEARTBEAT ---
+last_ping = 0
+if os.path.exists(STATE_FILE):
+    try:
+        with open(STATE_FILE, "r") as f:
+            last_ping = json.load(f).get("last_ping", 0)
+    except:
+        pass
+
+hours_since = (time.time() - last_ping) / 3600
+
+if ok and hours_since >= 24:
+    send_alert("✅ Watchdog Daily Health Check:\nAll systems normal.")
+    with open(STATE_FILE, "w") as f:
+        json.dump({"last_ping": time.time()}, f)
+elif ok:
+    print(f"Heartbeat OK. Last ping: {hours_since:.1f} hours ago.")
+else:
+    print("Some bots unhealthy — alerts already sent.")
+
+PYCODE
 
       - name: Commit Watchdog State
         run: |
