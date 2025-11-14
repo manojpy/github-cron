@@ -101,8 +101,7 @@ class Config(BaseModel):
 # DEFAULT CONFIG
 # -------------------------
 DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc
-",
+    "TELEGRAM_BOT_TOKEN": "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc",
     "TELEGRAM_CHAT_ID": "203813932",
     "DEBUG_MODE": False,
     "SEND_TEST_MESSAGE": True,
