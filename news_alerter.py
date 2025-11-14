@@ -119,8 +119,10 @@ class GlobalNewsAlerter:
                 response = requests.get(url, params=params, timeout=10)
                 if response.status_code == 200:
                     articles = response.json().get('articles', [])
-                    all_articles.extend(articles)
-                    print(f"✅ Found {len(articles)} from {source}")
+                    # Filter out articles with None values
+                    valid_articles = [article for article in articles if article.get('title') and article.get('url')]
+                    all_articles.extend(valid_articles)
+                    print(f"✅ Found {len(valid_articles)} from {source}")
             except Exception as e:
                 print(f"❌ Error from {source}: {e}")
                 continue
@@ -138,8 +140,10 @@ class GlobalNewsAlerter:
             response = requests.get(url, params=params, timeout=10)
             if response.status_code == 200:
                 articles = response.json().get('articles', [])
-                all_articles.extend(articles)
-                print(f"✅ Found {len(articles)} general headlines")
+                # Filter out articles with None values
+                valid_articles = [article for article in articles if article.get('title') and article.get('url')]
+                all_articles.extend(valid_articles)
+                print(f"✅ Found {len(valid_articles)} general headlines")
         except Exception as e:
             print(f"❌ Error getting general headlines: {e}")
         
@@ -160,8 +164,17 @@ class GlobalNewsAlerter:
         high_impact_news = []
         
         for item in news_items:
-            title = item.get('title', '').lower()
-            description = item.get('description', '').lower()
+            # FIX: Handle None values safely
+            title = item.get('title', '')
+            description = item.get('description', '')
+            
+            # Skip if title is None or empty
+            if not title:
+                continue
+                
+            # Convert to lowercase safely
+            title = str(title).lower() if title else ''
+            description = str(description).lower() if description else ''
             content = f"{title} {description}"
             
             impact_score = sum(1 for keyword in self.high_impact_keywords if keyword in content)
@@ -208,8 +221,15 @@ class GlobalNewsAlerter:
         categorized['other'] = []
         
         for item in news_items:
-            title = item.get('title', '').lower()
-            description = item.get('description', '').lower()
+            title = item.get('title', '')
+            description = item.get('description', '')
+            
+            # Skip if no title
+            if not title:
+                continue
+                
+            title = str(title).lower() if title else ''
+            description = str(description).lower() if description else ''
             content = f"{title} {description}"
             
             categorized_flag = False
@@ -229,6 +249,10 @@ class GlobalNewsAlerter:
         new_hashes = set()
         
         for item in news_items:
+            # Skip items without title or publishedAt
+            if not item.get('title') or not item.get('publishedAt'):
+                continue
+                
             news_hash = self.create_news_hash(item)
             if news_hash not in sent_hashes:
                 new_news.append(item)
@@ -407,3 +431,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
