@@ -923,6 +923,14 @@ async def evaluate_pair_async(
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         rma_50_15m = calculate_rma(df_15m['close'], 50)
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
+        # Extra debug output for indicator values
+        if cfg.DEBUG_MODE:
+            logger.debug(
+                f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
+                f"PPO={ppo_curr:.2f}, RMA50={rma50_curr:.2f}, "
+                f"MMH={magical_curr:.4f}, Cloud={cloud_state}, "
+                f"VWAP={vwap_curr:.2f if vwap_curr is not None else float('nan')}"
+            )
 
         idx = last_i_15m
         open_c = float(df_15m['open'].iloc[idx])
