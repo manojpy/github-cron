@@ -85,8 +85,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'False' }}
-          SEND_TEST_MESSAGE: 'False'
+          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'True' }}
+          SEND_TEST_MESSAGE: 'True'
           STATE_DB_PATH: fib_state.sqlite
           LOG_FILE: fibonacci_pivot_bot.log
           CONFIG_FILE: config_fib.json
@@ -130,4 +130,5 @@ jobs:
           
           echo "⚠️ Failed to push after 3 attempts. Continuing workflow..."
         continue-on-error: true
+
 
