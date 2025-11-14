@@ -1,44 +1,18 @@
-{
-  "TELEGRAM_BOT_TOKEN": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU",
-  "TELEGRAM_CHAT_ID": "203813932",
-  "DEBUG_MODE": true,
+{"DEBUG_MODE": true,
   "SEND_TEST_MESSAGE": true,
-  "RESET_STATE": false,
-  "DELTA_API_BASE": "https://api.india.delta.exchange",
-  
-  "PAIRS": [
-    "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
-    "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
-    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"
-  ],
-  
-  "SPECIAL_PAIRS": {
-    "SOLUSD": {
-      "limit_15m": 210,
-      "min_required": 180,
-      "limit_5m": 300,
-      "min_required_5m": 200
-    }
-  },
-  
   "STATE_DB_PATH": "fib_state.sqlite",
   "LOG_FILE": "fibonacci_pivot_bot.log",
-  "LOG_LEVEL": "INFO",
-  
-  "MAX_CONCURRENCY": 6,
-  "HTTP_TIMEOUT": 15,
-  "MAX_EXEC_TIME": 25,
-  "RUN_LOOP_INTERVAL": 900,
-  
-  "FETCH_RETRIES": 3,
-  "FETCH_BACKOFF": 1.5,
-  "TELEGRAM_RETRIES": 3,
-  "TELEGRAM_BACKOFF_BASE": 2.0,
-  
   "STATE_EXPIRY_DAYS": 30,
-  "DUPLICATE_SUPPRESSION_SECONDS": 3600,
-  "PRODUCTS_CACHE_TTL": 86400,
-  
-  "USE_RMA200": true,
-  "REQUESTS_PER_MINUTE": 60
-}
+  "DELTA_API_BASE": "https://api.india.delta.exchange",
+
+  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
+    "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
+    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+
+  "MAX_PARALLEL_FETCH": 8,
+  "HTTP_TIMEOUT": 15,
+  "MAX_CONCURRENCY": 6,
+  "MAX_EXEC_TIME": 25,
+  "DEADMAN_HOURS": 2,
+
+  "BOT_NAME": "Fibonacci Pivot Bot"}
