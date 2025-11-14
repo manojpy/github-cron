@@ -3,16 +3,16 @@
 # Python 3.12 — production-hardened version of your MACD/PPO bot.
 #
 # Behavior:
-# - Supports config via environment variables, config.json, or in-script defaults
-# - Safe locking for cron (PID file)
+# - Config via environment variables, config_macd.json, or safe in-script defaults
+# - PID file lock to avoid concurrent runs (cron-safe)
 # - aiohttp with TCPConnector(limit=...) to prevent socket exhaustion
 # - Circuit breaker + retries + jitter for API calls
 # - Telegram rate-limited sender with retry/backoff
-# - SQLite state store with WAL and safe cleanup
-# - Dead-man switch with cooldown
+# - SQLite state store (WAL mode) with prune and safe cleanup
 # - Memory guard via psutil
 # - Graceful signal handling and task cancellation
-# - Keeps your original evaluation logic intact
+# - Corrected Magical Momentum Histogram reversal rules (Buy/Sell) with sign gating
+# - Robust closed-candle indexing and NaN checks
 
 from __future__ import annotations
 
@@ -25,13 +25,11 @@ import random
 import logging
 import sqlite3
 import signal
-import traceback
 import fcntl
 import atexit
 from typing import Dict, Any, Optional, Tuple, List
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import contextmanager
 
 import aiohttp
 import pandas as pd
@@ -428,7 +426,6 @@ class DataFetcher:
 
         await asyncio.sleep(random.uniform(cfg["JITTER_MIN"], cfg["JITTER_MAX"]))
         url = f"{self.api_base}/v2/chart/history"
-        # resolution 'D' requires special handling in some APIs; keep it flexible
         params = {
             "resolution": resolution,
             "symbol": symbol,
@@ -466,22 +463,19 @@ def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
             "volume": res['v'][:min_len]
         })
         df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
-        # ensure numeric
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         if df.empty:
             return None
         if float(df['close'].iloc[-1]) <= 0:
             return None
-        if df.isnull().any().any():
-            logger.debug("parse_candles_result: dataframe contains NaNs")
         return df
     except Exception as e:
         logger.exception(f"Failed to parse candles: {e}")
         return None
 
 # -------------------------
-# Indicators (from your original script)
+# Indicators
 # -------------------------
 def calculate_ema(data: pd.Series, period: int) -> pd.Series:
     return data.ewm(span=period, adjust=False).mean()
@@ -571,6 +565,9 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
     return smooth_rsi
 
+# -------------------------
+# Magical Momentum Histogram (faithful to Pinescript v6)
+# -------------------------
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
     n = len(df)
     if n == 0:
@@ -579,8 +576,8 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         return pd.Series(np.zeros(n), index=df.index, dtype=float)
 
     close = df['close'].astype(float).copy()
-    sd = close.rolling(window=50, min_periods=10).std() * responsiveness
-    sd = sd.bfill().ffill().fillna(0.001).clip(lower=1e-6)
+    sd = close.rolling(window=50, min_periods=50).std() * responsiveness
+    sd = sd.fillna(method="bfill").fillna(method="ffill").fillna(0.001).clip(lower=1e-6)
 
     worm = close.copy()
     for i in range(1, n):
@@ -588,14 +585,14 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
-    ma = close.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
-    denom = worm.replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
+    ma = close.rolling(window=period, min_periods=period).mean().fillna(method="bfill").fillna(method="ffill")
+    denom = worm.replace(0, np.nan).fillna(method="bfill").fillna(method="ffill").clip(lower=1e-8)
 
     raw_momentum = ((worm - ma).fillna(0)) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], 0).fillna(0)
 
-    min_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).min().bfill().ffill()
-    max_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).max().bfill().ffill()
+    min_med = raw_momentum.rolling(window=period, min_periods=period).min().fillna(method="bfill").fillna(method="ffill")
+    max_med = raw_momentum.rolling(window=period, min_periods=period).max().fillna(method="bfill").fillna(method="ffill")
     rng = (max_med - min_med).replace(0, np.nan).fillna(1e-8)
 
     temp = pd.Series(0.0, index=df.index)
@@ -622,39 +619,45 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
 
 # -------------------------
-# Evaluation logic (keeps your existing rules)
+# Closed-candle indexing
 # -------------------------
-def get_last_closed_indices(df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> Tuple[int, int, int]:
+def get_last_closed_index(df: Optional[pd.DataFrame], resolution_min: int) -> Optional[int]:
+    if df is None or df.empty:
+        return None
     now_ts = int(time.time())
+    last_ts = int(df['timestamp'].iloc[-1])
+    current_interval_start = now_ts - (now_ts % (resolution_min * 60))
+    # If last bar timestamp is within the current interval, it is not yet closed:
+    if last_ts >= current_interval_start:
+        # use the previous bar (last closed)
+        if len(df) >= 2:
+            return len(df) - 2
+        return None
+    # last bar is closed
+    return len(df) - 1
 
-    def closed_index_for(df: Optional[pd.DataFrame], resolution_min: int) -> int:
-        if df is None or df.empty:
-            return -1
-        last_ts = int(df['timestamp'].iloc[-1])
-        current_interval_start = now_ts - (now_ts % (resolution_min * 60))
-        if last_ts >= current_interval_start:
-            return -2
-        return -1
-
-    last_i = closed_index_for(df_15m, 15)
-    prev_i = last_i - 1
-    last_i_5m = closed_index_for(df_5m, 5)
-    return last_i, prev_i, last_i_5m
-
+# -------------------------
+# Evaluation logic
+# -------------------------
 def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame,
-                       last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+                        last_state_for_pair: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     try:
-        last_i, prev_i, last_i_5m = get_last_closed_indices(df_15m, df_5m)
-
-        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
-        if magical_hist.empty or len(magical_hist) < abs(last_i) + 4:
-            logger.debug(f"MMH insufficient data ({len(magical_hist)}) for {pair_name}")
+        last_i_15 = get_last_closed_index(df_15m, 15)
+        last_i_5 = get_last_closed_index(df_5m, 5)
+        if last_i_15 is None or last_i_15 < 3 or last_i_5 is None:
+            logger.debug(f"Indexing not ready for {pair_name} (last_i_15={last_i_15}, last_i_5={last_i_5})")
             return None
 
-        mmh_curr = float(magical_hist.iloc[last_i])
-        mmh_prev1 = float(magical_hist.iloc[last_i - 1])
-        mmh_prev2 = float(magical_hist.iloc[last_i - 2])
-        mmh_prev3 = float(magical_hist.iloc[last_i - 3])
+        # Indicators
+        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
+        if magical_hist is None or len(magical_hist) <= last_i_15:
+            logger.debug(f"MMH missing for {pair_name}")
+            return None
+
+        mmh_curr = float(magical_hist.iloc[last_i_15])
+        mmh_prev1 = float(magical_hist.iloc[last_i_15 - 1])
+        mmh_prev2 = float(magical_hist.iloc[last_i_15 - 2])
+        mmh_prev3 = float(magical_hist.iloc[last_i_15 - 3])
 
         ppo, ppo_signal = calculate_ppo(df_15m, cfg["PPO_FAST"], cfg["PPO_SLOW"], cfg["PPO_SIGNAL"], cfg["PPO_USE_SMA"])
         rma_50 = calculate_rma(df_15m['close'], cfg["RMA_50_PERIOD"])
@@ -662,29 +665,40 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m, cfg["SRSI_RSI_LEN"], cfg["SRSI_KALMAN_LEN"])
 
-        ppo_curr = float(ppo.iloc[last_i])
-        ppo_prev = float(ppo.iloc[prev_i])
-        ppo_signal_curr = float(ppo_signal.iloc[last_i])
-        ppo_signal_prev = float(ppo_signal.iloc[prev_i])
-        smooth_rsi_curr = float(smooth_rsi.iloc[last_i])
-        smooth_rsi_prev = float(smooth_rsi.iloc[prev_i])
+        # Guard indices for these series
+        for series_name, s, idx in [
+            ("ppo", ppo, last_i_15), ("ppo_signal", ppo_signal, last_i_15),
+            ("rma_50", rma_50, last_i_15), ("rma_200", rma_200, last_i_5),
+            ("smooth_rsi", smooth_rsi, last_i_15)
+        ]:
+            if s is None or len(s) <= idx:
+                logger.debug(f"{series_name} not ready for {pair_name}")
+                return None
 
-        close_curr = float(df_15m['close'].iloc[last_i])
-        open_curr = float(df_15m['open'].iloc[last_i])
-        high_curr = float(df_15m['high'].iloc[last_i])
-        low_curr = float(df_15m['low'].iloc[last_i])
+        ppo_curr = float(ppo.iloc[last_i_15])
+        ppo_prev = float(ppo.iloc[last_i_15 - 1])
+        ppo_signal_curr = float(ppo_signal.iloc[last_i_15])
+        ppo_signal_prev = float(ppo_signal.iloc[last_i_15 - 1])
+        smooth_rsi_curr = float(smooth_rsi.iloc[last_i_15])
+        smooth_rsi_prev = float(smooth_rsi.iloc[last_i_15 - 1])
 
-        rma50_curr = float(rma_50.iloc[last_i])
-        rma200_curr = float(rma_200.iloc[last_i_5m])
+        close_curr = float(df_15m['close'].iloc[last_i_15])
+        open_curr = float(df_15m['open'].iloc[last_i_15])
+        high_curr = float(df_15m['high'].iloc[last_i_15])
+        low_curr = float(df_15m['low'].iloc[last_i_15])
 
-        indicators = [ppo_curr, ppo_prev, ppo_signal_curr, ppo_signal_prev, smooth_rsi_curr, smooth_rsi_prev, rma50_curr, rma200_curr, mmh_curr, mmh_prev1, mmh_prev2, mmh_prev3]
+        rma50_curr = float(rma_50.iloc[last_i_15])
+        rma200_curr = float(rma_200.iloc[last_i_5])
+
+        indicators = [ppo_curr, ppo_prev, ppo_signal_curr, ppo_signal_prev,
+                      smooth_rsi_curr, smooth_rsi_prev, rma50_curr, rma200_curr,
+                      mmh_curr, mmh_prev1, mmh_prev2, mmh_prev3]
         if any(pd.isna(x) for x in indicators):
             logger.debug(f"NaN in indicators for {pair_name}, skipping")
             return None
 
         total_range = high_curr - low_curr
         if total_range <= 0:
-            upper_wick = lower_wick = 0.0
             strong_bullish_close = strong_bearish_close = False
         else:
             upper_wick = max(0.0, high_curr - max(open_curr, close_curr))
@@ -710,19 +724,33 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         close_above_rma200 = close_curr > rma200_curr
         close_below_rma200 = close_curr < rma200_curr
 
-        mmh_reversal_buy = (mmh_prev3 > mmh_prev2 and mmh_prev2 > mmh_prev1 and mmh_curr > mmh_prev1)
-        mmh_reversal_sell = (mmh_prev3 < mmh_prev2 and mmh_prev2 < mmh_prev1 and mmh_curr < mmh_prev1)
+        # Corrected MMH reversal logic with sign gating and indexing aligned to your rule:
+        # Buy: histogram fell for 3 candles (H[2] < H[3], H[1] < H[2]) and latest H > H[1], all above 0
+        mmh_reversal_buy = (
+            mmh_curr > 0 and
+            mmh_prev2 < mmh_prev3 and
+            mmh_prev1 < mmh_prev2 and
+            mmh_curr > mmh_prev1
+        )
+        # Sell: histogram rose for 3 candles (H[2] > H[3], H[1] > H[2]) and latest H < H[1], all below 0
+        mmh_reversal_sell = (
+            mmh_curr < 0 and
+            mmh_prev2 > mmh_prev3 and
+            mmh_prev1 > mmh_prev2 and
+            mmh_curr < mmh_prev1
+        )
 
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
 
         cloud_state = "neutral"
         if cfg["CIRRUS_CLOUD_ENABLED"]:
-            cloud_state = ("green" if (bool(upw.iloc[last_i]) and not bool(dnw.iloc[last_i]))
-                           else "red" if (bool(dnw.iloc[last_i]) and not bool(upw.iloc[last_i]))
+            # use last closed index for cloud too
+            cloud_state = ("green" if (bool(upw.iloc[last_i_15]) and not bool(dnw.iloc[last_i_15]))
+                           else "red" if (bool(dnw.iloc[last_i_15]) and not bool(upw.iloc[last_i_15]))
                            else "neutral")
 
-        # Conditions dicts (same as original)
+        # Conditions dicts
         buy_mmh_reversal_conds = {
             "mmh_reversal_buy": mmh_reversal_buy,
             "close_above_rma50": close_above_rma50,
@@ -904,7 +932,6 @@ class TelegramQueue:
         data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
         try:
             async with session.post(url, data=data, timeout=10) as resp:
-                # handle rate-limited response
                 if resp.status == 429:
                     retry_after = int(resp.headers.get("Retry-After", 30))
                     logger.warning(f"Telegram rate limited. Retry after {retry_after}s")
@@ -932,7 +959,6 @@ class TelegramQueue:
             if ok:
                 return True
             last_exc = "Telegram non-ok or exception"
-            # exponential backoff
             await asyncio.sleep((cfg["TELEGRAM_BACKOFF_BASE"] ** (attempt - 1)) + random.uniform(0, 0.3))
         logger.error(f"Telegram send failed after retries: {last_exc}")
         return False
@@ -953,7 +979,6 @@ async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, produ
         limit_5m = sp.get("limit_5m", 300)
         min_required_5m = sp.get("min_required_5m", 200)
         symbol = prod["symbol"]
-        # fetch in parallel
         res15, res5 = await asyncio.gather(
             fetcher.fetch_candles(session, symbol, "15", limit_15m),
             fetcher.fetch_candles(session, symbol, "5", limit_5m)
@@ -966,7 +991,6 @@ async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, produ
         if df_5m is None or len(df_5m) < (min_required_5m + 2):
             logger.warning(f"Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{min_required_5m+2}")
             return None
-        # ensure numeric columns
         for df in (df_15m, df_5m):
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -989,8 +1013,7 @@ async def process_batch(session: aiohttp.ClientSession, fetcher: DataFetcher, pr
     results: List[Tuple[str, Dict[str, Any]]] = []
     tasks = []
     for pair_name in batch_pairs:
-        prod_info = products_map.get(pair_name)
-        if not prod_info:
+        if pair_name not in products_map:
             logger.warning(f"No product mapping for {pair_name}")
             continue
         last_state = state_db.get(pair_name)
@@ -1068,18 +1091,15 @@ async def run_once():
             logger.info(f"Processing batch {i//batch_size + 1}: {batch}")
             batch_results = await process_batch(session, fetcher, products_map, batch, sdb, telegram_queue)
             all_results.extend(batch_results)
-            # small rate-limiting between batches
             if i + batch_size < len(pairs_to_process):
                 await asyncio.sleep(random.uniform(0.5, 1.0))
 
-        # persist state changes
         updates = 0
         alerts_sent = 0
         for pair_name, new_state in all_results:
             if not isinstance(new_state, dict):
                 continue
             prev = sdb.get(pair_name)
-            # store message in telemetry? we've already sent it; only keep state and ts
             if prev != new_state:
                 sdb.set(pair_name, new_state.get("state"), new_state.get("ts"))
                 updates += 1
@@ -1155,7 +1175,6 @@ def main():
                     logger.exception("Unhandled exception in run loop")
                 elapsed = time.time() - start
                 to_sleep = max(0, interval - elapsed)
-                # sleep in 1s slices to allow responsive shutdown
                 slept = 0.0
                 while slept < to_sleep and not stop_requested:
                     time.sleep(min(1.0, to_sleep - slept))
