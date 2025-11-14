@@ -1,38 +1,9 @@
-name: Bot Watchdog Monitor
-
-on:
-  schedule:
-    - cron: '5 * * * *'   # Runs every hour at minute 5
-  workflow_dispatch:       # Also allow manual run
-
-jobs:
-  watchdog:
-    runs-on: ubuntu-latest
-    timeout-minutes: 4
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0      # Required so .watchdog_state.json exists if committed earlier
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
       - name: Run Watchdog Check
-        id: run_watchdog
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python << 'PYCODE'
+          python <<'PYCODE'
 import os, time, json, requests
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -56,7 +27,7 @@ def file_age_hours(path):
 ok = True
 
 # ------------------------------
-# Check MACD bot heartbeat
+# Check MACD bot
 # ------------------------------
 if not os.path.exists("macd_state.sqlite"):
     ok = False
@@ -67,7 +38,7 @@ elif file_age_hours("macd_state.sqlite") > 2:
     send_alert(f"⚠️ MACD Bot has not updated for {hrs:.1f} hours.")
 
 # ------------------------------
-# Check Fibonacci Pivot bot
+# Check Fibonacci Bot
 # ------------------------------
 if not os.path.exists("fib_state.sqlite"):
     ok = False
@@ -78,7 +49,7 @@ elif file_age_hours("fib_state.sqlite") > 2:
     send_alert(f"⚠️ Fibonacci Bot has not updated for {hrs:.1f} hours.")
 
 # ------------------------------
-# Handle Daily Health Check
+# Daily Heartbeat (every 24h)
 # ------------------------------
 last_ping = 0
 if os.path.exists(STATE_FILE):
@@ -100,13 +71,3 @@ else:
     print("Some bots unhealthy — alerts sent already.")
 
 PYCODE
-
-      - name: Commit Watchdog State (persist last_ping)
-        run: |
-          if [ -f ".watchdog_state.json" ]; then
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            git add .watchdog_state.json
-            git commit -m "Update watchdog state" --allow-empty
-            git push || true
-          fi
