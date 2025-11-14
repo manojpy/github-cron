@@ -4,60 +4,64 @@ import json
 import hashlib
 from datetime import datetime, timedelta
 
-class CryptoNewsAlerter:
+class GlobalNewsAlerter:
     def __init__(self):
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         self.newsapi_key = os.getenv('NEWSAPI_KEY')
         
-        # Cryptocurrencies from your image
-        self.crypto_keywords = {
-            'BTC': ['bitcoin', 'btc', 'satoshi', 'bitcoin etf', 'bitcoin mining'],
-            'ETH': ['ethereum', 'eth', 'vitalik', 'ethereum 2.0', 'merge', 'gas fee'],
-            'BNB': ['binance', 'bnb', 'cz', 'changpeng zhao', 'binance coin'],
-            'SOL': ['solana', 'sol', 'anatoly yakovenko', 'solana network'],
-            'XRP': ['xrp', 'ripple', 'brad garlinghouse', 'sec vs ripple'],
-            'ADA': ['cardano', 'ada', 'charles hoskinson', 'cardano network'],
-            'DOT': ['polkadot', 'dot', 'gavin wood', 'parachain'],
-            'AVAX': ['avalanche', 'avax', 'ava labs', 'avalanche network'],
-            'LTC': ['litecoin', 'ltc', 'charlie lee', 'litecoin foundation'],
-            'BCH': ['bitcoin cash', 'bch', 'bitcoin cash fork'],
-            'SUI': ['sui', 'sui network', 'mysten labs'],
-            'AAVE': ['aave', 'aave protocol', 'defi lending', 'flash loans']
-        }
-        
-        # News categories that impact crypto markets
-        self.impact_categories = {
-            'regulation': [
-                'regulation', 'sec', 'regulation', 'legal', 'law', 'government', 
-                'tax', 'compliance', 'ban', 'restriction', 'framework', 'policy',
-                'cfdc', 'finra', 'financial regulation', 'crypto bill', 'legislation'
+        # Major impactful news categories
+        self.categories = {
+            'politics': [
+                'election', 'government', 'president', 'prime minister', 'parliament',
+                'congress', 'senate', 'diplomacy', 'summit', 'treaty', 'sanctions',
+                'international relations', 'united nations', 'nato', 'alliance'
             ],
-            'adoption': [
-                'adoption', 'institutional', 'etf approval', 'blackrock', 'fidelity',
-                'vanguard', 'paypal', 'visa', 'mastercard', 'bank adoption',
-                'corporate adoption', 'tesla', 'microstrategy', 'company investment'
+            'business': [
+                'economy', 'recession', 'inflation', 'gdp', 'employment', 'jobs',
+                'trade', 'tariffs', 'market', 'corporate', 'merger', 'acquisition',
+                'bankruptcy', 'layoffs', 'economic crisis', 'financial'
+            ],
+            'stock_market': [
+                'stock market', 'dow jones', 's&p 500', 'nasdaq', 'market crash',
+                'market rally', 'trading', 'investor', 'wall street', 'bull market',
+                'bear market', 'market volatility', 'financial markets'
+            ],
+            'sports': [
+                'world cup', 'olympics', 'championship', 'tournament', 'final',
+                'victory', 'defeat', 'record', 'champion', 'super bowl', 'premier league',
+                'nba finals', 'world series', 'grand slam'
             ],
             'technology': [
-                'upgrade', 'hard fork', 'mainnet', 'launch', 'protocol', 'network',
-                'blockchain', 'smart contract', 'scalability', 'transaction speed',
-                'gas fees', 'congestion', 'outage', 'downtime', 'hack', 'exploit'
+                'breakthrough', 'innovation', 'ai', 'artificial intelligence',
+                'quantum computing', 'cyber attack', 'data breach', 'hack',
+                'spacex', 'nasa', 'mars', 'moon mission', 'scientific discovery'
             ],
-            'macro_economics': [
-                'inflation', 'interest rate', 'federal reserve', 'fed', 'central bank',
-                'economic policy', 'stimulus', 'quantitative easing', 'recession',
-                'economic data', 'gdp', 'employment', 'jobs report', 'dollar'
+            'disasters': [
+                'earthquake', 'tsunami', 'hurricane', 'typhoon', 'flood', 'wildfire',
+                'tornado', 'volcano', 'natural disaster', 'emergency', 'evacuation',
+                'rescue', 'death toll', 'catastrophe'
             ],
-            'security': [
-                'hack', 'security breach', 'exploit', 'rug pull', 'scam', 'phishing',
-                'wallet security', 'exchange hack', 'smart contract vulnerability',
-                'flash crash', 'market manipulation', 'whale movement'
+            'wars': [
+                'war', 'conflict', 'military', 'attack', 'invasion', 'defense',
+                'nuclear', 'missile', 'drone', 'casualties', 'ceasefire', 'peace talks',
+                'terrorism', 'terror attack', 'military operation'
             ],
-            'partnerships': [
-                'partnership', 'collaboration', 'integration', 'alliance', 'deal',
-                'enterprise', 'business development', 'strategic partnership'
+            'health': [
+                'pandemic', 'epidemic', 'outbreak', 'virus', 'health emergency',
+                'who', 'cdc', 'vaccine', 'medical breakthrough', 'hospital',
+                'health crisis', 'public health'
             ]
         }
+        
+        # High-impact keywords that indicate major news
+        self.high_impact_keywords = [
+            'crisis', 'emergency', 'breakthrough', 'historic', 'record', 'unprecedented',
+            'major', 'significant', 'important', 'critical', 'urgent', 'alert',
+            'warning', 'catastrophe', 'disaster', 'tragedy', 'victory', 'landmark',
+            'milestone', 'revolution', 'breakthrough', 'collapse', 'surge', 'plunge',
+            'soar', 'crash', 'attack', 'strike', 'summit', 'deal', 'agreement'
+        ]
         
         # File to store sent news hashes
         self.sent_news_file = 'sent_news.json'
@@ -80,95 +84,150 @@ class CryptoNewsAlerter:
         content = f"{news_item['title']}_{news_item['publishedAt']}"
         return hashlib.md5(content.encode()).hexdigest()
     
-    def get_crypto_impact_news(self):
-        """Fetch news that could impact cryptocurrencies"""
-        url = "https://newsapi.org/v2/everything"
-        
-        # Get news from last 3 hours for more comprehensive coverage
-        from_date = (datetime.now() - timedelta(hours=3)).strftime('%Y-%m-%dT%H:%M:%S')
-        
-        # Search for crypto and financial impact keywords
-        search_keywords = [
-            'cryptocurrency', 'bitcoin', 'ethereum', 'blockchain', 'digital currency',
-            'crypto regulation', 'sec crypto', 'fed crypto', 'crypto market',
-            'defi', 'nft', 'web3', 'token', 'digital asset'
+    def get_global_news(self):
+        """Fetch major global news from top sources"""
+        # Top international news sources
+        sources = [
+            'reuters', 'associated-press', 'bbc-news', 'cnn', 
+            'al-jazeera-english', 'the-guardian-uk', 'the-new-york-times'
         ]
         
-        query = " OR ".join(search_keywords)
+        url = "https://newsapi.org/v2/top-headlines"
         
+        # Get news from last 4 hours for comprehensive coverage
+        from_date = (datetime.now() - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%S')
+        
+        all_articles = []
+        
+        # Fetch from multiple sources
+        for source in sources:
+            params = {
+                'apiKey': self.newsapi_key,
+                'sources': source,
+                'pageSize': 20,
+                'sortBy': 'publishedAt',
+                'from': from_date
+            }
+            
+            try:
+                response = requests.get(url, params=params, timeout=10)
+                if response.status_code == 200:
+                    articles = response.json().get('articles', [])
+                    all_articles.extend(articles)
+                    print(f"Found {len(articles)} articles from {source}")
+                # Add small delay to avoid rate limiting
+                import time
+                time.sleep(0.5)
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching from {source}: {e}")
+                continue
+        
+        # Also get general top headlines
         params = {
             'apiKey': self.newsapi_key,
-            'q': query,
             'language': 'en',
-            'pageSize': 50,
+            'pageSize': 30,
             'sortBy': 'publishedAt',
-            'from': from_date,
-            'domains': 'bloomberg.com,reuters.com,coindesk.com,cointelegraph.com,decrypt.co,theblock.co'
+            'from': from_date
         }
         
         try:
             response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            articles = response.json().get('articles', [])
-            print(f"Found {len(articles)} crypto-related news articles")
-            return articles
+            if response.status_code == 200:
+                articles = response.json().get('articles', [])
+                all_articles.extend(articles)
+                print(f"Found {len(articles)} general top headlines")
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching crypto news: {e}")
-            return []
+            print(f"Error fetching general headlines: {e}")
+        
+        # Remove duplicates based on URL
+        seen_urls = set()
+        unique_articles = []
+        
+        for article in all_articles:
+            url = article.get('url', '')
+            if url and url not in seen_urls:
+                unique_articles.append(article)
+                seen_urls.add(url)
+        
+        print(f"Total unique articles: {len(unique_articles)}")
+        return unique_articles
     
-    def analyze_news_impact(self, news_items):
-        """Analyze which cryptocurrencies are affected by the news and potential impact"""
-        analyzed_news = []
+    def filter_high_impact_news(self, news_items):
+        """Filter only high-impact news stories"""
+        high_impact_news = []
         
         for item in news_items:
             title = item.get('title', '').lower()
             description = item.get('description', '').lower()
             content = f"{title} {description}"
             
-            affected_cryptos = []
-            impact_type = 'neutral'
-            impact_category = 'general'
+            # Check if it contains high-impact keywords
+            impact_score = sum(1 for keyword in self.high_impact_keywords if keyword in content)
             
-            # Check which cryptocurrencies are mentioned
-            for crypto, keywords in self.crypto_keywords.items():
+            # Check if it falls into major categories
+            category_match = False
+            for category, keywords in self.categories.items():
                 if any(keyword in content for keyword in keywords):
-                    affected_cryptos.append(crypto)
+                    category_match = True
+                    break
             
-            # Determine impact category and type
-            for category, keywords in self.impact_categories.items():
-                if any(keyword in content for keyword in keywords):
-                    impact_category = category
-            
-            # Determine positive/negative impact based on keywords
-            positive_keywords = [
-                'approval', 'adoption', 'partnership', 'integration', 'launch', 
-                'upgrade', 'success', 'growth', 'bullish', 'rally', 'surge',
-                'breakthrough', 'innovation', 'investment', 'funding', 'support'
-            ]
-            
-            negative_keywords = [
-                'ban', 'regulation', 'crackdown', 'lawsuit', 'sec', 'investigation',
-                'hack', 'exploit', 'crash', 'collapse', 'scam', 'fraud', 'warning',
-                'delay', 'problem', 'issue', 'outage', 'downtime', 'rejection'
-            ]
-            
-            positive_count = sum(1 for keyword in positive_keywords if keyword in content)
-            negative_count = sum(1 for keyword in negative_keywords if keyword in content)
-            
-            if negative_count > positive_count:
-                impact_type = 'negative'
-            elif positive_count > negative_count:
-                impact_type = 'positive'
-            else:
-                impact_type = 'neutral'
-            
-            if affected_cryptos:
-                item['affected_cryptos'] = affected_cryptos
+            # Include if high impact or belongs to major categories
+            if impact_score >= 2 or category_match:
+                # Determine impact type
+                positive_keywords = [
+                    'breakthrough', 'victory', 'success', 'achievement', 'record',
+                    'milestone', 'landmark', 'peace', 'agreement', 'deal', 'surge',
+                    'rally', 'growth', 'recovery', 'innovation', 'discovery'
+                ]
+                
+                negative_keywords = [
+                    'crisis', 'emergency', 'disaster', 'tragedy', 'attack', 'war',
+                    'conflict', 'crash', 'collapse', 'death', 'killed', 'injured',
+                    'outbreak', 'pandemic', 'recession', 'layoffs', 'bankruptcy'
+                ]
+                
+                positive_count = sum(1 for keyword in positive_keywords if keyword in content)
+                negative_count = sum(1 for keyword in negative_keywords if keyword in content)
+                
+                if negative_count > positive_count:
+                    impact_type = 'negative'
+                elif positive_count > negative_count:
+                    impact_type = 'positive'
+                else:
+                    impact_type = 'significant'
+                
                 item['impact_type'] = impact_type
-                item['impact_category'] = impact_category
-                analyzed_news.append(item)
+                item['impact_score'] = impact_score
+                high_impact_news.append(item)
         
-        return analyzed_news
+        # Sort by impact score (highest first)
+        high_impact_news.sort(key=lambda x: x['impact_score'], reverse=True)
+        
+        print(f"Filtered {len(high_impact_news)} high-impact news stories")
+        return high_impact_news
+    
+    def categorize_news(self, news_items):
+        """Categorize news items"""
+        categorized = {category: [] for category in self.categories.keys()}
+        categorized['other'] = []  # For uncategorized but high-impact news
+        
+        for item in news_items:
+            title = item.get('title', '').lower()
+            description = item.get('description', '').lower()
+            content = f"{title} {description}"
+            
+            categorized_flag = False
+            for category, keywords in self.categories.items():
+                if any(keyword in content for keyword in keywords):
+                    categorized[category].append(item)
+                    categorized_flag = True
+                    break  # Put in first matching category
+            
+            if not categorized_flag:
+                categorized['other'].append(item)
+        
+        return categorized
     
     def filter_new_news(self, news_items, sent_hashes):
         """Filter out already sent news"""
@@ -183,80 +242,81 @@ class CryptoNewsAlerter:
         
         return new_news, new_hashes
     
-    def format_impact_message(self, analyzed_news):
-        """Format the impact analysis message for Telegram"""
-        if not analyzed_news:
-            return "📭 No significant crypto-impacting news in the past few hours."
+    def format_news_message(self, categorized_news):
+        """Format the news message for Telegram"""
+        if not any(categorized_news.values()):
+            return "📭 No major impactful news in the past few hours."
         
-        # Group news by impact type
-        positive_news = [news for news in analyzed_news if news['impact_type'] == 'positive']
-        negative_news = [news for news in analyzed_news if news['impact_type'] == 'negative']
-        neutral_news = [news for news in analyzed_news if news['impact_type'] == 'neutral']
+        message = "🌍 **Global Impact News Alert** 🌍\n\n"
+        message += f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
         
-        message = "🚨 **Crypto Market Impact Alert** 🚨\n\n"
-        message += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        
-        # Negative impacts first (most important for traders)
-        if negative_news:
-            message += "🔴 **Potential Negative Impacts** 🔴\n\n"
-            for i, news in enumerate(negative_news[:5]):
-                message += self.format_news_item(news, i + 1)
-        
-        # Positive impacts
-        if positive_news:
-            message += "🟢 **Potential Positive Impacts** 🟢\n\n"
-            for i, news in enumerate(positive_news[:5]):
-                message += self.format_news_item(news, i + 1)
-        
-        # Neutral/important developments
-        if neutral_news and not (positive_news or negative_news):
-            message += "⚪ **Market Developments** ⚪\n\n"
-            for i, news in enumerate(neutral_news[:5]):
-                message += self.format_news_item(news, i + 1)
-        
-        message += f"\n📊 **Summary**: {len(positive_news)} positive, {len(negative_news)} negative, {len(neutral_news)} neutral impacts"
-        message += f"\n\n⏳ Next update in 1 hour"
-        
-        return message
-    
-    def format_news_item(self, news_item, index):
-        """Format individual news item"""
-        title = news_item.get('title', 'No title')
-        source = news_item.get('source', {}).get('name', 'Unknown')
-        url = news_item.get('url', '')
-        affected_cryptos = news_item.get('affected_cryptos', [])
-        impact_category = news_item.get('impact_category', 'general')
-        
-        # Shorten very long titles
-        if len(title) > 100:
-            title = title[:97] + "..."
-        
-        # Impact emojis
-        impact_emojis = {
-            'regulation': '⚖️',
-            'adoption': '🏦',
+        # Emoji mapping for categories
+        emojis = {
+            'politics': '🏛️',
+            'business': '💼',
+            'stock_market': '📈',
+            'sports': '⚽',
             'technology': '💻',
-            'macro_economics': '📊',
-            'security': '🔒',
-            'partnerships': '🤝',
-            'general': '📰'
+            'disasters': '⚠️',
+            'wars': '⚔️',
+            'health': '🏥',
+            'other': '📰'
         }
         
-        impact_emoji = impact_emojis.get(impact_category, '📰')
+        # Impact type emojis
+        impact_emojis = {
+            'positive': '🟢',
+            'negative': '🔴',
+            'significant': '🟡'
+        }
         
-        formatted_item = f"{index}. {impact_emoji} **{title}**\n"
+        total_stories = sum(len(items) for items in categorized_news.values())
+        message += f"📊 **Today's Major Stories**: {total_stories} impactful events\n\n"
         
-        if affected_cryptos:
-            formatted_item += f"   💰 Affects: {', '.join(affected_cryptos)}\n"
+        for category, items in categorized_news.items():
+            if items:
+                emoji = emojis.get(category, '📰')
+                message += f"{emoji} **{category.replace('_', ' ').title()}**\n"
+                
+                for i, item in enumerate(items[:3]):  # Limit to 3 items per category
+                    impact_emoji = impact_emojis.get(item.get('impact_type', 'significant'), '🟡')
+                    title = item.get('title', 'No title')
+                    source = item.get('source', {}).get('name', 'Unknown')
+                    url = item.get('url', '')
+                    
+                    # Shorten very long titles
+                    if len(title) > 90:
+                        title = title[:87] + "..."
+                    
+                    message += f"{impact_emoji} {title}\n"
+                    message += f"   📰 {source}\n"
+                    if url:
+                        message += f"   🔗 [Read more]({url})\n"
+                    message += "\n"
+                
+                message += "\n"
         
-        formatted_item += f"   📰 Source: {source}\n"
+        # Add summary
+        impact_counts = {}
+        for category, items in categorized_news.items():
+            for item in items:
+                impact_type = item.get('impact_type', 'significant')
+                impact_counts[impact_type] = impact_counts.get(impact_type, 0) + 1
         
-        if url:
-            formatted_item += f"   🔗 [Read more]({url})\n"
+        if impact_counts:
+            summary_parts = []
+            if 'negative' in impact_counts:
+                summary_parts.append(f"🔴 {impact_counts['negative']} critical")
+            if 'positive' in impact_counts:
+                summary_parts.append(f"🟢 {impact_counts['positive']} positive")
+            if 'significant' in impact_counts:
+                summary_parts.append(f"🟡 {impact_counts['significant']} significant")
+            
+            message += f"**Impact Summary**: {', '.join(summary_parts)}\n"
         
-        formatted_item += "\n"
+        message += f"\n⏰ Next update in 1 hour"
         
-        return formatted_item
+        return message
     
     def send_telegram_message(self, message):
         """Send message to Telegram"""
@@ -279,8 +339,8 @@ class CryptoNewsAlerter:
             return False
     
     def run(self):
-        """Main function to run the crypto impact alerter"""
-        print("Starting crypto impact news alerter...")
+        """Main function to run the global news alerter"""
+        print("Starting global impact news alerter...")
         
         # Check if required environment variables are set
         if not all([self.telegram_bot_token, self.telegram_chat_id, self.newsapi_key]):
@@ -291,61 +351,71 @@ class CryptoNewsAlerter:
         sent_hashes = self.get_sent_news_hashes()
         print(f"Loaded {len(sent_hashes)} previously sent news items")
         
-        # Fetch crypto-impacting news
-        print("Fetching crypto-impacting news...")
-        news_items = self.get_crypto_impact_news()
-        print(f"Found {len(news_items)} crypto-related news items")
+        # Fetch global news
+        print("Fetching global news...")
+        news_items = self.get_global_news()
+        print(f"Found {len(news_items)} total news items")
         
         if not news_items:
-            print("No crypto news items found")
-            # Send a heartbeat message
+            print("No news items found")
             self.send_telegram_message(
-                "✅ Crypto news check completed.\n"
-                "No significant crypto-impacting news in the past few hours.\n\n"
+                "✅ Global news check completed.\n"
+                "No major impactful news in the past few hours.\n\n"
                 "Next update in 1 hour ⏰"
             )
             return True
         
-        # Analyze impact
-        analyzed_news = self.analyze_news_impact(news_items)
-        print(f"Analyzed {len(analyzed_news)} news items with crypto impact")
+        # Filter for high-impact news only
+        high_impact_news = self.filter_high_impact_news(news_items)
+        
+        if not high_impact_news:
+            print("No high-impact news found")
+            self.send_telegram_message(
+                "✅ Global news check completed.\n"
+                "No major impactful news in the past few hours.\n\n"
+                "Next update in 1 hour ⏰"
+            )
+            return True
         
         # Filter new news
-        new_news, new_hashes = self.filter_new_news(analyzed_news, sent_hashes)
-        print(f"Found {len(new_news)} new impactful news items")
+        new_news, new_hashes = self.filter_new_news(high_impact_news, sent_hashes)
+        print(f"Found {len(new_news)} new high-impact news items")
         
         if not new_news:
-            print("No new impactful news to send")
+            print("No new high-impact news to send")
             self.send_telegram_message(
-                "✅ Crypto news check completed.\n"
-                "No new significant crypto-impacting news.\n\n"
+                "✅ Global news check completed.\n"
+                "No new major impactful news.\n\n"
                 "Next update in 1 hour ⏰"
             )
             return True
         
+        # Categorize news
+        categorized_news = self.categorize_news(new_news)
+        
         # Format and send message
-        message = self.format_impact_message(new_news)
+        message = self.format_news_message(categorized_news)
         success = self.send_telegram_message(message)
         
         if success:
             # Update sent news hashes
             updated_hashes = sent_hashes.union(new_hashes)
-            # Keep only last 500 hashes to prevent file from growing too large
-            if len(updated_hashes) > 500:
-                updated_hashes = set(list(updated_hashes)[-500:])
+            # Keep only last 1000 hashes to prevent file from growing too large
+            if len(updated_hashes) > 1000:
+                updated_hashes = set(list(updated_hashes)[-1000:])
             self.save_sent_news_hashes(updated_hashes)
             print(f"Updated sent news hashes: {len(updated_hashes)} items")
         
         return success
 
 def main():
-    alerter = CryptoNewsAlerter()
+    alerter = GlobalNewsAlerter()
     success = alerter.run()
     
     if success:
-        print("Crypto impact news alerter completed successfully")
+        print("Global impact news alerter completed successfully")
     else:
-        print("Crypto impact news alerter failed")
+        print("Global impact news alerter failed")
         exit(1)
 
 if __name__ == "__main__":
