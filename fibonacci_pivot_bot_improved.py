@@ -159,8 +159,8 @@ def load_config() -> Config:
         try:
             with open(config_file, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
-                base.update(user_cfg)
-                print(f"✅ Loaded configuration from {config_file}")
+            base.update(user_cfg)
+            print(f"✅ Loaded configuration from {config_file}")
         except Exception as e:
             print(f"⚠️ Warning: unable to parse {config_file}: {e}")
     else:
@@ -810,14 +810,11 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
 
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
-
     momentum = 0.25 * np.log(temp2)
     momentum = pd.Series(momentum, index=df.index).replace([np.inf, -np.inf], 0).fillna(0)
-
     hist = pd.Series(0.0, index=df.index)
     for i in range(1, n):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
@@ -831,36 +828,97 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     df2['cum_vol'] = df2.groupby('date')['volume'].cumsum()
     df2['cum_hlc3_vol'] = df2.groupby('date')['hlc3_vol'].cumsum()
     vwap = df2['cum_hlc3_vol'] / df2['cum_vol'].replace(0, np.nan)
-    return vwap.ffill().bfill()
+    return vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
 
-def calculate_fibonacci_pivots(high: float, low: float, close: float) -> Dict[str, float]:
-    pivot = (high + low + close) / 3.0
-    r1 = pivot + (high - low) * 0.382
-    r2 = pivot + (high - low) * 0.618
-    r3 = pivot + (high - low) * 1.000
-    s1 = pivot - (high - low) * 0.382
-    s2 = pivot - (high - low) * 0.618
-    s3 = pivot - (high - low) * 1.000
-    return {'P': pivot, 'R1': r1, 'R2': r2, 'R3': r3, 'S1': s1, 'S2': s2, 'S3': s3}
+# -------------------------
+# PIVOT CALCULATION
+# -------------------------
+def calculate_fibonacci_pivots(df_daily: pd.DataFrame):
+    if df_daily is None or len(df_daily) < 2:
+        return None
+    
+    # Get the data for yesterday's candle (second to last)
+    prev_day = df_daily.iloc[-2]
+    high = float(prev_day['high'])
+    low = float(prev_day['low'])
+    close = float(prev_day['close'])
 
-def cloud_state_from(upw: pd.Series, dnw: pd.Series, idx: int = -1) -> str:
-    u = bool(upw.iloc[idx])
-    d = bool(dnw.iloc[idx])
-    if u and not d:
-        return "green"
-    elif d and not u:
-        return "red"
-    else:
-        return "neutral"
+    pivot = (high + low + close) / 3
+    
+    # Determine which way the market moved yesterday
+    if close < pivot: # Bearish close (Pivot is closer to High)
+        R3 = pivot + (high - low)
+        R2 = pivot + 0.618 * (high - low)
+        R1 = pivot + 0.382 * (high - low)
+        S1 = pivot - 0.382 * (high - low)
+        S2 = pivot - 0.618 * (high - low)
+        S3 = pivot - (high - low)
+    elif close > pivot: # Bullish close (Pivot is closer to Low)
+        R3 = pivot + (high - low)
+        R2 = pivot + 0.618 * (high - low)
+        R1 = pivot + 0.382 * (high - low)
+        S1 = pivot - 0.382 * (high - low)
+        S2 = pivot - 0.618 * (high - low)
+        S3 = pivot - (high - low)
+    else: # Neutral close
+        R3 = pivot + (high - low)
+        R2 = pivot + 0.618 * (high - low)
+        R1 = pivot + 0.382 * (high - low)
+        S1 = pivot - 0.382 * (high - low)
+        S2 = pivot - 0.618 * (high - low)
+        S3 = pivot - (high - low)
 
-def should_suppress_duplicate(last_state: Optional[Dict[str, Any]], current_signal: str, suppression_seconds: int) -> bool:
+    return {
+        'P': pivot, 'R1': R1, 'R2': R2, 'R3': R3,
+        'S1': S1, 'S2': S2, 'S3': S3,
+        'high': high, 'low': low
+    }
+
+def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: float, direction: str) -> Optional[Tuple[str, float]]:
+    if not pivots:
+        return None
+    
+    levels = ["R3", "R2", "R1", "P", "S1", "S2", "S3"]
+    
+    for level_name in levels:
+        line = pivots.get(level_name)
+        if line is None:
+            continue
+        
+        # Check for crossover
+        if direction == "long":
+            if prev_price <= line and curr_price > line:
+                return level_name, line
+        elif direction == "short":
+            if prev_price >= line and curr_price < line:
+                return level_name, line
+    
+    return None
+
+# -------------------------
+# STATE MANAGEMENT
+# -------------------------
+def should_suppress_duplicate(last_state: Optional[Dict[str, Any]], current_signal: str, suppress_secs: int) -> bool:
     if not last_state:
         return False
-    last_signal = last_state.get("state")
-    last_ts = int(last_state.get("ts", 0))
-    if last_signal == current_signal and (now_ts() - last_ts) <= suppression_seconds:
-        return True
+    
+    state_ts = int(last_state.get("ts", 0))
+    state_signal = last_state.get("state")
+    
+    if current_signal == state_signal:
+        if now_ts() - state_ts < suppress_secs:
+            logger.debug(f"Suppressed duplicate signal: {current_signal} within {suppress_secs}s")
+            return True
+            
     return False
+
+def cloud_state_from(upw: pd.Series, dnw: pd.Series, idx: int) -> str:
+    if upw.iloc[idx] and not dnw.iloc[idx]:
+        return "bullish"
+    elif dnw.iloc[idx] and not upw.iloc[idx]:
+        return "bearish"
+    else:
+        return "neutral"
 
 # -------------------------
 # CORE PAIR EVALUATION
@@ -878,73 +936,86 @@ async def evaluate_pair_async(
         if not prod:
             logger.debug(f"No product mapping for {pair_name}")
             return None
+            
         sp = cfg.SPECIAL_PAIRS.get(pair_name, {})
         limit_15m = sp.get("limit_15m", 250)
         min_required_15m = sp.get("min_required", 150)
         limit_5m = sp.get("limit_5m", 500)
         min_required_5m = sp.get("min_required_5m", 250)
+        
+        # FIX: Initialize vwap_curr to None to prevent UnboundLocalError
+        vwap_curr: Optional[float] = None
+
         tasks = [fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)]
         if cfg.USE_RMA200:
             tasks.append(fetcher.fetch_candles(session, prod['symbol'], "5", limit_5m))
+            
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
         res15 = results[0] if not isinstance(results[0], Exception) else None
         res5 = results[1] if cfg.USE_RMA200 and len(results) > 1 and not isinstance(results[1], Exception) else None
+
         if isinstance(results[0], Exception):
             logger.error(f"Exception fetching 15m data for {pair_name}: {results[0]}")
             METRICS["network_errors"] += 1
-
+            
         df_15m = parse_candle_response(res15)
         df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
+
         last_i_15m = -2
         last_i_5m = -2
-
+        
         if df_15m is None or len(df_15m) < min_required_15m:
             logger.debug(f"{pair_name}: Insufficient 15m data (got {len(df_15m) if df_15m is not None else 0}, need {min_required_15m})")
             return None
+            
         if cfg.USE_RMA200 and (df_5m is None or len(df_5m) < min_required_5m):
             logger.debug(f"{pair_name}: Insufficient 5m data (got {len(df_5m) if df_5m is not None else 0}, need {min_required_5m})")
             return None
-
+            
         # Fetch daily data for pivots
         daily_res = await fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 1)
         df_daily = parse_candle_response(daily_res)
-        if df_daily is None or len(df_daily) < 2:
-            logger.warning(f"{pair_name}: could not fetch sufficient daily candles")
-            return None
-        df_daily['date'] = pd.to_datetime(df_daily['timestamp'], unit='s', utc=True).dt.date
-        today = datetime.now(timezone.utc).date()
-        yesterday = today - timedelta(days=1)
-        prev_day_row = df_daily[df_daily['date'] == yesterday]
-        prev = prev_day_row.iloc[-1] if not prev_day_row.empty else df_daily.iloc[-2]
-
-        pivots = calculate_fibonacci_pivots(float(prev['high']), float(prev['low']), float(prev['close']))
-        vwap_15m = calculate_vwap_daily_reset(df_15m)
-        ppo, _ = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
-        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
-        rma_50_15m = calculate_rma(df_15m['close'], 50)
-        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         
-        idx = last_i_15m
-        open_c = float(df_15m['open'].iloc[idx])
-        close_c = float(df_15m['close'].iloc[idx])
-        high_c = float(df_15m['high'].iloc[idx])
-        low_c = float(df_15m['low'].iloc[idx])
-        candle_pct = abs((close_c - open_c) / open_c) * 100 if open_c != 0 else 0
-        if candle_pct > cfg.EXTREME_CANDLE_PCT:
-            logger.info(f"{pair_name}: extreme candle {candle_pct:.2f}% > {cfg.EXTREME_CANDLE_PCT}% - skipping")
-            return None
-
-        try:
-            ppo_curr = float(ppo.iloc[idx])
-            rma50_curr = float(rma_50_15m.iloc[idx])
-            magical_curr = float(magical_hist.iloc[idx]) if len(magical_hist) > abs(idx) else np.nan
-        except Exception:
-            logger.debug(f"{pair_name}: indicators indexing issue - skipping")
-            return None
+        pivots = calculate_fibonacci_pivots(df_daily)
         
-        rma200_5m_curr = np.nan
-        if df_5m is not None:
-            rma200 = calculate_rma(df_5m['close'], 200)
+        if pivots is None or df_daily is None or len(df_daily) < 2:
+            logger.debug(f"{pair_name}: Insufficient daily data for pivots.")
+            pivots_available = False
+        else:
+            pivots_available = True
+            
+        # Calculate Indicators
+        ppo, ppo_signal = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
+        magical_hist = calculate_magical_momentum_hist(df_15m)
+        
+        # VWAP Calculation (15m)
+        vwap_15m: Optional[pd.Series] = None
+        if df_daily is not None and len(df_daily) >= 2:
+            # VWAP reset daily is calculated based on 15m candles
+            vwap_15m = calculate_vwap_daily_reset(df_15m)
+            try:
+                # Use second-to-last candle for trigger logic
+                vwap_curr = float(vwap_15m.iloc[last_i_15m])
+            except Exception:
+                vwap_curr = None
+                
+        # Extract values from 15m
+        close_c = float(df_15m['close'].iloc[last_i_15m])
+        open_c = float(df_15m['open'].iloc[last_i_15m])
+        high_c = float(df_15m['high'].iloc[last_i_15m])
+        low_c = float(df_15m['low'].iloc[last_i_15m])
+        ppo_curr = float(ppo.iloc[last_i_15m])
+        magical_curr = float(magical_hist.iloc[last_i_15m])
+        
+        # Calculate RMA50 for 15m
+        rma50 = calculate_rma(df_15m['close'].astype(float), 50)
+        rma50_curr = float(rma50.iloc[last_i_15m])
+
+        # RMA 200 (5m) check
+        if cfg.USE_RMA200 and df_5m is not None:
+            rma200 = calculate_rma(df_5m['close'].astype(float), 200)
             try:
                 rma200_5m_curr = float(rma200.iloc[last_i_5m])
                 rma_200_available = not np.isnan(rma200_5m_curr)
@@ -954,15 +1025,18 @@ async def evaluate_pair_async(
             rma_200_available = False
 
         cloud_state = cloud_state_from(upw, dnw, idx=last_i_15m)
+        
         total_range = high_c - low_c
         upper_wick = high_c - max(open_c, close_c)
         lower_wick = min(open_c, close_c) - low_c
         wick_ratio = 0.35
         upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
         lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
+        
         is_green = close_c > open_c
         is_red = close_c < open_c
-# Extra debug output for indicator values
+
+        # Extra debug output for indicator values
         if cfg.DEBUG_MODE:
             logger.debug(
                 f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
@@ -974,56 +1048,59 @@ async def evaluate_pair_async(
         # Reason for skip summary
         if cfg.DEBUG_MODE:
             reasons = []
-            if cloud_state == "neutral":
-                reasons.append("cloud neutral")
-            if magical_curr <= 0 and is_green:
-                reasons.append("MMH not positive for long")
-            if magical_curr >= 0 and is_red:
-                reasons.append("MMH not negative for short")
-            if not upper_wick_ok and is_green:
-                reasons.append("upper wick too long")
-            if not lower_wick_ok and is_red:
-                reasons.append("lower wick too long")
-            if vwap_curr is not None:
+            if cloud_state == "neutral": reasons.append("cloud neutral")
+            if magical_curr <= 0 and is_green: reasons.append("MMH not positive for long")
+            if magical_curr >= 0 and is_red: reasons.append("MMH not negative for short")
+            if not upper_wick_ok and is_green: reasons.append("upper wick too long")
+            if not lower_wick_ok and is_red: reasons.append("lower wick too long")
+            if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 2:
                 prev_close = float(df_15m['close'].iloc[last_i_15m - 1])
                 prev_vwap = float(vwap_15m.iloc[last_i_15m - 1])
-                if prev_close <= prev_vwap and close_c <= vwap_curr:
-                    reasons.append("no VWAP crossover for long")
-                if prev_close >= prev_vwap and close_c >= vwap_curr:
-                    reasons.append("no VWAP crossover for short")
-            if not reasons:
-                reasons.append("conditions not met")
+                if prev_close <= prev_vwap and close_c <= vwap_curr: reasons.append("no VWAP crossover for long")
+                if prev_close >= prev_vwap and close_c >= vwap_curr: reasons.append("no VWAP crossover for short")
+
+            # RMA200 check reasons
+            if cfg.USE_RMA200 and rma_200_available:
+                if close_c <= rma200_5m_curr and is_green: reasons.append("15m close below 5m RMA200 for long")
+                if close_c >= rma200_5m_curr and is_red: reasons.append("15m close above 5m RMA200 for short")
+                
+            if not reasons: reasons.append("conditions not met")
             logger.debug(f"{pair_name}: skipped because {', '.join(reasons)}")
 
         # RMA200 check: 5m close must be above 200 RMA for long, below for short
         rma_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
         rma_short_ok = not cfg.USE_RMA200 or (rma_200_available and close_c < rma200_5m_curr)
+        
+        # Base requirements for signal
+        base_long_ok = (
+            is_green and
+            cloud_state == "bullish" and
+            ppo_curr > 0 and
+            magical_curr > 0 and
+            upper_wick_ok and
+            rma_long_ok and
+            close_c > rma50_curr
+        )
+        
+        base_short_ok = (
+            is_red and
+            cloud_state == "bearish" and
+            ppo_curr < 0 and
+            magical_curr < 0 and
+            lower_wick_ok and
+            rma_short_ok and
+            close_c < rma50_curr
+        )
 
-        # FIBONACCI LOGIC
-        long_crossover_line = None
-        long_crossover_name = None
-        for name in ['P', 'S1', 'S2', 'S3']:
-            line = pivots.get(name)
-            if df_15m['close'].iloc[idx-1] <= line and close_c > line:
-                long_crossover_line = line
-                long_crossover_name = name
-                break
-        short_crossover_line = None
-        short_crossover_name = None
-        for name in ['P', 'R1', 'R2', 'R3']:
-            line = pivots.get(name)
-            if df_15m['close'].iloc[idx-1] >= line and close_c < line:
-                short_crossover_line = line
-                short_crossover_name = name
-                break
+        long_crossover = get_crossover_line(pivots, float(df_15m['close'].iloc[last_i_15m - 1]), close_c, "long")
+        short_crossover = get_crossover_line(pivots, float(df_15m['close'].iloc[last_i_15m - 1]), close_c, "short")
+        
+        long_crossover_name = long_crossover[0] if long_crossover else None
+        long_crossover_line = long_crossover[1] if long_crossover else None
+        short_crossover_name = short_crossover[0] if short_crossover else None
+        short_crossover_line = short_crossover[1] if short_crossover else None
 
-        # VWAP LOGIC
-        vwap_curr = float(vwap_15m.iloc[idx]) if vwap_15m is not None else None
-
-        # Combined Base Logic
-        base_long_ok = (cloud_state == "green") and upper_wick_ok and rma_long_ok and (magical_curr > 0) and is_green
-        base_short_ok = (cloud_state == "red") and lower_wick_ok and rma_short_ok and (magical_curr < 0) and is_red
-
+        # VWAP Crossover Signal
         vbuy = False
         vsell = False
         if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 2:
@@ -1036,7 +1113,7 @@ async def evaluate_pair_async(
 
         fib_long = base_long_ok and (long_crossover_line is not None)
         fib_short = base_short_ok and (short_crossover_line is not None)
-
+        
         up_sig = "🟢⬆️"
         down_sig = "🔴⬇️"
         current_signal = None
@@ -1049,94 +1126,106 @@ async def evaluate_pair_async(
                 vwap_str = f"{vwap_curr:,.2f}"
                 ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
-                message = (f"{up_sig} {sanitize_for_telegram(pair_name)} - VBuy\n"
-                           f"Closed Above VWAP (${vwap_str})\n"
-                           f"PPO 15m: {ppo_str}\n"
-                           f"Price: ${price_str}\n"
-                           f"{human_ts()}")
+                message = (
+                    f"{up_sig} {sanitize_for_telegram(pair_name)} - VBuy\n"
+                    f"Closed Above VWAP (${vwap_str})\n"
+                    f"PPO 15m: {ppo_str}\n"
+                    f"Price: ${price_str}\n"
+                    f"{human_ts()}"
+                )
         elif vsell:
             current_signal = "vsell"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 vwap_str = f"{vwap_curr:,.2f}"
                 ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
-                message = (f"{down_sig} {sanitize_for_telegram(pair_name)} - VSell\n"
-                           f"Closed Below VWAP (${vwap_str})\n"
-                           f"PPO 15m: {ppo_str}\n"
-                           f"Price: ${price_str}\n"
-                           f"{human_ts()}")
+                message = (
+                    f"{down_sig} {sanitize_for_telegram(pair_name)} - VSell\n"
+                    f"Closed Below VWAP (${vwap_str})\n"
+                    f"PPO 15m: {ppo_str}\n"
+                    f"Price: ${price_str}\n"
+                    f"{human_ts()}"
+                )
         elif fib_long:
             current_signal = f"fib_long_{long_crossover_name}"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 line_str = f"{long_crossover_line:,.2f}"
                 ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
-                message = (f"{up_sig} {sanitize_for_telegram(pair_name)} - Fib Long (Cross {long_crossover_name})\n"
-                           f"Price Crossed Above {long_crossover_name} (${line_str})\n"
-                           f"PPO 15m: {ppo_str}\n"
-                           f"Price: ${price_str}\n"
-                           f"{human_ts()}")
+                message = (
+                    f"{up_sig} {sanitize_for_telegram(pair_name)} - Fib Long (Cross {long_crossover_name})\n"
+                    f"Price Crossed Above {long_crossover_name} (${line_str})\n"
+                    f"PPO 15m: {ppo_str}\n"
+                    f"Price: ${price_str}\n"
+                    f"{human_ts()}"
+                )
         elif fib_short:
             current_signal = f"fib_short_{short_crossover_name}"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 line_str = f"{short_crossover_line:,.2f}"
                 ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
-                message = (f"{down_sig} {sanitize_for_telegram(pair_name)} - Fib Short (Cross {short_crossover_name})\n"
-                           f"Price Crossed Below {short_crossover_name} (${line_str})\n"
-                           f"PPO 15m: {ppo_str}\n"
-                           f"Price: ${price_str}\n"
-                           f"{human_ts()}")
-
-        # Determine the new state to save
-        if current_signal:
-            new_state = current_signal
-            new_ts = now_ts()
-        elif last_state and last_state.get("state") in ["vbuy", "vsell", "fib_long_P", "fib_short_P"]:
-            new_state = last_state.get("state")
-            new_ts = last_state.get("ts")
-        else:
-            new_state = None
-            new_ts = None
+                message = (
+                    f"{down_sig} {sanitize_for_telegram(pair_name)} - Fib Short (Cross {short_crossover_name})\n"
+                    f"Price Crossed Below {short_crossover_name} (${line_str})\n"
+                    f"PPO 15m: {ppo_str}\n"
+                    f"Price: ${price_str}\n"
+                    f"{human_ts()}"
+                )
 
         if message:
-            logger.info(f"SIGNAL: {message.replace('\n', ' | ')}")
-            return new_state, {"message": message, "ts": now_ts(), "state": current_signal}
-        elif new_state:
-            return new_state, {"ts": new_ts, "state": new_state}
-        else:
-            return None, None
+            logger.info(f"Generated alert for {pair_name}: {current_signal}")
+            ok = await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, message, session)
+            if ok:
+                METRICS["alerts_sent"] += 1
+                return current_signal, {"message": message, "signal": current_signal}
+            else:
+                # If Telegram send fails, don't update state to allow retry
+                return None, None
+        
+        # Update state only if a non-duplicate signal was found and sent, or if state needs to be cleared
+        # If no signal, explicitly check if the last state signal is stale and clear it
+        if last_state and current_signal is None and now_ts() - int(last_state.get("ts", 0)) > suppress_secs:
+            logger.debug(f"{pair_name}: Last state '{last_state.get('state')}' expired. Clearing state.")
+            return None, None # Clear state in DB by returning None
+            
+        return last_state.get("state") if last_state else None, None
 
+    except ClientConnectorError as e:
+        logger.error(f"Network error evaluating {pair_name}: {e}")
+        METRICS["network_errors"] += 1
+        return None, None
     except Exception as e:
-        logger.exception(f"Error evaluating {pair_name}: {e}")
+        logger.error(f"Error evaluating {pair_name}: {e}")
+        logger.debug(traceback.format_exc())
         METRICS["logic_errors"] += 1
         return None, None
 
 # -------------------------
-# TELEGRAM SENDER
+# TELEGRAM NOTIFICATIONS
 # -------------------------
-async def send_telegram_async(
-    token: str,
-    chat_id: str,
-    text: str,
-    session: Optional[aiohttp.ClientSession] = None
-) -> bool:
-    if not token or not chat_id:
-        logger.warning("Telegram not configured; skipping.")
-        return False
+async def send_telegram_async(token: str, chat_id: str, text: str, session: Optional[aiohttp.ClientSession] = None) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true"
+    }
+    
     own_session = False
     if session is None:
         connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
         session = aiohttp.ClientSession(connector=connector)
         own_session = True
+
     try:
         async with session.post(url, data=data, timeout=10) as resp:
             try:
                 js = await resp.json(content_type=None)
             except Exception:
                 js = {"ok": False, "status": resp.status, "text": await resp.text()}
+            
             ok = js.get("ok", False)
             if ok:
                 await asyncio.sleep(0.2)
@@ -1163,6 +1252,7 @@ async def send_telegram_with_retries(token: str, chat_id: str, text: str, sessio
             last_exc = e
         sleep_for = cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)
         await asyncio.sleep(sleep_for + random.uniform(0, 0.3))
+
     logger.error(f"Telegram send failed after retries: {last_exc}")
     return False
 
@@ -1177,7 +1267,9 @@ async def check_dead_mans_switch(state_db: StateDB):
                 last_success_int = int(last_success)
             except Exception:
                 last_success_int = now_ts()
+                
             hours_since = (now_ts() - last_success_int) / 3600.0
+            
             if hours_since > 2:
                 dead_alert_ts = state_db.get_metadata("dead_alert_ts")
                 if dead_alert_ts:
@@ -1187,11 +1279,15 @@ async def check_dead_mans_switch(state_db: StateDB):
                         dead_alert_int = 0
                 else:
                     dead_alert_int = 0
+                
                 if now_ts() - dead_alert_int > 4 * 3600:
-                    msg = (f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
-                           f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S IST')}")
+                    msg = (
+                        f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
+                        f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S IST')}"
+                    )
                     await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg)
                     state_db.set_metadata("dead_alert_ts", str(now_ts()))
+                    
     except Exception as e:
         logger.exception(f"Dead man's switch failed: {e}")
 
@@ -1209,52 +1305,38 @@ async def run_once(send_test: bool = True):
     global stop_requested
     reset_metrics()
     start_time = time.time()
-
+    
     async def check_timeout():
         while True:
             elapsed = time.time() - start_time
             if elapsed > cfg.MAX_EXEC_TIME:
-                logger.critical(f"Execution timeout: {elapsed:.1f}s > {cfg.MAX_EXEC_TIME}s")
-                raise TimeoutError("Max execution time exceeded")
+                logger.error(f"Execution exceeded MAX_EXEC_TIME ({cfg.MAX_EXEC_TIME}s). Forcing exit.")
+                raise SystemExit(EXIT_TIMEOUT)
             await asyncio.sleep(1)
+
     timeout_task = asyncio.create_task(check_timeout())
-
+    
     try:
-        proc = psutil.Process(os.getpid())
-    except Exception:
-        proc = None
-
-    try:
-        logger.info("🚀 Starting fibonacci_pivot_bot_production run")
-        if proc:
-            try:
-                rss = proc.memory_info().rss
-                if rss > cfg.MEMORY_LIMIT_BYTES:
-                    logger.critical(f"High memory usage at start: {rss} bytes > {cfg.MEMORY_LIMIT_BYTES}")
-                    raise MemoryError("High memory usage")
-            except Exception as e:
-                logger.debug(f"Memory check failed: {e}")
-
+        # DB and State initialization
+        prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
         state_db = StateDB(cfg.STATE_DB_PATH)
         await check_dead_mans_switch(state_db)
-        try:
-            prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
-        except Exception as e:
-            logger.warning(f"Prune error: {e}")
-
         last_alerts = state_db.load_all()
+
         if cfg.RESET_STATE:
             logger.warning("🔄 RESET_STATE requested: clearing states table")
             for p in cfg.PAIRS:
                 state_db.set(p, None)
 
         if send_test and cfg.SEND_TEST_MESSAGE:
-            test_msg = (f"🔔 Fibonacci Pivot Bot started\n"
-                        f"Time: {human_ts()}\n"
-                        f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
-                        f"Pairs: {len(cfg.PAIRS)}")
+            test_msg = (
+                f"🔔 Fibonacci Pivot Bot started\n"
+                f"Time: {human_ts()}\n"
+                f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
+                f"Pairs: {len(cfg.PAIRS)}"
+            )
             await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
-
+            
         products_map = load_products_cache()
         circuit = CircuitBreaker()
         fetcher_local = DataFetcher(
@@ -1263,9 +1345,10 @@ async def run_once(send_test: bool = True):
             timeout=cfg.HTTP_TIMEOUT,
             circuit_breaker=circuit
         )
-
+        
         connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
+            
             if products_map is None:
                 prod_resp = await fetcher_local.fetch_products(session)
                 if not prod_resp:
@@ -1282,133 +1365,127 @@ async def run_once(send_test: bool = True):
                     products_map,
                     pair_name,
                     last_alerts.get(pair_name)
-                )
-                for pair_name in cfg.PAIRS
+                ) for pair_name in cfg.PAIRS
             ]
+            
             results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        alerts_sent = 0
-        for pair_name, result in zip(cfg.PAIRS, results):
-            if stop_requested:
-                break
-            if isinstance(result, Exception):
-                logger.error(f"Error in task for {pair_name}: {result}")
-                METRICS["logic_errors"] += 1
-                continue
-
-            new_state, alert_info = result
-            if new_state:
-                state_db.set(pair_name, new_state)
-
-            if alert_info and alert_info.get("message"):
-                success = await send_telegram_with_retries(
-                    cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, alert_info["message"]
-                )
-                if success:
+            
+            alerts_sent = 0
+            for pair_name, result in zip(cfg.PAIRS, results):
+                if stop_requested:
+                    break
+                
+                if isinstance(result, Exception):
+                    logger.error(f"Error in task for {pair_name}: {result}")
+                    METRICS["logic_errors"] += 1
+                    continue
+                    
+                new_state, alert_info = result
+                
+                if new_state:
+                    state_db.set(pair_name, new_state)
+                
+                if new_state is None and last_alerts.get(pair_name):
+                    # Only clear state if evaluate_pair_async explicitly signals it (e.g., expiry)
+                    if result[0] is None and result[1] is None:
+                         state_db.set(pair_name, None)
+                
+                if alert_info:
                     alerts_sent += 1
-                    METRICS["alerts_sent"] += 1
 
-        METRICS["execution_time"] = time.time() - start_time
-        logger.info(f"✅ Run finished in {METRICS['execution_time']:.2f}s | Pairs checked: {METRICS['pairs_checked']} | Alerts sent: {alerts_sent}")
+            METRICS["alerts_sent"] = alerts_sent
+            
         state_db.set_metadata("last_success_run", str(now_ts()))
-        state_db.set_metadata("last_run_metrics", json.dumps(METRICS))
-        state_db.close()
+        state_db.set_metadata("dead_alert_ts", "0")
 
-    except TimeoutError:
-        raise
-    except MemoryError:
-        raise
-    except SystemExit:
-        raise
-    except Exception:
-        pass
-    except asyncio.CancelledError:
-        logger.warning("Run was cancelled")
-        raise
-    except TimeoutError as te:
-        logger.critical(f"Timeout error: {te}")
-        raise SystemExit(EXIT_TIMEOUT)
     except SystemExit:
         raise
     except Exception as e:
-        logger.exception(f"Unhandled error in run_once: {e}")
-        raise
+        logger.exception("Unhandled exception in run_once")
+        raise SystemExit(EXIT_API_FAILURE)
     finally:
-        try:
-            timeout_task.cancel()
-            await timeout_task
-        except asyncio.CancelledError:
-            pass
+        timeout_task.cancel()
+        if 'state_db' in locals():
+            state_db.close()
+            
+        METRICS["execution_time"] = time.time() - start_time
+        logger.info(
+            f"✅ Run finished. Pairs: {METRICS['pairs_checked']}, "
+            f"Alerts: {METRICS['alerts_sent']}, Time: {METRICS['execution_time']:.2f}s"
+        )
+        
+        if cfg.DEBUG_MODE:
+            logger.debug(f"Metrics: {METRICS}")
+
 
 # -------------------------
-# CLI + SIGNAL HANDLING
+# MAIN EXECUTION
 # -------------------------
 def main():
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
+    if os.getenv("GITHUB_ACTIONS"):
+        logger.info("Running in GitHub Actions environment.")
+    elif os.getenv("CRON_JOB"):
+        logger.info("Running in Cron Job environment.")
 
-    lock = ProcessLock("/tmp/fib_bot.lock", timeout=cfg.MAX_EXEC_TIME * 2)
+    # Memory limit check
+    try:
+        if psutil.virtual_memory().total < cfg.MEMORY_LIMIT_BYTES:
+            logger.warning(f"Total system memory ({psutil.virtual_memory().total / (1024**3):.2f}GB) is below configured limit ({cfg.MEMORY_LIMIT_BYTES / (1024**3):.2f}GB). Proceeding but watch for OOM.")
+    except Exception:
+        pass
+
+    # Process locking to prevent concurrent runs
+    lock = ProcessLock("fib_pivot.lock", timeout=cfg.RUN_LOOP_INTERVAL * 2)
     if not lock.acquire():
-        logger.error("❌ Another instance is running or stale lock exists. Exiting.")
+        logger.error("❌ Failed to acquire process lock. Another instance is running.")
         sys.exit(EXIT_LOCK_CONFLICT)
 
+    # Signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    
     try:
-        import argparse
-        parser = argparse.ArgumentParser(
-            description="Improved Fibonacci Pivot Bot for Delta Exchange.",
-            formatter_class=argparse.RawTextHelpFormatter
-        )
-        parser.add_argument("--once", action="store_true", help="Run once and exit (default).")
-        parser.add_argument("--loop", type=int, default=cfg.RUN_LOOP_INTERVAL,
-                            help=f"Run in a loop with specified interval in seconds (default: {cfg.RUN_LOOP_INTERVAL}).")
-        parser.add_argument("--reset-state", action="store_true", help="Clear the state database before running.")
-        parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-        args = parser.parse_args()
-
-        if args.reset_state:
-            cfg.RESET_STATE = True
-            logger.warning("Configuration override: RESET_STATE=True")
-        if args.debug:
-            cfg.DEBUG_MODE = True
-            logger.warning("Configuration override: DEBUG_MODE=True")
-            logger.setLevel(logging.DEBUG)
-
-        if args.once:
+        # Argument parsing placeholder (assuming command line logic from context)
+        # Assuming run modes like --once or --loop N are handled here
+        
+        # If running in a loop mode (simulated from context):
+        interval = cfg.RUN_LOOP_INTERVAL
+        logger.info(f"🔄 Loop mode: interval={interval}s")
+        while not stop_requested:
+            loop_start = time.time()
             try:
-                asyncio.run(run_once())
+                # The argument to run_once is usually True for the first run to send a test message, 
+                # and False for subsequent loop iterations.
+                asyncio.run(run_once(send_test=False if loop_start != METRICS.get('start_time') else True))
             except SystemExit as e:
-                logger.error(f"Exited with code {e.code}")
-                sys.exit(e.code if isinstance(e.code, int) else 1)
-        elif args.loop:
-            interval = args.loop
-            logger.info(f"🔄 Loop mode: interval={interval}s")
-            while not stop_requested:
-                loop_start = time.time()
-                try:
-                    asyncio.run(run_once(send_test=False))
-                except SystemExit as e:
-                    logger.error(f"Run exited with code {e.code}, continuing loop.")
-                except Exception:
-                    logger.exception("Unhandled in run_once")
+                logger.error(f"Run exited with code {e.code}, continuing loop.")
+                if e.code == EXIT_TIMEOUT:
+                    logger.warning("Continuing loop after timeout exit.")
+                elif e.code != EXIT_API_FAILURE:
+                    break # Stop for non-recoverable errors
+            except Exception:
+                logger.exception("Unhandled in run_once")
 
-                elapsed = time.time() - loop_start
-                to_sleep = max(0, interval - elapsed)
-                if to_sleep > 0:
-                    for _ in range(int(to_sleep)):
-                        if stop_requested:
-                            break
-                        time.sleep(1)
-                    if not stop_requested:
-                        remainder = to_sleep - int(to_sleep)
-                        if remainder > 0:
-                            time.sleep(remainder)
-        else:
-            try:
-                asyncio.run(run_once())
-            except SystemExit as e:
-                logger.error(f"Exited with code {e.code}")
-                sys.exit(e.code if isinstance(e.code, int) else 1)
+            elapsed = time.time() - loop_start
+            to_sleep = max(0, interval - elapsed)
+            if to_sleep > 0:
+                for _ in range(int(to_sleep)):
+                    if stop_requested:
+                        break
+                    time.sleep(1)
+                if not stop_requested:
+                    remainder = to_sleep - int(to_sleep)
+                    if remainder > 0:
+                        time.sleep(remainder)
 
+        if not stop_requested:
+             # Default to running once if no loop is configured (based on original script logic flow)
+             try:
+                 asyncio.run(run_once())
+             except SystemExit as e:
+                 logger.error(f"Exited with code {e.code}")
+                 sys.exit(e.code if isinstance(e.code, int) else 1)
+        
         sys.exit(EXIT_SUCCESS)
 
     finally:
