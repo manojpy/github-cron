@@ -943,7 +943,7 @@ async def evaluate_pair_async(
         limit_5m = sp.get("limit_5m", 500)
         min_required_5m = sp.get("min_required_5m", 250)
         
-        # FIX: Initialize vwap_curr to None to prevent UnboundLocalError
+        # FIX #1: Initialize vwap_curr to None to prevent UnboundLocalError
         vwap_curr: Optional[float] = None
 
         tasks = [fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)]
@@ -1038,11 +1038,14 @@ async def evaluate_pair_async(
 
         # Extra debug output for indicator values
         if cfg.DEBUG_MODE:
+            # FIX #2: Correctly handle formatting of optional float (vwap_curr) to avoid ValueError
+            vwap_log_str = f"{vwap_curr:.2f}" if vwap_curr is not None and not np.isnan(vwap_curr) else "nan"
+            
             logger.debug(
                 f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
                 f"PPO={ppo_curr:.2f}, RMA50={rma50_curr:.2f}, "
                 f"MMH={magical_curr:.4f}, Cloud={cloud_state}, "
-                f"VWAP={vwap_curr:.2f if vwap_curr is not None else float('nan')}"
+                f"VWAP={vwap_log_str}" 
             )
 
         # Reason for skip summary
