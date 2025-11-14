@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 # macd_bot_improved.py
-# Python 3.12 — production-hardened version of your MACD/PPO bot.
-#
-# Behavior:
-# - Config via environment variables, config_macd.json, or safe in-script defaults
-# - PID file lock to avoid concurrent runs (cron-safe)
-# - aiohttp with TCPConnector(limit=...) to prevent socket exhaustion
-# - Circuit breaker + retries + jitter for API calls
-# - Telegram rate-limited sender with retry/backoff
-# - SQLite state store (WAL mode) with prune and safe cleanup
-# - Memory guard via psutil
-# - Graceful signal handling and task cancellation
-# - Corrected Magical Momentum Histogram reversal rules (Buy/Sell) with sign gating
-# - Robust closed-candle indexing and NaN checks
+# Python 3.12 — production-hardened MACD/PPO bot with corrected MMH reversal logic.
 
 from __future__ import annotations
 
@@ -60,7 +48,7 @@ DEFAULT_CONFIG = {
     "RMA_200_PERIOD": 200,
     "CIRRUS_CLOUD_ENABLED": True,
     "X1": 22, "X2": 9, "X3": 15, "X4": 5,
-    "SRSI_RSI_LEN": 21, "SRSI_KALMAN_LEN": 5, "SRSI_EMA_LEN": 5,
+    "SRSI_RSI_LEN": 21, "SRSI_KALMAN_LEN": 5,
     "STATE_DB_PATH": os.environ.get("STATE_DB_PATH", "macd_state.sqlite"),
     "LOG_FILE": os.environ.get("LOG_FILE", "macd_bot.log"),
     "MAX_PARALLEL_FETCH": int(os.environ.get("MAX_PARALLEL_FETCH", "4")),
@@ -75,19 +63,19 @@ DEFAULT_CONFIG = {
     "LOG_LEVEL": os.environ.get("LOG_LEVEL", "INFO"),
     "TELEGRAM_RETRIES": int(os.environ.get("TELEGRAM_RETRIES", "3")),
     "TELEGRAM_BACKOFF_BASE": float(os.environ.get("TELEGRAM_BACKOFF_BASE", "2.0")),
-    "MEMORY_LIMIT_BYTES": int(os.environ.get("MEMORY_LIMIT_BYTES", str(400_000_000))),  # ~400MB
+    "MEMORY_LIMIT_BYTES": int(os.environ.get("MEMORY_LIMIT_BYTES", str(400_000_000))),
     "TCP_CONN_LIMIT": int(os.environ.get("TCP_CONN_LIMIT", "8")),
-    "DEAD_MANS_COOLDOWN_SECONDS": int(os.environ.get("DEAD_MANS_COOLDOWN_SECONDS", str(4 * 3600)))  # 4 hours
+    "DEAD_MANS_COOLDOWN_SECONDS": int(os.environ.get("DEAD_MANS_COOLDOWN_SECONDS", str(4 * 3600))),
+    "BOT_NAME": os.environ.get("BOT_NAME", "MACD Alert Bot"),
 }
 
 # ==========================================================
-# CONFIGURATION LOADER (Enhanced Boolean + Env Handling)
+# Configuration loader
 # ==========================================================
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config_macd.json")
 cfg = DEFAULT_CONFIG.copy()
 
-def str_to_bool(value):
-    """Safely interpret string-based booleans."""
+def str_to_bool(value: Any) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
 
 # Load config file if present
@@ -128,7 +116,6 @@ if cfg["MAX_PARALLEL_FETCH"] < 1 or cfg["MAX_PARALLEL_FETCH"] > 16:
     cfg["MAX_PARALLEL_FETCH"] = max(1, min(16, cfg["MAX_PARALLEL_FETCH"]))
 
 print(f"DEBUG_MODE={cfg['DEBUG_MODE']}, SEND_TEST_MESSAGE={cfg['SEND_TEST_MESSAGE']}")
-# ==========================================================
 
 # -------------------------
 # Logger
@@ -137,14 +124,12 @@ logger = logging.getLogger("macd_bot")
 log_level = getattr(logging, str(cfg.get("LOG_LEVEL", "INFO")).upper(), logging.INFO)
 logger.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else log_level)
 
-# console handler
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else log_level)
 fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 ch.setFormatter(fmt)
 logger.addHandler(ch)
 
-# rotating file handler
 try:
     log_dir = os.path.dirname(cfg["LOG_FILE"]) or "."
     os.makedirs(log_dir, exist_ok=True)
@@ -156,7 +141,7 @@ except Exception as e:
     logger.warning(f"Could not set up rotating log file: {e}")
 
 # -------------------------
-# PID File Lock (prevents concurrent runs)
+# PID file lock
 # -------------------------
 class PidFileLock:
     def __init__(self, path: str = "/tmp/macd_bot.pid"):
@@ -199,7 +184,7 @@ class PidFileLock:
             pass
 
 # -------------------------
-# SQLite State DB (WAL mode, safe)
+# SQLite State DB
 # -------------------------
 class StateDB:
     def __init__(self, db_path: str):
@@ -415,7 +400,13 @@ class DataFetcher:
     async def fetch_products(self, session: aiohttp.ClientSession) -> Optional[dict]:
         url = f"{self.api_base}/v2/products"
         async with self.semaphore:
-            return await async_fetch_json(session, url, retries=cfg["CANDLE_FETCH_RETRIES"], backoff=cfg["CANDLE_FETCH_BACKOFF"], timeout=self.timeout, circuit_breaker=self.circuit_breaker)
+            return await async_fetch_json(
+                session, url,
+                retries=cfg["CANDLE_FETCH_RETRIES"],
+                backoff=cfg["CANDLE_FETCH_BACKOFF"],
+                timeout=self.timeout,
+                circuit_breaker=self.circuit_breaker
+            )
 
     async def fetch_candles(self, session: aiohttp.ClientSession, symbol: str, resolution: str, limit: int):
         key = f"candles:{symbol}:{resolution}:{limit}"
@@ -433,7 +424,13 @@ class DataFetcher:
             "to": int(time.time())
         }
         async with self.semaphore:
-            data = await async_fetch_json(session, url, params=params, retries=cfg["CANDLE_FETCH_RETRIES"], backoff=cfg["CANDLE_FETCH_BACKOFF"], timeout=self.timeout, circuit_breaker=self.circuit_breaker)
+            data = await async_fetch_json(
+                session, url, params=params,
+                retries=cfg["CANDLE_FETCH_RETRIES"],
+                backoff=cfg["CANDLE_FETCH_BACKOFF"],
+                timeout=self.timeout,
+                circuit_breaker=self.circuit_breaker
+            )
         self._cache[key] = (time.time(), data)
         return data
 
@@ -566,7 +563,7 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     return smooth_rsi
 
 # -------------------------
-# Magical Momentum Histogram (faithful to Pinescript v6)
+# Magical Momentum Histogram (Pinescript v6 faithful)
 # -------------------------
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
     n = len(df)
@@ -577,7 +574,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
 
     close = df['close'].astype(float).copy()
     sd = close.rolling(window=50, min_periods=50).std() * responsiveness
-    sd = sd.fillna(method="bfill").fillna(method="ffill").fillna(0.001).clip(lower=1e-6)
+    sd = sd.bfill().ffill().fillna(0.001).clip(lower=1e-6)
 
     worm = close.copy()
     for i in range(1, n):
@@ -585,14 +582,14 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
-    ma = close.rolling(window=period, min_periods=period).mean().fillna(method="bfill").fillna(method="ffill")
-    denom = worm.replace(0, np.nan).fillna(method="bfill").fillna(method="ffill").clip(lower=1e-8)
+    ma = close.rolling(window=period, min_periods=period).mean().bfill().ffill()
+    denom = worm.replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
 
     raw_momentum = ((worm - ma).fillna(0)) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], 0).fillna(0)
 
-    min_med = raw_momentum.rolling(window=period, min_periods=period).min().fillna(method="bfill").fillna(method="ffill")
-    max_med = raw_momentum.rolling(window=period, min_periods=period).max().fillna(method="bfill").fillna(method="ffill")
+    min_med = raw_momentum.rolling(window=period, min_periods=period).min().bfill().ffill()
+    max_med = raw_momentum.rolling(window=period, min_periods=period).max().bfill().ffill()
     rng = (max_med - min_med).replace(0, np.nan).fillna(1e-8)
 
     temp = pd.Series(0.0, index=df.index)
@@ -627,13 +624,8 @@ def get_last_closed_index(df: Optional[pd.DataFrame], resolution_min: int) -> Op
     now_ts = int(time.time())
     last_ts = int(df['timestamp'].iloc[-1])
     current_interval_start = now_ts - (now_ts % (resolution_min * 60))
-    # If last bar timestamp is within the current interval, it is not yet closed:
     if last_ts >= current_interval_start:
-        # use the previous bar (last closed)
-        if len(df) >= 2:
-            return len(df) - 2
-        return None
-    # last bar is closed
+        return len(df) - 2 if len(df) >= 2 else None
     return len(df) - 1
 
 # -------------------------
@@ -648,7 +640,6 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             logger.debug(f"Indexing not ready for {pair_name} (last_i_15={last_i_15}, last_i_5={last_i_5})")
             return None
 
-        # Indicators
         magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
         if magical_hist is None or len(magical_hist) <= last_i_15:
             logger.debug(f"MMH missing for {pair_name}")
@@ -665,7 +656,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m, cfg["SRSI_RSI_LEN"], cfg["SRSI_KALMAN_LEN"])
 
-        # Guard indices for these series
+        # Verify series lengths
         for series_name, s, idx in [
             ("ppo", ppo, last_i_15), ("ppo_signal", ppo_signal, last_i_15),
             ("rma_50", rma_50, last_i_15), ("rma_200", rma_200, last_i_5),
@@ -724,7 +715,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         close_above_rma200 = close_curr > rma200_curr
         close_below_rma200 = close_curr < rma200_curr
 
-        # Corrected MMH reversal logic with sign gating and indexing aligned to your rule:
+        # Corrected MMH reversal logic (indexing per your spec):
         # Buy: histogram fell for 3 candles (H[2] < H[3], H[1] < H[2]) and latest H > H[1], all above 0
         mmh_reversal_buy = (
             mmh_curr > 0 and
@@ -745,10 +736,11 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
 
         cloud_state = "neutral"
         if cfg["CIRRUS_CLOUD_ENABLED"]:
-            # use last closed index for cloud too
             cloud_state = ("green" if (bool(upw.iloc[last_i_15]) and not bool(dnw.iloc[last_i_15]))
                            else "red" if (bool(dnw.iloc[last_i_15]) and not bool(upw.iloc[last_i_15]))
                            else "neutral")
+
+        bot_name = cfg.get("BOT_NAME", "MACD Bot")
 
         # Conditions dicts
         buy_mmh_reversal_conds = {
@@ -840,28 +832,28 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
 
         if all(buy_mmh_reversal_conds.values()):
             current_state = "buy_mmh_reversal"
-            send_message = f"🟢 {pair_name} - BUY (MMH Reversal)\nMMH 15m Reversal Up ({mmh_curr:.5f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n🟢 {pair_name} - BUY (MMH Reversal)\nMMH 15m Reversal Up ({mmh_curr:.5f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(sell_mmh_reversal_conds.values()):
             current_state = "sell_mmh_reversal"
-            send_message = f"🔴 {pair_name} - SELL (MMH Reversal)\nMMH 15m Reversal Down ({mmh_curr:.5f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n🔴 {pair_name} - SELL (MMH Reversal)\nMMH 15m Reversal Down ({mmh_curr:.5f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(buy_srsi_conds.values()):
             current_state = "buy_srsi50"
-            send_message = f"⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n⬆️ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(sell_srsi_conds.values()):
             current_state = "sell_srsi50"
-            send_message = f"⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n⬇️ {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(long0_conds.values()):
             current_state = "long_zero"
-            send_message = f"🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(long011_conds.values()):
             current_state = "long_011"
-            send_message = f"🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(short0_conds.values()):
             current_state = "short_zero"
-            send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(short011_conds.values()):
             current_state = "short_011"
-            send_message = f"🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
 
         now_ts_int = int(time.time())
         last_state_value = last_state_for_pair.get("state") if isinstance(last_state_for_pair, dict) else None
@@ -979,6 +971,7 @@ async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, produ
         limit_5m = sp.get("limit_5m", 300)
         min_required_5m = sp.get("min_required_5m", 200)
         symbol = prod["symbol"]
+
         res15, res5 = await asyncio.gather(
             fetcher.fetch_candles(session, symbol, "15", limit_15m),
             fetcher.fetch_candles(session, symbol, "5", limit_5m)
@@ -1066,7 +1059,8 @@ async def run_once():
         if cfg["SEND_TEST_MESSAGE"]:
             ist = pytz.timezone("Asia/Kolkata")
             current_dt = datetime.now(ist)
-            test_msg = (f"🔔 MACD Bot Started\nTime: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
+            test_msg = (f"🔔 {cfg.get('BOT_NAME', 'MACD Bot')} Started\n"
+                        f"Time: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
                         f"Pairs: {len(cfg['PAIRS'])} | Debug: {cfg['DEBUG_MODE']}")
             await telegram_queue.send(session, test_msg)
 
