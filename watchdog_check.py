@@ -50,7 +50,7 @@ def check_recent_workflows():
     }
     
     # Use your actual single workflow name that runs both bots
-    workflows_to_check = ["bot-monitor", "trading-bots", "run-bots"]  # Choose the name that matches your YML file
+    workflows_to_check = ["macd_alert"]  # Choose the name that matches your YML file
     
     problems = []
     
