@@ -3,16 +3,28 @@ import requests
 import json
 import hashlib
 from datetime import datetime, timedelta
-from dotenv import load_dotenv  # ADD THIS LINE
 
-load_dotenv()  # ADD THIS LINE
+# ⚠️ REPLACE THESE WITH YOUR ACTUAL VALUES ⚠️
+NEWS_BOT_TOKEN = "8589118688:AAEYi9Uix03DiB7WQtU6Z7EJuQBlkFrSGEA"  # ← Your NEW bot token from @BotFather
+TELEGRAM_CHAT_ID = "203813932"                           # ← Your personal Chat ID (same as before)
+NEWSAPI_KEY = "6c5fd5cfb5d142bf917f038a3e1111eb"                 # ← Your NewsAPI key from newsapi.org
 
 class GlobalNewsAlerter:
     def __init__(self):
-        # Use NEW bot token, but same chat ID
-        self.telegram_bot_token = os.getenv('8589118688:AAEYi9Uix03DiB7WQtU6Z7EJuQBlkFrSGEA')  # New bot token
-        self.telegram_chat_id = os.getenv('203813932')  # Same chat ID as before!
-        self.newsapi_key = os.getenv('6c5fd5cfb5d142bf917f038a3e1111eb')
+        # Use the direct values
+        self.telegram_bot_token = NEWS_BOT_TOKEN
+        self.telegram_chat_id = TELEGRAM_CHAT_ID
+        self.newsapi_key = NEWSAPI_KEY
+        
+        # Debug info
+        print(f"🔧 Debug Info:")
+        print(f"   Token: {'✅' if self.telegram_bot_token else '❌'}")
+        print(f"   Chat ID: {'✅' if self.telegram_chat_id else '❌'}")
+        print(f"   NewsAPI: {'✅' if self.newsapi_key else '❌'}")
+        
+        if not all([self.telegram_bot_token, self.telegram_chat_id, self.newsapi_key]):
+            print("❌ ERROR: Please replace the token values at the top of this file!")
+            return
         
         # Major impactful news categories
         self.categories = {
@@ -58,7 +70,6 @@ class GlobalNewsAlerter:
             ]
         }
         
-        # High-impact keywords that indicate major news
         self.high_impact_keywords = [
             'crisis', 'emergency', 'breakthrough', 'historic', 'record', 'unprecedented',
             'major', 'significant', 'important', 'critical', 'urgent', 'alert',
@@ -67,11 +78,9 @@ class GlobalNewsAlerter:
             'soar', 'crash', 'attack', 'strike', 'summit', 'deal', 'agreement'
         ]
         
-        # File to store sent news hashes
         self.sent_news_file = 'sent_news.json'
-        
+    
     def get_sent_news_hashes(self):
-        """Load previously sent news hashes"""
         try:
             with open(self.sent_news_file, 'r') as f:
                 return set(json.load(f))
@@ -79,31 +88,24 @@ class GlobalNewsAlerter:
             return set()
     
     def save_sent_news_hashes(self, hashes):
-        """Save sent news hashes"""
         with open(self.sent_news_file, 'w') as f:
             json.dump(list(hashes), f)
     
     def create_news_hash(self, news_item):
-        """Create unique hash for news item to avoid duplicates"""
         content = f"{news_item['title']}_{news_item['publishedAt']}"
         return hashlib.md5(content.encode()).hexdigest()
     
     def get_global_news(self):
-        """Fetch major global news from top sources"""
-        # Top international news sources
         sources = [
             'reuters', 'associated-press', 'bbc-news', 'cnn', 
             'al-jazeera-english', 'the-guardian-uk', 'the-new-york-times'
         ]
         
         url = "https://newsapi.org/v2/top-headlines"
-        
-        # Get news from last 4 hours for comprehensive coverage
         from_date = (datetime.now() - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%S')
         
         all_articles = []
         
-        # Fetch from multiple sources
         for source in sources:
             params = {
                 'apiKey': self.newsapi_key,
@@ -118,15 +120,12 @@ class GlobalNewsAlerter:
                 if response.status_code == 200:
                     articles = response.json().get('articles', [])
                     all_articles.extend(articles)
-                    print(f"Found {len(articles)} articles from {source}")
-                # Add small delay to avoid rate limiting
-                import time
-                time.sleep(0.5)
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching from {source}: {e}")
+                    print(f"✅ Found {len(articles)} from {source}")
+            except Exception as e:
+                print(f"❌ Error from {source}: {e}")
                 continue
         
-        # Also get general top headlines
+        # Also get general headlines
         params = {
             'apiKey': self.newsapi_key,
             'language': 'en',
@@ -140,11 +139,11 @@ class GlobalNewsAlerter:
             if response.status_code == 200:
                 articles = response.json().get('articles', [])
                 all_articles.extend(articles)
-                print(f"Found {len(articles)} general top headlines")
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching general headlines: {e}")
+                print(f"✅ Found {len(articles)} general headlines")
+        except Exception as e:
+            print(f"❌ Error getting general headlines: {e}")
         
-        # Remove duplicates based on URL
+        # Remove duplicates
         seen_urls = set()
         unique_articles = []
         
@@ -154,11 +153,10 @@ class GlobalNewsAlerter:
                 unique_articles.append(article)
                 seen_urls.add(url)
         
-        print(f"Total unique articles: {len(unique_articles)}")
+        print(f"📊 Total unique articles: {len(unique_articles)}")
         return unique_articles
     
     def filter_high_impact_news(self, news_items):
-        """Filter only high-impact news stories"""
         high_impact_news = []
         
         for item in news_items:
@@ -166,19 +164,15 @@ class GlobalNewsAlerter:
             description = item.get('description', '').lower()
             content = f"{title} {description}"
             
-            # Check if it contains high-impact keywords
             impact_score = sum(1 for keyword in self.high_impact_keywords if keyword in content)
             
-            # Check if it falls into major categories
             category_match = False
             for category, keywords in self.categories.items():
                 if any(keyword in content for keyword in keywords):
                     category_match = True
                     break
             
-            # Include if high impact or belongs to major categories
             if impact_score >= 2 or category_match:
-                # Determine impact type
                 positive_keywords = [
                     'breakthrough', 'victory', 'success', 'achievement', 'record',
                     'milestone', 'landmark', 'peace', 'agreement', 'deal', 'surge',
@@ -205,16 +199,13 @@ class GlobalNewsAlerter:
                 item['impact_score'] = impact_score
                 high_impact_news.append(item)
         
-        # Sort by impact score (highest first)
         high_impact_news.sort(key=lambda x: x['impact_score'], reverse=True)
-        
-        print(f"Filtered {len(high_impact_news)} high-impact news stories")
+        print(f"🎯 High-impact stories: {len(high_impact_news)}")
         return high_impact_news
     
     def categorize_news(self, news_items):
-        """Categorize news items"""
         categorized = {category: [] for category in self.categories.keys()}
-        categorized['other'] = []  # For uncategorized but high-impact news
+        categorized['other'] = []
         
         for item in news_items:
             title = item.get('title', '').lower()
@@ -226,7 +217,7 @@ class GlobalNewsAlerter:
                 if any(keyword in content for keyword in keywords):
                     categorized[category].append(item)
                     categorized_flag = True
-                    break  # Put in first matching category
+                    break
             
             if not categorized_flag:
                 categorized['other'].append(item)
@@ -234,7 +225,6 @@ class GlobalNewsAlerter:
         return categorized
     
     def filter_new_news(self, news_items, sent_hashes):
-        """Filter out already sent news"""
         new_news = []
         new_hashes = set()
         
@@ -247,14 +237,12 @@ class GlobalNewsAlerter:
         return new_news, new_hashes
     
     def format_news_message(self, categorized_news):
-        """Format the news message for Telegram"""
         if not any(categorized_news.values()):
             return "📭 No major impactful news in the past few hours."
         
         message = "🌍 **Global Impact News Alert** 🌍\n\n"
         message += f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
         
-        # Emoji mapping for categories
         emojis = {
             'politics': '🏛️',
             'business': '💼',
@@ -267,7 +255,6 @@ class GlobalNewsAlerter:
             'other': '📰'
         }
         
-        # Impact type emojis
         impact_emojis = {
             'positive': '🟢',
             'negative': '🔴',
@@ -282,13 +269,12 @@ class GlobalNewsAlerter:
                 emoji = emojis.get(category, '📰')
                 message += f"{emoji} **{category.replace('_', ' ').title()}**\n"
                 
-                for i, item in enumerate(items[:3]):  # Limit to 3 items per category
+                for i, item in enumerate(items[:3]):
                     impact_emoji = impact_emojis.get(item.get('impact_type', 'significant'), '🟡')
                     title = item.get('title', 'No title')
                     source = item.get('source', {}).get('name', 'Unknown')
                     url = item.get('url', '')
                     
-                    # Shorten very long titles
                     if len(title) > 90:
                         title = title[:87] + "..."
                     
@@ -300,7 +286,6 @@ class GlobalNewsAlerter:
                 
                 message += "\n"
         
-        # Add summary
         impact_counts = {}
         for category, items in categorized_news.items():
             for item in items:
@@ -323,7 +308,6 @@ class GlobalNewsAlerter:
         return message
     
     def send_telegram_message(self, message):
-        """Send message to Telegram"""
         url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
         
         payload = {
@@ -334,34 +318,37 @@ class GlobalNewsAlerter:
         }
         
         try:
+            print("📤 Sending message to Telegram...")
             response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
-            print("Message sent successfully to Telegram")
+            print("✅ Message sent successfully to Telegram")
             return True
         except requests.exceptions.RequestException as e:
-            print(f"Error sending Telegram message: {e}")
+            print(f"❌ Error sending Telegram message: {e}")
             return False
     
     def run(self):
-        """Main function to run the global news alerter"""
-        print("Starting global impact news alerter...")
+        print("🚀 Starting global impact news alerter...")
         
-        # Check if required environment variables are set
+        # Check if tokens are set
         if not all([self.telegram_bot_token, self.telegram_chat_id, self.newsapi_key]):
-            print("Error: Missing required environment variables")
+            print("❌ ERROR: Please replace the token values at the top of this file!")
+            print("   Make sure you've updated:")
+            print("   - NEWS_BOT_TOKEN (your new bot token)")
+            print("   - TELEGRAM_CHAT_ID (your personal chat ID)") 
+            print("   - NEWSAPI_KEY (from newsapi.org)")
             return False
         
         # Load previously sent news
         sent_hashes = self.get_sent_news_hashes()
-        print(f"Loaded {len(sent_hashes)} previously sent news items")
+        print(f"📁 Loaded {len(sent_hashes)} previously sent news items")
         
         # Fetch global news
-        print("Fetching global news...")
+        print("📡 Fetching global news...")
         news_items = self.get_global_news()
-        print(f"Found {len(news_items)} total news items")
         
         if not news_items:
-            print("No news items found")
+            print("❌ No news items found")
             self.send_telegram_message(
                 "✅ Global news check completed.\n"
                 "No major impactful news in the past few hours.\n\n"
@@ -369,11 +356,11 @@ class GlobalNewsAlerter:
             )
             return True
         
-        # Filter for high-impact news only
+        # Filter for high-impact news
         high_impact_news = self.filter_high_impact_news(news_items)
         
         if not high_impact_news:
-            print("No high-impact news found")
+            print("❌ No high-impact news found")
             self.send_telegram_message(
                 "✅ Global news check completed.\n"
                 "No major impactful news in the past few hours.\n\n"
@@ -383,10 +370,10 @@ class GlobalNewsAlerter:
         
         # Filter new news
         new_news, new_hashes = self.filter_new_news(high_impact_news, sent_hashes)
-        print(f"Found {len(new_news)} new high-impact news items")
+        print(f"🆕 New high-impact stories: {len(new_news)}")
         
         if not new_news:
-            print("No new high-impact news to send")
+            print("ℹ️ No new high-impact news to send")
             self.send_telegram_message(
                 "✅ Global news check completed.\n"
                 "No new major impactful news.\n\n"
@@ -394,21 +381,17 @@ class GlobalNewsAlerter:
             )
             return True
         
-        # Categorize news
+        # Categorize and send
         categorized_news = self.categorize_news(new_news)
-        
-        # Format and send message
         message = self.format_news_message(categorized_news)
         success = self.send_telegram_message(message)
         
         if success:
-            # Update sent news hashes
             updated_hashes = sent_hashes.union(new_hashes)
-            # Keep only last 1000 hashes to prevent file from growing too large
             if len(updated_hashes) > 1000:
                 updated_hashes = set(list(updated_hashes)[-1000:])
             self.save_sent_news_hashes(updated_hashes)
-            print(f"Updated sent news hashes: {len(updated_hashes)} items")
+            print(f"💾 Updated sent news hashes: {len(updated_hashes)} items")
         
         return success
 
@@ -417,9 +400,9 @@ def main():
     success = alerter.run()
     
     if success:
-        print("Global impact news alerter completed successfully")
+        print("🎉 Global impact news alerter completed successfully")
     else:
-        print("Global impact news alerter failed")
+        print("💥 Global impact news alerter failed")
         exit(1)
 
 if __name__ == "__main__":
