@@ -941,7 +941,28 @@ async def evaluate_pair_async(
         except Exception:
             logger.debug(f"{pair_name}: indicators indexing issue - skipping")
             return None
-        # Extra debug output for indicator values
+        
+        rma200_5m_curr = np.nan
+        if df_5m is not None:
+            rma200 = calculate_rma(df_5m['close'], 200)
+            try:
+                rma200_5m_curr = float(rma200.iloc[last_i_5m])
+                rma_200_available = not np.isnan(rma200_5m_curr)
+            except Exception:
+                rma_200_available = False
+        else:
+            rma_200_available = False
+
+        cloud_state = cloud_state_from(upw, dnw, idx=last_i_15m)
+        total_range = high_c - low_c
+        upper_wick = high_c - max(open_c, close_c)
+        lower_wick = min(open_c, close_c) - low_c
+        wick_ratio = 0.35
+        upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
+        lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
+        is_green = close_c > open_c
+        is_red = close_c < open_c
+# Extra debug output for indicator values
         if cfg.DEBUG_MODE:
             logger.debug(
                 f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
@@ -973,27 +994,6 @@ async def evaluate_pair_async(
             if not reasons:
                 reasons.append("conditions not met")
             logger.debug(f"{pair_name}: skipped because {', '.join(reasons)}")
-
-        rma200_5m_curr = np.nan
-        if df_5m is not None:
-            rma200 = calculate_rma(df_5m['close'], 200)
-            try:
-                rma200_5m_curr = float(rma200.iloc[last_i_5m])
-                rma_200_available = not np.isnan(rma200_5m_curr)
-            except Exception:
-                rma_200_available = False
-        else:
-            rma_200_available = False
-
-        cloud_state = cloud_state_from(upw, dnw, idx=last_i_15m)
-        total_range = high_c - low_c
-        upper_wick = high_c - max(open_c, close_c)
-        lower_wick = min(open_c, close_c) - low_c
-        wick_ratio = 0.35
-        upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
-        lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
-        is_green = close_c > open_c
-        is_red = close_c < open_c
 
         # RMA200 check: 5m close must be above 200 RMA for long, below for short
         rma_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
