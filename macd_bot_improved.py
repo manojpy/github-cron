@@ -15,9 +15,11 @@ import sqlite3
 import signal
 import fcntl
 import atexit
+import gc
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import contextmanager
 
 import aiohttp
 import pandas as pd
@@ -31,7 +33,8 @@ from logging.handlers import RotatingFileHandler
 # Default configuration (safe defaults)
 # -------------------------
 DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc"),
+    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc
+"),
     "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", "203813932"),
     "DEBUG_MODE": os.environ.get("DEBUG_MODE", "False").lower() == "true",
     "SEND_TEST_MESSAGE": os.environ.get("SEND_TEST_MESSAGE", "False").lower() == "true",
@@ -118,6 +121,30 @@ if cfg["MAX_PARALLEL_FETCH"] < 1 or cfg["MAX_PARALLEL_FETCH"] > 16:
 print(f"DEBUG_MODE={cfg['DEBUG_MODE']}, SEND_TEST_MESSAGE={cfg['SEND_TEST_MESSAGE']}")
 
 # -------------------------
+# Configuration Validation
+# -------------------------
+def validate_config():
+    """Validate critical configuration before running"""
+    required = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'DELTA_API_BASE']
+    for key in required:
+        if not cfg.get(key) or cfg.get(key) in ['xxxx', '']:
+            raise ValueError(f"Missing required configuration: {key}")
+    
+    # Validate pairs list
+    if not isinstance(cfg['PAIRS'], list) or len(cfg['PAIRS']) == 0:
+        raise ValueError("PAIRS must be a non-empty list")
+    
+    # Validate numeric ranges
+    if cfg['MAX_PARALLEL_FETCH'] < 1 or cfg['MAX_PARALLEL_FETCH'] > 16:
+        raise ValueError("MAX_PARALLEL_FETCH must be between 1-16")
+    
+    if cfg['RUN_TIMEOUT_SECONDS'] < 60:
+        raise ValueError("RUN_TIMEOUT_SECONDS must be at least 60 seconds")
+    
+    if cfg['BATCH_SIZE'] < 1:
+        raise ValueError("BATCH_SIZE must be at least 1")
+
+# -------------------------
 # Logger
 # -------------------------
 logger = logging.getLogger("macd_bot")
@@ -184,7 +211,7 @@ class PidFileLock:
             pass
 
 # -------------------------
-# SQLite State DB
+# SQLite State DB with Context Manager
 # -------------------------
 class StateDB:
     def __init__(self, db_path: str):
@@ -200,6 +227,12 @@ class StateDB:
         except Exception:
             pass
         self._ensure_tables()
+
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def _ensure_tables(self):
         cur = self._conn.cursor()
@@ -286,7 +319,8 @@ class StateDB:
 
     def close(self):
         try:
-            self._conn.close()
+            if hasattr(self, '_conn') and self._conn:
+                self._conn.close()
         except Exception:
             pass
 
@@ -343,6 +377,26 @@ class CircuitBreaker:
                 logger.info("Circuit breaker: reset after success")
 
 # -------------------------
+# Rate Limited Fetcher
+# -------------------------
+class RateLimitedFetcher:
+    def __init__(self, max_per_minute: int = 60):
+        self.semaphore = asyncio.Semaphore(max_per_minute)
+        self.requests = []
+        
+    async def call(self, func, *args, **kwargs):
+        async with self.semaphore:
+            # Clean old requests
+            now = time.time()
+            self.requests = [r for r in self.requests if now - r < 60]
+            
+            if len(self.requests) >= self.semaphore._value:
+                await asyncio.sleep(1)
+                
+            self.requests.append(now)
+            return await func(*args, **kwargs)
+
+# -------------------------
 # Async HTTP helpers with retries
 # -------------------------
 async def async_fetch_json(session: aiohttp.ClientSession, url: str, params: dict = None,
@@ -387,7 +441,7 @@ async def async_fetch_json(session: aiohttp.ClientSession, url: str, params: dic
     return None
 
 # -------------------------
-# DataFetcher
+# DataFetcher with Cache Management
 # -------------------------
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: int = 4, timeout: int = 15):
@@ -395,12 +449,24 @@ class DataFetcher:
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = timeout
         self._cache: Dict[str, Tuple[float, Any]] = {}
+        self._cache_max_size = 50  # Prevent unlimited cache growth
         self.circuit_breaker = CircuitBreaker()
+        self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
+
+    def _clean_cache(self):
+        """Remove oldest cache entries if cache gets too large"""
+        if len(self._cache) > self._cache_max_size:
+            # Remove oldest 20% of entries
+            to_remove = sorted(self._cache.keys(), 
+                             key=lambda k: self._cache[k][0])[:self._cache_max_size//5]
+            for key in to_remove:
+                del self._cache[key]
 
     async def fetch_products(self, session: aiohttp.ClientSession) -> Optional[dict]:
         url = f"{self.api_base}/v2/products"
         async with self.semaphore:
-            return await async_fetch_json(
+            return await self.rate_limiter.call(
+                async_fetch_json,
                 session, url,
                 retries=cfg["CANDLE_FETCH_RETRIES"],
                 backoff=cfg["CANDLE_FETCH_BACKOFF"],
@@ -424,7 +490,8 @@ class DataFetcher:
             "to": int(time.time())
         }
         async with self.semaphore:
-            data = await async_fetch_json(
+            data = await self.rate_limiter.call(
+                async_fetch_json,
                 session, url, params=params,
                 retries=cfg["CANDLE_FETCH_RETRIES"],
                 backoff=cfg["CANDLE_FETCH_BACKOFF"],
@@ -432,10 +499,11 @@ class DataFetcher:
                 circuit_breaker=self.circuit_breaker
             )
         self._cache[key] = (time.time(), data)
+        self._clean_cache()
         return data
 
 # -------------------------
-# Candle parsing & validation
+# Candle parsing & validation with Memory Optimization
 # -------------------------
 def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
     if not result or not isinstance(result, dict):
@@ -460,8 +528,15 @@ def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
             "volume": res['v'][:min_len]
         })
         df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Optimize DataFrame memory usage
+        if not df.empty:
+            # Downcast numeric columns to save memory
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], downcast='float', errors='coerce')
+            df['volume'] = pd.to_numeric(df['volume'], downcast='float', errors='coerce')
+            df['timestamp'] = pd.to_numeric(df['timestamp'], downcast='integer', errors='coerce')
+        
         if df.empty:
             return None
         if float(df['close'].iloc[-1]) <= 0:
@@ -470,6 +545,33 @@ def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
     except Exception as e:
         logger.exception(f"Failed to parse candles: {e}")
         return None
+
+# -------------------------
+# Health Check
+# -------------------------
+async def health_check() -> bool:
+    """Verify API connectivity before full run"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Quick API health check
+            async with session.get(f"{cfg['DELTA_API_BASE']}/v2/products", 
+                                 timeout=10) as resp:
+                return resp.status == 200
+    except Exception as e:
+        logger.warning(f"Health check failed: {e}")
+        return False
+
+# -------------------------
+# Resource Cleanup
+# -------------------------
+async def cleanup_resources():
+    """Explicit cleanup for Cron-jobs.org environment"""
+    # Force garbage collection
+    gc.collect()
+    
+    # Clear pandas caches
+    if 'pd' in globals():
+        pd.DataFrame().empty  # Force cleanup
 
 # -------------------------
 # Indicators
@@ -838,7 +940,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             send_message = f"{bot_name}\n🔴 {pair_name} - SELL (MMH Reversal)\nMMH 15m Reversal Down ({mmh_curr:.5f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(buy_srsi_conds.values()):
             current_state = "buy_srsi50"
-            send_message = f"{bot_name}\▲ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+            send_message = f"{bot_name}\n▲ {pair_name} - BUY (SRSI 50)\nSRSI 15m Cross Up 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(sell_srsi_conds.values()):
             current_state = "sell_srsi50"
             send_message = f"{bot_name}\n🔻 {pair_name} - SELL (SRSI 50)\nSRSI 15m Cross Down 50 ({smooth_rsi_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
@@ -1021,94 +1123,120 @@ async def process_batch(session: aiohttp.ClientSession, fetcher: DataFetcher, pr
     return results
 
 # -------------------------
-# Run once (main work)
+# Run once (main work) with Enhanced Error Handling
 # -------------------------
 async def run_once():
     start_time = time.time()
     logger.info("="*50)
     logger.info("Starting run_once")
 
-    # memory guard
     try:
-        p = psutil.Process(os.getpid())
-        rss = p.memory_info().rss
-        if rss > cfg["MEMORY_LIMIT_BYTES"]:
-            logger.critical(f"High memory usage at start: {rss} > {cfg['MEMORY_LIMIT_BYTES']}")
-            raise SystemExit(3)
-    except Exception:
-        pass
+        # Health check at start
+        if not await health_check():
+            logger.error("Health check failed - API unreachable, skipping run")
+            return
 
-    # prune old states
-    try:
-        sdb = StateDB(cfg["STATE_DB_PATH"])
-        deleted = sdb.prune_old_records(cfg["STATE_EXPIRY_DAYS"])
-        if deleted > 0:
-            logger.info(f"Pruned {deleted} old state records")
+        # memory guard
+        try:
+            p = psutil.Process(os.getpid())
+            rss = p.memory_info().rss
+            if rss > cfg["MEMORY_LIMIT_BYTES"]:
+                logger.critical(f"High memory usage at start: {rss} > {cfg['MEMORY_LIMIT_BYTES']}")
+                raise SystemExit(3)
+        except Exception:
+            pass
+
+        # prune old states
+        with StateDB(cfg["STATE_DB_PATH"]) as sdb:
+            deleted = sdb.prune_old_records(cfg["STATE_EXPIRY_DAYS"])
+            if deleted > 0:
+                logger.info(f"Pruned {deleted} old state records")
+
+        with StateDB(cfg["STATE_DB_PATH"]) as sdb:
+            last_alerts = sdb.load_all()
+            logger.info(f"Loaded {len(last_alerts)} previous states")
+
+            fetcher = DataFetcher(cfg["DELTA_API_BASE"], max_parallel=cfg["MAX_PARALLEL_FETCH"], timeout=cfg["HTTP_TIMEOUT"])
+            telegram_queue = TelegramQueue(cfg["TELEGRAM_BOT_TOKEN"], cfg["TELEGRAM_CHAT_ID"])
+
+            connector = TCPConnector(limit=cfg["TCP_CONN_LIMIT"], ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                if cfg["SEND_TEST_MESSAGE"]:
+                    ist = pytz.timezone("Asia/Kolkata")
+                    current_dt = datetime.now(ist)
+                    test_msg = (f"🔔 {cfg.get('BOT_NAME', 'MACD Bot')} Started\n"
+                                f"Time: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
+                                f"Pairs: {len(cfg['PAIRS'])} | Debug: {cfg['DEBUG_MODE']}")
+                    await telegram_queue.send(session, test_msg)
+
+                logger.info("Fetching products from API...")
+                prod_resp = await fetcher.fetch_products(session)
+                if not prod_resp:
+                    logger.error("Failed to fetch products; aborting run.")
+                    raise SystemExit(2)
+
+                products_map = build_products_map_from_api_result(prod_resp)
+                if not products_map:
+                    logger.error("No tradable pairs found; exiting.")
+                    raise SystemExit(2)
+
+                pairs_to_process = [p for p in cfg["PAIRS"] if p in products_map]
+                batch_size = max(1, cfg["BATCH_SIZE"])
+                logger.info(f"Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
+
+                all_results: List[Tuple[str, Dict[str, Any]]] = []
+                for i in range(0, len(pairs_to_process), batch_size):
+                    batch = pairs_to_process[i:i+batch_size]
+                    logger.info(f"Processing batch {i//batch_size + 1}: {batch}")
+                    batch_results = await process_batch(session, fetcher, products_map, batch, sdb, telegram_queue)
+                    all_results.extend(batch_results)
+                    if i + batch_size < len(pairs_to_process):
+                        await asyncio.sleep(random.uniform(0.5, 1.0))
+
+                updates = 0
+                alerts_sent = 0
+                for pair_name, new_state in all_results:
+                    if not isinstance(new_state, dict):
+                        continue
+                    prev = sdb.get(pair_name)
+                    if prev != new_state:
+                        sdb.set(pair_name, new_state.get("state"), new_state.get("ts"))
+                        updates += 1
+                    if "message" in new_state:
+                        alerts_sent += 1
+
+                sdb.set_metadata("last_success_run", str(int(time.time())))
+                logger.info(f"Run complete. {updates} state updates applied. Sent ~{alerts_sent} alerts.")
+
+        # Force garbage collection and cleanup
+        await cleanup_resources()
+        
+        # Clear large objects explicitly
+        del fetcher, telegram_queue, products_map
+        if 'all_results' in locals():
+            del all_results
+        gc.collect()
+
+        duration = time.time() - start_time
+        logger.info(f"✅ Completed run_once in {duration:.2f}s")
+        
+        # Log if we're approaching timeout limits
+        if duration > cfg["RUN_TIMEOUT_SECONDS"] * 0.8:
+            logger.warning(f"Run took {duration:.2f}s - close to timeout!")
+            
     except Exception as e:
-        logger.warning(f"Prune failed: {e}")
-
-    sdb = StateDB(cfg["STATE_DB_PATH"])
-    last_alerts = sdb.load_all()
-    logger.info(f"Loaded {len(last_alerts)} previous states")
-
-    fetcher = DataFetcher(cfg["DELTA_API_BASE"], max_parallel=cfg["MAX_PARALLEL_FETCH"], timeout=cfg["HTTP_TIMEOUT"])
-    telegram_queue = TelegramQueue(cfg["TELEGRAM_BOT_TOKEN"], cfg["TELEGRAM_CHAT_ID"])
-
-    connector = TCPConnector(limit=cfg["TCP_CONN_LIMIT"], ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        if cfg["SEND_TEST_MESSAGE"]:
-            ist = pytz.timezone("Asia/Kolkata")
-            current_dt = datetime.now(ist)
-            test_msg = (f"🔔 {cfg.get('BOT_NAME', 'MACD Bot')} Started\n"
-                        f"Time: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
-                        f"Pairs: {len(cfg['PAIRS'])} | Debug: {cfg['DEBUG_MODE']}")
-            await telegram_queue.send(session, test_msg)
-
-        logger.info("Fetching products from API...")
-        prod_resp = await fetcher.fetch_products(session)
-        if not prod_resp:
-            logger.error("Failed to fetch products; aborting run.")
-            raise SystemExit(2)
-
-        products_map = build_products_map_from_api_result(prod_resp)
-        if not products_map:
-            logger.error("No tradable pairs found; exiting.")
-            raise SystemExit(2)
-
-        pairs_to_process = [p for p in cfg["PAIRS"] if p in products_map]
-        batch_size = max(1, cfg["BATCH_SIZE"])
-        logger.info(f"Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
-
-        all_results: List[Tuple[str, Dict[str, Any]]] = []
-        for i in range(0, len(pairs_to_process), batch_size):
-            batch = pairs_to_process[i:i+batch_size]
-            logger.info(f"Processing batch {i//batch_size + 1}: {batch}")
-            batch_results = await process_batch(session, fetcher, products_map, batch, sdb, telegram_queue)
-            all_results.extend(batch_results)
-            if i + batch_size < len(pairs_to_process):
-                await asyncio.sleep(random.uniform(0.5, 1.0))
-
-        updates = 0
-        alerts_sent = 0
-        for pair_name, new_state in all_results:
-            if not isinstance(new_state, dict):
-                continue
-            prev = sdb.get(pair_name)
-            if prev != new_state:
-                sdb.set(pair_name, new_state.get("state"), new_state.get("ts"))
-                updates += 1
-            if "message" in new_state:
-                alerts_sent += 1
-
-        sdb.set_metadata("last_success_run", str(int(time.time())))
-        logger.info(f"Run complete. {updates} state updates applied. Sent ~{alerts_sent} alerts.")
-    try:
-        sdb.close()
-    except Exception:
-        pass
-
-    duration = time.time() - start_time
-    logger.info(f"✅ Completed run_once in {duration:.2f}s")
+        logger.critical(f"CRITICAL FAILURE in run_once: {str(e)}")
+        
+        # Try to send failure notification
+        try:
+            async with aiohttp.ClientSession() as session:
+                telegram_queue = TelegramQueue(cfg["TELEGRAM_BOT_TOKEN"], cfg["TELEGRAM_CHAT_ID"])
+                fail_msg = f"❌ {cfg.get('BOT_NAME', 'MACD Bot')} CRASHED\nError: {str(e)[:200]}"
+                await telegram_queue.send(session, fail_msg)
+        except Exception as te:
+            logger.error(f"Failed to send crash notification: {te}")
+            
+        raise  # Re-raise to maintain current behavior
 
 # -------------------------
 # Run with timeout wrapper
@@ -1143,6 +1271,13 @@ def main():
     group.add_argument("--once", action="store_true", help="Run once and exit")
     group.add_argument("--loop", type=int, metavar="SECONDS", help="Run in loop every N seconds")
     args = parser.parse_args()
+
+    # Validate configuration before starting
+    try:
+        validate_config()
+    except ValueError as e:
+        logger.critical(f"Configuration error: {e}")
+        sys.exit(1)
 
     pid_lock = PidFileLock("/tmp/macd_bot.pid")
     if not pid_lock.acquire():
