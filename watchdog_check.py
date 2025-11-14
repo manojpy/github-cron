@@ -49,8 +49,8 @@ def check_recent_workflows():
         "Accept": "application/vnd.github.v3+json"
     }
     
-    # Updated workflow names based on your actual workflow files
-    workflows_to_check = ["macd_bot_improved", "fibonacci_pivot_bot_improved"]  # Adjust to match your actual workflow file names
+    # Use your actual single workflow name that runs both bots
+    workflows_to_check = ["bot-monitor", "trading-bots", "run-bots"]  # Choose the name that matches your YML file
     
     problems = []
     
@@ -71,21 +71,20 @@ def check_recent_workflows():
                     hours_ago = (datetime.now(timezone.utc) - run_time).total_seconds() / 3600
                     
                     if hours_ago > 6:  # Alert if no run in 6 hours
-                        problems.append(f"{workflow}: last run {hours_ago:.1f}h ago")
+                        problems.append(f"Main workflow: last run {hours_ago:.1f}h ago")
                     elif latest_run["conclusion"] not in ["success", "skipped"]:
-                        problems.append(f"{workflow}: last run failed - {latest_run['conclusion']}")
+                        problems.append(f"Main workflow: last run failed - {latest_run['conclusion']}")
                     else:
-                        print(f"✅ {workflow}: last run {hours_ago:.1f}h ago - {latest_run['conclusion']}")
+                        print(f"✅ Main workflow: last run {hours_ago:.1f}h ago - {latest_run['conclusion']}")
                 else:
-                    problems.append(f"{workflow}: no recent runs found")
+                    problems.append(f"Main workflow: no recent runs found")
             else:
-                problems.append(f"{workflow}: API error {response.status_code}")
+                problems.append(f"Workflow API error {response.status_code}")
                 
         except Exception as e:
-            problems.append(f"{workflow}: check failed - {e}")
+            problems.append(f"Workflow check failed - {e}")
     
     return len(problems) == 0, problems
-
 def main():
     print("🤖 Starting Bot Watchdog Check...")
     print("Current directory:", os.getcwd())
