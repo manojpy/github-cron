@@ -1427,8 +1427,16 @@ async def run_once(send_test: bool = True):
 def main():
     if os.getenv("GITHUB_ACTIONS"):
         logger.info("Running in GitHub Actions environment.")
+        # If running in GitHub Actions, assume we only want to run once
+        # and not loop, unless explicitly configured otherwise.
+        # This prevents the job from hanging for the full RUN_LOOP_INTERVAL.
+        run_mode = "ONCE"
     elif os.getenv("CRON_JOB"):
         logger.info("Running in Cron Job environment.")
+        run_mode = "ONCE" # Assuming standard cron job should run once and exit
+    else:
+        # For local development, respect the loop interval
+        run_mode = "LOOP"
 
     # Memory limit check
     try:
@@ -1448,49 +1456,49 @@ def main():
     signal.signal(signal.SIGTERM, request_stop)
     
     try:
-        # Argument parsing placeholder (assuming command line logic from context)
-        # Assuming run modes like --once or --loop N are handled here
-        
-        # If running in a loop mode (simulated from context):
-        interval = cfg.RUN_LOOP_INTERVAL
-        logger.info(f"🔄 Loop mode: interval={interval}s")
-        while not stop_requested:
-            loop_start = time.time()
-            try:
-                # The argument to run_once is usually True for the first run to send a test message, 
-                # and False for subsequent loop iterations.
-                asyncio.run(run_once(send_test=False if loop_start != METRICS.get('start_time') else True))
-            except SystemExit as e:
-                logger.error(f"Run exited with code {e.code}, continuing loop.")
-                if e.code == EXIT_TIMEOUT:
-                    logger.warning("Continuing loop after timeout exit.")
-                elif e.code != EXIT_API_FAILURE:
-                    break # Stop for non-recoverable errors
-            except Exception:
-                logger.exception("Unhandled in run_once")
+        if run_mode == "LOOP":
+            # --- Original Looping Logic (for local dev) ---
+            interval = cfg.RUN_LOOP_INTERVAL
+            logger.info(f"🔄 Loop mode: interval={interval}s")
+            while not stop_requested:
+                loop_start = time.time()
+                try:
+                    asyncio.run(run_once(send_test=False if loop_start != METRICS.get('start_time') else True))
+                except SystemExit as e:
+                    logger.error(f"Run exited with code {e.code}, continuing loop.")
+                    if e.code == EXIT_TIMEOUT:
+                        logger.warning("Continuing loop after timeout exit.")
+                    elif e.code != EXIT_API_FAILURE:
+                        break # Stop for non-recoverable errors
+                except Exception:
+                    logger.exception("Unhandled in run_once")
 
-            elapsed = time.time() - loop_start
-            to_sleep = max(0, interval - elapsed)
-            if to_sleep > 0:
-                for _ in range(int(to_sleep)):
-                    if stop_requested:
-                        break
-                    time.sleep(1)
-                if not stop_requested:
-                    remainder = to_sleep - int(to_sleep)
-                    if remainder > 0:
-                        time.sleep(remainder)
+                elapsed = time.time() - loop_start
+                to_sleep = max(0, interval - elapsed)
+                if to_sleep > 0:
+                    for _ in range(int(to_sleep)):
+                        if stop_requested:
+                            break
+                        time.sleep(1)
+                    if not stop_requested:
+                        remainder = to_sleep - int(to_sleep)
+                        if remainder > 0:
+                            time.sleep(remainder)
 
-        if not stop_requested:
-             # Default to running once if no loop is configured (based on original script logic flow)
-             try:
-                 asyncio.run(run_once())
-             except SystemExit as e:
-                 logger.error(f"Exited with code {e.code}")
-                 sys.exit(e.code if isinstance(e.code, int) else 1)
-        
-        sys.exit(EXIT_SUCCESS)
+            sys.exit(EXIT_SUCCESS)
+            
+        else:
+            # --- Single Run Logic (for GitHub Actions / Cron) ---
+            logger.info("🚀 Single run mode (exiting immediately after completion).")
+            asyncio.run(run_once())
+            sys.exit(EXIT_SUCCESS) # Ensure explicit exit
 
+    except SystemExit as e:
+        logger.error(f"Exited with code {e.code}")
+        sys.exit(e.code if isinstance(e.code, int) else 1)
+    except Exception:
+        logger.exception("Unhandled exception in main execution block")
+        sys.exit(EXIT_API_FAILURE)
     finally:
         lock.release()
 
