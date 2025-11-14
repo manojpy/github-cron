@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os, time, json, requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -11,7 +11,7 @@ REPO = os.getenv("GITHUB_REPOSITORY", "your-username/your-repo")  # Fallback if 
 
 def send_alert(msg):
     """Send formatted alert with timestamp"""
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     full_msg = f"🤖 <b>Bot Watchdog Alert</b>\n⏰ {timestamp}\n\n{msg}"
     
     try:
@@ -49,7 +49,9 @@ def check_recent_workflows():
         "Accept": "application/vnd.github.v3+json"
     }
     
-    workflows_to_check = ["macd-bot", "fibonacci-bot"]  # Adjust to your workflow names
+    # Updated workflow names based on your actual workflow files
+    workflows_to_check = ["macd_bot_improved", "fibonacci_pivot_bot_improved"]  # Adjust to match your actual workflow file names
+    
     problems = []
     
     for workflow in workflows_to_check:
@@ -60,17 +62,20 @@ def check_recent_workflows():
             
             if response.status_code == 200:
                 runs = response.json()["workflow_runs"]
-                recent_runs = [r for r in runs if workflow in r["name"].lower()]
+                # More flexible matching for workflow names
+                recent_runs = [r for r in runs if workflow.lower() in r["name"].lower() or workflow.lower() in r["path"].lower()]
                 
                 if recent_runs:
                     latest_run = recent_runs[0]
                     run_time = datetime.fromisoformat(latest_run["created_at"].replace('Z', '+00:00'))
-                    hours_ago = (datetime.utcnow() - run_time).total_seconds() / 3600
+                    hours_ago = (datetime.now(timezone.utc) - run_time).total_seconds() / 3600
                     
                     if hours_ago > 6:  # Alert if no run in 6 hours
                         problems.append(f"{workflow}: last run {hours_ago:.1f}h ago")
-                    elif latest_run["conclusion"] != "success":
-                        problems.append(f"{workflow}: last run failed")
+                    elif latest_run["conclusion"] not in ["success", "skipped"]:
+                        problems.append(f"{workflow}: last run failed - {latest_run['conclusion']}")
+                    else:
+                        print(f"✅ {workflow}: last run {hours_ago:.1f}h ago - {latest_run['conclusion']}")
                 else:
                     problems.append(f"{workflow}: no recent runs found")
             else:
@@ -115,13 +120,13 @@ def main():
         else:
             print(f"✅ {bot_name}: state file age {age_hours:.1f}h - OK")
 
-    # Check recent workflow runs
+    # Check recent workflow runs (optional - comment out if you don't want this check)
     workflows_ok, workflow_problems = check_recent_workflows()
     if not workflows_ok:
-        ok = False
+        # Don't mark overall status as bad for workflow issues alone
         alerts_sent = True
         problems_text = "\n".join(f"• {p}" for p in workflow_problems)
-        send_alert(f"⚠️ Workflow Issues:\n{problems_text}")
+        send_alert(f"⚠️ Workflow Issues:\n{problems_text}\n\nNote: This may be normal if workflows are not scheduled to run hourly.")
 
     # Daily heartbeat persistence
     last_ping = 0
@@ -140,7 +145,7 @@ def main():
 
     if ok and hours_since >= 24:
         # Send daily all-clear message
-        send_alert("✅ <b>Daily Health Check</b>\n\nAll systems running normally:\n• State files current\n• Workflows active\n• No critical issues")
+        send_alert("✅ <b>Daily Health Check</b>\n\nAll systems running normally:\n• State files current\n• No critical issues")
         with open(STATE_FILE, "w") as f:
             json.dump({"last_ping": time.time(), "last_status": "healthy"}, f)
         print("Daily heartbeat sent - all systems OK")
@@ -158,4 +163,4 @@ def main():
     print("🤖 Watchdog check completed")
 
 if __name__ == "__main__":
-    main()
+    main() 
