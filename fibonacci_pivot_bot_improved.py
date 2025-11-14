@@ -1117,8 +1117,8 @@ async def evaluate_pair_async(
         fib_long = base_long_ok and (long_crossover_line is not None)
         fib_short = base_short_ok and (short_crossover_line is not None)
         
-        up_sig = "🟢⬆️"
-        down_sig = "🔴⬇️"
+        up_sig = "🟩⬆️"
+        down_sig = "🟥🔻"
         current_signal = None
         message = None
         suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
