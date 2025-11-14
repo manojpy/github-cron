@@ -21,6 +21,7 @@ import traceback
 import signal
 import html
 import fcntl
+import resource
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List, Union
@@ -80,6 +81,7 @@ class Config(BaseModel):
     TELEGRAM_RETRIES: int = 3
     TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000  # ~400MB safe default for small hosts
+    REQUESTS_PER_MINUTE: int = 60
 
     @field_validator("TELEGRAM_BOT_TOKEN")
     @classmethod
@@ -99,7 +101,8 @@ class Config(BaseModel):
 # DEFAULT CONFIG
 # -------------------------
 DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc",
+    "TELEGRAM_BOT_TOKEN": "8462496498:AAHYZ4xDIHvrVRjmCmZyoPhupCjRaRgiITc
+",
     "TELEGRAM_CHAT_ID": "203813932",
     "DEBUG_MODE": False,
     "SEND_TEST_MESSAGE": True,
@@ -135,6 +138,7 @@ DEFAULT_CONFIG = {
     "TELEGRAM_RETRIES": 3,
     "TELEGRAM_BACKOFF_BASE": 2.0,
     "MEMORY_LIMIT_BYTES": 400_000_000,
+    "REQUESTS_PER_MINUTE": 60,
 }
 
 # -------------------------
@@ -149,7 +153,8 @@ EXIT_API_FAILURE = 5
 # -------------------------
 # CONFIG LOADER
 # -------------------------
-def str_to_bool(value): return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
+def str_to_bool(value): 
+    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
 
 def load_config() -> Config:
     base = DEFAULT_CONFIG.copy()
@@ -181,6 +186,7 @@ def load_config() -> Config:
     override("MAX_CONCURRENCY", 6, int)
     override("HTTP_TIMEOUT", 15, int)
     override("MAX_EXEC_TIME", 25, int)
+    override("REQUESTS_PER_MINUTE", 60, int)
 
     return Config(**base)
 
@@ -296,15 +302,17 @@ class ProcessLock:
             logger.debug(f"Error releasing lock: {e}")
 
 # -------------------------
-# CIRCUIT BREAKER
+# ENHANCED CIRCUIT BREAKER
 # -------------------------
-class CircuitBreaker:
-    """Prevent cascading failures when API is down"""
-    def __init__(self, failure_threshold: int = 5, timeout: int = 300):
+class EnhancedCircuitBreaker:
+    """Prevent cascading failures when API is down with enhanced recovery"""
+    def __init__(self, failure_threshold: int = 5, timeout: int = 300, success_threshold: int = 3):
         self.failures = 0
         self.last_failure = 0.0
         self.threshold = failure_threshold
         self.timeout = timeout
+        self.success_count = 0
+        self.success_threshold = success_threshold
         self.state = "CLOSED"
 
     async def call(self, func):
@@ -319,13 +327,18 @@ class CircuitBreaker:
         try:
             result = await func()
             if self.state == "HALF_OPEN":
-                logger.info("Circuit breaker: CLOSED (recovery successful)")
+                self.success_count += 1
+                if self.success_count >= self.success_threshold:
+                    self.state = "CLOSED"
+                    self.success_count = 0
+                    logger.info("Circuit breaker: CLOSED (recovery confirmed)")
             self.failures = 0
             self.state = "CLOSED"
             return result
         except ClientConnectorError:
             self.failures += 1
             self.last_failure = time.time()
+            self.success_count = 0
             METRICS["network_errors"] += 1
             if self.failures >= self.threshold:
                 self.state = "OPEN"
@@ -334,6 +347,7 @@ class CircuitBreaker:
         except Exception:
             self.failures += 1
             self.last_failure = time.time()
+            self.success_count = 0
             METRICS["api_errors"] += 1
             if self.failures >= self.threshold:
                 self.state = "OPEN"
@@ -354,30 +368,49 @@ def sanitize_for_telegram(text: Union[str, float, int]) -> str:
     """Prevent Telegram HTML injection"""
     return html.escape(str(text))
 
+def is_cron_environment():
+    """Detect if running in cron environment more reliably"""
+    cron_indicators = [
+        os.getenv("CRON_JOB"),
+        os.getenv("GITHUB_ACTIONS"), 
+        not os.isatty(sys.stdin.fileno()) if hasattr(sys.stdin, 'fileno') else True,  # No terminal
+        "CRON" in os.getenv("USER", ""),    # Common cron usernames
+        len(sys.argv) > 1 and any(arg in sys.argv for arg in ["--cron", "--once"])
+    ]
+    return any(cron_indicators)
+
 # -------------------------
-# SQLITE STATE DB (WAL mode)
+# ENHANCED SQLITE STATE DB (WAL mode with connection pooling)
 # -------------------------
 class StateDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._conn = None
         db_dir = os.path.dirname(db_path)
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
-        try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-        except Exception:
-            pass
         self._ensure_tables()
         try:
             os.chmod(self.db_path, 0o600)
         except Exception:
             pass
 
+    def get_connection(self):
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, 
+                                       isolation_level=None, timeout=30.0)
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                pass
+        return self._conn
+
     def _ensure_tables(self):
-        cur = self._conn.cursor()
+        conn = self.get_connection()
+        cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS states (
                 pair TEXT PRIMARY KEY,
@@ -391,57 +424,89 @@ class StateDB:
                 value TEXT
             )
         """)
-        self._conn.commit()
+        conn.commit()
+
+    def db_operation_with_retry(self, operation, max_retries=3):
+        """Execute database operation with retry on lock conflicts"""
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    time.sleep(0.1 * (2 ** attempt))
+                    continue
+                raise
+            except Exception:
+                raise
 
     def load_all(self) -> Dict[str, Dict[str, Any]]:
-        cur = self._conn.cursor()
-        cur.execute("SELECT pair, state, ts FROM states")
-        rows = cur.fetchall()
-        return {r[0]: {"state": r[1], "ts": int(r[2] or 0)} for r in rows}
+        def _load():
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT pair, state, ts FROM states")
+            rows = cur.fetchall()
+            return {r[0]: {"state": r[1], "ts": int(r[2] or 0)} for r in rows}
+        
+        return self.db_operation_with_retry(_load)
 
     def get(self, pair: str) -> Optional[Dict[str, Any]]:
-        cur = self._conn.cursor()
-        cur.execute("SELECT state, ts FROM states WHERE pair = ?", (pair,))
-        r = cur.fetchone()
-        if not r:
-            return None
-        return {"state": r[0], "ts": int(r[1] or 0)}
+        def _get():
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT state, ts FROM states WHERE pair = ?", (pair,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {"state": r[0], "ts": int(r[1] or 0)}
+        
+        return self.db_operation_with_retry(_get)
 
     def set(self, pair: str, state: Optional[str], ts: Optional[int] = None):
-        ts = int(ts or now_ts())
-        cur = self._conn.cursor()
-        if state is None:
-            cur.execute("DELETE FROM states WHERE pair = ?", (pair,))
-        else:
-            cur.execute(
-                "INSERT INTO states(pair, state, ts) VALUES (?, ?, ?) "
-                "ON CONFLICT(pair) DO UPDATE SET state=excluded.state, ts=excluded.ts",
-                (pair, state, ts)
-            )
-        self._conn.commit()
+        def _set():
+            ts_val = int(ts or now_ts())
+            conn = self.get_connection()
+            cur = conn.cursor()
+            if state is None:
+                cur.execute("DELETE FROM states WHERE pair = ?", (pair,))
+            else:
+                cur.execute(
+                    "INSERT INTO states(pair, state, ts) VALUES (?, ?, ?) "
+                    "ON CONFLICT(pair) DO UPDATE SET state=excluded.state, ts=excluded.ts",
+                    (pair, state, ts_val)
+                )
+            conn.commit()
+        
+        self.db_operation_with_retry(_set)
 
     def get_metadata(self, key: str) -> Optional[str]:
-        cur = self._conn.cursor()
-        cur.execute("SELECT value FROM metadata WHERE key = ?", (key,))
-        r = cur.fetchone()
-        return r[0] if r else None
+        def _get_meta():
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+            r = cur.fetchone()
+            return r[0] if r else None
+        
+        return self.db_operation_with_retry(_get_meta)
 
     def set_metadata(self, key: str, value: str):
-        cur = self._conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value))
-        self._conn.commit()
+        def _set_meta():
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
+        
+        self.db_operation_with_retry(_set_meta)
 
     def close(self):
         try:
-            self._conn.close()
+            if self._conn:
+                self._conn.close()
+                self._conn = None
         except Exception:
             pass
 
     def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+        self.close()
 
 # -------------------------
 # PRUNE (smart daily)
@@ -521,7 +586,7 @@ async def fetch_json_with_retries(
     retries: int = 3,
     backoff: float = 1.5,
     timeout: int = 15,
-    circuit_breaker: Optional[CircuitBreaker] = None
+    circuit_breaker: Optional[EnhancedCircuitBreaker] = None
 ):
     async def _fetch():
         for attempt in range(1, retries + 1):
@@ -560,17 +625,31 @@ async def fetch_json_with_retries(
         return await _fetch()
 
 # -------------------------
-# DATA FETCHER
+# RATE LIMITED DATA FETCHER
 # -------------------------
-class DataFetcher:
-    def __init__(self, base_url: str, max_parallel: int = 6, timeout: int = 15, circuit_breaker: Optional[CircuitBreaker] = None):
+class RateLimitedDataFetcher:
+    def __init__(self, base_url: str, max_parallel: int = 6, timeout: int = 15, 
+                 circuit_breaker: Optional[EnhancedCircuitBreaker] = None,
+                 requests_per_minute: int = 60):
         self.base_url = base_url.rstrip("/")
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = timeout
         self.cache: Dict[str, Tuple[float, Any]] = {}
         self.circuit_breaker = circuit_breaker
+        self.requests_per_minute = requests_per_minute
+        self.last_request_time = 0
+        self.min_interval = 60.0 / requests_per_minute
+
+    async def _rate_limit(self):
+        """Simple rate limiting implementation"""
+        now = time.time()
+        elapsed = now - self.last_request_time
+        if elapsed < self.min_interval:
+            await asyncio.sleep(self.min_interval - elapsed)
+        self.last_request_time = time.time()
 
     async def fetch_products(self, session: aiohttp.ClientSession):
+        await self._rate_limit()
         url = f"{self.base_url}/v2/products"
         async with self.semaphore:
             return await fetch_json_with_retries(
@@ -582,6 +661,7 @@ class DataFetcher:
             )
 
     async def fetch_candles(self, session: aiohttp.ClientSession, symbol: str, resolution: str, limit: int):
+        await self._rate_limit()
         key = f"candles:{symbol}:{resolution}:{limit}"
         if key in self.cache:
             age, data = self.cache[key]
@@ -787,7 +867,6 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
     ma = source.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
-    # raw_momentum = (worm - ma) / worm
     denom = worm.replace(0, np.nan).bfill().ffill()
     raw_momentum = (worm - ma) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -921,11 +1000,27 @@ def cloud_state_from(upw: pd.Series, dnw: pd.Series, idx: int) -> str:
         return "neutral"
 
 # -------------------------
+# STRUCTURED LOGGING
+# -------------------------
+class StructuredLogger:
+    @staticmethod
+    def log_pair_analysis(pair_name: str, indicators: Dict[str, Any], decision: str):
+        """Log structured analysis for better debugging"""
+        logger.info(json.dumps({
+            "type": "pair_analysis",
+            "pair": pair_name,
+            "timestamp": now_ts(),
+            "indicators": indicators,
+            "decision": decision,
+            "execution_id": os.getenv("GITHUB_RUN_ID", "local")
+        }))
+
+# -------------------------
 # CORE PAIR EVALUATION
 # -------------------------
 async def evaluate_pair_async(
     session: aiohttp.ClientSession,
-    fetcher: DataFetcher,
+    fetcher: RateLimitedDataFetcher,
     products_map: Dict[str, dict],
     pair_name: str,
     last_state: Optional[Dict[str, Any]]
@@ -943,7 +1038,7 @@ async def evaluate_pair_async(
         limit_5m = sp.get("limit_5m", 500)
         min_required_5m = sp.get("min_required_5m", 250)
         
-        # FIX #1: Initialize vwap_curr to None to prevent UnboundLocalError
+        # Initialize vwap_curr to None to prevent UnboundLocalError
         vwap_curr: Optional[float] = None
 
         tasks = [fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)]
@@ -1036,9 +1131,22 @@ async def evaluate_pair_async(
         is_green = close_c > open_c
         is_red = close_c < open_c
 
+        # Structured logging for analysis
+        if cfg.DEBUG_MODE:
+            indicators = {
+                "close": round(close_c, 2),
+                "open": round(open_c, 2),
+                "ppo": round(ppo_curr, 2),
+                "rma50": round(rma50_curr, 2),
+                "magical_momentum": round(magical_curr, 4),
+                "cloud_state": cloud_state,
+                "vwap": round(vwap_curr, 2) if vwap_curr else None,
+                "rma200": round(rma200_5m_curr, 2) if rma_200_available else None
+            }
+            StructuredLogger.log_pair_analysis(pair_name, indicators, "evaluating")
+
         # Extra debug output for indicator values
         if cfg.DEBUG_MODE:
-            # FIX #2: Correctly handle formatting of optional float (vwap_curr) to avoid ValueError
             vwap_log_str = f"{vwap_curr:.2f}" if vwap_curr is not None and not np.isnan(vwap_curr) else "nan"
             
             logger.debug(
@@ -1295,6 +1403,68 @@ async def check_dead_mans_switch(state_db: StateDB):
         logger.exception(f"Dead man's switch failed: {e}")
 
 # -------------------------
+# HEALTH CHECK
+# -------------------------
+async def health_check(state_db: Optional[StateDB] = None) -> Dict[str, Any]:
+    """Simple health check that can be called externally"""
+    health_status = {
+        "status": "healthy",
+        "timestamp": now_ts(),
+        "memory_usage": psutil.Process().memory_info().rss,
+        "last_success": state_db.get_metadata("last_success_run") if state_db else None,
+        "metrics": METRICS.copy()
+    }
+    return health_status
+
+# -------------------------
+# CONFIGURATION VALIDATION
+# -------------------------
+def validate_configuration() -> bool:
+    """Validate critical configuration before starting"""
+    issues = []
+    
+    # Check required pairs
+    if not cfg.PAIRS:
+        issues.append("No trading pairs configured")
+    
+    # Check API endpoints are reachable
+    try:
+        import urllib.request
+        urllib.request.urlopen(f"{cfg.DELTA_API_BASE}/v2/products", timeout=5)
+    except Exception as e:
+        issues.append(f"Delta API endpoint not reachable: {e}")
+    
+    # Check database is writable
+    try:
+        test_db_path = "/tmp/test_fib.db"
+        test_db = StateDB(test_db_path)
+        test_db.close()
+        if os.path.exists(test_db_path):
+            os.unlink(test_db_path)
+    except Exception as e:
+        issues.append(f"Database not writable: {e}")
+    
+    # Check Telegram credentials
+    if cfg.TELEGRAM_BOT_TOKEN == "xxxx" or cfg.TELEGRAM_CHAT_ID == "xxxx":
+        issues.append("Telegram credentials not configured")
+    
+    if issues:
+        logger.error(f"Configuration issues: {issues}")
+        return False
+    
+    logger.info("✅ Configuration validation passed")
+    return True
+
+# -------------------------
+# GRACEFUL SHUTDOWN
+# -------------------------
+async def graceful_shutdown():
+    """Wait for current operations to complete"""
+    logger.info("Shutting down gracefully...")
+    # Add any cleanup needed
+    await asyncio.sleep(1)
+
+# -------------------------
 # CORE RUN LOGIC
 # -------------------------
 stop_requested = False
@@ -1341,12 +1511,13 @@ async def run_once(send_test: bool = True):
             await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
             
         products_map = load_products_cache()
-        circuit = CircuitBreaker()
-        fetcher_local = DataFetcher(
+        circuit = EnhancedCircuitBreaker()
+        fetcher_local = RateLimitedDataFetcher(
             cfg.DELTA_API_BASE,
             max_parallel=cfg.MAX_CONCURRENCY,
             timeout=cfg.HTTP_TIMEOUT,
-            circuit_breaker=circuit
+            circuit_breaker=circuit,
+            requests_per_minute=cfg.REQUESTS_PER_MINUTE
         )
         
         connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
@@ -1410,11 +1581,24 @@ async def run_once(send_test: bool = True):
         timeout_task.cancel()
         if 'state_db' in locals():
             state_db.close()
+        if 'fetcher_local' in locals():
+            if hasattr(fetcher_local, 'cache'):
+                fetcher_local.cache.clear()
+        if 'session' in locals():
+            await session.close()
+            
+        await asyncio.sleep(0.1)  # Allow pending tasks to complete
             
         METRICS["execution_time"] = time.time() - start_time
+        
+        # Performance monitoring
+        execution_time = METRICS["execution_time"]
+        if execution_time > cfg.MAX_EXEC_TIME * 0.8:
+            logger.warning(f"Execution time ({execution_time:.2f}s) approaching limit")
+        
         logger.info(
             f"✅ Run finished. Pairs: {METRICS['pairs_checked']}, "
-            f"Alerts: {METRICS['alerts_sent']}, Time: {METRICS['execution_time']:.2f}s"
+            f"Alerts: {METRICS['alerts_sent']}, Time: {execution_time:.2f}s"
         )
         
         if cfg.DEBUG_MODE:
@@ -1425,25 +1609,26 @@ async def run_once(send_test: bool = True):
 # MAIN EXECUTION
 # -------------------------
 def main():
-    if os.getenv("GITHUB_ACTIONS"):
-        logger.info("Running in GitHub Actions environment.")
-        # If running in GitHub Actions, assume we only want to run once
-        # and not loop, unless explicitly configured otherwise.
-        # This prevents the job from hanging for the full RUN_LOOP_INTERVAL.
-        run_mode = "ONCE"
-    elif os.getenv("CRON_JOB"):
-        logger.info("Running in Cron Job environment.")
-        run_mode = "ONCE" # Assuming standard cron job should run once and exit
-    else:
-        # For local development, respect the loop interval
-        run_mode = "LOOP"
-
-    # Memory limit check
+    # Environment detection
+    cron_env = is_cron_environment()
+    run_mode = "ONCE" if cron_env else "LOOP"
+    
+    # Enhanced startup logging
+    logger.info(f"🚀 Starting Fibonacci Bot - Mode: {run_mode}")
+    logger.info(f"🐍 Python: {sys.version}")
+    logger.info(f"💾 Memory available: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+    
+    # Validate configuration first
+    if not validate_configuration():
+        sys.exit(EXIT_CONFIG_ERROR)
+    
+    # Set memory limits
     try:
-        if psutil.virtual_memory().total < cfg.MEMORY_LIMIT_BYTES:
-            logger.warning(f"Total system memory ({psutil.virtual_memory().total / (1024**3):.2f}GB) is below configured limit ({cfg.MEMORY_LIMIT_BYTES / (1024**3):.2f}GB). Proceeding but watch for OOM.")
-    except Exception:
-        pass
+        memory_limit = min(cfg.MEMORY_LIMIT_BYTES, int(psutil.virtual_memory().available * 0.8))
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+        logger.info(f"🧠 Memory limit set to: {memory_limit / (1024**3):.2f} GB")
+    except (ImportError, ValueError, OSError) as e:
+        logger.debug(f"Could not set memory limits: {e}")
 
     # Process locking to prevent concurrent runs
     lock = ProcessLock("fib_pivot.lock", timeout=cfg.RUN_LOOP_INTERVAL * 2)
@@ -1501,6 +1686,10 @@ def main():
         sys.exit(EXIT_API_FAILURE)
     finally:
         lock.release()
+        try:
+            asyncio.run(graceful_shutdown())
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
