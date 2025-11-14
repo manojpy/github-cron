@@ -3,7 +3,7 @@ name: Hourly Global Impact News Alerter
 on:
   schedule:
     # Runs at the top of every hour
-    - cron: '0 * * * *'
+    - cron: '11 * * * *'
   workflow_dispatch:  # Allows manual triggering
 
 jobs:
