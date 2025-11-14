@@ -3,6 +3,9 @@ import requests
 import json
 import hashlib
 from datetime import datetime, timedelta
+from dotenv import load_dotenv  # ADD THIS LINE
+
+load_dotenv()  # ADD THIS LINE
 
 class GlobalNewsAlerter:
     def __init__(self):
