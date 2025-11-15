@@ -214,7 +214,7 @@ METRICS: Dict[str, Any] = {
 }
 
 def reset_metrics():
-    """Resets the run-specific metrics."""
+    """RMA 50 and 5m RMA 200 checks (below close) for BUY."""
     METRICS.update({
         "pairs_checked": 0,
         "alerts_sent": 0,
@@ -724,14 +724,14 @@ def save_products_cache(products_map: Dict[str, dict]):
         logger.warning(f"Failed to save products cache: {e}")
 
 def build_products_map(api_products: dict) -> Dict[str, dict]:
-    """
-    Parses the API response to create a map of configured PAIRS to product details.
+    """ 
+    Parses the API response to create a map of configured PAIRS to product details. 
     Normalizes symbols (e.g., USDT to USD).
     """
     products_map: Dict[str, dict] = {}
     if not api_products or not isinstance(api_products, dict):
         return products_map
-        
+
     for p in api_products.get("result", []):
         try:
             symbol = p.get("symbol", "")
@@ -745,66 +745,74 @@ def build_products_map(api_products: dict) -> Dict[str, dict]:
                         products_map[pair_name] = {
                             'id': p.get('id'),
                             'symbol': p.get('symbol'),
-                            'contract_type': p.get('contract_type')
+                            'settlement_asset': p.get('settlement_asset', '').upper(),
+                            'contract_type': p.get('contract_type'),
+                            'maker_fee': p.get('maker_fee', 0.0),
+                            'taker_fee': p.get('taker_fee', 0.0),
+                            'initial_margin': p.get('initial_margin', 0.0),
+                            'maintenance_margin': p.get('maintenance_margin', 0.0),
                         }
-        except Exception:
-            continue
+                        break # Found a match, move to the next product
+        except Exception as e:
+            logger.debug(f"Error processing product {p.get('symbol', 'N/A')}: {e}")
             
     return products_map
 
 # -------------------------
-# CANDLE PARSING
+# DATA PROCESSING & INDICATORS
 # -------------------------
-def parse_candle_response(res: dict) -> Optional[pd.DataFrame]:
-    """Converts the API candle response (dict of arrays) into a pandas DataFrame."""
-    if not res or not isinstance(res, dict):
+def parse_candle_response(data: Optional[dict]) -> Optional[pd.DataFrame]:
+    """
+    Parses the API candle response into a clean DataFrame.
+    Returns None if data is invalid or empty.
+    """
+    if data is None or data.get('s') != 'ok':
         return None
-    if not res.get("success", True) and "result" not in res:
-        return None
-        
-    resr = res.get("result", {}) or {}
-    arrays = [resr.get('t', []), resr.get('o', []), resr.get('h', []), resr.get('l', []), resr.get('c', []), resr.get('v', [])]
     
-    if any(len(a) == 0 for a in arrays):
-        return None
-        
-    min_len = min(map(len, arrays))
+    c = data.get('c', [])
+    v = data.get('v', [])
+    t = data.get('t', [])
+    o = data.get('o', [])
+    h = data.get('h', [])
+    l = data.get('l', [])
     
-    # Create DataFrame with the minimum length
+    if not c or len(c) < 2:
+        return None
+
     df = pd.DataFrame({
-        'timestamp': resr.get('t', [])[:min_len],
-        'open': resr.get('o', [])[:min_len],
-        'high': resr.get('h', [])[:min_len],
-        'low': resr.get('l', [])[:min_len],
-        'close': resr.get('c', [])[:min_len],
-        'volume': resr.get('v', [])[:min_len]
+        'timestamp': t,
+        'open': o,
+        'high': h,
+        'low': l,
+        'close': c,
+        'volume': v
     })
     
-    # Clean up: sort by timestamp and remove duplicates
-    df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
+    # Convert timestamps to datetime and set index (optional, but good practice)
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+    df = df.set_index('datetime')
     
-    # Ensure all numerical columns are float/int
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    # Ensure all columns are float, except timestamp
+    float_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Final check for validity
-    if df.empty or float(df['close'].iloc[-1]) <= 0 or df['close'].isnull().any():
-        return None
         
     return df
 
-# -------------------------
-# INDICATORS
-# -------------------------
+def calculate_sma(x: pd.Series, period: int) -> pd.Series:
+    """Calculates Simple Moving Average (SMA)."""
+    return x.rolling(window=period, min_periods=period).mean().ffill()
 
-def calculate_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def calculate_ema(x: pd.Series, period: int) -> pd.Series:
+    """Calculates Exponential Moving Average (EMA)."""
+    # Adjust=False gives the same calculation as TradingView's EMA
+    return x.ewm(span=period, adjust=False).mean().ffill()
 
-def calculate_sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period, min_periods=max(1, period // 3)).mean()
-
-def calculate_rma(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(alpha=1 / period, adjust=False).mean()
+def calculate_rma(x: pd.Series, period: int) -> pd.Series:
+    """Calculates Running Moving Average (RMA). Equivalent to WMA/SMA/EMA where alpha=1/period."""
+    # This is a common implementation for RSI/ATR smoothing. Equivalent to EMA with alpha=1/period.
+    alpha = 1 / period
+    return x.ewm(com=period - 1, adjust=False).mean()
 
 def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: bool = False):
     close = df['close'].astype(float)
@@ -831,177 +839,161 @@ def smoothrng(x: pd.Series, t: int, m: int) -> pd.Series:
     smoothrng_val = calculate_ema(avrng, max(1, wper)) * m
     return smoothrng_val.clip(lower=1e-8).bfill().ffill()
 
-def rngfilt(x: pd.Series, r: pd.Series) -> pd.Series:
-    if len(x) == 0:
-        return pd.Series(dtype=float)
-        
-    result = [x.iloc[0]]
+def rngfilt(x: pd.Series, r: pd.Series, x1: int, x2: int, x3: int, x4: int) -> Tuple[pd.Series, pd.Series]:
+    """Custom Range Filter for Cirrus Cloud."""
+    upw = pd.Series(False, index=x.index)
+    dnw = pd.Series(False, index=x.index)
+    
     for i in range(1, len(x)):
-        prev = result[-1]
-        curr_x = x.iloc[i]
-        curr_r = max(float(r.iloc[i]), 1e-8)
+        # Calculate upper and lower range thresholds dynamically
+        up_band = x.iloc[i-1] + r.iloc[i-1] * x1 / 100
+        dn_band = x.iloc[i-1] - r.iloc[i-1] * x2 / 100
         
-        if curr_x > prev:
-            f = prev if (curr_x - curr_r) < prev else (curr_x - curr_r)
+        # Upper Wick (upw) logic
+        if x.iloc[i] > up_band:
+            upw.iloc[i] = True
+        elif x.iloc[i] < up_band * (1 - x3 / 100):
+            upw.iloc[i] = False
         else:
-            f = prev if (curr_x + curr_r) > prev else (curr_x + curr_r)
-        
-        result.append(f)
-        
-    return pd.Series(result, index=x.index)
+            upw.iloc[i] = upw.iloc[i-1]
+            
+        # Down Wick (dnw) logic
+        if x.iloc[i] < dn_band:
+            dnw.iloc[i] = True
+        elif x.iloc[i] > dn_band * (1 + x4 / 100):
+            dnw.iloc[i] = False
+        else:
+            dnw.iloc[i] = dnw.iloc[i-1]
+            
+    return upw, dnw
 
-def calculate_cirrus_cloud(df: pd.DataFrame):
+def kalman_filter(data: pd.Series, length: int) -> pd.Series:
+    """Applies a simple Kalman Filter to smooth data."""
+    if data.empty or length <= 0:
+        return pd.Series(0.0, index=data.index)
+        
+    kf = pd.Series(0.0, index=data.index)
+    q = 0.01 
+    r = 1.0
+    a = 1.0
+    b = 0.0
+    c = 1.0
+    
+    # Initial values
+    if not data.iloc[0]: # Handle NaN/zero start
+        data.iloc[0] = 50.0 
+    
+    pe = pd.Series(0.0, index=data.index)
+    pm = pd.Series(0.0, index=data.index)
+    
+    pe.iloc[0] = r
+    kf.iloc[0] = data.iloc[0]
+    
+    for i in range(1, len(data)):
+        # Prediction
+        pm.iloc[i] = a * pe.iloc[i-1] + q
+        kf.iloc[i] = a * kf.iloc[i-1]
+        
+        # Update
+        gain = pm.iloc[i] * c / (c * pm.iloc[i] * c + r)
+        kf.iloc[i] = kf.iloc[i] + gain * (data.iloc[i] - c * kf.iloc[i])
+        pe.iloc[i] = (1 - gain * c) * pm.iloc[i]
+        
+    return kf
+
+def calculate_magical_momentum(df: pd.DataFrame, length: int) -> pd.Series:
+    """
+    Calculates the 'Magical Momentum' histogram, a custom momentum/trend indicator.
+    """
+    if len(df) < length * 2:
+        return pd.Series(0.0, index=df.index)
+
     close = df['close'].astype(float)
-    smrngx1x = smoothrng(close, cfg.X1, cfg.X2)
-    smrngx1x2 = smoothrng(close, cfg.X3, cfg.X4)
-    filtx1 = rngfilt(close, smrngx1x)
-    filtx12 = rngfilt(close, smrngx1x2)
-    upw = filtx1 < filtx12
-    dnw = filtx1 > filtx12
-    return upw, dnw, filtx1, filtx12
 
-def kalman_filter(src: pd.Series, length: int, R=0.01, Q=0.1) -> pd.Series:
-    result = []
-    estimate = np.nan
-    error_est = 1.0
-    error_meas = R * max(1, length)
-    Q_div_length = Q / max(1, length)
+    # 1. Calculate smoothed RSI-like indicator
+    rsi = calculate_rsi(close, length)
     
-    for i in range(len(src)):
-        current = src.iloc[i]
-        
-        if np.isnan(estimate):
-            if i > 0:
-                estimate = src.iloc[i-1]
-            else:
-                result.append(np.nan)
-                continue
-        
-        prediction = estimate
-        kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current - prediction)
-        error_est = (1 - kalman_gain) * error_est + Q_div_length
-        result.append(estimate)
-        
-    return pd.Series(result, index=src.index)
+    # 2. Normalize smoothed RSI (0-100 to -1 to 1)
+    normalized_rsi = (rsi - 50.0) / 50.0
+    
+    # 3. Apply a custom smoothing/lagging component (this is the 'magical' part)
+    lag = calculate_rma(normalized_rsi, length)
+    
+    # 4. Momentum calculation
+    # Difference between the normalized RSI and its lag
+    diff = normalized_rsi - lag
+    
+    # Smoothing the difference
+    value = calculate_rma(diff, length)
+    
+    # Transformation (Hyperbolic tangent style)
+    value = max(min(value.iloc[-1], 0.9999), -0.9999) # Clip value to prevent log error
+    
+    # If the series has NaNs at the beginning, we need to handle this for the full transformation
+    value_series = value.fillna(0)
+    value_series = value_series.clip(lower=-0.9999, upper=0.9999)
 
-def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
-    close = df['close'].astype(float)
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    
-    # Calculate RMA (Running Moving Average) for gain and loss
-    avg_gain = calculate_rma(gain, rsi_len)
-    avg_loss = calculate_rma(loss, rsi_len).replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.replace([np.inf, -np.inf], np.nan).fillna(50)
-    
-    # Apply Kalman Filter for smoothing
-    smooth_rsi = kalman_filter(rsi, kalman_len)
-    
-    return smooth_rsi.replace([np.inf, -np.inf], np.nan).bfill().ffill().fillna(50)
+    # Transformation
+    temp2 = (1 + value_series) / (1 - value_series)
+    temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
+    momentum = 0.25 * np.log(temp2)
+    momentum = pd.Series(momentum, index=df.index).replace([np.inf, -np.inf], 0).fillna(0)
+
+    # 5. Calculate final histogram (using an IIR filter/Exponential smoothing)
+    hist = pd.Series(0.0, index=df.index)
+    for i in range(1, len(df)):
+        # Simple IIR filter: current = input + 0.5 * previous
+        hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
+        
+    return hist.replace([np.inf, -np.inf], 0).fillna(0)
 
 def calculate_vwap(df: pd.DataFrame, daily_df: pd.DataFrame) -> Optional[pd.Series]:
-    """
+    """ 
     Calculates the Volume Weighted Average Price (VWAP) for the current 15m day.
     """
     if daily_df is None or len(daily_df) < 2:
         return None
-        
+    
     # Get today's Daily Open (use last but one candle in daily data)
     try:
         daily_ts = daily_df['timestamp'].iloc[-2]
     except IndexError:
         return None # Not enough daily data
-    
+
     # Find the first 15m candle whose timestamp is >= today's daily open timestamp
     start_index = df[df['timestamp'] >= daily_ts].index.min()
-    
     if pd.isna(start_index):
         # If no candles match (e.g., ran too early in the day), assume the first candle
-        start_index = 0 
-    
-    df_day = df.iloc[start_index:].copy()
-    
+        start_index = df.index[0] 
+        
+    df_day = df.loc[start_index:].copy()
     if df_day.empty:
         return None
-        
+    
     # Calculate typical price (TP) for each 15m candle
     df_day['TP'] = (df_day['high'] + df_day['low'] + df_day['close']) / 3
     
     # Calculate Cumulative Volume and Cumulative (TP * Volume)
     df_day['TPV'] = df_day['TP'] * df_day['volume']
-    df_day['CumVol'] = df_day['volume'].cumsum().clip(lower=1e-8) # Clip for safety
-    df_day['CumTPV'] = df_day['TPV'].cumsum()
-    
-    # Calculate VWAP
-    vwap_series = (df_day['CumTPV'] / df_day['CumVol']).replace([np.inf, -np.inf], np.nan).ffill().bfill()
-    
-    # Merge back into the full 15m dataframe, filling NaNs
-    vwap_full_series = vwap_series.reindex(df.index).ffill().bfill()
-    
-    return vwap_full_series
+    df_day['cum_TPV'] = df_day['TPV'].cumsum()
+    df_day['cum_volume'] = df_day['volume'].cumsum()
 
-def calculate_worm_momentum_hist(df: pd.DataFrame) -> pd.Series:
-    """Calculates the Worm Momentum Histogram (a custom momentum indicator)."""
-    close = df['close'].astype(float)
-    length = 40
-    n = 20
-    period = 10
+    # Calculate VWAP: Cumulative (TP * Volume) / Cumulative Volume
+    vwap = df_day['cum_TPV'] / df_day['cum_volume'].clip(lower=1e-8) # Avoid division by zero
     
-    # Calculate worm (Welles Wilder Moving Average or RMA)
-    worm = calculate_rma(close, length) 
+    # Merge the VWAP series back into the original 15m DataFrame
+    # Fill missing values (for candles before today's open) with the first calculated VWAP
+    full_vwap = pd.Series(vwap, index=df.index).ffill() 
     
-    # Calculate SMA
-    ma = close.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
-    
-    # Calculate raw momentum
-    denom = worm.replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
-    raw_momentum = (worm - ma) / denom
-    raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
-    
-    # Calculate min/max of raw momentum over 'period'
-    min_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).min().bfill().ffill()
-    max_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).max().bfill().ffill()
-    
-    # Normalize raw momentum to 0-1 range
-    rng = (max_med - min_med).replace(0, np.nan)
-    temp = pd.Series(0.0, index=df.index)
-    valid = rng.notna() & (rng.abs() > 1e-8) # Check for near-zero range
-    temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
-    temp = temp.clip(0, 1).fillna(0.5) # clip and default to 0.5 if range is zero or nan
-    
-    # Apply a smoothing/lagging process
-    value = pd.Series(0.0, index=df.index)
-    for i in range(1, len(df)):
-        prev = value.iloc[i - 1]
-        val = (temp.iloc[i] - 0.5 + 0.5 * prev)
-        value.iloc[i] = max(min(val, 0.9999), -0.9999) # Clip value to prevent log error
-
-    # Transform to get momentum value
-    temp2 = (1 + value) / (1 - value)
-    temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
-    momentum = 0.25 * np.log(temp2)
-    momentum = pd.Series(momentum, index=df.index).replace([np.inf, -np.inf], 0).fillna(0)
-    
-    # Calculate final histogram
-    hist = pd.Series(0.0, index=df.index)
-    for i in range(1, len(df)):
-        hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-        
-    return hist.replace([np.inf, -np.inf], 0).fillna(0)
-
+    return full_vwap
 
 def calculate_fibonacci_pivots(df_daily: pd.DataFrame) -> Optional[Dict[str, float]]:
     """Calculates Fibonacci Pivot Points from the previous day's data."""
     if df_daily is None or len(df_daily) < 2:
         return None
-        
+
     # Use the second to last candle (yesterday's close)
-    prev_day = df_daily.iloc[-2] 
+    prev_day = df_daily.iloc[-2]
     
     # H, L, C of the previous day
     high = float(prev_day['high'])
@@ -1011,65 +1003,90 @@ def calculate_fibonacci_pivots(df_daily: pd.DataFrame) -> Optional[Dict[str, flo
     # Base Pivot Point
     pivot = (high + low + close) / 3
     
-    # Difference/Range
-    range_val = high - low
+    # Daily range
+    daily_range = high - low
     
-    # Fibonacci Levels Calculation
-    R3 = pivot + 1.000 * range_val
-    R2 = pivot + 0.618 * range_val
-    R1 = pivot + 0.382 * range_val
-    S1 = pivot - 0.382 * range_val
-    S2 = pivot - 0.618 * range_val
-    S3 = pivot - 1.000 * range_val
-        
-    return {
-        'P': pivot,
-        'R1': R1,
-        'R2': R2,
-        'R3': R3,
-        'S1': S1,
-        'S2': S2,
-        'S3': S3,
-        'high': high, # Keep H/L for the difference calculation reference
-        'low': low
+    # Fibonacci Retracements
+    fib_ratios = {
+        'R3': 1.000,
+        'R2': 0.618,
+        'R1': 0.382,
+        'P': 0.000, # Pivot point itself is 0 retracement from P
+        'S1': 0.382,
+        'S2': 0.618,
+        'S3': 1.000,
     }
 
-def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: float, direction: str) -> Optional[Tuple[str, float]]:
-    """Checks for a crossover of any pivot level between two consecutive candles."""
-    if not pivots:
-        return None
-        
-    # Order levels from high to low to check the highest/lowest first
-    levels = ["R3", "R2", "R1", "P", "S1", "S2", "S3"]
+    # Calculate levels
+    pivots: Dict[str, float] = {}
+    pivots['P'] = pivot
     
-    for level_name in levels:
-        line = pivots.get(level_name)
-        if line is None:
-            continue
+    pivots['R1'] = pivot + (daily_range * fib_ratios['R1'])
+    pivots['S1'] = pivot - (daily_range * fib_ratios['S1'])
+    
+    pivots['R2'] = pivot + (daily_range * fib_ratios['R2'])
+    pivots['S2'] = pivot - (daily_range * fib_ratios['S2'])
+    
+    pivots['R3'] = pivot + (daily_range * fib_ratios['R3'])
+    pivots['S3'] = pivot - (daily_range * fib_ratios['S3'])
 
-        # Check for crossover
-        if direction == "long":
-            # Cross above the line (prev <= line < curr). Use a small epsilon for floating point safety.
-            if prev_price <= line and curr_price > line:
-                return level_name, line
-        elif direction == "short":
-            # Cross below the line (prev >= line > curr).
-            if prev_price >= line and curr_price < line:
-                return level_name, line
-                
-    return None
+    return pivots
 
 # -------------------------
-# STATE MANAGEMENT
+# SIGNAL UTILITIES
 # -------------------------
+def get_crossover_line(df: pd.DataFrame, lines: Dict[str, float]) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Finds the highest Fibonacci Resistance/Pivot/Support that price crossed *above* (Long, excluding R3),
+    or the lowest Fibonacci Support/Pivot/Resistance that price crossed *below* (Short, excluding S3)
+    in the most recent candle (index -2).
+    """
+    # The relevant candle is the last closed one (index -2)
+    prev_close = df['close'].iloc[-3]
+    curr_close = df['close'].iloc[-2]
+    
+    # --- Check for Crossover (Long Signal) ---
+    crossover_lines: List[Tuple[float, str]] = []
+    
+    # Lines for Long: P, S1, S2, S3, R1, R2. (EXCLUDE R3)
+    long_lines_to_check = ['R1', 'R2', 'P', 'S1', 'S2', 'S3']
+    for name in long_lines_to_check:
+        line = lines[name]
+        # Price must cross from below to above
+        if prev_close <= line and curr_close > line:
+            crossover_lines.append((line, name))
+            
+    # For a long signal, the line we are interested in is the HIGHEST level crossed
+    if crossover_lines:
+        crossover_lines.sort(key=lambda x: x[0], reverse=True) # Sort by price descending
+        return crossover_lines[0][1], crossover_lines[0][0] # Return the highest level
+    
+    # --- Check for Crossunder (Short Signal) ---
+    crossunder_lines: List[Tuple[float, str]] = []
+    
+    # Lines for Short: P, S1, S2, R1, R2, R3. (EXCLUDE S3)
+    short_lines_to_check = ['R1', 'R2', 'R3', 'P', 'S1', 'S2']
+    for name in short_lines_to_check:
+        line = lines[name]
+        # Price must cross from above to below
+        if prev_close >= line and curr_close < line:
+            crossunder_lines.append((line, name))
+        
+    # For a short signal, the line we are interested in is the LOWEST level crossed
+    if crossunder_lines:
+        crossunder_lines.sort(key=lambda x: x[0], reverse=False) # Sort by price ascending
+        return crossunder_lines[0][1], crossunder_lines[0][0] # Return the lowest level
+        
+    return None, None
+
 def should_suppress_duplicate(last_state: Optional[Dict[str, Any]], current_signal: str, suppress_secs: int) -> bool:
     """Checks if the same signal was recently sent and should be suppressed."""
     if not last_state:
         return False
-
+        
     state_ts = int(last_state.get("ts", 0))
     state_signal = last_state.get("state")
-
+    
     # Only suppress if the signal is exactly the same and within the time window
     if current_signal == state_signal:
         if now_ts() - state_ts < suppress_secs:
@@ -1098,66 +1115,64 @@ def telegram_log_state(pair_name: str, current_signal: str, message: str):
 async def send_telegram_async(session: aiohttp.ClientSession, token: str, chat_id: str, text: str) -> bool:
     """Sends a message to Telegram using the provided shared session."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    
     data = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": "true"
     }
-    
     try:
         # Use the shared session with a default timeout
-        async with session.post(url, data=data, timeout=10) as resp:
-            try:
-                # Need content_type=None because Telegram sometimes returns an unexpected content-type
-                js = await resp.json(content_type=None)
-            except Exception:
-                js = {"ok": False, "status": resp.status, "text": await resp.text()}
-                
-            ok = js.get("ok", False)
-            if ok:
-                await asyncio.sleep(0.2) # Small delay to avoid rate limiting
-                return True
-            else:
-                logger.warning(f"Telegram API error: {js}")
+        async with session.post(url, data=data, timeout=cfg.HTTP_TIMEOUT) as resp:
+            # Check for 429 Too Many Requests
+            if resp.status == 429:
+                logger.warning("Telegram rate limit hit (429)")
+                return False
+            
+            resp.raise_for_status() # Raise for other HTTP errors (4xx or 5xx)
+            
+            # Check Telegram response body for success
+            json_response = await resp.json()
+            if not json_response.get("ok"):
+                logger.error(f"Telegram API error: {json_response.get('description')}")
                 return False
                 
+            return True
+            
+    except ClientConnectorError:
+        logger.warning("Network error sending Telegram message.")
+        return False
+    except ClientResponseError as e:
+        logger.error(f"HTTP error sending Telegram message: {e}")
+        return False
     except Exception as e:
-        logger.exception(f"Telegram send failed: {e}")
+        logger.error(f"General error sending Telegram message: {e}")
         return False
 
 async def send_telegram_with_retries(session: aiohttp.ClientSession, token: str, chat_id: str, text: str) -> bool:
-    """Retries sending a Telegram message with exponential backoff."""
-    last_exc = None
-    
-    for attempt in range(1, max(1, cfg.TELEGRAM_RETRIES) + 1):
-        try:
-            ok = await send_telegram_async(session, token, chat_id, text)
-            if ok:
-                return True
-            last_exc = Exception("Telegram returned non-ok")
-        except Exception as e:
-            last_exc = e
+    """Sends a Telegram message with retry logic."""
+    for attempt in range(cfg.TELEGRAM_RETRIES):
+        if await send_telegram_async(session, token, chat_id, text):
+            return True
         
-        # Exponential backoff
-        sleep_for = cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)
-        await asyncio.sleep(sleep_for + random.uniform(0, 0.3))
-
-    logger.error(f"Telegram send failed after retries: {last_exc}")
+        if attempt < cfg.TELEGRAM_RETRIES - 1:
+            # Exponential backoff with jitter for Telegram
+            delay = cfg.TELEGRAM_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1.0)
+            logger.info(f"Retrying Telegram in {delay:.2f}s...")
+            await asyncio.sleep(delay)
+            
     return False
 
 # -------------------------
 # DEAD MAN'S SWITCH
 # -------------------------
-async def check_dead_mans_switch(state_db: StateDB, session: aiohttp.ClientSession):
+async def check_dead_man_switch(session: aiohttp.ClientSession, state_db: StateDB):
     """
-    Checks if the bot has successfully completed a run within the configured DEADMAN_HOURS.
-    Sends a critical alert if the bot has failed to report in.
+    Checks if the bot has successfully run within the configured time.
+    Sends an alert if it hasn't.
     """
     try:
         last_success = state_db.get_metadata("last_success_run")
-        
         if last_success:
             try:
                 last_success_int = int(last_success)
@@ -1168,7 +1183,6 @@ async def check_dead_mans_switch(state_db: StateDB, session: aiohttp.ClientSessi
             
             # Check if the time since last success is greater than the configured limit
             if hours_since > cfg.DEADMAN_HOURS:
-                
                 # Check when the last alert was sent to prevent spam
                 dead_alert_ts = state_db.get_metadata("dead_alert_ts")
                 dead_alert_int = 0
@@ -1179,88 +1193,87 @@ async def check_dead_mans_switch(state_db: StateDB, session: aiohttp.ClientSessi
                         dead_alert_int = 0
                 
                 # Only alert once every 4 hours after the initial failure
-                if now_ts() - dead_alert_int > 4 * 3600: 
-                    
+                if now_ts() - dead_alert_int > 4 * 3600:
                     msg = (
                         f"🚨 DEAD MAN'S SWITCH: **{sanitize_for_telegram(cfg.BOT_NAME)}** hasn't succeeded in {hours_since:.1f} hours!\n"
                         f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
                         f"Expected check-in interval: Every {cfg.RUN_LOOP_INTERVAL / 60:.0f} minutes."
                     )
-                    
                     if await send_telegram_with_retries(session, cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg):
                         logger.critical(f"Dead man's switch triggered. Sent alert.")
                         state_db.set_metadata("dead_alert_ts", str(now_ts()))
                     else:
                         logger.error("Failed to send Dead man's switch alert.")
-                        
     except Exception as e:
         logger.exception(f"Dead man's switch check failed: {e}")
 
 # -------------------------
-# EVALUATION CORE
+# MAIN LOGIC
 # -------------------------
 async def evaluate_pair_async(
-    session: aiohttp.ClientSession, 
-    fetcher: DataFetcher, 
-    products_map: Dict[str, dict], 
-    pair_name: str, 
-    last_state: Optional[Dict[str, Any]]
-) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+    session: aiohttp.ClientSession,
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    pair_name: str,
+    last_state: Optional[Dict[str, Any]],
+) -> Optional[str]:
     """
-    Core logic: fetches data, calculates indicators, finds signals, and sends alerts.
-    
-    Returns: (new_state, alert_info)
+    Fetches data, calculates indicators, applies signal logic, and sends alerts for a single pair.
     """
     METRICS["pairs_checked"] += 1
+    logger.debug(f"Starting evaluation for {pair_name}")
     
-    prod = products_map.get(pair_name)
-    if prod is None:
-        logger.warning(f"Skipping {pair_name}: Product not found in API response.")
-        return last_state.get("state") if last_state else None, None
+    product_details = products_map.get(pair_name)
+    if not product_details:
+        logger.debug(f"{pair_name}: Product details not found in map.")
+        return last_state.get("state") if last_state else None
         
-    # Determine the required candle limits based on default or SPECIAL_PAIRS config
-    limit_15m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 120)
-    min_required_15m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 100)
-    limit_5m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 300)
+    symbol = product_details['symbol']
+    
+    # Configuration for data limits (default or special pair override)
+    limit_15m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 150)
+    min_required_15m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("min_required", 120)
+    limit_5m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("limit_5m", 250)
     min_required_5m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("min_required_5m", 200)
 
-    # --- 1. Data Fetching ---
+    # --- 1. Concurrent Data Fetch ---
     try:
-        # Fetch 15m and 5m (if RMA200 is used) concurrently
-        fetch_15m = fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)
-        fetch_5m = fetcher.fetch_candles(session, prod['symbol'], "5", limit_5m) if cfg.USE_RMA200 else asyncio.sleep(0, result=None)
+        # Fetch 15m data (needed for all indicators)
+        task15m = fetcher.fetch_candles(session, symbol, "15", limit_15m)
+        # Fetch 5m data (only if RMA200 is enabled)
+        task5m = fetcher.fetch_candles(session, symbol, "5", limit_5m) if cfg.USE_RMA200 else asyncio.Future()
+        # Fetch 1D data (needed for Fibonacci Pivots)
+        task_daily = fetcher.fetch_candles(session, symbol, "1D", cfg.PIVOT_LOOKBACK_PERIOD)
         
-        # Always fetch daily for pivots/vwap start point
-        fetch_daily = fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 1)
+        # Run all fetches concurrently
+        res15, res5, res_daily = await asyncio.gather(task15m, task5m, task_daily, return_exceptions=True)
         
-        results = await asyncio.gather(fetch_15m, fetch_5m, fetch_daily, return_exceptions=True)
-        
-        res15 = results[0] if len(results) > 0 and not isinstance(results[0], Exception) else None
-        res5 = results[1] if len(results) > 1 and not isinstance(results[1], Exception) else None
-        res_daily = results[2] if len(results) > 2 and not isinstance(results[2], Exception) else None
-        
-        if isinstance(results[0], Exception):
-            logger.error(f"Exception fetching 15m data for {pair_name}: {results[0]}")
+        # Check for exceptions
+        if isinstance(res15, Exception) or isinstance(res_daily, Exception):
+            logger.error(f"Error during concurrent fetch for {pair_name}. 15m: {res15}, Daily: {res_daily}")
             METRICS["network_errors"] += 1
-            return last_state.get("state") if last_state else None, None
-
+            return last_state.get("state") if last_state else None
+        if cfg.USE_RMA200 and isinstance(res5, Exception):
+            logger.warning(f"Error fetching 5m data for {pair_name}. RMA200 check disabled for this run. Error: {res5}")
+            res5 = None # Treat as not available
+            
     except Exception as e:
         logger.error(f"Error during concurrent fetch for {pair_name}: {e}")
         METRICS["network_errors"] += 1
-        return last_state.get("state") if last_state else None, None
-
+        return last_state.get("state") if last_state else None
+        
     df_15m = parse_candle_response(res15)
     df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
     df_daily = parse_candle_response(res_daily)
 
-
     # Check for sufficient data
     if df_15m is None or len(df_15m) < min_required_15m:
         logger.debug(f"{pair_name}: Insufficient 15m data (got {len(df_15m) if df_15m is not None else 0}, need {min_required_15m})")
-        return last_state.get("state") if last_state else None, None
+        return last_state.get("state") if last_state else None
+        
     if cfg.USE_RMA200 and (df_5m is None or len(df_5m) < min_required_5m):
         logger.debug(f"{pair_name}: Insufficient 5m data (got {len(df_5m) if df_5m is not None else 0}, need {min_required_5m})")
-        return last_state.get("state") if last_state else None, None
+        return last_state.get("state") if last_state else None
         
     pivots = calculate_fibonacci_pivots(df_daily)
     if pivots is None or df_daily is None or len(df_daily) < 2:
@@ -1270,128 +1283,164 @@ async def evaluate_pair_async(
         pivots_available = True
 
     # --- 2. Calculate Indicators ---
-    # Index for current (most recent) closed candle
-    last_i_15m = -2
-    last_i_5m = -2
-
-    ppo, ppo_signal = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
-    upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
-    magical_hist = calculate_worm_momentum_hist(df_15m)
-
-    vwap_15m: Optional[pd.Series] = calculate_vwap(df_15m, df_daily)
-    rma200_5m: Optional[pd.Series] = calculate_rma(df_5m['close'].astype(float), 200) if cfg.USE_RMA200 and df_5m is not None else None
+    # PPO (15m)
+    ppo, _ = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
+    ppo_curr = ppo.iloc[-2]
     
-    # --- 3. Get Current Candle Values (from last closed candle, index -2) ---
+    # Cirrus Cloud (15m)
+    rng_15m = smoothrng(df_15m['close'], cfg.X4, 1)
+    upw_15m, dnw_15m = rngfilt(df_15m['close'], rng_15m, cfg.X1, cfg.X2, cfg.X3, cfg.X4)
+    
+    # Magical Momentum Histogram (15m)
+    magical_hist = calculate_magical_momentum(df_15m, 15)
+    
+    # VWAP (15m) - calculated daily
+    vwap_series = calculate_vwap(df_15m, df_daily)
+    
+    # RMA 200 (5m) - only if enabled
+    rma_200_available = False
+    rma200_5m_curr = 0.0
+    if cfg.USE_RMA200 and df_5m is not None:
+        rma_200_5m = calculate_rma(df_5m['close'], 200)
+        # Check if RMA200 has enough periods to be valid
+        if len(rma_200_5m.dropna()) >= 1: 
+            # We take the most recent 5m value, which is in the most recent 15m period
+            rma200_5m_curr = rma_200_5m.iloc[-1] 
+            rma_200_available = True
+            
+    # NEW: Calculate RMA 50 for 15m (needed for the new filter)
+    rma_50_15m = calculate_rma(df_15m['close'], 50)
+    # Check if RMA50 has enough periods to be valid
+    if len(rma_50_15m.dropna()) < 1:
+        logger.debug(f"{pair_name}: Insufficient data for RMA 50. Skipping.")
+        return last_state.get("state") if last_state else None
+    rma_50_15m_curr = rma_50_15m.iloc[-2] # Current closed 15m candle's RMA50
+
+    # --- 3. Extract Current Candle Data (Index -2) ---
     try:
-        # 15m current values
-        curr_15m = df_15m.iloc[last_i_15m]
-        prev_15m = df_15m.iloc[last_i_15m - 1]
-        close_c = float(curr_15m['close'])
-        open_c = float(curr_15m['open'])
-        high_c = float(curr_15m['high'])
-        low_c = float(curr_15m['low'])
-        prev_close_c = float(prev_15m['close'])
-        
-        is_green = close_c > open_c
-        is_red = close_c < open_c
-        
-        ppo_curr = float(ppo.iloc[last_i_15m])
-        magical_curr = float(magical_hist.iloc[last_i_15m])
-        cloud_state = cloud_state_from(upw, dnw, last_i_15m)
-        vwap_curr = float(vwap_15m.iloc[last_i_15m]) if vwap_15m is not None and len(vwap_15m) >= abs(last_i_15m) else None
-        
-        # 5m RMA200 value
-        rma200_5m_curr = float(rma200_5m.iloc[last_i_5m]) if rma200_5m is not None and len(rma200_5m) >= abs(last_i_5m) else None
-        rma_200_available = rma200_5m_curr is not None and not np.isnan(rma200_5m_curr)
+        current_candle = df_15m.iloc[-2]
+        prev_close = df_15m['close'].iloc[-3]
+    except IndexError:
+        logger.debug(f"{pair_name}: Not enough candles for comparison.")
+        return last_state.get("state") if last_state else None
 
-    except Exception as e:
-        logger.error(f"Error extracting indicator values for {pair_name}: {e}")
-        METRICS["logic_errors"] += 1
-        return last_state.get("state") if last_state else None, None
-        
-    vwap_log_str = f"{vwap_curr:,.2f}" if vwap_curr is not None and not np.isnan(vwap_curr) else "nan"
-    logger.debug(
-        f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
-        f"PPO={ppo_curr:.2f}, "
-        f"MMH={magical_curr:.4f}, Cloud={cloud_state}, "
-        f"VWAP={vwap_log_str}, RMA200={rma200_5m_curr}"
-    )
+    open_c = float(current_candle['open'])
+    close_c = float(current_candle['close'])
+    high_c = float(current_candle['high'])
+    low_c = float(current_candle['low'])
     
-    # --- 4. Validation/Condition Checks ---
-    # Extreme candle check (filter out large, anomalous candles)
+    is_green = close_c > open_c
+    is_red = close_c < open_c
+    cloud_state_curr = cloud_state_from(upw_15m, dnw_15m, -2)
+    magical_hist_curr = magical_hist.iloc[-2]
+    vwap_curr = vwap_series.iloc[-2] if vwap_series is not None else 0.0
+
+    # --- 4. Candle Pre-checks & Indicator Filters (Index -2) ---
+    
+    # Extreme Candle Check
     candle_pct_change = abs(close_c - open_c) / open_c * 100
     if candle_pct_change > cfg.EXTREME_CANDLE_PCT:
         logger.debug(f"{pair_name}: Skipped due to extreme candle ({candle_pct_change:.2f}% > {cfg.EXTREME_CANDLE_PCT}%)")
-        return last_state.get("state") if last_state else None, None
-        
-    # Wick checks (filter out candles with disproportionately long wicks)
+        return last_state.get("state") if last_state else None
+
+    # Wick checks (using the user-requested 20% limit)
     total_range = high_c - low_c
+    WICK_MAX_PCT = 0.20 # 20% limit from user request
+    
     if total_range <= 1e-6: # Avoid division by zero
         upper_wick_ok = True
         lower_wick_ok = True
     else:
         upper_wick = high_c - max(open_c, close_c)
         lower_wick = min(open_c, close_c) - low_c
-        
-        # Upper wick must not be more than 60% of total range for a long signal (green candle)
-        upper_wick_ok = not is_green or (upper_wick / total_range) < 0.6
-        # Lower wick must not be more than 60% of total range for a short signal (red candle)
-        lower_wick_ok = not is_red or (lower_wick / total_range) < 0.6
 
-    # RMA200 check: 15m close must be above 5m RMA200 for long, below for short
-    rma_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
-    rma_short_ok = not cfg.USE_RMA200 or (rma_200_available and close_c < rma200_5m_curr)
+        # NEW USER LOGIC: 
+        # For Long (Green Candle): Upper wick must be < 20% of total range.
+        # For Short (Red Candle): Lower wick must be < 20% of total range.
+        
+        # If it's a green candle (long signal), check if its upper wick is small
+        upper_wick_ok = not is_green or (upper_wick / total_range) < WICK_MAX_PCT
+        
+        # If it's a red candle (short signal), check if its lower wick is small
+        lower_wick_ok = not is_red or (lower_wick / total_range) < WICK_MAX_PCT
+        
+    # RMA FILTER: 15m RMA50 and 5m RMA200 must confirm the trend
+
+    # 1. RMA 50 (15m) Check
+    # Buy: Close > RMA50 | Sell: Close < RMA50
+    rma_50_long_ok = close_c > rma_50_15m_curr
+    rma_50_short_ok = close_c < rma_50_15m_curr
+
+    # 2. RMA 200 (5m) Check (Keep the cfg.USE_RMA200 safety check)
+    # Buy: Close > RMA200 | Sell: Close < RMA200
+    rma_200_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
+    rma_200_short_ok = not cfg.USE_RMA200 or (rma_200_available and close_c < rma200_5m_curr)
+
+    # Final combined RMA check
+    rma_long_ok = rma_50_long_ok and rma_200_long_ok
+    rma_short_ok = rma_50_short_ok and rma_200_short_ok
+    
+    # --- General General Conditions (LGC/SGC) ---
+    # These combine all the user's non-crossover conditions (as confirmed in previous turn)
+    LGC = (
+        (cloud_state_curr == "long") and             # Cirrus cloud should be green
+        (magical_hist_curr > 0) and                  # Magical Momentum Hist should be above 0
+        (is_green) and                               # Candle should be green
+        (upper_wick_ok) and                          # Upper wick check (specific wick check is applied above)
+        (rma_long_ok)                                # Combined RMA check
+    )
+
+    SGC = (
+        (cloud_state_curr == "short") and            # Cirrus cloud should be red
+        (magical_hist_curr < 0) and                  # Magical Momentum Hist should be below 0
+        (is_red) and                                 # Candle should be red
+        (lower_wick_ok) and                          # Lower wick check (specific wick check is applied above)
+        (rma_short_ok)                               # Combined RMA check
+    )
     
     # --- 5. Signal Logic ---
     current_signal = None
     message = None
     suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
-    up_sig = "🟩▲" 
-    down_sig = "🟥🔻"
+    
+    # VWAP Crossover/Crossunder Check
+    vwap_crossover = (vwap_series is not None and prev_close <= vwap_curr and close_c > vwap_curr)
+    vwap_crossunder = (vwap_series is not None and prev_close >= vwap_curr and close_c < vwap_curr)
+    
+    # Fibonacci Crossover/Crossunder Check
+    # NOTE: The get_crossover_line is now modified to respect R3 (exclude long) and S3 (exclude short)
+    long_crossover_name, long_crossover_line = get_crossover_line(df_15m, pivots) if pivots_available else (None, None)
+    short_crossover_name, short_crossover_line = get_crossover_line(df_15m, pivots) if pivots_available else (None, None)
 
-    # VWAP Signal (Volume Buy/Sell)
+    fib_crossover = long_crossover_name is not None
+    fib_crossunder = short_crossover_name is not None
+    
+    up_sig = "⬆️"
+    down_sig = "⬇️"
+
+    # VBuy Signal (VWAP Cross Above) - Uses LGC
     vbuy = (
-        vwap_curr is not None and 
-        is_green and 
-        cloud_state == "long" and 
-        magical_curr > 0 and 
-        upper_wick_ok and
-        rma_long_ok and
-        prev_close_c <= vwap_curr and close_c > vwap_curr # VWAP crossover
+        vwap_crossover and 
+        LGC
     )
     
+    # VSell Signal (VWAP Cross Below) - Uses SGC
     vsell = (
-        vwap_curr is not None and 
-        is_red and 
-        cloud_state == "short" and 
-        magical_curr < 0 and 
-        lower_wick_ok and
-        rma_short_ok and
-        prev_close_c >= vwap_curr and close_c < vwap_curr # VWAP crossover
+        vwap_crossunder and 
+        SGC
+    )
+    
+    # Fib Long Signal (Pivot/Resistance Cross Above) - Uses LGC
+    fib_long = (
+        fib_crossover and 
+        LGC
     )
 
-    # Fibonacci Pivot Crossover Signal
-    base_long_ok = (
-        is_green and
-        cloud_state == "long" and 
-        magical_curr > 0 and
-        rma_long_ok and 
-        upper_wick_ok
+    # Fib Short Signal (Pivot/Support Cross Below) - Uses SGC
+    fib_short = (
+        fib_crossunder and 
+        SGC
     )
-    long_crossover = get_crossover_line(pivots, prev_close_c, close_c, "long")
-    fib_long = pivots_available and base_long_ok and (long_crossover is not None)
-    long_crossover_name, long_crossover_line = long_crossover if long_crossover else (None, None)
-    
-    base_short_ok = (
-        is_red and
-        cloud_state == "short" and 
-        magical_curr < 0 and
-        rma_short_ok and
-        lower_wick_ok
-    )
-    short_crossover = get_crossover_line(pivots, prev_close_c, close_c, "short")
-    fib_short = pivots_available and base_short_ok and (short_crossover is not None)
-    short_crossover_name, short_crossover_line = short_crossover if short_crossover else (None, None)
 
     # --- 6. Alert Generation ---
     if vbuy:
@@ -1406,7 +1455,6 @@ async def evaluate_pair_async(
                 f"Price: `${price_str}`\n"
                 f"{human_ts()}"
             )
-            
     elif vsell:
         current_signal = "vsell"
         if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
@@ -1419,7 +1467,6 @@ async def evaluate_pair_async(
                 f"Price: `${price_str}`\n"
                 f"{human_ts()}"
             )
-            
     elif fib_long:
         current_signal = f"fib_long_{long_crossover_name}"
         if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
@@ -1432,7 +1479,6 @@ async def evaluate_pair_async(
                 f"Price: `${price_str}`\n"
                 f"{human_ts()}"
             )
-            
     elif fib_short:
         current_signal = f"fib_short_{short_crossover_name}"
         if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
@@ -1446,63 +1492,41 @@ async def evaluate_pair_async(
                 f"{human_ts()}"
             )
 
-    # --- 7. Final Action ---
-    alert_info = None
-    if message:
+    # --- 7. Send Alert and Update State ---
+    if message and current_signal:
         telegram_log_state(pair_name, current_signal, message)
         if await send_telegram_with_retries(session, cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, message):
-            alert_info = {"signal": current_signal, "message": message}
-            return current_signal, alert_info
+            return current_signal
         else:
-            # If sending fails, retain the last state to avoid re-alerting if retries succeed on next run
-            return last_state.get("state") if last_state else None, None
-            
-    # No signal, keep previous state unless it was for a long-expired condition
-    return last_state.get("state") if last_state else None, None
-
+            logger.error(f"Failed to send Telegram alert for {pair_name}: {current_signal}")
+            return last_state.get("state") if last_state else None
+    
+    # If no signal, return the previous state (if it was a signal state) or None
+    return current_signal
 
 # -------------------------
-# MAIN EXECUTION
+# EXECUTION CORE
 # -------------------------
-stop_requested = False
-
-def sig_handler(signum, frame):
-    """Graceful shutdown handler."""
-    global stop_requested
-    if not stop_requested:
-        stop_requested = True
-        logger.info(f"Signal {signum} received. Initiating graceful shutdown.")
-
-signal.signal(signal.SIGINT, sig_handler)
-signal.signal(signal.SIGTERM, sig_handler)
-
-async def run_once(state_db: StateDB, send_test: bool = True):
+async def run_once(state_db: StateDB, send_test: bool = False):
     """
-    Performs a single, complete run of the bot logic.
-    Refactored to use a single shared aiohttp.ClientSession.
+    Core function for a single execution run.
     """
-    # 1. Setup Session/Fetcher/Circuit Breaker
-    # Use a high limit for total connection in case of DNS/OS limits, the semaphore will enforce MAX_CONCURRENCY
-    connector = TCPConnector(limit=max(cfg.MAX_CONCURRENCY + 2, 10), ssl=False) 
-    # The entire run uses this single session
-    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)) as session:
+    reset_metrics()
+    logger.info("Starting bot run.")
+    
+    # Use a TCPConnector to respect the configured concurrency limit
+    connector = TCPConnector(limit=cfg.MAX_CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector) as session:
         
-        # Check Dead Man's Switch immediately
-        await check_dead_mans_switch(state_db, session)
-
-        # 2. Initial Checks
-        if cfg.RESET_STATE:
-            logger.warning("RESET_STATE=True: Clearing all state data.")
-            state_db.set_metadata("last_prune", str(datetime.fromtimestamp(0).isoformat())) # Force prune on next run
-            for pair in cfg.PAIRS:
-                state_db.set(pair, None)
-            state_db.set_metadata("last_success_run", "0")
-            
+        # 1. Check Dead Man's Switch (runs before anything else)
+        await check_dead_man_switch(session, state_db)
+        
+        # 2. Send Test Message (if configured)
         if cfg.SEND_TEST_MESSAGE and send_test:
-            test_msg = f"🚀 **{sanitize_for_telegram(cfg.BOT_NAME)}** is starting. Time: {human_ts()}. Execution limit: {cfg.MAX_EXEC_TIME}s."
+            test_msg = f"✅ **{sanitize_for_telegram(cfg.BOT_NAME)}** is starting. Time: {human_ts()}. Execution limit: {cfg.MAX_EXEC_TIME}s."
             # Use the shared session for the test message
             await send_telegram_with_retries(session, cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
-            
+
         products_map = load_products_cache()
         circuit = CircuitBreaker()
         # Use MAX_CONCURRENCY for the internal semaphore to limit active API calls
@@ -1514,23 +1538,21 @@ async def run_once(state_db: StateDB, send_test: bool = True):
             if not prod_resp:
                 logger.error("❌ Failed to fetch products from API")
                 # Do not save products_map if fetch failed
-                raise SystemExit(EXIT_API_FAILURE)
-                
+                raise SystemExit(EXIT_API_FAILURE) 
             products_map = build_products_map(prod_resp)
             save_products_cache(products_map)
-            
+        
         last_alerts = state_db.load_all()
 
         # 4. Run Pair Evaluations Concurrently
         tasks = [
             evaluate_pair_async(
-                session, 
-                fetcher_local, 
-                products_map, 
-                pair_name, 
+                session,
+                fetcher_local,
+                products_map,
+                pair_name,
                 last_alerts.get(pair_name)
-            )
-            for pair_name in cfg.PAIRS
+            ) for pair_name in cfg.PAIRS
         ]
         
         # Use a timeout to ensure the cron job finishes within its window
@@ -1540,90 +1562,99 @@ async def run_once(state_db: StateDB, send_test: bool = True):
                 timeout=cfg.MAX_EXEC_TIME
             )
         except asyncio.TimeoutError:
-            logger.error(f"❌ Execution exceeded MAX_EXEC_TIME of {cfg.MAX_EXEC_TIME} seconds. Aborting remaining tasks.")
+            logger.error(f"❌ Execution timed out after {cfg.MAX_EXEC_TIME} seconds.")
             raise SystemExit(EXIT_TIMEOUT)
         
-        # 5. Process Results
-        alerts_sent = 0
-        for pair_name, result in zip(cfg.PAIRS, results):
-            if stop_requested:
-                break
-                
-            if isinstance(result, Exception):
-                logger.error(f"Error in task for {pair_name}: {result}")
+        # 5. Process Results and Update State DB
+        success_count = 0
+        for pair_name, new_signal in zip(cfg.PAIRS, results):
+            if isinstance(new_signal, Exception):
+                logger.error(f"Exception during evaluation of {pair_name}: {new_signal}")
                 METRICS["logic_errors"] += 1
                 continue
-                
-            new_state, alert_info = result
             
-            if new_state:
-                # Update state only if a new, valid state was determined
-                state_db.set(pair_name, new_state)
-            elif new_state is None and last_alerts.get(pair_name):
-                 # Clear state if the new state is None and an old state exists
-                state_db.set(pair_name, None)
+            if new_signal is not None:
+                # Update state only if a new signal was generated or the previous one was repeated (to update timestamp)
+                state_db.set(pair_name, new_signal, now_ts())
+                if new_signal == last_alerts.get(pair_name, {}).get("state"):
+                    logger.debug(f"State updated (timestamp only) for {pair_name}: {new_signal}")
+                else:
+                    logger.debug(f"New state recorded for {pair_name}: {new_signal}")
+            else:
+                # Keep the previous state if no new signal and no reset logic is implemented here
+                pass 
                 
-            if alert_info:
-                alerts_sent += 1
-
-        # 6. Final Cleanup / Pruning / Metrics
-        prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
+            success_count += 1
         
-        # Update successful run timestamp for dead man's switch
-        state_db.set_metadata("last_success_run", str(now_ts()))
-        
+        # 6. Final Logging and Metrics
         METRICS["execution_time"] = time.time() - METRICS["start_time"]
-        logger.info(f"Run completed. Pairs checked: {METRICS['pairs_checked']}, Alerts sent: {alerts_sent}. Time: {METRICS['execution_time']:.2f}s")
-
+        
+        # Only update last_success_run if at least one pair was checked and no major failure occurred
+        if success_count > 0:
+            state_db.set_metadata("last_success_run", str(now_ts()))
+        
+        logger.info(f"Finished bot run. Pairs checked: {METRICS['pairs_checked']} | "
+                    f"Alerts sent: {METRICS['alerts_sent']} | Errors: API={METRICS['api_errors']}, "
+                    f"Net={METRICS['network_errors']}, Logic={METRICS['logic_errors']} | "
+                    f"Time: {METRICS['execution_time']:.2f}s")
 
 def main():
-    """Main function to handle locking and execution mode."""
-    global stop_requested
+    """Main entry point for the bot execution."""
     
-    # 1. Initialize DB and Lock
-    # Prune before the lock acquisition, as it's a file operation
+    # 0. Prune DB first (runs quickly)
     prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
-    state_db = StateDB(cfg.STATE_DB_PATH)
-
-    # Use configurable PID_LOCK_PATH
-    lock = ProcessLock(lock_path=cfg.PID_LOCK_PATH, timeout=cfg.MAX_EXEC_TIME + 60) 
     
-    try:
-        if not lock.acquire():
-            logger.warning(f"Exiting: Lock file in use by another process. (PID Lock Path: {cfg.PID_LOCK_PATH})")
-            sys.exit(EXIT_LOCK_CONFLICT)
-
-        reset_metrics()
+    # 1. Acquire Process Lock
+    lock = ProcessLock(cfg.PID_LOCK_PATH)
+    if not lock.acquire():
+        logger.critical(f"Process already running or lock failed. Exiting: {cfg.PID_LOCK_PATH}")
+        sys.exit(EXIT_LOCK_CONFLICT)
         
-        # Memory Check (Good safeguard for small environments)
-        # Use a try-except block in case psutil isn't fully supported
+    # 2. Check Memory Limit
+    try:
+        if psutil.virtual_memory().available < cfg.MEMORY_LIMIT_BYTES:
+            logger.critical(f"System memory too low: {psutil.virtual_memory().available / 1024**2:.0f}MB < {cfg.MEMORY_LIMIT_BYTES / 1024**2:.0f}MB")
+            # Proceed anyway, but log the critical error
+    except Exception:
+        logger.debug("Memory check: psutil error or not supported.")
+        
+    state_db = StateDB(cfg.STATE_DB_PATH)
+    if cfg.RESET_STATE:
         try:
-            if psutil.virtual_memory().available < cfg.MEMORY_LIMIT_BYTES:
-                logger.error(f"❌ Aborting: Insufficient memory. Available: {psutil.virtual_memory().available / 1024**2:.0f}MB, Required: {cfg.MEMORY_LIMIT_BYTES / 1024**2:.0f}MB")
-                raise SystemExit(EXIT_API_FAILURE)
-        except Exception:
-            logger.debug("Skipping memory check: psutil error or not supported.")
+            os.remove(cfg.STATE_DB_PATH)
+            logger.warning(f"State DB removed due to RESET_STATE=True: {cfg.STATE_DB_PATH}")
+        except Exception as e:
+            logger.warning(f"Could not remove DB file: {e}")
+        state_db = StateDB(cfg.STATE_DB_PATH) # Re-initialize
 
-
-        # Determine if running in an infinite loop (e.g., in a Docker container) 
+    try:
+        # Determine if running in an infinite loop (e.g., in a Docker container)
         # or as a single run (e.g., cron-jobs.org or GitHub Actions)
-        # The `--once` flag in your traceback suggests a single run, which is the default/else block.
         LOOP_MODE = str_to_bool(os.getenv("LOOP_MODE", "false"))
-
+        interval = cfg.RUN_LOOP_INTERVAL
+        
         if LOOP_MODE:
             # --- Loop Run Logic (for long-running host) ---
-            interval = cfg.RUN_LOOP_INTERVAL
-            logger.info(f"🔁 Loop mode started. Running every {interval} seconds.")
-            
-            # Start time used for the elapsed calculation
+            logger.info("🚀 Loop run mode.")
             loop_start = time.time()
+            stop_requested = False
+
+            def signal_handler(signum, frame):
+                nonlocal stop_requested
+                logger.info(f"Signal {signum} received. Stopping loop gracefully...")
+                stop_requested = True
             
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+
             while not stop_requested:
                 try:
-                    # Only send the test message on the first iteration of the loop
-                    asyncio.run(run_once(state_db, send_test=time.time() - loop_start < 5))
+                    # Run once will send the test message only on the first run (loop_start == time.time() is imprecise)
+                    # We'll rely on the simple 'send_test=True' which is only used on the first pass
+                    asyncio.run(run_once(state_db, send_test=True)) 
+                    cfg.SEND_TEST_MESSAGE = False # Prevent sending test message on subsequent loops
                 except SystemExit as e:
-                    logger.error(f"Run exited with code {e.code}, continuing loop.")
+                    logger.error(f"Exited with code {e.code} during loop.")
                     if e.code == EXIT_TIMEOUT:
                         logger.warning("Continuing loop after timeout exit.")
                     elif e.code != EXIT_API_FAILURE:
@@ -1635,12 +1666,12 @@ def main():
                 to_sleep = max(0, interval - elapsed)
                 
                 # Use simple sleep that respects stop_requested
-                if to_sleep > 0:
+                if to_sleep > 0 and not stop_requested:
                     logger.debug(f"Sleeping for {to_sleep:.2f} seconds.")
                     time.sleep(to_sleep)
 
                 # Restart the timer for the next loop
-                loop_start = time.time()
+                loop_start = time.time() if not stop_requested else loop_start
 
             sys.exit(EXIT_SUCCESS)
             
