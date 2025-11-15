@@ -1,18 +1,46 @@
-{"DEBUG_MODE": true,
+{
+  "TELEGRAM_BOT_TOKEN": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU",
+  "TELEGRAM_CHAT_ID": "203813932",
+  "DEBUG_MODE": true,
   "SEND_TEST_MESSAGE": true,
   "STATE_DB_PATH": "macd_state.sqlite",
   "LOG_FILE": "macd_bot.log",
   "STATE_EXPIRY_DAYS": 30,
   "DELTA_API_BASE": "https://api.india.delta.exchange",
+  "PID_LOCK_PATH": "/tmp/macd_bot.pid",
 
   "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
     "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
     "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
 
+  "SPECIAL_PAIRS": {
+    "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
+  },
+
+  "PPO_FAST": 7,
+  "PPO_SLOW": 16,
+  "PPO_SIGNAL": 5,
+  "PPO_USE_SMA": false,
+  "RMA_50_PERIOD": 50,
+  "RMA_200_PERIOD": 200,
+  "CIRRUS_CLOUD_ENABLED": true,
+  "X1": 22, "X2": 9, "X3": 15, "X4": 5,
+  "SRSI_RSI_LEN": 21, "SRSI_KALMAN_LEN": 5,
+
   "MAX_PARALLEL_FETCH": 8,
   "HTTP_TIMEOUT": 15,
-  "MAX_CONCURRENCY": 6,
-  "MAX_EXEC_TIME": 25,
-  "DEADMAN_HOURS": 2,
+  "CANDLE_FETCH_RETRIES": 3,
+  "CANDLE_FETCH_BACKOFF": 1.5,
+  "JITTER_MIN": 0.1,
+  "JITTER_MAX": 0.8,
+  "RUN_TIMEOUT_SECONDS": 600,
+  "BATCH_SIZE": 4,
+  "LOG_LEVEL": "INFO",
+  "TELEGRAM_RETRIES": 3,
+  "TELEGRAM_BACKOFF_BASE": 2.0,
+  "MEMORY_LIMIT_BYTES": 400000000,
+  "TCP_CONN_LIMIT": 8,
+  "DEAD_MANS_COOLDOWN_SECONDS": 14400,
 
-  "BOT_NAME": "MACD Alert Bot"}
+  "BOT_NAME": "MACD Alert Bot"
+}
