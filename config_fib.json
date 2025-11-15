@@ -1,6 +1,10 @@
-{"DEBUG_MODE": true,
+{
+  "TELEGRAM_BOT_TOKEN": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU",
+  "TELEGRAM_CHAT_ID": "203813932",
+  "DEBUG_MODE": true,
   "SEND_TEST_MESSAGE": true,
   "STATE_DB_PATH": "fib_state.sqlite",
+  "LOCK_FILE_PATH": "fib_pivot.lock",
   "LOG_FILE": "fibonacci_pivot_bot.log",
   "STATE_EXPIRY_DAYS": 30,
   "DELTA_API_BASE": "https://api.india.delta.exchange",
@@ -9,10 +13,10 @@
     "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
     "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
 
-  "MAX_PARALLEL_FETCH": 8,
-  "HTTP_TIMEOUT": 15,
   "MAX_CONCURRENCY": 6,
+  "HTTP_TIMEOUT": 15,
   "MAX_EXEC_TIME": 25,
   "DEADMAN_HOURS": 2,
 
-  "BOT_NAME": "Fibonacci Pivot Bot"}
+  "BOT_NAME": "Fibonacci Pivot Bot"
+} 
