@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# macd_bot_improved_pydantic.py
-# Python 3.12 — production-hardened MACD/PPO bot with corrected MMH reversal logic and Pydantic config.
+# macd_bot_improved.py
+# Python 3.12 — production-hardened MACD/PPO bot with corrected MMH reversal logic and Pydantic v2 config.
 
 from __future__ import annotations
 
@@ -27,9 +27,16 @@ import pytz
 import psutil
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
 from logging.handlers import RotatingFileHandler
-from pydantic import Field
+
+# ✅ Pydantic v2 imports
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
-from pydantic import field_validator, model_validator
+
+# ==========================================================
+# Configuration via Pydantic (env + optional JSON file)
+# ==========================================================
+
+    
 
 
 # ==========================================================
@@ -37,17 +44,14 @@ from pydantic import field_validator, model_validator
 # ==========================================================
 
 class Settings(BaseSettings):
-    # Core
     TELEGRAM_BOT_TOKEN: str = Field(default="xxxx")
     TELEGRAM_CHAT_ID: str = Field(default="xxxx")
     DELTA_API_BASE: str = Field(default="https://api.india.delta.exchange")
     BOT_NAME: str = Field(default="MACD Alert Bot")
 
-    # Debug and messaging
     DEBUG_MODE: bool = Field(default=False)
     SEND_TEST_MESSAGE: bool = Field(default=False)
 
-    # Pairs and special rules
     PAIRS: List[str] = Field(default_factory=lambda: [
         "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
         "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"
@@ -55,7 +59,7 @@ class Settings(BaseSettings):
     SPECIAL_PAIRS: Dict[str, Dict[str, int]] = Field(default_factory=lambda: {
         "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
     })
-
+    
     # Indicators
     PPO_FAST: int = 7
     PPO_SLOW: int = 16
@@ -77,8 +81,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO")
     PID_FILE_PATH: str = Field(default="/tmp/macd_bot.pid")
 
-    # HTTP and concurrency
-    MAX_PARALLEL_FETCH: int = Field(default=4)  # per fetcher semaphore
+    MAX_PARALLEL_FETCH: int = Field(default=4)
     HTTP_TIMEOUT: int = Field(default=15)
     CANDLE_FETCH_RETRIES: int = Field(default=3)
     CANDLE_FETCH_BACKOFF: float = Field(default=1.5)
@@ -86,18 +89,15 @@ class Settings(BaseSettings):
     JITTER_MAX: float = Field(default=0.8)
     TCP_CONN_LIMIT: int = Field(default=8)
 
-    # Execution controls
     STATE_EXPIRY_DAYS: int = Field(default=30)
     RUN_TIMEOUT_SECONDS: int = Field(default=600)
     BATCH_SIZE: int = Field(default=4)
     MEMORY_LIMIT_BYTES: int = Field(default=400_000_000)
     DEAD_MANS_COOLDOWN_SECONDS: int = Field(default=4 * 3600)
 
-    # Telegram retry controls
     TELEGRAM_RETRIES: int = Field(default=3)
     TELEGRAM_BACKOFF_BASE: float = Field(default=2.0)
 
-    # Optional config file (to merge over defaults)
     CONFIG_FILE: Optional[str] = Field(default="config_macd.json")
 
     class Config:
@@ -105,105 +105,78 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         case_sensitive = False
 
+    # --- Validators (Pydantic v2 style) ---
     @field_validator("DELTA_API_BASE")
     def strip_api_base(cls, v: str) -> str:
         return v.rstrip("/")
 
-
-    @validator("LOG_LEVEL")
-    def validate_log_level(cls, v):
+    @field_validator("LOG_LEVEL")
+    def validate_log_level(cls, v: str) -> str:
         lv = v.strip().upper()
-        valid = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
-        if lv not in valid:
-            return "INFO"
-        return lv
+        return lv if lv in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"} else "INFO"
 
-    @validator("MAX_PARALLEL_FETCH")
-    def validate_max_parallel_fetch(cls, v):
-        return max(1, min(32, v))  # allow up to 32, we cross-check with TCP later
+    @field_validator("MAX_PARALLEL_FETCH")
+    def validate_max_parallel_fetch(cls, v: int) -> int:
+        return max(1, min(32, v))
 
-    @validator("BATCH_SIZE")
-    def validate_batch_size(cls, v):
+    @field_validator("BATCH_SIZE")
+    def validate_batch_size(cls, v: int) -> int:
         return max(1, min(64, v))
 
-    @validator("HTTP_TIMEOUT")
-    def validate_http_timeout(cls, v):
+    @field_validator("HTTP_TIMEOUT")
+    def validate_http_timeout(cls, v: int) -> int:
         return max(5, min(120, v))
 
-    @validator("JITTER_MAX")
-    def validate_jitter(cls, v, values):
-        jm = float(v)
-        jmin = float(values.get("JITTER_MIN", 0.1))
-        if jm < jmin:
-            return max(jmin, jm)
-        return jm
+    @field_validator("JITTER_MAX")
+    def validate_jitter(cls, v: float, info) -> float:
+        jmin = info.data.get("JITTER_MIN", 0.1)
+        return max(v, jmin)
 
-    @validator("TELEGRAM_RETRIES")
-    def validate_tel_retries(cls, v):
+    @field_validator("TELEGRAM_RETRIES")
+    def validate_tel_retries(cls, v: int) -> int:
         return max(0, min(10, v))
 
-    @validator("TELEGRAM_BACKOFF_BASE")
-    def validate_tel_backoff(cls, v):
+    @field_validator("TELEGRAM_BACKOFF_BASE")
+    def validate_tel_backoff(cls, v: float) -> float:
         return max(1.0, min(5.0, v))
 
     @model_validator(mode="after")
     def cross_validate(self) -> "Settings":
-    values = self.__dict__
-    
-    # Merge JSON config file if present
+        values = self.__dict__
+
+        # Merge JSON config file if present
         cfg_file = values.get("CONFIG_FILE")
         if cfg_file and Path(cfg_file).exists():
             try:
                 with open(cfg_file, "r", encoding="utf-8") as f:
                     user_cfg = json.load(f)
-                # Merge only known fields
                 for k, val in user_cfg.items():
                     if k in values:
                         values[k] = val
             except Exception:
-                # Non-fatal; keep env/defaults
                 pass
 
-        # Required fields sanity
-        token = values.get("TELEGRAM_BOT_TOKEN")
-        chat = values.get("TELEGRAM_CHAT_ID")
-        api = values.get("DELTA_API_BASE")
-
-        # Pairs must be non-empty list
-        pairs = values.get("PAIRS", [])
-        if not isinstance(pairs, list) or len(pairs) == 0:
+        # Sanity checks
+        if not isinstance(values.get("PAIRS"), list) or len(values["PAIRS"]) == 0:
             raise ValueError("PAIRS must be a non-empty list")
 
-        # Run timeout minimum
         run_timeout = int(values.get("RUN_TIMEOUT_SECONDS", 600))
         if run_timeout < 60:
             raise ValueError("RUN_TIMEOUT_SECONDS must be at least 60 seconds")
 
-        # Cross-check concurrency vs connector
         max_parallel = int(values.get("MAX_PARALLEL_FETCH", 4))
         tcp_limit = int(values.get("TCP_CONN_LIMIT", 8))
         if max_parallel > tcp_limit:
-            # Cap parallel fetch to connector limit to prevent starvation
             values["MAX_PARALLEL_FETCH"] = tcp_limit
 
-        # Validate DELTA_API_BASE
-        if not api or not api.startswith("http"):
+        if not values.get("DELTA_API_BASE", "").startswith("http"):
             raise ValueError("DELTA_API_BASE must be a valid URL")
-
-        # Telegram can be intentionally disabled via "xxxx"; do not hard fail.
-        # But warn if one is configured and the other isn't.
-        if (token != "xxxx" and chat == "xxxx") or (token == "xxxx" and chat != "xxxx"):
-            logging.getLogger("macd_bot").warning("Telegram config is partial; alerts will be skipped.")
-
-        # PID path safe default
-        pid_path = values.get("PID_FILE_PATH", "/tmp/macd_bot.pid")
-        if not pid_path:
-            values["PID_FILE_PATH"] = "/tmp/macd_bot.pid"
 
         return self
 
-
+# Instantiate config
 cfg = Settings()
+                
 
 # ==========================================================
 # Logger setup (standardized format)
