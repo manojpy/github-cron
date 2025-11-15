@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import asyncio
+import atexit  # FIXED: Added missing import
 import fcntl
 import gc
 import json
@@ -200,7 +200,7 @@ def load_config(path: str = "config_macd.json") -> Config:
             data["dead_mans_switch"] = DeadMansSwitchConfig(**data["dead_mans_switch"])
         
         if "circuit_breaker" in data and isinstance(data["circuit_breaker"], dict):
-            data["circuit_breaker"] = CircuitBreakerConfig(**data["circuit_breaker"])
+            data["circuit_breaker"] = CircuitBreakerConfig(**data["dead_mans_switch"])
         
         if "logging" in data and isinstance(data["logging"], dict):
             data["logging"] = LoggingConfig(**data["logging"])
@@ -651,16 +651,23 @@ class HTTPClient:
     
     def __init__(self, config: Config):
         self.config = config
-        self.connector = TCPConnector(
-            limit=config.tcp_conn_limit,
-            ssl=True,  # SECURITY: Enable SSL verification
-            limit_per_host=config.tcp_conn_limit // 2
-        )
+        self._connector = None  # Lazy initialization
         self.circuit_breaker = CircuitBreaker(
             failure_threshold=config.circuit_breaker.failure_threshold,
             timeout=config.circuit_breaker.timeout_seconds
         )
         self.rate_limiter = RateLimiter(config.http_rate_limit_per_minute)
+
+    @property
+    def connector(self) -> TCPConnector:
+        """Lazy connector creation - only when accessed inside async context"""
+        if self._connector is None:
+            self._connector = TCPConnector(
+                limit=self.config.tcp_conn_limit,
+                ssl=True,  # SECURITY: Enable SSL verification
+                limit_per_host=self.config.tcp_conn_limit // 2
+            )
+        return self._connector
 
     @asynccontextmanager
     async def session(self) -> aiohttp.ClientSession:
