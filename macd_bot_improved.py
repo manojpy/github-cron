@@ -27,7 +27,8 @@ import pytz
 import psutil
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
 from logging.handlers import RotatingFileHandler
-from pydantic import BaseSettings, Field, validator, root_validator
+from pydantic import Field, validator, root_validator
+from pydantic_settings import BaseSettings
 
 # ==========================================================
 # Configuration via Pydantic (env + optional JSON file)
