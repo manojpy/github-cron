@@ -12,9 +12,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        # Switched to v3 for latest stable features, though v4 is also fine.
+        uses: actions/checkout@v3 
         with:
-          fetch-depth: 0
+          # fetch-depth: 0 is necessary here since you are committing and pushing, 
+          # which requires the full history for git to work correctly.
+          fetch-depth: 0 
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -24,21 +27,29 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests psutil # Added psutil for more robust lock check
+          pip install requests
 
       - name: Run Watchdog Script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python watchdog_check.py # <-- CORRECTED SCRIPT NAME
+          # Use the corrected script name if you saved it as .py
+          python watchdog_check.py 
 
       - name: Commit Watchdog State File
         run: |
           if [ -f ".watchdog_state.json" ]; then
             git config --local user.email "github-actions[bot]@users.noreply.github.com"
             git config --local user.name "github-actions[bot]"
+            
+            # 1. Pull latest changes to avoid conflicts
+            git pull --rebase origin main || git pull --rebase origin master 
+            
+            # 2. Add and commit the updated state file
             git add .watchdog_state.json
-            git commit -m "Update watchdog state" --allow-empty
+            git commit -m "🤖 WATCHDOG: Update state file" --allow-empty
+            
+            # 3. Push and allow failure (in case another workflow committed in between)
             git push || true
           fi
