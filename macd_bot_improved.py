@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import argparse  # Added as requested
+import argparse
 import asyncio
-import fcntl  # FIXED: Added missing import
+import fcntl
 import gc
 import json
 import logging
@@ -165,25 +165,53 @@ class Config(BaseSettings):
         Validate max_parallel_fetch is reasonable for I/O-bound operations.
         For network operations, we can safely exceed CPU cores.
         """
-        cpu_cores = os.cpu_count() or 1
-        
-        # For I/O-bound asyncio operations, allow higher concurrency
-        # The practical limit is usually network/API constraints, not CPU
+        if v < 1:
+            raise ValueError("max_parallel_fetch must be at least 1")
         if v > 32:
             warnings.warn(
                 f"max_parallel_fetch={v} is very high. "
                 f"Consider reducing if you experience network issues.",
                 stacklevel=2
             )
+        return v
+
+
+# ============================================================================
+# Standalone Config Loader
+# ============================================================================
+def load_config(path: str = "config_macd.json") -> Config:
+    """Load and validate configuration from JSON file"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
         
-        # Only warn if it's unusually low or high for typical use
-        if v < 2:
-            warnings.warn(
-                f"max_parallel_fetch={v} is very low and may cause slow execution",
-                stacklevel=2
-            )
+        # Convert nested dicts to proper types
+        if "telegram" in data and isinstance(data["telegram"], dict):
+            data["telegram"] = TelegramConfig(**data["telegram"])
         
-        return min(max(1, v), 32)  # Allow up to 32 for I/O-bound ops
+        if "special_pairs" in data and isinstance(data["special_pairs"], dict):
+            data["special_pairs"] = {
+                k: SpecialPairConfig(**v) if isinstance(v, dict) else v
+                for k, v in data["special_pairs"].items()
+            }
+        
+        if "dead_mans_switch" in data and isinstance(data["dead_mans_switch"], dict):
+            data["dead_mans_switch"] = DeadMansSwitchConfig(**data["dead_mans_switch"])
+        
+        if "circuit_breaker" in data and isinstance(data["circuit_breaker"], dict):
+            data["circuit_breaker"] = CircuitBreakerConfig(**data["circuit_breaker"])
+        
+        if "logging" in data and isinstance(data["logging"], dict):
+            data["logging"] = LoggingConfig(**data["logging"])
+        
+        return Config(**data)
+    
+    except FileNotFoundError:
+        raise ValueError(f"Config file not found: {path}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in config file: {e}")
+    except ValidationError as e:
+        raise ValueError(f"Configuration validation failed: {e}")
 
 
 # ============================================================================
@@ -1833,8 +1861,7 @@ async def run_once(
             extra={"context": run_stats}
         )
         
-        return run_stats
-        
+        return run_stats        
     except Exception as e:
         logger.critical(
             "Run failed",
@@ -1844,7 +1871,6 @@ async def run_once(
         run_stats["errors"].append(str(e))
         run_stats["duration"] = time.time() - start_time
         raise
-
     finally:
         # Cleanup
         try:
@@ -1901,7 +1927,7 @@ def main():
 
     # Load configuration
     try:
-        config = Config.from_json_file(args.config)
+        config = load_config(args.config)
     except ValueError as e:
         print(f"❌ Configuration error: {e}", file=sys.stderr)
         sys.exit(1)
