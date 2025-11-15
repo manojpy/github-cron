@@ -1,18 +1,68 @@
-{"DEBUG_MODE": true,
-  "SEND_TEST_MESSAGE": true,
-  "STATE_DB_PATH": "macd_state.sqlite",
-  "LOG_FILE": "macd_bot.log",
-  "STATE_EXPIRY_DAYS": 30,
-  "DELTA_API_BASE": "https://api.india.delta.exchange",
-
-  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
+{
+  "telegram": {
+    "bot_token": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU",
+    "chat_id": "203813932"
+  },
+  "debug_mode": true,
+  "send_test_message": true,
+  "delta_api_base": "https://api.india.delta.exchange",
+  "pairs": [
+    "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
     "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
-    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
-
-  "MAX_PARALLEL_FETCH": 8,
-  "HTTP_TIMEOUT": 15,
-  "MAX_CONCURRENCY": 6,
-  "MAX_EXEC_TIME": 25,
-  "DEADMAN_HOURS": 2,
-
-  "BOT_NAME": "MACD Alert Bot"}
+    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"
+  ],
+  "special_pairs": {
+    "SOLUSD": {
+      "limit_15m": 210,
+      "min_required": 180,
+      "limit_5m": 300,
+      "min_required_5m": 200
+    }
+  },
+  "ppo_fast": 7,
+  "ppo_slow": 16,
+  "ppo_signal": 5,
+  "ppo_use_sma": false,
+  "rma_50_period": 50,
+  "rma_200_period": 200,
+  "cirrus_cloud_enabled": true,
+  "x1": 22,
+  "x2": 9,
+  "x3": 15,
+  "x4": 5,
+  "srsi_rsi_len": 21,
+  "srsi_kalman_len": 5,
+  "state_db_path": "macd_state.sqlite",
+  "state_expiry_days": 30,
+  "max_parallel_fetch": 8,
+  "http_timeout": 15,
+  "candle_fetch_retries": 3,
+  "candle_fetch_backoff": 1.5,
+  "jitter_min": 0.1,
+  "jitter_max": 0.8,
+  "run_timeout_seconds": 600,
+  "batch_size": 4,
+  "telegram_retries": 3,
+  "telegram_backoff_base": 2.0,
+  "http_rate_limit_per_minute": 60,
+  "memory_limit_bytes": 400000000,
+  "tcp_conn_limit": 8,
+  "dead_mans_switch": {
+    "enabled": true,
+    "hours": 2,
+    "cooldown_seconds": 14400
+  },
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "timeout_seconds": 300
+  },
+  "pid_lock_path": "/tmp/macd_bot.pid",
+  "logging": {
+    "level": "INFO",
+    "format": "json",
+    "file": "macd_bot.log",
+    "max_bytes": 5000000,
+    "backup_count": 5
+  },
+  "bot_name": "MACD Alert Bot"
+}
