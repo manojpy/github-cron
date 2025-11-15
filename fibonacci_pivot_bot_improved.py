@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # python 3.12+
 """
-Improved Fibonacci Pivot Bot - Corrected Version
-- Removed PPO calculations and conditions
-- Changed wick threshold to 20%
-- Limited Buy signals to P, S1, S2, S3, R1, R2 (exclude R3)
-- Limited Sell signals to P, S1, S2, R1, R2, R3 (exclude S3)
-- Kept VWAP crossover alerts with common conditions
+Improved Fibonacci Pivot Bot - Enhanced Version
+- Pydantic 2.0 compliance
+- Standardized JSON logging
+- Configurable PID lock path
+- Improved dead man's switch
+- Shared aiohttp.ClientSession
+- Enhanced error handling and stability
 """
 
 from __future__ import annotations
@@ -32,104 +33,109 @@ import pandas as pd
 import numpy as np
 import pytz
 import psutil
-from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
+from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientTimeout
 from logging.handlers import RotatingFileHandler
 
 # Pydantic V2 imports
 try:
-    from pydantic import BaseModel, field_validator
-except Exception:
-    print("⚠️ pydantic not found. Install with: pip install 'pydantic>=2.5.0'")
-    raise
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
+except ImportError:
+    print("❌ pydantic not found. Install with: pip install 'pydantic>=2.5.0'")
+    sys.exit(1)
 
 # -------------------------
 # CONFIGURATION MODEL
 # -------------------------
 class Config(BaseModel):
-    TELEGRAM_BOT_TOKEN: str
-    TELEGRAM_CHAT_ID: str
+    model_config = ConfigDict(extra='ignore')
+    
+    TELEGRAM_BOT_TOKEN: str = Field(..., min_length=10)
+    TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     DEBUG_MODE: bool = False
     SEND_TEST_MESSAGE: bool = True
     RESET_STATE: bool = False
     DELTA_API_BASE: str = "https://api.india.delta.exchange"
-    PAIRS: List[str] = ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"]
-    SPECIAL_PAIRS: Dict[str, Dict[str, int]] = {"SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}}
-    X1: int = 22
-    X2: int = 9
-    X3: int = 15
-    X4: int = 5
-    PIVOT_LOOKBACK_PERIOD: int = 15
+    PAIRS: List[str] = Field(default=[
+        "BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", 
+        "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"
+    ])
+    SPECIAL_PAIRS: Dict[str, Dict[str, int]] = Field(default={
+        "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
+    })
+    X1: int = Field(default=22, ge=1)
+    X2: int = Field(default=9, ge=1)
+    X3: int = Field(default=15, ge=1)
+    X4: int = Field(default=5, ge=1)
+    PIVOT_LOOKBACK_PERIOD: int = Field(default=15, ge=1)
     STATE_DB_PATH: str = "fib_state.sqlite"
     LOG_FILE: str = "fibonacci_pivot_bot.log"
-    MAX_CONCURRENCY: int = 6
-    HTTP_TIMEOUT: int = 15
-    FETCH_RETRIES: int = 3
-    FETCH_BACKOFF: float = 1.5
-    JITTER_MIN: float = 0.05
-    JITTER_MAX: float = 0.6
-    STATE_EXPIRY_DAYS: int = 30
-    DUPLICATE_SUPPRESSION_SECONDS: int = 3600
-    EXTREME_CANDLE_PCT: float = 8.0
-    RUN_LOOP_INTERVAL: int = 900
-    MAX_EXEC_TIME: int = 25
+    LOCK_FILE_PATH: str = "fib_pivot.lock"
+    MAX_CONCURRENCY: int = Field(default=6, ge=1, le=20)
+    HTTP_TIMEOUT: int = Field(default=15, ge=5, le=60)
+    FETCH_RETRIES: int = Field(default=3, ge=1, le=5)
+    FETCH_BACKOFF: float = Field(default=1.5, ge=1.0, le=5.0)
+    JITTER_MIN: float = Field(default=0.05, ge=0.0, le=1.0)
+    JITTER_MAX: float = Field(default=0.6, ge=0.0, le=2.0)
+    STATE_EXPIRY_DAYS: int = Field(default=30, ge=1)
+    DUPLICATE_SUPPRESSION_SECONDS: int = Field(default=3600, ge=300)
+    EXTREME_CANDLE_PCT: float = Field(default=8.0, ge=0.1, le=50.0)
+    RUN_LOOP_INTERVAL: int = Field(default=900, ge=60)
+    MAX_EXEC_TIME: int = Field(default=25, ge=10, le=300)
     USE_RMA200: bool = True
-    PRODUCTS_CACHE_TTL: int = 86400
+    PRODUCTS_CACHE_TTL: int = Field(default=86400, ge=3600)
     LOG_LEVEL: str = "INFO"
-    TELEGRAM_RETRIES: int = 3
-    TELEGRAM_BACKOFF_BASE: float = 2.0
-    MEMORY_LIMIT_BYTES: int = 400_000_000
+    TELEGRAM_RETRIES: int = Field(default=3, ge=1, le=5)
+    TELEGRAM_BACKOFF_BASE: float = Field(default=2.0, ge=1.0, le=5.0)
+    MEMORY_LIMIT_BYTES: int = Field(default=400_000_000, ge=100_000_000)
+    DEADMAN_HOURS: float = Field(default=2.0, ge=0.5, le=24.0)
 
-    @field_validator("TELEGRAM_BOT_TOKEN")
+    @field_validator("PAIRS")
     @classmethod
-    def token_not_default(cls, v):
-        if not v or v == "xxxx":
-            raise ValueError("TELEGRAM_BOT_TOKEN must be set and not be 'xxxx'")
-        return v
+    def validate_pairs(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("PAIRS list cannot be empty")
+        return [p.upper().replace(" ", "") for p in v]
 
-    @field_validator("TELEGRAM_CHAT_ID")
+    @field_validator("LOG_LEVEL")
     @classmethod
-    def chat_id_not_default(cls, v):
-        if not v or v == "xxxx":
-            raise ValueError("TELEGRAM_CHAT_ID must be set and not be 'xxxx'")
-        return v
+    def validate_log_level(cls, v: str) -> str:
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        if v.upper() not in valid_levels:
+            raise ValueError(f"LOG_LEVEL must be one of {valid_levels}")
+        return v.upper()
 
 # -------------------------
-# DEFAULT CONFIG
+# CONFIG LOADER
 # -------------------------
-DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU",
-    "TELEGRAM_CHAT_ID": "203813932",
-    "DEBUG_MODE": False,
-    "SEND_TEST_MESSAGE": True,
-    "RESET_STATE": False,
-    "DELTA_API_BASE": "https://api.india.delta.exchange",
-    "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
-    "SPECIAL_PAIRS": {"SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}},
-    "X1": 22,
-    "X2": 9,
-    "X3": 15,
-    "X4": 5,
-    "PIVOT_LOOKBACK_PERIOD": 15,
-    "STATE_DB_PATH": "fib_state.sqlite",
-    "LOG_FILE": "fibonacci_pivot_bot.log",
-    "MAX_CONCURRENCY": 6,
-    "HTTP_TIMEOUT": 15,
-    "FETCH_RETRIES": 3,
-    "FETCH_BACKOFF": 1.5,
-    "JITTER_MIN": 0.05,
-    "JITTER_MAX": 0.6,
-    "STATE_EXPIRY_DAYS": 30,
-    "DUPLICATE_SUPPRESSION_SECONDS": 3600,
-    "EXTREME_CANDLE_PCT": 8.0,
-    "RUN_LOOP_INTERVAL": 900,
-    "MAX_EXEC_TIME": 25,
-    "USE_RMA200": True,
-    "PRODUCTS_CACHE_TTL": 86400,
-    "LOG_LEVEL": "INFO",
-    "TELEGRAM_RETRIES": 3,
-    "TELEGRAM_BACKOFF_BASE": 2.0,
-    "MEMORY_LIMIT_BYTES": 400_000_000,
-}
+def str_to_bool(value: str) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
+
+def load_config() -> Config:
+    config_file = os.getenv("CONFIG_FILE", "config_fib.json")
+    
+    if not Path(config_file).exists():
+        print(f"❌ Config file {config_file} not found")
+        sys.exit(1)
+    
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            user_cfg = json.load(f)
+        
+        # Validate required Telegram fields
+        if not user_cfg.get("TELEGRAM_BOT_TOKEN") or user_cfg.get("TELEGRAM_BOT_TOKEN") == "xxxx":
+            raise ValueError("TELEGRAM_BOT_TOKEN must be set in config file")
+        if not user_cfg.get("TELEGRAM_CHAT_ID") or user_cfg.get("TELEGRAM_CHAT_ID") == "xxxx":
+            raise ValueError("TELEGRAM_CHAT_ID must be set in config file")
+        
+        print(f"✅ Loaded configuration from {config_file}")
+        return Config(**user_cfg)
+        
+    except Exception as e:
+        print(f"❌ Error loading config: {e}")
+        sys.exit(1)
+
+# Load configuration
+cfg = load_config()
 
 # -------------------------
 # EXIT CODES
@@ -139,46 +145,6 @@ EXIT_LOCK_CONFLICT = 2
 EXIT_TIMEOUT = 3
 EXIT_CONFIG_ERROR = 4
 EXIT_API_FAILURE = 5
-
-# -------------------------
-# CONFIG LOADER
-# -------------------------
-def str_to_bool(value): return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
-
-def load_config() -> Config:
-    base = DEFAULT_CONFIG.copy()
-    config_file = os.getenv("CONFIG_FILE", "config_fib.json")
-
-    if Path(config_file).exists():
-        try:
-            with open(config_file, "r", encoding="utf-8") as f:
-                user_cfg = json.load(f)
-            base.update(user_cfg)
-            print(f"✅ Loaded configuration from {config_file}")
-        except Exception as e:
-            print(f"⚠️ Warning: unable to parse {config_file}: {e}")
-    else:
-        print(f"⚠️ Warning: config file {config_file} not found, using defaults.")
-
-    def override(key, default=None, cast=None):
-        val = os.getenv(key)
-        if val is not None:
-            base[key] = cast(val) if cast else val
-        else:
-            base[key] = base.get(key, default)
-
-    override("DEBUG_MODE", False, str_to_bool)
-    override("SEND_TEST_MESSAGE", False, str_to_bool)
-    override("STATE_DB_PATH")
-    override("LOG_FILE")
-    override("DELTA_API_BASE")
-    override("MAX_CONCURRENCY", 6, int)
-    override("HTTP_TIMEOUT", 15, int)
-    override("MAX_EXEC_TIME", 25, int)
-
-    return Config(**base)
-
-cfg = load_config()
 
 # -------------------------
 # METRICS
@@ -205,35 +171,65 @@ def reset_metrics():
     })
 
 # -------------------------
-# LOGGER
+# STANDARDIZED LOGGING
 # -------------------------
-logger = logging.getLogger("fibonacci_pivot_bot")
-log_level = getattr(logging, cfg.LOG_LEVEL if isinstance(cfg.LOG_LEVEL, str) else "INFO", logging.INFO)
-logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else log_level)
-
 class JSONFormatter(logging.Formatter):
-    def format(self, record):
-        log_obj = {"time": self.formatTime(record), "level": record.levelname, "msg": record.getMessage()}
-        return json.dumps(log_obj, ensure_ascii=False)
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno
+        }
+        
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+            
+        return json.dumps(log_entry, ensure_ascii=False)
 
-formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s") if cfg.DEBUG_MODE else JSONFormatter()
+def setup_logging():
+    logger = logging.getLogger("fibonacci_pivot_bot")
+    
+    # Clear any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    log_level = getattr(logging, cfg.LOG_LEVEL, logging.INFO)
+    logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else log_level)
+    
+    # Console handler with JSON format
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(JSONFormatter())
+    logger.addHandler(console_handler)
+    
+    # File handler with rotation
+    try:
+        file_handler = RotatingFileHandler(
+            cfg.LOG_FILE, 
+            maxBytes=10_000_000,  # 10MB
+            backupCount=5, 
+            encoding="utf-8"
+        )
+        file_handler.setFormatter(JSONFormatter())
+        logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"⚠️ Could not create log file: {e}")
+    
+    # Prevent propagation to root logger
+    logger.propagate = False
+    
+    return logger
 
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-
-try:
-    file_handler = RotatingFileHandler(cfg.LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-except Exception as e:
-    logger.warning(f"Could not create rotating log file: {e}")
+logger = setup_logging()
 
 # -------------------------
-# PROCESS LOCKING
+# PROCESS LOCKING (Configurable Path)
 # -------------------------
 class ProcessLock:
-    """File-based lock with stale detection"""
+    """File-based lock with stale detection and configurable path"""
     def __init__(self, lock_path: str, timeout: int = 1200):
         self.lock_path = Path(lock_path)
         self.timeout = timeout
@@ -247,6 +243,7 @@ class ProcessLock:
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fd.write(str(os.getpid()))
             self.fd.flush()
+            logger.debug(f"Acquired lock: {self.lock_path}")
             return True
         except (IOError, OSError):
             try:
@@ -254,15 +251,16 @@ class ProcessLock:
                     with open(self.lock_path, 'r') as f:
                         raw = f.read().strip()
                     old_pid = int(raw) if raw.isdigit() else None
-                    if old_pid and not os.path.exists(f"/proc/{old_pid}"):
+                    if old_pid and not psutil.pid_exists(old_pid):
                         logger.warning(f"Removing stale lock from PID {old_pid}")
                         try:
                             self.lock_path.unlink(missing_ok=True)
                         except Exception:
                             pass
                         return self.acquire()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error checking stale lock: {e}")
+            
             if self.fd:
                 try:
                     self.fd.close()
@@ -286,6 +284,7 @@ class ProcessLock:
                 self.lock_path.unlink(missing_ok=True)
             except Exception:
                 pass
+            logger.debug(f"Released lock: {self.lock_path}")
         except Exception as e:
             logger.debug(f"Error releasing lock: {e}")
 
@@ -440,16 +439,14 @@ class StateDB:
 # -------------------------
 # PRUNE (smart daily)
 # -------------------------
-def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: logging.Logger = None):
+def prune_old_state_records(db_path: str, expiry_days: int = 30):
     try:
         if expiry_days <= 0:
-            if logger_local:
-                logger_local.debug("Pruning disabled (expiry_days <= 0)")
+            logger.debug("Pruning disabled (expiry_days <= 0)")
             return
 
         if not os.path.exists(db_path):
-            if logger_local:
-                logger_local.info(f"State DB not found at {db_path}; skipping prune.")
+            logger.info(f"State DB not found at {db_path}; skipping prune.")
             return
 
         conn = sqlite3.connect(db_path)
@@ -469,8 +466,7 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
             try:
                 last_prune_date = datetime.fromisoformat(row[0]).date()
                 if last_prune_date >= today:
-                    if logger_local:
-                        logger_local.debug("Prune already run today; skipping.")
+                    logger.debug("Prune already run today; skipping.")
                     conn.close()
                     return
             except Exception:
@@ -478,8 +474,7 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
 
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='states'")
         if not cur.fetchone():
-            if logger_local:
-                logger_local.debug("No states table yet; skipping prune.")
+            logger.debug("No states table yet; skipping prune.")
             conn.close()
             return
 
@@ -494,16 +489,13 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
             try:
                 cur.execute("VACUUM;")
             except Exception as e:
-                if logger_local:
-                    logger_local.warning(f"VACUUM failed: {e}")
+                logger.warning(f"VACUUM failed: {e}")
 
         conn.close()
-        if logger_local:
-            logger_local.info(f"Pruned {deleted} states older than {expiry_days} days from {db_path}.")
+        logger.info(f"Pruned {deleted} states older than {expiry_days} days from {db_path}.")
     except Exception as e:
-        if logger_local:
-            logger_local.warning(f"Prune failed: {e}")
-            logger_local.debug(traceback.format_exc())
+        logger.warning(f"Prune failed: {e}")
+        logger.debug(traceback.format_exc())
 
 # -------------------------
 # ASYNC HTTP HELPERS
@@ -520,7 +512,7 @@ async def fetch_json_with_retries(
     async def _fetch():
         for attempt in range(1, retries + 1):
             try:
-                async with session.get(url, params=params, timeout=timeout) as resp:
+                async with session.get(url, params=params, timeout=ClientTimeout(total=timeout)) as resp:
                     text = await resp.text()
                     if resp.status >= 400:
                         logger.debug(f"HTTP {resp.status} {url} {params} - {text[:200]}")
@@ -610,8 +602,8 @@ def load_products_cache() -> Optional[Dict[str, dict]]:
         try:
             age = time.time() - cache_path.stat().st_mtime
             if age < cfg.PRODUCTS_CACHE_TTL:
+                logger.info(f"Using cached products ({age:.0f}s old)")
                 with open(cache_path, "r", encoding="utf-8") as f:
-                    logger.info(f"Using cached products ({age:.0f}s old)")
                     return json.load(f)
         except Exception as e:
             logger.debug(f"Cache load failed: {e}")
@@ -747,7 +739,6 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
     return smooth_rsi
 
-# Corrected Magical Momentum Histogram per Pinescript v6
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
     n = len(df)
     if n == 0:
@@ -946,8 +937,9 @@ async def evaluate_pair_async(
         df_15m = parse_candle_response(res15)
         df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
 
-        last_i_15m = -2
-        last_i_5m = -2
+        # CORRECTED: Use -1 for last completed candle
+        last_i_15m = -1
+        last_i_5m = -1
         
         if df_15m is None or len(df_15m) < min_required_15m:
             logger.debug(f"{pair_name}: Insufficient 15m data (got {len(df_15m) if df_15m is not None else 0}, need {min_required_15m})")
@@ -982,7 +974,7 @@ async def evaluate_pair_async(
             except Exception:
                 vwap_curr = None
                 
-        # Extract values from 15m
+        # Extract values from 15m - using last_i_15m for last closed candle
         close_c = float(df_15m['close'].iloc[last_i_15m])
         open_c = float(df_15m['open'].iloc[last_i_15m])
         high_c = float(df_15m['high'].iloc[last_i_15m])
@@ -1050,20 +1042,21 @@ async def evaluate_pair_async(
             close_c < rma50_curr
         )
 
-        long_crossover = get_crossover_line(pivots, float(df_15m['close'].iloc[last_i_15m - 1]), close_c, "long")
-        short_crossover = get_crossover_line(pivots, float(df_15m['close'].iloc[last_i_15m - 1]), close_c, "short")
+        # CORRECTED: Use -2 for previous close (the candle before last completed)
+        prev_close = float(df_15m['close'].iloc[-2]) if len(df_15m) >= 2 else close_c
+        long_crossover = get_crossover_line(pivots, prev_close, close_c, "long")
+        short_crossover = get_crossover_line(pivots, prev_close, close_c, "short")
         
         long_crossover_name = long_crossover[0] if long_crossover else None
         long_crossover_line = long_crossover[1] if long_crossover else None
         short_crossover_name = short_crossover[0] if short_crossover else None
         short_crossover_line = short_crossover[1] if short_crossover else None
 
-        # VWAP Crossover Signal
+        # CORRECTED VWAP Crossover Signal
         vbuy = False
         vsell = False
-        if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 2:
-            prev_close = float(df_15m['close'].iloc[last_i_15m - 1])
-            prev_vwap = float(vwap_15m.iloc[last_i_15m - 1])
+        if vwap_curr is not None and len(df_15m) >= 2:
+            prev_vwap = float(vwap_15m.iloc[-2]) if len(vwap_15m) >= 2 else vwap_curr
             if base_long_ok and prev_close <= prev_vwap and close_c > vwap_curr:
                 vbuy = True
             if base_short_ok and prev_close >= prev_vwap and close_c < vwap_curr:
@@ -1151,7 +1144,7 @@ async def evaluate_pair_async(
 # -------------------------
 # TELEGRAM NOTIFICATIONS
 # -------------------------
-async def send_telegram_async(token: str, chat_id: str, text: str, session: Optional[aiohttp.ClientSession] = None) -> bool:
+async def send_telegram_async(token: str, chat_id: str, text: str, session: aiohttp.ClientSession) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = {
         "chat_id": chat_id,
@@ -1160,14 +1153,8 @@ async def send_telegram_async(token: str, chat_id: str, text: str, session: Opti
         "disable_web_page_preview": "true"
     }
     
-    own_session = False
-    if session is None:
-        connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
-        session = aiohttp.ClientSession(connector=connector)
-        own_session = True
-
     try:
-        async with session.post(url, data=data, timeout=10) as resp:
+        async with session.post(url, data=data, timeout=ClientTimeout(total=10)) as resp:
             try:
                 js = await resp.json(content_type=None)
             except Exception:
@@ -1183,11 +1170,8 @@ async def send_telegram_async(token: str, chat_id: str, text: str, session: Opti
     except Exception as e:
         logger.exception(f"Telegram send failed: {e}")
         return False
-    finally:
-        if own_session:
-            await session.close()
 
-async def send_telegram_with_retries(token: str, chat_id: str, text: str, session: Optional[aiohttp.ClientSession] = None) -> bool:
+async def send_telegram_with_retries(token: str, chat_id: str, text: str, session: aiohttp.ClientSession) -> bool:
     last_exc = None
     for attempt in range(1, max(1, cfg.TELEGRAM_RETRIES) + 1):
         try:
@@ -1204,37 +1188,52 @@ async def send_telegram_with_retries(token: str, chat_id: str, text: str, sessio
     return False
 
 # -------------------------
-# DEAD MAN'S SWITCH
+# IMPROVED DEAD MAN'S SWITCH
 # -------------------------
 async def check_dead_mans_switch(state_db: StateDB):
     try:
         last_success = state_db.get_metadata("last_success_run")
-        if last_success:
-            try:
-                last_success_int = int(last_success)
-            except Exception:
-                last_success_int = now_ts()
-                
-            hours_since = (now_ts() - last_success_int) / 3600.0
+        if not last_success:
+            logger.debug("No last success run recorded yet")
+            return
             
-            if hours_since > 2:
-                dead_alert_ts = state_db.get_metadata("dead_alert_ts")
-                if dead_alert_ts:
-                    try:
-                        dead_alert_int = int(dead_alert_ts)
-                    except Exception:
-                        dead_alert_int = 0
-                else:
-                    dead_alert_int = 0
+        try:
+            last_success_int = int(last_success)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid last_success timestamp: {last_success}")
+            return
+
+        hours_since = (now_ts() - last_success_int) / 3600.0
+        
+        if hours_since > cfg.DEADMAN_HOURS:
+            dead_alert_ts = state_db.get_metadata("dead_alert_ts")
+            dead_alert_int = 0
+            
+            if dead_alert_ts:
+                try:
+                    dead_alert_int = int(dead_alert_ts)
+                except (ValueError, TypeError):
+                    pass
+            
+            # Only alert if we haven't alerted in the last 4 hours
+            if now_ts() - dead_alert_int > 4 * 3600:
+                last_success_dt = datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S IST')
+                msg = (
+                    f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
+                    f"Last success: {last_success_dt}\n"
+                    f"Threshold: {cfg.DEADMAN_HOURS} hours\n"
+                    f"Time: {human_ts()}"
+                )
                 
-                if now_ts() - dead_alert_int > 4 * 3600:
-                    msg = (
-                        f"🚨 DEAD MAN'S SWITCH: Bot hasn't succeeded in {hours_since:.1f} hours!\n"
-                        f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S IST')}"
-                    )
-                    await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg)
-                    state_db.set_metadata("dead_alert_ts", str(now_ts()))
-                    
+                # Use a temporary session for the dead man's switch
+                connector = TCPConnector(limit=1, ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as temp_session:
+                    if await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, msg, temp_session):
+                        state_db.set_metadata("dead_alert_ts", str(now_ts()))
+                        logger.warning(f"Dead man's switch triggered: {hours_since:.1f} hours since last success")
+                    else:
+                        logger.error("Failed to send dead man's switch alert")
+                        
     except Exception as e:
         logger.exception(f"Dead man's switch failed: {e}")
 
@@ -1264,7 +1263,7 @@ async def run_once(send_test: bool = True):
     timeout_task = asyncio.create_task(check_timeout())
     
     try:
-        prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
+        prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS)
         state_db = StateDB(cfg.STATE_DB_PATH)
         await check_dead_mans_switch(state_db)
         last_alerts = state_db.load_all()
@@ -1281,7 +1280,10 @@ async def run_once(send_test: bool = True):
                 f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
                 f"Pairs: {len(cfg.PAIRS)}"
             )
-            await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
+            # Create temporary session for test message
+            connector = TCPConnector(limit=1, ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as temp_session:
+                await send_telegram_with_retries(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg, temp_session)
             
         products_map = load_products_cache()
         circuit = CircuitBreaker()
@@ -1292,6 +1294,7 @@ async def run_once(send_test: bool = True):
             circuit_breaker=circuit
         )
         
+        # Use shared session for all HTTP requests
         connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             
@@ -1383,8 +1386,8 @@ def main():
     except Exception:
         pass
 
-    # Process locking to prevent concurrent runs
-    lock = ProcessLock("fib_pivot.lock", timeout=cfg.RUN_LOOP_INTERVAL * 2)
+    # Process locking with configurable path
+    lock = ProcessLock(cfg.LOCK_FILE_PATH, timeout=cfg.RUN_LOOP_INTERVAL * 2)
     if not lock.acquire():
         logger.error("❌ Failed to acquire process lock. Another instance is running.")
         sys.exit(EXIT_LOCK_CONFLICT)
