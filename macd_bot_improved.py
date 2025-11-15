@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # macd_bot_improved.py
-# Python 3.12 — production-hardened MACD/PPO bot with Pydantic config and shared sessions.
+# Python 3.12 — production-hardened MACD/PPO bot with Pydantic v2 config and shared sessions.
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import signal
 import fcntl
 import atexit
 import gc
-from typing import Dict, Any, Optional, Tuple, List, ClassVar
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, get_type_hints
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,12 +25,12 @@ import pandas as pd
 import numpy as np
 import pytz
 import psutil
-from pydantic import BaseModel, validator, Field
+from pydantic import BaseModel, Field, field_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
 from logging.handlers import RotatingFileHandler
 
 # -------------------------
-# Pydantic Configuration Model
+# Pydantic v2 Configuration Model
 # -------------------------
 class BotConfig(BaseModel):
     # Required Telegram config
@@ -46,7 +46,7 @@ class BotConfig(BaseModel):
     DELTA_API_BASE: str = "https://api.india.delta.exchange"
     
     # Trading pairs
-    PAIRS: List[str] = Field(..., min_items=1)
+    PAIRS: List[str] = Field(..., min_length=1)
     SPECIAL_PAIRS: Dict[str, Dict[str, int]] = {
         "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
     }
@@ -94,21 +94,23 @@ class BotConfig(BaseModel):
     # Logging
     LOG_LEVEL: str = "INFO"
 
-    @validator('LOG_LEVEL')
-    def validate_log_level(cls, v):
+    @field_validator('LOG_LEVEL')
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
         valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
         if v.upper() not in valid_levels:
             raise ValueError(f'LOG_LEVEL must be one of {valid_levels}')
         return v.upper()
 
-    @validator('PAIRS')
-    def validate_pairs(cls, v):
+    @field_validator('PAIRS')
+    @classmethod
+    def validate_pairs(cls, v: List[str]) -> List[str]:
         if not v:
             raise ValueError('PAIRS cannot be empty')
         return v
 
 # -------------------------
-# Configuration loader with Pydantic
+# Configuration loader with Pydantic v2
 # -------------------------
 def load_config() -> BotConfig:
     """Load configuration from file and environment variables"""
@@ -128,11 +130,14 @@ def load_config() -> BotConfig:
         print(f"❌ Config file not found: {CONFIG_FILE}")
         sys.exit(1)
     
+    # Get type hints for proper type conversion
+    type_hints = get_type_hints(BotConfig)
+    
     # Override from environment variables
-    for key in BotConfig.__fields__:
+    for key in BotConfig.model_fields:
         env_val = os.getenv(key)
         if env_val is not None:
-            field_type = BotConfig.__fields__[key].type_
+            field_type = type_hints.get(key, str)
             if field_type == bool:
                 config_data[key] = env_val.lower() in ("true", "1", "yes", "y", "t")
             elif field_type == int:
@@ -614,7 +619,7 @@ def parse_candles_result(result: dict) -> Optional[pd.DataFrame]:
         if not df.empty:
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col], downcast='float', errors='coerce')
-            df['volume'] = pd.to_numeric(df[col], downcast='float', errors='coerce')
+            df['volume'] = pd.to_numeric(df['volume'], downcast='float', errors='coerce')
             df['timestamp'] = pd.to_numeric(df['timestamp'], downcast='integer', errors='coerce')
         
         if df.empty:
