@@ -29,14 +29,34 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
 from logging.handlers import RotatingFileHandler
 
 # -------------------------
-# Default configuration (safe defaults)
+# Configuration loader
 # -------------------------
-DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU"),
-    "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", "203813932"),
-    "DEBUG_MODE": os.environ.get("DEBUG_MODE", "False").lower() == "true",
-    "SEND_TEST_MESSAGE": os.environ.get("SEND_TEST_MESSAGE", "False").lower() == "true",
-    "DELTA_API_BASE": os.environ.get("DELTA_API_BASE", "https://api.india.delta.exchange"),
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config_macd.json")
+
+def str_to_bool(value: Any) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
+
+# Load config file if present
+cfg = {}
+if Path(CONFIG_FILE).exists():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            print(f"✅ Loaded configuration from {CONFIG_FILE}")
+    except Exception as e:
+        print(f"⚠️ Warning: unable to parse config file: {e}")
+        sys.exit(1)
+else:
+    print(f"❌ Config file not found: {CONFIG_FILE}")
+    sys.exit(1)
+
+# Set defaults for missing values
+DEFAULTS = {
+    "DEBUG_MODE": False,
+    "SEND_TEST_MESSAGE": False,
+    "STATE_DB_PATH": "macd_state.sqlite",
+    "LOG_FILE": "macd_bot.log",
+    "DELTA_API_BASE": "https://api.india.delta.exchange",
     "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
     "SPECIAL_PAIRS": {
         "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
@@ -50,46 +70,30 @@ DEFAULT_CONFIG = {
     "CIRRUS_CLOUD_ENABLED": True,
     "X1": 22, "X2": 9, "X3": 15, "X4": 5,
     "SRSI_RSI_LEN": 21, "SRSI_KALMAN_LEN": 5,
-    "STATE_DB_PATH": os.environ.get("STATE_DB_PATH", "macd_state.sqlite"),
-    "LOG_FILE": os.environ.get("LOG_FILE", "macd_bot.log"),
-    "MAX_PARALLEL_FETCH": int(os.environ.get("MAX_PARALLEL_FETCH", "4")),
-    "HTTP_TIMEOUT": int(os.environ.get("HTTP_TIMEOUT", "15")),
-    "CANDLE_FETCH_RETRIES": int(os.environ.get("CANDLE_FETCH_RETRIES", "3")),
-    "CANDLE_FETCH_BACKOFF": float(os.environ.get("CANDLE_FETCH_BACKOFF", "1.5")),
-    "JITTER_MIN": float(os.environ.get("JITTER_MIN", "0.1")),
-    "JITTER_MAX": float(os.environ.get("JITTER_MAX", "0.8")),
-    "STATE_EXPIRY_DAYS": int(os.environ.get("STATE_EXPIRY_DAYS", "30")),
-    "RUN_TIMEOUT_SECONDS": int(os.environ.get("RUN_TIMEOUT_SECONDS", "600")),
-    "BATCH_SIZE": int(os.environ.get("BATCH_SIZE", "4")),
-    "LOG_LEVEL": os.environ.get("LOG_LEVEL", "INFO"),
-    "TELEGRAM_RETRIES": int(os.environ.get("TELEGRAM_RETRIES", "3")),
-    "TELEGRAM_BACKOFF_BASE": float(os.environ.get("TELEGRAM_BACKOFF_BASE", "2.0")),
-    "MEMORY_LIMIT_BYTES": int(os.environ.get("MEMORY_LIMIT_BYTES", str(400_000_000))),
-    "TCP_CONN_LIMIT": int(os.environ.get("TCP_CONN_LIMIT", "8")),
-    "DEAD_MANS_COOLDOWN_SECONDS": int(os.environ.get("DEAD_MANS_COOLDOWN_SECONDS", str(4 * 3600))),
-    "BOT_NAME": os.environ.get("BOT_NAME", "MACD Alert Bot"),
+    "MAX_PARALLEL_FETCH": 8,
+    "HTTP_TIMEOUT": 15,
+    "CANDLE_FETCH_RETRIES": 3,
+    "CANDLE_FETCH_BACKOFF": 1.5,
+    "JITTER_MIN": 0.1,
+    "JITTER_MAX": 0.8,
+    "STATE_EXPIRY_DAYS": 30,
+    "RUN_TIMEOUT_SECONDS": 600,
+    "BATCH_SIZE": 4,
+    "LOG_LEVEL": "INFO",
+    "TELEGRAM_RETRIES": 3,
+    "TELEGRAM_BACKOFF_BASE": 2.0,
+    "MEMORY_LIMIT_BYTES": 400000000,
+    "TCP_CONN_LIMIT": 8,
+    "DEAD_MANS_COOLDOWN_SECONDS": 14400,
+    "BOT_NAME": "MACD Alert Bot",
+    "PID_LOCK_PATH": "/tmp/macd_bot.pid"
 }
 
-# ==========================================================
-# Configuration loader
-# ==========================================================
-CONFIG_FILE = os.getenv("CONFIG_FILE", "config_macd.json")
-cfg = DEFAULT_CONFIG.copy()
+for key, default_value in DEFAULTS.items():
+    if key not in cfg:
+        cfg[key] = default_value
 
-def str_to_bool(value: Any) -> bool:
-    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
-
-# Load config file if present
-if Path(CONFIG_FILE).exists():
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            user_cfg = json.load(f)
-            cfg.update(user_cfg)
-            print(f"✅ Loaded configuration from {CONFIG_FILE}")
-    except Exception as e:
-        print(f"⚠️ Warning: unable to parse config file: {e}")
-
-# Merge/override from environment variables with type casting
+# Override from environment variables
 def override(key, default=None, cast=None):
     val = os.getenv(key)
     if val is not None:
@@ -143,43 +147,62 @@ def validate_config():
         raise ValueError("BATCH_SIZE must be at least 1")
 
 # -------------------------
-# Logger
+# Standardized Logger
 # -------------------------
 logger = logging.getLogger("macd_bot")
 log_level = getattr(logging, str(cfg.get("LOG_LEVEL", "INFO")).upper(), logging.INFO)
 logger.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else log_level)
 
+# Clear existing handlers
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# Create formatter with standardized format
+formatter = logging.Formatter(
+    fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Console handler
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.DEBUG if cfg["DEBUG_MODE"] else log_level)
-fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-ch.setFormatter(fmt)
+ch.setFormatter(formatter)
 logger.addHandler(ch)
 
+# File handler with rotation
 try:
     log_dir = os.path.dirname(cfg["LOG_FILE"]) or "."
     os.makedirs(log_dir, exist_ok=True)
-    fh = RotatingFileHandler(cfg["LOG_FILE"], maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+    fh = RotatingFileHandler(cfg["LOG_FILE"], maxBytes=10_000_000, backupCount=5, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
+    fh.setFormatter(formatter)
     logger.addHandler(fh)
 except Exception as e:
     logger.warning(f"Could not set up rotating log file: {e}")
 
 # -------------------------
-# PID file lock
+# PID file lock (Configurable Path)
 # -------------------------
 class PidFileLock:
-    def __init__(self, path: str = "/tmp/macd_bot.pid"):
-        self.path = path
+    def __init__(self, path: str = None):
+        self.path = path or cfg.get("PID_LOCK_PATH", "/tmp/macd_bot.pid")
         self.fd = None
+        self.acquired = False
 
     def acquire(self) -> bool:
         try:
+            # Create directory if needed
+            lock_dir = os.path.dirname(self.path)
+            if lock_dir and not os.path.exists(lock_dir):
+                os.makedirs(lock_dir, exist_ok=True)
+                
             self.fd = open(self.path, "w")
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fd.write(str(os.getpid()))
             self.fd.flush()
             atexit.register(self.release)
+            self.acquired = True
+            logger.debug(f"Acquired PID lock: {self.path}")
             return True
         except (IOError, OSError):
             if self.fd:
@@ -187,6 +210,7 @@ class PidFileLock:
                     self.fd.close()
                 except Exception:
                     pass
+            logger.warning(f"Could not acquire PID lock {self.path} - another instance may be running")
             return False
 
     def release(self):
@@ -205,8 +229,18 @@ class PidFileLock:
                     os.unlink(self.path)
                 except Exception:
                     pass
-        except Exception:
-            pass
+            self.acquired = False
+            logger.debug("Released PID lock")
+        except Exception as e:
+            logger.warning(f"Error releasing PID lock: {e}")
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"Could not acquire PID lock: {self.path}")
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
 
 # -------------------------
 # SQLite State DB with Context Manager
@@ -1126,6 +1160,50 @@ async def process_batch(session: aiohttp.ClientSession, fetcher: DataFetcher, pr
     return results
 
 # -------------------------
+# Dead Man's Switch
+# -------------------------
+class DeadMansSwitch:
+    def __init__(self, state_db: StateDB, cooldown_seconds: int):
+        self.state_db = state_db
+        self.cooldown_seconds = cooldown_seconds
+        self.alert_sent = False
+
+    def should_alert(self) -> bool:
+        """Check if dead man's switch should trigger"""
+        try:
+            last_success = self.state_db.get_metadata("last_success_run")
+            if not last_success:
+                return False
+                
+            last_run_time = int(last_success)
+            time_since_last_run = time.time() - last_run_time
+            
+            if time_since_last_run > self.cooldown_seconds and not self.alert_sent:
+                self.alert_sent = True
+                return True
+                
+            # Reset alert flag if we're back within cooldown
+            if time_since_last_run <= self.cooldown_seconds:
+                self.alert_sent = False
+                
+            return False
+        except Exception as e:
+            logger.error(f"Error checking dead man's switch: {e}")
+            return False
+
+    async def send_alert(self, telegram_queue: TelegramQueue, session: aiohttp.ClientSession):
+        """Send dead man's switch alert"""
+        last_success = self.state_db.get_metadata("last_success_run")
+        last_run_time = datetime.fromtimestamp(int(last_success)) if last_success else "Never"
+        message = (
+            f"🚨 {cfg.get('BOT_NAME', 'MACD Bot')} - DEAD MAN'S SWITCH TRIGGERED\n"
+            f"No successful run detected in {self.cooldown_seconds // 3600} hours\n"
+            f"Last run: {last_run_time}\n"
+            f"Check bot status immediately!"
+        )
+        await telegram_queue.send(session, message)
+
+# -------------------------
 # Run once (main work) with Enhanced Error Handling
 # -------------------------
 async def run_once():
@@ -1158,6 +1236,14 @@ async def run_once():
         with StateDB(cfg["STATE_DB_PATH"]) as sdb:
             last_alerts = sdb.load_all()
             logger.info(f"Loaded {len(last_alerts)} previous states")
+
+            # Check dead man's switch
+            dead_mans_switch = DeadMansSwitch(sdb, cfg["DEAD_MANS_COOLDOWN_SECONDS"])
+            if dead_mans_switch.should_alert():
+                logger.warning("Dead man's switch triggered - sending alert")
+                async with aiohttp.ClientSession() as session:
+                    telegram_queue = TelegramQueue(cfg["TELEGRAM_BOT_TOKEN"], cfg["TELEGRAM_CHAT_ID"])
+                    await dead_mans_switch.send_alert(telegram_queue, session)
 
             fetcher = DataFetcher(cfg["DELTA_API_BASE"], max_parallel=cfg["MAX_PARALLEL_FETCH"], timeout=cfg["HTTP_TIMEOUT"])
             telegram_queue = TelegramQueue(cfg["TELEGRAM_BOT_TOKEN"], cfg["TELEGRAM_CHAT_ID"])
@@ -1282,7 +1368,7 @@ def main():
         logger.critical(f"Configuration error: {e}")
         sys.exit(1)
 
-    pid_lock = PidFileLock("/tmp/macd_bot.pid")
+    pid_lock = PidFileLock(cfg.get("PID_LOCK_PATH", "/tmp/macd_bot.pid"))
     if not pid_lock.acquire():
         logger.error("Another instance is running. Exiting.")
         sys.exit(2)
@@ -1321,4 +1407,4 @@ def main():
         pid_lock.release()
 
 if __name__ == "__main__":
-    main()
+    main() 
