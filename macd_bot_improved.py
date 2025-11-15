@@ -125,7 +125,7 @@ def load_config(config_file: str) -> BotConfig:
         try:
             with open(config_file, "r", encoding="utf-8") as f:
                 user_config = json.load(f)
-                print(f"✅ Loaded configuration from {config_file}")
+            print(f"✅ Loaded configuration from {config_file}")
         except Exception as e:
             print(f"⚠️ Warning: unable to parse config file: {e}", file=sys.stderr)
 
@@ -168,7 +168,7 @@ logger = logging.getLogger("macd_bot")
 log_level = getattr(logging, str(cfg.LOG_LEVEL).upper(), logging.INFO)
 logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else log_level)
 
-# Standardized Format: time.msecs | LEVEL    | module::function:line | message
+# Standardized Format: time.msecs |
 fmt = logging.Formatter(
     "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s::%(funcName)s:%(lineno)d | %(message)s", 
     datefmt='%Y-%m-%d %H:%M:%S'
@@ -241,7 +241,6 @@ class PidFileLock:
 # SQLite State DB (Context Manager)
 # -------------------------
 class StateDB:
-    # ... (content remains the same as in original script, but now uses cfg object)
     def __init__(self, db_path: str):
         self.db_path = db_path
         db_dir = os.path.dirname(db_path)
@@ -351,7 +350,7 @@ class StateDB:
                 self._conn.close()
         except Exception:
             pass
-
+            
     def __del__(self):
         try:
             self.close()
@@ -774,152 +773,173 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         # --- Calculate Indicators ---
         magical_hist = calculate_magical_momentum_hist(df_15m)
         ppo, ppo_signal = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
-        rma_50 = calculate_rma(df_15m['close'], cfg.RMA_50_PERIOD)
-        rma_200 = calculate_rma(df_5m['close'], cfg.RMA_200_PERIOD)
-        upw, dnw, _, _ = calculate_cirrus_cloud(df_15m)
         smooth_rsi = calculate_smooth_rsi(df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN)
+        rma50 = calculate_rma(df_15m['close'].astype(float), cfg.RMA_50_PERIOD)
+        rma200_5m = calculate_rma(df_5m['close'].astype(float), cfg.RMA_200_PERIOD)
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
 
-        # Verify series lengths
-        for series_name, s, idx in [
-            ("ppo", ppo, last_i_15), 
-            ("ppo_signal", ppo_signal, last_i_15), 
-            ("rma_50", rma_50, last_i_15), 
-            ("rma_200", rma_200, last_i_5), 
-            ("smooth_rsi", smooth_rsi, last_i_15),
-            ("magical_hist", magical_hist, last_i_15)
-        ]:
-            if s is None or len(s) <= idx:
-                logger.debug(f"{series_name} not ready for {pair_name}")
-                return None
-        
-        # --- Get current and previous values ---
-        ppo_curr = float(ppo.iloc[last_i_15])
-        ppo_prev = float(ppo.iloc[last_i_15 - 1])
-        ppo_signal_curr = float(ppo_signal.iloc[last_i_15])
-        ppo_signal_prev = float(ppo_signal.iloc[last_i_15 - 1])
-        smooth_rsi_curr = float(smooth_rsi.iloc[last_i_15])
-        smooth_rsi_prev = float(smooth_rsi.iloc[last_i_15 - 1])
+        # --- Get Current Values ---
+        # 15m candle data
         close_curr = float(df_15m['close'].iloc[last_i_15])
         open_curr = float(df_15m['open'].iloc[last_i_15])
         high_curr = float(df_15m['high'].iloc[last_i_15])
         low_curr = float(df_15m['low'].iloc[last_i_15])
-        rma50_curr = float(rma_50.iloc[last_i_15])
-        rma200_curr = float(rma_200.iloc[last_i_5])
-        
+        # Indicator current values
+        ppo_curr = float(ppo.iloc[last_i_15])
+        ppo_signal_curr = float(ppo_signal.iloc[last_i_15])
+        smooth_rsi_curr = float(smooth_rsi.iloc[last_i_15])
+        rma50_curr = float(rma50.iloc[last_i_15])
         mmh_curr = float(magical_hist.iloc[last_i_15])
+        # Indicator previous values (for cross checks)
+        ppo_prev = float(ppo.iloc[last_i_15 - 1])
+        ppo_signal_prev = float(ppo_signal.iloc[last_i_15 - 1])
+        smooth_rsi_prev = float(smooth_rsi.iloc[last_i_15 - 1])
+        # MMH previous values (for reversal checks)
         mmh_prev1 = float(magical_hist.iloc[last_i_15 - 1])
         mmh_prev2 = float(magical_hist.iloc[last_i_15 - 2])
         mmh_prev3 = float(magical_hist.iloc[last_i_15 - 3])
+
+        # RMA 200 of 5m
+        if last_i_5 is not None:
+            rma200_curr = float(rma200_5m.iloc[last_i_5])
+        else:
+            logger.debug(f"Insufficient closed 5m candles for RMA 200 for {pair_name}")
+            return None
 
         indicators = [ppo_curr, ppo_prev, ppo_signal_curr, ppo_signal_prev, smooth_rsi_curr, smooth_rsi_prev, rma50_curr, rma200_curr, mmh_curr, mmh_prev1, mmh_prev2, mmh_prev3]
         if any(pd.isna(x) for x in indicators):
             logger.debug(f"NaN in indicators for {pair_name}, skipping")
             return None
 
-        # --- Conditions ---
-        total_range = high_curr - low_curr
-        strong_bullish_close = close_curr > high_curr - (total_range * 0.25)
-        strong_bearish_close = close_curr < low_curr + (total_range * 0.25)
+        # --- Common Price and Trend Conditions ---
         price = close_curr
         formatted_time = datetime.fromtimestamp(df_15m['timestamp'].iloc[last_i_15]).strftime("%H:%M:%S UTC")
 
-        ppo_above_signal = ppo_curr > ppo_signal_curr and ppo_prev < ppo_signal_prev
-        ppo_below_signal = ppo_curr < ppo_signal_curr and ppo_prev > ppo_signal_prev
+        total_range = high_curr - low_curr
+        # Prevent division by zero, min range should be above 0
+        total_range = total_range if total_range > 0 else 1e-8 
+
+        # Common Buy/Long Conditions
+        # Rma 50 of 15 minutes below close -> close > rma50
+        close_above_rma50 = close_curr > rma50_curr
+        # Rma 200 of 5 minutes below close -> close > rma200_5m
+        close_above_rma200 = close_curr > rma200_curr
+        # Magical Momentum Hist of 15 minutes should be above 0
+        mmh_above_zero = mmh_curr > 0
+        # Candle of 15 minutes should be green - close above open
+        candle_green = close_curr > open_curr
+        # Upper wick of 15 minutes should be less than 20% of the total candle size
+        upper_wick_small = (high_curr - close_curr) / total_range < 0.20
+        # Cirrus cloud of 15 minutes should be green
+        cloud_state_green = ("green" == ("green" if (bool(upw.iloc[last_i_15]) and not bool(dnw.iloc[last_i_15])) else "red" if (bool(dnw.iloc[last_i_15]) and not bool(upw.iloc[last_i_15])) else "neutral"))
+
+        long_common_conds = {
+            "close_above_rma50": close_above_rma50,
+            "close_above_rma200": close_above_rma200,
+            "cloud_green": cloud_state_green,
+            "mmh_above_zero": mmh_above_zero,
+            "candle_green": candle_green,
+            "upper_wick_small": upper_wick_small,
+        }
+
+        # Common Sell/Short Conditions
+        # Rma 50 of 15 minutes above close -> close < rma50
+        close_below_rma50 = close_curr < rma50_curr
+        # Rma 200 of 5 minutes above close -> close < rma200_5m
+        close_below_rma200 = close_curr < rma200_curr
+        # Magical Momentum Hist of 15 minutes should be below 0
+        mmh_below_zero = mmh_curr < 0
+        # Candle of 15 minutes should be red - close below open
+        candle_red = close_curr < open_curr
+        # Lower wick of 15 minutes should be less than 20% of the total candle size
+        lower_wick_small = (close_curr - low_curr) / total_range < 0.20
+        # Cirrus cloud of 15 minutes should be red
+        cloud_state_red = ("red" == ("green" if (bool(upw.iloc[last_i_15]) and not bool(dnw.iloc[last_i_15])) else "red" if (bool(dnw.iloc[last_i_15]) and not bool(upw.iloc[last_i_15])) else "neutral"))
+
+        short_common_conds = {
+            "close_below_rma50": close_below_rma50,
+            "close_below_rma200": close_below_rma200,
+            "cloud_red": cloud_state_red,
+            "mmh_below_zero": mmh_below_zero,
+            "candle_red": candle_red,
+            "lower_wick_small": lower_wick_small,
+        }
+
+        # --- Crossover Checks ---
         ppo_cross_above_zero = ppo_curr > 0 and ppo_prev < 0
         ppo_cross_below_zero = ppo_curr < 0 and ppo_prev > 0
         ppo_cross_above_011 = ppo_curr > 0.11 and ppo_prev <= 0.11
         ppo_cross_below_minus011 = ppo_curr < -0.11 and ppo_prev >= -0.11
-        ppo_below_030 = ppo_curr < 0.30
-        ppo_above_minus030 = ppo_curr > -0.30
-
-        close_above_rma50 = close_curr > rma50_curr
-        close_below_rma50 = close_curr < rma50_curr
-        close_above_rma200 = close_curr > rma200_curr
-        close_below_rma200 = close_curr < rma200_curr
-        
-        # MMH Reversal logic
-        mmh_reversal_buy = (
-            mmh_prev3 < mmh_prev2 and mmh_prev2 < mmh_prev1 and mmh_curr > mmh_prev1
-        )
-        mmh_reversal_sell = (
-            mmh_prev3 > mmh_prev2 and mmh_prev2 > mmh_prev1 and mmh_curr < mmh_prev1
-        )
         srsi_cross_up_50 = (smooth_rsi_prev <= 50) and (smooth_rsi_curr > 50)
         srsi_cross_down_50 = (smooth_rsi_prev >= 50) and (smooth_rsi_curr < 50)
 
-        cloud_state = "neutral"
-        if cfg.CIRRUS_CLOUD_ENABLED:
-            cloud_state = ("green" if (bool(upw.iloc[last_i_15]) and not bool(dnw.iloc[last_i_15])) else "red" if (bool(dnw.iloc[last_i_15]) and not bool(upw.iloc[last_i_15])) else "neutral")
-        
+        # =========================================================================
+        # MMH PATTERN LOGIC (UPDATED as requested - 3-bar pullback, 1-bar continuation)
+        # =========================================================================
+        # Buy: Hist falling for 3 bars (mmh_prev3 > mmh_prev2 > mmh_prev1) AND current Hist is rising (mmh_curr > mmh_prev1)
+        mmh_reversal_buy_pattern = (
+            mmh_prev3 > mmh_prev2 and mmh_prev2 > mmh_prev1 and mmh_curr > mmh_prev1
+        )
+        # Sell: Hist rising for 3 bars (mmh_prev3 < mmh_prev2 < mmh_prev1) AND current Hist is falling (mmh_curr < mmh_prev1)
+        mmh_reversal_sell_pattern = (
+            mmh_prev3 < mmh_prev2 and mmh_prev2 < mmh_prev1 and mmh_curr < mmh_prev1
+        )
+        # =========================================================================
+
         bot_name = cfg.BOT_NAME
 
-        # Conditions dicts
-        buy_mmh_reversal_conds = {
-            "mmh_reversal_buy": mmh_reversal_buy,
-            "close_above_rma50": close_above_rma50,
-            "close_above_rma200": close_above_rma200,
-            "magical_hist_curr>0": mmh_curr > 0,
-            "cloud_green": (cloud_state == "green"),
-            "strong_bullish_close": strong_bullish_close,
-        }
-        sell_mmh_reversal_conds = {
-            "mmh_reversal_sell": mmh_reversal_sell,
-            "close_below_rma50": close_below_rma50,
-            "close_below_rma200": close_below_rma200,
-            "magical_hist_curr<0": mmh_curr < 0,
-            "cloud_red": (cloud_state == "red"),
-            "strong_bearish_close": strong_bearish_close,
-        }
-        buy_srsi_conds = {
-            "srsi_cross_up_50": srsi_cross_up_50,
-            "ppo_above_signal": ppo_above_signal,
-            "ppo_below_030": ppo_below_030,
-            "close_above_rma50": close_above_rma50,
-            "close_above_rma200": close_above_rma200,
-            "cloud_green": (cloud_state == "green"),
-            "strong_bullish_close": strong_bullish_close,
-            "magical_hist_curr>0": mmh_curr > 0,
-        }
-        sell_srsi_conds = {
-            "srsi_cross_down_50": srsi_cross_down_50,
-            "ppo_below_signal": ppo_below_signal,
-            "ppo_above_minus030": ppo_above_minus030,
-            "close_below_rma50": close_below_rma50,
-            "close_below_rma200": close_below_rma200,
-            "cloud_red": (cloud_state == "red"),
-            "strong_bearish_close": strong_bearish_close,
-            "magical_hist_curr<0": mmh_curr < 0,
-        }
-        long0_conds = {
-            "ppo_cross_above_zero": ppo_cross_above_zero,
-            "ppo_above_signal": ppo_above_signal,
-            "close_above_rma50": close_above_rma50,
-            "close_above_rma200": close_above_rma200,
-            "cloud_green": (cloud_state == "green"),
-        }
-        long011_conds = {
-            "ppo_cross_above_011": ppo_cross_above_011,
-            "ppo_above_signal": ppo_above_signal,
-            "close_above_rma50": close_above_rma50,
-            "close_above_rma200": close_above_rma200,
-            "cloud_green": (cloud_state == "green"),
-        }
-        short0_conds = {
-            "ppo_cross_below_zero": ppo_cross_below_zero,
-            "ppo_below_signal": ppo_below_signal,
-            "close_below_rma50": close_below_rma50,
-            "close_below_rma200": close_below_rma200,
-            "cloud_red": (cloud_state == "red"),
-        }
-        short011_conds = {
-            "ppo_cross_below_minus011": ppo_cross_below_minus011,
-            "ppo_below_signal": ppo_below_signal,
-            "close_below_rma50": close_below_rma50,
-            "close_below_rma200": close_below_rma200,
-            "cloud_red": (cloud_state == "red"),
-        }
+        # --- CONDITIONS DICTS (MERGING LOGIC) ---
         
-        # --- Decision Logic (Prioritized) ---
+        # 1. MMH REVERSAL (Highest Priority - Combines pattern and all common filters)
+        buy_mmh_reversal_conds = long_common_conds.copy()
+        # NOTE: Using the user's specific logic here
+        buy_mmh_reversal_conds.update({"mmh_reversal_buy_pattern": mmh_reversal_buy_pattern})
+
+        sell_mmh_reversal_conds = short_common_conds.copy()
+        # NOTE: Using the user's specific logic here
+        sell_mmh_reversal_conds.update({"mmh_reversal_sell_pattern": mmh_reversal_sell_pattern})
+        
+        # 2. SRSI LONG (Combined with common filters and specific PPO filter)
+        buy_srsi_conds = long_common_conds.copy()
+        buy_srsi_conds.update({
+            "srsi_cross_up_50": srsi_cross_up_50,
+            "ppo_less_than_030": ppo_curr < 0.30, 
+        })
+        # SRSI SHORT (Combined with common filters and specific PPO filter)
+        sell_srsi_conds = short_common_conds.copy()
+        sell_srsi_conds.update({
+            "srsi_cross_down_50": srsi_cross_down_50,
+            "ppo_greater_than_minus030": ppo_curr > -0.30, 
+        })
+
+        # 3. PPO LONG 0 (Combined with common filters and PPO > Signal filter)
+        long0_conds = long_common_conds.copy()
+        long0_conds.update({
+            "ppo_cross_above_zero": ppo_cross_above_zero,
+            "ppo_above_signal": ppo_curr > ppo_signal_curr,
+        })
+        # PPO SHORT 0 (Combined with common filters and PPO < Signal filter)
+        short0_conds = short_common_conds.copy()
+        short0_conds.update({
+            "ppo_cross_below_zero": ppo_cross_below_zero,
+            "ppo_below_signal": ppo_curr < ppo_signal_curr,
+        })
+
+        # 4. PPO LONG 0.11 (Combined with common filters and PPO > Signal filter)
+        long011_conds = long_common_conds.copy()
+        long011_conds.update({
+            "ppo_cross_above_011": ppo_cross_above_011,
+            "ppo_above_signal": ppo_curr > ppo_signal_curr,
+        })
+        # PPO SHORT -0.11 (Combined with common filters and PPO < Signal filter)
+        short011_conds = short_common_conds.copy()
+        short011_conds.update({
+            "ppo_cross_below_minus011": ppo_cross_below_minus011,
+            "ppo_below_signal": ppo_curr < ppo_signal_curr,
+        })
+
+
+        # --- Decision Logic (Prioritized) --- 
         current_state = None
         send_message = None
 
@@ -938,75 +958,60 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         elif all(long0_conds.values()):
             current_state = "long_zero"
             send_message = f"{bot_name}\n🟢 {pair_name} - LONG\nPPO crossing above 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-        elif all(long011_conds.values()):
-            current_state = "long_011"
-            send_message = f"{bot_name}\n🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(short0_conds.values()):
             current_state = "short_zero"
             send_message = f"{bot_name}\n🔴 {pair_name} - SHORT\nPPO crossing below 0 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
+        elif all(long011_conds.values()):
+            current_state = "long_011"
+            send_message = f"{bot_name}\n🟢 {pair_name} - LONG\nPPO crossing above 0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
         elif all(short011_conds.values()):
             current_state = "short_011"
             send_message = f"{bot_name}\n🔴 {pair_name} - SHORT\nPPO crossing below -0.11 ({ppo_curr:.2f})\nPrice: ${price:,.2f}\n{formatted_time}"
-        
+
         now_ts_int = int(time.time())
-        last_state_value = last_state_for_pair.get("state") if isinstance(last_state_for_pair, dict) else None
-
-        if current_state is None:
-            if last_state_value and last_state_value != 'NO_SIGNAL':
-                return {"state": "NO_SIGNAL", "ts": now_ts_int}
-            return last_state_for_pair
-
-        if current_state == last_state_value:
-            logger.debug(f"Idempotency: {pair_name} signal remains {current_state}.")
-            return last_state_for_pair
-
-        return {"state": current_state, "ts": now_ts_int, "message": send_message}
+        last_state_value = last_state_for_pair.get("state") if last_state_for_pair else None
+        
+        # Cooldown logic
+        if current_state:
+            # Check for cooldown
+            if current_state == last_state_value:
+                last_ts = last_state_for_pair.get("ts")
+                if last_ts and (now_ts_int - last_ts < cfg.DEAD_MANS_COOLDOWN_SECONDS):
+                    logger.debug(f"State for {pair_name} is '{current_state}', but is in cooldown (skip message)")
+                    send_message = None # Suppress alert
+                else:
+                    logger.info(f"Signal: {current_state} for {pair_name} (Cooldown expired).")
+            else:
+                logger.info(f"Signal: {current_state} for {pair_name} (New state).")
+                
+            new_state = {"state": current_state, "ts": now_ts_int, "message": send_message}
+            return pair_name, new_state
+        else:
+            if last_state_value is not None:
+                # Clear state if no signal
+                new_state = {"state": None, "ts": now_ts_int, "message": None}
+                return pair_name, new_state
+            
+            logger.debug(f"No signal for {pair_name} and state is already None. Skip update.")
+            return None
 
     except Exception as e:
-        logger.exception(f"Error evaluating logic for {pair_name}: {e}")
+        logger.exception(f"Unhandled error in evaluate_pair_logic for {pair_name}: {e}")
         return None
 
 # -------------------------
-# Product mapping 
-# -------------------------
-def build_products_map_from_api_result(api_products: dict) -> Dict[str, dict]:
-    products_map = {}
-    if not api_products or not api_products.get("result"):
-        logger.error("No products in API result")
-        return products_map
-    for p in api_products.get("result", []):
-        try:
-            symbol = p.get("symbol", "")
-            # Normalize symbol names (e.g., BTC_USDT -> BTCUSD)
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD").replace("_", "")
-            
-            if p.get("contract_type") == "perpetual_futures":
-                for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name:
-                        products_map[pair_name] = {
-                            "id": p.get("id"),
-                            "symbol": p.get("symbol"),
-                            "contract_type": p.get("contract_type")
-                        }
-                        break
-        except Exception:
-            continue
-    logger.info(f"Mapped {len(products_map)} tradable pairs")
-    return products_map
-
-# -------------------------
-# Telegram queue with Shared aiohttp.ClientSession
+# Telegram Messenger
 # -------------------------
 class TelegramQueue:
-    def __init__(self, session: aiohttp.ClientSession, config: BotConfig, rate_limit: float = 0.1):
-        self.session = session # Store the shared session
+    def __init__(self, session: aiohttp.ClientSession, config: BotConfig):
         self.token = config.TELEGRAM_BOT_TOKEN
         self.chat_id = config.TELEGRAM_CHAT_ID
         self.config = config
-        self.rate_limit = rate_limit
-        self._last_send_time = 0.0
         self._send_lock = asyncio.Lock()
-        
+        self._last_send_time = 0
+        self.rate_limit = 1 # Delta: 1 message per second limit
+        self.session = session # Use the shared session
+
     async def _send_once(self, message: str) -> bool:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
@@ -1042,7 +1047,8 @@ class TelegramQueue:
         logger.error(f"Telegram send failed after retries: {last_exc}")
         return False
 
-    async def send(self, message: str) -> bool: # Removed session argument
+    async def send(self, message: str) -> bool:
+        # Removed session argument
         async with self._send_lock:
             # Enforce rate limit
             now = time.time()
@@ -1057,14 +1063,13 @@ class TelegramQueue:
 # -------------------------
 # Check single pair (fetch, evaluate, alert)
 # -------------------------
-async def check_pair(fetcher: DataFetcher, products_map: Dict[str, dict], pair_name: str, 
-                     last_state_for_pair: Optional[Dict[str, Any]], telegram_queue: TelegramQueue) -> Optional[Tuple[str, Dict[str, Any]]]:
+async def check_pair(fetcher: DataFetcher, products_map: Dict[str, dict], pair_name: str, last_state_for_pair: Optional[Dict[str, Any]], telegram_queue: TelegramQueue) -> Optional[Tuple[str, Dict[str, Any]]]:
     try:
         prod = products_map.get(pair_name)
         if not prod:
             logger.debug(f"No product mapping for {pair_name}")
             return None
-            
+
         # Use config (now cfg) for limits
         sp = cfg.SPECIAL_PAIRS.get(pair_name, {})
         limit_15m = sp.get("limit_15m", 210)
@@ -1082,31 +1087,20 @@ async def check_pair(fetcher: DataFetcher, products_map: Dict[str, dict], pair_n
         df_15m = parse_candles_result(res15)
         df_5m = parse_candles_result(res5)
 
-        if df_15m is None or len(df_15m) < (min_required + 2):
-            logger.warning(f"Insufficient 15m data for {pair_name}: {len(df_15m) if df_15m is not None else 0}/{min_required+2}")
+        if df_15m is None or len(df_15m) < min_required:
+            logger.warning(f"Not enough 15m candle data for {pair_name}")
             return None
-        if df_5m is None or len(df_5m) < (min_required_5m + 2):
-            logger.warning(f"Insufficient 5m data for {pair_name}: {len(df_5m) if df_5m is not None else 0}/{min_required_5m+2}")
-            return None
-        
-        # Ensure all columns are numeric (robustness check)
-        for df in (df_15m, df_5m):
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        new_state = evaluate_pair_logic(pair_name, df_15m, df_5m, last_state_for_pair)
-
-        if not new_state:
+        if df_5m is None or len(df_5m) < min_required_5m:
+            logger.warning(f"Not enough 5m candle data for {pair_name}")
             return None
 
-        state_value = new_state.get("state")
+        # The core logic is called here
+        result = evaluate_pair_logic(pair_name, df_15m, df_5m, last_state_for_pair)
         
-        if state_value and "message" in new_state:
-            logger.info(f"ALERT: {new_state['message']}")
-            await telegram_queue.send(new_state['message'])
-        
-        return pair_name, new_state
+        if result and result[1].get("message"):
+            await telegram_queue.send(result[1]["message"])
 
+        return result
     except Exception as e:
         logger.exception(f"Unhandled error in check_pair for {pair_name}: {e}")
         return None
@@ -1114,12 +1108,32 @@ async def check_pair(fetcher: DataFetcher, products_map: Dict[str, dict], pair_n
 # -------------------------
 # Main runner
 # -------------------------
+
+def build_products_map_from_api_result(prod_resp: dict) -> Dict[str, dict]:
+    """Builds a map from product name to product details, filtering for perpetuals."""
+    products_map = {}
+    if not prod_resp or not prod_resp.get("result"):
+        return products_map
+    
+    for product in prod_resp["result"]:
+        if product.get("product_type") == "perpetual_future" and product.get("symbol"):
+            products_map[product["symbol"]] = product
+    return products_map
+
+async def run_once_with_timeout(timeout_seconds: int):
+    """Runs run_once with a timeout."""
+    try:
+        await asyncio.wait_for(run_once(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.critical(f"Run timed out after {timeout_seconds}s")
+        raise SystemExit(3)
+
+
 async def run_once():
     pid_lock = PidFileLock(cfg.PID_LOCK_PATH) # Use configurable path
-
     if not pid_lock.acquire():
         logger.warning("Bot already running, exiting new run")
-        return 
+        return
 
     # Memory Guard
     try:
@@ -1137,83 +1151,73 @@ async def run_once():
         if deleted > 0:
             logger.info(f"Pruned {deleted} old state records")
         last_alerts = sdb.load_all()
-    logger.info(f"Loaded {len(last_alerts)} previous states")
-    
-    # Use TCPConnector for session connection limiting
-    connector = TCPConnector(limit=cfg.TCP_CONN_LIMIT, ssl=False)
-    
-    # Shared ClientSession Context Manager
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Initialize resources with the shared session
-        fetcher = DataFetcher(session, cfg)
-        telegram_queue = TelegramQueue(session, cfg)
-        
-        if cfg.SEND_TEST_MESSAGE:
-            ist = pytz.timezone("Asia/Kolkata")
-            current_dt = datetime.now(ist)
-            test_msg = (f"🔔 {cfg.BOT_NAME} Started\n"
-                        f"Time: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
-                        f"Pairs: {len(cfg.PAIRS)} | Debug: {cfg.DEBUG_MODE}")
-            await telegram_queue.send(test_msg) # Removed session argument
-        
-        logger.info("Fetching products from API...")
-        prod_resp = await fetcher.fetch_products() # Removed session argument
-        
-        if not prod_resp:
-            logger.error("Failed to fetch products; aborting run.")
-            raise SystemExit(2)
-        
-        products_map = build_products_map_from_api_result(prod_resp)
-        if not products_map:
-            logger.error("No tradable pairs found; exiting.")
-            raise SystemExit(2)
+        logger.info(f"Loaded {len(last_alerts)} previous states")
 
-        pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
-        batch_size = max(1, cfg.BATCH_SIZE)
-        logger.info(f"Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
-        
-        all_results: List[Tuple[str, Dict[str, Any]]] = []
-        
-        # Process in batches for better concurrency management
-        for i in range(0, len(pairs_to_process), batch_size):
-            batch = pairs_to_process[i:i + batch_size]
-            logger.debug(f"Processing batch: {batch}")
+        # Use TCPConnector for session connection limiting
+        connector = TCPConnector(limit=cfg.TCP_CONN_LIMIT, ssl=False) 
+        # Shared ClientSession Context Manager
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Initialize resources with the shared session
+            fetcher = DataFetcher(session, cfg)
+            telegram_queue = TelegramQueue(session, cfg)
+
+            if cfg.SEND_TEST_MESSAGE:
+                ist = pytz.timezone("Asia/Kolkata")
+                current_dt = datetime.now(ist)
+                test_msg = (f"🔔 {cfg.BOT_NAME} Started\n"
+                            f"Time: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
+                            f"Pairs: {len(cfg.PAIRS)} | Debug: {cfg.DEBUG_MODE}")
+                await telegram_queue.send(test_msg) # Removed session argument
+
+            logger.info("Fetching products from API...")
+            prod_resp = await fetcher.fetch_products() # Removed session argument
+            if not prod_resp:
+                logger.error("Failed to fetch products; aborting run.")
+                raise SystemExit(2)
             
-            tasks = []
-            for pair in batch:
-                tasks.append(
-                    check_pair(
-                        fetcher, products_map, pair, 
-                        last_alerts.get(pair), telegram_queue
+            products_map = build_products_map_from_api_result(prod_resp)
+            if not products_map:
+                logger.error("No tradable pairs found; exiting.")
+                raise SystemExit(2)
+
+            pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
+            batch_size = max(1, cfg.BATCH_SIZE)
+            logger.info(f"Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
+            
+            new_alerts: Dict[str, Dict[str, Any]] = {}
+
+            # Process in batches
+            for i in range(0, len(pairs_to_process), batch_size):
+                batch = pairs_to_process[i:i + batch_size]
+                logger.debug(f"Processing batch: {batch}")
+                
+                tasks = []
+                for pair_name in batch:
+                    tasks.append(
+                        check_pair(
+                            fetcher, 
+                            products_map, 
+                            pair_name, 
+                            last_alerts.get(pair_name), 
+                            telegram_queue
+                        )
                     )
-                )
-            
-            # Execute tasks and filter out None results (errors/no-data)
-            batch_results = await asyncio.gather(*tasks)
-            all_results.extend([r for r in batch_results if r is not None])
-            
-            # Yield control between batches
-            await asyncio.sleep(random.uniform(0.1, 0.5))
 
-        # Save all new states in a single transaction
-        new_states = {pair: state for pair, state in all_results}
-        with StateDB(cfg.STATE_DB_PATH) as sdb:
-            for pair, state_info in new_states.items():
-                sdb.set(pair, state_info["state"], state_info["ts"])
-            logger.info(f"Saved/Updated {len(new_states)} pair states.")
+                results = await asyncio.gather(*tasks)
+                
+                for result in results:
+                    if result:
+                        pair_name, state_data = result
+                        # If message is not None, it means a new alert was sent or cooldown expired
+                        if state_data.get("state") is None or state_data.get("message") is not None:
+                             sdb.set(pair_name, state_data.get("state"), state_data.get("ts"))
+                             new_alerts[pair_name] = state_data
 
-    # Final cleanup after run
-    await cleanup_resources()
-    
-# -------------------------
-# Run wrapper with timeout (crash-free)
-# -------------------------
-async def run_once_with_timeout(timeout_seconds: int = 600):
-    try:
-        await asyncio.wait_for(run_once(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        logger.error(f"Run timed out after {timeout_seconds}s")
-        raise SystemExit(3)
+                # Jitter between batches
+                if i + batch_size < len(pairs_to_process):
+                    await asyncio.sleep(random.uniform(cfg.JITTER_MIN, cfg.JITTER_MAX))
+        
+        logger.info(f"Run completed. Total alerts/state changes processed: {len(new_alerts)}")
 
 # -------------------------
 # SIG handling & graceful shutdown
@@ -1236,25 +1240,22 @@ def main():
     group.add_argument("--once", action="store_true", help="Run the bot once and exit (default mode)")
     group.add_argument("--loop", type=int, help="Run the bot in a loop every N seconds (e.g., --loop 60)")
     args = parser.parse_args()
-    
+
     # Check for critical configuration before starting
     try:
         cfg.check_secrets(cfg.TELEGRAM_BOT_TOKEN)
         cfg.check_secrets(cfg.TELEGRAM_CHAT_ID)
         cfg.check_secrets(cfg.DELTA_API_BASE)
-        if cfg.TELEGRAM_BOT_TOKEN == 'xxxx' or cfg.TELEGRAM_CHAT_ID == 'xxxx':
-            if not cfg.DEBUG_MODE or cfg.SEND_TEST_MESSAGE:
-                 raise ValueError("Critical config missing")
-    except ValueError as e:
-        print(f"❌ Configuration Error: {e}")
-        sys.exit(2)
+    except Exception as e:
+        logger.critical(f"Pre-run configuration check failed: {e}")
+        sys.exit(1)
 
     pid_lock = PidFileLock(cfg.PID_LOCK_PATH)
     
     try:
         if args.once:
             try:
-                # Use a simple run for 'once' mode compatible with cronjob setups
+                # Ensure asyncio loops are only started once to prevent resource buildups
                 asyncio.run(run_once_with_timeout(cfg.RUN_TIMEOUT_SECONDS))
             except SystemExit as e:
                 logger.error(f"Exited with code {e.code}")
