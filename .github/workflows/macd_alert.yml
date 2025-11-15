@@ -49,8 +49,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pydantic-settings
-
+          
       # -------------------------
       # Step 5: Run MACD Bot
       # -------------------------
@@ -131,6 +130,7 @@ jobs:
           
           echo "⚠️ Failed to push after 3 attempts. Continuing workflow..."
         continue-on-error: true
+
 
 
 
