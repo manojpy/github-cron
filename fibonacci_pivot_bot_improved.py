@@ -35,8 +35,8 @@ from logging.handlers import RotatingFileHandler
 
 # Pydantic V2 imports
 try:
-    # We explicitly import specific models used in the script
-    from pydantic import BaseModel, field_validator, model_validator 
+    # Removed model_validator as it's not used, just BaseModel
+    from pydantic import BaseModel 
 except ImportError:
     print("⚠️ pydantic not found. Install with: pip install 'pydantic>=2.5.0'")
     sys.exit(1)
@@ -51,8 +51,9 @@ class Config(BaseModel):
     Includes Telegram, API, indicator settings, and operational parameters.
     """
     # Essential Telegram/API Credentials
-    TELEGRAM_BOT_TOKEN: str
-    TELEGRAM_CHAT_ID: str
+    # NOTE: The default must be the placeholder 'xxxx' so it can be overwritten by the config file.
+    TELEGRAM_BOT_TOKEN: str = "xxxx" 
+    TELEGRAM_CHAT_ID: str = "xxxx"
     DELTA_API_BASE: str = "https://api.india.delta.exchange"
     
     # Operational Settings
@@ -103,30 +104,11 @@ class Config(BaseModel):
     # Main Loop (only used if script is run in loop mode, not standard cron)
     RUN_LOOP_INTERVAL: int = 900
     
-    @field_validator("TELEGRAM_BOT_TOKEN")
-    @classmethod
-    def token_not_default(cls, v: str) -> str:
-        if not v or v == "xxxx":
-            raise ValueError("TELEGRAM_BOT_TOKEN must be set and not be 'xxxx'")
-        return v
-
-    @field_validator("TELEGRAM_CHAT_ID")
-    @classmethod
-    def chat_id_not_default(cls, v: str) -> str:
-        if not v or v == "xxxx":
-            raise ValueError("TELEGRAM_CHAT_ID must be set and not be 'xxxx'")
-        return v
-
 # -------------------------
 # DEFAULT CONFIG
 # -------------------------
-DEFAULT_CONFIG = Config(
-    TELEGRAM_BOT_TOKEN="xxxx",
-    TELEGRAM_CHAT_ID="xxxx",
-    PID_LOCK_PATH="/tmp/fibonacci_pivot_bot.lock", # Default added here
-    DEADMAN_HOURS=2, # Default added here
-    BOT_NAME="Fibonacci Pivot Bot", # Default added here
-).model_dump()
+# Initialize default config without custom validators
+DEFAULT_CONFIG = Config().model_dump() 
 
 # -------------------------
 # EXIT CODES
@@ -170,7 +152,12 @@ def load_config() -> Config:
         """Overrides a config key with environment variable if present."""
         val = os.getenv(key)
         if val is not None:
-            base[key] = cast(val) if cast else val
+            # We explicitly check for 'xxxx' here for security sensitive fields
+            if key in ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] and val == "xxxx":
+                # Do nothing, keep the file/default value (which we'll check later)
+                pass 
+            else:
+                base[key] = cast(val) if cast else val
         else:
             base[key] = base.get(key, default)
 
@@ -191,10 +178,24 @@ def load_config() -> Config:
     override("BOT_NAME")
 
     try:
-        # Use model_validate_json for V2 to parse the combined dictionary
-        return Config(**base)
+        # Final Pydantic validation
+        final_config = Config(**base)
+        
+        # --- CRITICAL SECURITY CHECK (Moved here from model validator) ---
+        if final_config.TELEGRAM_BOT_TOKEN == "xxxx":
+            raise ValueError("TELEGRAM_BOT_TOKEN must be set and not be 'xxxx' in config_fib.json or env.")
+        if final_config.TELEGRAM_CHAT_ID == "xxxx":
+            raise ValueError("TELEGRAM_CHAT_ID must be set and not be 'xxxx' in config_fib.json or env.")
+        # --- END CRITICAL SECURITY CHECK ---
+        
+        return final_config
     except Exception as e:
-        print(f"❌ Critical Configuration Error: {e}")
+        # Capture config error details for better debugging
+        print(f"❌ Critical Configuration Error: {e.__class__.__name__}: {e}")
+        # If the error is a ValueError from the security check, we raise a controlled exit
+        if isinstance(e, ValueError):
+            raise SystemExit(EXIT_CONFIG_ERROR)
+        # For other Pydantic errors, re-raise the SystemExit
         raise SystemExit(EXIT_CONFIG_ERROR)
 
 cfg = load_config()
@@ -234,6 +235,7 @@ logger.setLevel(logging.DEBUG if cfg.DEBUG_MODE else log_level)
 class JSONFormatter(logging.Formatter):
     """Enhanced JSON formatter for standardized logging."""
     def format(self, record: logging.LogRecord) -> str:
+        # Standardized logging format includes essential context
         log_obj = {
             "time": self.formatTime(record), 
             "level": record.levelname, 
@@ -243,6 +245,10 @@ class JSONFormatter(logging.Formatter):
             "lineno": record.lineno,
             "msg": record.getMessage()
         }
+        # Add traceback if an exception occurred
+        if record.exc_info:
+            log_obj["exc_info"] = self.formatException(record.exc_info)
+            
         return json.dumps(log_obj, ensure_ascii=False)
 
 # Use standard format for console in debug, JSON for all else
@@ -291,7 +297,8 @@ class ProcessLock:
                         raw = f.read().strip()
                     old_pid = int(raw) if raw.isdigit() else None
                     # Check if the process still exists in /proc (Linux-specific, but robust)
-                    if old_pid and not os.path.exists(f"/proc/{old_pid}"):
+                    # Use psutil.pid_exists for cross-platform robustness
+                    if old_pid and not psutil.pid_exists(old_pid):
                         logger.warning(f"Removing stale lock from PID {old_pid}")
                         try:
                             self.lock_path.unlink(missing_ok=True)
@@ -517,6 +524,13 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
             pass # Ignore if transaction fails
 
         cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='states'")
+        if not cur.fetchone():
+            if logger_local:
+                logger_local.debug("No states table yet; skipping prune.")
+            conn.close()
+            return
+            
         cur.execute("SELECT value FROM metadata WHERE key='last_prune'")
         row = cur.fetchone()
 
@@ -532,13 +546,6 @@ def prune_old_state_records(db_path: str, expiry_days: int = 30, logger_local: l
                     return
             except Exception:
                 pass # Ignore metadata parse errors
-
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='states'")
-        if not cur.fetchone():
-            if logger_local:
-                logger_local.debug("No states table yet; skipping prune.")
-            conn.close()
-            return
 
         # Calculate cutoff timestamp
         cutoff = int(time.time()) - (expiry_days * 86400)
@@ -606,7 +613,8 @@ async def fetch_json_with_retries(
                     raise # Re-raise for the circuit breaker's outer try block
                 
                 # Jittered exponential backoff sleep
-                await asyncio.sleep(backoff * (attempt ** 1.2) + random.uniform(0, 0.2))
+                # Use a larger exponent (1.5) for better spread
+                await asyncio.sleep(backoff * (attempt ** 1.5) + random.uniform(0, 0.2))
             
             except ClientResponseError as cre:
                 METRICS["api_errors"] += 1
@@ -775,16 +783,19 @@ def parse_candle_response(res: dict) -> Optional[pd.DataFrame]:
     # Clean up: sort by timestamp and remove duplicates
     df = df.sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
     
+    # Ensure all numerical columns are float/int
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
     # Final check for validity
-    if df.empty or float(df['close'].astype(float).iloc[-1]) <= 0:
+    if df.empty or float(df['close'].iloc[-1]) <= 0 or df['close'].isnull().any():
         return None
         
     return df
 
 # -------------------------
-# INDICATORS (No change required, existing implementation is fine)
+# INDICATORS
 # -------------------------
-# ... (calculate_ema, calculate_sma, calculate_rma, calculate_ppo, smoothrng, rngfilt, calculate_cirrus_cloud, kalman_filter, calculate_smooth_rsi, calculate_worm_momentum_hist, calculate_fibonacci_pivots, get_crossover_line) ...
 
 def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -804,13 +815,13 @@ def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: 
         fast_ma = calculate_ema(close, fast)
         slow_ma = calculate_ema(close, slow)
         
-    slow_ma = slow_ma.replace(0, np.nan).bfill().ffill() # Handle division by zero
+    slow_ma = slow_ma.replace(0, np.nan).bfill().ffill().clip(lower=1e-8) # Handle division by zero
     
     ppo = ((fast_ma - slow_ma) / slow_ma) * 100
-    ppo = ppo.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+    ppo = ppo.replace([np.inf, -np.inf], np.nan).bfill().ffill().fillna(0) # Fill remaining NaNs with 0
     
     ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
-    ppo_signal = ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+    ppo_signal = ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill().fillna(0)
     
     return ppo, ppo_signal
 
@@ -891,22 +902,23 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     # Apply Kalman Filter for smoothing
     smooth_rsi = kalman_filter(rsi, kalman_len)
     
-    return smooth_rsi.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+    return smooth_rsi.replace([np.inf, -np.inf], np.nan).bfill().ffill().fillna(50)
 
 def calculate_vwap(df: pd.DataFrame, daily_df: pd.DataFrame) -> Optional[pd.Series]:
     """
     Calculates the Volume Weighted Average Price (VWAP) for the current 15m day.
-    Uses daily open/high/low for the pivot point calculation used in VWAP start.
     """
     if daily_df is None or len(daily_df) < 2:
         return None
         
     # Get today's Daily Open (use last but one candle in daily data)
-    today_open = float(daily_df['open'].iloc[-2])
+    try:
+        daily_ts = daily_df['timestamp'].iloc[-2]
+    except IndexError:
+        return None # Not enough daily data
     
-    # Find the first 15m candle whose open is >= today's daily open
-    # This aligns the 15m data with the start of the trading day (usually UTC 00:00)
-    start_index = df[df['timestamp'] >= daily_df['timestamp'].iloc[-2]].index.min()
+    # Find the first 15m candle whose timestamp is >= today's daily open timestamp
+    start_index = df[df['timestamp'] >= daily_ts].index.min()
     
     if pd.isna(start_index):
         # If no candles match (e.g., ran too early in the day), assume the first candle
@@ -918,20 +930,20 @@ def calculate_vwap(df: pd.DataFrame, daily_df: pd.DataFrame) -> Optional[pd.Seri
         return None
         
     # Calculate typical price (TP) for each 15m candle
-    df_day['TP'] = (df_day['high'].astype(float) + df_day['low'].astype(float) + df_day['close'].astype(float)) / 3
+    df_day['TP'] = (df_day['high'] + df_day['low'] + df_day['close']) / 3
     
     # Calculate Cumulative Volume and Cumulative (TP * Volume)
-    df_day['TPV'] = df_day['TP'] * df_day['volume'].astype(float)
-    df_day['CumVol'] = df_day['volume'].astype(float).cumsum()
+    df_day['TPV'] = df_day['TP'] * df_day['volume']
+    df_day['CumVol'] = df_day['volume'].cumsum().clip(lower=1e-8) # Clip for safety
     df_day['CumTPV'] = df_day['TPV'].cumsum()
     
     # Calculate VWAP
-    df_day['VWAP'] = (df_day['CumTPV'] / df_day['CumVol']).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    vwap_series = (df_day['CumTPV'] / df_day['CumVol']).replace([np.inf, -np.inf], np.nan).ffill().bfill()
     
     # Merge back into the full 15m dataframe, filling NaNs
-    vwap_series = df_day['VWAP'].reindex(df.index).ffill().bfill()
+    vwap_full_series = vwap_series.reindex(df.index).ffill().bfill()
     
-    return vwap_series
+    return vwap_full_series
 
 def calculate_worm_momentum_hist(df: pd.DataFrame) -> pd.Series:
     """Calculates the Worm Momentum Histogram (a custom momentum indicator)."""
@@ -947,7 +959,7 @@ def calculate_worm_momentum_hist(df: pd.DataFrame) -> pd.Series:
     ma = close.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
     
     # Calculate raw momentum
-    denom = worm.replace(0, np.nan).bfill().ffill()
+    denom = worm.replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
     raw_momentum = (worm - ma) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
     
@@ -958,17 +970,16 @@ def calculate_worm_momentum_hist(df: pd.DataFrame) -> pd.Series:
     # Normalize raw momentum to 0-1 range
     rng = (max_med - min_med).replace(0, np.nan)
     temp = pd.Series(0.0, index=df.index)
-    valid = rng.notna() & (rng != 0)
+    valid = rng.notna() & (rng.abs() > 1e-8) # Check for near-zero range
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
-    temp = temp.clip(0, 1).fillna(0.5) # clip and default to 0.5 if range is zero
+    temp = temp.clip(0, 1).fillna(0.5) # clip and default to 0.5 if range is zero or nan
     
     # Apply a smoothing/lagging process
     value = pd.Series(0.0, index=df.index)
-    for i in range(1, n):
+    for i in range(1, len(df)):
         prev = value.iloc[i - 1]
         val = (temp.iloc[i] - 0.5 + 0.5 * prev)
-        val = max(min(val, 0.9999), -0.9999)
-        value.iloc[i] = val 
+        value.iloc[i] = max(min(val, 0.9999), -0.9999) # Clip value to prevent log error
 
     # Transform to get momentum value
     temp2 = (1 + value) / (1 - value)
@@ -978,7 +989,7 @@ def calculate_worm_momentum_hist(df: pd.DataFrame) -> pd.Series:
     
     # Calculate final histogram
     hist = pd.Series(0.0, index=df.index)
-    for i in range(1, n):
+    for i in range(1, len(df)):
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
         
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
@@ -1000,30 +1011,16 @@ def calculate_fibonacci_pivots(df_daily: pd.DataFrame) -> Optional[Dict[str, flo
     # Base Pivot Point
     pivot = (high + low + close) / 3
     
-    if close > pivot:
-        # Bullish close
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
-    elif close < pivot:
-        # Bearish close
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
-    else:
-        # Neutral close
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
+    # Difference/Range
+    range_val = high - low
+    
+    # Fibonacci Levels Calculation
+    R3 = pivot + 1.000 * range_val
+    R2 = pivot + 0.618 * range_val
+    R1 = pivot + 0.382 * range_val
+    S1 = pivot - 0.382 * range_val
+    S2 = pivot - 0.618 * range_val
+    S3 = pivot - 1.000 * range_val
         
     return {
         'P': pivot,
@@ -1042,6 +1039,7 @@ def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: 
     if not pivots:
         return None
         
+    # Order levels from high to low to check the highest/lowest first
     levels = ["R3", "R2", "R1", "P", "S1", "S2", "S3"]
     
     for level_name in levels:
@@ -1051,11 +1049,11 @@ def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: 
 
         # Check for crossover
         if direction == "long":
-            # Cross above the line (prev <= line < curr)
+            # Cross above the line (prev <= line < curr). Use a small epsilon for floating point safety.
             if prev_price <= line and curr_price > line:
                 return level_name, line
         elif direction == "short":
-            # Cross below the line (prev >= line > curr)
+            # Cross below the line (prev >= line > curr).
             if prev_price >= line and curr_price < line:
                 return level_name, line
                 
@@ -1072,6 +1070,7 @@ def should_suppress_duplicate(last_state: Optional[Dict[str, Any]], current_sign
     state_ts = int(last_state.get("ts", 0))
     state_signal = last_state.get("state")
 
+    # Only suppress if the signal is exactly the same and within the time window
     if current_signal == state_signal:
         if now_ts() - state_ts < suppress_secs:
             logger.debug(f"Suppressed duplicate signal: {current_signal} within {suppress_secs}s")
@@ -1163,7 +1162,7 @@ async def check_dead_mans_switch(state_db: StateDB, session: aiohttp.ClientSessi
             try:
                 last_success_int = int(last_success)
             except Exception:
-                last_success_int = now_ts()
+                last_success_int = 0
                 
             hours_since = (now_ts() - last_success_int) / 3600.0
             
@@ -1172,19 +1171,18 @@ async def check_dead_mans_switch(state_db: StateDB, session: aiohttp.ClientSessi
                 
                 # Check when the last alert was sent to prevent spam
                 dead_alert_ts = state_db.get_metadata("dead_alert_ts")
+                dead_alert_int = 0
                 if dead_alert_ts:
                     try:
                         dead_alert_int = int(dead_alert_ts)
                     except Exception:
                         dead_alert_int = 0
-                else:
-                    dead_alert_int = 0
                 
                 # Only alert once every 4 hours after the initial failure
                 if now_ts() - dead_alert_int > 4 * 3600: 
                     
                     msg = (
-                        f"🚨 DEAD MAN'S SWITCH: **{cfg.BOT_NAME}** hasn't succeeded in {hours_since:.1f} hours!\n"
+                        f"🚨 DEAD MAN'S SWITCH: **{sanitize_for_telegram(cfg.BOT_NAME)}** hasn't succeeded in {hours_since:.1f} hours!\n"
                         f"Last success: {datetime.fromtimestamp(last_success_int).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
                         f"Expected check-in interval: Every {cfg.RUN_LOOP_INTERVAL / 60:.0f} minutes."
                     )
@@ -1218,7 +1216,7 @@ async def evaluate_pair_async(
     prod = products_map.get(pair_name)
     if prod is None:
         logger.warning(f"Skipping {pair_name}: Product not found in API response.")
-        return None, None
+        return last_state.get("state") if last_state else None, None
         
     # Determine the required candle limits based on default or SPECIAL_PAIRS config
     limit_15m = cfg.SPECIAL_PAIRS.get(pair_name, {}).get("limit_15m", 120)
@@ -1232,10 +1230,14 @@ async def evaluate_pair_async(
         fetch_15m = fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)
         fetch_5m = fetcher.fetch_candles(session, prod['symbol'], "5", limit_5m) if cfg.USE_RMA200 else asyncio.sleep(0, result=None)
         
-        results = await asyncio.gather(fetch_15m, fetch_5m, return_exceptions=True)
+        # Always fetch daily for pivots/vwap start point
+        fetch_daily = fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 1)
+        
+        results = await asyncio.gather(fetch_15m, fetch_5m, fetch_daily, return_exceptions=True)
         
         res15 = results[0] if len(results) > 0 and not isinstance(results[0], Exception) else None
         res5 = results[1] if len(results) > 1 and not isinstance(results[1], Exception) else None
+        res_daily = results[2] if len(results) > 2 and not isinstance(results[2], Exception) else None
         
         if isinstance(results[0], Exception):
             logger.error(f"Exception fetching 15m data for {pair_name}: {results[0]}")
@@ -1249,6 +1251,8 @@ async def evaluate_pair_async(
 
     df_15m = parse_candle_response(res15)
     df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
+    df_daily = parse_candle_response(res_daily)
+
 
     # Check for sufficient data
     if df_15m is None or len(df_15m) < min_required_15m:
@@ -1258,10 +1262,6 @@ async def evaluate_pair_async(
         logger.debug(f"{pair_name}: Insufficient 5m data (got {len(df_5m) if df_5m is not None else 0}, need {min_required_5m})")
         return last_state.get("state") if last_state else None, None
         
-    # Fetch daily data for pivots
-    daily_res = await fetcher.fetch_candles(session, prod['symbol'], "D", cfg.PIVOT_LOOKBACK_PERIOD + 1)
-    df_daily = parse_candle_response(daily_res)
-
     pivots = calculate_fibonacci_pivots(df_daily)
     if pivots is None or df_daily is None or len(df_daily) < 2:
         logger.debug(f"{pair_name}: Insufficient daily data for pivots.")
@@ -1482,7 +1482,8 @@ async def run_once(state_db: StateDB, send_test: bool = True):
     Refactored to use a single shared aiohttp.ClientSession.
     """
     # 1. Setup Session/Fetcher/Circuit Breaker
-    connector = TCPConnector(limit=cfg.MAX_CONCURRENCY, ssl=False)
+    # Use a high limit for total connection in case of DNS/OS limits, the semaphore will enforce MAX_CONCURRENCY
+    connector = TCPConnector(limit=max(cfg.MAX_CONCURRENCY + 2, 10), ssl=False) 
     # The entire run uses this single session
     async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)) as session:
         
@@ -1498,11 +1499,13 @@ async def run_once(state_db: StateDB, send_test: bool = True):
             state_db.set_metadata("last_success_run", "0")
             
         if cfg.SEND_TEST_MESSAGE and send_test:
-            test_msg = f"🚀 **{cfg.BOT_NAME}** is starting. Time: {human_ts()}. Execution limit: {cfg.MAX_EXEC_TIME}s."
+            test_msg = f"🚀 **{sanitize_for_telegram(cfg.BOT_NAME)}** is starting. Time: {human_ts()}. Execution limit: {cfg.MAX_EXEC_TIME}s."
+            # Use the shared session for the test message
             await send_telegram_with_retries(session, cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, test_msg)
             
         products_map = load_products_cache()
         circuit = CircuitBreaker()
+        # Use MAX_CONCURRENCY for the internal semaphore to limit active API calls
         fetcher_local = DataFetcher(cfg.DELTA_API_BASE, max_parallel=cfg.MAX_CONCURRENCY, circuit_breaker=circuit)
 
         # 3. Product Discovery (if cache miss)
@@ -1537,7 +1540,7 @@ async def run_once(state_db: StateDB, send_test: bool = True):
                 timeout=cfg.MAX_EXEC_TIME
             )
         except asyncio.TimeoutError:
-            logger.error(f"❌ Execution exceeded MAX_EXEC_TIME of {cfg.MAX_EXEC_TIME} seconds.")
+            logger.error(f"❌ Execution exceeded MAX_EXEC_TIME of {cfg.MAX_EXEC_TIME} seconds. Aborting remaining tasks.")
             raise SystemExit(EXIT_TIMEOUT)
         
         # 5. Process Results
@@ -1554,8 +1557,8 @@ async def run_once(state_db: StateDB, send_test: bool = True):
             new_state, alert_info = result
             
             if new_state:
+                # Update state only if a new, valid state was determined
                 state_db.set(pair_name, new_state)
-            # Only clear state if evaluate_pair_async explicitly signals it (e.g., expiry/no longer valid)
             elif new_state is None and last_alerts.get(pair_name):
                  # Clear state if the new state is None and an old state exists
                 state_db.set(pair_name, None)
@@ -1578,6 +1581,7 @@ def main():
     global stop_requested
     
     # 1. Initialize DB and Lock
+    # Prune before the lock acquisition, as it's a file operation
     prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
     state_db = StateDB(cfg.STATE_DB_PATH)
 
@@ -1586,18 +1590,24 @@ def main():
     
     try:
         if not lock.acquire():
-            logger.warning("Exiting: Lock file in use by another process. (PID Lock Path: {cfg.PID_LOCK_PATH})")
+            logger.warning(f"Exiting: Lock file in use by another process. (PID Lock Path: {cfg.PID_LOCK_PATH})")
             sys.exit(EXIT_LOCK_CONFLICT)
 
         reset_metrics()
         
         # Memory Check (Good safeguard for small environments)
-        if psutil.virtual_memory().available < cfg.MEMORY_LIMIT_BYTES:
-            logger.error(f"❌ Aborting: Insufficient memory. Available: {psutil.virtual_memory().available / 1024**2:.0f}MB, Required: {cfg.MEMORY_LIMIT_BYTES / 1024**2:.0f}MB")
-            raise SystemExit(EXIT_API_FAILURE)
+        # Use a try-except block in case psutil isn't fully supported
+        try:
+            if psutil.virtual_memory().available < cfg.MEMORY_LIMIT_BYTES:
+                logger.error(f"❌ Aborting: Insufficient memory. Available: {psutil.virtual_memory().available / 1024**2:.0f}MB, Required: {cfg.MEMORY_LIMIT_BYTES / 1024**2:.0f}MB")
+                raise SystemExit(EXIT_API_FAILURE)
+        except Exception:
+            logger.debug("Skipping memory check: psutil error or not supported.")
+
 
         # Determine if running in an infinite loop (e.g., in a Docker container) 
         # or as a single run (e.g., cron-jobs.org or GitHub Actions)
+        # The `--once` flag in your traceback suggests a single run, which is the default/else block.
         LOOP_MODE = str_to_bool(os.getenv("LOOP_MODE", "false"))
 
         if LOOP_MODE:
@@ -1605,11 +1615,13 @@ def main():
             interval = cfg.RUN_LOOP_INTERVAL
             logger.info(f"🔁 Loop mode started. Running every {interval} seconds.")
             
-            loop_start = METRICS.get('start_time')
+            # Start time used for the elapsed calculation
+            loop_start = time.time()
+            
             while not stop_requested:
                 try:
                     # Only send the test message on the first iteration of the loop
-                    asyncio.run(run_once(state_db, send_test=loop_start == METRICS.get('start_time')))
+                    asyncio.run(run_once(state_db, send_test=time.time() - loop_start < 5))
                 except SystemExit as e:
                     logger.error(f"Run exited with code {e.code}, continuing loop.")
                     if e.code == EXIT_TIMEOUT:
@@ -1622,9 +1634,13 @@ def main():
                 elapsed = time.time() - loop_start
                 to_sleep = max(0, interval - elapsed)
                 
-                # Check for stop request while sleeping
+                # Use simple sleep that respects stop_requested
                 if to_sleep > 0:
-                    time.sleep(to_sleep) # Simple sleep for a long-running process
+                    logger.debug(f"Sleeping for {to_sleep:.2f} seconds.")
+                    time.sleep(to_sleep)
+
+                # Restart the timer for the next loop
+                loop_start = time.time()
 
             sys.exit(EXIT_SUCCESS)
             
