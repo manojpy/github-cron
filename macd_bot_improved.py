@@ -19,7 +19,6 @@ import gc
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import contextmanager
 
 import aiohttp
 import pandas as pd
@@ -843,7 +842,8 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
 
         bot_name = cfg.get("BOT_NAME", "MACD Bot")
 
-        # Conditions dicts
+        # Conditions dicts — all buy signals require the common buy filters,
+        # and all sell signals require the common sell filters.
         buy_mmh_reversal_conds = {
             "mmh_reversal_buy": mmh_reversal_buy,
             "close_above_rma50": close_above_rma50,
@@ -865,7 +865,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         buy_srsi_conds = {
             "srsi_cross_up_50": srsi_cross_up_50,
             "ppo_above_signal": ppo_above_signal,
-            "ppo_below_030": ppo_below_030,
+            "ppo_below_030": ppo_below_030,  # additional guard (kept)
             "close_above_rma50": close_above_rma50,
             "close_above_rma200": close_above_rma200,
             "cloud_green": (cloud_state == "green"),
@@ -876,7 +876,7 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         sell_srsi_conds = {
             "srsi_cross_down_50": srsi_cross_down_50,
             "ppo_below_signal": ppo_below_signal,
-            "ppo_above_minus030": ppo_above_minus030,
+            "ppo_above_minus030": ppo_above_minus030,  # additional guard (kept)
             "close_below_rma50": close_below_rma50,
             "close_below_rma200": close_below_rma200,
             "cloud_red": (cloud_state == "red"),
@@ -968,7 +968,11 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             logger.debug(f"Idempotency: {pair_name} signal remains {current_state}.")
             return last_state_for_pair
 
-        return {"state": current_state, "ts": now_ts_int, "message": send_message}
+        result = {"state": current_state, "ts": now_ts_int}
+        if send_message:
+            result["message"] = send_message
+        return result
+
     except Exception as e:
         logger.exception(f"Error evaluating logic for {pair_name}: {e}")
         return None
@@ -1091,7 +1095,7 @@ async def check_pair(session: aiohttp.ClientSession, fetcher: DataFetcher, produ
         new_state = evaluate_pair_logic(pair_name, df_15m, df_5m, last_state_for_pair)
         if not new_state:
             return None
-        message = new_state.pop("message", None)
+        message = new_state.get("message")
         if message:
             await telegram_queue.send(session, message)
         return pair_name, new_state
@@ -1201,7 +1205,7 @@ async def run_once():
                     if prev != new_state:
                         sdb.set(pair_name, new_state.get("state"), new_state.get("ts"))
                         updates += 1
-                    if "message" in new_state:
+                    if new_state.get("message"):
                         alerts_sent += 1
 
                 sdb.set_metadata("last_success_run", str(int(time.time())))
