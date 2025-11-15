@@ -9,9 +9,7 @@
   "DELTA_API_BASE": "https://api.india.delta.exchange",
   "PID_LOCK_PATH": "/tmp/macd_bot.pid",
 
-  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
-    "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD",
-    "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
+  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
 
   "SPECIAL_PAIRS": {
     "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
@@ -24,8 +22,12 @@
   "RMA_50_PERIOD": 50,
   "RMA_200_PERIOD": 200,
   "CIRRUS_CLOUD_ENABLED": true,
-  "X1": 22, "X2": 9, "X3": 15, "X4": 5,
-  "SRSI_RSI_LEN": 21, "SRSI_KALMAN_LEN": 5,
+  "X1": 22,
+  "X2": 9,
+  "X3": 15,
+  "X4": 5,
+  "SRSI_RSI_LEN": 21,
+  "SRSI_KALMAN_LEN": 5,
 
   "MAX_PARALLEL_FETCH": 8,
   "HTTP_TIMEOUT": 15,
