@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import asyncio
 import fcntl
 import gc
