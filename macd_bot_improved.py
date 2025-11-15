@@ -27,8 +27,10 @@ import pytz
 import psutil
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector
 from logging.handlers import RotatingFileHandler
-from pydantic import Field, validator, root_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings
+from pydantic import field_validator, model_validator
+
 
 # ==========================================================
 # Configuration via Pydantic (env + optional JSON file)
@@ -103,9 +105,10 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         case_sensitive = False
 
-    @validator("DELTA_API_BASE")
-    def strip_api_base(cls, v):
+    @field_validator("DELTA_API_BASE")
+    def strip_api_base(cls, v: str) -> str:
         return v.rstrip("/")
+
 
     @validator("LOG_LEVEL")
     def validate_log_level(cls, v):
@@ -143,9 +146,11 @@ class Settings(BaseSettings):
     def validate_tel_backoff(cls, v):
         return max(1.0, min(5.0, v))
 
-    @root_validator
-    def cross_validate(cls, values):
-        # Merge JSON config file if present
+    @model_validator(mode="after")
+    def cross_validate(self) -> "Settings":
+    values = self.__dict__
+    
+    # Merge JSON config file if present
         cfg_file = values.get("CONFIG_FILE")
         if cfg_file and Path(cfg_file).exists():
             try:
@@ -195,7 +200,7 @@ class Settings(BaseSettings):
         if not pid_path:
             values["PID_FILE_PATH"] = "/tmp/macd_bot.pid"
 
-        return values
+        return self
 
 
 cfg = Settings()
