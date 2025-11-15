@@ -3,37 +3,28 @@ name: Trading Alert Bots
 on:
   workflow_dispatch:     # Manual trigger
   # schedule:
-  #   - cron: '1,16,31,46 * * * *'   # Every 15 mins at :01, :16, :31, :46 UTC (commented since Cron-jobs.org handles timing)
+  #   - cron: '1,16,31,46 * * * *'
 
 concurrency:
   group: trading-alert-bots
-  cancel-in-progress: false  # Ensures previous runs finish fully
+  cancel-in-progress: false
 
 jobs:
-  run-bot:
+  # Separate job for MACD bot
+  macd-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
-      # -------------------------
-      # Step 1: Checkout repository
-      # -------------------------
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # -------------------------
-      # Step 2: Setup Python 3.12
-      # -------------------------
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
-      # -------------------------
-      # Step 3: Cache pip packages
-      # -------------------------
       - name: Cache pip packages
         uses: actions/cache@v3
         with:
@@ -42,19 +33,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # -------------------------
-      # Step 4: Install dependencies
-      # -------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # -------------------------
-      # Step 5: Run MACD Bot
-      # -------------------------
-      - name: Run MACD Bot (Improved)
-        id: macd_bot
+      - name: Run MACD Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -64,24 +48,53 @@ jobs:
           LOG_FILE: macd_bot.log
           CONFIG_FILE: config_macd.json
         run: python macd_bot_improved.py --once
-        continue-on-error: true
 
-      # -------------------------
-      # Step 6: Cleanup after MACD Bot
-      # -------------------------
-      - name: Cleanup After MACD Bot
+      - name: Upload MACD Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macd_logs
+          path: macd_bot.log
+          retention-days: 7
+
+      - name: Commit MACD State
         if: always()
         run: |
-          echo "Cleaning up Python cache and session leftovers..."
-          rm -rf __pycache__ || true
-          rm -f aiohttp_cache.db || true
-          rm -rf ~/.aiohttp_cache || true
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add macd_state.sqlite --force
+          git commit -m "Update MACD bot state [skip ci]" --allow-empty || echo "No changes to commit"
+          git push || echo "Push failed, will retry in next run"
 
-      # -------------------------
-      # Step 7: Run Fibonacci Pivot Bot
-      # -------------------------
-      - name: Run Fibonacci Pivot Bot (Improved)
-        id: fib_bot
+  # Separate job for Fibonacci bot  
+  fib-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Fibonacci Pivot Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -91,48 +104,31 @@ jobs:
           LOG_FILE: fibonacci_pivot_bot.log
           CONFIG_FILE: config_fib.json
         run: python fibonacci_pivot_bot_improved.py --once
-        continue-on-error: true
 
-      # -------------------------
-      # Step 8: Upload Logs (always, even on failure)
-      # -------------------------
-      - name: Upload Bot Logs
-        uses: actions/upload-artifact@v4
+      - name: Upload Fibonacci Logs
         if: always()
-        continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
-          name: bot_logs
-          path: |
-            macd_bot.log
-            fibonacci_pivot_bot.log
+          name: fib_logs
+          path: fibonacci_pivot_bot.log
           retention-days: 7
 
-      # -------------------------
-      # Step 9: Commit and Push State Files (with retries)
-      # -------------------------
-      - name: Commit and Push state files
+      - name: Commit Fibonacci State
         if: always()
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add *.sqlite --force
-          git commit -m "Update bot states [skip ci]" --allow-empty
-          
-          # Retry push up to 3 times
-          for i in {1..3}; do
-            if git push; then
-              echo "✅ Push successful"
-              exit 0
-            fi
-            echo "❌ Push failed, attempt $i/3. Retrying in 5 seconds..."
-            sleep 5
-          done
-          
-          echo "⚠️ Failed to push after 3 attempts. Continuing workflow..."
-        continue-on-error: true
+          git add fib_state.sqlite --force
+          git commit -m "Update Fibonacci bot state [skip ci]" --allow-empty || echo "No changes to commit"
+          git push || echo "Push failed, will retry in next run"
 
-
-
-
-
-
+  # Optional: Add a notification job
+  notify:
+    runs-on: ubuntu-latest
+    needs: [macd-bot, fib-bot]
+    if: always()
+    steps:
+      - name: Notify workflow completion
+        run: |
+          echo "Workflow completed - check artifacts for logs"
+        # Add Telegram notification here if desired
