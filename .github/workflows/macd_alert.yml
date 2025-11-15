@@ -49,7 +49,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
+
       # -------------------------
       # Step 5: Run MACD Bot
       # -------------------------
@@ -58,8 +58,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'True' }}
-          SEND_TEST_MESSAGE: 'True'
+          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'False' }}
+          SEND_TEST_MESSAGE: 'False'
           STATE_DB_PATH: macd_state.sqlite
           LOG_FILE: macd_bot.log
           CONFIG_FILE: config_macd.json
@@ -86,7 +86,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DEBUG_MODE: ${{ vars.DEBUG_MODE || 'True' }}
-          SEND_TEST_MESSAGE: 'True'
+          SEND_TEST_MESSAGE: 'False'
           STATE_DB_PATH: fib_state.sqlite
           LOG_FILE: fibonacci_pivot_bot.log
           CONFIG_FILE: config_fib.json
@@ -130,9 +130,6 @@ jobs:
           
           echo "⚠️ Failed to push after 3 attempts. Continuing workflow..."
         continue-on-error: true
-
-
-
 
 
 
