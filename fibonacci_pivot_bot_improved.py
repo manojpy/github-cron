@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # python 3.12+
 """
-Improved Fibonacci Pivot Bot - Enhanced Version
-- Pydantic 2.0 compliance
-- Standardized JSON logging
-- Configurable PID lock path
-- Improved dead man's switch
-- Shared aiohttp.ClientSession
-- Enhanced error handling and stability
+Improved Fibonacci Pivot Bot - Enhanced Debug Version
+- Fixed candle timing issues
+- Enhanced debug logging for signal conditions
+- Better error handling
 """
 
 from __future__ import annotations
@@ -986,6 +983,7 @@ async def evaluate_pair_async(
         rma50_curr = float(rma50.iloc[last_i_15m])
 
         # RMA 200 (5m) check
+        rma200_5m_curr = None
         if cfg.USE_RMA200 and df_5m is not None:
             rma200 = calculate_rma(df_5m['close'].astype(float), 200)
             try:
@@ -1008,15 +1006,17 @@ async def evaluate_pair_async(
         is_green = close_c > open_c
         is_red = close_c < open_c
 
-        # Extra debug output for indicator values
+        # Enhanced debug output for signal conditions
         if cfg.DEBUG_MODE:
             vwap_log_str = f"{vwap_curr:.2f}" if vwap_curr is not None and not np.isnan(vwap_curr) else "nan"
+            rma200_log_str = f"{rma200_5m_curr:.2f}" if rma200_5m_curr is not None else "N/A"
             
             logger.debug(
                 f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
-                f"RMA50={rma50_curr:.2f}, "
+                f"RMA50={rma50_curr:.2f}, RMA200={rma200_log_str}, "
                 f"MMH={magical_curr:.4f}, Cloud={cloud_state}, "
-                f"VWAP={vwap_log_str}" 
+                f"VWAP={vwap_log_str}, Green={is_green}, Red={is_red}, "
+                f"UpperWickOK={upper_wick_ok}, LowerWickOK={lower_wick_ok}"
             )
 
         # RMA200 check: close must be above 200 RMA for long, below for short
@@ -1064,6 +1064,22 @@ async def evaluate_pair_async(
 
         fib_long = base_long_ok and (long_crossover_line is not None)
         fib_short = base_short_ok and (short_crossover_line is not None)
+        
+        # Enhanced signal debugging
+        if cfg.DEBUG_MODE:
+            logger.debug(
+                f"{pair_name} SIGNAL CHECK: "
+                f"base_long_ok={base_long_ok} (green={is_green}, cloud={cloud_state}, "
+                f"MMH>0={magical_curr>0}, upper_wick_ok={upper_wick_ok}, "
+                f"rma_long_ok={rma_long_ok}, close>RMA50={close_c>rma50_curr}), "
+                f"base_short_ok={base_short_ok}, "
+                f"fib_long={fib_long}, fib_short={fib_short}, "
+                f"vbuy={vbuy}, vsell={vsell}"
+            )
+            if long_crossover:
+                logger.debug(f"{pair_name} LONG CROSSOVER: {long_crossover_name} at {long_crossover_line}")
+            if short_crossover:
+                logger.debug(f"{pair_name} SHORT CROSSOVER: {short_crossover_name} at {short_crossover_line}")
         
         up_sig = "🟩▲"
         down_sig = "🟥🔻"
