@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # python 3.12+
 """
-Improved Fibonacci Pivot Bot
-- Designed for cron-jobs.org / GitHub-run environment
-- Uses asyncio, aiohttp, sqlite (WAL), pydantic config validation
-- Robust: circuit breaker, retries, jitter, dead-man switch, graceful shutdown
+Improved Fibonacci Pivot Bot - Corrected Version
+- Removed PPO calculations and conditions
+- Changed wick threshold to 20%
+- Limited Buy signals to P, S1, S2, S3, R1, R2 (exclude R3)
+- Limited Sell signals to P, S1, S2, R1, R2, R3 (exclude S3)
+- Kept VWAP crossover alerts with common conditions
 """
 
 from __future__ import annotations
@@ -52,10 +54,6 @@ class Config(BaseModel):
     DELTA_API_BASE: str = "https://api.india.delta.exchange"
     PAIRS: List[str] = ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"]
     SPECIAL_PAIRS: Dict[str, Dict[str, int]] = {"SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}}
-    PPO_FAST: int = 7
-    PPO_SLOW: int = 16
-    PPO_SIGNAL: int = 5
-    PPO_USE_SMA: bool = False
     X1: int = 22
     X2: int = 9
     X3: int = 15
@@ -79,7 +77,7 @@ class Config(BaseModel):
     LOG_LEVEL: str = "INFO"
     TELEGRAM_RETRIES: int = 3
     TELEGRAM_BACKOFF_BASE: float = 2.0
-    MEMORY_LIMIT_BYTES: int = 400_000_000  # ~400MB safe default for small hosts
+    MEMORY_LIMIT_BYTES: int = 400_000_000
 
     @field_validator("TELEGRAM_BOT_TOKEN")
     @classmethod
@@ -99,7 +97,7 @@ class Config(BaseModel):
 # DEFAULT CONFIG
 # -------------------------
 DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU",
+    "TELEGRAM_BOT_TOKEN": "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU ",
     "TELEGRAM_CHAT_ID": "203813932",
     "DEBUG_MODE": False,
     "SEND_TEST_MESSAGE": True,
@@ -107,10 +105,6 @@ DEFAULT_CONFIG = {
     "DELTA_API_BASE": "https://api.india.delta.exchange",
     "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
     "SPECIAL_PAIRS": {"SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}},
-    "PPO_FAST": 7,
-    "PPO_SLOW": 16,
-    "PPO_SIGNAL": 5,
-    "PPO_USE_SMA": False,
     "X1": 22,
     "X2": 9,
     "X3": 15,
@@ -688,21 +682,6 @@ def calculate_sma(series: pd.Series, period: int) -> pd.Series:
 def calculate_rma(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(alpha=1 / period, adjust=False).mean()
 
-def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: bool = False):
-    close = df['close'].astype(float)
-    if use_sma:
-        fast_ma = calculate_sma(close, fast)
-        slow_ma = calculate_sma(close, slow)
-    else:
-        fast_ma = calculate_ema(close, fast)
-        slow_ma = calculate_ema(close, slow)
-    slow_ma = slow_ma.replace(0, np.nan).bfill().ffill()
-    ppo = ((fast_ma - slow_ma) / slow_ma) * 100
-    ppo = ppo.replace([np.inf, -np.inf], np.nan).bfill().ffill()
-    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
-    ppo_signal = ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill()
-    return ppo, ppo_signal
-
 def smoothrng(x: pd.Series, t: int, m: int) -> pd.Series:
     wper = t * 2 - 1
     avrng = calculate_ema(np.abs(x.diff().fillna(0)), t)
@@ -787,7 +766,6 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
     ma = source.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
-    # raw_momentum = (worm - ma) / worm
     denom = worm.replace(0, np.nan).bfill().ffill()
     raw_momentum = (worm - ma) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -846,21 +824,21 @@ def calculate_fibonacci_pivots(df_daily: pd.DataFrame):
     pivot = (high + low + close) / 3
     
     # Determine which way the market moved yesterday
-    if close < pivot: # Bearish close (Pivot is closer to High)
+    if close < pivot:  # Bearish close (Pivot is closer to High)
         R3 = pivot + (high - low)
         R2 = pivot + 0.618 * (high - low)
         R1 = pivot + 0.382 * (high - low)
         S1 = pivot - 0.382 * (high - low)
         S2 = pivot - 0.618 * (high - low)
         S3 = pivot - (high - low)
-    elif close > pivot: # Bullish close (Pivot is closer to Low)
+    elif close > pivot:  # Bullish close (Pivot is closer to Low)
         R3 = pivot + (high - low)
         R2 = pivot + 0.618 * (high - low)
         R1 = pivot + 0.382 * (high - low)
         S1 = pivot - 0.382 * (high - low)
         S2 = pivot - 0.618 * (high - low)
         S3 = pivot - (high - low)
-    else: # Neutral close
+    else:  # Neutral close
         R3 = pivot + (high - low)
         R2 = pivot + 0.618 * (high - low)
         R1 = pivot + 0.382 * (high - low)
@@ -878,7 +856,14 @@ def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: 
     if not pivots:
         return None
     
-    levels = ["R3", "R2", "R1", "P", "S1", "S2", "S3"]
+    # Buy signals: P, S1, S2, S3, R1, R2 (exclude R3)
+    # Sell signals: P, S1, S2, R1, R2, R3 (exclude S3)
+    if direction == "long":
+        levels = ["R2", "R1", "P", "S1", "S2", "S3"]
+    elif direction == "short":
+        levels = ["R3", "R2", "R1", "P", "S2", "S1"]
+    else:
+        return None
     
     for level_name in levels:
         line = pivots.get(level_name)
@@ -943,7 +928,6 @@ async def evaluate_pair_async(
         limit_5m = sp.get("limit_5m", 500)
         min_required_5m = sp.get("min_required_5m", 250)
         
-        # FIX #1: Initialize vwap_curr to None to prevent UnboundLocalError
         vwap_curr: Optional[float] = None
 
         tasks = [fetcher.fetch_candles(session, prod['symbol'], "15", limit_15m)]
@@ -985,18 +969,15 @@ async def evaluate_pair_async(
         else:
             pivots_available = True
             
-        # Calculate Indicators
-        ppo, ppo_signal = calculate_ppo(df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
+        # Calculate Indicators (NO PPO)
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         magical_hist = calculate_magical_momentum_hist(df_15m)
         
         # VWAP Calculation (15m)
         vwap_15m: Optional[pd.Series] = None
         if df_daily is not None and len(df_daily) >= 2:
-            # VWAP reset daily is calculated based on 15m candles
             vwap_15m = calculate_vwap_daily_reset(df_15m)
             try:
-                # Use second-to-last candle for trigger logic
                 vwap_curr = float(vwap_15m.iloc[last_i_15m])
             except Exception:
                 vwap_curr = None
@@ -1006,7 +987,6 @@ async def evaluate_pair_async(
         open_c = float(df_15m['open'].iloc[last_i_15m])
         high_c = float(df_15m['high'].iloc[last_i_15m])
         low_c = float(df_15m['low'].iloc[last_i_15m])
-        ppo_curr = float(ppo.iloc[last_i_15m])
         magical_curr = float(magical_hist.iloc[last_i_15m])
         
         # Calculate RMA50 for 15m
@@ -1029,7 +1009,7 @@ async def evaluate_pair_async(
         total_range = high_c - low_c
         upper_wick = high_c - max(open_c, close_c)
         lower_wick = min(open_c, close_c) - low_c
-        wick_ratio = 0.35
+        wick_ratio = 0.20  # Changed to 20%
         upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
         lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
         
@@ -1038,47 +1018,23 @@ async def evaluate_pair_async(
 
         # Extra debug output for indicator values
         if cfg.DEBUG_MODE:
-            # FIX #2: Correctly handle formatting of optional float (vwap_curr) to avoid ValueError
             vwap_log_str = f"{vwap_curr:.2f}" if vwap_curr is not None and not np.isnan(vwap_curr) else "nan"
             
             logger.debug(
                 f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
-                f"PPO={ppo_curr:.2f}, RMA50={rma50_curr:.2f}, "
+                f"RMA50={rma50_curr:.2f}, "
                 f"MMH={magical_curr:.4f}, Cloud={cloud_state}, "
                 f"VWAP={vwap_log_str}" 
             )
 
-        # Reason for skip summary
-        if cfg.DEBUG_MODE:
-            reasons = []
-            if cloud_state == "neutral": reasons.append("cloud neutral")
-            if magical_curr <= 0 and is_green: reasons.append("MMH not positive for long")
-            if magical_curr >= 0 and is_red: reasons.append("MMH not negative for short")
-            if not upper_wick_ok and is_green: reasons.append("upper wick too long")
-            if not lower_wick_ok and is_red: reasons.append("lower wick too long")
-            if vwap_curr is not None and len(df_15m) >= abs(last_i_15m) + 2:
-                prev_close = float(df_15m['close'].iloc[last_i_15m - 1])
-                prev_vwap = float(vwap_15m.iloc[last_i_15m - 1])
-                if prev_close <= prev_vwap and close_c <= vwap_curr: reasons.append("no VWAP crossover for long")
-                if prev_close >= prev_vwap and close_c >= vwap_curr: reasons.append("no VWAP crossover for short")
-
-            # RMA200 check reasons
-            if cfg.USE_RMA200 and rma_200_available:
-                if close_c <= rma200_5m_curr and is_green: reasons.append("15m close below 5m RMA200 for long")
-                if close_c >= rma200_5m_curr and is_red: reasons.append("15m close above 5m RMA200 for short")
-                
-            if not reasons: reasons.append("conditions not met")
-            logger.debug(f"{pair_name}: skipped because {', '.join(reasons)}")
-
-        # RMA200 check: 5m close must be above 200 RMA for long, below for short
+        # RMA200 check: close must be above 200 RMA for long, below for short
         rma_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
         rma_short_ok = not cfg.USE_RMA200 or (rma_200_available and close_c < rma200_5m_curr)
         
-        # Base requirements for signal
+        # Base requirements for signal (NO PPO CONDITION)
         base_long_ok = (
             is_green and
             cloud_state == "bullish" and
-            ppo_curr > 0 and
             magical_curr > 0 and
             upper_wick_ok and
             rma_long_ok and
@@ -1088,7 +1044,6 @@ async def evaluate_pair_async(
         base_short_ok = (
             is_red and
             cloud_state == "bearish" and
-            ppo_curr < 0 and
             magical_curr < 0 and
             lower_wick_ok and
             rma_short_ok and
@@ -1127,12 +1082,10 @@ async def evaluate_pair_async(
             current_signal = "vbuy"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 vwap_str = f"{vwap_curr:,.2f}"
-                ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
                 message = (
                     f"{up_sig} {sanitize_for_telegram(pair_name)} - VBuy\n"
                     f"Closed Above VWAP (${vwap_str})\n"
-                    f"PPO 15m: {ppo_str}\n"
                     f"Price: ${price_str}\n"
                     f"{human_ts()}"
                 )
@@ -1140,12 +1093,10 @@ async def evaluate_pair_async(
             current_signal = "vsell"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 vwap_str = f"{vwap_curr:,.2f}"
-                ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
                 message = (
                     f"{down_sig} {sanitize_for_telegram(pair_name)} - VSell\n"
                     f"Closed Below VWAP (${vwap_str})\n"
-                    f"PPO 15m: {ppo_str}\n"
                     f"Price: ${price_str}\n"
                     f"{human_ts()}"
                 )
@@ -1153,12 +1104,10 @@ async def evaluate_pair_async(
             current_signal = f"fib_long_{long_crossover_name}"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 line_str = f"{long_crossover_line:,.2f}"
-                ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
                 message = (
                     f"{up_sig} {sanitize_for_telegram(pair_name)} - Fib Long (Cross {long_crossover_name})\n"
                     f"Price Crossed Above {long_crossover_name} (${line_str})\n"
-                    f"PPO 15m: {ppo_str}\n"
                     f"Price: ${price_str}\n"
                     f"{human_ts()}"
                 )
@@ -1166,12 +1115,10 @@ async def evaluate_pair_async(
             current_signal = f"fib_short_{short_crossover_name}"
             if not should_suppress_duplicate(last_state, current_signal, suppress_secs):
                 line_str = f"{short_crossover_line:,.2f}"
-                ppo_str = f"{ppo_curr:.2f}"
                 price_str = f"{close_c:,.2f}"
                 message = (
                     f"{down_sig} {sanitize_for_telegram(pair_name)} - Fib Short (Cross {short_crossover_name})\n"
                     f"Price Crossed Below {short_crossover_name} (${line_str})\n"
-                    f"PPO 15m: {ppo_str}\n"
                     f"Price: ${price_str}\n"
                     f"{human_ts()}"
                 )
@@ -1183,14 +1130,11 @@ async def evaluate_pair_async(
                 METRICS["alerts_sent"] += 1
                 return current_signal, {"message": message, "signal": current_signal}
             else:
-                # If Telegram send fails, don't update state to allow retry
                 return None, None
         
-        # Update state only if a non-duplicate signal was found and sent, or if state needs to be cleared
-        # If no signal, explicitly check if the last state signal is stale and clear it
         if last_state and current_signal is None and now_ts() - int(last_state.get("ts", 0)) > suppress_secs:
             logger.debug(f"{pair_name}: Last state '{last_state.get('state')}' expired. Clearing state.")
-            return None, None # Clear state in DB by returning None
+            return None, None
             
         return last_state.get("state") if last_state else None, None
 
@@ -1320,7 +1264,6 @@ async def run_once(send_test: bool = True):
     timeout_task = asyncio.create_task(check_timeout())
     
     try:
-        # DB and State initialization
         prune_old_state_records(cfg.STATE_DB_PATH, cfg.STATE_EXPIRY_DAYS, logger)
         state_db = StateDB(cfg.STATE_DB_PATH)
         await check_dead_mans_switch(state_db)
@@ -1333,7 +1276,7 @@ async def run_once(send_test: bool = True):
 
         if send_test and cfg.SEND_TEST_MESSAGE:
             test_msg = (
-                f"🔔 Fibonacci Pivot Bot started\n"
+                f"📡 Fibonacci Pivot Bot started\n"
                 f"Time: {human_ts()}\n"
                 f"Debug: {'ON' if cfg.DEBUG_MODE else 'OFF'}\n"
                 f"Pairs: {len(cfg.PAIRS)}"
@@ -1389,7 +1332,6 @@ async def run_once(send_test: bool = True):
                     state_db.set(pair_name, new_state)
                 
                 if new_state is None and last_alerts.get(pair_name):
-                    # Only clear state if evaluate_pair_async explicitly signals it (e.g., expiry)
                     if result[0] is None and result[1] is None:
                          state_db.set(pair_name, None)
                 
@@ -1427,15 +1369,11 @@ async def run_once(send_test: bool = True):
 def main():
     if os.getenv("GITHUB_ACTIONS"):
         logger.info("Running in GitHub Actions environment.")
-        # If running in GitHub Actions, assume we only want to run once
-        # and not loop, unless explicitly configured otherwise.
-        # This prevents the job from hanging for the full RUN_LOOP_INTERVAL.
         run_mode = "ONCE"
     elif os.getenv("CRON_JOB"):
         logger.info("Running in Cron Job environment.")
-        run_mode = "ONCE" # Assuming standard cron job should run once and exit
+        run_mode = "ONCE"
     else:
-        # For local development, respect the loop interval
         run_mode = "LOOP"
 
     # Memory limit check
@@ -1457,7 +1395,6 @@ def main():
     
     try:
         if run_mode == "LOOP":
-            # --- Original Looping Logic (for local dev) ---
             interval = cfg.RUN_LOOP_INTERVAL
             logger.info(f"🔄 Loop mode: interval={interval}s")
             while not stop_requested:
@@ -1469,7 +1406,7 @@ def main():
                     if e.code == EXIT_TIMEOUT:
                         logger.warning("Continuing loop after timeout exit.")
                     elif e.code != EXIT_API_FAILURE:
-                        break # Stop for non-recoverable errors
+                        break
                 except Exception:
                     logger.exception("Unhandled in run_once")
 
@@ -1488,10 +1425,9 @@ def main():
             sys.exit(EXIT_SUCCESS)
             
         else:
-            # --- Single Run Logic (for GitHub Actions / Cron) ---
             logger.info("🚀 Single run mode (exiting immediately after completion).")
             asyncio.run(run_once())
-            sys.exit(EXIT_SUCCESS) # Ensure explicit exit
+            sys.exit(EXIT_SUCCESS)
 
     except SystemExit as e:
         logger.error(f"Exited with code {e.code}")
