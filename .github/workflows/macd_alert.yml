@@ -1,80 +1,55 @@
-name: Trading Alert Bots
+name: Trading Bots
 
 on:
-  workflow_dispatch:     # Manual trigger
-  # schedule:
-  #   - cron: '1,16,31,46 * * * *'
-
-concurrency:
-  group: trading-alert-bots
-  cancel-in-progress: false
+  #schedule:
+   # - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 jobs:
-  # Separate job for MACD bot
-  macd-bot:
+  run-bots:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Cache pip packages
-        uses: actions/cache@v3
+      - name: Restore state DBs
+        uses: actions/download-artifact@v4
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          name: bot-state
+          path: .
+        continue-on-error: true   # if first run, no artifact yet
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || true
+          pip install pandas numpy aiohttp pydantic psutil pytz
+
+      - name: Run Fibonacci Pivot Bot
+        env:
+          CONFIG_FILE: config_fib.json
+        run: |
+          python fibonacci_pivot_bot_improved.py
 
       - name: Run MACD Bot
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DEBUG_MODE: ${{ vars.DEBUG_MODE || 'True' }}
-          SEND_TEST_MESSAGE: 'True'
-          STATE_DB_PATH: macd_state.sqlite
-          LOG_FILE: macd_bot.log
           CONFIG_FILE: config_macd.json
-        run: python macd_bot_improved.py --once
+        run: |
+          python macd_bot_improved.py
 
-      - name: Upload MACD Logs
-        if: always()
+      - name: Save state DBs
         uses: actions/upload-artifact@v4
         with:
-          name: macd_logs
-          path: macd_bot.log
-          retention-days: 7
-
-      - name: Commit MACD State
-        if: always()
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add macd_state.sqlite --force
-          git commit -m "Update MACD bot state [skip ci]" --allow-empty || echo "No changes to commit"
-          git push || echo "Push failed, will retry in next run"
-
-  # Separate job for Fibonacci bot  
-  fib-bot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+          name: bot-state
+          path: |
+            fib_state.sqlite
+            macd_state.sqlite
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -132,3 +107,4 @@ jobs:
         run: |
           echo "Workflow completed - check artifacts for logs"
         # Add Telegram notification here if desired
+
