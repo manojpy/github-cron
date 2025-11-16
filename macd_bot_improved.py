@@ -1217,7 +1217,7 @@ async def run_once():
             if cfg.SEND_TEST_MESSAGE:
                 ist = pytz.timezone("Asia/Kolkata")
                 current_dt = datetime.now(ist)
-                test_msg = (f"🔔 {cfg.BOT_NAME} Started\n"
+                test_msg = (f"🚀 {cfg.BOT_NAME} Started\n"
                             f"Time: {current_dt.strftime('%d-%m-%Y @ %H:%M IST')}\n"
                             f"Pairs: {len(cfg.PAIRS)} | Debug: {cfg.DEBUG_MODE}")
                 await telegram_queue.send(test_msg)

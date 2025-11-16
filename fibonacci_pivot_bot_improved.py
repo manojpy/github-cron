@@ -1081,8 +1081,8 @@ async def evaluate_pair_async(
             if short_crossover:
                 logger.debug(f"{pair_name} SHORT CROSSOVER: {short_crossover_name} at {short_crossover_line}")
         
-        up_sig = "🟩▲"
-        down_sig = "🟥🔻"
+        up_sig = "🔼🔵"
+        down_sig = "🔽🟣"
         current_signal = None
         message = None
         suppress_secs = cfg.DUPLICATE_SUPPRESSION_SECONDS
