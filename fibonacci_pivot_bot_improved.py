@@ -779,10 +779,10 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
     value = pd.Series(0.0, index=df.index)
     value.iloc[0] = 1.0
     
-    # BUG FIX #2: Correct recursion formula
+    # BUG FIX #2: Correct recursion formula (remove multiplication by prev_val)
     for i in range(1, n):
         prev_val = value.iloc[i - 1]
-        value.iloc[i] = prev_val * (temp.iloc[i] - 0.5 + 0.5 * prev_val)
+        value.iloc[i] = temp.iloc[i] - 0.5 + 0.5 * prev_val
         value.iloc[i] = max(min(value.iloc[i], 0.9999), -0.9999)
 
     temp2 = (1 + value) / (1 - value)
@@ -811,19 +811,6 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         )
 
     return momentum.replace([np.inf, -np.inf], 0).fillna(0)
-
-def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    df2 = df.copy()
-    df2['datetime'] = pd.to_datetime(df2['timestamp'], unit='s', utc=True)
-    df2['date'] = df2['datetime'].dt.date
-    hlc3 = (df2['high'] + df2['low'] + df2['close']) / 3.0
-    df2['hlc3_vol'] = hlc3 * df2['volume']
-    df2['cum_vol'] = df2.groupby('date')['volume'].cumsum()
-    df2['cum_hlc3_vol'] = df2.groupby('date')['hlc3_vol'].cumsum()
-    vwap = df2['cum_hlc3_vol'] / df2['cum_vol'].replace(0, np.nan)
-    return vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
 
 # -------------------------
 # PIVOT CALCULATION
