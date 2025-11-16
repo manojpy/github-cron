@@ -621,10 +621,11 @@ def build_products_map(api_products: dict) -> Dict[str, dict]:
     for p in api_products.get("result", []):
         try:
             symbol = p.get("symbol", "")
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
+            # Normalize consistently: uppercase, USDT->USD, remove underscores
+            symbol_norm = symbol.upper().replace("_USDT", "USD").replace("USDT", "USD").replace("_", "")
             if p.get("contract_type") == "perpetual_futures":
                 for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+                    if symbol_norm == pair_name.upper().replace("_", ""):
                         products_map[pair_name] = {
                             'id': p.get('id'),
                             'symbol': p.get('symbol'),
