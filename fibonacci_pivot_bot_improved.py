@@ -736,11 +736,24 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
     return smooth_rsi
 
-# -------------------------
-# FIXED MAGICAL MOMENTUM HIST
-# -------------------------
-def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9, pair_name: str = "") -> pd.Series:
-    """FIXED Magical Momentum Hist - Matches Pine Script v6 exactly"""
+def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
+    """
+    Magical Momentum Histogram - matches Pine Script v6 exactly.
+
+    Pine reference:
+      sd = stdev(source, 50) * responsiveness
+      var worm = source; diff = source - worm; delta = abs(diff) > sd ? sign(diff)*sd : diff; worm := worm + delta
+      ma = sma(source, period)
+      raw_momentum = (worm - ma) / worm
+      temp = (raw_momentum - lowest(raw_momentum, period)) / (highest(raw_momentum, period) - lowest(...))
+      value = 1.0
+      value := value * (temp - .5 + .5 * nz(value[1]))
+      value clipped to [-0.9999, 0.9999]
+      temp2 = (1 + value) / (1 - value)
+      momentum = .25 * log(temp2)
+      momentum := momentum + .5 * nz(momentum[1])
+      hist = momentum
+    """
     n = len(df)
     if n == 0:
         return pd.Series([], dtype=float)
@@ -748,79 +761,83 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         return pd.Series(np.zeros(n), index=df.index, dtype=float)
 
     source = df['close'].astype(float).copy()
-    
-    # CRITICAL: Use ddof=0 to match Pine Script's population stddev
+
+    # Match Pine: population stddev (ddof=0) and responsiveness floor
     sd = source.rolling(window=50, min_periods=10).std(ddof=0) * max(0.00001, responsiveness)
     sd = sd.bfill().ffill().clip(lower=1e-6)
 
-    # Calculate worm (this part was correct)
+    # Worm recursive clamp by sd
     worm = source.copy()
     for i in range(1, n):
         diff = source.iloc[i] - worm.iloc[i - 1]
         delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
+    # SMA(period) of source
     ma = source.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
+
+    # Raw momentum normalized by worm
     denom = worm.replace(0, np.nan).bfill().ffill()
     raw_momentum = (worm - ma) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # Normalize raw momentum
+    # Min/max over rolling window
     min_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).min().bfill().ffill()
     max_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).max().bfill().ffill()
     rng = (max_med - min_med).replace(0, np.nan)
 
+    # temp in [0,1] from current_med normalization
     temp = pd.Series(0.0, index=df.index)
     valid = rng.notna()
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
     temp = temp.clip(-1, 1).fillna(0)
 
-    # BUG FIX #1: First bar value must be 1.0 (Pine: value = 0.5 * 2)
+    # Value recursion: multiplicative as per Pine
     value = pd.Series(0.0, index=df.index)
     value.iloc[0] = 1.0
-    
-    # BUG FIX #2: Correct recursion formula (remove multiplication by prev_val)
     for i in range(1, n):
         prev_val = value.iloc[i - 1]
-        value.iloc[i] = temp.iloc[i] - 0.5 + 0.5 * prev_val
-        value.iloc[i] = max(min(value.iloc[i], 0.9999), -0.9999)
+        expr = temp.iloc[i] - 0.5 + 0.5 * prev_val
+        new_val = prev_val * expr
+        # Clip to [-0.9999, 0.9999]
+        if new_val > 0.9999:
+            new_val = 0.9999
+        elif new_val < -0.9999:
+            new_val = -0.9999
+        value.iloc[i] = new_val
 
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
-    
-    # BUG FIX #3: Recursion on momentum itself, not hist
-    momentum = pd.Series(0.0, index=df.index)
-    for i in range(1, n):
-        momentum.iloc[i] = 0.25 * np.log(temp2.iloc[i]) + 0.5 * momentum.iloc[i - 1]
 
-    # Enhanced debugging for specific pairs - FIXED to prevent crashes
-    if pair_name and cfg.DEBUG_MODE and len(momentum) >= 2:
-        # Verify all series have sufficient length before accessing (non-intrusive)
-        min_len = min(len(momentum), len(source), len(worm), len(temp), len(value))
-        if min_len >= 2:
-            last_idx = min_len - 1
-            prev_idx = min_len - 2
-            try:
-                logger.debug(
-                    f"🔍 {pair_name} MMH CALC: "
-                    f"current={momentum.iloc[last_idx]:.6f}, "
-                    f"previous={momentum.iloc[prev_idx]:.6f}, "
-                    f"close={source.iloc[last_idx]:.2f}, "
-                    f"worm={worm.iloc[last_idx]:.2f}, "
-                    f"temp={temp.iloc[last_idx]:.4f}, "
-                    f"value={value.iloc[last_idx]:.4f}"
-                )
-            except Exception:
-                # Silently skip debug logging if it fails
-                pass
+    # Momentum recursion on momentum itself
+    momentum = pd.Series(0.0, index=df.index)
+    for i in range(n):
+        base = 0.25 * np.log(temp2.iloc[i])
+        momentum.iloc[i] = base if i == 0 else base + 0.5 * momentum.iloc[i - 1]
+
+    # Optional debug trace for last bars
+    if cfg.DEBUG_MODE and n >= 2:
+        li = -1
+        pi = -2
+        try:
+            logger.debug(
+                json.dumps({
+                    "mmh_debug": {
+                        "last_close": float(source.iloc[li]),
+                        "last_worm": float(worm.iloc[li]),
+                        "last_temp": float(temp.iloc[li]),
+                        "last_value": float(value.iloc[li]),
+                        "last_momentum": float(momentum.iloc[li]),
+                        "prev_momentum": float(momentum.iloc[pi])
+                    }
+                })
+            )
+        except Exception:
+            pass
 
     return momentum.replace([np.inf, -np.inf], 0).fillna(0)
 
-# -------------------------
-# VWAP DAILY RESET
-# -------------------------
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
-    """Calculate VWAP with daily reset"""
     if df is None or df.empty:
         return pd.Series(dtype=float)
     df2 = df.copy()
@@ -995,9 +1012,9 @@ async def evaluate_pair_async(
         else:
             pivots_available = True
             
-        # Calculate Indicators (NO PPO)
+        # Calculate Indicators
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
-        magical_hist = calculate_magical_momentum_hist(df_15m, pair_name=pair_name)  # FIXED: Pass pair_name
+        magical_hist = calculate_magical_momentum_hist(df_15m)
         
         # VWAP Calculation (15m)
         vwap_15m: Optional[pd.Series] = None
@@ -1495,4 +1512,4 @@ def main():
         lock.release()
 
 if __name__ == "__main__":
-    main() 
+    main()
