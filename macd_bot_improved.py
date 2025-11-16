@@ -301,24 +301,24 @@ class StateDB:
         rows = cur.fetchall()
         return {r[0]: {"state": r[1], "ts": int(r[2] or 0)} for r in rows}
 
-    def get(self, pair: str) -> Optional[Dict[str, Any]]:
+    def get(self, pair_name: str) -> Optional[Dict[str, Any]]:
         cur = self._conn.cursor()
-        cur.execute("SELECT state, ts FROM states WHERE pair = ?", (pair,))
+        cur.execute("SELECT state, ts FROM states WHERE pair = ?", (pair_name,))
         r = cur.fetchone()
         if not r:
             return None
         return {"state": r[0], "ts": int(r[1] or 0)}
 
-    def set(self, pair: str, state: Optional[str], ts: Optional[int] = None):
+    def set(self, pair_name: str, state: Optional[str], ts: Optional[int] = None):
         ts = int(ts or time.time())
         cur = self._conn.cursor()
         if state is None:
-            cur.execute("DELETE FROM states WHERE pair = ?", (pair,))
+            cur.execute("DELETE FROM states WHERE pair = ?", (pair_name,))
         else:
             cur.execute(
                 "INSERT INTO states(pair, state, ts) VALUES (?, ?, ?) "
                 "ON CONFLICT(pair) DO UPDATE SET state=excluded.state, ts=excluded.ts",
-                (pair, state, ts)
+                (pair_name, state, ts)
             )
         self._conn.commit()
 
@@ -702,7 +702,8 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
 # -------------------------
 # Corrected Magical Momentum Histogram (MMH)
 # -------------------------
-def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
+def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9, pair_name: str = "") -> pd.Series:
+    """FIXED Magical Momentum Hist - Matches Pine Script v6 exactly"""
     n = len(df)
     if n == 0:
         return pd.Series([], dtype=float)
@@ -710,21 +711,24 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         return pd.Series(np.zeros(n), index=df.index, dtype=float)
 
     source = df['close'].astype(float).copy()
-    sd = source.rolling(window=50, min_periods=10).std() * max(0.00001, responsiveness)
+    
+    # CRITICAL: Use ddof=0 to match Pine Script's population stddev
+    sd = source.rolling(window=50, min_periods=10).std(ddof=0) * max(0.00001, responsiveness)
     sd = sd.bfill().ffill().clip(lower=1e-6)
 
-    # Initialize worm correctly to the first source value, then recursive update
-    worm = pd.Series(index=source.index, dtype=float)
-    worm.iloc[0] = source.iloc[0]
+    # Calculate worm (this part was correct)
+    worm = source.copy()
     for i in range(1, n):
         diff = source.iloc[i] - worm.iloc[i - 1]
         delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
     ma = source.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
-    raw_momentum = (worm - ma) / worm.replace(0, np.nan).bfill().ffill()
+    denom = worm.replace(0, np.nan).bfill().ffill()
+    raw_momentum = (worm - ma) / denom
     raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
 
+    # Normalize raw momentum
     min_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).min().bfill().ffill()
     max_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).max().bfill().ffill()
     rng = (max_med - min_med).replace(0, np.nan)
@@ -734,23 +738,42 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
     temp = temp.clip(-1, 1).fillna(0)
 
-    # Recursive value update must multiply by previous value (per PineScript)
-    value = pd.Series(1.0, index=df.index)
+    # BUG FIX #1: First bar value must be 1.0 (Pine: value = 0.5 * 2)
+    value = pd.Series(0.0, index=df.index)
+    value.iloc[0] = 1.0
+    
+    # BUG FIX #2: Correct recursion formula (remove multiplication by prev_val)
     for i in range(1, n):
-        prev = value.iloc[i - 1]
-        val = prev * (temp.iloc[i] - 0.5 + 0.5 * prev)
-        val = max(min(val, 0.9999), -0.9999)
-        value.iloc[i] = val
+        prev_val = value.iloc[i - 1]
+        value.iloc[i] = temp.iloc[i] - 0.5 + 0.5 * prev_val
+        value.iloc[i] = max(min(value.iloc[i], 0.9999), -0.9999)
 
     temp2 = (1 + value) / (1 - value)
     temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
-    momentum = 0.25 * np.log(temp2)
+    
+    # BUG FIX #3: Recursion on momentum itself, not hist
+    momentum = pd.Series(0.0, index=df.index)
+    for i in range(n):
+        if i == 0:
+            momentum.iloc[i] = 0.25 * np.log(temp2.iloc[i])
+        else:
+            momentum.iloc[i] = 0.25 * np.log(temp2.iloc[i]) + 0.5 * momentum.iloc[i - 1]
 
-    hist = pd.Series(0.0, index=df.index)
-    for i in range(1, n):
-        hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
+    # Enhanced debugging for specific pairs
+    if pair_name and cfg.DEBUG_MODE and len(momentum) >= 2:
+        last_idx = -1
+        prev_idx = -2
+        logger.debug(
+            f"🔍 {pair_name} MMH CALC: "
+            f"current={momentum.iloc[last_idx]:.6f}, "
+            f"previous={momentum.iloc[prev_idx]:.6f}, "
+            f"close={source.iloc[last_idx]:.2f}, "
+            f"worm={worm.iloc[last_idx]:.2f}, "
+            f"temp={temp.iloc[last_idx]:.4f}, "
+            f"value={value.iloc[last_idx]:.4f}"
+        )
 
-    return hist.replace([np.inf, -np.inf], 0).fillna(0)
+    return momentum.replace([np.inf, -np.inf], 0).fillna(0)
 
 # -------------------------
 # Closed-candle indexing
@@ -777,7 +800,8 @@ def evaluate_pair_logic(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
             logger.debug(f"Indexing not ready for {pair_name} (last_i_15={last_i_15}, last_i_5={last_i_5})")
             return None
 
-        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9)
+        # UPDATED: Pass pair_name for enhanced debugging
+        magical_hist = calculate_magical_momentum_hist(df_15m, period=144, responsiveness=0.9, pair_name=pair_name)
         if magical_hist is None or len(magical_hist) <= last_i_15:
             logger.debug(f"MMH missing for {pair_name}")
             return None
