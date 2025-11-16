@@ -15,7 +15,7 @@
 
   "MAX_CONCURRENCY": 6,
   "HTTP_TIMEOUT": 15,
-  "MAX_EXEC_TIME": 25,
+  "MAX_EXEC_TIME": 60,
   "DEADMAN_HOURS": 2,
 
   "BOT_NAME": "Fibonacci Pivot Bot"
