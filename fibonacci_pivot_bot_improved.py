@@ -786,7 +786,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
 
     return hist.replace([np.inf, -np.inf], 0).fillna(0)
-      logger.debug(f"{pair_name} MMH tail: {magical_hist.tail(5).tolist()}")
+       logger.debug(f"{pair_name} MMH tail: {magical_hist.tail(5).tolist()}")
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
