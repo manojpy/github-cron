@@ -33,7 +33,7 @@ from logging.handlers import RotatingFileHandler
 # Default configuration (safe defaults)
 # -------------------------
 DEFAULT_CONFIG = {
-    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAHURmrq_syb7ab1q0R9dSPDJ-8UOCA05uU"),
+    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8462496498:AAFOejDKnww3McUTLoOUd8z3BShnU6DbZIQ"),
     "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", "203813932"),
     "DEBUG_MODE": os.environ.get("DEBUG_MODE", "False").lower() == "true",
     "SEND_TEST_MESSAGE": os.environ.get("SEND_TEST_MESSAGE", "False").lower() == "true",
