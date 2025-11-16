@@ -5,6 +5,7 @@ Improved Fibonacci Pivot Bot - Enhanced Debug Version
 - Fixed candle timing issues
 - Enhanced debug logging for signal conditions
 - Better error handling
+- Added debugging for Magical Momentum Histogram values
 """
 
 from __future__ import annotations
@@ -620,10 +621,11 @@ def build_products_map(api_products: dict) -> Dict[str, dict]:
     for p in api_products.get("result", []):
         try:
             symbol = p.get("symbol", "")
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
+            # Normalize consistently: uppercase, USDT->USD, remove underscores
+            symbol_norm = symbol.upper().replace("_USDT", "USD").replace("USDT", "USD").replace("_", "")
             if p.get("contract_type") == "perpetual_futures":
                 for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+                    if symbol_norm == pair_name.upper().replace("_", ""):
                         products_map[pair_name] = {
                             'id': p.get('id'),
                             'symbol': p.get('symbol'),
@@ -737,51 +739,76 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     return smooth_rsi
 
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
+    """
+    Vectorized Magical Momentum Histogram (fast) with minimal recursion and debug-friendly numerics.
+    Keeps output semantics consistent with the existing alert logic.
+    """
     n = len(df)
     if n == 0:
         return pd.Series([], dtype=float)
     if n < period + 50:
+        # Not enough warmup; keep zeros to avoid noisy early alerts
         return pd.Series(np.zeros(n), index=df.index, dtype=float)
 
     source = df['close'].astype(float).copy()
-    sd = source.rolling(window=50, min_periods=10).std() * max(0.00001, responsiveness)
-    sd = sd.bfill().ffill().clip(lower=1e-6)
 
+    # Rolling std scaled by responsiveness
+    sd = source.rolling(window=50, min_periods=10).std(ddof=0)
+    sd = (sd * max(0.00001, responsiveness)).bfill().ffill().clip(lower=1e-8)
+
+    # Worm update (adaptive step relative to previous worm)
     worm = source.copy()
     for i in range(1, n):
         diff = source.iloc[i] - worm.iloc[i - 1]
-        delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
+        thresh = sd.iloc[i]
+        delta = np.sign(diff) * thresh if abs(diff) > thresh else diff
         worm.iloc[i] = worm.iloc[i - 1] + delta
 
+    # Moving average baseline
     ma = source.rolling(window=period, min_periods=max(5, period // 3)).mean().bfill().ffill()
+
+    # Raw momentum normalized by worm (guard zeros)
     denom = worm.replace(0, np.nan).bfill().ffill()
     raw_momentum = (worm - ma) / denom
-    raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
+    raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
+    # Window min/max
     min_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).min().bfill().ffill()
     max_med = raw_momentum.rolling(window=period, min_periods=max(5, period // 3)).max().bfill().ffill()
     rng = (max_med - min_med).replace(0, np.nan)
 
+    # Normalize into temp [0..1], fall back to 0 when range invalid
     temp = pd.Series(0.0, index=df.index)
     valid = rng.notna()
     temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
-    temp = temp.clip(-1, 1).fillna(0)
+    temp = temp.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    temp = temp.clip(0.0, 1.0)
 
+    # Recursive value with clamp
     value = pd.Series(0.0, index=df.index)
     for i in range(1, n):
-        prev = value.iloc[i - 1]
-        val = (temp.iloc[i] - 0.5 + 0.5 * prev)
-        val = max(min(val, 0.9999), -0.9999)
-        value.iloc[i] = val
+        v = temp.iloc[i] - 0.5 + 0.5 * value.iloc[i - 1]
+        value.iloc[i] = max(min(v, 0.9999), -0.9999)
 
-    temp2 = (1 + value) / (1 - value)
-    temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
-    momentum = 0.25 * np.log(temp2)
-    momentum = pd.Series(momentum, index=df.index).replace([np.inf, -np.inf], 0).fillna(0)
+    # Momentum transform
+    temp2 = (1.0 + value) / (1.0 - value)
+    temp2 = temp2.replace([np.inf, -np.inf], np.nan).fillna(1e-6).clip(lower=1e-6)
+    momentum_val = 0.25 * np.log(temp2)
+
+    # EMA-like recursion to produce histogram
     hist = pd.Series(0.0, index=df.index)
     for i in range(1, n):
-        hist.iloc[i] = momentum.iloc[i] + 0.5 * hist.iloc[i - 1]
-    return hist.replace([np.inf, -np.inf], 0).fillna(0)
+        hist.iloc[i] = float(momentum_val.iloc[i]) + 0.5 * float(hist.iloc[i - 1])
+
+    # Debug: log last values if enabled
+    if cfg.DEBUG_MODE and n >= 4:
+        last4 = hist.iloc[-4:].tolist()
+        logger.debug(
+            f"MMH Debug: last4={list(map(lambda x: round(x, 6), last4))}, "
+            f"last={hist.iloc[-1]:.6f}, raw_last={momentum_val.iloc[-1]:.6f}"
+        )
+
+    return hist.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
@@ -811,28 +838,13 @@ def calculate_fibonacci_pivots(df_daily: pd.DataFrame):
 
     pivot = (high + low + close) / 3
     
-    # Determine which way the market moved yesterday
-    if close < pivot:  # Bearish close (Pivot is closer to High)
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
-    elif close > pivot:  # Bullish close (Pivot is closer to Low)
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
-    else:  # Neutral close
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
+    # Standard Fibonacci pivots (kept as-is)
+    R3 = pivot + (high - low)
+    R2 = pivot + 0.618 * (high - low)
+    R1 = pivot + 0.382 * (high - low)
+    S1 = pivot - 0.382 * (high - low)
+    S2 = pivot - 0.618 * (high - low)
+    S3 = pivot - (high - low)
 
     return {
         'P': pivot, 'R1': R1, 'R2': R2, 'R3': R3,
@@ -934,7 +946,7 @@ async def evaluate_pair_async(
         df_15m = parse_candle_response(res15)
         df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
 
-        # CORRECTED: Use -1 for last completed candle
+        # Use -1 for last completed candle
         last_i_15m = -1
         last_i_5m = -1
         
@@ -958,9 +970,12 @@ async def evaluate_pair_async(
         else:
             pivots_available = True
             
-        # Calculate Indicators (NO PPO)
+        # Indicators
         upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
         magical_hist = calculate_magical_momentum_hist(df_15m)
+
+        # Debug: last 4 bars of histogram for alert visibility
+        last4_hist = magical_hist.iloc[-4:].tolist() if len(magical_hist) >= 4 else magical_hist.tolist()
         
         # VWAP Calculation (15m)
         vwap_15m: Optional[pd.Series] = None
@@ -999,7 +1014,7 @@ async def evaluate_pair_async(
         total_range = high_c - low_c
         upper_wick = high_c - max(open_c, close_c)
         lower_wick = min(open_c, close_c) - low_c
-        wick_ratio = 0.20  # Changed to 20%
+        wick_ratio = 0.20  # 20%
         upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
         lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
         
@@ -1010,11 +1025,10 @@ async def evaluate_pair_async(
         if cfg.DEBUG_MODE:
             vwap_log_str = f"{vwap_curr:.2f}" if vwap_curr is not None and not np.isnan(vwap_curr) else "nan"
             rma200_log_str = f"{rma200_5m_curr:.2f}" if rma200_5m_curr is not None else "N/A"
-            
             logger.debug(
                 f"{pair_name}: close={close_c:.2f}, open={open_c:.2f}, "
                 f"RMA50={rma50_curr:.2f}, RMA200={rma200_log_str}, "
-                f"MMH={magical_curr:.4f}, Cloud={cloud_state}, "
+                f"MMH={magical_curr:.6f}, MMH_last4={[round(x,6) for x in last4_hist]}, Cloud={cloud_state}, "
                 f"VWAP={vwap_log_str}, Green={is_green}, Red={is_red}, "
                 f"UpperWickOK={upper_wick_ok}, LowerWickOK={lower_wick_ok}"
             )
@@ -1042,7 +1056,7 @@ async def evaluate_pair_async(
             close_c < rma50_curr
         )
 
-        # CORRECTED: Use -2 for previous close (the candle before last completed)
+        # Use -2 for previous close (the candle before last completed)
         prev_close = float(df_15m['close'].iloc[-2]) if len(df_15m) >= 2 else close_c
         long_crossover = get_crossover_line(pivots, prev_close, close_c, "long")
         short_crossover = get_crossover_line(pivots, prev_close, close_c, "short")
@@ -1052,7 +1066,7 @@ async def evaluate_pair_async(
         short_crossover_name = short_crossover[0] if short_crossover else None
         short_crossover_line = short_crossover[1] if short_crossover else None
 
-        # CORRECTED VWAP Crossover Signal
+        # VWAP Crossover Signal
         vbuy = False
         vsell = False
         if vwap_curr is not None and len(df_15m) >= 2:
@@ -1380,7 +1394,6 @@ async def run_once(send_test: bool = True):
         
         if cfg.DEBUG_MODE:
             logger.debug(f"Metrics: {METRICS}")
-
 
 # -------------------------
 # MAIN EXECUTION
