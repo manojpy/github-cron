@@ -5,6 +5,8 @@ Improved Fibonacci Pivot Bot - Enhanced Debug Version
 - Fixed candle timing issues
 - Enhanced debug logging for signal conditions
 - Better error handling
+- Corrected Magical Momentum Histogram to match Pine Script v6
+- Added MMH distribution summary logging
 """
 
 from __future__ import annotations
@@ -104,9 +106,6 @@ class Config(BaseModel):
 # -------------------------
 # CONFIG LOADER
 # -------------------------
-def str_to_bool(value: str) -> bool:
-    return str(value).strip().lower() in ("true", "1", "yes", "y", "t")
-
 def load_config() -> Config:
     config_file = os.getenv("CONFIG_FILE", "config_fib.json")
     
@@ -736,9 +735,108 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
     return smooth_rsi
 
-MMH_POSITIVES: List[Tuple[str, float]] = [] # global collector def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series: """ Magical Momentum Histogram - matches Pine Script v6 exactly. """ n = len(df) if n == 0: return pd.Series([], dtype=float) if n < period + 50: return pd.Series(np.zeros(n), index=df.index, dtype=float) source = df['close'].astype(float).copy() # Match Pine: population stddev (ddof=0) and responsiveness floor sd = source.rolling(window=50, min_periods=10).std(ddof=0) * max(0.00001, responsiveness) sd = sd.ffill().clip(lower=1e-6) # Worm recursive clamp by sd worm = source.copy() for i in range(1, n): diff = source.iloc[i] - worm.iloc[i - 1] delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff worm.iloc[i] = worm.iloc[i - 1] + delta # SMA(period) of source — require full window, then forward-fill only ma = source.rolling(window=period, min_periods=period).mean().ffill() # Raw momentum normalized by worm — avoid backward fill denom = worm.replace(0, np.nan).ffill() raw_momentum = (worm - ma) / denom raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0) # Min/max over rolling window — require full window, then ffill min_med = raw_momentum.rolling(window=period, min_periods=period).min().ffill() max_med = raw_momentum.rolling(window=period, min_periods=period).max().ffill() rng = (max_med - min_med).replace(0, np.nan) # temp in [0,1] from current_med normalization temp = pd.Series(0.0, index=df.index) valid = rng.notna() temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid] temp = temp.clip(0, 1).fillna(0) # Value recursion: multiplicative as per Pine value = pd.Series(0.0, index=df.index) value.iloc[0] = 1.0 for i in range(1, n): prev_val = value.iloc[i - 1] expr = temp.iloc[i] - 0.5 + 0.5 * prev_val new_val = prev_val * expr if new_val > 0.9999: new_val = 0.9999 elif new_val < -0.9999: new_val = -0.9999 value.iloc[i] = new_val temp2 = (1 + value) / (1 - value) temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6) # Momentum recursion on momentum itself momentum = pd.Series(0.0, index=df.index) for i in range(n): base = 0.25 * np.log(temp2.iloc[i]) momentum.iloc[i] = base if i == 0 else base + 0.5 * momentum.iloc[i - 1] # Optional debug trace for last bars if cfg.DEBUG_MODE and n >= 2: li = -1 pi = -2 try: logger.debug( json.dumps({ "mmh_debug": { "last_close": float(source.iloc[li]), "last_worm": float(worm.iloc[li]), "last_temp": float(temp.iloc[li]), "last_value": float(value.iloc[li]), "last_momentum": float(momentum.iloc[li]), "prev_momentum": float(momentum.iloc[pi]) } }) ) except Exception: pass
+# Corrected MMH to match Pine v6 and produce meaningful distribution
+MMH_POSITIVES: List[Tuple[str, float]] = []
 
+def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
+    """
+    Magical Momentum Histogram - matches Pine Script v6 exactly.
 
+    Pine reference:
+      sd = stdev(source, 50) * responsiveness
+      var worm = source; diff = source - worm; delta = abs(diff) > sd ? sign(diff)*sd : diff; worm := worm + delta
+      ma = sma(source, period)
+      raw_momentum = (worm - ma) / worm
+      temp = (raw_momentum - lowest(raw_momentum, period)) / (highest(raw_momentum, period) - lowest(...))
+      value = 1.0
+      value := value * (temp - .5 + .5 * nz(value[1]))
+      value clipped to [-0.9999, 0.9999]
+      temp2 = (1 + value) / (1 - value)
+      momentum = .25 * log(temp2)
+      momentum := momentum + .5 * nz(momentum[1])
+      hist = momentum
+    """
+    n = len(df)
+    if n == 0:
+        return pd.Series([], dtype=float)
+    if n < period + 50:
+        return pd.Series(np.zeros(n), index=df.index, dtype=float)
+
+    source = df['close'].astype(float).copy()
+
+    # Population stddev and responsiveness floor
+    sd = source.rolling(window=50, min_periods=10).std(ddof=0) * max(0.00001, responsiveness)
+    sd = sd.ffill().clip(lower=1e-6)
+
+    # Worm recursion
+    worm = source.copy()
+    for i in range(1, n):
+        diff = source.iloc[i] - worm.iloc[i - 1]
+        delta = np.sign(diff) * sd.iloc[i] if abs(diff) > sd.iloc[i] else diff
+        worm.iloc[i] = worm.iloc[i - 1] + delta
+
+    # SMA(period) — require full window, forward-fill only (no backfill)
+    ma = source.rolling(window=period, min_periods=period).mean().ffill()
+
+    # Raw momentum normalized by worm — avoid backward fill
+    denom = worm.replace(0, np.nan).ffill()
+    raw_momentum = (worm - ma) / denom
+    raw_momentum = raw_momentum.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # Min/max — require full window, then ffill
+    min_med = raw_momentum.rolling(window=period, min_periods=period).min().ffill()
+    max_med = raw_momentum.rolling(window=period, min_periods=period).max().ffill()
+    rng = (max_med - min_med).replace(0, np.nan)
+
+    # temp normalized to [0,1]
+    temp = pd.Series(0.0, index=df.index)
+    valid = rng.notna()
+    temp.loc[valid] = (raw_momentum.loc[valid] - min_med.loc[valid]) / rng.loc[valid]
+    temp = temp.clip(0, 1).fillna(0)
+
+    # Multiplicative value recursion
+    value = pd.Series(0.0, index=df.index)
+    value.iloc[0] = 1.0
+    for i in range(1, n):
+        prev_val = value.iloc[i - 1]
+        expr = temp.iloc[i] - 0.5 + 0.5 * prev_val
+        new_val = prev_val * expr
+        if new_val > 0.9999:
+            new_val = 0.9999
+        elif new_val < -0.9999:
+            new_val = -0.9999
+        value.iloc[i] = new_val
+
+    temp2 = (1 + value) / (1 - value)
+    temp2 = temp2.replace([np.inf, -np.inf], np.nan).clip(lower=1e-6).fillna(1e-6)
+
+    # Momentum recursion on momentum itself
+    momentum = pd.Series(0.0, index=df.index)
+    for i in range(n):
+        base = 0.25 * np.log(temp2.iloc[i])
+        momentum.iloc[i] = base if i == 0 else base + 0.5 * momentum.iloc[i - 1]
+
+    # Optional debug trace for last bars
+    if cfg.DEBUG_MODE and n >= 2:
+        li = -1
+        pi = -2
+        try:
+            logger.debug(
+                json.dumps({
+                    "mmh_debug": {
+                        "last_close": float(source.iloc[li]),
+                        "last_worm": float(worm.iloc[li]),
+                        "last_temp": float(temp.iloc[li]),
+                        "last_value": float(value.iloc[li]),
+                        "last_momentum": float(momentum.iloc[li]),
+                        "prev_momentum": float(momentum.iloc[pi])
+                    }
+                })
+            )
+        except Exception:
+            pass
+
+    return momentum.replace([np.inf, -np.inf], 0).fillna(0)
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
@@ -768,28 +866,13 @@ def calculate_fibonacci_pivots(df_daily: pd.DataFrame):
 
     pivot = (high + low + close) / 3
     
-    # Determine which way the market moved yesterday
-    if close < pivot:  # Bearish close (Pivot is closer to High)
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
-    elif close > pivot:  # Bullish close (Pivot is closer to Low)
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
-    else:  # Neutral close
-        R3 = pivot + (high - low)
-        R2 = pivot + 0.618 * (high - low)
-        R1 = pivot + 0.382 * (high - low)
-        S1 = pivot - 0.382 * (high - low)
-        S2 = pivot - 0.618 * (high - low)
-        S3 = pivot - (high - low)
+    # Same formulas for all cases (kept explicit for clarity)
+    R3 = pivot + (high - low)
+    R2 = pivot + 0.618 * (high - low)
+    R1 = pivot + 0.382 * (high - low)
+    S1 = pivot - 0.382 * (high - low)
+    S2 = pivot - 0.618 * (high - low)
+    S3 = pivot - (high - low)
 
     return {
         'P': pivot, 'R1': R1, 'R2': R2, 'R3': R3,
@@ -801,8 +884,6 @@ def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: 
     if not pivots:
         return None
     
-    # Buy signals: P, S1, S2, S3, R1, R2 (exclude R3)
-    # Sell signals: P, S1, S2, R1, R2, R3 (exclude S3)
     if direction == "long":
         levels = ["R2", "R1", "P", "S1", "S2", "S3"]
     elif direction == "short":
@@ -815,7 +896,6 @@ def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: 
         if line is None:
             continue
         
-        # Check for crossover
         if direction == "long":
             if prev_price <= line and curr_price > line:
                 return level_name, line
@@ -828,6 +908,9 @@ def get_crossover_line(pivots: Dict[str, float], prev_price: float, curr_price: 
 # -------------------------
 # STATE MANAGEMENT
 # -------------------------
+def now_ts() -> int:
+    return int(time.time())
+
 def should_suppress_duplicate(last_state: Optional[Dict[str, Any]], current_signal: str, suppress_secs: int) -> bool:
     if not last_state:
         return False
@@ -891,7 +974,7 @@ async def evaluate_pair_async(
         df_15m = parse_candle_response(res15)
         df_5m = parse_candle_response(res5) if cfg.USE_RMA200 else None
 
-        # CORRECTED: Use -1 for last completed candle
+        # Use -1 for last completed candle
         last_i_15m = -1
         last_i_5m = -1
         
@@ -928,12 +1011,18 @@ async def evaluate_pair_async(
             except Exception:
                 vwap_curr = None
                 
-        # Extract values from 15m - using last_i_15m for last closed candle
+        # Extract values from 15m
         close_c = float(df_15m['close'].iloc[last_i_15m])
         open_c = float(df_15m['open'].iloc[last_i_15m])
         high_c = float(df_15m['high'].iloc[last_i_15m])
         low_c = float(df_15m['low'].iloc[last_i_15m])
         magical_curr = float(magical_hist.iloc[last_i_15m])
+        
+        # MMH distribution logging
+        if cfg.DEBUG_MODE:
+            if magical_curr > 0:
+                MMH_POSITIVES.append((pair_name, magical_curr))
+            logger.debug(f"{pair_name} MMH_SIGN: {'POS' if magical_curr > 0 else 'NEG/FLAT'} value={magical_curr:.6g}")
         
         # Calculate RMA50 for 15m
         rma50 = calculate_rma(df_15m['close'].astype(float), 50)
@@ -956,7 +1045,7 @@ async def evaluate_pair_async(
         total_range = high_c - low_c
         upper_wick = high_c - max(open_c, close_c)
         lower_wick = min(open_c, close_c) - low_c
-        wick_ratio = 0.20  # Changed to 20%
+        wick_ratio = 0.20  # 20%
         upper_wick_ok = upper_wick / total_range < wick_ratio if total_range > 0 else True
         lower_wick_ok = lower_wick / total_range < wick_ratio if total_range > 0 else True
         
@@ -976,11 +1065,11 @@ async def evaluate_pair_async(
                 f"UpperWickOK={upper_wick_ok}, LowerWickOK={lower_wick_ok}"
             )
 
-        # RMA200 check: close must be above 200 RMA for long, below for short
+        # RMA200 check
         rma_long_ok = not cfg.USE_RMA200 or (rma_200_available and close_c > rma200_5m_curr)
         rma_short_ok = not cfg.USE_RMA200 or (rma_200_available and close_c < rma200_5m_curr)
         
-        # Base requirements for signal (NO PPO CONDITION)
+        # Base requirements
         base_long_ok = (
             is_green and
             cloud_state == "bullish" and
@@ -999,7 +1088,7 @@ async def evaluate_pair_async(
             close_c < rma50_curr
         )
 
-        # CORRECTED: Use -2 for previous close (the candle before last completed)
+        # Previous close
         prev_close = float(df_15m['close'].iloc[-2]) if len(df_15m) >= 2 else close_c
         long_crossover = get_crossover_line(pivots, prev_close, close_c, "long")
         short_crossover = get_crossover_line(pivots, prev_close, close_c, "short")
@@ -1009,10 +1098,10 @@ async def evaluate_pair_async(
         short_crossover_name = short_crossover[0] if short_crossover else None
         short_crossover_line = short_crossover[1] if short_crossover else None
 
-        # CORRECTED VWAP Crossover Signal
+        # VWAP crossover
         vbuy = False
         vsell = False
-        if vwap_curr is not None and len(df_15m) >= 2:
+        if vwap_curr is not None and len(df_15m) >= 2 and vwap_15m is not None:
             prev_vwap = float(vwap_15m.iloc[-2]) if len(vwap_15m) >= 2 else vwap_curr
             if base_long_ok and prev_close <= prev_vwap and close_c > vwap_curr:
                 vbuy = True
@@ -1337,7 +1426,15 @@ async def run_once(send_test: bool = True):
         
         if cfg.DEBUG_MODE:
             logger.debug(f"Metrics: {METRICS}")
-
+            pos_count = len(MMH_POSITIVES)
+            logger.debug(json.dumps({
+                "mmh_distribution": {
+                    "pairs_scanned": METRICS["pairs_checked"],
+                    "positives_count": pos_count,
+                    "positives": [{"pair": p, "value": v} for p, v in MMH_POSITIVES]
+                }
+            }, ensure_ascii=False))
+            MMH_POSITIVES.clear()
 
 # -------------------------
 # MAIN EXECUTION
