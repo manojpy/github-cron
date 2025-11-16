@@ -1,7 +1,7 @@
 name: Trading Bots
 
 on:
-  #schedule:
+ # schedule:
    # - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:          # manual trigger
 
