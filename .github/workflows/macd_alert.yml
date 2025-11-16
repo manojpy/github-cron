@@ -1,8 +1,8 @@
 name: Trading Bots
 
 on:
- # schedule:
-   # - cron: "*/15 * * * *"   # every 15 minutes
+  #schedule:
+   #- cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:          # manual trigger
 
 jobs:
@@ -12,6 +12,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: List repo files (debug)
+        run: ls -R
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,12 +38,14 @@ jobs:
           CONFIG_FILE: config_fib.json
         run: |
           python fibonacci_pivot_bot_improved.py
+        continue-on-error: true   # don’t fail workflow if bot exits non-zero
 
       - name: Run MACD Bot
         env:
           CONFIG_FILE: config_macd.json
         run: |
           python macd_bot_improved.py
+        continue-on-error: true   # same here
 
       - name: Save state DBs
         uses: actions/upload-artifact@v4
@@ -49,6 +54,7 @@ jobs:
           path: |
             fib_state.sqlite
             macd_state.sqlite
+        continue-on-error: true   # skip gracefully if files not created yet
 
       - name: Save logs
         uses: actions/upload-artifact@v4
@@ -57,5 +63,15 @@ jobs:
           path: |
             fibonacci_pivot_bot.log
             macd_bot.log
+        continue-on-error: true   # skip gracefully if logs not created yet
 
+      - name: Save dependency snapshot
+        run: pip freeze > pip-freeze.txt
+        continue-on-error: true
 
+      - name: Upload dependency snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-freeze
+          path: pip-freeze.txt
+        continue-on-error: true
