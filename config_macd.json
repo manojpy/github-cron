@@ -1,20 +1,36 @@
 {
-  "TELEGRAM_BOT_TOKEN": "8462496498:AAFOejDKnww3McUTLoOUd8z3BShnU6DbZIQ",
-  "TELEGRAM_CHAT_ID": "203813932",
   "DEBUG_MODE": true,
-  "SEND_TEST_MESSAGE": true,
-  "STATE_DB_PATH": "macd_state.sqlite",
-  "LOG_FILE": "macd_bot.log",
-  "STATE_EXPIRY_DAYS": 30,
+  "SEND_TEST_MESSAGE": false,
+  "BOT_NAME": "Unified Alert Bot",
   "DELTA_API_BASE": "https://api.india.delta.exchange",
-  "PID_LOCK_PATH": "/tmp/macd_bot.pid",
-
-  "PAIRS": ["BTCUSD", "ETHUSD", "SOLUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD"],
-
+  "PAIRS": [
+    "BTCUSD",
+    "ETHUSD",
+    "AVAXUSD",
+    "BCHUSD",
+    "XRPUSD",
+    "BNBUSD",
+    "LTCUSD",
+    "DOTUSD",
+    "ADAUSD",
+    "SUIUSD",
+    "AAVEUSD",
+    "SOLUSD"
+  ],
   "SPECIAL_PAIRS": {
-    "SOLUSD": {"limit_15m": 210, "min_required": 180, "limit_5m": 300, "min_required_5m": 200}
+    "BTCUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "ETHUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "AVAXUSD": { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "BCHUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "XRPUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "BNBUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "LTCUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "DOTUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "ADAUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "SUIUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "AAVEUSD": { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 },
+    "SOLUSD":  { "limit_15m": 250, "min_required": 200, "limit_5m": 350, "min_required_5m": 250 }
   },
-
   "PPO_FAST": 7,
   "PPO_SLOW": 16,
   "PPO_SIGNAL": 5,
@@ -28,7 +44,9 @@
   "X4": 5,
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
-
+  "REDIS_URL": "redis://localhost:6379/0",
+  "LOG_FILE": "macd_bot.log",
+  "PID_LOCK_PATH": "/tmp/macd_bot.pid",
   "MAX_PARALLEL_FETCH": 8,
   "HTTP_TIMEOUT": 15,
   "CANDLE_FETCH_RETRIES": 3,
@@ -37,12 +55,19 @@
   "JITTER_MAX": 0.8,
   "RUN_TIMEOUT_SECONDS": 600,
   "BATCH_SIZE": 4,
-  "LOG_LEVEL": "INFO",
+  "TCP_CONN_LIMIT": 8,
   "TELEGRAM_RETRIES": 3,
   "TELEGRAM_BACKOFF_BASE": 2.0,
   "MEMORY_LIMIT_BYTES": 400000000,
-  "TCP_CONN_LIMIT": 8,
+  "STATE_EXPIRY_DAYS": 30,
+  "ENABLE_DMS_PLUGIN": false,
+  "ENABLE_HEALTH_TRACKER": true,
+  "ENABLE_AUTO_RESTART": false,
+  "AUTO_RESTART_MAX_RETRIES": 3,
+  "AUTO_RESTART_COOLDOWN_SEC": 10,
   "DEAD_MANS_COOLDOWN_SECONDS": 14400,
-
-  "BOT_NAME": "MACD Alert Bot"
+  "LOG_LEVEL": "INFO",
+  "ENABLE_VWAP": true,
+  "ENABLE_PIVOT": true,
+  "PIVOT_LOOKBACK_PERIOD": 15
 }
