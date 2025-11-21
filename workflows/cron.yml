@@ -1,0 +1,40 @@
+# File: .github/workflows/cron.yml
+
+name: Scheduled Bot Run (15-Minute Interval)
+
+on:
+  # This sets the cron schedule to run at minute 1, 16, 31, and 46 of every hour.
+  schedule:
+    - cron: '1,16,31,46 * * * *'
+  # Allows manual triggering of the workflow from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  run_bot:
+    # Use a standard Ubuntu runner environment
+    runs-on: ubuntu-latest
+    
+    # Configure environment variables, pulling sensitive values from GitHub Secrets
+    env:
+      PYTHONUNBUFFERED: 1
+      CONFIG_FILE: config_macd.json
+      # These must be set as Secrets in your GitHub repository
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      REDIS_URL: ${{ secrets.REDIS_URL }}
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Matches the version in render.yml
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Alert Bot
+        # The Python script runs once and exits, perfect for a scheduled cron job
+        run: python macd_unified.py
