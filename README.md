@@ -13,7 +13,7 @@ This repository contains an automated trading alert bot that run every 15 minute
 ### Secrets Used
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- 'REDIS_URL' 
+- `REDIS_URL`
 
 ### Config Files
 - `config_macd.json` – Settings for MACD
