@@ -1,8 +1,8 @@
 name: Run Unified MACD Bot
 
 on:
-  schedule:
-    - cron: "1,16,31,46 * * * *"
+  #schedule:
+   # - cron: "1,16,31,46 * * * *"
   workflow_dispatch:
 
 jobs:
