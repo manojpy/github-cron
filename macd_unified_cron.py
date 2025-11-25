@@ -1286,11 +1286,7 @@ def escape_markdown_v2(text: str) -> str:
         if not isinstance(text, str):
             text = str(text)
         text = text.replace("\\", "\\\\")
-        pattern = r'([_\*
-
-\[\]
-
-\(\)~`>#+\-=|{}\.\!])'
+        pattern = r'([_\*\[\]\(\)~`>#+\-=|{}\.\!])'
         return re.sub(pattern, r'\\\1', text)
     except Exception:
         return str(text).replace("\\", "\\\\")
