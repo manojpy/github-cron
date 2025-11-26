@@ -1216,11 +1216,20 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
 
 # ---------- Last closed candle helper (unchanged logic; enforced use) ----------
 def get_last_closed_index(df: pd.DataFrame, interval_minutes: int) -> Optional[int]:
+    
     if df is None or df.empty or len(df) < 2:
         return None
+    
     last_ts = int(df["timestamp"].iloc[-1])
-    current_interval_start = (last_ts // (interval_minutes * 60)) * (interval_minutes * 60)
-    return len(df) - 2 if last_ts >= current_interval_start else len(df) - 1
+    current_time = int(time.time())
+    interval_seconds = interval_minutes * 60
+    
+    last_candle_interval_end = last_ts + interval_seconds
+    
+    if current_time >= last_candle_interval_end:
+        return len(df) - 1
+    else:
+        return len(df) - 2
 
 # ---------- Health tracker ----------
 class HealthTracker:
@@ -1677,9 +1686,21 @@ async def evaluate_pair_and_alert(
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     try:
-        # Always use last CLOSED candle indices
         i15 = get_last_closed_index(df_15m, 15)
         i5 = get_last_closed_index(df_5m, 5)
+        
+        # Debug logging to verify candle timing
+        if i15 is not None:
+            candle_ts = df_15m['timestamp'].iloc[i15]
+            candle_age_minutes = (time.time() - candle_ts) / 60
+            logger_pair.info(
+                f"Analyzing 15m candle: "
+                f"timestamp={candle_ts}, "
+                f"IST={format_ist_time(candle_ts)}, "
+                f"current_time={format_ist_time(time.time())}, "
+                f"age={candle_age_minutes:.1f}min"
+            )
+        
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.debug(f"Indexing not ready (i15={i15}, i5={i5})")
             return None
