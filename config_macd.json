@@ -4,7 +4,7 @@
   "REDIS_URL": "REPLACE_WITH_UPSTASH_REDIS_URL",
   "DELTA_API_BASE": "https://api.delta.exchange",
   "DEBUG_MODE": false,
-  "SEND_TEST_MESSAGE": true,
+  "SEND_TEST_MESSAGE": false,
   "BOT_NAME": "Unified Alert Bot",
   "PAIRS": ["BTCUSD","ETHUSD","AVAXUSD","BCHUSD","XRPUSD","BNBUSD","LTCUSD","DOTUSD","ADAUSD","SUIUSD","AAVEUSD","SOLUSD"],
   "PPO_FAST": 7,
