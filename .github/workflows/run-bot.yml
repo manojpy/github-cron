@@ -35,4 +35,4 @@ jobs:
           FILE_LOGGING: "false"
           CONFIG_FILE: config_macd.json
         run: |
-          python macd_unified_cron.py --once
+          python macd_unified.py --once
