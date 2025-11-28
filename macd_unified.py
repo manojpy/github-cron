@@ -236,6 +236,7 @@ class SafeFormatter(logging.Formatter):
     _CHAT_RE   = re.compile(r"chat_id=\d+")
 
     def format(self, record: logging.LogRecord) -> str:
+        record.args = None
         formatted = super().format(record)
         formatted = self._SECRET_RE.sub("[REDACTED_TOKEN]", formatted)
         formatted = self._CHAT_RE.sub("chat_id=[REDACTED]", formatted)
