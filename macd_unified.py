@@ -473,7 +473,7 @@ class RedisStateStore:
             ok = await self._ping_with_retry(timeout)
             if not ok:
                 raise RedisConnectionError("ping failed after retries")
-            logger.info("Connected to RedisStateStore (max_connections=50, timeouts=%ss)", timeout)
+            logger.info("Connected to RedisStateStore (max_connections=%s, timeouts=%ss)", 50, timeout)
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as exc:
             logger.critical("Redis connection failed – %s", exc)
             if cfg.FAIL_ON_REDIS_DOWN:
