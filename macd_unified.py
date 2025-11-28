@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
-
+import redis.asyncio as aioredis
 import aiohttp
 from aiohttp import web
 import pandas as pd
