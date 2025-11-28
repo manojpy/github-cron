@@ -863,37 +863,50 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> bool:
         logger.error(f"DataFrame validation failed: {e}")
         return False
 
-
 def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFrame]:
     if not result or not isinstance(result, dict):
         return None
     res = result.get("result", {}) or {}
     required_keys = ["t", "o", "h", "l", "c", "v"]
+    
     if not all(k in res for k in required_keys):
         return None
-    try:
-        min_len = min(len(res[k]) for k in required_keys)
-        df = pd.DataFrame({
-            "timestamp": res["t"][:min_len], "open": res["o"][:min_len],
-            "high": res["h"][:min_len], "low": res["l"][:min_len],
-            "close": res["c"][:min_len], "volume": res["v"][:min_len],
-        })
         
+    try:
+        
+        min_len = min(len(res[k]) for k in required_keys)
+        if min_len == 0:
+            return None
+
+        df = pd.DataFrame({
+            "timestamp": res["t"][:min_len], 
+            "open": res["o"][:min_len],
+            "high": res["h"][:min_len], 
+            "low": res["l"][:min_len],
+            "close": res["c"][:min_len], 
+            "volume": res["v"][:min_len],
+        })
+
         df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+        
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
             
-        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype(np.int64)
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
 
-        # Robust timestamp normalization
-        max_ts = int(df["timestamp"].max())
-        if max_ts > 1_000_000_000_000:  # milliseconds
+        df = df[df["timestamp"] > 0].copy()
+        
+        if df.empty:
+            return None
+
+        median_ts = df["timestamp"].median()
+
+        if median_ts > 100_000_000_000:
             df["timestamp"] = (df["timestamp"] // 1000).astype(np.int64)
-        elif max_ts < 1_000_000_000:  # seconds → convert to ms
-            df["timestamp"] = (df["timestamp"] * 1000).astype(np.int64)
-
+        
         if len(df) > 0 and float(df["close"].iloc[-1]) <= 0:
             return None
+            
         return df
     except Exception as e:
         logger.exception(f"Failed to parse candles: {e}")
@@ -1567,15 +1580,21 @@ async def run_once() -> bool:
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     memory_monitor = MemoryMonitor(Constants.MEMORY_LIMIT_PERCENT)
+    
+    # Local reference to ensure we can shut it down explicitly in 'finally'
+    local_health_server: Optional[HealthHttpServer] = None
 
     try:
+        # 1. Start Health Server (Scoped to this run only)
         if HEALTH_SERVER_ENABLED:
-            global health_server
-            health_server = HealthHttpServer(HEALTH_HTTP_PORT)
-            asyncio.create_task(health_server.start())
+            local_health_server = HealthHttpServer(HEALTH_HTTP_PORT)
+            # We await start() inside a task or directly depending on implementation. 
+            # Given the class definition, start() is async but returns immediately after setting up runner.
+            await local_health_server.start()
 
+        # 2. Early Memory Check
         if memory_monitor.is_critical():
-            logger_run.critical(f"🚨 Memory limit exceeded at startup")
+            logger_run.critical(f"🚨 Memory limit exceeded at startup ({memory_monitor.check_memory()[1]}%)")
             return False
 
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
@@ -1584,13 +1603,15 @@ async def run_once() -> bool:
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
             global health_tracker
             health_tracker = HealthTracker(sdb)
-            lock = RedisLock(sdb._redis, "macd_bot_run")
             
+            # 3. Acquire Lock
+            lock = RedisLock(sdb._redis, "macd_bot_run")
             if not await lock.acquire(timeout=5.0):
                 logger_run.warning("❌ Another instance is running (Redis lock held)")
                 return False
 
             try:
+                # 4. Dead Man's Switch Check
                 dms = DeadMansSwitch(sdb, cfg.DEAD_MANS_COOLDOWN_SECONDS)
                 dms_result = await dms.should_alert()
                 if dms_result == "RECOVERED":
@@ -1604,56 +1625,89 @@ async def run_once() -> bool:
                 if cfg.SEND_TEST_MESSAGE:
                     await telegram_queue.send(escape_markdown_v2(f"🚀 Unified Bot - Run Started\nDate : {format_ist_time(datetime.now(timezone.utc))}\nCorr. ID: {correlation_id}"))
 
+                # 5. Fetch Products
                 prod_resp = await fetcher.fetch_products()
                 if not prod_resp:
+                    logger_run.error("Failed to fetch products map")
                     return False
+                
                 products_map = build_products_map_from_api_result(prod_resp)
                 pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
                 batch_size = max(1, cfg.BATCH_SIZE)
                 
                 logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
 
+                # 6. Process Batches
                 all_results: List[Tuple[str, Dict[str, Any]]] = []
                 for i in range(0, len(pairs_to_process), batch_size):
-                    if shutdown_event.is_set() or (time.time() - start_time > cfg.RUN_TIMEOUT_SECONDS):
+                    # Check for shutdown or timeout
+                    if shutdown_event.is_set():
+                        logger_run.info("Shutdown event received during batch processing")
                         break
+                    if time.time() - start_time > cfg.RUN_TIMEOUT_SECONDS:
+                        logger_run.warning("Run timeout reached during batch processing")
+                        break
+
                     batch_pairs = pairs_to_process[i : i + batch_size]
                     batch_results = await process_batch(fetcher, products_map, batch_pairs, sdb, telegram_queue, correlation_id, memory_monitor)
                     all_results.extend(batch_results)
+                    
+                    # Cleanup memory after batch
                     del batch_results
                     gc.collect()
+
                     if memory_monitor.is_critical():
+                        logger_run.warning("Memory critical, stopping batch processing early")
                         break
+                    
+                    # Extend Lock
                     if not await lock.extend(timeout=3.0):
+                        logger_run.error("Lost Redis lock during processing")
                         break
+                    
+                    # Small sleep between batches to be nice to API/CPU
                     if i + batch_size < len(pairs_to_process):
                         await asyncio.sleep(1)
 
+                # 7. Finalize
                 await sdb.set_metadata("last_success_run", str(int(time.time())))
                 alerts_sent = sum(1 for r in all_results if r[1].get("state") == "ALERT_SENT")
                 logger_run.info(f"✅ Run complete: {alerts_sent} alerts sent in {time.time() - start_time:.2f}s")
+            
+            except Exception as e:
+                logger_run.exception(f"Error within Redis context: {e}")
+                raise  # Re-raise to be caught by outer try/except
             finally:
                 await lock.release(timeout=3.0)
         
-        # Explicit session close
-        await SessionManager.close_session()
         return True
 
     except asyncio.CancelledError:
-        logger_run.info("🛑 Run cancelled")
-        await SessionManager.close_session()
+        logger_run.info("🛑 Run cancelled (Task Cancellation)")
         return False
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
-        await SessionManager.close_session()
+        # Only cancel other tasks if we had a fatal crash, not on success
         try:
             await cancel_all_tasks(grace_seconds=5)
         except Exception:
             pass
         return False
     finally:
-        # >>> THE MISSING LINE THAT WAS PROMISED <<<
-        await cancel_all_tasks(grace_seconds=5)
+        # --- CRITICAL CLEANUP SECTION ---
+        
+        # 1. Stop Health Server to free up Port 10001
+        if local_health_server:
+            try:
+                await local_health_server.stop()
+                logger_run.debug("Health server stopped")
+            except Exception as e:
+                logger_run.error(f"Failed to stop health server: {e}")
+
+        # 2. Close HTTP Session
+        await SessionManager.close_session()
+        
+        # 3. Clear Context
         TRACE_ID.set("")
 
 # ---------- Optional uvloop ----------
@@ -1665,6 +1719,7 @@ except ImportError:
     pass
 
 # ---------- Entrypoint ----------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
     parser.add_argument("--once", action="store_true", help="Run one pass and exit")
@@ -1676,10 +1731,16 @@ if __name__ == "__main__":
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
 
+    # LOGIC FIX: CLI args should override Config
+    SHOULD_LOOP = cfg.ENABLE_AUTO_RESTART
+    if args.once:
+        SHOULD_LOOP = False
+        logger.info("CLI override: --once flag detected, disabling auto-restart.")
+
     # ------------------------------------------------------------------
-    # Auto-restart loop (only active when ENABLE_AUTO_RESTART = true in config)
+    # Auto-restart loop
     # ------------------------------------------------------------------
-    if cfg.ENABLE_AUTO_RESTART:
+    if SHOULD_LOOP:
         attempt = 0
         max_attempts = cfg.AUTO_RESTART_MAX_RETRIES
 
@@ -1689,8 +1750,10 @@ if __name__ == "__main__":
 
             try:
                 asyncio.run(asyncio.wait_for(run_once(), timeout=cfg.RUN_TIMEOUT_SECONDS + 120))
-                logger.info("Bot completed successfully – exiting")
-                sys.exit(0)
+                # If run_once completes without error, we usually want to exit even in loop mode
+                # unless this is a continuous daemon. For a Cron-like bot, success = exit.
+                logger.info("Bot completed successfully – exiting loop")
+                sys.exit(0) 
 
             except (asyncio.TimeoutError, KeyboardInterrupt):
                 logger.info("Bot stopped by timeout or user interrupt")
@@ -1701,21 +1764,15 @@ if __name__ == "__main__":
                     f"Bot crashed on attempt {attempt}/{max_attempts}: {exc}",
                     exc_info=True
                 )
-
                 if attempt >= max_attempts:
                     logger.critical("Maximum restart attempts reached – giving up")
                     sys.exit(1)
-
+                
                 cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
                 logger.warning(f"Sleeping {cooldown}s before next restart...")
                 time.sleep(cooldown)
-
-        # Fallback (should never reach here)
-        logger.critical("Auto-restart loop ended unexpectedly")
-        sys.exit(1)
-
     else:
-        # Normal one-shot execution (original behavior)
+        # Standard execution
         try:
             asyncio.run(asyncio.wait_for(run_once(), timeout=cfg.RUN_TIMEOUT_SECONDS + 120))
             sys.exit(0)
