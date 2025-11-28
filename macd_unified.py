@@ -243,6 +243,9 @@ class SafeFormatter(logging.Formatter):
 
 class JsonFormatter(SafeFormatter):
     def format(self, record: logging.LogRecord) -> str:
+
+        record.args = None
+
         base = {
             "ts": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z',
             "level": record.levelname,
@@ -257,6 +260,7 @@ class JsonFormatter(SafeFormatter):
         if record.exc_info:
             base["exc"] = self.formatException(record.exc_info)
         return json.dumps(base, ensure_ascii=False)
+
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("macd_bot")
