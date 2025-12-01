@@ -1,0 +1,32 @@
+name: Run Trading Bot (15-min)
+
+on:
+  schedule:
+    - cron: '1,16,31,46 * * * *'        # same as GitLab
+  workflow_dispatch:                    # manual button
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot:latest
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ env.IMAGE_NAME }}
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        REDIS_URL:          ${{ secrets.REDIS_URL }}
+        DELTA_API_BASE:     ${{ secrets.DELTA_API_BASE }}
+        CONFIG_FILE:        config_macd.json
+        TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout (gives us config_macd.json)
+        uses: actions/checkout@v4
+
+      - name: Run bot
+        run: python -u gitlab_wrapper.py
+
+      - name: Log IST finish
+        run: echo "✅ Finished at $(TZ=Asia/Kolkata date '+%d-%m-%Y %H:%M IST')"
