@@ -1,0 +1,30 @@
+name: Run Unified MACD Bot
+
+on:
+  # schedule:
+  #   - cron: '1,16,31,46 * * * *'   # disable – only Cron-jobs.org will trigger
+  workflow_dispatch:                 # manual / REST entry point
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot:latest
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/${{ github.repository }}/trading-bot:latest   # literal – no env. here
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        REDIS_URL:          ${{ secrets.REDIS_URL }}
+        DELTA_API_BASE:     ${{ secrets.DELTA_API_BASE }}
+        CONFIG_FILE:        config_macd.json
+        TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout (gives us config_macd.json)
+        uses: actions/checkout@v4
+
+      - name: Run bot once
+        run: python -u gitlab_wrapper.py
