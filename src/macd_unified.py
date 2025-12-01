@@ -1526,7 +1526,7 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
         # ---------- message building ----------
         if raw_alerts:
             # HIGH #22 – write state BEFORE sending
-            await asyncio.gather(*[set_alert_state(sdb, pair_name, ALERT_KEYS[def_key], True) for def_key, _ in raw_alerts])
+            await asyncio.gather(*[set_alert_state(sdb, pair_name, k, True) for k, (_, _) in zip(alert_keys_to_set, raw_alerts)])
             if len(raw_alerts) == 1:
                 title, extra = raw_alerts[0]
                 msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
@@ -1745,28 +1745,76 @@ class HealthHttpServer:
         except Exception as e:
             return web.json_response({"status": "error", "error": str(e)}, status=500)
 
-# ---------- Exchange time sync ----------
+# ---------- Reliable exchange-time sync (NTP-style) ----------
 class ExchangeTime:
-    _offset: float = 0.0
-    _lock   = asyncio.Lock()
+    _offset: float = 0.0          # server – local (seconds)
+    _variance: float = 0.0        # std-dev of last samples
+    _samples: deque[float] = deque(maxlen=10)  # last 10 offsets
+    _lock = asyncio.Lock()
+    _decay_task: Optional[asyncio.Task] = None
 
     @classmethod
-    async def sync(cls, api_base: str, timeout: int = 5) -> None:
-        url = f"{api_base.rstrip('/')}/v2/time"
-        async with cls._lock:
+    async def start(cls, api_base: str, interval: int = 300) -> None:
+        """Start background sync (call once at bot start)."""
+        if cls._decay_task is not None:
+            return
+        cls._decay_task = asyncio.create_task(cls._sync_loop(api_base, interval))
+
+    @classmethod
+    async def stop(cls) -> None:
+        if cls._decay_task:
+            cls._decay_task.cancel()
             try:
-                data = await async_fetch_json(url, timeout=timeout, retries=2)
-                server_ts = int(data["result"]) / 1000
-                local_ts  = time.time()
-                cls._offset = server_ts - local_ts
-                logger.info("Exchange-time sync OK | offset %.3f s", cls._offset)
+                await cls._decay_task
+            except asyncio.CancelledError:
+                pass
+            cls._decay_task = None
+
+    @classmethod
+    async def _sync_loop(cls, api_base: str, interval: int) -> None:
+        """Background task: sync every `interval` seconds."""
+        while True:
+            try:
+                await cls.sync(api_base)
             except Exception as exc:
-                logger.warning("Exchange-time sync failed (%s) – using local clock", exc)
-                cls._offset = 0.0
+                logger.debug("background sync error: %s", exc)
+            await asyncio.sleep(interval)
+
+    @classmethod
+    async def sync(cls, api_base: str, timeout: int = 3) -> None:
+        """
+        Single sync attempt.
+        Uses low-cost HEAD if available, else /v2/time.
+        """
+        url = f"{api_base.rstrip('/')}/v2/time"
+        t0 = time.perf_counter()
+        try:
+            data = await async_fetch_json(url, timeout=timeout, retries=1)
+            server_ms = int(data["result"])
+        except Exception:
+            # fall back to local clock
+            server_ms = int(time.time() * 1000)
+        t1 = time.perf_counter()
+        rtt = (t1 - t0) / 2          # round-trip / 2
+        offset_ms = server_ms - int((t0 + rtt) * 1000)
+        offset = offset_ms / 1000.0
+
+        async with cls._lock:
+            cls._samples.append(offset)
+            cls._offset = statistics.fmean(cls._samples)
+            cls._variance = statistics.stdev(cls._samples) if len(cls._samples) > 1 else 0.0
+            logger.info("Exchange-time sync | offset %.3f s (σ=%.3f, n=%d)", cls._offset, cls._variance, len(cls._samples))
 
     @classmethod
     def now(cls) -> float:
-        return time.time() + cls._offset
+        """Return current exchange epoch seconds (float)."""
+        return time.perf_counter() + cls._offset   # monotonic + offset
+
+    @classmethod
+    def healthy(cls) -> bool:
+        """True if we have recent samples and low variance."""
+        return len(cls._samples) >= 3 and cls._variance < 0.1
+
 
 # ---------- Circuit-breaker persistence ----------
 class PersistentCircuitBreaker:
@@ -1834,8 +1882,13 @@ async def run_once() -> bool:
             return False
 
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-        await ExchangeTime.sync(cfg.DELTA_API_BASE)          # <-- exchange-time sync
+        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)                                                 
+        await ExchangeTime.start(cfg.DELTA_API_BASE, interval=300)   # 5-min background sync
+    try:
+        ... whole run ...
+    finally:
+        await ExchangeTime.stop()
+
 
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
             global health_tracker
