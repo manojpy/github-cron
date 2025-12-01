@@ -61,6 +61,8 @@ class Constants:
     CIRCUIT_BREAKER_MAX_WAIT = 300
     MEMORY_CHECK_INTERVAL = 30
     MEMORY_LIMIT_PERCENT = float(os.getenv("MEMORY_LIMIT_PERCENT", 85.0))
+    # MEDIUM #1 – increased cushion (was 3 s)
+    CANDLE_PUBLISH_DELAY_SAFETY = int(os.getenv("CANDLE_PUBLISH_DELAY_SAFETY", 12))
 
 HEALTH_SERVER_ENABLED = os.getenv("HEALTH_SERVER_ENABLED", "false").lower() in ("1", "true", "yes")
 HEALTH_HTTP_PORT = int(os.getenv("HEALTH_HTTP_PORT", "10001"))
@@ -236,8 +238,11 @@ class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = str(record.getMessage())
+            # CRITICAL #5 – extend redaction
             msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
             msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
+            msg = re.sub(r'redis://[^/\s]+', '[REDACTED_REDIS_URL]', msg)
+            msg = re.sub(r'https?://[^/\s]+/[^/\s]+', '[REDACTED_API_BASE]', msg)
             record.msg = msg
         except Exception:
             pass
@@ -252,12 +257,16 @@ class TraceContextFilter(logging.Filter):
 class SafeFormatter(logging.Formatter):
     _SECRET_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
     _CHAT_RE   = re.compile(r"chat_id=\d+")
+    _REDIS_RE  = re.compile(r"redis://[^/\s]+")
+    _API_RE    = re.compile(r'https?://[^/\s]+/[^/\s]+')
 
     def format(self, record: logging.LogRecord) -> str:
         record.args = None
         formatted = super().format(record)
         formatted = self._SECRET_RE.sub("[REDACTED_TOKEN]", formatted)
         formatted = self._CHAT_RE.sub("chat_id=[REDACTED]", formatted)
+        formatted = self._REDIS_RE.sub("[REDACTED_REDIS]", formatted)
+        formatted = self._API_RE.sub("[REDACTED_API]", formatted)
         return formatted
 
 class JsonFormatter(SafeFormatter):
@@ -312,6 +321,23 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 logger.info(f"Using DELTA_API_BASE: {cfg.DELTA_API_BASE}")
+
+def _sanitize_excepthook():
+    import traceback, re
+    secret_patterns = [
+        re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b"),  # telegram token
+        re.compile(r"redis://[^/\s]+"),                  # redis url
+        re.compile(r'https?://[^/\s]+/[^/\s]+'),        # api base
+    ]
+    old_hook = sys.excepthook
+    def safe_hook(exc_type, exc_value, exc_tb):
+        lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+        for pat in secret_patterns:
+            lines = [pat.sub("[REDACTED]", line) for line in lines]
+        sys.stderr.write("".join(lines))
+    sys.excepthook = safe_hook
+_sanitize_excepthook()
+
 
 # ---------- Global shutdown ----------
 shutdown_event = asyncio.Event()
@@ -371,9 +397,18 @@ if PROMETHEUS_ENABLED and Counter and Gauge and Histogram:
         METRIC_REDIS_KEYS = Gauge("redis_keys_total", "Total keys in Redis (db0)")
         METRIC_CB_OPEN = Gauge("circuit_breaker_open", "Circuit breaker open (1) or closed (0)")
         METRIC_CB_FAILURES = Counter("circuit_breaker_failures_total", "Circuit breaker failure increments")
-        start_http_server(Constants.HEALTH_CHECK_PORT)
-        metrics_started = True
-        logger.info(f"Prometheus metrics server started on port {Constants.HEALTH_CHECK_PORT}")
+        # CRITICAL #12 – guard port conflict
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("0.0.0.0", Constants.HEALTH_CHECK_PORT))
+            sock.close()
+            start_http_server(Constants.HEALTH_CHECK_PORT)
+            metrics_started = True
+            logger.info(f"Prometheus metrics server started on port {Constants.HEALTH_CHECK_PORT}")
+        except OSError:
+            logger.critical(f"Prometheus port {Constants.HEALTH_CHECK_PORT} already in use – metrics disabled")
+            PROMETHEUS_ENABLED = False
     except Exception as e:
         logger.warning(f"Failed to start Prometheus metrics: {e}")
 
@@ -456,6 +491,16 @@ async def retry_async(
             return await fn(*args, **kwargs)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            last_exc = Exception("asyncio.TimeoutError")
+            if on_error:
+                try:
+                    on_error(last_exc, attempt)  # type: ignore
+                except Exception:
+                    pass
+            if attempt >= retries:
+                break
+            await asyncio.sleep(_exp_backoff_sleep(attempt, base_backoff, cap))
         except Exception as e:
             last_exc = e
             if on_error:
@@ -668,6 +713,11 @@ class RedisLock:
             await asyncio.wait_for(self.redis.expire(self.lock_key, self.expire), timeout=timeout)
             logger.debug(f"Extended Redis lock: {self.lock_key}")
             return True
+        except asyncio.TimeoutError:
+            logger.error("Lock extend timed out")
+            if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
+                METRIC_REDIS_LOCK_FAILS.inc()
+            return False
         except Exception as e:
             logger.error(f"Error extending Redis lock: {e}")
             if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
@@ -793,11 +843,13 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
             return None
     return None
 
+# ---------- Rate-limited fetcher ----------
 class RateLimitedFetcher:
     def __init__(self, max_per_minute: int = 60, concurrency: int = 4):
         self.max_per_minute = max_per_minute
+        # MEDIUM #2 – bound the deque
+        self.requests: deque[float] = deque(maxlen=max_per_minute * 2)
         self.semaphore = asyncio.Semaphore(concurrency)
-        self.requests: deque[float] = deque()
         self.lock = asyncio.Lock()
 
     async def call(self, func: Callable, *args, **kwargs):
@@ -812,6 +864,7 @@ class RateLimitedFetcher:
         async with self.semaphore:
             return await func(*args, **kwargs)
 
+# ---------- Data fetcher ----------
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
@@ -823,15 +876,22 @@ class DataFetcher:
         self.circuit_breaker = CircuitBreaker()
         self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
 
+    # ---- exchange-aligned now ----
+    def _exchange_now(self) -> int:
+        return int(ExchangeTime.now())
+
     def _clean_cache(self) -> None:
-        now = time.time()
-        if len(self._cache) > self._cache_max_size:
-            to_remove = sorted(self._cache.items(), key=lambda x: x[1][0])[:self._cache_max_size // 5]
-            for k, _ in to_remove:
+        try:
+            now = time.time()
+            if len(self._cache) > self._cache_max_size:
+                to_remove = sorted(self._cache.items(), key=lambda x: x[1][0])[:self._cache_max_size // 5]
+                for k, _ in to_remove:
+                    del self._cache[k]
+            stale = [k for k, (ts, _) in self._cache.items() if now - ts > 300]
+            for k in stale:
                 del self._cache[k]
-        stale = [k for k, (ts, _) in self._cache.items() if now - ts > 300]
-        for k in stale:
-            del self._cache[k]
+        except Exception as e:
+            logger.debug("Cache cleanup error: %s", e)
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
@@ -860,7 +920,7 @@ class DataFetcher:
 
         # ----- DETERMINE LAST FULLY CLOSED CANDLE -----
         minutes = int(resolution) if resolution != "D" else 1440
-        now = int(time.time())
+        now = self._exchange_now()          # exchange-aligned
 
         # window size in seconds (e.g., 900 for 15 minutes)
         window = minutes * 60
@@ -871,8 +931,8 @@ class DataFetcher:
         # last fully closed candle end timestamp
         last_close = (current_window * window)
 
-        # safety cushion for exchange candle publishing delays
-        last_close -= 3
+        # CRITICAL #1 – bigger safety cushion
+        last_close -= Constants.CANDLE_PUBLISH_DELAY_SAFETY
 
         params = {
             "resolution": resolution,
@@ -912,6 +972,12 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> bool:
             return False
         if len(df) < required_len:
             return False
+        # CRITICAL #16 – basic timestamp sanity
+        median_ts = df["timestamp"].median()
+        now_s = int(time.time())
+        if median_ts < 946684800 or median_ts > now_s + 86400*365:  # before 2000 or >1 yr future
+            logger.warning("Candle timestamps out of sane range")
+            return False
         return True
     except Exception as e:
         logger.error(f"DataFrame validation failed: {e}")
@@ -936,7 +1002,11 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
             "close": res["c"][:min_len],
             "volume": res["v"][:min_len],
         })
-        df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+        # MEDIUM #10 – avoid sort if already sorted
+        if not df["timestamp"].is_monotonic_increasing:
+            df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+        else:
+            df = df.drop_duplicates(subset="timestamp").reset_index(drop=True)
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
@@ -953,15 +1023,16 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
         logger.exception(f"Failed to parse candles: {e}")
         return None
 
-# ---------- Indicators (UNCHANGED) ----------
+# ---------- Indicators (UNCHANGED VALUES) ----------
 def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
     try:
-        series = series.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+        series = series.replace([np.inf, -np.inf], np.nan)
+        # MEDIUM #17 – do NOT fill NaN with 0.0, leave NaN
         if series.isna().all():
-            return pd.Series([0.0] * len(series), index=series.index)
+            return pd.Series([np.nan] * len(series), index=series.index)
         return series
     except Exception:
-        return pd.Series([0.0] * len(series), index=series.index)
+        return pd.Series([np.nan] * len(series), index=series.index)
 
 def calculate_ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -1146,10 +1217,10 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "ppo_011_down", "title": "🔴 PPO cross below -0.11", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= Constants.PPO_011_THRESHOLD_SELL) and (ppo["curr"] < Constants.PPO_011_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
     {"key": "rsi_50_up", "title": "🟢 RSI cross above 50 (PPO < 0.30)", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (rsi["prev"] <= Constants.RSI_THRESHOLD) and (rsi["curr"] > Constants.RSI_THRESHOLD) and (ppo["curr"] < Constants.PPO_RSI_GUARD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "rsi"]},
     {"key": "rsi_50_down", "title": "🔴 RSI cross below 50 (PPO > -0.30)", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (rsi["prev"] >= Constants.RSI_THRESHOLD) and (rsi["curr"] < Constants.RSI_THRESHOLD) and (ppo["curr"] > Constants.PPO_RSI_GUARD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "rsi"]},
-    {"key": "vwap_up", "title": "🔵 Price cross above VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ctx["close_prev"] <= ctx["vwap_prev"]) and (ctx["close_curr"] > ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
-    {"key": "vwap_down", "title": "🟣 Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ctx["close_prev"] >= ctx["vwap_prev"]) and (ctx["close_curr"] < ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
-    {"key": "mmh_buy", "title": "⚡️🔵 MMH Reversal BUY", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
-    {"key": "mmh_sell", "title": "⚡️🟣 MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "vwap_up", "title": "🔵⤴ Price cross above VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ctx["close_prev"] <= ctx["vwap_prev"]) and (ctx["close_curr"] > ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "vwap_down", "title": "🟣⤵ Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ctx["close_prev"] >= ctx["vwap_prev"]) and (ctx["close_curr"] < ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_buy", "title": "⤴🔵 MMH Reversal BUY", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_sell", "title": "⤵🟣 MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
 ]
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
@@ -1393,6 +1464,10 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
 
         raw_alerts: List[Tuple[str, str]] = []  # (title, extra)
 
+        # HIGH #11 – pipeline Redis calls
+        alert_keys_to_check = []
+        alert_states_to_set: List[Tuple[str, str, bool]] = []
+
         for def_ in ALERT_DEFINITIONS:
             if "pivots" in def_["requires"] and not context.get("pivots"):
                 continue
@@ -1401,29 +1476,48 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
             try:
                 if def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx):
                     key = ALERT_KEYS[def_["key"]]
-                    if not await was_alert_active(sdb, pair_name, key):
-                        extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                        raw_alerts.append((def_["title"], extra))
-                        await set_alert_state(sdb, pair_name, key, True)
+                    alert_keys_to_check.append((def_["key"], key))
             except Exception:
                 pass
 
+        # Batch Redis GET
+        states = await asyncio.gather(*[was_alert_active(sdb, pair_name, k[1]) for k in alert_keys_to_check])
+        for (def_key, alert_key), was_active in zip(alert_keys_to_check, states):
+            if not was_active:
+                def_ = next(d for d in ALERT_DEFINITIONS if d["key"] == def_key)
+                extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                raw_alerts.append((def_["title"], extra))
+                alert_states_to_set.append((pair_name, alert_key, True))
+
+        # Batch Redis SET
+        await asyncio.gather(*[set_alert_state(sdb, p, k, v) for p, k, v in alert_states_to_set])
+
         # ---------- reset logic ----------
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_signal_up"], ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_signal_down"], ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_zero_up"], ppo_prev > 0 and ppo_curr <= 0)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_zero_down"], ppo_prev < 0 and ppo_curr >= 0)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_011_up"], ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_011_down"], ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["rsi_50_up"], rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["rsi_50_down"], rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD)
+        reset_conditions = [
+            (ALERT_KEYS["ppo_signal_up"], ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr),
+            (ALERT_KEYS["ppo_signal_down"], ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr),
+            (ALERT_KEYS["ppo_zero_up"], ppo_prev > 0 and ppo_curr <= 0),
+            (ALERT_KEYS["ppo_zero_down"], ppo_prev < 0 and ppo_curr >= 0),
+            (ALERT_KEYS["ppo_011_up"], ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD),
+            (ALERT_KEYS["ppo_011_down"], ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL),
+            (ALERT_KEYS["rsi_50_up"], rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD),
+            (ALERT_KEYS["rsi_50_down"], rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD),
+        ]
         if context["vwap"]:
-            await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["vwap_up"], close_prev > vwap_prev and close_curr <= vwap_curr)
-            await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["vwap_down"], close_prev < vwap_prev and close_curr >= vwap_curr)
+            reset_conditions.extend([
+                (ALERT_KEYS["vwap_up"], close_prev > vwap_prev and close_curr <= vwap_curr),
+                (ALERT_KEYS["vwap_down"], close_prev < vwap_prev and close_curr >= vwap_curr),
+            ])
         if piv:
             for level_name, level_value in piv.items():
-                await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS[f"pivot_up_{level_name}"], close_prev > level_value and close_curr <= level_value)
-                await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS[f"pivot_down_{level_name}"], close_prev < level_value and close_curr >= level_value)
+                reset_conditions.extend([
+                    (ALERT_KEYS[f"pivot_up_{level_name}"], close_prev > level_value and close_curr <= level_value),
+                    (ALERT_KEYS[f"pivot_down_{level_name}"], close_prev < level_value and close_curr >= level_value),
+                ])
+        # Batch reset calls
+        await asyncio.gather(*[reset_alert_on_condition(sdb, pair_name, k, cond) for k, cond in reset_conditions])
+
+        # MMH reset
         if (mmh_curr > 0) and (mmh_curr <= mmh_m1) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"])):
             await set_alert_state(sdb, pair_name, ALERT_KEYS["mmh_buy"], False)
         if (mmh_curr < 0) and (mmh_curr >= mmh_m1) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"])):
@@ -1431,6 +1525,8 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
 
         # ---------- message building ----------
         if raw_alerts:
+            # HIGH #22 – write state BEFORE sending
+            await asyncio.gather(*[set_alert_state(sdb, pair_name, ALERT_KEYS[def_key], True) for def_key, _ in raw_alerts])
             if len(raw_alerts) == 1:
                 title, extra = raw_alerts[0]
                 msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
@@ -1458,6 +1554,7 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
         return None
     finally:
         # ---------- explicit cleanup ----------
+        # HIGH #2 – delete intermediate DataFrames
         del df_15m, df_5m, df_daily, ppo, ppo_signal, smooth_rsi, vwap, mmh, upw, dnw
         gc.collect()
         PAIR_ID.set("")
@@ -1527,7 +1624,8 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     products_map: Dict[str, dict] = {}
     if not api_products or not api_products.get("result"):
         return products_map
-    valid_pattern = re.compile(r'^[A-Z0-9_]+$')
+    # MEDIUM #20 – allow mixed-case symbols
+    valid_pattern = re.compile(r'^[A-Za-z0-9_]+$')
     for p in api_products["result"]:
         try:
             symbol = p.get("symbol", "")
@@ -1647,6 +1745,75 @@ class HealthHttpServer:
         except Exception as e:
             return web.json_response({"status": "error", "error": str(e)}, status=500)
 
+# ---------- Exchange time sync ----------
+class ExchangeTime:
+    _offset: float = 0.0
+    _lock   = asyncio.Lock()
+
+    @classmethod
+    async def sync(cls, api_base: str, timeout: int = 5) -> None:
+        url = f"{api_base.rstrip('/')}/v2/time"
+        async with cls._lock:
+            try:
+                data = await async_fetch_json(url, timeout=timeout, retries=2)
+                server_ts = int(data["result"]) / 1000
+                local_ts  = time.time()
+                cls._offset = server_ts - local_ts
+                logger.info("Exchange-time sync OK | offset %.3f s", cls._offset)
+            except Exception as exc:
+                logger.warning("Exchange-time sync failed (%s) – using local clock", exc)
+                cls._offset = 0.0
+
+    @classmethod
+    def now(cls) -> float:
+        return time.time() + cls._offset
+
+# ---------- Circuit-breaker persistence ----------
+class PersistentCircuitBreaker:
+    """
+    Wraps the original CircuitBreaker but loads/saves state to Redis
+    so that a restart does not lose breaker history.
+    """
+    def __init__(self, sdb: RedisStateStore, key_prefix: str, failure_threshold: int = 5, timeout: int = 300):
+        self.sdb = sdb
+        self.key_prefix = key_prefix
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self._inner = CircuitBreaker(failure_threshold, timeout)
+
+    async def _load(self) -> None:
+        try:
+            data = await self.sdb.get_metadata(self.key_prefix + "cb_state")
+            if data:
+                d = json.loads(data)
+                self._inner.failure_count = d.get("fc", 0)
+                self._inner.last_failure_time = d.get("lft", None)
+        except Exception as e:
+            logger.debug("CB load error: %s", e)
+
+    async def _save(self) -> None:
+        try:
+            d = {"fc": self._inner.failure_count, "lft": self._inner.last_failure_time}
+            await self.sdb.set_metadata(self.key_prefix + "cb_state", json.dumps(d))
+        except Exception as e:
+            logger.debug("CB save error: %s", e)
+
+    async def is_open(self) -> bool:
+        await self._load()
+        return await self._inner.is_open()
+
+    async def record_failure(self) -> int:
+        ret = await self._inner.record_failure()
+        await self._save()
+        return ret
+
+    async def record_success(self) -> None:
+        await self._inner.record_success()
+        await self._save()
+
+    async def call(self, func: Callable, *args, **kwargs):
+        return await self._inner.call(func, *args, **kwargs)
+
 # ---------- main run_once ----------
 async def run_once() -> bool:
     correlation_id = uuid.uuid4().hex[:8]
@@ -1668,6 +1835,7 @@ async def run_once() -> bool:
 
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        await ExchangeTime.sync(cfg.DELTA_API_BASE)          # <-- exchange-time sync
 
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
             global health_tracker
@@ -1698,7 +1866,10 @@ async def run_once() -> bool:
                     return False
 
                 products_map = build_products_map_from_api_result(prod_resp)
+                # MEDIUM #7 – validate PAIRS against products_map
                 pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
+                if len(pairs_to_process) < len(cfg.PAIRS):
+                    logger_run.warning("Skipped invalid pairs: %s", set(cfg.PAIRS) - set(products_map.keys()))
                 batch_size = max(1, cfg.BATCH_SIZE)
                 logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
 
@@ -1726,26 +1897,31 @@ async def run_once() -> bool:
                         logger_run.error("Lost Redis lock during processing")
                         break
 
+                    # MEDIUM #9 – adaptive sleep (skip if last batch was fast)
                     if i + batch_size < len(pairs_to_process):
-                        await asyncio.sleep(1)
+                        elapsed = time.time() - start_time
+                        sleep_time = min(1.0, max(0.2, 1.0 - elapsed / cfg.RUN_TIMEOUT_SECONDS))
+                        await asyncio.sleep(sleep_time)
 
+                # MEDIUM #19 – write success ONLY after job actually finished
                 await sdb.set_metadata("last_success_run", str(int(time.time())))
                 alerts_sent = sum(1 for r in all_results if r[1].get("state") == "ALERT_SENT")
                 logger_run.info(f"✅ Run complete: {alerts_sent} alerts sent in {time.time() - start_time:.2f}s")
-                # ---- second-precision finish stamp ----
                 logger.info(f"⏰ finished@ {format_ist_time()}")
-
 
             except Exception as e:
                 logger_run.exception(f"Error within Redis context: {e}")
                 raise
             finally:
-                await lock.release(timeout=3.0)
+                try:
+                    await asyncio.wait_for(lock.release(timeout=3.0), timeout=5.0)
+                except Exception as rel_exc:
+                    logger.error("Redis lock release failed during shutdown: %s", rel_exc)
 
         return True
 
     except asyncio.CancelledError:
-        logger_run.info("���� Run cancelled (Task Cancellation)")
+        logger_run.info("Run cancelled (Task Cancellation)")
         return False
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
