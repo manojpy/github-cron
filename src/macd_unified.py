@@ -16,6 +16,7 @@ import uuid
 import argparse
 import psutil
 import math
+import statistics
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
 from datetime import datetime, timezone
