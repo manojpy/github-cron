@@ -2,8 +2,8 @@ name: Run Unified MACD Bot
 
 on:
   # schedule:
-  #   - cron: '1,16,31,46 * * * *'   # disable – only Cron-jobs.org will trigger
-  workflow_dispatch:                 # manual / REST entry point
+  #   - cron: '1,16,31,46 * * * *'   # disabled – only external triggers
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot:latest
@@ -13,7 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/${{ github.repository }}/trading-bot:latest   # literal – no env. here
+      image: ghcr.io/${{ github.repository }}/trading-bot:latest
+      options: --user root              # fix EACCES inside container
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -23,7 +24,7 @@ jobs:
         TZ: Asia/Kolkata
 
     steps:
-      - name: Checkout (gives us config_macd.json)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Run bot once
