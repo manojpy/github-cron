@@ -1882,13 +1882,8 @@ async def run_once() -> bool:
             return False
 
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)                                                 
-        await ExchangeTime.start(cfg.DELTA_API_BASE, interval=300)   # 5-min background sync
-    try:
-        ... whole run ...
-    finally:
-        await ExchangeTime.stop()
-
+        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        await ExchangeTime.sync(cfg.DELTA_API_BASE)  # <-- exchange-time sync
 
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
             global health_tracker
@@ -1919,7 +1914,6 @@ async def run_once() -> bool:
                     return False
 
                 products_map = build_products_map_from_api_result(prod_resp)
-                # MEDIUM #7 – validate PAIRS against products_map
                 pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
                 if len(pairs_to_process) < len(cfg.PAIRS):
                     logger_run.warning("Skipped invalid pairs: %s", set(cfg.PAIRS) - set(products_map.keys()))
@@ -1950,13 +1944,11 @@ async def run_once() -> bool:
                         logger_run.error("Lost Redis lock during processing")
                         break
 
-                    # MEDIUM #9 – adaptive sleep (skip if last batch was fast)
                     if i + batch_size < len(pairs_to_process):
                         elapsed = time.time() - start_time
                         sleep_time = min(1.0, max(0.2, 1.0 - elapsed / cfg.RUN_TIMEOUT_SECONDS))
                         await asyncio.sleep(sleep_time)
 
-                # MEDIUM #19 – write success ONLY after job actually finished
                 await sdb.set_metadata("last_success_run", str(int(time.time())))
                 alerts_sent = sum(1 for r in all_results if r[1].get("state") == "ALERT_SENT")
                 logger_run.info(f"✅ Run complete: {alerts_sent} alerts sent in {time.time() - start_time:.2f}s")
@@ -1993,6 +1985,10 @@ async def run_once() -> bool:
         await SessionManager.close_session()
         TRACE_ID.set("")
 
+
+        
+                    
+                    
 # ---------- optional uvloop ----------
 try:
     import uvloop
