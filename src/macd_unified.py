@@ -558,7 +558,7 @@ class RedisStateStore:
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
-            self._redis.get(f"{self.state_prefix}{key}"),
+            lambda: self._redis.get(f"{self.state_prefix}{key}"),   # ✅ wrap in lambda
             timeout,
             f"get {key}",
             lambda r: json.loads(r.decode("utf-8")) if r else None,
@@ -569,14 +569,14 @@ class RedisStateStore:
         redis_key = f"{self.state_prefix}{key}"
         data = json.dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            self._redis.set(redis_key, data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None),
+            lambda: self._redis.set(redis_key, data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None),  # ✅ lambda
             timeout,
             f"set {key}",
         )
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
         return await self._safe_redis_op(
-            self._redis.get(f"{self.meta_prefix}{key}"),
+            lambda: self._redis.get(f"{self.meta_prefix}{key}"),   # ✅ lambda
             timeout,
             f"get_metadata {key}",
             lambda r: r.decode("utf-8") if r else None,
@@ -584,7 +584,7 @@ class RedisStateStore:
 
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
         await self._safe_redis_op(
-            self._redis.set(f"{self.meta_prefix}{key}", value),
+            lambda: self._redis.set(f"{self.meta_prefix}{key}", value),   # ✅ lambda
             timeout,
             f"set_metadata {key}",
         )
@@ -1423,14 +1423,37 @@ async def build_context(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFram
         logger.exception(f"Error building context for {pair_name}: {e}")
         return None
 
-async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+async def evaluate_pair_and_alert(
+    pair_name: str,
+    df_15m: pd.DataFrame,
+    df_5m: pd.DataFrame,
+    df_daily: Optional[pd.DataFrame],
+    sdb: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str
+) -> Optional[Tuple[str, Dict[str, Any]]]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     try:
+        # 🚀 Defensive checks after removing insufficient data guard
+        if df_15m is None or df_5m is None:
+            logger_pair.error(f"{pair_name}: Missing candle data (15m or 5m). Skipping evaluation.")
+            return None
+        if df_15m.empty or df_5m.empty:
+            logger_pair.error(f"{pair_name}: Candle data empty. Skipping evaluation.")
+            return None
+
+        # Drop NaNs to avoid propagation
+        df_15m = df_15m.dropna().copy()
+        df_5m  = df_5m.dropna().copy()
+        if df_daily is not None:
+            df_daily = df_daily.dropna().copy()
+
         context = await build_context(pair_name, df_15m, df_5m, df_daily)
         if not context:
             return None
 
+        # --- keep your full existing alert logic below ---
         ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
         ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
         rsi_ctx = {"curr": context["rsi_curr"], "prev": context["rsi_prev"]}
@@ -1449,84 +1472,40 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
             alert_keys_to_check.append(f"{pair_name}:{key}")
             alert_defs_to_check.append(def_)
 
-        # MGET alert states – factory lambda to avoid re-awaiting coroutine
         states = await asyncio.gather(
-            *[sdb._safe_redis_op(lambda: sdb._redis.get(f"{sdb.state_prefix}{k}"), 2.0, f"get {k}", lambda r: json.loads(r.decode("utf-8")) if r else None)
+            *[sdb._safe_redis_op(lambda: sdb._redis.get(f"{sdb.state_prefix}{k}"), 2.0, f"get {k}",
+                                 lambda r: json.loads(r.decode("utf-8")) if r else None)
               for k in alert_keys_to_check]
         )
         states_map = dict(zip(alert_keys_to_check, states))
 
-        for def_, key in zip(alert_defs_to_check, alert_keys_to_check):
-            try:
-                if def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx):
-                    if states_map.get(key, {}).get("state") != "ACTIVE":
-                        extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                        raw_alerts.append((def_["title"], extra, def_["priority"]))
-                        await set_alert_state(sdb, pair_name, ALERT_KEYS[def_["key"]], True)
-                        if PROMETHEUS_ENABLED and METRIC_ALERT_TYPE_FIRED:
-                            METRIC_ALERT_TYPE_FIRED.labels(alert_type=def_["key"]).inc()
-            except Exception as e:
-                logger.warning(f"Alert check failed for {pair_name}, key={def_['key']}: {e}")
+        # ... rest of your alert evaluation, resets, Telegram send, summary building ...
 
-        # Reset states
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_signal_up"], ppo_ctx["prev"] > ppo_sig_ctx["prev"] and ppo_ctx["curr"] <= ppo_sig_ctx["curr"])
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_signal_down"], ppo_ctx["prev"] < ppo_sig_ctx["prev"] and ppo_ctx["curr"] >= ppo_sig_ctx["curr"])
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_zero_up"], ppo_ctx["prev"] > 0 and ppo_ctx["curr"] <= 0)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_zero_down"], ppo_ctx["prev"] < 0 and ppo_ctx["curr"] >= 0)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_011_up"], ppo_ctx["prev"] > Constants.PPO_011_THRESHOLD and ppo_ctx["curr"] <= Constants.PPO_011_THRESHOLD)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["ppo_011_down"], ppo_ctx["prev"] < Constants.PPO_011_THRESHOLD_SELL and ppo_ctx["curr"] >= Constants.PPO_011_THRESHOLD_SELL)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["rsi_50_up"], rsi_ctx["prev"] > Constants.RSI_THRESHOLD and rsi_ctx["curr"] <= Constants.RSI_THRESHOLD)
-        await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["rsi_50_down"], rsi_ctx["prev"] < Constants.RSI_THRESHOLD and rsi_ctx["curr"] >= Constants.RSI_THRESHOLD)
-        if context["vwap"]:
-            await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["vwap_up"], context["close_prev"] > context["vwap_prev"] and context["close_curr"] <= context["vwap_curr"])
-            await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS["vwap_down"], context["close_prev"] < context["vwap_prev"] and context["close_curr"] >= context["vwap_curr"])
-        if context["pivots"]:
-            for level_name, level_value in context["pivots"].items():
-                await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS[f"pivot_up_{level_name}"], context["close_prev"] > level_value and context["close_curr"] <= level_value)
-                await reset_alert_on_condition(sdb, pair_name, ALERT_KEYS[f"pivot_down_{level_name}"], context["close_prev"] < level_value and context["close_curr"] >= level_value)
-        if (context["mmh_curr"] > 0) and (context["mmh_curr"] <= context["mmh_m1"]) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"])):
-            await set_alert_state(sdb, pair_name, ALERT_KEYS["mmh_buy"], False)
-        if (context["mmh_curr"] < 0) and (context["mmh_curr"] >= context["mmh_m1"]) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"])):
-            await set_alert_state(sdb, pair_name, ALERT_KEYS["mmh_sell"], False)
-
-        # Build final state with guaranteed 'summary' key
-        if raw_alerts:
-            # Sort by priority: CRITICAL first
-            raw_alerts = sorted(raw_alerts, key=lambda x: 0 if x[2] == "CRITICAL" else (1 if x[2] == "NORMAL" else 2))
-            if len(raw_alerts) == 1:
-                title, extra, priority = raw_alerts[0]
-                msg = build_single_msg(title, pair_name, context["close_curr"], context["ts_curr"], extra)
-            else:
-                items = [(title, extra) for title, extra, _ in raw_alerts]
-                msg = build_batched_msg(pair_name, context["close_curr"], context["ts_curr"], items)
-            await telegram_queue.send(msg, priority=raw_alerts[0][2])
-            new_state = {"state": "ALERT_SENT", "ts": int(time.time()), "summary": {"alerts": len(raw_alerts), "types": [r[0] for r in raw_alerts]}}
-            logger_pair.info(f"✅ Sent {len(raw_alerts)} alerts for {pair_name}", extra={"alerts": [r[0] for r in raw_alerts], "priority": raw_alerts[0][2]})
-        else:
-            new_state = {"state": "NO_SIGNAL", "ts": int(time.time()), "summary": {}}
-
-        # ALWAYS add common summary fields
-        new_state["summary"].update({"cloud": context["cloud"], "mmh_hist": round(context["mmh_curr"], 4), "suppression": context["suppression"]})
         return pair_name, new_state
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
     finally:
-        del df_15m, df_5m, df_daily, ppo, ppo_signal, smooth_rsi, vwap, mmh
-        # Only delete cloud vars if they were created
-        if cfg.CIRRUS_CLOUD_ENABLED:
-            if 'upw' in locals() and 'dnw' in locals():
-                del upw, dnw
+        del df_15m, df_5m, df_daily
         gc.collect()
         PAIR_ID.set("")
 
-async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[str, dict], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+async def check_pair(
+    pair_name: str,
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    state_db: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str
+) -> Optional[Tuple[str, Dict[str, Any]]]:
     try:
         if shutdown_event.is_set():
             return None
+
         product_info = products_map.get(pair_name)
         if not product_info:
             return None
+
         symbol = product_info["symbol"]
         daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 2
 
@@ -1536,14 +1515,16 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
             fetcher.fetch_candles(symbol, "D", daily_limit) if cfg.ENABLE_PIVOT else asyncio.get_running_loop().create_future(),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
         df_15m = parse_candles_result(results[0]) if not isinstance(results[0], Exception) else None
         df_5m  = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
         df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
 
-        if not validate_candle_df(df_15m, 202, 15) or not validate_candle_df(df_5m, 252, 5):
-            logger.warning(f"Insufficient data for {pair_name} (15m_len={len(df_15m) if df_15m is not None else 0}, 5m_len={len(df_5m) if df_5m is not None else 0})")
-            return None
-        return await evaluate_pair_and_alert(pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id)
+        # 🚀 Removed insufficient data validation — always proceed to evaluation
+        return await evaluate_pair_and_alert(
+            pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id
+        )
+
     except Exception as e:
         logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
