@@ -1489,6 +1489,7 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
         if (context["mmh_curr"] < 0) and (context["mmh_curr"] >= context["mmh_m1"]) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"])):
             await set_alert_state(sdb, pair_name, ALERT_KEYS["mmh_sell"], False)
 
+        # Build final state with guaranteed 'summary' key
         if raw_alerts:
             # Sort by priority: CRITICAL first
             raw_alerts = sorted(raw_alerts, key=lambda x: 0 if x[2] == "CRITICAL" else (1 if x[2] == "NORMAL" else 2))
@@ -1502,17 +1503,20 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
             new_state = {"state": "ALERT_SENT", "ts": int(time.time()), "summary": {"alerts": len(raw_alerts), "types": [r[0] for r in raw_alerts]}}
             logger_pair.info(f"✅ Sent {len(raw_alerts)} alerts for {pair_name}", extra={"alerts": [r[0] for r in raw_alerts], "priority": raw_alerts[0][2]})
         else:
-            new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
+            new_state = {"state": "NO_SIGNAL", "ts": int(time.time()), "summary": {}}
 
+        # ALWAYS add common summary fields
         new_state["summary"].update({"cloud": context["cloud"], "mmh_hist": round(context["mmh_curr"], 4), "suppression": context["suppression"]})
         return pair_name, new_state
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
     finally:
-        del df_15m, df_5m, df_daily
+        del df_15m, df_5m, df_daily, ppo, ppo_signal, smooth_rsi, vwap, mmh
+        # Only delete cloud vars if they were created
         if cfg.CIRRUS_CLOUD_ENABLED:
-            del upw, dnw
+            if 'upw' in locals() and 'dnw' in locals():
+                del upw, dnw
         gc.collect()
         PAIR_ID.set("")
 
