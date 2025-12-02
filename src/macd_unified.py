@@ -990,7 +990,7 @@ def smooth_rng_x1(close_series: pd.Series, t: int, m: float) -> pd.Series:
     wper = t * 2 - 1
     diff = (close_series - close_series.shift(1)).abs()
     avrng = diff.ewm(span=t, adjust=False).mean()
-    smooth_rng = calculate_ema(avrng, wper) * m
+    smooth_rng = avrng.ewm(span=wper, adjust=False).mean() * m
     return smooth_rng
 
 def rng_filt_x1x1(x_series: pd.Series, r_series: pd.Series) -> pd.Series:
