@@ -17,7 +17,7 @@ import argparse
 import psutil
 import math
 from collections import deque, defaultdict
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -531,11 +531,11 @@ class RedisStateStore:
             self._redis.ping(), timeout, "ping", lambda r: bool(r)
         ) is True
 
-    async def _safe_redis_op(self, coro, timeout: float, op_name: str, parser: Optional[Callable] = None):
+    async def _safe_redis_op(self, coro_factory: Callable[[], Awaitable], timeout: float, op_name: str, parser: Optional[Callable] = None):
         if not self._redis:
             return None
         async def _do():
-            return await asyncio.wait_for(coro, timeout=timeout)
+            return await asyncio.wait_for(coro_factory(), timeout=timeout)
         try:
             result = await retry_async(
                 _do,
@@ -548,6 +548,12 @@ class RedisStateStore:
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
             logger.error(f"Redis {op_name} failed: {e}")
             return None
+        except Exception as e:
+            logger.error(f"Failed to {op_name}: {e}")
+            return None
+
+
+
         except Exception as e:
             logger.error(f"Failed to {op_name}: {e}")
             return None
@@ -1445,8 +1451,11 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
             alert_keys_to_check.append(f"{pair_name}:{key}")
             alert_defs_to_check.append(def_)
 
-        # MGET alert states
-        states = await asyncio.gather(*[sdb.get(k) for k in alert_keys_to_check])
+        # MGET alert states – factory lambda to avoid re-awaiting coroutine
+        states = await asyncio.gather(
+            *[sdb._safe_redis_op(lambda: sdb._redis.get(f"{sdb.state_prefix}{k}"), 2.0, f"get {k}", lambda r: json.loads(r.decode("utf-8")) if r else None)
+              for k in alert_keys_to_check]
+        )
         states_map = dict(zip(alert_keys_to_check, states))
 
         for def_, key in zip(alert_defs_to_check, alert_keys_to_check):
