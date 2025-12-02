@@ -3,10 +3,11 @@
 # ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
-# Install build dependencies for compiling Python packages
+# Install build dependencies for compiling Python packages (hiredis/uvloop)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
+    make \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,6 +29,7 @@ FROM python:3.11-slim-bookworm AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     ca-certificates \
+    tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -46,13 +48,23 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     CONFIG_FILE=config_macd.json \
-    TZ=Asia/Kolkata
+    TZ=Asia/Kolkata \
+    LOG_JSON=false \
+    FILE_LOGGING=true \
+    PROMETHEUS_ENABLED=false \
+    HEALTH_SERVER_ENABLED=false
 
 # Create non-root user for security
 RUN useradd -m -u 1000 botuser && \
-    chown -R botuser:botuser /app
+    chown -R botuser:botuser /app && \
+    mkdir -p /app/logs && \
+    chown -R botuser:botuser /app/logs
+
 USER botuser
 
-# Health check (optional - useful for debugging)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)"
+# Health check - checks if script file exists and Python works
+HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
+    CMD python -c "import os; assert os.path.exists('src/macd_unified.py')" || exit 1
+
+# Default command - run the wrapper script
+CMD ["python", "gitlab_wrapper.py"]
