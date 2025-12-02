@@ -61,6 +61,7 @@ class Constants:
     CIRCUIT_BREAKER_MAX_WAIT = 300
     MEMORY_CHECK_INTERVAL = 30
     MEMORY_LIMIT_PERCENT = float(os.getenv("MEMORY_LIMIT_PERCENT", 85.0))
+    CANDLE_SAFETY_MARGIN_SECONDS = 45
 
 HEALTH_SERVER_ENABLED = os.getenv("HEALTH_SERVER_ENABLED", "false").lower() in ("1", "true", "yes")
 HEALTH_HTTP_PORT = int(os.getenv("HEALTH_HTTP_PORT", "10001"))
@@ -391,7 +392,7 @@ def print_startup_banner_once() -> None:
     )
 print_startup_banner_once()
 
-# ---------- HTTP session manager (FIXED: SSL context reused) ----------
+# ---------- HTTP session manager ----------
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
@@ -434,7 +435,7 @@ class SessionManager:
             cls._session = None
             logger.debug("Closed shared aiohttp session")
 
-# ---------- Retry / backoff helpers ----------
+# ---------- Retry / backoff ----------
 def _exp_backoff_sleep(attempt: int, base: float, cap: float) -> float:
     sleep = min(cap, base * (2 ** (attempt - 1)))
     return max(0.05, sleep * random.uniform(0.5, 1.5))
@@ -688,66 +689,75 @@ class RedisLock:
         finally:
             self.token = None
 
-# ---------- HTTP fetch / Circuit Breaker ----------
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, timeout: int = 300):
-        self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.threshold = failure_threshold
+# ---------- Persisted Circuit Breaker ----------
+class PersistedCircuitBreaker:
+    def __init__(self, sdb: RedisStateStore, failure_threshold: int = 5, timeout: int = 300):
+        self.sdb = sdb
+        self.failure_threshold = failure_threshold
         self.timeout = timeout
-        self.lock = asyncio.Lock()
 
     async def is_open(self) -> bool:
-        async with self.lock:
-            if self.failure_count < self.threshold:
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-                return False
-            if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
-                self.failure_count = 0
-                self.last_failure_time = None
-                logger.info("Circuit breaker reset after timeout")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-                return False
-            if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                METRIC_CB_OPEN.set(1.0)
-            return True
+        open_until = await self.sdb.get_metadata("circuit:open_until")
+        if open_until:
+            try:
+                open_until_ts = float(open_until)
+                if time.time() < open_until_ts:
+                    return True
+                else:
+                    await self.sdb.set_metadata("circuit:open_until", "")
+            except:
+                pass
+        return False
 
     async def record_failure(self) -> int:
-        async with self.lock:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            logger.warning(f"Circuit breaker: failure {self.failure_count}/{self.threshold}")
-            if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
-                METRIC_CB_FAILURES.inc()
-            if self.failure_count >= self.threshold:
-                logger.critical(f"Circuit breaker OPEN for {self.timeout}s")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(1.0)
-            return self.failure_count
+        failures = await self.sdb.get_metadata("circuit:failure_count")
+        failures = int(failures) if failures else 0
+        failures += 1
+        await self.sdb.set_metadata("circuit:failure_count", str(failures))
+        logger.warning(f"Circuit breaker: failure {failures}/{self.failure_threshold}")
+        if failures >= self.failure_threshold:
+            open_until = time.time() + self.timeout
+            await self.sdb.set_metadata("circuit:open_until", str(open_until))
+            logger.critical(f"Circuit breaker OPEN for {self.timeout}s")
+        return failures
 
     async def record_success(self) -> None:
-        async with self.lock:
-            if self.failure_count > 0:
-                self.failure_count = 0
-                self.last_failure_time = None
-                logger.info("Circuit breaker: reset after success")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
+        await self.sdb.set_metadata("circuit:failure_count", "0")
 
-    async def call(self, func: Callable, *args, **kwargs):
-        if await self.is_open():
-            raise Exception("Circuit breaker is OPEN")
-        try:
-            result = await func(*args, **kwargs)
-            await self.record_success()
-            return result
-        except Exception:
-            await self.record_failure()
-            raise
+# ---------- Persisted TokenBucket ----------
+class PersistedTokenBucket:
+    def __init__(self, sdb: RedisStateStore, rate: int, burst: int):
+        self.sdb = sdb
+        self.rate = rate
+        self.burst = burst
 
-async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15, circuit_breaker: Optional[CircuitBreaker] = None) -> Optional[Dict[str, Any]]:
+    async def acquire(self) -> None:
+        while True:
+            tokens = await self._get_tokens()
+            now = time.monotonic()
+            elapsed = now - tokens["last"]
+            new_tokens = min(self.burst, tokens["count"] + elapsed * (self.rate / 60))
+            if new_tokens >= 1:
+                new_tokens -= 1
+                await self._set_tokens(count=new_tokens, last=now)
+                return
+            wait_time = (1 - new_tokens) / (self.rate / 60)
+            await asyncio.sleep(wait_time)
+
+    async def _get_tokens(self) -> dict:
+        raw = await self.sdb.get_metadata("telegram:tokens")
+        if raw:
+            try:
+                return json.loads(raw)
+            except:
+                pass
+        return {"count": float(self.burst), "last": time.monotonic()}
+
+    async def _set_tokens(self, count: float, last: float) -> None:
+        await self.sdb.set_metadata("telegram:tokens", json.dumps({"count": count, "last": last}))
+
+# ---------- HTTP fetch with persisted circuit breaker ----------
+async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15, circuit_breaker: Optional[PersistedCircuitBreaker] = None) -> Optional[Dict[str, Any]]:
     if circuit_breaker and await circuit_breaker.is_open():
         logger.warning(f"Circuit breaker open; skipping fetch {url}")
         return None
@@ -780,19 +790,16 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
             if attempt == retries:
                 if circuit_breaker:
                     await circuit_breaker.record_failure()
-                if PROMETHEUS_ENABLED and METRIC_FETCH_ERRORS:
-                    METRIC_FETCH_ERRORS.inc()
                 return None
             await asyncio.sleep(_exp_backoff_sleep(attempt, backoff, Constants.CIRCUIT_BREAKER_MAX_WAIT / 10))
         except Exception as e:
             logger.exception(f"Unexpected fetch error for {url}: {e}")
             if circuit_breaker:
                 await circuit_breaker.record_failure()
-            if PROMETHEUS_ENABLED and METRIC_FETCH_ERRORS:
-                METRIC_FETCH_ERRORS.inc()
             return None
     return None
 
+# ---------- Rate-limited fetcher ----------
 class RateLimitedFetcher:
     def __init__(self, max_per_minute: int = 60, concurrency: int = 4):
         self.max_per_minute = max_per_minute
@@ -812,6 +819,7 @@ class RateLimitedFetcher:
         async with self.semaphore:
             return await func(*args, **kwargs)
 
+# ---------- Candle fetcher with 60 s safety margin ----------
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
@@ -820,7 +828,7 @@ class DataFetcher:
         self.timeout = cfg.HTTP_TIMEOUT
         self._cache: Dict[str, Tuple[float, Any]] = {}
         self._cache_max_size = 50
-        self.circuit_breaker = CircuitBreaker()
+        self.circuit_breaker: Optional[PersistedCircuitBreaker] = None
         self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
 
     def _clean_cache(self) -> None:
@@ -833,47 +841,19 @@ class DataFetcher:
         for k in stale:
             del self._cache[k]
 
-    async def fetch_products(self) -> Optional[Dict[str, Any]]:
-        url = f"{self.api_base}/v2/products"
-        async with self.semaphore:
-            return await self.rate_limiter.call(
-                async_fetch_json, url, retries=cfg.CANDLE_FETCH_RETRIES, backoff=cfg.CANDLE_FETCH_BACKOFF,
-                timeout=self.timeout, circuit_breaker=self.circuit_breaker
-            )
-
     async def fetch_candles(self, symbol: str, resolution: str, limit: int) -> Optional[Dict[str, Any]]:
-        """
-        Corrected + optimized:
-        - Always fetches the LAST FULLY CLOSED candle.
-        - Ensures consistent timing at 01/16/31/46.
-        - Removes schedule-drift from time.time().
-        - Keeps caching + rate limiting + backoff + semaphore.
-        """
-
-        # ----- CACHE LOOKUP -----
         key_str = f"{symbol}:{resolution}:{limit}"
         key_hash = f"candles:{hashlib.blake2b(key_str.encode(), digest_size=8).hexdigest()}"
         if key_hash in self._cache:
             age, data = self._cache[key_hash]
-            if time.time() - age < 60:   # 1-minute cache validity
+            if time.time() - age < 60:
                 return data
 
-        # ----- DETERMINE LAST FULLY CLOSED CANDLE -----
         minutes = int(resolution) if resolution != "D" else 1440
         now = int(time.time())
-
-        # window size in seconds (e.g., 900 for 15 minutes)
         window = minutes * 60
-
-        # which candle window we are currently in
         current_window = now // window
-
-        # last fully closed candle end timestamp
-        last_close = (current_window * window)
-
-        # safety cushion for exchange candle publishing delays
-        last_close -= 3
-
+        last_close = (current_window * window) - Constants.CANDLE_SAFETY_MARGIN_SECONDS
         params = {
             "resolution": resolution,
             "symbol": symbol,
@@ -881,7 +861,6 @@ class DataFetcher:
             "to": last_close
         }
 
-        # ----- API CALL -----
         url = f"{self.api_base}/v2/chart/history"
         async with self.semaphore:
             data = await self.rate_limiter.call(
@@ -894,14 +873,21 @@ class DataFetcher:
                 circuit_breaker=self.circuit_breaker
             )
 
-        # ----- CACHE SAVE -----
         if data:
             self._cache[key_hash] = (time.time(), data)
             self._clean_cache()
 
         return data
 
-# ---------- Candle parsing & validation (FIXED timestamp handling) ----------
+    async def fetch_products(self) -> Optional[Dict[str, Any]]:
+        url = f"{self.api_base}/v2/products"
+        async with self.semaphore:
+            return await self.rate_limiter.call(
+                async_fetch_json, url, retries=cfg.CANDLE_FETCH_RETRIES, backoff=cfg.CANDLE_FETCH_BACKOFF,
+                timeout=self.timeout, circuit_breaker=self.circuit_breaker
+            )
+
+# ---------- Candle parsing & validation ----------
 def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> bool:
     try:
         if df is None or df.empty:
@@ -941,8 +927,6 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
             df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
         df = df[df["timestamp"] > 0].copy()
-        if df.empty:
-            return None
         median_ts = df["timestamp"].median()
         if median_ts > 100_000_000_000:
             df["timestamp"] = (df["timestamp"] // 1000).astype(np.int64)
@@ -953,7 +937,7 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
         logger.exception(f"Failed to parse candles: {e}")
         return None
 
-# ---------- Indicators (UNCHANGED) ----------
+# ---------- Indicators (EMA cache in Redis) ----------
 def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
     try:
         series = series.replace([np.inf, -np.inf], np.nan).bfill().ffill()
@@ -963,8 +947,26 @@ def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
     except Exception:
         return pd.Series([0.0] * len(series), index=series.index)
 
-def calculate_ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+def calculate_ema_cached(series: pd.Series, length: int, sdb: RedisStateStore, key: str) -> pd.Series:
+    try:
+        last_val = series.iloc[-1]
+        last_ts  = int(series.index[-1].timestamp())
+        cache_key = f"ema:{key}:{length}"
+        cached = sdb.get(cache_key)
+        if cached:
+            try:
+                prev_ema = float(cached["ema"])
+                alpha = 2 / (length + 1)
+                ema = alpha * last_val + (1 - alpha) * prev_ema
+                sdb.set(cache_key, {"ema": ema, "ts": last_ts})
+                return pd.Series(ema, index=series.index[-1:])
+            except:
+                pass
+        ema = series.ewm(span=length, adjust=False).mean()
+        sdb.set(cache_key, {"ema": float(ema.iloc[-1]), "ts": last_ts})
+        return ema
+    except:
+        return series.ewm(span=length, adjust=False).mean()
 
 def calculate_sma(data: pd.Series, period: int) -> pd.Series:
     return validate_indicator_series(data.rolling(window=period, min_periods=max(2, period // 3)).mean(), "SMA")
@@ -973,21 +975,21 @@ def calculate_rma(data: pd.Series, period: int) -> pd.Series:
     r = data.ewm(alpha=1 / period, adjust=False).mean()
     return validate_indicator_series(r.bfill().ffill(), "RMA")
 
-def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: bool = False) -> Tuple[pd.Series, pd.Series]:
+def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: bool = False, sdb: Optional[RedisStateStore] = None) -> Tuple[pd.Series, pd.Series]:
     close = df["close"].astype(float)
-    fast_ma = calculate_sma(close, fast) if use_sma else calculate_ema(close, fast)
-    slow_ma = calculate_sma(close, slow) if use_sma else calculate_ema(close, slow)
+    fast_ma = calculate_sma(close, fast) if use_sma else (calculate_ema_cached(close, fast, sdb, "ppo_fast") if sdb else close.ewm(span=fast, adjust=False).mean())
+    slow_ma = calculate_sma(close, slow) if use_sma else (calculate_ema_cached(close, slow, sdb, "ppo_slow") if sdb else close.ewm(span=slow, adjust=False).mean())
     slow_ma = slow_ma.replace(0, np.nan).bfill().ffill()
     ppo = ((fast_ma - slow_ma) / slow_ma) * 100
     ppo = validate_indicator_series(ppo.replace([np.inf, -np.inf], np.nan).bfill().ffill(), "PPO")
-    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
+    ppo_signal = calculate_sma(ppo, signal) if use_sma else ppo.ewm(span=signal, adjust=False).mean()
     ppo_signal = validate_indicator_series(ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill(), "PPO_SIGNAL")
     return ppo, ppo_signal
 
 def smooth_rng_x1(close_series: pd.Series, t: int, m: float) -> pd.Series:
     wper = t * 2 - 1
     diff = (close_series - close_series.shift(1)).abs()
-    avrng = calculate_ema(diff, t)
+    avrng = diff.ewm(span=t, adjust=False).mean()
     smooth_rng = calculate_ema(avrng, wper) * m
     return smooth_rng
 
@@ -1129,7 +1131,7 @@ def get_last_closed_index(df: pd.DataFrame, interval_minutes: int) -> Optional[i
     else:
         return len(df) - 2
 
-# ---------- Alert definitions (UNCHANGED) ----------
+# ---------- Alert definitions ----------
 class AlertDefinition(TypedDict):
     key: str
     title: str
@@ -1208,35 +1210,14 @@ def escape_markdown_v2(text: str) -> str:
     except Exception:
         return str(text)
 
-class TokenBucket:
-    def __init__(self, rate: int, burst: int):
-        self.rate = rate
-        self.burst = burst
-        self.tokens = float(burst)
-        self.last_update = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def acquire(self) -> None:
-        while True:
-            async with self.lock:
-                now = time.monotonic()
-                elapsed = now - self.last_update
-                self.tokens = min(self.burst, self.tokens + elapsed * (self.rate / 60))
-                self.last_update = now
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-                wait_time = (1 - self.tokens) / (self.rate / 60)
-            await asyncio.sleep(wait_time)
-
 class TelegramQueue:
-    def __init__(self, token: str, chat_id: str):
+    def __init__(self, token: str, chat_id: str, sdb: RedisStateStore):
         self.token = token
         self.chat_id = chat_id
         self._last_sent = 0.0
         self.rate_limit = 0.1
-        self.token_bucket = TokenBucket(cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
-        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=300)
+        self.token_bucket = PersistedTokenBucket(sdb, cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
+        self.circuit_breaker = PersistedCircuitBreaker(sdb, failure_threshold=3, timeout=300)
 
     async def send(self, message: str) -> bool:
         try:
@@ -1310,7 +1291,6 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     return escape_markdown_v2(f"{headline}\n{body}")
 
 # ---------- core evaluate ----------
-
 async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
@@ -1321,7 +1301,7 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
             return None
 
         # heavy pandas -> thread pool
-        ppo, ppo_signal = await asyncio.to_thread(calculate_ppo, df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA)
+        ppo, ppo_signal = await asyncio.to_thread(calculate_ppo, df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA, sdb)
         smooth_rsi = await asyncio.to_thread(calculate_smooth_rsi, df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN)
         vwap = await asyncio.to_thread(calculate_vwap_daily_reset, df_15m) if cfg.ENABLE_VWAP else pd.Series(index=df_15m.index, dtype=float)
         mmh = await asyncio.to_thread(calculate_magical_momentum_hist, df_15m)
@@ -1667,7 +1647,7 @@ async def run_once() -> bool:
             return False
 
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID, RedisStateStore(cfg.REDIS_URL))
 
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
             global health_tracker
@@ -1732,9 +1712,8 @@ async def run_once() -> bool:
                 await sdb.set_metadata("last_success_run", str(int(time.time())))
                 alerts_sent = sum(1 for r in all_results if r[1].get("state") == "ALERT_SENT")
                 logger_run.info(f"✅ Run complete: {alerts_sent} alerts sent in {time.time() - start_time:.2f}s")
-                # ---- second-precision finish stamp ----
                 logger.info(f"⏰ finished@ {format_ist_time()}")
-
+                return True
 
             except Exception as e:
                 logger_run.exception(f"Error within Redis context: {e}")
@@ -1742,10 +1721,8 @@ async def run_once() -> bool:
             finally:
                 await lock.release(timeout=3.0)
 
-        return True
-
     except asyncio.CancelledError:
-        logger_run.info("���� Run cancelled (Task Cancellation)")
+        logger_run.info("Run cancelled (Task Cancellation)")
         return False
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
