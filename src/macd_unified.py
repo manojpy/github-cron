@@ -491,7 +491,8 @@ class RedisStateStore:
                 max_connections=50,
                 decode_responses=False,
             )
-            ok = await self._ping_with_retry(timeout)
+            ok = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping", lambda r: bool(r))
+
             if not ok:
                 raise RedisConnectionError("ping failed after retries")
             logger.info("Connected to RedisStateStore (max_connections=50, timeouts=%.1fs)", timeout)
@@ -527,9 +528,8 @@ class RedisStateStore:
         await self.close()
 
     async def _ping_with_retry(self, timeout: float) -> bool:
-        return await self._safe_redis_op(
-            self._redis.ping(), timeout, "ping", lambda r: bool(r)
-        ) is True
+        return await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping", lambda r: bool(r)) is True
+
 
     async def _safe_redis_op(self, coro_factory: Callable[[], Awaitable], timeout: float, op_name: str, parser: Optional[Callable] = None):
         if not self._redis:
@@ -551,8 +551,6 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"Failed to {op_name}: {e}")
             return None
-
-
 
         except Exception as e:
             logger.error(f"Failed to {op_name}: {e}")
