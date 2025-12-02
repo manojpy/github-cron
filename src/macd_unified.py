@@ -1297,7 +1297,7 @@ async def evaluate_pair_and_alert(pair_name: str, df_15m: pd.DataFrame, df_5m: p
             upw = dnw = pd.Series(False, index=df_15m.index)
 
         piv: Dict[str, float] = {}
-        if cfg.ENABLE_PIVOT && df_daily is not None and len(df_daily) >= 2:
+        if cfg.ENABLE_PIVOT and df_daily is not None and len(df_daily) >= 2:
             try:
                 df_daily = df_daily.sort_values("timestamp").reset_index(drop=True)
                 df_daily["date"] = pd.to_datetime(df_daily["timestamp"], unit="s", utc=True).dt.date
