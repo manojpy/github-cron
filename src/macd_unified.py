@@ -302,7 +302,7 @@ def setup_logging() -> logging.Logger:
             file_handler = logging.handlers.TimedRotatingFileHandler(
                 filename=cfg.LOG_FILE, when="midnight", interval=1, backupCount=7, encoding="utf-8", utc=True
             )
-                file_handler.setLevel(level)
+            file_handler.setLevel(level)
             file_handler.setFormatter(formatter)
             file_handler.addFilter(SecretFilter())
             file_handler.addFilter(TraceContextFilter())
