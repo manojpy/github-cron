@@ -2004,7 +2004,7 @@ async def run_once() -> bool:
                 logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
 
                 all_results: List[Tuple[str, Dict[str, Any]]] = []
-                heartbeat_task = asyncio.create_task(self._heartbeat_updater(dms, sdb))
+                heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
                 
                 for i in range(0, len(pairs_to_process), batch_size):
                     if shutdown_event.is_set():
