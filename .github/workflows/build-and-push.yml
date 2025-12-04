@@ -7,7 +7,7 @@ on:
       - 'requirements.txt'
       - 'Dockerfile'
       - 'src/**'
-      - 'gitlab_wrapper.py'
+      - 'wrapper.py'
       - 'config_macd.json'
 
 env:
