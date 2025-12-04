@@ -11,27 +11,13 @@ This wrapper:
 
 import sys
 import os
-import pathlib
 import asyncio
-import logging
-from typing import Optional
 
-# Add src/ to Python path
-sys.path.insert(0, str(pathlib.Path(__file__).parent / 'src'))
-
+# Note: PYTHONPATH is set in Dockerfile, so no need for sys.path.insert
 from macd_unified import run_once, setup_logging, load_config
 
-# Configure logging to both file and console
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    handlers=[
-        logging.FileHandler("last_run.log", mode="w", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ],
-)
-
-logger = logging.getLogger("gitlab_wrapper")
+# Use setup_logging from macd_unified to avoid double configuration
+logger = setup_logging()
 
 
 def validate_environment() -> bool:
@@ -112,8 +98,7 @@ async def main() -> int:
         logger.error("❌ Environment validation failed - exiting")
         return 1
     
-    # Set environment variables for the bot (override config file placeholders)
-    # These are already set by GitLab CI, but we ensure they're available
+    # Ensure environment variables are available
     os.environ.setdefault("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
     os.environ.setdefault("TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
     os.environ.setdefault("REDIS_URL", os.getenv("REDIS_URL", ""))
@@ -137,12 +122,12 @@ async def main() -> int:
             return 0
         else:
             logger.error("=" * 70)
-            logger.error("⚠️  Bot execution completed with warnings/errors")
+            logger.error("⚠️ Bot execution completed with warnings/errors")
             logger.error("=" * 70)
             return 2
             
     except KeyboardInterrupt:
-        logger.warning("⚠️  Execution interrupted by user")
+        logger.warning("⚠️ Execution interrupted by user")
         return 130
         
     except Exception as exc:

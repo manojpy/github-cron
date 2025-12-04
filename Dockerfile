@@ -1,5 +1,5 @@
 # ============================================================================
-# Stage 1: Builder - compile dependencies with all build tools
+# Stage 1: Builder - compile dependencies with uv (ultra-fast)
 # ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
@@ -8,18 +8,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libc6-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment to isolate dependencies
+# Install uv - the ultra-fast Python package installer
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Create virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
-    PIP_CACHE_DIR=/tmp/pip-cache
+    UV_SYSTEM_PYTHON=1
 
-# Copy requirements and install dependencies using pip cache
+# Copy requirements and install dependencies with uv (10-100x faster than pip)
 COPY requirements.txt /tmp/requirements.txt
-RUN mkdir -p $PIP_CACHE_DIR && \
-    pip install --upgrade pip setuptools wheel && \
-    pip install --cache-dir=$PIP_CACHE_DIR -r /tmp/requirements.txt
+RUN uv pip install --no-cache -r /tmp/requirements.txt
 
 # ============================================================================
 # Stage 2: Runtime - minimal image with only runtime dependencies
@@ -44,16 +46,20 @@ COPY gitlab_wrapper.py config_macd.json ./
 
 # Set environment variables
 ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONPATH="/app/src:${PYTHONPATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     CONFIG_FILE=config_macd.json \
     TZ=Asia/Kolkata
+
+# Pre-compile Python bytecode for faster startup
+RUN python -m compileall -q /app/src /app/gitlab_wrapper.py
 
 # Create non-root user for security
 RUN useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app
 USER botuser
 
-# Health check (optional - useful for debugging)
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
