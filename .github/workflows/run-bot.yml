@@ -1,0 +1,36 @@
+name: Run Unified MACD Bot
+
+on:
+  workflow_dispatch:
+  #schedule:
+    #- cron: '1,16,31,46 * * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot:latest
+    container:
+      image: ghcr.io/${{ github.repository }}/trading-bot:latest   # inline reference
+      options: --user root
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        REDIS_URL:          ${{ secrets.REDIS_URL }}
+        DELTA_API_BASE:     ${{ secrets.DELTA_API_BASE }}
+        CONFIG_FILE:        config_macd.json
+        TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Log scheduled vs actual start time
+        run: |
+          echo "⏱ Scheduled trigger (UTC): ${{ github.event.schedule || 'manual dispatch' }}"
+          echo "⏱ Actual start time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "⏱ IST time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S')"
+
+      - name: Run bot once
+        run: python -u gitlab_wrapper.py
