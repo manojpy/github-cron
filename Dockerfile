@@ -1,35 +1,36 @@
 # ============================================================================
-# Stage 1: Builder - compile dependencies with uv (ultra-fast)
+# Stage 1: Builder - Uses 'uv' for lightning-fast installs and full dependencies
 # ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
-# Install build dependencies for compiling Python packages
+# Get the fast package installer 'uv'
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+# Install build dependencies (needed for packages like numpy/pandas/psutil if wheels fail)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libc6-dev \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv - the ultra-fast Python package installer
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
 # Create virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH" \
-    UV_SYSTEM_PYTHON=1
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Copy requirements and install dependencies with uv (10-100x faster than pip)
-COPY requirements.txt /tmp/requirements.txt
-RUN uv pip install --no-cache -r /tmp/requirements.txt
+# Copy requirements and install dependencies with uv (Forces rebuild to fix psutil error)
+COPY requirements.txt .
+# The cache-buster here (uv venv) ensures this step runs fresh if requirements.txt changes.
+RUN uv pip install --no-cache -r requirements.txt
 
 # ============================================================================
-# Stage 2: Runtime - minimal image with only runtime dependencies
+# Stage 2: Runtime - Minimal & Optimized for Speed
 # ============================================================================
 FROM python:3.11-slim-bookworm AS runtime
 
-# Install only runtime libraries (no compilers)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install only runtime libraries (e.g., for OpenMP used by numpy)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     libgomp1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -37,29 +38,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy virtual environment from builder stage
 COPY --from=builder /opt/venv /opt/venv
 
-# Set up working directory
 WORKDIR /app
 
-# Copy application files
+# Copy application code
 COPY src/ ./src/
-COPY gitlab_wrapper.py config_macd.json ./
+COPY wrapper.py config_macd.json ./
 
-# Set environment variables
+# Environment configuration (Crucially sets PYTHONPATH to find 'src' modules)
 ENV PATH="/opt/venv/bin:$PATH" \
-    PYTHONPATH="/app/src:${PYTHONPATH}" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="/app/src:$PYTHONPATH" \
     CONFIG_FILE=config_macd.json \
     TZ=Asia/Kolkata
-
-# Pre-compile Python bytecode for faster startup
-RUN python -m compileall -q /app/src /app/gitlab_wrapper.py
 
 # Create non-root user for security
 RUN useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app
+
+# Pre-compile python bytecode for faster startup time (removes need for PYTHONDONTWRITEBYTECODE=1)
+RUN python -m compileall /app
+
 USER botuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)"
+# Run command
+CMD ["python", "-u", "wrapper.py"]
