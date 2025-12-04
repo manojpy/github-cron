@@ -25,6 +25,7 @@ jobs:
           echo "⏱ IST: $(date '+%Y-%m-%d %H:%M:%S')"
 
       - name: Run bot once
+        working-directory: /app
         run: python -u gitlab_wrapper.py
 
       - name: Notify on failure
