@@ -808,8 +808,8 @@ class RedisLock:
             return False
 
     def should_extend(self) -> bool:
-    if not self.acquired_by_me or self.lost:
-        return False
+            if not self.acquired_by_me or self.lost:
+            return False
     
     # Extend at 66-75% of expiry with jitter to prevent thundering herd
     base_interval = Constants.LOCK_EXTEND_INTERVAL
