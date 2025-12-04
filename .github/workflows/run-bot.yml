@@ -1,0 +1,32 @@
+name: Run Unified MACD Bot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/${{ github.repository }}/trading-bot:latest
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        REDIS_URL: ${{ secrets.REDIS_URL }}
+        DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
+        CONFIG_FILE: config_macd.json
+        TZ: Asia/Kolkata
+
+    steps:
+      - name: Log execution time
+        run: |
+          echo "⏱ Triggered via: Cron-jobs.org webhook"
+          echo "⏱ UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "⏱ IST: $(date '+%Y-%m-%d %H:%M:%S')"
+
+      - name: Run bot once
+        run: python -u gitlab_wrapper.py
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ Bot execution failed at $(date)"
