@@ -2,9 +2,9 @@ name: Run Unified MACD Bot
 
 on:
   workflow_dispatch:
-  schedule:
+  #schedule:
     # Run at 1,16,31,46 minutes past each hour (IST offset handled by UTC)
-    - cron: '1,16,31,46 * * * *'
+    #- cron: '1,16,31,46 * * * *'
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot:latest
