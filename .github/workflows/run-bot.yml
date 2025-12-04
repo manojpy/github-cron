@@ -27,7 +27,7 @@ jobs:
       - name: Run bot once
         run: |
           cd /app
-          /opt/venv/bin/python -u gitlab_wrapper.py
+          /opt/venv/bin/python -u wrapper.py
 
       - name: Notify on failure
         if: failure()
