@@ -742,8 +742,13 @@ class RedisLock:
         return 0
     end
     """
-    
-    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
+
+    def __init__(
+        self,
+        redis_client: Optional[redis.Redis],
+        lock_key: str,
+        expire: int | None = None,
+    ):
         self.redis = redis_client
         self.lock_key = f"lock:{lock_key}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
@@ -756,11 +761,12 @@ class RedisLock:
         if not self.redis:
             logger.warning("Redis not available; cannot acquire lock")
             return False
+
         try:
             token = str(uuid.uuid4())
             ok = await asyncio.wait_for(
                 self.redis.set(self.lock_key, token, nx=True, ex=self.expire),
-                timeout=timeout
+                timeout=timeout,
             )
             if ok:
                 self.token = token
@@ -768,6 +774,7 @@ class RedisLock:
                 self.last_extend_time = time.time()
                 logger.info(f"Acquired Redis lock: {self.lock_key} (expires in {self.expire}s)")
                 return True
+
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
             return False
         except Exception as e:
@@ -778,6 +785,7 @@ class RedisLock:
         if not self.token or not self.redis or not self.acquired_by_me:
             self.lost = True
             return False
+
         try:
             raw_val = await asyncio.wait_for(self.redis.get(self.lock_key), timeout=timeout)
             if raw_val is None:
@@ -787,6 +795,7 @@ class RedisLock:
                 if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
                     METRIC_REDIS_LOCK_FAILS.inc()
                 return False
+
             current_token = str(raw_val)
             if current_token != self.token:
                 logger.warning("Lock token mismatch on extend")
@@ -795,7 +804,10 @@ class RedisLock:
                 if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
                     METRIC_REDIS_LOCK_FAILS.inc()
                 return False
-            await asyncio.wait_for(self.redis.expire(self.lock_key, self.expire), timeout=timeout)
+
+            await asyncio.wait_for(
+                self.redis.expire(self.lock_key, self.expire), timeout=timeout
+            )
             self.last_extend_time = time.time()
             logger.debug(f"Extended Redis lock: {self.lock_key}")
             return True
@@ -807,25 +819,26 @@ class RedisLock:
                 METRIC_REDIS_LOCK_FAILS.inc()
             return False
 
-        def should_extend(self) -> bool:
-            if not self.acquired_by_me or self.lost:
-                return False
-    
-    # Extend at 66-75% of expiry with jitter to prevent thundering herd
-    base_interval = Constants.LOCK_EXTEND_INTERVAL
-    jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
-    extend_threshold = base_interval + jitter
-    
-    elapsed = time.time() - self.last_extend_time
-    return elapsed >= extend_threshold
+    def should_extend(self) -> bool:
+        if not self.acquired_by_me or self.lost:
+            return False
+
+        # Extend at ~66-75% of expiry with jitter to prevent thundering herd
+        base_interval = Constants.LOCK_EXTEND_INTERVAL
+        jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
+        extend_threshold = base_interval + jitter
+
+        elapsed = time.time() - self.last_extend_time
+        return elapsed >= extend_threshold
 
     async def release(self, timeout: float = 3.0) -> None:
         if not self.token or not self.redis or not self.acquired_by_me:
             return
+
         try:
             await asyncio.wait_for(
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
-                timeout=timeout
+                timeout=timeout,
             )
             logger.info(f"Released Redis lock: {self.lock_key}")
         except Exception as e:
