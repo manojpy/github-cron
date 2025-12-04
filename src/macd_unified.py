@@ -1893,7 +1893,7 @@ async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], bat
                 logger.error(f"Timeout processing {pair} after {per_pair_timeout}s")
                 return None
 
-tasks.append(check_with_timeout(pair_name))   
+        tasks.append(check_with_timeout(pair_name))   
     results = await asyncio.gather(*tasks, return_exceptions=True)
     valid_results = []
     
