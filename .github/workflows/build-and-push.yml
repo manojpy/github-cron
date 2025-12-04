@@ -2,64 +2,62 @@ name: Build & Push GHCR
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     paths:
       - 'requirements.txt'
       - 'Dockerfile'
       - 'src/**'
       - 'gitlab_wrapper.py'
       - 'config_macd.json'
+      - '.github/workflows/build-push.yml'   # optional: rebuild if workflow changes
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot
   LATEST_TAG: latest
-  PIP_CACHE_DIR: .cache/pip
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write    # needed for GHCR push
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # helpful for proper git metadata in image labels
+
+      - name: Set up QEMU (for multi-arch if you ever need it)
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Restore pip cache
-        uses: actions/cache@v4
+      - name: Docker meta (nice labels + tags)
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          path: .cache/pip
-          key: python-deps-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            python-deps-${{ runner.os }}-
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
 
-      - name: Pre-install dependencies into pip cache
-        run: |
-          python -m pip install --upgrade pip
-          mkdir -p ${{ env.PIP_CACHE_DIR }}
-          pip install --cache-dir=${{ env.PIP_CACHE_DIR }} -r requirements.txt || true
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: Dockerfile
+          platforms: linux/amd64          # add linux/arm64 later if you want
           push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:${{ env.LATEST_TAG }}
-          build-args: |
-            PIP_CACHE_DIR=/tmp/pip-cache
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
