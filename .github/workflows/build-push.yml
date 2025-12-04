@@ -1,4 +1,4 @@
-name: Build & Push GHCR
+name: Docker Build & Push
 
 on:
   push:
@@ -9,27 +9,19 @@ on:
       - 'src/**'
       - 'gitlab_wrapper.py'
       - 'config_macd.json'
-      - '.github/workflows/build-push.yml'   # optional: rebuild if workflow changes
-
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot
-  LATEST_TAG: latest
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write    # needed for GHCR push
+      packages: write
 
     steps:
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # helpful for proper git metadata in image labels
-
-      - name: Set up QEMU (for multi-arch if you ever need it)
-        uses: docker/setup-qemu-action@v3
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -41,21 +33,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker meta (nice labels + tags)
+      - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=long
+          images: ghcr.io/${{ github.repository }}/trading-bot
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
-          platforms: linux/amd64          # add linux/arm64 later if you want
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
