@@ -42,7 +42,7 @@ WORKDIR /app
 
 # Copy application code
 COPY src/ ./src/
-COPY gitlab_wrapper.py config_macd.json ./
+COPY wrapper.py config_macd.json ./
 
 # Environment configuration (Crucially sets PYTHONPATH to find 'src' modules)
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -61,4 +61,4 @@ RUN python -m compileall /app
 USER botuser
 
 # Run command
-CMD ["python", "-u", "gitlab_wrapper.py"]
+CMD ["python", "-u", "wrapper.py"]
