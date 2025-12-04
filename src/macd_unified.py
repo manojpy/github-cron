@@ -807,7 +807,7 @@ class RedisLock:
                 METRIC_REDIS_LOCK_FAILS.inc()
             return False
 
-    def should_extend(self) -> bool:
+        def should_extend(self) -> bool:
             if not self.acquired_by_me or self.lost:
             return False
     
