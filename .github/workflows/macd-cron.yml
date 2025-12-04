@@ -1,8 +1,9 @@
+# .github/workflows/macd-cron.yml
 name: MACD Bot – Every 15 min
 
 on:
- # schedule:
- #   - cron: '1,16,31,46 * * * *'   # 01, 16, 31, 46 past every hour
+  #schedule:
+   # - cron: '1,16,31,46 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -18,5 +19,6 @@ jobs:
         TZ: Asia/Kolkata
 
     steps:
-      - name: Run bot once
-        run: python src/macd_unified.py --once
+      - name: Bot started – running once and exiting
+        run: echo "Bot is running with CMD from Dockerfile…"
+        # ← That’s literally all! Docker will execute the CMD automatically
