@@ -3,32 +3,42 @@ name: Run Unified MACD Bot
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    container:
-      image: ghcr.io/${{ github.repository }}/trading-bot:latest
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        REDIS_URL: ${{ secrets.REDIS_URL }}
-        DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
-        CONFIG_FILE: config_macd.json
-        TZ: Asia/Kolkata
-
     steps:
-      - name: Log execution time
-        run: |
-          echo "⏱ Triggered via: Cron-jobs.org webhook"
-          echo "⏱ UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "⏱ IST: $(date '+%Y-%m-%d %H:%M:%S')"
+      - name: Checkout (for logs / optional file access)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Run bot once
-        run: |
-          cd /app
-          /opt/venv/bin/python -u wrapper.py
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Notify on failure
-        if: failure()
-        run: echo "❌ Bot execution failed at $(date)"
+      - name: Pull image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}:latest
+          echo "Pulling $IMAGE"
+          docker pull "$IMAGE"
+
+      - name: Run container (single execution)
+        env:
+          CONFIG_FILE: config_macd.json
+          TZ: Asia/Kolkata
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}:latest
+          echo "Running container $IMAGE"
+          docker run --rm \
+            -e CONFIG_FILE="$CONFIG_FILE" \
+            -e TZ="$TZ" \
+            -e GITHUB_ACTIONS=true \
+            -v /tmp:/tmp \
+            $IMAGE
