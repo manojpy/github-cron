@@ -1,56 +1,64 @@
-# Dockerfile
-# Multi-stage build using uv for fast installs, no pip cache, bytecode compilation,
-# and PYTHONPATH configured for both repo root and src/.
-
 # ============================================================================
-# Stage 1: Builder - use uv to install dependencies
+# Stage 1: Builder - Uses 'uv' for lightning-fast installs and full dependencies
 # ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
-# Bring in uv binary from upstream image
+# Get the fast package installer 'uv'
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
-RUN chmod +x /bin/uv
 
-# Environment for deterministic builds
-ENV PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app:/app/src
+# Install build dependencies (needed for packages like numpy/pandas/psutil if wheels fail)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Create virtual environment
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Copy only requirements first to leverage Docker cache for deps
-COPY requirements.txt requirements.txt
-
-# Install dependencies using uv (wraps pip) into system prefix (/usr/local)
-RUN /bin/uv pip install --no-warn-script-location --no-cache-dir -r requirements.txt --prefix=/usr/local
-
-# Copy application source
-COPY . /app
-
-# Pre-compile bytecode to speed up cold starts (cron frequent runs)
-RUN python -m compileall /app || true
+# Copy requirements and install dependencies with uv (Forces rebuild to fix psutil error)
+COPY requirements.txt .
+# The cache-buster here (uv venv) ensures this step runs fresh if requirements.txt changes.
+RUN uv pip install --no-cache -r requirements.txt
 
 # ============================================================================
-# Stage 2: Runtime image (slim)
+# Stage 2: Runtime - Minimal & Optimized for Speed
 # ============================================================================
 FROM python:3.11-slim-bookworm AS runtime
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app:/app/src \
-    TZ=Asia/Kolkata
+# Install only runtime libraries (e.g., for OpenMP used by numpy)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy virtual environment from builder stage
+COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy installed packages & app from builder
-COPY --from=builder /usr/local /usr/local
-COPY --from=builder /app /app
+# Copy application code
+COPY src/ ./src/
+COPY wrapper.py config_macd.json ./
 
-# Create a non-root user for security
+# Environment configuration (Crucially sets PYTHONPATH to find 'src' modules)
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app/src:$PYTHONPATH" \
+    CONFIG_FILE=config_macd.json \
+    TZ=Asia/Kolkata
+
+# Create non-root user for security
 RUN useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app
 
+# Pre-compile python bytecode for faster startup time (removes need for PYTHONDONTWRITEBYTECODE=1)
+RUN python -m compileall /app
+
 USER botuser
 
-# Default command runs the wrapper once (CI-friendly)
+# Run command
 CMD ["python", "-u", "wrapper.py"]

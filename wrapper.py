@@ -1,93 +1,146 @@
 #!/usr/bin/env python3
-# wrapper.py - GitHub Actions friendly wrapper for one-off run
+"""
+wrapper.py - GitLab CI/CD entry point for trading bot
 
-import os
+This wrapper:
+1. Sets up environment variables from GitLab CI
+2. Validates configuration
+3. Runs the bot once
+4. Handles errors and exit codes properly
+"""
+
 import sys
-import logging
-import importlib
-import traceback
-from typing import Optional
+import os
+import asyncio
 
-# Add src to path so `import macd_unified` resolves when code is in /app/src
-sys.path.insert(0, "/app/src")
-sys.path.insert(0, "/app")
+# Note: PYTHONPATH is set in Dockerfile, so no need for sys.path.insert
+from macd_unified import run_once, setup_logging, load_config
 
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "config_macd.json")
-TZ = os.environ.get("TZ", "Asia/Kolkata")
-BOT_MODULE = os.environ.get("BOT_MODULE", "macd_unified")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    stream=sys.stdout
-)
-logger = logging.getLogger("wrapper")
+# Use setup_logging from macd_unified to avoid double configuration
+logger = setup_logging()
 
 
-def set_timezone(tz: str) -> None:
-    os.environ["TZ"] = tz
+def validate_environment() -> bool:
+    """
+    Validate that all required environment variables are set.
+    Returns True if valid, False otherwise.
+    """
+    required_vars = {
+        "TELEGRAM_BOT_TOKEN": "Telegram bot token",
+        "TELEGRAM_CHAT_ID": "Telegram chat ID",
+        "REDIS_URL": "Redis connection URL",
+    }
+    
+    missing = []
+    for var, description in required_vars.items():
+        value = os.getenv(var)
+        if not value or value == "__SET_IN_GITLAB_CI__":
+            missing.append(f"  - {var} ({description})")
+            logger.error(f"❌ Missing or invalid: {var}")
+    
+    if missing:
+        logger.error("=" * 70)
+        logger.error("❌ CONFIGURATION ERROR: Required environment variables not set")
+        logger.error("=" * 70)
+        logger.error("Missing variables:")
+        for item in missing:
+            logger.error(item)
+        logger.error("")
+        logger.error("Please set these in GitLab CI/CD Settings → Variables")
+        logger.error("=" * 70)
+        return False
+    
+    logger.info("✅ Environment validation passed")
+    return True
+
+
+def log_environment_info() -> None:
+    """Log relevant environment information for debugging."""
+    logger.info("=" * 70)
+    logger.info("🚀 GitLab CI/CD Trading Bot Wrapper Starting")
+    logger.info("=" * 70)
+    
+    # Log GitLab CI environment info
+    ci_info = {
+        "CI_COMMIT_SHA": os.getenv("CI_COMMIT_SHORT_SHA", "N/A"),
+        "CI_PIPELINE_ID": os.getenv("CI_PIPELINE_ID", "N/A"),
+        "CI_JOB_ID": os.getenv("CI_JOB_ID", "N/A"),
+        "CI_JOB_STARTED_AT": os.getenv("CI_JOB_STARTED_AT", "N/A"),
+        "CONFIG_FILE": os.getenv("CONFIG_FILE", "config_macd.json"),
+    }
+    
+    for key, value in ci_info.items():
+        logger.info(f"{key}: {value}")
+    
+    # Log masked environment variables (don't reveal secrets)
+    logger.info(f"TELEGRAM_BOT_TOKEN: {'✓ SET' if os.getenv('TELEGRAM_BOT_TOKEN') else '✗ MISSING'}")
+    logger.info(f"TELEGRAM_CHAT_ID: {'✓ SET' if os.getenv('TELEGRAM_CHAT_ID') else '✗ MISSING'}")
+    logger.info(f"REDIS_URL: {'✓ SET' if os.getenv('REDIS_URL') else '✗ MISSING'}")
+    logger.info(f"DELTA_API_BASE: {os.getenv('DELTA_API_BASE', 'https://api.delta.exchange')}")
+    logger.info("=" * 70)
+
+
+async def main() -> int:
+    """
+    Main entry point for GitLab CI wrapper.
+    
+    Returns:
+        0 if successful
+        1 if configuration error
+        2 if bot execution failed
+    """
+    
+    # Log environment information
+    log_environment_info()
+    
+    # Validate environment variables
+    if not validate_environment():
+        logger.error("❌ Environment validation failed - exiting")
+        return 1
+    
+    # Ensure environment variables are available
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    os.environ.setdefault("TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
+    os.environ.setdefault("REDIS_URL", os.getenv("REDIS_URL", ""))
+    os.environ.setdefault("DELTA_API_BASE", os.getenv("DELTA_API_BASE", "https://api.delta.exchange"))
+    
     try:
-        import time
-        if hasattr(time, "tzset"):
-            time.tzset()
-    except Exception:
-        logger.debug("tzset not available", exc_info=True)
-
-
-def validate_config(path: str) -> None:
-    if not os.path.exists(path):
-        logger.warning("Config file %s not found in container.", path)
-    else:
-        logger.info("Using config file: %s", path)
-
-
-def run_module(module_name: str, config_file: Optional[str] = None) -> int:
-    try:
-        logger.info("Attempting to import module '%s'", module_name)
-        mod = importlib.import_module(module_name)
-
-        # Prefer run_once()
-        if hasattr(mod, "run_once"):
-            logger.info("Calling run_once() on %s", module_name)
-            try:
-                mod.run_once(config_file) if callable(mod.run_once) else mod.run_once()
-            except TypeError:
-                mod.run_once()
+        # Load and validate configuration
+        logger.info("📋 Loading configuration...")
+        cfg = load_config()
+        logger.info(f"✅ Configuration loaded: {cfg.BOT_NAME}")
+        logger.info(f"📊 Monitoring {len(cfg.PAIRS)} pairs: {', '.join(cfg.PAIRS)}")
+        
+        # Run the bot once
+        logger.info("🤖 Starting bot execution...")
+        success = await run_once()
+        
+        if success:
+            logger.info("=" * 70)
+            logger.info("✅ Bot execution completed successfully")
+            logger.info("=" * 70)
             return 0
-
-        # Fallback to main()
-        if hasattr(mod, "main"):
-            logger.info("Calling main() on %s", module_name)
-            try:
-                mod.main(config_file)
-            except TypeError:
-                mod.main()
-            return 0
-
-        # Last resort: execute module as script
-        logger.info("No run_once/main found. Running as script.")
-        import runpy
-        runpy.run_module(module_name, run_name="__main__")
-        return 0
-
-    except Exception as e:
-        logger.error("Error while running module '%s': %s", module_name, e)
-        logger.debug(traceback.format_exc())
+        else:
+            logger.error("=" * 70)
+            logger.error("⚠️ Bot execution completed with warnings/errors")
+            logger.error("=" * 70)
+            return 2
+            
+    except KeyboardInterrupt:
+        logger.warning("⚠️ Execution interrupted by user")
+        return 130
+        
+    except Exception as exc:
+        logger.exception(f"❌ FATAL ERROR during bot execution: {exc}")
+        logger.error("=" * 70)
+        logger.error("💥 Bot crashed - check logs above for details")
+        logger.error("=" * 70)
         return 2
-
-
-def main():
-    logger.info("wrapper starting up")
-    set_timezone(TZ)
-    validate_config(CONFIG_FILE)
-
-    exit_code = run_module(BOT_MODULE, CONFIG_FILE)
-    if exit_code == 0:
-        logger.info("Bot run completed successfully.")
-    else:
-        logger.error("Bot run failed with exit code %d", exit_code)
-    sys.exit(exit_code)
+    
+    finally:
+        logger.info("👋 wrapper shutting down")
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)
