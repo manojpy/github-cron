@@ -39,7 +39,7 @@ COPY wrapper.py config_macd.json ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH="/app/src:$PYTHONPATH" \
+    PYTHONPATH="/app/src" \
     CONFIG_FILE=config_macd.json \
     TZ=Asia/Kolkata \
     LOG_JSON=false \
