@@ -42,7 +42,7 @@ except Exception:
     PROMETHEUS_ENABLED = False
     Counter = Gauge = Histogram = None
 
-__version__ = "1.0.8-production-stable"
+__version__ = "1.0.8-production-optimized"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -65,6 +65,7 @@ class Constants:
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
     PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "10000"))
+    ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
 
 HEALTH_SERVER_ENABLED = os.getenv("HEALTH_SERVER_ENABLED", "false").lower() in ("1", "true", "yes")
 HEALTH_HTTP_PORT = int(os.getenv("HEALTH_HTTP_PORT", "10001"))
@@ -371,6 +372,8 @@ if PROMETHEUS_ENABLED and Counter and Gauge and Histogram:
         METRIC_INDICATOR_CALC_TIME = Histogram("indicator_calculation_seconds", "Time to calculate indicators", ["indicator"])
         METRIC_REDIS_OP_TIME = Histogram("redis_operation_seconds", "Redis operation latency", ["operation"])
         METRIC_DATA_QUALITY_FAILURES = Counter("data_quality_failures_total", "Data quality check failures", ["reason"])
+        METRIC_ALERT_DEDUP_HITS = Counter("alert_dedup_hits_total", "Alert deduplication hits", ["pair"])
+        METRIC_PAIR_PROCESSING_TIME = Histogram("pair_processing_seconds", "Per-pair processing time", ["pair"])
         start_http_server(Constants.PROMETHEUS_PORT)
         metrics_started = True
         logger.info(f"Prometheus metrics server started on port {Constants.PROMETHEUS_PORT}")
@@ -628,21 +631,56 @@ class RedisStateStore:
         )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        """Check if alert was recently sent (within 14 minutes). Returns True if should send."""
+        """Check if alert was recently sent. Returns True if should send."""
         if self.degraded:
-            return True  # Allow sending if Redis unavailable
+            return True
 
-        window = ts // 900  # 15-minute window
+        window = ts // 900
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
         result = await self._safe_redis_op(
-            self._redis.set(recent_key, "1", nx=True, ex=840),  # 14 min TTL
+            self._redis.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
             timeout=2.0,
             op_name=f"check_recent_alert {pair}:{alert_key}",
             parser=lambda r: bool(r)
         )
 
-        return result is True  # True = not recently sent, safe to send
+        if result is False and PROMETHEUS_ENABLED and METRIC_ALERT_DEDUP_HITS:
+            METRIC_ALERT_DEDUP_HITS.labels(pair=pair).inc()
+
+        return result is True
+
+    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
+        """Batch check multiple alerts. Returns dict of {(pair, alert_key): should_send}."""
+        if self.degraded or not checks:
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+
+        try:
+            pipeline = self._redis.pipeline()
+            keys_map = {}
+            
+            for pair, alert_key, ts in checks:
+                window = ts // 900
+                recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
+                keys_map[recent_key] = f"{pair}:{alert_key}"
+                pipeline.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+
+            results = await asyncio.wait_for(pipeline.execute(), timeout=3.0)
+            
+            output = {}
+            for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
+                should_send = bool(results[idx]) if idx < len(results) else True
+                output[composite_key] = should_send
+                
+                if not should_send and PROMETHEUS_ENABLED and METRIC_ALERT_DEDUP_HITS:
+                    pair = composite_key.split(':')[0]
+                    METRIC_ALERT_DEDUP_HITS.labels(pair=pair).inc()
+            
+            return output
+            
+        except Exception as e:
+            logger.error(f"Batch check_recent_alerts failed: {e}")
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
     async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]:
         if not self._redis or not keys:
@@ -694,7 +732,6 @@ class RedisStateStore:
             logger.debug(f"Batch set {len(updates)} states via pipeline")
         except Exception as e:
             logger.error(f"Pipeline set_multiple_states failed: {e}")
-            # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts, timeout=1.0)
 
@@ -823,7 +860,6 @@ class RedisLock:
         if not self.acquired_by_me or self.lost:
             return False
 
-        # Extend at ~66-75% of expiry with jitter to prevent thundering herd
         base_interval = Constants.LOCK_EXTEND_INTERVAL
         jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
         extend_threshold = base_interval + jitter
@@ -1513,7 +1549,6 @@ for level in PIVOT_LEVELS:
     ALERT_KEYS[f"pivot_up_{level}"] = f"ALERT:PIVOT_UP_{level}"
     ALERT_KEYS[f"pivot_down_{level}"] = f"ALERT:PIVOT_DOWN_{level}"
 
-
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
     if sdb.degraded:
         return
@@ -1543,12 +1578,6 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         output[key] = st is not None and st.get("state") == "ACTIVE"
     
     return output
-
-async def reset_alert_on_condition(sdb: RedisStateStore, pair: str, key: str, condition: bool) -> None:
-    if sdb.degraded:
-        return
-    if condition:
-        await set_alert_state(sdb, pair, key, False)
 
 class HealthTracker:
     def __init__(self, sdb: RedisStateStore):
@@ -1727,6 +1756,16 @@ async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     async with indicator_semaphore:
         return await asyncio.to_thread(func, *args, **kwargs)
 
+async def _heartbeat_updater(dms: DeadMansSwitch, sdb: RedisStateStore) -> None:
+    try:
+        while not shutdown_event.is_set():
+            await asyncio.sleep(60)
+            await dms.update_heartbeat()
+    except asyncio.CancelledError:
+        logger.debug("Heartbeat updater cancelled")
+    except Exception as e:
+        logger.error(f"Heartbeat updater error: {e}")
+
 async def evaluate_pair_and_alert(
     pair_name: str,
     df_15m: pd.DataFrame,
@@ -1738,6 +1777,8 @@ async def evaluate_pair_and_alert(
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
+    pair_start_time = time.time()
+    
     try:
         i15 = get_last_closed_index(df_15m, 15)
         i5 = get_last_closed_index(df_5m, 5)
@@ -1871,7 +1912,6 @@ async def evaluate_pair_and_alert(
 
         raw_alerts: List[Tuple[str, str, str]] = []
 
-        # First, check which alerts were previously active (batch read)
         alert_keys_to_check = []
         for def_ in ALERT_DEFINITIONS:
             if "pivots" in def_["requires"] and not context.get("pivots"):
@@ -1880,12 +1920,10 @@ async def evaluate_pair_and_alert(
                 continue
             alert_keys_to_check.append(def_["key"])
 
-        # Batch check previous states
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, [ALERT_KEYS[k] for k in alert_keys_to_check]
         )
 
-        # Collect alerts to activate
         states_to_update = []
         for def_ in ALERT_DEFINITIONS:
             if "pivots" in def_["requires"] and not context.get("pivots"):
@@ -1902,14 +1940,11 @@ async def evaluate_pair_and_alert(
             except Exception as e:
                 logger_pair.warning(f"Alert check failed for {pair_name}, key={def_['key']}: {e}")
 
-        # Batch update all activated alerts
         if states_to_update:
             await sdb.set_multiple_states(states_to_update)
 
-        # Batch collect all resets
         resets_to_apply = []
 
-        # PPO-based resets
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
@@ -1923,20 +1958,17 @@ async def evaluate_pair_and_alert(
         if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
 
-        # RSI-based resets
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
 
-        # VWAP resets
         if context["vwap"]:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
             if close_prev < vwap_prev and close_curr >= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
 
-        # Pivot resets
         if piv:
             for level_name, level_value in piv.items():
                 if close_prev > level_value and close_curr <= level_value:
@@ -1944,7 +1976,6 @@ async def evaluate_pair_and_alert(
                 if close_prev < level_value and close_curr >= level_value:
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level_name}']}", "INACTIVE", None))
 
-        # MMH resets (these need to check current state first)
         if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
@@ -1952,64 +1983,20 @@ async def evaluate_pair_and_alert(
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        # Apply all resets in one pipeline
         if resets_to_apply:
             await sdb.set_multiple_states(resets_to_apply)
 
-        # Individual reset hooks (kept for parity with existing behavior)
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["ppo_signal_up"], ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["ppo_signal_down"], ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["ppo_zero_up"], ppo_prev > 0 and ppo_curr <= 0
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["ppo_zero_down"], ppo_prev < 0 and ppo_curr >= 0
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["ppo_011_up"], ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["ppo_011_down"], ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["rsi_50_up"], rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD
-        )
-        await reset_alert_on_condition(
-            sdb, pair_name, ALERT_KEYS["rsi_50_down"], rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD
-        )
-        if context["vwap"]:
-            await reset_alert_on_condition(
-                sdb, pair_name, ALERT_KEYS["vwap_up"], close_prev > vwap_prev and close_curr <= vwap_curr
-            )
-            await reset_alert_on_condition(
-                sdb, pair_name, ALERT_KEYS["vwap_down"], close_prev < vwap_prev and close_curr >= vwap_curr
-            )
-        if piv:
-            for level_name, level_value in piv.items():
-                await reset_alert_on_condition(
-                    sdb, pair_name, ALERT_KEYS[f"pivot_up_{level_name}"], close_prev > level_value and close_curr <= level_value
-                )
-                await reset_alert_on_condition(
-                    sdb, pair_name, ALERT_KEYS[f"pivot_down_{level_name}"], close_prev < level_value and close_curr >= level_value
-                )
-        if (mmh_curr > 0) and (mmh_curr <= mmh_m1) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"])):
-            await set_alert_state(sdb, pair_name, ALERT_KEYS["mmh_buy"], False)
-        if (mmh_curr < 0) and (mmh_curr >= mmh_m1) and (await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"])):
-            await set_alert_state(sdb, pair_name, ALERT_KEYS["mmh_sell"], False)
-
-        # Send alerts (dedup aware)
         if raw_alerts:
-            # Check deduplication before sending
+            dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
+            dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
+            
             alerts_to_send = []
             for title, extra, alert_key in raw_alerts:
-                if await sdb.check_recent_alert(pair_name, alert_key, ts_curr):
+                composite_key = f"{pair_name}:{alert_key}"
+                if dedup_results.get(composite_key, True):
                     alerts_to_send.append((title, extra, alert_key))
                 else:
-                    logger_pair.debug(f"Skipping duplicate alert: {pair_name}:{alert_key}")
+                    logger_pair.debug(f"Skipping duplicate alert: {composite_key}")
 
             if alerts_to_send:
                 if len(alerts_to_send) == 1:
@@ -2042,25 +2029,23 @@ async def evaluate_pair_and_alert(
         suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
 
         new_state["summary"] = {"cloud": cloud, "mmh_hist": round(mmh_curr, 4), "suppression": suppression_reason}
+        
+        if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
+            METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
+        
         return pair_name, new_state
 
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
     finally:
-        # Explicit cleanup with memory release hints
         try:
-            for df in [df_15m, df_5m, df_daily]:
-                if df is not None:
-                    del df
-            for series in [ppo, ppo_signal, smooth_rsi, vwap, mmh]:
-                if series is not None:
-                    del series
+            del df_15m, df_5m, df_daily
+            if 'ppo' in locals():
+                del ppo, ppo_signal, smooth_rsi, vwap, mmh
             if cfg.CIRRUS_CLOUD_ENABLED and 'upw' in locals():
                 del upw, dnw
-
-            # Force garbage collection with generation focus
-            gc.collect(generation=0)  # Quick collect of newest objects
+            gc.collect()
         except Exception as e:
             logger.warning(f"Cleanup error (non-critical): {e}")
         finally:
@@ -2119,7 +2104,8 @@ async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], bat
                 logger.error(f"Timeout processing {pair} after {per_pair_timeout}s")
                 return None
 
-        tasks.append(check_with_timeout(pair_name))   
+        tasks.append(check_with_timeout(pair_name))
+    
     results = await asyncio.gather(*tasks, return_exceptions=True)
     valid_results = []
     
@@ -2325,16 +2311,6 @@ async def run_once() -> bool:
         await SessionManager.close_session()
         TRACE_ID.set("")
 
-async def _heartbeat_updater(dms: DeadMansSwitch, sdb: RedisStateStore) -> None:
-    try:
-        while not shutdown_event.is_set():
-            await asyncio.sleep(60)
-            await dms.update_heartbeat()
-    except asyncio.CancelledError:
-        logger.debug("Heartbeat updater cancelled")
-    except Exception as e:
-        logger.error(f"Heartbeat updater error: {e}")
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -2404,3 +2380,4 @@ if __name__ == "__main__":
         except Exception as exc:
             logger.critical(f"Fatal error: {exc}", exc_info=True)
             sys.exit(1)
+
