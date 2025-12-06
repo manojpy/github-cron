@@ -8,7 +8,9 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # INCREASED: 12 mins is too risky for a 10 min internal timeout + queue lag.
+    # 25 mins guarantees the container won't be hard-killed by GitHub while waiting.
+    timeout-minutes: 25
     
     permissions:
       packages: read
@@ -37,6 +39,13 @@ jobs:
         run: |
           docker pull ghcr.io/${{ github.repository }}/trading-bot:latest
 
+      # ADDED: Calculate the specific Unix timestamp of the trigger.
+      # This helps future-proof the bot to know exactly WHEN it started 
+      # regardless of how long GitHub takes to queue the job.
+      - name: Set Trigger Timestamp
+        id: timestamp
+        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
+
       - name: Run bot once
         run: |
           docker run --rm \
@@ -52,6 +61,7 @@ jobs:
             -e GITHUB_RUN_ID="${{ github.run_id }}" \
             -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
             -e GITHUB_WORKFLOW="${{ github.workflow }}" \
+            -e WORKFLOW_TRIGGER_TS="${{ steps.timestamp.outputs.ts }}" \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             ghcr.io/${{ github.repository }}/trading-bot:latest
 
@@ -59,4 +69,4 @@ jobs:
         if: failure()
         run: |
           echo "❌ Bot execution failed at $(date)"
-          echo "Check logs at: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "Check logs at: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" 
