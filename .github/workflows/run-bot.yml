@@ -2,33 +2,61 @@ name: Run Unified MACD Bot
 
 on:
   workflow_dispatch:
+  repository_dispatch:
+    types: [cron_trigger]
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    container:
-      image: ghcr.io/${{ github.repository }}/trading-bot:latest
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        REDIS_URL: ${{ secrets.REDIS_URL }}
-        DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
-        CONFIG_FILE: config_macd.json
-        TZ: Asia/Kolkata
+    timeout-minutes: 12
+    
+    permissions:
+      packages: read
 
     steps:
       - name: Log execution time
         run: |
-          echo "⏱ Triggered via: Cron-jobs.org webhook"
+          echo "⏱ Triggered via: ${{ github.event_name }}"
           echo "⏱ UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "⏱ IST: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "⏱ IST: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
+
+      - name: Checkout (for config file)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            config_macd.json
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull latest image
+        run: |
+          docker pull ghcr.io/${{ github.repository }}/trading-bot:latest
 
       - name: Run bot once
         run: |
-          cd /app
-          /opt/venv/bin/python -u wrapper.py
+          docker run --rm \
+            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
+            -e CONFIG_FILE=config_macd.json \
+            -e TZ=Asia/Kolkata \
+            -e LOG_JSON=false \
+            -e FILE_LOGGING=false \
+            -e GITHUB_SHA="${{ github.sha }}" \
+            -e GITHUB_RUN_ID="${{ github.run_id }}" \
+            -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
+            -e GITHUB_WORKFLOW="${{ github.workflow }}" \
+            -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
+            ghcr.io/${{ github.repository }}/trading-bot:latest
 
       - name: Notify on failure
         if: failure()
-        run: echo "❌ Bot execution failed at $(date)"
+        run: |
+          echo "❌ Bot execution failed at $(date)"
+          echo "Check logs at: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
