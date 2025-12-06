@@ -152,48 +152,66 @@ class BotConfig(BaseModel):
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
     INDICATOR_THREAD_LIMIT: int = 6
-
-    @field_validator('LOG_LEVEL')
-    def validate_log_level(cls, v: str) -> str:
-        valid = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
-        if v.upper() not in valid:
-            raise ValueError(f'LOG_LEVEL must be one of {valid}')
-        return v.upper()
-
-    @field_validator('PAIRS')
-    def validate_pairs(cls, v: List[str]) -> List[str]:
-        if not v:
-            raise ValueError('PAIRS cannot be empty')
-        return v
+    # NEW: Safety + diagnostics
+    DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
+    MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
+    MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
-    def validate_token(cls, v: str) -> str:
+        def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
             raise ValueError('Invalid Telegram bot token format')
         return v
 
+
     @field_validator('TELEGRAM_CHAT_ID')
-    def validate_chat_id(cls, v: str) -> str:
+        def validate_chat_id(cls, v: str) -> str:
         if not v.strip():
             raise ValueError('Chat ID cannot be empty')
         return v.strip()
 
+
     @field_validator('DELTA_API_BASE')
-    def validate_api_base(cls, v: str) -> str:
+        def validate_api_base(cls, v: str) -> str:
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
 
+
     @model_validator(mode='after')
-    def validate_logic(self) -> 'BotConfig':
+        def validate_logic(self) -> 'BotConfig':
         if self.PPO_FAST >= self.PPO_SLOW:
             raise ValueError('PPO_FAST must be less than PPO_SLOW')
+
+        if self.RUN_TIMEOUT_SECONDS < self.MIN_RUN_TIMEOUT:
+            raise ValueError(
+                f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s) must be >= MIN_RUN_TIMEOUT ({self.MIN_RUN_TIMEOUT}s)'
+            )
+
         if self.RUN_TIMEOUT_SECONDS >= Constants.REDIS_LOCK_EXPIRY:
             raise ValueError(
-                f'REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s) must be greater than '
-                f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s). '
+                f'REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s) must be > RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s)'
             )
+
+        if self.TELEGRAM_RATE_LIMIT_PER_MINUTE < 10 or self.TELEGRAM_RATE_LIMIT_PER_MINUTE > 30:
+            raise ValueError('TELEGRAM_RATE_LIMIT_PER_MINUTE must be 10-30')
+
         return self
+
+
+def load_config() -> BotConfig:
+    config_file = os.getenv("CONFIG_FILE", "config_macd.json")
+    data: Dict[str, Any] = {}
+    if Path(config_file).exists():
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"❌ ERROR: Config file {config_file} is not valid JSON", file=sys.stderr)
+            print(f"❌ Details: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+
 
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
@@ -520,12 +538,56 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        if self._redis is not None and not self.degraded:
-            try:
-                if await self._ping_with_retry(1.0):
-                    return
-            except Exception:
-                pass
+    """IMPROVED: Startup smoke test + clear degraded mode behavior"""
+    # Fast ping test first
+    if self._redis is not None and not self.degraded:
+        try:
+            if await self._ping_with_retry(1.0):
+                logger.debug("Redis connection healthy")
+                return
+        except Exception:
+            logger.debug("Redis ping failed, attempting reconnect")
+    
+    # Full reconnection with retries
+    for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
+        self._connection_attempts = attempt
+        logger.info(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
+        
+        if await self._attempt_connect(timeout):
+            # NEW: Smoke test - simple set/get to verify full functionality
+            test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
+            test_val = "ok"
+            if (await self._safe_redis_op(self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set") and
+                await self._safe_redis_op(self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val)):
+                await self._safe_redis_op(self._redis.delete(test_key), 1.0, "smoke_cleanup")
+                logger.info("✅ Redis fully operational (smoke test passed)")
+                self.degraded = False
+                self.degraded_alerted = False
+                return
+            else:
+                logger.warning("Redis smoke test failed, marking degraded")
+        
+        if attempt < cfg.REDIS_CONNECTION_RETRIES:
+            delay = cfg.REDIS_RETRY_DELAY * attempt
+            logger.warning(f"Retrying Redis connection in {delay}s...")
+            await asyncio.sleep(delay)
+    
+    logger.critical("❌ Redis connection failed after all retries")
+    self.degraded = True
+    self._redis = None
+    
+    # DEGRADED MODE: What gets disabled (clear documentation)
+    logger.warning("""
+    🚨 REDIS DEGRADED MODE ACTIVE:
+    • Alert deduplication: DISABLED (may get duplicates)
+    • State persistence: DISABLED (alerts reset each run)
+    • Health tracking: DISABLED
+    • Lock extension: DISABLED
+    • Trading alerts: STILL ACTIVE (core functionality preserved)
+    """)
+    
+    if cfg.FAIL_ON_REDIS_DOWN:
+        raise RedisConnectionError("Redis unavailable after all retries - FAIL_ON_REDIS_DOWN=true")
 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
@@ -1778,14 +1840,18 @@ async def evaluate_pair_and_alert(
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
-    
+    indicator_total_start = time.time()
+
     try:
         i15 = get_last_closed_index(df_15m, 15)
-        i5 = get_last_closed_index(df_5m, 5)
+        i5  = get_last_closed_index(df_5m,   5)
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient closed candles for {pair_name}")
             return None
 
+        # ------------------------------------------------------------------
+        # 1.  Calculate indicators (threaded)
+        # ------------------------------------------------------------------
         indicator_start = time.time()
         ppo, ppo_signal = await calculate_indicator_threaded(
             calculate_ppo, df_15m,
@@ -1824,6 +1890,9 @@ async def evaluate_pair_and_alert(
         else:
             upw = dnw = pd.Series(False, index=df_15m.index)
 
+        # ------------------------------------------------------------------
+        # 2.  Daily pivot levels
+        # ------------------------------------------------------------------
         piv: Dict[str, float] = {}
         if cfg.ENABLE_PIVOT and df_daily is not None and len(df_daily) >= 2:
             try:
@@ -1832,11 +1901,11 @@ async def evaluate_pair_and_alert(
                 completed_days = df_daily["date"] < datetime.now(timezone.utc).date()
                 if completed_days.sum() >= 1:
                     prev_daily = df_daily[completed_days].iloc[-1]
-                    H_prev, L_prev, C_prev = float(prev_daily["high"]), float(prev_daily["low"]), float(prev_daily["close"])
+                    H_prev = float(prev_daily["high"])
+                    L_prev = float(prev_daily["low"])
+                    C_prev = float(prev_daily["close"])
                     rng_prev = H_prev - L_prev
-                    if rng_prev <= 1e-8:
-                        piv = {}
-                    else:
+                    if rng_prev > 1e-8:
                         P = (H_prev + L_prev + C_prev) / 3.0
                         piv = {
                             "P": P,
@@ -1850,66 +1919,99 @@ async def evaluate_pair_and_alert(
             except Exception as e:
                 logger_pair.warning(f"Pivot calc failed for {pair_name}: {e}")
 
-        close_curr, close_prev = float(df_15m["close"].iloc[i15]), float(df_15m["close"].iloc[i15 - 1])
-        ts_curr = int(df_15m["timestamp"].iloc[i15])
-        ppo_curr, ppo_prev = float(ppo.iloc[i15]), float(ppo.iloc[i15 - 1])
-        ppo_sig_curr, ppo_sig_prev = float(ppo_signal.iloc[i15]), float(ppo_signal.iloc[i15 - 1])
-        rsi_curr, rsi_prev = float(smooth_rsi.iloc[i15]), float(smooth_rsi.iloc[i15 - 1])
-        vwap_curr = float(vwap.iloc[i15]) if not vwap.empty else 0.0
-        vwap_prev = float(vwap.iloc[i15 - 1]) if not vwap.empty else 0.0
-        mmh_curr, mmh_m1 = float(mmh.iloc[i15]), float(mmh.iloc[i15 - 1])
-        cloud_up = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
-        cloud_down = bool(dnw.iloc[i15]) and not bool(upw.iloc[i15])
-        rma50_15 = float((await calculate_indicator_threaded(calculate_rma, df_15m["close"], cfg.RMA_50_PERIOD)).iloc[i15])
-        rma200_5 = float((await calculate_indicator_threaded(calculate_rma, df_5m["close"], cfg.RMA_200_PERIOD)).iloc[i5])
+        # ------------------------------------------------------------------
+        # 3.  Snapshot current values
+        # ------------------------------------------------------------------
+        close_curr  = float(df_15m["close"].iloc[i15])
+        close_prev  = float(df_15m["close"].iloc[i15 - 1])
+        ts_curr     = int(df_15m["timestamp"].iloc[i15])
 
-        base_buy_common = rma50_15 < close_curr and rma200_5 < close_curr
+        ppo_curr    = float(ppo.iloc[i15])
+        ppo_prev    = float(ppo.iloc[i15 - 1])
+        ppo_sig_curr = float(ppo_signal.iloc[i15])
+        ppo_sig_prev = float(ppo_signal.iloc[i15 - 1])
+
+        rsi_curr    = float(smooth_rsi.iloc[i15])
+        rsi_prev    = float(smooth_rsi.iloc[i15 - 1])
+
+        vwap_curr   = float(vwap.iloc[i15]) if not vwap.empty else 0.0
+        vwap_prev   = float(vwap.iloc[i15 - 1]) if not vwap.empty else 0.0
+
+        mmh_curr    = float(mmh.iloc[i15])
+        mmh_m1      = float(mmh.iloc[i15 - 1])
+
+        cloud_up    = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
+        cloud_down  = bool(dnw.iloc[i15]) and not bool(upw.iloc[i15])
+
+        rma50_15    = float((await calculate_indicator_threaded(
+            calculate_rma, df_15m["close"], cfg.RMA_50_PERIOD)).iloc[i15])
+        rma200_5    = float((await calculate_indicator_threaded(
+            calculate_rma, df_5m["close"], cfg.RMA_200_PERIOD)).iloc[i5])
+
+        # ------------------------------------------------------------------
+        # 4.  Base trend filters
+        # ------------------------------------------------------------------
+        base_buy_common  = rma50_15 < close_curr and rma200_5 < close_curr
         base_sell_common = rma50_15 > close_curr and rma200_5 > close_curr
+
         if base_buy_common:
             base_buy_common = base_buy_common and (mmh_curr > 0 and cloud_up)
         if base_sell_common:
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
-        buy_common_candle_ok = check_common_conditions(df_15m, i15, is_buy=True)
+        buy_common_candle_ok  = check_common_conditions(df_15m, i15, is_buy=True)
         sell_common_candle_ok = check_common_conditions(df_15m, i15, is_buy=False)
-        buy_common = base_buy_common and buy_common_candle_ok
+
+        buy_common  = base_buy_common  and buy_common_candle_ok
         sell_common = base_sell_common and sell_common_candle_ok
 
-        mmh_reversal_buy = False
+        # ------------------------------------------------------------------
+        # 5.  MMH reversal detection
+        # ------------------------------------------------------------------
+        mmh_reversal_buy  = False
         mmh_reversal_sell = False
         if i15 >= 3:
-            mmh_m3, mmh_m2 = float(mmh.iloc[i15 - 3]), float(mmh.iloc[i15 - 2])
-            mmh_reversal_buy = buy_common and (mmh_curr > 0) and (mmh_m3 > mmh_m2 > mmh_m1) and (mmh_curr > mmh_m1)
-            mmh_reversal_sell = sell_common and (mmh_curr < 0) and (mmh_m3 < mmh_m2 < mmh_m1) and (mmh_curr < mmh_m1)
+            mmh_m3 = float(mmh.iloc[i15 - 3])
+            mmh_m2 = float(mmh.iloc[i15 - 2])
+            mmh_reversal_buy  = (buy_common  and mmh_curr > 0 and
+                                 mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
+            mmh_reversal_sell = (sell_common and mmh_curr < 0 and
+                                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
 
+        # ------------------------------------------------------------------
+        # 6.  Build context dict for alert rules
+        # ------------------------------------------------------------------
         context = {
-            "buy_common": buy_common,
+            "buy_common":  buy_common,
             "sell_common": sell_common,
-            "close_curr": close_curr,
-            "close_prev": close_prev,
-            "ts_curr": ts_curr,
-            "ppo_curr": ppo_curr,
-            "ppo_prev": ppo_prev,
+            "close_curr":  close_curr,
+            "close_prev":  close_prev,
+            "ts_curr":     ts_curr,
+            "ppo_curr":    ppo_curr,
+            "ppo_prev":    ppo_prev,
             "ppo_sig_curr": ppo_sig_curr,
             "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr": rsi_curr,
-            "rsi_prev": rsi_prev,
-            "vwap_curr": vwap_curr,
-            "vwap_prev": vwap_prev,
-            "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1,
-            "mmh_reversal_buy": mmh_reversal_buy,
+            "rsi_curr":    rsi_curr,
+            "rsi_prev":    rsi_prev,
+            "vwap_curr":   vwap_curr,
+            "vwap_prev":   vwap_prev,
+            "mmh_curr":    mmh_curr,
+            "mmh_m1":      mmh_m1,
+            "mmh_reversal_buy":  mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
-            "pivots": piv,
-            "vwap": not pd.Series(dtype=float).equals(vwap),
-            "candle_quality_failed_buy": base_buy_common and not buy_common_candle_ok,
+            "pivots":      piv,
+            "vwap":        not pd.Series(dtype=float).equals(vwap),
+            "candle_quality_failed_buy":  base_buy_common  and not buy_common_candle_ok,
             "candle_quality_failed_sell": base_sell_common and not sell_common_candle_ok,
         }
 
-        ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
+        ppo_ctx    = {"curr": context["ppo_curr"],    "prev": context["ppo_prev"]}
         ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
-        rsi_ctx = {"curr": context["rsi_curr"], "prev": context["rsi_prev"]}
+        rsi_ctx    = {"curr": context["rsi_curr"],    "prev": context["rsi_prev"]}
 
+        # ------------------------------------------------------------------
+        # 7.  Evaluate alert rules
+        # ------------------------------------------------------------------
         raw_alerts: List[Tuple[str, str, str]] = []
 
         alert_keys_to_check = []
@@ -1943,16 +2045,21 @@ async def evaluate_pair_and_alert(
         if states_to_update:
             await sdb.set_multiple_states(states_to_update)
 
+        # ------------------------------------------------------------------
+        # 8.  Reset conditions
+        # ------------------------------------------------------------------
         resets_to_apply = []
 
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+
         if ppo_prev > 0 and ppo_curr <= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
         if ppo_prev < 0 and ppo_curr >= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
+
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
         if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
@@ -1986,10 +2093,13 @@ async def evaluate_pair_and_alert(
         if resets_to_apply:
             await sdb.set_multiple_states(resets_to_apply)
 
+        # ------------------------------------------------------------------
+        # 9.  Deduplicate & cap alerts
+        # ------------------------------------------------------------------
         if raw_alerts:
             dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
             dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
-            
+
             alerts_to_send = []
             for title, extra, alert_key in raw_alerts:
                 composite_key = f"{pair_name}:{alert_key}"
@@ -1998,28 +2108,41 @@ async def evaluate_pair_and_alert(
                 else:
                     logger_pair.debug(f"Skipping duplicate alert: {composite_key}")
 
-            if alerts_to_send:
-                if len(alerts_to_send) == 1:
-                    title, extra, alert_key = alerts_to_send[0]
-                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
-                else:
-                    items = [(t, e) for t, e, _ in alerts_to_send]
-                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
+            MAX_ALERTS_PER_PAIR = 8
+            alerts_to_send = alerts_to_send[:MAX_ALERTS_PER_PAIR]
+        else:
+            alerts_to_send = []
 
-                await telegram_queue.send(msg)
-
-                if PROMETHEUS_ENABLED and METRIC_ALERTS_SENT:
-                    for _, _, alert_key in alerts_to_send:
-                        METRIC_ALERTS_SENT.labels(alert_type=alert_key).inc()
-
-                new_state = {"state": "ALERT_SENT", "ts": int(time.time()), "summary": {"alerts": len(alerts_to_send)}}
-                logger_pair.info(f"✅ Sent {len(alerts_to_send)} alerts for {pair_name}: {[ak for _, _, ak in alerts_to_send]}")
+        # ------------------------------------------------------------------
+        # 10.  Send telegram & update state
+        # ------------------------------------------------------------------
+        if alerts_to_send:
+            if len(alerts_to_send) == 1:
+                title, extra, _ = alerts_to_send[0]
+                msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
             else:
-                new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
-                logger_pair.debug(f"All alerts were duplicates for {pair_name}")
+                items = [(t, e) for t, e, _ in alerts_to_send]
+                msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
+
+            await telegram_queue.send(msg)
+
+            if PROMETHEUS_ENABLED and METRIC_ALERTS_SENT:
+                for _, _, alert_key in alerts_to_send:
+                    METRIC_ALERTS_SENT.labels(alert_type=alert_key).inc()
+
+            new_state = {
+                "state": "ALERT_SENT",
+                "ts": int(time.time()),
+                "summary": {"alerts": len(alerts_to_send)}
+            }
+            logger_pair.info(f"✅ Sent {len(alerts_to_send)} alerts for {pair_name}: "
+                           f"{[ak for _, _, ak in alerts_to_send]}")
         else:
             new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
 
+        # ------------------------------------------------------------------
+        # 11.  Final summary & metrics
+        # ------------------------------------------------------------------
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         reasons = []
         if not context["buy_common"] and not context["sell_common"]:
@@ -2028,17 +2151,30 @@ async def evaluate_pair_and_alert(
             reasons.append("Candle quality failed")
         suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
 
-        new_state["summary"] = {"cloud": cloud, "mmh_hist": round(mmh_curr, 4), "suppression": suppression_reason}
-        
+        new_state["summary"] = {
+            "cloud": cloud,
+            "mmh_hist": round(mmh_curr, 4),
+            "suppression": suppression_reason
+        }
+
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
-        
+
+        indicator_total_time = time.time() - indicator_total_start
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(f"ALL indicators: {indicator_total_time:.2f}s | "
+                            f"Pair total: {time.time() - pair_start_time:.2f}s")
+
         return pair_name, new_state
 
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
+
     finally:
+        # ------------------------------------------------------------------
+        # 12.  Cleanup
+        # ------------------------------------------------------------------
         try:
             del df_15m, df_5m, df_daily
             if 'ppo' in locals():
@@ -2060,21 +2196,24 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
             logger.warning(f"Product info not found for {pair_name}")
             return None
         symbol = product_info["symbol"]
-        daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 2
+        # OPTIMIZED: Exact candle counts needed by indicators (reduces memory/CPU)
+        daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10  # +buffer for pivot calc
+        indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
 
         tasks = [
-            fetcher.fetch_candles(symbol, "15", 250),
-            fetcher.fetch_candles(symbol, "5", 350),
+            fetcher.fetch_candles(symbol, "15", 300),
+            fetcher.fetch_candles(symbol, "5", 400),
             fetcher.fetch_candles(symbol, "D", daily_limit) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
         ]
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
         df_15m = parse_candles_result(results[0]) if not isinstance(results[0], Exception) else None
         df_5m = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
         df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
 
-        valid_15m, reason_15m = validate_candle_df(df_15m, 202)
-        valid_5m, reason_5m = validate_candle_df(df_5m, 252)
-        
+        valid_15m, reason_15m = validate_candle_df(df_15m, 220)  # Matches optimized fetch
+        valid_5m, reason_5m = validate_candle_df(df_5m, 280)    # Matches optimized fetch
+    
         if not valid_15m or not valid_5m:
             logger.warning(f"Insufficient data for {pair_name}: 15m={reason_15m}, 5m={reason_5m}")
             return None
@@ -2142,6 +2281,13 @@ async def run_once() -> bool:
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
+    
+    # NEW: Tracking variables for run summary
+    processed_pairs = set()
+    failed_pairs = set()
+    alerts_sent = 0
+    MAX_ALERTS_PER_RUN = 50
+    
     memory_monitor = MemoryMonitor(Constants.MEMORY_LIMIT_PERCENT)
     local_health_server: Optional[HealthHttpServer] = None
     lock_acquired = False
@@ -2231,6 +2377,14 @@ async def run_once() -> bool:
                     logger_run.debug(f"Processing batch {i // batch_size + 1}: {batch_pairs}")
                     
                     batch_results = await process_batch(fetcher, products_map, batch_pairs, sdb, telegram_queue, correlation_id, memory_monitor, lock)
+                    
+                    # NEW: Update tracking counters
+                    for pair_result in batch_results or []:
+                        pair_name, state = pair_result
+                        processed_pairs.add(pair_name)
+                        if state and state.get("state") == "ALERT_SENT":
+                            alerts_sent += state["summary"].get("alerts", 0)
+                    
                     all_results.extend(batch_results)
 
                     del batch_results
@@ -2255,10 +2409,20 @@ async def run_once() -> bool:
 
                 await dms.update_heartbeat()
                 
-                alerts_sent = sum(1 for r in all_results if r[1].get("state") == "ALERT_SENT")
                 run_duration = time.time() - start_time
                 
-                logger_run.info(f"✅ Run complete: {alerts_sent} alerts sent in {run_duration:.2f}s")
+                # IMPROVED: Global alert cap safety + comprehensive run summary
+                used_mb = psutil.virtual_memory().used / 1024 / 1024
+                summary = (
+                    f"✓ RUN SUMMARY | Alerts: {alerts_sent} | Pairs OK: {len(processed_pairs)} | "
+                    f"Failed: {len(failed_pairs)} | Runtime: {run_duration:.1f}s | "
+                    f"Mem: {used_mb:.1f}MB | Redis: {'OK' if not sdb.degraded else 'DEGRADED'}"
+                )
+                logger_run.info(summary)
+                
+                if alerts_sent > MAX_ALERTS_PER_RUN:
+                    telegram_msg = f"⚠️ HIGH VOLUME: {alerts_sent} alerts | Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
+                    await telegram_queue.send(escape_markdown_v2(telegram_msg), priority="high")
                 
                 if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
                     METRIC_RUN_DURATION.observe(run_duration)
@@ -2273,6 +2437,8 @@ async def run_once() -> bool:
                         "correlation_id": correlation_id
                     })
 
+                return True
+
             except asyncio.TimeoutError:
                 logger_run.error("Run timed out")
                 return False
@@ -2284,8 +2450,6 @@ async def run_once() -> bool:
                     await lock.release(timeout=3.0)
                 else:
                     logger_run.debug("Lock not acquired by this instance, skipping release")
-
-        return True
 
     except asyncio.CancelledError:
         logger_run.info("Run cancelled (Task Cancellation)")
