@@ -13,6 +13,10 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+.tox/
+.hypothesis/
+*.cover
+.python-version
 
 # ============================================================================
 # Virtual environments
@@ -20,7 +24,9 @@ htmlcov/
 venv/
 env/
 ENV/
-.venv
+.venv/
+.virtualenv/
+pip-selfcheck.json
 
 # ============================================================================
 # IDEs
@@ -30,6 +36,11 @@ ENV/
 *.swp
 *.swo
 *~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
 
 # ============================================================================
 # Logs and temporary files
@@ -37,7 +48,9 @@ ENV/
 *.log
 last_run.log
 macd_bot.log
+*.log.*
 *.pid
+*.lock
 
 # ============================================================================
 # Environment variables (NEVER commit secrets!)
@@ -45,7 +58,12 @@ macd_bot.log
 .env
 .env.local
 .env.*.local
+.env.production
+.env.development
 *.secret
+*.key
+*.pem
+config_macd.local.json
 
 # ============================================================================
 # Redis dumps (if running locally)
@@ -58,14 +76,52 @@ dump.rdb
 # ============================================================================
 .DS_Store
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
 
 # ============================================================================
 # Cache directories
 # ============================================================================
 .cache/
 .pip_cache/
+*.cache
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
 
 # ============================================================================
-# GitHub Actions (optional)
+# Jupyter Notebooks (if you use them for analysis)
 # ============================================================================
-.github/*.md
+.ipynb_checkpoints
+*.ipynb
+
+# ============================================================================
+# Docker (optional - uncomment if you don't want to track images)
+# ============================================================================
+# *.tar
+# *.tar.gz
+
+# ============================================================================
+# Local development
+# ============================================================================
+scratch/
+tmp/
+temp/
+local/
+dev/
+
+# ============================================================================
+# Testing artifacts
+# ============================================================================
+.pytest_cache/
+.coverage.*
+coverage.xml
+*.cover
+nosetests.xml
+
+# ============================================================================
+# Documentation builds
+# ============================================================================
+docs/_build/
+site/

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-wrapper.py - GitLab CI/CD entry point for trading bot
+wrapper.py - GitHub Actions / Cron-jobs.org entry point for trading bot
 
 This wrapper:
-1. Sets up environment variables from GitLab CI
+1. Sets up environment variables from GitHub Actions
 2. Validates configuration
 3. Runs the bot once
 4. Handles errors and exit codes properly
@@ -12,12 +12,15 @@ This wrapper:
 import sys
 import os
 import asyncio
+import logging
 
-# Note: PYTHONPATH is set in Dockerfile, so no need for sys.path.insert
-from macd_unified import run_once, setup_logging, load_config
+try:
+    from src.macd_unified import run_once, logger as bot_logger, cfg
+except ImportError:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+    from macd_unified import run_once, logger as bot_logger, cfg
 
-# Use setup_logging from macd_unified to avoid double configuration
-logger = setup_logging()
+logger = bot_logger
 
 
 def validate_environment() -> bool:
@@ -29,6 +32,7 @@ def validate_environment() -> bool:
         "TELEGRAM_BOT_TOKEN": "Telegram bot token",
         "TELEGRAM_CHAT_ID": "Telegram chat ID",
         "REDIS_URL": "Redis connection URL",
+        "DELTA_API_BASE": "Delta Exchange API base URL",
     }
     
     missing = []
@@ -46,7 +50,7 @@ def validate_environment() -> bool:
         for item in missing:
             logger.error(item)
         logger.error("")
-        logger.error("Please set these in GitLab CI/CD Settings → Variables")
+        logger.error("Please set these in GitHub Secrets or Cron-jobs.org headers")
         logger.error("=" * 70)
         return False
     
@@ -57,22 +61,21 @@ def validate_environment() -> bool:
 def log_environment_info() -> None:
     """Log relevant environment information for debugging."""
     logger.info("=" * 70)
-    logger.info("🚀 GitLab CI/CD Trading Bot Wrapper Starting")
+    logger.info("🚀 GitHub Actions Trading Bot Wrapper Starting")
     logger.info("=" * 70)
     
-    # Log GitLab CI environment info
     ci_info = {
-        "CI_COMMIT_SHA": os.getenv("CI_COMMIT_SHORT_SHA", "N/A"),
-        "CI_PIPELINE_ID": os.getenv("CI_PIPELINE_ID", "N/A"),
-        "CI_JOB_ID": os.getenv("CI_JOB_ID", "N/A"),
-        "CI_JOB_STARTED_AT": os.getenv("CI_JOB_STARTED_AT", "N/A"),
+        "GITHUB_SHA": os.getenv("GITHUB_SHA", "N/A")[:8],
+        "GITHUB_RUN_ID": os.getenv("GITHUB_RUN_ID", "N/A"),
+        "GITHUB_RUN_NUMBER": os.getenv("GITHUB_RUN_NUMBER", "N/A"),
+        "GITHUB_WORKFLOW": os.getenv("GITHUB_WORKFLOW", "N/A"),
         "CONFIG_FILE": os.getenv("CONFIG_FILE", "config_macd.json"),
+        "PYTHONPATH": os.getenv("PYTHONPATH", "N/A"),
     }
     
     for key, value in ci_info.items():
         logger.info(f"{key}: {value}")
     
-    # Log masked environment variables (don't reveal secrets)
     logger.info(f"TELEGRAM_BOT_TOKEN: {'✓ SET' if os.getenv('TELEGRAM_BOT_TOKEN') else '✗ MISSING'}")
     logger.info(f"TELEGRAM_CHAT_ID: {'✓ SET' if os.getenv('TELEGRAM_CHAT_ID') else '✗ MISSING'}")
     logger.info(f"REDIS_URL: {'✓ SET' if os.getenv('REDIS_URL') else '✗ MISSING'}")
@@ -82,36 +85,28 @@ def log_environment_info() -> None:
 
 async def main() -> int:
     """
-    Main entry point for GitLab CI wrapper.
+    Main entry point for GitHub Actions wrapper.
     
     Returns:
         0 if successful
         1 if configuration error
         2 if bot execution failed
+        130 if interrupted
     """
     
-    # Log environment information
     log_environment_info()
     
-    # Validate environment variables
     if not validate_environment():
         logger.error("❌ Environment validation failed - exiting")
         return 1
     
-    # Ensure environment variables are available
-    os.environ.setdefault("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
-    os.environ.setdefault("TELEGRAM_CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
-    os.environ.setdefault("REDIS_URL", os.getenv("REDIS_URL", ""))
-    os.environ.setdefault("DELTA_API_BASE", os.getenv("DELTA_API_BASE", "https://api.delta.exchange"))
+    os.environ.setdefault("DELTA_API_BASE", "https://api.delta.exchange")
     
     try:
-        # Load and validate configuration
-        logger.info("📋 Loading configuration...")
-        cfg = load_config()
-        logger.info(f"✅ Configuration loaded: {cfg.BOT_NAME}")
-        logger.info(f"📊 Monitoring {len(cfg.PAIRS)} pairs: {', '.join(cfg.PAIRS)}")
+        logger.info("📋 Configuration loaded from macd_unified")
+        logger.info(f"✅ Bot Name: {cfg.BOT_NAME}")
+        logger.info(f"📊 Monitoring {len(cfg.PAIRS)} pairs: {', '.join(cfg.PAIRS[:5])}{'...' if len(cfg.PAIRS) > 5 else ''}")
         
-        # Run the bot once
         logger.info("🤖 Starting bot execution...")
         success = await run_once()
         
@@ -138,7 +133,7 @@ async def main() -> int:
         return 2
     
     finally:
-        logger.info("👋 wrapper shutting down")
+        logger.info("👋 Wrapper shutting down")
 
 
 if __name__ == "__main__":

@@ -1,64 +1,59 @@
 # ============================================================================
-# Stage 1: Builder - Uses 'uv' for lightning-fast installs and full dependencies
+# Stage 1: Builder - Uses 'uv' for lightning-fast installs
 # ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
-# Get the fast package installer 'uv'
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Install build dependencies (needed for packages like numpy/pandas/psutil if wheels fail)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment
 ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Copy requirements and install dependencies with uv (Forces rebuild to fix psutil error)
 COPY requirements.txt .
-# The cache-buster here (uv venv) ensures this step runs fresh if requirements.txt changes.
 RUN uv pip install --no-cache -r requirements.txt
 
 # ============================================================================
-# Stage 2: Runtime - Minimal & Optimized for Speed
+# Stage 2: Runtime - Minimal & Optimized
 # ============================================================================
 FROM python:3.11-slim-bookworm AS runtime
 
-# Install only runtime libraries (e.g., for OpenMP used by numpy)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libgomp1 \
     ca-certificates \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy virtual environment from builder stage
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy application code
-COPY src/ ./src/
+COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
 
-# Environment configuration (Crucially sets PYTHONPATH to find 'src' modules)
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app/src:$PYTHONPATH" \
     CONFIG_FILE=config_macd.json \
-    TZ=Asia/Kolkata
+    TZ=Asia/Kolkata \
+    LOG_JSON=false \
+    FILE_LOGGING=false
 
-# Create non-root user for security
 RUN useradd -m -u 1000 botuser && \
-    chown -R botuser:botuser /app
+    chown -R botuser:botuser /app && \
+    chmod +x wrapper.py
 
-# Pre-compile python bytecode for faster startup time (removes need for PYTHONDONTWRITEBYTECODE=1)
-RUN python -m compileall /app
+RUN python -m compileall /app/src
 
 USER botuser
 
-# Run command
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD python -c "import sys; sys.exit(0)"
+
 CMD ["python", "-u", "wrapper.py"]
