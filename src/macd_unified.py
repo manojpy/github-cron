@@ -158,28 +158,28 @@ class BotConfig(BaseModel):
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
-        def validate_token(cls, v: str) -> str:
+    def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
             raise ValueError('Invalid Telegram bot token format')
         return v
 
 
     @field_validator('TELEGRAM_CHAT_ID')
-        def validate_chat_id(cls, v: str) -> str:
+    def validate_chat_id(cls, v: str) -> str:
         if not v.strip():
             raise ValueError('Chat ID cannot be empty')
         return v.strip()
 
 
     @field_validator('DELTA_API_BASE')
-        def validate_api_base(cls, v: str) -> str:
+    def validate_api_base(cls, v: str) -> str:
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
 
 
     @model_validator(mode='after')
-        def validate_logic(self) -> 'BotConfig':
+    def validate_logic(self) -> 'BotConfig':
         if self.PPO_FAST >= self.PPO_SLOW:
             raise ValueError('PPO_FAST must be less than PPO_SLOW')
 
