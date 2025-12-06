@@ -496,18 +496,21 @@ async def retry_async(
 
 class RedisStateStore:
     def __init__(self, redis_url: str):
-        self.redis_url = redis_url
+        self.redis_url                   = redis_url
         self._redis: Optional[redis.Redis] = None
-        self.state_prefix = "pair_state:"
-        self.meta_prefix = "metadata:"
-        self.alert_prefix = "alert:"
-        self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
-        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
-        self.metadata_expiry_seconds = 7 * 86400
-        self.degraded = False
-        self.degraded_alerted = False
-        self._connection_attempts = 0
+        self.state_prefix                = "pair_state:"
+        self.meta_prefix                 = "metadata:"
+        self.alert_prefix                = "alert:"
+        self.expiry_seconds              = cfg.STATE_EXPIRY_DAYS * 86400
+        self.alert_expiry_seconds        = cfg.STATE_EXPIRY_DAYS * 86400
+        self.metadata_expiry_seconds     = 7 * 86400
+        self.degraded                    = False
+        self.degraded_alerted            = False
+        self._connection_attempts        = 0
 
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
             self._redis = redis.from_url(
@@ -521,8 +524,8 @@ class RedisStateStore:
             ok = await self._ping_with_retry(timeout)
             if ok:
                 logger.info("Connected to RedisStateStore (decode_responses=True, max_connections=50)")
-                self.degraded = False
-                self.degraded_alerted = False
+                self.degraded            = False
+                self.degraded_alerted    = False
                 self._connection_attempts = 0
                 return True
             else:
@@ -538,77 +541,66 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-    """IMPROVED: Startup smoke test + clear degraded mode behavior"""
-    # Fast ping test first
-    if self._redis is not None and not self.degraded:
-        try:
-            if await self._ping_with_retry(1.0):
-                logger.debug("Redis connection healthy")
-                return
-        except Exception:
-            logger.debug("Redis ping failed, attempting reconnect")
-    
-    # Full reconnection with retries
-    for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-        self._connection_attempts = attempt
-        logger.info(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
-        
-        if await self._attempt_connect(timeout):
-            # NEW: Smoke test - simple set/get to verify full functionality
-            test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
-            test_val = "ok"
-            if (await self._safe_redis_op(self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set") and
-                await self._safe_redis_op(self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val)):
-                await self._safe_redis_op(self._redis.delete(test_key), 1.0, "smoke_cleanup")
-                logger.info("✅ Redis fully operational (smoke test passed)")
-                self.degraded = False
-                self.degraded_alerted = False
-                return
-            else:
-                logger.warning("Redis smoke test failed, marking degraded")
-        
-        if attempt < cfg.REDIS_CONNECTION_RETRIES:
-            delay = cfg.REDIS_RETRY_DELAY * attempt
-            logger.warning(f"Retrying Redis connection in {delay}s...")
-            await asyncio.sleep(delay)
-    
-    logger.critical("❌ Redis connection failed after all retries")
-    self.degraded = True
-    self._redis = None
-    
-    # DEGRADED MODE: What gets disabled (clear documentation)
-    logger.warning("""
-    🚨 REDIS DEGRADED MODE ACTIVE:
-    • Alert deduplication: DISABLED (may get duplicates)
-    • State persistence: DISABLED (alerts reset each run)
-    • Health tracking: DISABLED
-    • Lock extension: DISABLED
-    • Trading alerts: STILL ACTIVE (core functionality preserved)
-    """)
-    
-    if cfg.FAIL_ON_REDIS_DOWN:
-        raise RedisConnectionError("Redis unavailable after all retries - FAIL_ON_REDIS_DOWN=true")
+        """
+        IMPROVED: Startup smoke test + clear degraded-mode behaviour
+        """
+        # Fast ping test first
+        if self._redis is not None and not self.degraded:
+            try:
+                if await self._ping_with_retry(1.0):
+                    logger.debug("Redis connection healthy")
+                    return
+            except Exception:
+                logger.debug("Redis ping failed, attempting reconnect")
 
+        # Full reconnection with retries
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
             logger.info(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
-                return
+                # NEW: Smoke test – simple set/get to verify full functionality
+                test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
+                test_val = "ok"
+                if (
+                    await self._safe_redis_op(
+                        self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set"
+                    )
+                    and await self._safe_redis_op(
+                        self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val
+                    )
+                ):
+                    await self._safe_redis_op(
+                        self._redis.delete(test_key), 1.0, "smoke_cleanup"
+                    )
+                    logger.info("✅ Redis fully operational (smoke test passed)")
+                    self.degraded         = False
+                    self.degraded_alerted = False
+                    return
+                else:
+                    logger.warning("Redis smoke test failed, marking degraded")
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
                 delay = cfg.REDIS_RETRY_DELAY * attempt
                 logger.warning(f"Retrying Redis connection in {delay}s...")
                 await asyncio.sleep(delay)
 
-        logger.critical("Redis connection failed after all retries")
+        logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
-        self._redis = None
+        self._redis   = None
+
+        # DEGRADED MODE: what gets disabled (clear documentation)
+        logger.warning("""
+🚨 REDIS DEGRADED MODE ACTIVE:
+• Alert deduplication:  DISABLED (may get duplicates)
+• State persistence:    DISABLED (alerts reset each run)
+• Health tracking:      DISABLED
+• Lock extension:       DISABLED
+• Trading alerts:       STILL ACTIVE (core functionality preserved)
+""")
 
         if cfg.FAIL_ON_REDIS_DOWN:
-            raise RedisConnectionError("Redis unavailable after all retries")
-
-        logger.warning("Degraded mode: Redis unavailable. Features disabled: locks, alert dedup, health.")
+            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
         if self._redis:
@@ -625,12 +617,23 @@ class RedisStateStore:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
+    # ------------------------------------------------------------------
+    # Low-level helpers
+    # ------------------------------------------------------------------
     async def _ping_with_retry(self, timeout: float) -> bool:
-        return (await self._safe_redis_op(
-            self._redis.ping(), timeout, "ping", lambda r: bool(r)
-        )) is True
+        return (
+            await self._safe_redis_op(
+                self._redis.ping(), timeout, "ping", lambda r: bool(r)
+            )
+        ) is True
 
-    async def _safe_redis_op(self, coro, timeout: float, op_name: str, parser: Optional[Callable] = None):
+    async def _safe_redis_op(
+        self,
+        coro,
+        timeout: float,
+        op_name: str,
+        parser: Optional[Callable] = None,
+    ):
         if not self._redis:
             return None
 
@@ -645,11 +648,15 @@ class RedisStateStore:
                 retries=3,
                 base_backoff=0.6,
                 cap=3.0,
-                on_error=lambda e, a: logger.debug(f"Redis {op_name} error (attempt {a}): {e}"),
+                on_error=lambda e, a: logger.debug(
+                    f"Redis {op_name} error (attempt {a}): {e}"
+                ),
             )
 
             if PROMETHEUS_ENABLED and METRIC_REDIS_OP_TIME:
-                METRIC_REDIS_OP_TIME.labels(operation=op_name).observe(time.time() - start_time)
+                METRIC_REDIS_OP_TIME.labels(operation=op_name).observe(
+                    time.time() - start_time
+                )
 
             return parser(result) if parser else result
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
@@ -659,6 +666,9 @@ class RedisStateStore:
             logger.error(f"Failed to {op_name}: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # Single-key operations
+    # ------------------------------------------------------------------
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
             self._redis.get(f"{self.state_prefix}{key}"),
@@ -667,12 +677,22 @@ class RedisStateStore:
             lambda r: json.loads(r) if r else None,
         )
 
-    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
-        ts = int(ts or time.time())
+    async def set(
+        self,
+        key: str,
+        state: Optional[Any],
+        ts: Optional[int] = None,
+        timeout: float = 2.0,
+    ) -> None:
+        ts        = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
-        data = json.dumps({"state": state, "ts": ts})
+        data      = json.dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            self._redis.set(redis_key, data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None),
+            self._redis.set(
+                redis_key,
+                data,
+                ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
+            ),
             timeout,
             f"set {key}",
         )
@@ -685,26 +705,37 @@ class RedisStateStore:
             lambda r: r if r else None,
         )
 
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
+    async def set_metadata(
+        self, key: str, value: str, timeout: float = 2.0
+    ) -> None:
         await self._safe_redis_op(
-            self._redis.set(f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds),
+            self._redis.set(
+                f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds
+            ),
             timeout,
             f"set_metadata {key}",
         )
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        """Check if alert was recently sent. Returns True if should send."""
+    # ------------------------------------------------------------------
+    # Alert deduplication
+    # ------------------------------------------------------------------
+    async def check_recent_alert(
+        self, pair: str, alert_key: str, ts: int
+    ) -> bool:
+        """Return True if alert should be sent (not a duplicate)."""
         if self.degraded:
             return True
 
-        window = ts // 900
+        window     = ts // 900
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
         result = await self._safe_redis_op(
-            self._redis.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
+            self._redis.set(
+                recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
+            ),
             timeout=2.0,
             op_name=f"check_recent_alert {pair}:{alert_key}",
-            parser=lambda r: bool(r)
+            parser=lambda r: bool(r),
         )
 
         if result is False and PROMETHEUS_ENABLED and METRIC_ALERT_DEDUP_HITS:
@@ -712,48 +743,64 @@ class RedisStateStore:
 
         return result is True
 
-    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
-        """Batch check multiple alerts. Returns dict of {(pair, alert_key): should_send}."""
+    async def batch_check_recent_alerts(
+        self, checks: List[Tuple[str, str, int]]
+    ) -> Dict[str, bool]:
+        """
+        Batch-check multiple alerts.
+        Returns dict of {(pair, alert_key): should_send}.
+        """
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
         try:
             pipeline = self._redis.pipeline()
             keys_map = {}
-            
+
             for pair, alert_key, ts in checks:
-                window = ts // 900
+                window     = ts // 900
                 recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
                 keys_map[recent_key] = f"{pair}:{alert_key}"
-                pipeline.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                pipeline.set(
+                    recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
+                )
 
             results = await asyncio.wait_for(pipeline.execute(), timeout=3.0)
-            
+
             output = {}
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
                 should_send = bool(results[idx]) if idx < len(results) else True
                 output[composite_key] = should_send
-                
-                if not should_send and PROMETHEUS_ENABLED and METRIC_ALERT_DEDUP_HITS:
-                    pair = composite_key.split(':')[0]
+
+                if (
+                    not should_send
+                    and PROMETHEUS_ENABLED
+                    and METRIC_ALERT_DEDUP_HITS
+                ):
+                    pair = composite_key.split(":")[0]
                     METRIC_ALERT_DEDUP_HITS.labels(pair=pair).inc()
-            
+
             return output
-            
+
         except Exception as e:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]:
+    # ------------------------------------------------------------------
+    # Bulk state operations
+    # ------------------------------------------------------------------
+    async def mget_states(
+        self, keys: List[str], timeout: float = 2.0
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
         if not self._redis or not keys:
             return {}
 
         redis_keys = [f"{self.state_prefix}{k}" for k in keys]
-        results = await self._safe_redis_op(
+        results    = await self._safe_redis_op(
             self._redis.mget(redis_keys),
             timeout,
             f"mget {len(keys)} keys",
-            lambda r: r if r else []
+            lambda r: r if r else [],
         )
 
         if not results:
@@ -771,19 +818,23 @@ class RedisStateStore:
 
         return output
 
-    async def set_multiple_states(self, updates: List[Tuple[str, Optional[Any], Optional[int]]], timeout: float = 3.0) -> None:
-        """Batch set multiple alert states using Redis pipeline."""
+    async def set_multiple_states(
+        self,
+        updates: List[Tuple[str, Optional[Any], Optional[int]]],
+        timeout: float = 3.0,
+    ) -> None:
+        """Batch-set multiple alert states using Redis pipeline."""
         if not self._redis or not updates:
             return
 
         try:
             pipeline = self._redis.pipeline()
-            ts = int(time.time())
+            ts       = int(time.time())
 
             for key, state, custom_ts in updates:
-                use_ts = custom_ts if custom_ts is not None else ts
+                use_ts    = custom_ts if custom_ts is not None else ts
                 redis_key = f"{self.state_prefix}{key}"
-                data = json.dumps({"state": state, "ts": use_ts})
+                data      = json.dumps({"state": state, "ts": use_ts})
 
                 if self.expiry_seconds > 0:
                     pipeline.set(redis_key, data, ex=self.expiry_seconds)
@@ -794,15 +845,20 @@ class RedisStateStore:
             logger.debug(f"Batch set {len(updates)} states via pipeline")
         except Exception as e:
             logger.error(f"Pipeline set_multiple_states failed: {e}")
+            # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts, timeout=1.0)
 
+    # ------------------------------------------------------------------
+    # Maintenance & monitoring
+    # ------------------------------------------------------------------
     async def _prune_old_records(self, expiry_days: int) -> int:
         if expiry_days <= 0 or self.expiry_seconds > 0:
             logger.debug("Using Redis TTL – manual pruning skipped")
             return 0
+
         last_prune_str = await self.get_metadata("last_prune")
-        today = datetime.now(timezone.utc).date()
+        today          = datetime.now(timezone.utc).date()
         if last_prune_str:
             try:
                 last_prune_date = datetime.fromisoformat(last_prune_str).date()
@@ -818,17 +874,23 @@ class RedisStateStore:
             return None
         try:
             info_raw = await self._safe_redis_op(
-                self._redis.info("all"), timeout=3.0, op_name="info all", parser=lambda r: r,
+                self._redis.info("all"),
+                timeout=3.0,
+                op_name="info all",
+                parser=lambda r: r,
             )
             if not info_raw:
                 return None
+
             mem_used = info_raw.get("memory", {}).get("used_memory")
-            keys = info_raw.get("keyspace", {}).get("db0", {}).get("keys", 0)
+            keys     = info_raw.get("keyspace", {}).get("db0", {}).get("keys", 0)
+
             if PROMETHEUS_ENABLED:
                 if METRIC_REDIS_MEMORY_USED and mem_used is not None:
                     METRIC_REDIS_MEMORY_USED.set(float(mem_used))
                 if METRIC_REDIS_KEYS:
                     METRIC_REDIS_KEYS.set(float(keys))
+
             return {"used_memory": mem_used, "db0_keys": keys}
         except Exception:
             return None
