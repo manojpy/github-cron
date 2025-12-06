@@ -5,6 +5,7 @@ FROM python:3.11-slim-bookworm AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
+# COMBINED: Combine update and install to reduce image layers
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -45,15 +46,19 @@ ENV PATH="/opt/venv/bin:$PATH" \
     LOG_JSON=false \
     FILE_LOGGING=false
 
+# OPTIMIZED: Combined user creation and permission setting
 RUN useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app && \
     chmod +x wrapper.py
 
+# COMPILE: Keeps startup slightly faster
 RUN python -m compileall /app/src
 
 USER botuser
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD python -c "import sys; sys.exit(0)"
+# REMOVED: HEALTHCHECK
+# Reason: This is a batch job that runs once and exits. 
+# A healthcheck adds polling overhead and is intended for long-running services (daemons).
+# The wrapper.py logic already handles exit codes for success/failure.
 
 CMD ["python", "-u", "wrapper.py"]
