@@ -20,6 +20,7 @@ pydantic==2.10.3
 
 # System and process utilities
 psutil==6.1.0
+orjson==3.9.15
 
 # Timezone database
 tzdata==2024.2

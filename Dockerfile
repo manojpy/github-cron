@@ -3,21 +3,22 @@
 # ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
-
-# COMBINED: Combine update and install to reduce image layers
+# Install build dependencies for orjson/uvloop
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
 ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt .
-RUN uv pip install --no-cache -r requirements.txt
+# Compile bytecode during install for faster startup
+RUN uv pip install --no-cache --compile -r requirements.txt
 
 # ============================================================================
 # Stage 2: Runtime - Minimal & Optimized
@@ -35,30 +36,22 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
+# Copy source code
 COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
 
+# Environment Setup
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app/src" \
     CONFIG_FILE=config_macd.json \
-    TZ=Asia/Kolkata \
-    LOG_JSON=false \
-    FILE_LOGGING=false
+    TZ=Asia/Kolkata
 
-# OPTIMIZED: Combined user creation and permission setting
+# Security: Run as non-root
 RUN useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app && \
     chmod +x wrapper.py
 
-# COMPILE: Keeps startup slightly faster
-RUN python -m compileall /app/src
-
 USER botuser
 
-# REMOVED: HEALTHCHECK
-# Reason: This is a batch job that runs once and exits. 
-# A healthcheck adds polling overhead and is intended for long-running services (daemons).
-# The wrapper.py logic already handles exit codes for success/failure.
-
-CMD ["python", "-u", "wrapper.py"]
+CMD ["python", "-u", "wrapper.py"] 
