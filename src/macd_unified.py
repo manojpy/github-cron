@@ -1565,87 +1565,106 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     vwap = df2["cum_hlc3_vol"] / df2["cum_vol"].replace(0, np.nan)
     return validate_indicator_series(vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0), "VWAP")
 
-def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool
+def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
+    """
+    CRITICAL FIX: Correct wick calculation for 15-minute candles.
+
+    For GREEN candles (BUY):
+        - Upper wick = High - Close
+        - Must be < 20 % of (High - Low)
+
+    For RED candles (SELL):
+        - Lower wick = Close - Low
+        - Must be < 20 % of (High - Low)
+
+    Args:
+        df_15m: DataFrame with OHLC data
+        idx: Index of the candle to check
+        is_buy: True for buy (green candle), False for sell (red candle)
+
+    Returns:
+        True if candle passes quality check, False otherwise
+    """
     try:
         row = df_15m.iloc[idx]
         o = float(row["open"])
         h = float(row["high"])
         l = float(row["low"])
         c = float(row["close"])
-        
-        # Calculate total candle range (High - Low)
-        candle_range = h - l
-        
-        # Guard against zero or near-zero ranges
-        if candle_range < 1e-8:
-            logger.debug(f"Candle range too small: {candle_range:.8f}")
-            return False
-        
-        if is_buy:
-            # BUY ALERT: Must be GREEN candle (Close > Open)
-            if c <= o:
-                logger.debug(f"BUY rejected: Not green candle | O={o:.4f} C={c:.4f}")
-                return False
-            
-            # Calculate upper wick: High - Close
-            upper_wick = h - c
-            
-            # Calculate wick ratio
-            wick_ratio = upper_wick / candle_range
-            
-            # Check if wick is less than 20% of total range
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                logger.debug(
-                    f"BUY REJECTED: Upper wick too large | "
-                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                    f"Candle Range (H-L)={candle_range:.4f} | "
-                    f"Upper Wick (H-C)={upper_wick:.4f} | "
-                    f"Wick Ratio={wick_ratio*100:.2f}% | "
-                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
-                )
-                return False
-            
-            # Passed all checks
-            logger.debug(
-                f"BUY PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                f"Upper Wick={upper_wick:.4f} ({wick_ratio*100:.2f}%)"
-            )
-            return True
-            
-        else:
-            # SELL ALERT: Must be RED candle (Close < Open)
-            if c >= o:
-                logger.debug(f"SELL rejected: Not red candle | O={o:.4f} C={c:.4f}")
-                return False
-            
-            # Calculate lower wick: Close - Low
-            lower_wick = c - l
-            
-            # Calculate wick ratio
-            wick_ratio = lower_wick / candle_range
-            
-            # Check if wick is less than 20% of total range
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                logger.debug(
-                    f"SELL REJECTED: Lower wick too large | "
-                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                    f"Candle Range (H-L)={candle_range:.4f} | "
-                    f"Lower Wick (C-L)={lower_wick:.4f} | "
-                    f"Wick Ratio={wick_ratio*100:.2f}% | "
-                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
-                )
-                return False
-            
-            # Passed all checks
-            logger.debug(
-                f"SELL PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                f"Lower Wick={lower_wick:.4f} ({wick_ratio*100:.2f}%)"
-            )
-            return True
-            
-    except Exception as e:
-        logger.error(f"check_common_conditions failed at idx={idx}, is_buy={is_buy}: {e}")
-        return False
+
+        # Calculate total candle range (High - Low)
+        candle_range = h - l
+
+        # Guard against zero or near-zero ranges
+        if candle_range < 1e-8:
+            logger.debug(f"Candle range too small: {candle_range:.8f}")
+            return False
+
+        if is_buy:
+            # BUY ALERT: Must be GREEN candle (Close > Open)
+            if c <= o:
+                logger.debug(f"BUY rejected: Not green candle | O={o:.4f} C={c:.4f}")
+                return False
+
+            # Calculate upper wick: High - Close
+            upper_wick = h - c
+
+            # Calculate wick ratio
+            wick_ratio = upper_wick / candle_range
+
+            # Check if wick is less than 20 % of total range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger.debug(
+                    f"BUY REJECTED: Upper wick too large | "
+                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                    f"Candle Range (H-L)={candle_range:.4f} | "
+                    f"Upper Wick (H-C)={upper_wick:.4f} | "
+                    f"Wick Ratio={wick_ratio*100:.2f}% | "
+                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
+                )
+                return False
+
+            # Passed all checks
+            logger.debug(
+                f"BUY PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                f"Upper Wick={upper_wick:.4f} ({wick_ratio*100:.2f}%)"
+            )
+            return True
+
+        else:
+            # SELL ALERT: Must be RED candle (Close < Open)
+            if c >= o:
+                logger.debug(f"SELL rejected: Not red candle | O={o:.4f} C={c:.4f}")
+                return False
+
+            # Calculate lower wick: Close - Low
+            lower_wick = c - l
+
+            # Calculate wick ratio
+            wick_ratio = lower_wick / candle_range
+
+            # Check if wick is less than 20 % of total range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger.debug(
+                    f"SELL REJECTED: Lower wick too large | "
+                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                    f"Candle Range (H-L)={candle_range:.4f} | "
+                    f"Lower Wick (C-L)={lower_wick:.4f} | "
+                    f"Wick Ratio={wick_ratio*100:.2f}% | "
+                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
+                )
+                return False
+
+            # Passed all checks
+            logger.debug(
+                f"SELL PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                f"Lower Wick={lower_wick:.4f} ({wick_ratio*100:.2f}%)"
+            )
+            return True
+
+    except Exception as e:
+        logger.error(f"check_common_conditions failed at idx={idx}, is_buy={is_buy}: {e}")
+        return False
 
 def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> Tuple[bool, str]:
     """
