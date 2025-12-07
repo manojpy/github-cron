@@ -1,13 +1,11 @@
 from __future__ import annotations
 import os
 import sys
-import json
 import time
 import asyncio
 import random
 import logging
 import logging.handlers
-import gc
 import ssl
 import signal
 import hashlib
@@ -32,6 +30,27 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 
+# ============================================================================
+# PERFORMANCE ENHANCEMENT: Use orjson for faster JSON operations
+# ============================================================================
+try:
+    import orjson
+    
+    def json_dumps(obj: Any) -> str:
+        """Fast JSON serialization using orjson"""
+        return orjson.dumps(obj).decode('utf-8')
+    
+    def json_loads(s: str | bytes) -> Any:
+        """Fast JSON deserialization using orjson"""
+        return orjson.loads(s)
+    
+    JSON_BACKEND = "orjson"
+except ImportError:
+    import json
+    json_dumps = json.dumps
+    json_loads = json.loads
+    JSON_BACKEND = "stdlib"
+
 PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "false").lower() in ("1", "true", "yes")
 try:
     if PROMETHEUS_ENABLED:
@@ -42,7 +61,7 @@ except Exception:
     PROMETHEUS_ENABLED = False
     Counter = Gauge = Histogram = None
 
-__version__ = "1.0.8-production-stable"
+__version__ = "1.1.0-performance-optimized"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -200,7 +219,7 @@ def load_config() -> BotConfig:
     if Path(config_file).exists():
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+                data = json_loads(f.read())
         except Exception as exc:
             print(f"❌ ERROR: Config file {config_file} is not valid JSON", file=sys.stderr)
             print(f"❌ Details: {exc}", file=sys.stderr)
@@ -222,7 +241,7 @@ def load_config() -> BotConfig:
         print(f"❌ ERROR: Pydantic validation failed", file=sys.stderr)
         print(f"❌ Details: {exc}", file=sys.stderr)
         sys.exit(1)
-        
+
 cfg = load_config()
 
 class SecretFilter(logging.Filter):
@@ -272,7 +291,7 @@ class JsonFormatter(SafeFormatter):
             base["pair_id"] = record.pair_id
         if record.exc_info:
             base["exc"] = self.formatException(record.exc_info)
-        return json.dumps(base, ensure_ascii=False)
+        return json_dumps(base)
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("macd_bot")
@@ -307,6 +326,7 @@ def setup_logging() -> logging.Logger:
     return logger
 
 logger = setup_logging()
+logger.info(f"🚀 Using JSON backend: {JSON_BACKEND}")
 logger.info(f"Using DELTA_API_BASE: {cfg.DELTA_API_BASE}")
 
 shutdown_event = asyncio.Event()
@@ -399,7 +419,7 @@ def print_startup_banner_once() -> None:
         return
     _STARTUP_BANNER_PRINTED = True
     logger.info(
-        f"UNIFIED TRADING BOT - PRODUCTION\n"
+        f"UNIFIED TRADING BOT - PERFORMANCE OPTIMIZED\n"
         f"Version: {__version__} | Time: {format_ist_time(datetime.now(timezone.utc), '%d-%m-%Y @%H:%M IST')}\n"
         f"Pairs: {len(cfg.PAIRS)} | Debug: {cfg.DEBUG_MODE} | Lock Expiry: {Constants.REDIS_LOCK_EXPIRY}s | Run Timeout: {cfg.RUN_TIMEOUT_SECONDS}s"
     )
@@ -691,7 +711,7 @@ class RedisStateStore:
             self._redis.get(f"{self.state_prefix}{key}"),
             timeout,
             f"get {key}",
-            lambda r: json.loads(r) if r else None,
+            lambda r: json_loads(r) if r else None,
         )
 
     async def set(
@@ -703,7 +723,7 @@ class RedisStateStore:
     ) -> None:
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
-        data = json.dumps({"state": state, "ts": ts})
+        data = json_dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
             self._redis.set(
                 redis_key,
@@ -816,7 +836,7 @@ class RedisStateStore:
         for idx, key in enumerate(keys):
             if idx < len(results) and results[idx]:
                 try:
-                    output[key] = json.loads(results[idx])
+                    output[key] = json_loads(results[idx])
                 except Exception:
                     output[key] = None
             else:
@@ -839,7 +859,7 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 use_ts = custom_ts if custom_ts is not None else ts
                 redis_key = f"{self.state_prefix}{key}"
-                data = json.dumps({"state": state, "ts": use_ts})
+                data = json_dumps({"state": state, "ts": use_ts})
 
                 if self.expiry_seconds > 0:
                     pipeline.set(redis_key, data, ex=self.expiry_seconds)
@@ -905,7 +925,7 @@ class RedisStateStore:
             self._redis.get(key),
             timeout=2.0,
             op_name=f"get_cb_state {breaker_name}",
-            parser=lambda r: json.loads(r) if r else None,
+            parser=lambda r: json_loads(r) if r else None,
         )
         return result
 
@@ -922,7 +942,7 @@ class RedisStateStore:
             "updated_at": time.time()
         }
         await self._safe_redis_op(
-            self._redis.set(key, json.dumps(data), ex=3600),
+            self._redis.set(key, json_dumps(data), ex=3600),
             timeout=2.0,
             op_name=f"set_cb_state {breaker_name}",
         )
@@ -1156,7 +1176,7 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                 if resp.status >= 400:
                     logger.error(f"Client error {resp.status} for {url}")
                     return None
-                data = await resp.json()
+                data = await resp.json(loads=json_loads)
                 if circuit_breaker:
                     await circuit_breaker.record_success()
                 return data
@@ -1541,27 +1561,20 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
         l = float(row["low"])
         c = float(row["close"])
 
-        # Calculate total candle range (High - Low)
         candle_range = h - l
 
-        # Guard against zero or near-zero ranges
         if candle_range < 1e-8:
             logger.debug(f"Candle range too small: {candle_range:.8f}")
             return False
 
         if is_buy:
-            # BUY ALERT: Must be GREEN candle (Close > Open)
             if c <= o:
                 logger.debug(f"BUY rejected: Not green candle | O={o:.4f} C={c:.4f}")
                 return False
 
-            # Calculate upper wick: High - Close
             upper_wick = h - c
-
-            # Calculate wick ratio
             wick_ratio = upper_wick / candle_range
 
-            # Check if wick is less than 20 % of total range
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 logger.debug(
                     f"BUY REJECTED: Upper wick too large | "
@@ -1573,7 +1586,6 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
                 )
                 return False
 
-            # Passed all checks
             logger.debug(
                 f"BUY PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
                 f"Upper Wick={upper_wick:.4f} ({wick_ratio*100:.2f}%)"
@@ -1581,18 +1593,13 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
             return True
 
         else:
-            # SELL ALERT: Must be RED candle (Close < Open)
             if c >= o:
                 logger.debug(f"SELL rejected: Not red candle | O={o:.4f} C={c:.4f}")
                 return False
 
-            # Calculate lower wick: Close - Low
             lower_wick = c - l
-
-            # Calculate wick ratio
             wick_ratio = lower_wick / candle_range
 
-            # Check if wick is less than 20 % of total range
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 logger.debug(
                     f"SELL REJECTED: Lower wick too large | "
@@ -1604,7 +1611,6 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
                 )
                 return False
 
-            # Passed all checks
             logger.debug(
                 f"SELL PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
                 f"Lower Wick={lower_wick:.4f} ({wick_ratio*100:.2f}%)"
@@ -1617,7 +1623,6 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
 
 def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> Tuple[bool, str]:
     try:
-        # Check if we have valid index
         if idx < 0 or idx >= len(df_15m):
             return False, f"Invalid index {idx}"
 
@@ -1632,11 +1637,9 @@ def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: boo
             return False, "Candle range too small"
 
         if is_buy:
-            # Must be green candle
             if c <= o:
                 return False, f"Not green candle (C={c:.4f} <= O={o:.4f})"
 
-            # Check upper wick
             upper_wick = h - c
             wick_ratio = upper_wick / candle_range
 
@@ -1646,11 +1649,9 @@ def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: boo
             return True, "Passed"
 
         else:
-            # Must be red candle
             if c >= o:
                 return False, f"Not red candle (C={c:.4f} >= O={o:.4f})"
 
-            # Check lower wick
             lower_wick = c - l
             wick_ratio = lower_wick / candle_range
 
@@ -1661,7 +1662,6 @@ def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: boo
 
     except Exception as e:
         return False, f"Error: {str(e)}"
-
 
 def escape_markdown_v2(text: str) -> str:
     try:
@@ -1873,14 +1873,14 @@ class HealthTracker:
         payload = {"last_checked": now, "last_success": now if success else None, "success": bool(success)}
         if info:
             payload.update({"info": info})
-        await self.sdb.set_metadata(key, json.dumps(payload))
+        await self.sdb.set_metadata(key, json_dumps(payload))
 
     async def record_overall(self, summary: Dict[str, Any]) -> None:
         if self.sdb.degraded:
             return
         key = "health:overall"
         payload = {"ts": int(time.time()), "summary": summary}
-        await self.sdb.set_metadata(key, json.dumps(payload))
+        await self.sdb.set_metadata(key, json_dumps(payload))
 
 class DeadMansSwitch:
     def __init__(self, sdb: RedisStateStore, cooldown_seconds: int):
@@ -2184,7 +2184,6 @@ async def evaluate_pair_and_alert(
         if base_sell_common:
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
-        # CRITICAL FIX: Use enhanced candle-quality check with reason tracking
         buy_candle_passed,  buy_candle_reason  = check_candle_quality_with_reason(
             df_15m, i15, is_buy=True
         )
@@ -2192,7 +2191,6 @@ async def evaluate_pair_and_alert(
             df_15m, i15, is_buy=False
         )
 
-        # Log candle-quality results for debugging
         if base_buy_common and not buy_candle_passed:
             logger_pair.info(
                 f"⚠️ BUY alert blocked by candle quality | "
@@ -2207,7 +2205,6 @@ async def evaluate_pair_and_alert(
                 f"Reason: {sell_candle_reason}"
             )
 
-        # Final buy/sell common flags
         buy_common  = base_buy_common  and buy_candle_passed
         sell_common = base_sell_common and sell_candle_passed
 
@@ -2251,13 +2248,11 @@ async def evaluate_pair_and_alert(
             "mmh_reversal_sell": mmh_reversal_sell,
             "pivots": piv,
             "vwap": not pd.Series(dtype=float).equals(vwap),
-            # UPDATED: Store both failure flag AND reason
             "candle_quality_failed_buy": base_buy_common and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_common and not sell_candle_passed,
             "candle_rejection_reason_buy": buy_candle_reason if (base_buy_common and not buy_candle_passed) else None,
             "candle_rejection_reason_sell": sell_candle_reason if (base_sell_common and not sell_candle_passed) else None,
         }
-
 
         ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
         ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
@@ -2384,11 +2379,9 @@ async def evaluate_pair_and_alert(
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         reasons = []
 
-        # Check trend filter
         if not context["buy_common"] and not context["sell_common"]:
             reasons.append("Trend filter blocked")
 
-        # Check candle quality with detailed reasons
         if context.get("candle_quality_failed_buy"):
             buy_reason = context.get("candle_rejection_reason_buy", "Unknown")
             reasons.append(f"BUY candle quality: {buy_reason}")
@@ -2410,7 +2403,6 @@ async def evaluate_pair_and_alert(
                 "sell_reason": context.get("candle_rejection_reason_sell"),
             }
         }
-
 
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
@@ -2473,58 +2465,176 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
 
-async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], batch_pairs: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, memory_monitor: MemoryMonitor, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
-    tasks = []
-    per_pair_timeout = max(30, int(cfg.RUN_TIMEOUT_SECONDS / max(1, len(cfg.PAIRS))))
-    
-    for pair_name in batch_pairs:
-        if shutdown_event.is_set():
-            break
-        if pair_name not in products_map:
-            continue
-        
-        async def check_with_timeout(pair):
-            try:
-                return await asyncio.wait_for(
-                    check_pair(pair, fetcher, products_map, state_db, telegram_queue, correlation_id, reference_time),
-                    timeout=per_pair_timeout
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout processing {pair} after {per_pair_timeout}s")
-                return None
+# ============================================================================
+# PERFORMANCE ENHANCEMENT: Producer-Consumer Worker Queue Architecture
+# ============================================================================
+# This replaces the old batch processing approach with a worker pool pattern.
+# Workers process pairs as soon as they become available, maximizing CPU/Network
+# utilization and significantly reducing total runtime.
+# ============================================================================
 
-        tasks.append(check_with_timeout(pair_name))
+async def worker_process_pair(
+    worker_id: int,
+    pair_queue: asyncio.Queue,
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    state_db: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str,
+    reference_time: int,
+    memory_monitor: MemoryMonitor,
+    lock: RedisLock,
+    results: List[Tuple[str, Dict[str, Any]]],
+    results_lock: asyncio.Lock
+) -> None:
+    """
+    Worker coroutine that processes pairs from the queue.
+    Each worker runs independently and picks up work as it becomes available.
+    """
+    logger_worker = logging.getLogger(f"macd_bot.worker_{worker_id}")
     
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    valid_results = []
-    
-    for idx, r in enumerate(results):
-        pair_name = batch_pairs[idx] if idx < len(batch_pairs) else "unknown"
-        if isinstance(r, Exception):
-            logger.error(f"Pair {pair_name} failed: {r}")
-            if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
-                METRIC_FAILED_PAIRS.inc()
-        elif r is not None:
-            valid_results.append(r)
-            pair, state = r
-            summary = state.get("summary", {})
-            logger.info(f"PAIR_END_SUMMARY | pair={pair} | cloud={summary.get('cloud','n/a')} | mmh_hist={summary.get('mmh_hist','n/a')} | suppression={summary.get('suppression','n/a')}")
-        
-        if memory_monitor.should_check():
-            used_bytes, mem_percent = memory_monitor.check_memory()
-            if PROMETHEUS_ENABLED and METRIC_MEMORY_USAGE:
-                METRIC_MEMORY_USAGE.set(float(used_bytes) / 1048576.0)
-            if memory_monitor.is_critical():
-                logger.critical(f"🚨 Memory critical: {mem_percent:.1f}%")
-                await telegram_queue.send(escape_markdown_v2(f"🚨 Memory limit reached ({mem_percent:.1f}%)"))
+    while True:
+        try:
+            # Get next pair from queue (non-blocking with timeout)
+            try:
+                pair_name = await asyncio.wait_for(pair_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                # Queue is empty, check if we should exit
+                if pair_queue.empty():
+                    break
+                continue
+            
+            if pair_name is None:  # Poison pill to signal worker shutdown
+                pair_queue.task_done()
                 break
-        
-        if lock.should_extend():
-            if not await lock.extend(timeout=3.0):
-                logger.error("Failed to extend Redis lock; stopping batch processing")
+            
+            # Check for shutdown
+            if shutdown_event.is_set():
+                pair_queue.task_done()
                 break
+            
+            logger_worker.debug(f"Worker {worker_id} processing {pair_name}")
+            
+            # Process the pair
+            try:
+                result = await check_pair(
+                    pair_name, fetcher, products_map, state_db,
+                    telegram_queue, correlation_id, reference_time
+                )
+                
+                if result:
+                    async with results_lock:
+                        results.append(result)
+                    
+                    pair, state = result
+                    summary = state.get("summary", {})
+                    logger_worker.info(
+                        f"Worker {worker_id} completed {pair} | "
+                        f"cloud={summary.get('cloud','n/a')} | "
+                        f"mmh_hist={summary.get('mmh_hist','n/a')}"
+                    )
+                else:
+                    logger_worker.warning(f"Worker {worker_id}: {pair_name} returned None")
+                    if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
+                        METRIC_FAILED_PAIRS.inc()
+                
+            except Exception as e:
+                logger_worker.error(f"Worker {worker_id} error processing {pair_name}: {e}")
+                if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
+                    METRIC_FAILED_PAIRS.inc()
+            
+            # Memory check
+            if memory_monitor.should_check():
+                used_bytes, mem_percent = memory_monitor.check_memory()
+                if PROMETHEUS_ENABLED and METRIC_MEMORY_USAGE:
+                    METRIC_MEMORY_USAGE.set(float(used_bytes) / 1048576.0)
+                
+                if memory_monitor.is_critical():
+                    logger_worker.critical(f"🚨 Worker {worker_id}: Memory critical ({mem_percent:.1f}%)")
+                    pair_queue.task_done()
+                    break
+            
+            # Lock extension check
+            if lock.should_extend():
+                if not await lock.extend(timeout=3.0):
+                    logger_worker.error(f"Worker {worker_id}: Failed to extend Redis lock")
+                    pair_queue.task_done()
+                    break
+            
+            pair_queue.task_done()
+            
+        except asyncio.CancelledError:
+            logger_worker.debug(f"Worker {worker_id} cancelled")
+            break
+        except Exception as e:
+            logger_worker.error(f"Worker {worker_id} unexpected error: {e}")
+            break
     
-    return valid_results
+    logger_worker.debug(f"Worker {worker_id} exiting")
+
+
+async def process_pairs_with_workers(
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    pairs_to_process: List[str],
+    state_db: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str,
+    memory_monitor: MemoryMonitor,
+    lock: RedisLock,
+    reference_time: int
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Process all pairs using a worker pool architecture.
+    
+    This is the key performance optimization:
+    - Creates a queue of pairs to process
+    - Spawns multiple workers that process pairs concurrently
+    - Workers pick up new pairs as soon as they finish the current one
+    - Much more efficient than batch processing with wait times
+    """
+    logger_main = logging.getLogger("macd_bot.worker_pool")
+    
+    # Create queue and add all pairs
+    pair_queue: asyncio.Queue = asyncio.Queue()
+    for pair in pairs_to_process:
+        await pair_queue.put(pair)
+    
+    # Results storage
+    results: List[Tuple[str, Dict[str, Any]]] = []
+    results_lock = asyncio.Lock()
+    
+    # Determine number of workers (use MAX_PARALLEL_FETCH as worker count)
+    num_workers = cfg.MAX_PARALLEL_FETCH
+    logger_main.info(f"🚀 Starting worker pool with {num_workers} workers for {len(pairs_to_process)} pairs")
+    
+    # Create worker tasks
+    workers = []
+    for worker_id in range(num_workers):
+        worker = asyncio.create_task(
+            worker_process_pair(
+                worker_id, pair_queue, fetcher, products_map,
+                state_db, telegram_queue, correlation_id,
+                reference_time, memory_monitor, lock,
+                results, results_lock
+            )
+        )
+        workers.append(worker)
+    
+    # Wait for all pairs to be processed
+    await pair_queue.join()
+    
+    # Send poison pills to workers to signal shutdown
+    for _ in range(num_workers):
+        await pair_queue.put(None)
+    
+    # Wait for all workers to complete
+    await asyncio.gather(*workers, return_exceptions=True)
+    
+    logger_main.info(f"✅ Worker pool completed: {len(results)} successful results")
+    
+    return results
+
 
 async def run_once() -> bool:
     correlation_id = uuid.uuid4().hex[:8]
@@ -2612,46 +2722,25 @@ async def run_once() -> bool:
                     missing = set(cfg.PAIRS) - set(pairs_to_process)
                     logger_run.warning(f"Missing products for pairs: {missing}")
                 
-                batch_size = max(1, cfg.BATCH_SIZE)
-                logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs in batches of {batch_size}")
+                logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
 
-                all_results: List[Tuple[str, Dict[str, Any]]] = []
                 heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
                 
-                for i in range(0, len(pairs_to_process), batch_size):
-                    if shutdown_event.is_set():
-                        logger_run.info("Shutdown event received during batch processing")
-                        break
-                    
-                    if time.time() - start_time > cfg.RUN_TIMEOUT_SECONDS:
-                        logger_run.warning("Run timeout reached during batch processing")
-                        break
-
-                    batch_pairs = pairs_to_process[i: i + batch_size]
-                    logger_run.debug(f"Processing batch {i // batch_size + 1}: {batch_pairs}")
-                    
-                    batch_results = await process_batch(fetcher, products_map, batch_pairs, sdb, telegram_queue, correlation_id, memory_monitor, lock, reference_time)
-                    
-                    for pair_result in batch_results or []:
-                        pair_name, state = pair_result
-                        processed_pairs.add(pair_name)
-                        if state and state.get("state") == "ALERT_SENT":
-                            alerts_sent += state["summary"].get("alerts", 0)
-                    
-                    all_results.extend(batch_results)
-
-                    del batch_results
-
-                    if memory_monitor.is_critical():
-                        logger_run.warning("Memory critical, stopping batch processing early")
-                        break
-
-                    if lock.lost:
-                        logger_run.error("Lost Redis lock during processing; stopping")
-                        break
-
-                    if i + batch_size < len(pairs_to_process):
-                        await asyncio.sleep(1)
+                # ============================================================================
+                # NEW: Use worker pool instead of batch processing
+                # ============================================================================
+                all_results = await process_pairs_with_workers(
+                    fetcher, products_map, pairs_to_process,
+                    sdb, telegram_queue, correlation_id,
+                    memory_monitor, lock, reference_time
+                )
+                
+                # Process results
+                for pair_result in all_results:
+                    pair_name, state = pair_result
+                    processed_pairs.add(pair_name)
+                    if state and state.get("state") == "ALERT_SENT":
+                        alerts_sent += state["summary"].get("alerts", 0)
 
                 heartbeat_task.cancel()
                 try:
@@ -2728,22 +2817,24 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info("✅ uvloop enabled")
+    logger.info("✅ uvloop enabled for high-performance async I/O")
 except ImportError:
-    logger.info("ℹ️ uvloop not available, using default event loop")
+    logger.info("ℹ️ uvloop not available, using default asyncio event loop")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
-    parser.add_argument("--once", action="store_true", help="Run one pass and exit")
+    parser.add_argument("--once", action="store_true", help="Run one pass and exit (overrides config)")
     parser.add_argument("--debug", action="store_true", help="Set logger to DEBUG")
     args = parser.parse_args()
 
+    # Apply CLI overrides
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
+    # Determine execution mode
     SHOULD_LOOP = cfg.ENABLE_AUTO_RESTART
     if args.once:
         SHOULD_LOOP = False
@@ -2780,6 +2871,7 @@ if __name__ == "__main__":
                 logger.warning(f"Sleeping {cooldown}s before next restart...")
                 time.sleep(cooldown)
     else:
+        # One-shot mode (Default for Cron usage)
         try:
             success = asyncio.run(run_once())
             if success:
@@ -2793,5 +2885,4 @@ if __name__ == "__main__":
             sys.exit(130)
         except Exception as exc:
             logger.critical(f"Fatal error: {exc}", exc_info=True)
-            sys.exit(1) 
-
+            sys.exit(1)
