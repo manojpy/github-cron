@@ -1567,7 +1567,7 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
 
 def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool
     try:
-        row = df_15m.iloc[idx]
+        row = df_15m.iloc[idx]
         o = float(row["open"])
         h = float(row["high"])
         l = float(row["low"])
