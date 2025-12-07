@@ -2304,31 +2304,32 @@ async def evaluate_pair_and_alert(
             )
 
         context = {
-            "buy_common": buy_common,
-            "sell_common": sell_common,
-            "close_curr": close_curr,
-            "close_prev": close_prev,
-            "ts_curr": ts_curr,
-            "ppo_curr": ppo_curr,
-            "ppo_prev": ppo_prev,
-            "ppo_sig_curr": ppo_sig_curr,
-            "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr": rsi_curr,
-            "rsi_prev": rsi_prev,
-            "vwap_curr": vwap_curr,
-            "vwap_prev": vwap_prev,
-            "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1,
-            "mmh_reversal_buy": mmh_reversal_buy,
-            "mmh_reversal_sell": mmh_reversal_sell,
-            "pivots": piv,
-            "vwap": not pd.Series(dtype=float).equals(vwap),
-            # UPDATED: Store both failure flag AND reason
-            "candle_quality_failed_buy": base_buy_common and not buy_candle_passed,
-            "candle_quality_failed_sell": base_sell_common and not sell_candle_passed,
-            "candle_rejection_reason_buy": buy_candle_reason if (base_buy_common and not buy_candle_passed) else None,
-            "candle_rejection_reason_sell": sell_candle_reason if (base_sell_common and not sell_candle_passed) else None,
-        }
+            "buy_common": buy_common,
+            "sell_common": sell_common,
+            "close_curr": close_curr,
+            "close_prev": close_prev,
+            "ts_curr": ts_curr,
+            "ppo_curr": ppo_curr,
+            "ppo_prev": ppo_prev,
+            "ppo_sig_curr": ppo_sig_curr,
+            "ppo_sig_prev": ppo_sig_prev,
+            "rsi_curr": rsi_curr,
+            "rsi_prev": rsi_prev,
+            "vwap_curr": vwap_curr,
+            "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr,
+            "mmh_m1": mmh_m1,
+            "mmh_reversal_buy": mmh_reversal_buy,
+            "mmh_reversal_sell": mmh_reversal_sell,
+            "pivots": piv,
+            "vwap": not pd.Series(dtype=float).equals(vwap),
+            # UPDATED: Store both failure flag AND reason
+            "candle_quality_failed_buy": base_buy_common and not buy_candle_passed,
+            "candle_quality_failed_sell": base_sell_common and not sell_candle_passed,
+            "candle_rejection_reason_buy": buy_candle_reason if (base_buy_common and not buy_candle_passed) else None,
+            "candle_rejection_reason_sell": sell_candle_reason if (base_sell_common and not sell_candle_passed) else None,
+        }
+
 
         ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
         ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
