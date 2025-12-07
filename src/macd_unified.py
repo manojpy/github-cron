@@ -2449,39 +2449,40 @@ async def evaluate_pair_and_alert(
                 "summary": {"alerts": len(alerts_to_send)}
             }
             logger_pair.info(f"✅ Sent {len(alerts_to_send)} alerts for {pair_name}: "
-                           f"{[ak for _, _, ak in alerts_to_send]}")
+                   f"{[ak for _, _, ak in alerts_to_send]}")
         else:
             new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
 
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
-        reasons = []
-        
-        # Check trend filter
-        if not context["buy_common"] and not context["sell_common"]:
-            reasons.append("Trend filter blocked")
-        
-        # Check candle quality with detailed reasons
-        if context.get("candle_quality_failed_buy"):
-            buy_reason = context.get("candle_rejection_reason_buy", "Unknown")
-            reasons.append(f"BUY candle quality: {buy_reason}")
-        
-        if context.get("candle_quality_failed_sell"):
-            sell_reason = context.get("candle_rejection_reason_sell", "Unknown")
-            reasons.append(f"SELL candle quality: {sell_reason}")
-        
-        suppression_reason = "; ".join(reasons) if reasons else "No conditions met" 
+        reasons = []
 
-        new_state["summary"] = {
-            "cloud": cloud,
-            "mmh_hist": round(mmh_curr, 4),
-            "suppression": suppression_reason,
-            "candle_quality": {
-                "buy_passed": not context.get("candle_quality_failed_buy", False),
-                "sell_passed": not context.get("candle_quality_failed_sell", False),
-                "buy_reason": context.get("candle_rejection_reason_buy"),
-                "sell_reason": context.get("candle_rejection_reason_sell"),
-            }
-        }
+        # Check trend filter
+        if not context["buy_common"] and not context["sell_common"]:
+            reasons.append("Trend filter blocked")
+
+        # Check candle quality with detailed reasons
+        if context.get("candle_quality_failed_buy"):
+            buy_reason = context.get("candle_rejection_reason_buy", "Unknown")
+            reasons.append(f"BUY candle quality: {buy_reason}")
+
+        if context.get("candle_quality_failed_sell"):
+            sell_reason = context.get("candle_rejection_reason_sell", "Unknown")
+            reasons.append(f"SELL candle quality: {sell_reason}")
+
+        suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
+
+        new_state["summary"] = {
+            "cloud": cloud,
+            "mmh_hist": round(mmh_curr, 4),
+            "suppression": suppression_reason,
+            "candle_quality": {
+                "buy_passed": not context.get("candle_quality_failed_buy", False),
+                "sell_passed": not context.get("candle_quality_failed_sell", False),
+                "buy_reason": context.get("candle_rejection_reason_buy"),
+                "sell_reason": context.get("candle_rejection_reason_sell"),
+            }
+        }
+
 
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
