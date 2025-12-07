@@ -1565,26 +1565,7 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     vwap = df2["cum_hlc3_vol"] / df2["cum_vol"].replace(0, np.nan)
     return validate_indicator_series(vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0), "VWAP")
 
-def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
-    """
-    CRITICAL FIX: Correct wick calculation for 15-minute candles.
-    
-    For GREEN candles (BUY):
-        - Upper wick = High - Close
-        - Must be < 20% of (High - Low)
-    
-    For RED candles (SELL):
-        - Lower wick = Close - Low
-        - Must be < 20% of (High - Low)
-    
-    Args:
-        df_15m: DataFrame with OHLC data
-        idx: Index of the candle to check
-        is_buy: True for buy (green candle), False for sell (red candle)
-    
-    Returns:
-        True if candle passes quality check, False otherwise
-    """
+def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool
     try:
         row = df_15m.iloc[idx]
         o = float(row["open"])
