@@ -1667,66 +1667,67 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
         return False
 
 def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> Tuple[bool, str]:
-    """
-    Wrapper around check_common_conditions that returns both result AND reason.
-    
-    This helps with debugging by capturing WHY a candle failed quality checks.
-    
-    Args:
-        df_15m: DataFrame with OHLC data
-        idx: Index of candle to check
-        is_buy: True for buy alerts, False for sell alerts
-    
-    Returns:
-        Tuple of (passed: bool, reason: str)
-        - If passed=True, reason="Passed"
-        - If passed=False, reason explains why (e.g., "Upper wick 35.06% > 20%")
-    """
-    try:
-        # Check if we have valid index
-        if idx < 0 or idx >= len(df_15m):
-            return False, f"Invalid index {idx}"
-        
-        row = df_15m.iloc[idx]
-        o = float(row["open"])
-        h = float(row["high"])
-        l = float(row["low"])
-        c = float(row["close"])
-        
-        candle_range = h - l
-        if candle_range < 1e-8:
-            return False, "Candle range too small"
-        
-        if is_buy:
-            # Must be green candle
-            if c <= o:
-                return False, f"Not green candle (C={c:.4f} <= O={o:.4f})"
-            
-            # Check upper wick
-            upper_wick = h - c
-            wick_ratio = upper_wick / candle_range
-            
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
-            
-            return True, "Passed"
-            
-        else:
-            # Must be red candle
-            if c >= o:
-                return False, f"Not red candle (C={c:.4f} >= O={o:.4f})"
-            
-            # Check lower wick
-            lower_wick = c - l
-            wick_ratio = lower_wick / candle_range
-            
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
-            
-            return True, "Passed"
-            
-    except Exception as e:
-        return False, f"Error: {str(e)}"
+    """
+    Wrapper around check_common_conditions that returns both result AND reason.
+
+    This helps with debugging by capturing WHY a candle failed quality checks.
+
+    Args:
+        df_15m: DataFrame with OHLC data
+        idx: Index of candle to check
+        is_buy: True for buy alerts, False for sell alerts
+
+    Returns:
+        Tuple of (passed: bool, reason: str)
+        - If passed=True, reason="Passed"
+        - If passed=False, reason explains why (e.g., "Upper wick 35.06% > 20%")
+    """
+    try:
+        # Check if we have valid index
+        if idx < 0 or idx >= len(df_15m):
+            return False, f"Invalid index {idx}"
+
+        row = df_15m.iloc[idx]
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+
+        candle_range = h - l
+        if candle_range < 1e-8:
+            return False, "Candle range too small"
+
+        if is_buy:
+            # Must be green candle
+            if c <= o:
+                return False, f"Not green candle (C={c:.4f} <= O={o:.4f})"
+
+            # Check upper wick
+            upper_wick = h - c
+            wick_ratio = upper_wick / candle_range
+
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Upper wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+
+            return True, "Passed"
+
+        else:
+            # Must be red candle
+            if c >= o:
+                return False, f"Not red candle (C={c:.4f} >= O={o:.4f})"
+
+            # Check lower wick
+            lower_wick = c - l
+            wick_ratio = lower_wick / candle_range
+
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Lower wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+
+            return True, "Passed"
+
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
 
 def escape_markdown_v2(text: str) -> str:
     try:
