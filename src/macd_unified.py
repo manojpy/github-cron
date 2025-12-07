@@ -216,14 +216,13 @@ def load_config() -> BotConfig:
             print(f"❌ ERROR: Missing required config: {key}", file=sys.stderr)
             print(f"❌ Set this in GitLab CI/CD Settings → Variables", file=sys.stderr)
             sys.exit(1)
-
     try:
         return BotConfig(**data)
     except Exception as exc:
         print(f"❌ ERROR: Pydantic validation failed", file=sys.stderr)
         print(f"❌ Details: {exc}", file=sys.stderr)
         sys.exit(1)
-
+        
 cfg = load_config()
 
 class SecretFilter(logging.Filter):
@@ -489,11 +488,6 @@ async def retry_async(
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
 def get_trigger_timestamp() -> int:
-    """
-    CRITICAL FIX #1: Use TRIGGER_TIMESTAMP from env if available.
-    This ensures timing precision even if GitHub Actions delays container start.
-    Falls back to current time if not provided.
-    """
     trigger_ts_str = os.getenv("TRIGGER_TIMESTAMP")
     if trigger_ts_str:
         try:
@@ -510,24 +504,12 @@ def get_trigger_timestamp() -> int:
     return int(time.time())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
-    """
-    CRITICAL FIX #1: Calculate which candle timestamp we should be analyzing.
-    Returns the timestamp of the LAST CLOSED candle based on the reference time.
-    
-    Example: If reference_time is 10:03 and interval is 15 minutes:
-    - Last closed candle ended at 10:00
-    - Returns: timestamp for 10:00
-    """
     interval_seconds = interval_minutes * 60
     current_window = reference_time // interval_seconds
     last_closed_candle = (current_window * interval_seconds) - interval_seconds
     return last_closed_candle
 
 def validate_candle_timestamp(candle_ts: int, expected_ts: int, tolerance_seconds: int = 120) -> bool:
-    """
-    CRITICAL FIX #1: Validate that the candle we fetched matches what we expect.
-    Prevents processing wrong candles due to API delays or timing issues.
-    """
     diff = abs(candle_ts - expected_ts)
     if diff > tolerance_seconds:
         logger.error(f"Candle timestamp mismatch! Expected ~{expected_ts}, got {candle_ts} (diff: {diff}s)")
@@ -915,7 +897,6 @@ class RedisStateStore:
             return None
 
     async def get_circuit_breaker_state(self, breaker_name: str) -> Optional[Dict[str, Any]]:
-        """CRITICAL FIX #2: Load circuit breaker state from Redis"""
         if self.degraded:
             return None
         
@@ -931,7 +912,6 @@ class RedisStateStore:
     async def set_circuit_breaker_state(
         self, breaker_name: str, failure_count: int, last_failure_time: Optional[float]
     ) -> None:
-        """CRITICAL FIX #2: Persist circuit breaker state to Redis"""
         if self.degraded:
             return
         
@@ -960,7 +940,6 @@ class CircuitBreaker:
         self._loaded_from_redis = False
 
     async def _load_state_from_redis(self) -> None:
-        """CRITICAL FIX #2: Load persisted state on first use"""
         if self._loaded_from_redis or not self.redis_store:
             return
         
@@ -972,7 +951,6 @@ class CircuitBreaker:
             logger.info(f"Circuit breaker '{self.name}' loaded from Redis: failures={self.failure_count}")
 
     async def _persist_state_to_redis(self) -> None:
-        """CRITICAL FIX #2: Persist state after changes"""
         if self.redis_store:
             await self.redis_store.set_circuit_breaker_state(
                 self.name, self.failure_count, self.last_failure_time
@@ -1043,14 +1021,7 @@ class CircuitBreaker:
             raise
 
 class RedisLock:
-    RELEASE_LUA = """
-    if redis.call("GET", KEYS[1]) == ARGV[1] then
-        return redis.call("DEL", KEYS[1])
-    else
-        return 0
-    end
-    """
-
+    RELEASE_LUA = 
     def __init__(
         self,
         redis_client: Optional[redis.Redis],
@@ -1069,7 +1040,6 @@ class RedisLock:
         if not self.redis:
             logger.warning("Redis not available; cannot acquire lock")
             return False
-
         try:
             token = str(uuid.uuid4())
             ok = await asyncio.wait_for(
@@ -1141,7 +1111,6 @@ class RedisLock:
     async def release(self, timeout: float = 3.0) -> None:
         if not self.token or not self.redis or not self.acquired_by_me:
             return
-
         try:
             await asyncio.wait_for(
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
@@ -1244,10 +1213,6 @@ class DataFetcher:
             return result
 
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """
-        CRITICAL FIX #1: Now accepts reference_time for precise candle targeting.
-        Uses reference_time (from TRIGGER_TIMESTAMP) instead of time.time() for calculations.
-        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1402,10 +1367,6 @@ def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: 
     return ppo, ppo_signal
 
 def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
-    """
-    CRITICAL FIX #1: Now uses reference_time instead of time.time().
-    Determines which candle is CLOSED based on the trigger time, not container start time.
-    """
     if df is None or df.empty or len(df) < 2:
         return None
     
@@ -1566,25 +1527,6 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     return validate_indicator_series(vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0), "VWAP")
 
 def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
-    """
-    CRITICAL FIX: Correct wick calculation for 15-minute candles.
-
-    For GREEN candles (BUY):
-        - Upper wick = High - Close
-        - Must be < 20 % of (High - Low)
-
-    For RED candles (SELL):
-        - Lower wick = Close - Low
-        - Must be < 20 % of (High - Low)
-
-    Args:
-        df_15m: DataFrame with OHLC data
-        idx: Index of the candle to check
-        is_buy: True for buy (green candle), False for sell (red candle)
-
-    Returns:
-        True if candle passes quality check, False otherwise
-    """
     try:
         row = df_15m.iloc[idx]
         o = float(row["open"])
@@ -1667,21 +1609,6 @@ def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> boo
         return False
 
 def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> Tuple[bool, str]:
-    """
-    Wrapper around check_common_conditions that returns both result AND reason.
-
-    This helps with debugging by capturing WHY a candle failed quality checks.
-
-    Args:
-        df_15m: DataFrame with OHLC data
-        idx: Index of candle to check
-        is_buy: True for buy alerts, False for sell alerts
-
-    Returns:
-        Tuple of (passed: bool, reason: str)
-        - If passed=True, reason="Passed"
-        - If passed=False, reason explains why (e.g., "Upper wick 35.06% > 20%")
-    """
     try:
         # Check if we have valid index
         if idx < 0 or idx >= len(df_15m):
@@ -1808,10 +1735,6 @@ class TelegramQueue:
         return False
 
     async def send_batch(self, messages: List[str]) -> bool:
-        """
-        CRITICAL FIX #8: Batch telegram messages to reduce API calls.
-        If >5 alerts, consolidate into summary message.
-        """
         if not messages:
             return True
         
@@ -2131,9 +2054,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    CRITICAL FIX #1: Now accepts reference_time parameter for precise timing.
-    """
+    
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
@@ -2511,9 +2432,6 @@ async def evaluate_pair_and_alert(
             PAIR_ID.set("")
 
 async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[str, dict], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    CRITICAL FIX #1: Now accepts and passes reference_time to downstream functions.
-    """
     try:
         if shutdown_event.is_set():
             return None
@@ -2549,9 +2467,6 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         return None
 
 async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], batch_pairs: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, memory_monitor: MemoryMonitor, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    CRITICAL FIX #1: Now accepts and passes reference_time parameter.
-    """
     tasks = []
     per_pair_timeout = max(30, int(cfg.RUN_TIMEOUT_SECONDS / max(1, len(cfg.PAIRS))))
     
@@ -2765,7 +2680,6 @@ async def run_once() -> bool:
                         "duration": run_duration,
                         "correlation_id": correlation_id
                     })
-
                 return True
 
             except asyncio.TimeoutError:
