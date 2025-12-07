@@ -18,7 +18,7 @@ import psutil
 import math
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -42,7 +42,7 @@ except Exception:
     PROMETHEUS_ENABLED = False
     Counter = Gauge = Histogram = None
 
-__version__ = "1.0.8-production-optimized"
+__version__ = "1.0.8-production-stable"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -137,7 +137,7 @@ class BotConfig(BaseModel):
     STATE_EXPIRY_DAYS: int = 30
     ENABLE_DMS_PLUGIN: bool = False
     ENABLE_HEALTH_TRACKER: bool = True
-    DEAD_MANS_COOLDOWN_SECONDS: int = 14400
+    DEAD_MANS_COOLDOWN_SECONDS: int = 1200
     LOG_LEVEL: str = "INFO"
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
@@ -151,8 +151,7 @@ class BotConfig(BaseModel):
     AUTO_RESTART_COOLDOWN_SEC: int = 10
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
-    INDICATOR_THREAD_LIMIT: int = 6
-    # NEW: Safety + diagnostics
+    INDICATOR_THREAD_LIMIT: int = 3
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
@@ -163,20 +162,17 @@ class BotConfig(BaseModel):
             raise ValueError('Invalid Telegram bot token format')
         return v
 
-
     @field_validator('TELEGRAM_CHAT_ID')
     def validate_chat_id(cls, v: str) -> str:
         if not v.strip():
             raise ValueError('Chat ID cannot be empty')
         return v.strip()
 
-
     @field_validator('DELTA_API_BASE')
     def validate_api_base(cls, v: str) -> str:
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
-
 
     @model_validator(mode='after')
     def validate_logic(self) -> 'BotConfig':
@@ -197,21 +193,6 @@ class BotConfig(BaseModel):
             raise ValueError('TELEGRAM_RATE_LIMIT_PER_MINUTE must be 10-30')
 
         return self
-
-
-def load_config() -> BotConfig:
-    config_file = os.getenv("CONFIG_FILE", "config_macd.json")
-    data: Dict[str, Any] = {}
-    if Path(config_file).exists():
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as exc:
-            print(f"❌ ERROR: Config file {config_file} is not valid JSON", file=sys.stderr)
-            print(f"❌ Details: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-
 
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
@@ -359,6 +340,7 @@ class MemoryMonitor:
         self.limit_percent = limit_percent
         self.last_check = 0.0
         self.interval = Constants.MEMORY_CHECK_INTERVAL
+        self.process = psutil.Process()
 
     def should_check(self) -> bool:
         now = time.time()
@@ -368,11 +350,23 @@ class MemoryMonitor:
         return False
 
     def is_critical(self) -> bool:
-        return psutil.virtual_memory().percent >= self.limit_percent
+        try:
+            container_memory_mb = self.process.memory_info().rss / 1024 / 1024
+            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+            return container_memory_mb >= limit_mb
+        except Exception:
+            vm = psutil.virtual_memory()
+            return vm.percent >= self.limit_percent
 
     def check_memory(self) -> Tuple[int, float]:
-        vm = psutil.virtual_memory()
-        return int(vm.used), float(vm.percent)
+        try:
+            memory_info = self.process.memory_info()
+            container_used = int(memory_info.rss)
+            container_percent = (container_used / cfg.MEMORY_LIMIT_BYTES) * 100
+            return container_used, float(container_percent)
+        except Exception:
+            vm = psutil.virtual_memory()
+            return int(vm.used), float(vm.percent)
 
 metrics_started = False
 if PROMETHEUS_ENABLED and Counter and Gauge and Histogram:
@@ -494,23 +488,67 @@ async def retry_async(
             await asyncio.sleep(_exp_backoff_sleep(attempt, base_backoff, cap))
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
+def get_trigger_timestamp() -> int:
+    """
+    CRITICAL FIX #1: Use TRIGGER_TIMESTAMP from env if available.
+    This ensures timing precision even if GitHub Actions delays container start.
+    Falls back to current time if not provided.
+    """
+    trigger_ts_str = os.getenv("TRIGGER_TIMESTAMP")
+    if trigger_ts_str:
+        try:
+            trigger_ts = int(trigger_ts_str)
+            now = int(time.time())
+            if abs(now - trigger_ts) > 600:
+                logger.warning(f"TRIGGER_TIMESTAMP ({trigger_ts}) is >10 min from now ({now}), using current time")
+                return now
+            logger.debug(f"Using TRIGGER_TIMESTAMP from env: {trigger_ts}")
+            return trigger_ts
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid TRIGGER_TIMESTAMP: {trigger_ts_str}, using current time")
+    
+    return int(time.time())
+
+def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
+    """
+    CRITICAL FIX #1: Calculate which candle timestamp we should be analyzing.
+    Returns the timestamp of the LAST CLOSED candle based on the reference time.
+    
+    Example: If reference_time is 10:03 and interval is 15 minutes:
+    - Last closed candle ended at 10:00
+    - Returns: timestamp for 10:00
+    """
+    interval_seconds = interval_minutes * 60
+    current_window = reference_time // interval_seconds
+    last_closed_candle = (current_window * interval_seconds) - interval_seconds
+    return last_closed_candle
+
+def validate_candle_timestamp(candle_ts: int, expected_ts: int, tolerance_seconds: int = 120) -> bool:
+    """
+    CRITICAL FIX #1: Validate that the candle we fetched matches what we expect.
+    Prevents processing wrong candles due to API delays or timing issues.
+    """
+    diff = abs(candle_ts - expected_ts)
+    if diff > tolerance_seconds:
+        logger.error(f"Candle timestamp mismatch! Expected ~{expected_ts}, got {candle_ts} (diff: {diff}s)")
+        return False
+    return True
+
 class RedisStateStore:
     def __init__(self, redis_url: str):
-        self.redis_url                   = redis_url
+        self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
-        self.state_prefix                = "pair_state:"
-        self.meta_prefix                 = "metadata:"
-        self.alert_prefix                = "alert:"
-        self.expiry_seconds              = cfg.STATE_EXPIRY_DAYS * 86400
-        self.alert_expiry_seconds        = cfg.STATE_EXPIRY_DAYS * 86400
-        self.metadata_expiry_seconds     = 7 * 86400
-        self.degraded                    = False
-        self.degraded_alerted            = False
-        self._connection_attempts        = 0
+        self.state_prefix = "pair_state:"
+        self.meta_prefix = "metadata:"
+        self.alert_prefix = "alert:"
+        self.cb_prefix = "circuit_breaker:"
+        self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
+        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
+        self.metadata_expiry_seconds = 7 * 86400
+        self.degraded = False
+        self.degraded_alerted = False
+        self._connection_attempts = 0
 
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
             self._redis = redis.from_url(
@@ -518,14 +556,14 @@ class RedisStateStore:
                 socket_connect_timeout=timeout,
                 socket_timeout=timeout,
                 retry_on_timeout=True,
-                max_connections=50,
+                max_connections=10,
                 decode_responses=True,
             )
             ok = await self._ping_with_retry(timeout)
             if ok:
-                logger.info("Connected to RedisStateStore (decode_responses=True, max_connections=50)")
-                self.degraded            = False
-                self.degraded_alerted    = False
+                logger.info("Connected to RedisStateStore (decode_responses=True, max_connections=10)")
+                self.degraded = False
+                self.degraded_alerted = False
                 self._connection_attempts = 0
                 return True
             else:
@@ -541,10 +579,6 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        """
-        IMPROVED: Startup smoke test + clear degraded-mode behaviour
-        """
-        # Fast ping test first
         if self._redis is not None and not self.degraded:
             try:
                 if await self._ping_with_retry(1.0):
@@ -553,13 +587,11 @@ class RedisStateStore:
             except Exception:
                 logger.debug("Redis ping failed, attempting reconnect")
 
-        # Full reconnection with retries
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
             logger.info(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
-                # NEW: Smoke test – simple set/get to verify full functionality
                 test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
                 test_val = "ok"
                 if (
@@ -574,7 +606,16 @@ class RedisStateStore:
                         self._redis.delete(test_key), 1.0, "smoke_cleanup"
                     )
                     logger.info("✅ Redis fully operational (smoke test passed)")
-                    self.degraded         = False
+                    
+                    info = await self._safe_redis_op(
+                        self._redis.info("memory"), 3.0, "info_memory", lambda r: r
+                    )
+                    if info:
+                        policy = info.get("maxmemory_policy", "unknown")
+                        if policy in ("volatile-lru", "allkeys-lru"):
+                            logger.warning(f"⚠️ Redis using {policy} - keys may be evicted under memory pressure")
+                    
+                    self.degraded = False
                     self.degraded_alerted = False
                     return
                 else:
@@ -587,16 +628,16 @@ class RedisStateStore:
 
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
-        self._redis   = None
+        self._redis = None
 
-        # DEGRADED MODE: what gets disabled (clear documentation)
         logger.warning("""
 🚨 REDIS DEGRADED MODE ACTIVE:
-• Alert deduplication:  DISABLED (may get duplicates)
-• State persistence:    DISABLED (alerts reset each run)
-• Health tracking:      DISABLED
-• Lock extension:       DISABLED
-• Trading alerts:       STILL ACTIVE (core functionality preserved)
+- Alert deduplication:  DISABLED (may get duplicates)
+- State persistence:    DISABLED (alerts reset each run)
+- Health tracking:      DISABLED
+- Lock extension:       DISABLED
+- Circuit breaker:      DISABLED (will reset each run)
+- Trading alerts:       STILL ACTIVE (core functionality preserved)
 """)
 
         if cfg.FAIL_ON_REDIS_DOWN:
@@ -617,9 +658,6 @@ class RedisStateStore:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    # ------------------------------------------------------------------
-    # Low-level helpers
-    # ------------------------------------------------------------------
     async def _ping_with_retry(self, timeout: float) -> bool:
         return (
             await self._safe_redis_op(
@@ -666,9 +704,6 @@ class RedisStateStore:
             logger.error(f"Failed to {op_name}: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # Single-key operations
-    # ------------------------------------------------------------------
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
             self._redis.get(f"{self.state_prefix}{key}"),
@@ -684,9 +719,9 @@ class RedisStateStore:
         ts: Optional[int] = None,
         timeout: float = 2.0,
     ) -> None:
-        ts        = int(ts or time.time())
+        ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
-        data      = json.dumps({"state": state, "ts": ts})
+        data = json.dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
             self._redis.set(
                 redis_key,
@@ -716,17 +751,13 @@ class RedisStateStore:
             f"set_metadata {key}",
         )
 
-    # ------------------------------------------------------------------
-    # Alert deduplication
-    # ------------------------------------------------------------------
     async def check_recent_alert(
         self, pair: str, alert_key: str, ts: int
     ) -> bool:
-        """Return True if alert should be sent (not a duplicate)."""
         if self.degraded:
             return True
 
-        window     = ts // 900
+        window = ts // 900
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
         result = await self._safe_redis_op(
@@ -746,10 +777,6 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
-        """
-        Batch-check multiple alerts.
-        Returns dict of {(pair, alert_key): should_send}.
-        """
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -758,7 +785,7 @@ class RedisStateStore:
             keys_map = {}
 
             for pair, alert_key, ts in checks:
-                window     = ts // 900
+                window = ts // 900
                 recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
                 keys_map[recent_key] = f"{pair}:{alert_key}"
                 pipeline.set(
@@ -786,9 +813,6 @@ class RedisStateStore:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    # ------------------------------------------------------------------
-    # Bulk state operations
-    # ------------------------------------------------------------------
     async def mget_states(
         self, keys: List[str], timeout: float = 2.0
     ) -> Dict[str, Optional[Dict[str, Any]]]:
@@ -796,7 +820,7 @@ class RedisStateStore:
             return {}
 
         redis_keys = [f"{self.state_prefix}{k}" for k in keys]
-        results    = await self._safe_redis_op(
+        results = await self._safe_redis_op(
             self._redis.mget(redis_keys),
             timeout,
             f"mget {len(keys)} keys",
@@ -823,18 +847,17 @@ class RedisStateStore:
         updates: List[Tuple[str, Optional[Any], Optional[int]]],
         timeout: float = 3.0,
     ) -> None:
-        """Batch-set multiple alert states using Redis pipeline."""
         if not self._redis or not updates:
             return
 
         try:
             pipeline = self._redis.pipeline()
-            ts       = int(time.time())
+            ts = int(time.time())
 
             for key, state, custom_ts in updates:
-                use_ts    = custom_ts if custom_ts is not None else ts
+                use_ts = custom_ts if custom_ts is not None else ts
                 redis_key = f"{self.state_prefix}{key}"
-                data      = json.dumps({"state": state, "ts": use_ts})
+                data = json.dumps({"state": state, "ts": use_ts})
 
                 if self.expiry_seconds > 0:
                     pipeline.set(redis_key, data, ex=self.expiry_seconds)
@@ -845,20 +868,16 @@ class RedisStateStore:
             logger.debug(f"Batch set {len(updates)} states via pipeline")
         except Exception as e:
             logger.error(f"Pipeline set_multiple_states failed: {e}")
-            # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts, timeout=1.0)
 
-    # ------------------------------------------------------------------
-    # Maintenance & monitoring
-    # ------------------------------------------------------------------
     async def _prune_old_records(self, expiry_days: int) -> int:
         if expiry_days <= 0 or self.expiry_seconds > 0:
             logger.debug("Using Redis TTL – manual pruning skipped")
             return 0
 
         last_prune_str = await self.get_metadata("last_prune")
-        today          = datetime.now(timezone.utc).date()
+        today = datetime.now(timezone.utc).date()
         if last_prune_str:
             try:
                 last_prune_date = datetime.fromisoformat(last_prune_str).date()
@@ -883,7 +902,7 @@ class RedisStateStore:
                 return None
 
             mem_used = info_raw.get("memory", {}).get("used_memory")
-            keys     = info_raw.get("keyspace", {}).get("db0", {}).get("keys", 0)
+            keys = info_raw.get("keyspace", {}).get("db0", {}).get("keys", 0)
 
             if PROMETHEUS_ENABLED:
                 if METRIC_REDIS_MEMORY_USED and mem_used is not None:
@@ -894,6 +913,134 @@ class RedisStateStore:
             return {"used_memory": mem_used, "db0_keys": keys}
         except Exception:
             return None
+
+    async def get_circuit_breaker_state(self, breaker_name: str) -> Optional[Dict[str, Any]]:
+        """CRITICAL FIX #2: Load circuit breaker state from Redis"""
+        if self.degraded:
+            return None
+        
+        key = f"{self.cb_prefix}{breaker_name}"
+        result = await self._safe_redis_op(
+            self._redis.get(key),
+            timeout=2.0,
+            op_name=f"get_cb_state {breaker_name}",
+            parser=lambda r: json.loads(r) if r else None,
+        )
+        return result
+
+    async def set_circuit_breaker_state(
+        self, breaker_name: str, failure_count: int, last_failure_time: Optional[float]
+    ) -> None:
+        """CRITICAL FIX #2: Persist circuit breaker state to Redis"""
+        if self.degraded:
+            return
+        
+        key = f"{self.cb_prefix}{breaker_name}"
+        data = {
+            "failure_count": failure_count,
+            "last_failure_time": last_failure_time,
+            "updated_at": time.time()
+        }
+        await self._safe_redis_op(
+            self._redis.set(key, json.dumps(data), ex=3600),
+            timeout=2.0,
+            op_name=f"set_cb_state {breaker_name}",
+        )
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, timeout: int = 300, name: str = "default", redis_store: Optional[RedisStateStore] = None):
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self.threshold = failure_threshold
+        self.timeout = timeout
+        self.lock = asyncio.Lock()
+        self.state = "CLOSED"
+        self.name = name
+        self.redis_store = redis_store
+        self._loaded_from_redis = False
+
+    async def _load_state_from_redis(self) -> None:
+        """CRITICAL FIX #2: Load persisted state on first use"""
+        if self._loaded_from_redis or not self.redis_store:
+            return
+        
+        self._loaded_from_redis = True
+        state = await self.redis_store.get_circuit_breaker_state(self.name)
+        if state:
+            self.failure_count = state.get("failure_count", 0)
+            self.last_failure_time = state.get("last_failure_time")
+            logger.info(f"Circuit breaker '{self.name}' loaded from Redis: failures={self.failure_count}")
+
+    async def _persist_state_to_redis(self) -> None:
+        """CRITICAL FIX #2: Persist state after changes"""
+        if self.redis_store:
+            await self.redis_store.set_circuit_breaker_state(
+                self.name, self.failure_count, self.last_failure_time
+            )
+
+    async def is_open(self) -> bool:
+        await self._load_state_from_redis()
+        
+        async with self.lock:
+            if self.failure_count < self.threshold:
+                self.state = "CLOSED"
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(0.0)
+                return False
+            if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
+                self.failure_count = 0
+                self.last_failure_time = None
+                self.state = "CLOSED"
+                logger.info(f"Circuit breaker '{self.name}' reset after timeout")
+                await self._persist_state_to_redis()
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(0.0)
+                return False
+            self.state = "OPEN"
+            if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                METRIC_CB_OPEN.set(1.0)
+            return True
+
+    async def record_failure(self) -> int:
+        await self._load_state_from_redis()
+        
+        async with self.lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            logger.warning(f"Circuit breaker '{self.name}': failure {self.failure_count}/{self.threshold}")
+            await self._persist_state_to_redis()
+            if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
+                METRIC_CB_FAILURES.inc()
+            if self.failure_count >= self.threshold:
+                self.state = "OPEN"
+                logger.critical(f"Circuit breaker '{self.name}' OPEN for {self.timeout}s")
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(1.0)
+            return self.failure_count
+
+    async def record_success(self) -> None:
+        await self._load_state_from_redis()
+        
+        async with self.lock:
+            if self.failure_count > 0:
+                self.failure_count = 0
+                self.last_failure_time = None
+                self.state = "CLOSED"
+                logger.info(f"Circuit breaker '{self.name}': reset after success")
+                await self._persist_state_to_redis()
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(0.0)
+
+    async def call(self, func: Callable, *args, **kwargs):
+        if await self.is_open():
+            raise Exception(f"Circuit breaker '{self.name}' is OPEN (state: {self.state})")
+        try:
+            result = await func(*args, **kwargs)
+            await self.record_success()
+            return result
+        except Exception:
+            await self.record_failure()
+            raise
 
 class RedisLock:
     RELEASE_LUA = """
@@ -1007,70 +1154,6 @@ class RedisLock:
             self.token = None
             self.acquired_by_me = False
 
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, timeout: int = 300):
-        self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.threshold = failure_threshold
-        self.timeout = timeout
-        self.lock = asyncio.Lock()
-        self.state = "CLOSED"
-
-    async def is_open(self) -> bool:
-        async with self.lock:
-            if self.failure_count < self.threshold:
-                self.state = "CLOSED"
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-                return False
-            if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
-                self.failure_count = 0
-                self.last_failure_time = None
-                self.state = "CLOSED"
-                logger.info("Circuit breaker reset after timeout")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-                return False
-            self.state = "OPEN"
-            if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                METRIC_CB_OPEN.set(1.0)
-            return True
-
-    async def record_failure(self) -> int:
-        async with self.lock:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            logger.warning(f"Circuit breaker: failure {self.failure_count}/{self.threshold}")
-            if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
-                METRIC_CB_FAILURES.inc()
-            if self.failure_count >= self.threshold:
-                self.state = "OPEN"
-                logger.critical(f"Circuit breaker OPEN for {self.timeout}s")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(1.0)
-            return self.failure_count
-
-    async def record_success(self) -> None:
-        async with self.lock:
-            if self.failure_count > 0:
-                self.failure_count = 0
-                self.last_failure_time = None
-                self.state = "CLOSED"
-                logger.info("Circuit breaker: reset after success")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-
-    async def call(self, func: Callable, *args, **kwargs):
-        if await self.is_open():
-            raise Exception(f"Circuit breaker is OPEN (state: {self.state})")
-        try:
-            result = await func(*args, **kwargs)
-            await self.record_success()
-            return result
-        except Exception:
-            await self.record_failure()
-            raise
-
 async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15, circuit_breaker: Optional[CircuitBreaker] = None) -> Optional[Dict[str, Any]]:
     if circuit_breaker and await circuit_breaker.is_open():
         logger.warning(f"Circuit breaker open; skipping fetch {url}")
@@ -1140,28 +1223,14 @@ class RateLimitedFetcher:
             return await func(*args, **kwargs)
 
 class DataFetcher:
-    def __init__(self, api_base: str, max_parallel: Optional[int] = None):
+    def __init__(self, api_base: str, max_parallel: Optional[int] = None, redis_store: Optional[RedisStateStore] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
-        self._cache: Dict[str, Tuple[float, Any]] = {}
-        self._cache_max_size = 50
-        self._cache_lock = asyncio.Lock()
-        self.circuit_breaker_products = CircuitBreaker()
-        self.circuit_breaker_candles = CircuitBreaker()
+        self.circuit_breaker_products = CircuitBreaker(name="products_api", redis_store=redis_store)
+        self.circuit_breaker_candles = CircuitBreaker(name="candles_api", redis_store=redis_store)
         self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
-
-    async def _clean_cache(self) -> None:
-        async with self._cache_lock:
-            now = time.time()
-            if len(self._cache) > self._cache_max_size:
-                to_remove = sorted(self._cache.items(), key=lambda x: x[1][0])[:self._cache_max_size // 5]
-                for k, _ in to_remove:
-                    del self._cache[k]
-            stale = [k for k, (ts, _) in self._cache.items() if now - ts > 300]
-            for k in stale:
-                del self._cache[k]
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
@@ -1174,20 +1243,17 @@ class DataFetcher:
                 await self.circuit_breaker_products.record_success()
             return result
 
-    async def fetch_candles(self, symbol: str, resolution: str, limit: int) -> Optional[Dict[str, Any]]:
-        key_str = f"{symbol}:{resolution}:{limit}"
-        key_hash = f"candles:{hashlib.blake2b(key_str.encode(), digest_size=8).hexdigest()}"
-        
-        async with self._cache_lock:
-            if key_hash in self._cache:
-                age, data = self._cache[key_hash]
-                if time.time() - age < 60:
-                    return data
+    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        CRITICAL FIX #1: Now accepts reference_time for precise candle targeting.
+        Uses reference_time (from TRIGGER_TIMESTAMP) instead of time.time() for calculations.
+        """
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
 
         minutes = int(resolution) if resolution != "D" else 1440
-        now = int(time.time())
         window = minutes * 60
-        current_window = now // window
+        current_window = reference_time // window
         last_close = (current_window * window)
         cushion = max(3, min(Constants.CANDLE_PUBLICATION_LAG_SEC, window - 3))
         last_close -= cushion
@@ -1210,11 +1276,6 @@ class DataFetcher:
                 timeout=self.timeout,
                 circuit_breaker=self.circuit_breaker_candles
             )
-
-        if data:
-            async with self._cache_lock:
-                self._cache[key_hash] = (time.time(), data)
-            await self._clean_cache()
 
         return data
 
@@ -1340,16 +1401,28 @@ def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: 
     ppo_signal = validate_indicator_series(ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill(), "PPO_SIGNAL")
     return ppo, ppo_signal
 
-def get_last_closed_index(df: pd.DataFrame, interval_minutes: int) -> Optional[int]:
+def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
+    """
+    CRITICAL FIX #1: Now uses reference_time instead of time.time().
+    Determines which candle is CLOSED based on the trigger time, not container start time.
+    """
     if df is None or df.empty or len(df) < 2:
         return None
+    
+    if reference_time is None:
+        reference_time = get_trigger_timestamp()
+    
     last_ts = int(df["timestamp"].iloc[-1])
-    current_time = int(time.time())
     interval_seconds = interval_minutes * 60
     
     publication_buffer = Constants.CANDLE_PUBLICATION_LAG_SEC
     
-    if current_time >= (last_ts + interval_seconds + publication_buffer):
+    expected_last_closed = calculate_expected_candle_timestamp(reference_time, interval_minutes)
+    
+    if not validate_candle_timestamp(last_ts, expected_last_closed, tolerance_seconds=interval_seconds):
+        logger.warning(f"Last candle timestamp ({last_ts}) doesn't match expected ({expected_last_closed})")
+    
+    if reference_time >= (last_ts + interval_seconds + publication_buffer):
         return len(df) - 1
     else:
         if len(df) >= 2:
@@ -1549,9 +1622,9 @@ class TelegramQueue:
         self.token = token
         self.chat_id = chat_id
         self.token_bucket = TokenBucket(cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
-        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=300)
+        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=300, name="telegram_api")
 
-    async def send(self, message: str) -> bool:
+    async def send(self, message: str, priority: str = "normal") -> bool:
         try:
             await asyncio.wait_for(self.circuit_breaker.call(self._send_impl, message), timeout=30.0)
             if PROMETHEUS_ENABLED and METRIC_ALERTS_SENT:
@@ -1590,8 +1663,18 @@ class TelegramQueue:
         return False
 
     async def send_batch(self, messages: List[str]) -> bool:
+        """
+        CRITICAL FIX #8: Batch telegram messages to reduce API calls.
+        If >5 alerts, consolidate into summary message.
+        """
         if not messages:
             return True
+        
+        if len(messages) > 5:
+            summary = f"🚨 MARKET ALERT: {len(messages)} signals detected\n\n"
+            preview = "\n".join([f"• {msg[:50]}..." for msg in messages[:10]])
+            return await self.send(escape_markdown_v2(summary + preview))
+        
         max_len = 3800
         to_send = messages[:10]
         combined = "\n\n".join(to_send)
@@ -1826,11 +1909,14 @@ class HealthHttpServer:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         try:
-            vm = psutil.virtual_memory()
+            process = psutil.Process()
+            container_memory_mb = process.memory_info().rss / 1024 / 1024
+            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             status = {
-                "status": "ok" if vm.percent < Constants.MEMORY_LIMIT_PERCENT else "degraded",
+                "status": "ok" if container_memory_mb < limit_mb else "degraded",
                 "version": __version__,
-                "memory_percent": vm.percent,
+                "memory_mb": round(container_memory_mb, 2),
+                "memory_limit_mb": round(limit_mb, 2),
                 "time": format_ist_time(time.time()),
                 "trace_id": TRACE_ID.get(),
             }
@@ -1897,23 +1983,24 @@ async def evaluate_pair_and_alert(
     df_daily: Optional[pd.DataFrame],
     sdb: RedisStateStore,
     telegram_queue: TelegramQueue,
-    correlation_id: str
+    correlation_id: str,
+    reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """
+    CRITICAL FIX #1: Now accepts reference_time parameter for precise timing.
+    """
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
     indicator_total_start = time.time()
 
     try:
-        i15 = get_last_closed_index(df_15m, 15)
-        i5  = get_last_closed_index(df_5m,   5)
+        i15 = get_last_closed_index(df_15m, 15, reference_time)
+        i5 = get_last_closed_index(df_5m, 5, reference_time)
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient closed candles for {pair_name}")
             return None
-
-        # ------------------------------------------------------------------
-        # 1.  Calculate indicators (threaded)
-        # ------------------------------------------------------------------
+   
         indicator_start = time.time()
         ppo, ppo_signal = await calculate_indicator_threaded(
             calculate_ppo, df_15m,
@@ -1952,15 +2039,15 @@ async def evaluate_pair_and_alert(
         else:
             upw = dnw = pd.Series(False, index=df_15m.index)
 
-        # ------------------------------------------------------------------
-        # 2.  Daily pivot levels
-        # ------------------------------------------------------------------
         piv: Dict[str, float] = {}
         if cfg.ENABLE_PIVOT and df_daily is not None and len(df_daily) >= 2:
             try:
                 df_daily = df_daily.sort_values("timestamp").reset_index(drop=True)
                 df_daily["date"] = pd.to_datetime(df_daily["timestamp"], unit="s", utc=True).dt.date
-                completed_days = df_daily["date"] < datetime.now(timezone.utc).date()
+                
+                yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+                completed_days = df_daily["date"] == yesterday
+                
                 if completed_days.sum() >= 1:
                     prev_daily = df_daily[completed_days].iloc[-1]
                     H_prev = float(prev_daily["high"])
@@ -1978,42 +2065,38 @@ async def evaluate_pair_and_alert(
                             "S2": P - rng_prev * 0.618,
                             "S3": P - rng_prev,
                         }
+                else:
+                    logger_pair.warning(f"Yesterday's daily candle not available yet for {pair_name}")
             except Exception as e:
                 logger_pair.warning(f"Pivot calc failed for {pair_name}: {e}")
 
-        # ------------------------------------------------------------------
-        # 3.  Snapshot current values
-        # ------------------------------------------------------------------
-        close_curr  = float(df_15m["close"].iloc[i15])
-        close_prev  = float(df_15m["close"].iloc[i15 - 1])
-        ts_curr     = int(df_15m["timestamp"].iloc[i15])
+        close_curr = float(df_15m["close"].iloc[i15])
+        close_prev = float(df_15m["close"].iloc[i15 - 1])
+        ts_curr = int(df_15m["timestamp"].iloc[i15])
 
-        ppo_curr    = float(ppo.iloc[i15])
-        ppo_prev    = float(ppo.iloc[i15 - 1])
+        ppo_curr = float(ppo.iloc[i15])
+        ppo_prev = float(ppo.iloc[i15 - 1])
         ppo_sig_curr = float(ppo_signal.iloc[i15])
         ppo_sig_prev = float(ppo_signal.iloc[i15 - 1])
 
-        rsi_curr    = float(smooth_rsi.iloc[i15])
-        rsi_prev    = float(smooth_rsi.iloc[i15 - 1])
+        rsi_curr = float(smooth_rsi.iloc[i15])
+        rsi_prev = float(smooth_rsi.iloc[i15 - 1])
 
-        vwap_curr   = float(vwap.iloc[i15]) if not vwap.empty else 0.0
-        vwap_prev   = float(vwap.iloc[i15 - 1]) if not vwap.empty else 0.0
+        vwap_curr = float(vwap.iloc[i15]) if not vwap.empty else 0.0
+        vwap_prev = float(vwap.iloc[i15 - 1]) if not vwap.empty else 0.0
 
-        mmh_curr    = float(mmh.iloc[i15])
-        mmh_m1      = float(mmh.iloc[i15 - 1])
+        mmh_curr = float(mmh.iloc[i15])
+        mmh_m1 = float(mmh.iloc[i15 - 1])
 
-        cloud_up    = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
-        cloud_down  = bool(dnw.iloc[i15]) and not bool(upw.iloc[i15])
+        cloud_up = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
+        cloud_down = bool(dnw.iloc[i15]) and not bool(upw.iloc[i15])
 
-        rma50_15    = float((await calculate_indicator_threaded(
+        rma50_15 = float((await calculate_indicator_threaded(
             calculate_rma, df_15m["close"], cfg.RMA_50_PERIOD)).iloc[i15])
-        rma200_5    = float((await calculate_indicator_threaded(
+        rma200_5 = float((await calculate_indicator_threaded(
             calculate_rma, df_5m["close"], cfg.RMA_200_PERIOD)).iloc[i5])
 
-        # ------------------------------------------------------------------
-        # 4.  Base trend filters
-        # ------------------------------------------------------------------
-        base_buy_common  = rma50_15 < close_curr and rma200_5 < close_curr
+        base_buy_common = rma50_15 < close_curr and rma200_5 < close_curr
         base_sell_common = rma50_15 > close_curr and rma200_5 > close_curr
 
         if base_buy_common:
@@ -2021,59 +2104,50 @@ async def evaluate_pair_and_alert(
         if base_sell_common:
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
-        buy_common_candle_ok  = check_common_conditions(df_15m, i15, is_buy=True)
+        buy_common_candle_ok = check_common_conditions(df_15m, i15, is_buy=True)
         sell_common_candle_ok = check_common_conditions(df_15m, i15, is_buy=False)
 
-        buy_common  = base_buy_common  and buy_common_candle_ok
+        buy_common = base_buy_common and buy_common_candle_ok
         sell_common = base_sell_common and sell_common_candle_ok
 
-        # ------------------------------------------------------------------
-        # 5.  MMH reversal detection
-        # ------------------------------------------------------------------
-        mmh_reversal_buy  = False
+        mmh_reversal_buy = False
         mmh_reversal_sell = False
         if i15 >= 3:
             mmh_m3 = float(mmh.iloc[i15 - 3])
             mmh_m2 = float(mmh.iloc[i15 - 2])
-            mmh_reversal_buy  = (buy_common  and mmh_curr > 0 and
-                                 mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
+            mmh_reversal_buy = (buy_common and mmh_curr > 0 and
+                                mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
             mmh_reversal_sell = (sell_common and mmh_curr < 0 and
                                  mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
 
-        # ------------------------------------------------------------------
-        # 6.  Build context dict for alert rules
-        # ------------------------------------------------------------------
         context = {
-            "buy_common":  buy_common,
+            "buy_common": buy_common,
             "sell_common": sell_common,
-            "close_curr":  close_curr,
-            "close_prev":  close_prev,
-            "ts_curr":     ts_curr,
-            "ppo_curr":    ppo_curr,
-            "ppo_prev":    ppo_prev,
+            "close_curr": close_curr,
+            "close_prev": close_prev,
+            "ts_curr": ts_curr,
+            "ppo_curr": ppo_curr,
+            "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr,
             "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr":    rsi_curr,
-            "rsi_prev":    rsi_prev,
-            "vwap_curr":   vwap_curr,
-            "vwap_prev":   vwap_prev,
-            "mmh_curr":    mmh_curr,
-            "mmh_m1":      mmh_m1,
-            "mmh_reversal_buy":  mmh_reversal_buy,
+            "rsi_curr": rsi_curr,
+            "rsi_prev": rsi_prev,
+            "vwap_curr": vwap_curr,
+            "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr,
+            "mmh_m1": mmh_m1,
+            "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
-            "pivots":      piv,
-            "vwap":        not pd.Series(dtype=float).equals(vwap),
-            "candle_quality_failed_buy":  base_buy_common  and not buy_common_candle_ok,
+            "pivots": piv,
+            "vwap": not pd.Series(dtype=float).equals(vwap),
+            "candle_quality_failed_buy": base_buy_common and not buy_common_candle_ok,
             "candle_quality_failed_sell": base_sell_common and not sell_common_candle_ok,
         }
 
-        ppo_ctx    = {"curr": context["ppo_curr"],    "prev": context["ppo_prev"]}
+        ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
         ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
-        rsi_ctx    = {"curr": context["rsi_curr"],    "prev": context["rsi_prev"]}
+        rsi_ctx = {"curr": context["rsi_curr"], "prev": context["rsi_prev"]}
 
-        # ------------------------------------------------------------------
-        # 7.  Evaluate alert rules
-        # ------------------------------------------------------------------
         raw_alerts: List[Tuple[str, str, str]] = []
 
         alert_keys_to_check = []
@@ -2107,9 +2181,6 @@ async def evaluate_pair_and_alert(
         if states_to_update:
             await sdb.set_multiple_states(states_to_update)
 
-        # ------------------------------------------------------------------
-        # 8.  Reset conditions
-        # ------------------------------------------------------------------
         resets_to_apply = []
 
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
@@ -2155,9 +2226,6 @@ async def evaluate_pair_and_alert(
         if resets_to_apply:
             await sdb.set_multiple_states(resets_to_apply)
 
-        # ------------------------------------------------------------------
-        # 9.  Deduplicate & cap alerts
-        # ------------------------------------------------------------------
         if raw_alerts:
             dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
             dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
@@ -2170,14 +2238,10 @@ async def evaluate_pair_and_alert(
                 else:
                     logger_pair.debug(f"Skipping duplicate alert: {composite_key}")
 
-            MAX_ALERTS_PER_PAIR = 8
-            alerts_to_send = alerts_to_send[:MAX_ALERTS_PER_PAIR]
+            alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
         else:
             alerts_to_send = []
 
-        # ------------------------------------------------------------------
-        # 10.  Send telegram & update state
-        # ------------------------------------------------------------------
         if alerts_to_send:
             if len(alerts_to_send) == 1:
                 title, extra, _ = alerts_to_send[0]
@@ -2202,9 +2266,6 @@ async def evaluate_pair_and_alert(
         else:
             new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
 
-        # ------------------------------------------------------------------
-        # 11.  Final summary & metrics
-        # ------------------------------------------------------------------
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         reasons = []
         if not context["buy_common"] and not context["sell_common"]:
@@ -2234,22 +2295,21 @@ async def evaluate_pair_and_alert(
         return None
 
     finally:
-        # ------------------------------------------------------------------
-        # 12.  Cleanup
-        # ------------------------------------------------------------------
         try:
             del df_15m, df_5m, df_daily
             if 'ppo' in locals():
                 del ppo, ppo_signal, smooth_rsi, vwap, mmh
             if cfg.CIRRUS_CLOUD_ENABLED and 'upw' in locals():
                 del upw, dnw
-            gc.collect()
         except Exception as e:
             logger.warning(f"Cleanup error (non-critical): {e}")
         finally:
             PAIR_ID.set("")
 
-async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[str, dict], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[str, dict], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """
+    CRITICAL FIX #1: Now accepts and passes reference_time to downstream functions.
+    """
     try:
         if shutdown_event.is_set():
             return None
@@ -2258,14 +2318,13 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
             logger.warning(f"Product info not found for {pair_name}")
             return None
         symbol = product_info["symbol"]
-        # OPTIMIZED: Exact candle counts needed by indicators (reduces memory/CPU)
-        daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10  # +buffer for pivot calc
-        indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
+        
+        daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10
 
         tasks = [
-            fetcher.fetch_candles(symbol, "15", 300),
-            fetcher.fetch_candles(symbol, "5", 400),
-            fetcher.fetch_candles(symbol, "D", daily_limit) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
+            fetcher.fetch_candles(symbol, "15", 300, reference_time),
+            fetcher.fetch_candles(symbol, "5", 400, reference_time),
+            fetcher.fetch_candles(symbol, "D", daily_limit, reference_time) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2273,19 +2332,22 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         df_5m = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
         df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
 
-        valid_15m, reason_15m = validate_candle_df(df_15m, 220)  # Matches optimized fetch
-        valid_5m, reason_5m = validate_candle_df(df_5m, 280)    # Matches optimized fetch
+        valid_15m, reason_15m = validate_candle_df(df_15m, 220)
+        valid_5m, reason_5m = validate_candle_df(df_5m, 280)
     
         if not valid_15m or not valid_5m:
             logger.warning(f"Insufficient data for {pair_name}: 15m={reason_15m}, 5m={reason_5m}")
             return None
         
-        return await evaluate_pair_and_alert(pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id)
+        return await evaluate_pair_and_alert(pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id, reference_time)
     except Exception as e:
         logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
 
-async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], batch_pairs: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, memory_monitor: MemoryMonitor, lock: RedisLock) -> List[Tuple[str, Dict[str, Any]]]:
+async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], batch_pairs: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, memory_monitor: MemoryMonitor, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    CRITICAL FIX #1: Now accepts and passes reference_time parameter.
+    """
     tasks = []
     per_pair_timeout = max(30, int(cfg.RUN_TIMEOUT_SECONDS / max(1, len(cfg.PAIRS))))
     
@@ -2298,7 +2360,7 @@ async def process_batch(fetcher: DataFetcher, products_map: Dict[str, dict], bat
         async def check_with_timeout(pair):
             try:
                 return await asyncio.wait_for(
-                    check_pair(pair, fetcher, products_map, state_db, telegram_queue, correlation_id),
+                    check_pair(pair, fetcher, products_map, state_db, telegram_queue, correlation_id, reference_time),
                     timeout=per_pair_timeout
                 )
             except asyncio.TimeoutError:
@@ -2344,7 +2406,9 @@ async def run_once() -> bool:
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     
-    # NEW: Tracking variables for run summary
+    reference_time = get_trigger_timestamp()
+    logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
+    
     processed_pairs = set()
     failed_pairs = set()
     alerts_sent = 0
@@ -2369,18 +2433,20 @@ async def run_once() -> bool:
             logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
             return False
 
-        fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
             if sdb.degraded and not sdb.degraded_alerted:
                 logger_run.critical("⚠️ Redis is in degraded mode - alert deduplication disabled!")
+                
+                telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
                     f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
                     f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
                     f"Time: {format_ist_time()}"
                 ))
                 sdb.degraded_alerted = True
+            
+            fetcher = DataFetcher(cfg.DELTA_API_BASE, redis_store=sdb)
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
             global health_tracker
             health_tracker = HealthTracker(sdb)
@@ -2438,9 +2504,8 @@ async def run_once() -> bool:
                     batch_pairs = pairs_to_process[i: i + batch_size]
                     logger_run.debug(f"Processing batch {i // batch_size + 1}: {batch_pairs}")
                     
-                    batch_results = await process_batch(fetcher, products_map, batch_pairs, sdb, telegram_queue, correlation_id, memory_monitor, lock)
+                    batch_results = await process_batch(fetcher, products_map, batch_pairs, sdb, telegram_queue, correlation_id, memory_monitor, lock, reference_time)
                     
-                    # NEW: Update tracking counters
                     for pair_result in batch_results or []:
                         pair_name, state = pair_result
                         processed_pairs.add(pair_name)
@@ -2450,7 +2515,6 @@ async def run_once() -> bool:
                     all_results.extend(batch_results)
 
                     del batch_results
-                    gc.collect()
 
                     if memory_monitor.is_critical():
                         logger_run.warning("Memory critical, stopping batch processing early")
@@ -2473,8 +2537,7 @@ async def run_once() -> bool:
                 
                 run_duration = time.time() - start_time
                 
-                # IMPROVED: Global alert cap safety + comprehensive run summary
-                used_mb = psutil.virtual_memory().used / 1024 / 1024
+                used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
                 summary = (
                     f"✓ RUN SUMMARY | Alerts: {alerts_sent} | Pairs OK: {len(processed_pairs)} | "
                     f"Failed: {len(failed_pairs)} | Runtime: {run_duration:.1f}s | "
@@ -2484,7 +2547,7 @@ async def run_once() -> bool:
                 
                 if alerts_sent > MAX_ALERTS_PER_RUN:
                     telegram_msg = f"⚠️ HIGH VOLUME: {alerts_sent} alerts | Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
-                    await telegram_queue.send(escape_markdown_v2(telegram_msg), priority="high")
+                    await telegram_queue.send(escape_markdown_v2(telegram_msg))
                 
                 if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
                     METRIC_RUN_DURATION.observe(run_duration)
@@ -2605,5 +2668,5 @@ if __name__ == "__main__":
             sys.exit(130)
         except Exception as exc:
             logger.critical(f"Fatal error: {exc}", exc_info=True)
-            sys.exit(1)
+            sys.exit(1) 
 
