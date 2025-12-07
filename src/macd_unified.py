@@ -1566,23 +1566,167 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     return validate_indicator_series(vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0), "VWAP")
 
 def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
-    try:
-        row = df_15m.iloc[idx]
-        o, c, h, l = float(row["open"]), float(row["close"]), float(row["high"]), float(row["low"])
-        rng = max(h - l, 1e-8)
-        if is_buy:
-            if c <= o:
-                return False
-            upper_wick = h - max(o, c)
-            return upper_wick < Constants.MIN_WICK_RATIO * rng
-        else:
-            if c >= o:
-                return False
-            lower_wick = min(o, c) - l
-            return lower_wick < Constants.MIN_WICK_RATIO * rng
-    except Exception as e:
-        logger.error(f"check_common_conditions failed: {e}")
-        return False
+    """
+    CRITICAL FIX: Correct wick calculation for 15-minute candles.
+    
+    For GREEN candles (BUY):
+        - Upper wick = High - Close
+        - Must be < 20% of (High - Low)
+    
+    For RED candles (SELL):
+        - Lower wick = Close - Low
+        - Must be < 20% of (High - Low)
+    
+    Args:
+        df_15m: DataFrame with OHLC data
+        idx: Index of the candle to check
+        is_buy: True for buy (green candle), False for sell (red candle)
+    
+    Returns:
+        True if candle passes quality check, False otherwise
+    """
+    try:
+        row = df_15m.iloc[idx]
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+        
+        # Calculate total candle range (High - Low)
+        candle_range = h - l
+        
+        # Guard against zero or near-zero ranges
+        if candle_range < 1e-8:
+            logger.debug(f"Candle range too small: {candle_range:.8f}")
+            return False
+        
+        if is_buy:
+            # BUY ALERT: Must be GREEN candle (Close > Open)
+            if c <= o:
+                logger.debug(f"BUY rejected: Not green candle | O={o:.4f} C={c:.4f}")
+                return False
+            
+            # Calculate upper wick: High - Close
+            upper_wick = h - c
+            
+            # Calculate wick ratio
+            wick_ratio = upper_wick / candle_range
+            
+            # Check if wick is less than 20% of total range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger.debug(
+                    f"BUY REJECTED: Upper wick too large | "
+                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                    f"Candle Range (H-L)={candle_range:.4f} | "
+                    f"Upper Wick (H-C)={upper_wick:.4f} | "
+                    f"Wick Ratio={wick_ratio*100:.2f}% | "
+                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
+                )
+                return False
+            
+            # Passed all checks
+            logger.debug(
+                f"BUY PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                f"Upper Wick={upper_wick:.4f} ({wick_ratio*100:.2f}%)"
+            )
+            return True
+            
+        else:
+            # SELL ALERT: Must be RED candle (Close < Open)
+            if c >= o:
+                logger.debug(f"SELL rejected: Not red candle | O={o:.4f} C={c:.4f}")
+                return False
+            
+            # Calculate lower wick: Close - Low
+            lower_wick = c - l
+            
+            # Calculate wick ratio
+            wick_ratio = lower_wick / candle_range
+            
+            # Check if wick is less than 20% of total range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger.debug(
+                    f"SELL REJECTED: Lower wick too large | "
+                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                    f"Candle Range (H-L)={candle_range:.4f} | "
+                    f"Lower Wick (C-L)={lower_wick:.4f} | "
+                    f"Wick Ratio={wick_ratio*100:.2f}% | "
+                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
+                )
+                return False
+            
+            # Passed all checks
+            logger.debug(
+                f"SELL PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                f"Lower Wick={lower_wick:.4f} ({wick_ratio*100:.2f}%)"
+            )
+            return True
+            
+    except Exception as e:
+        logger.error(f"check_common_conditions failed at idx={idx}, is_buy={is_buy}: {e}")
+        return False
+
+def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> Tuple[bool, str]:
+    """
+    Wrapper around check_common_conditions that returns both result AND reason.
+    
+    This helps with debugging by capturing WHY a candle failed quality checks.
+    
+    Args:
+        df_15m: DataFrame with OHLC data
+        idx: Index of candle to check
+        is_buy: True for buy alerts, False for sell alerts
+    
+    Returns:
+        Tuple of (passed: bool, reason: str)
+        - If passed=True, reason="Passed"
+        - If passed=False, reason explains why (e.g., "Upper wick 35.06% > 20%")
+    """
+    try:
+        # Check if we have valid index
+        if idx < 0 or idx >= len(df_15m):
+            return False, f"Invalid index {idx}"
+        
+        row = df_15m.iloc[idx]
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+        
+        candle_range = h - l
+        if candle_range < 1e-8:
+            return False, "Candle range too small"
+        
+        if is_buy:
+            # Must be green candle
+            if c <= o:
+                return False, f"Not green candle (C={c:.4f} <= O={o:.4f})"
+            
+            # Check upper wick
+            upper_wick = h - c
+            wick_ratio = upper_wick / candle_range
+            
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Upper wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+            
+            return True, "Passed"
+            
+        else:
+            # Must be red candle
+            if c >= o:
+                return False, f"Not red candle (C={c:.4f} >= O={o:.4f})"
+            
+            # Check lower wick
+            lower_wick = c - l
+            wick_ratio = lower_wick / candle_range
+            
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Lower wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+            
+            return True, "Passed"
+            
+    except Exception as e:
+        return False, f"Error: {str(e)}"
 
 def escape_markdown_v2(text: str) -> str:
     try:
@@ -2086,63 +2230,104 @@ async def evaluate_pair_and_alert(
         vwap_prev = float(vwap.iloc[i15 - 1]) if not vwap.empty else 0.0
 
         mmh_curr = float(mmh.iloc[i15])
-        mmh_m1 = float(mmh.iloc[i15 - 1])
+        mmh_m1   = float(mmh.iloc[i15 - 1])
 
-        cloud_up = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
+        cloud_up   = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
         cloud_down = bool(dnw.iloc[i15]) and not bool(upw.iloc[i15])
 
-        rma50_15 = float((await calculate_indicator_threaded(
-            calculate_rma, df_15m["close"], cfg.RMA_50_PERIOD)).iloc[i15])
-        rma200_5 = float((await calculate_indicator_threaded(
-            calculate_rma, df_5m["close"], cfg.RMA_200_PERIOD)).iloc[i5])
+        rma50_15 = float(
+            (await calculate_indicator_threaded(
+                calculate_rma, df_15m["close"], cfg.RMA_50_PERIOD
+            )).iloc[i15]
+        )
+        rma200_5 = float(
+            (await calculate_indicator_threaded(
+                calculate_rma, df_5m["close"], cfg.RMA_200_PERIOD
+            )).iloc[i5]
+        )
 
-        base_buy_common = rma50_15 < close_curr and rma200_5 < close_curr
+        base_buy_common  = rma50_15 < close_curr and rma200_5 < close_curr
         base_sell_common = rma50_15 > close_curr and rma200_5 > close_curr
 
         if base_buy_common:
             base_buy_common = base_buy_common and (mmh_curr > 0 and cloud_up)
+
         if base_sell_common:
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
-        buy_common_candle_ok = check_common_conditions(df_15m, i15, is_buy=True)
-        sell_common_candle_ok = check_common_conditions(df_15m, i15, is_buy=False)
+        # CRITICAL FIX: Use enhanced candle-quality check with reason tracking
+        buy_candle_passed,  buy_candle_reason  = check_candle_quality_with_reason(
+            df_15m, i15, is_buy=True
+        )
+        sell_candle_passed, sell_candle_reason = check_candle_quality_with_reason(
+            df_15m, i15, is_buy=False
+        )
 
-        buy_common = base_buy_common and buy_common_candle_ok
-        sell_common = base_sell_common and sell_common_candle_ok
+        # Log candle-quality results for debugging
+        if base_buy_common and not buy_candle_passed:
+            logger_pair.info(
+                f"⚠️ BUY alert blocked by candle quality | "
+                f"{pair_name} @ {format_ist_time(ts_curr)} | "
+                f"Reason: {buy_candle_reason}"
+            )
 
-        mmh_reversal_buy = False
+        if base_sell_common and not sell_candle_passed:
+            logger_pair.info(
+                f"⚠️ SELL alert blocked by candle quality | "
+                f"{pair_name} @ {format_ist_time(ts_curr)} | "
+                f"Reason: {sell_candle_reason}"
+            )
+
+        # Final buy/sell common flags
+        buy_common  = base_buy_common  and buy_candle_passed
+        sell_common = base_sell_common and sell_candle_passed
+
+        mmh_reversal_buy  = False
         mmh_reversal_sell = False
+
         if i15 >= 3:
             mmh_m3 = float(mmh.iloc[i15 - 3])
             mmh_m2 = float(mmh.iloc[i15 - 2])
-            mmh_reversal_buy = (buy_common and mmh_curr > 0 and
-                                mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
-            mmh_reversal_sell = (sell_common and mmh_curr < 0 and
-                                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
+
+            mmh_reversal_buy = (
+                buy_common
+                and mmh_curr > 0
+                and mmh_m3 > mmh_m2 > mmh_m1
+                and mmh_curr > mmh_m1
+            )
+            mmh_reversal_sell = (
+                sell_common
+                and mmh_curr < 0
+                and mmh_m3 < mmh_m2 < mmh_m1
+                and mmh_curr < mmh_m1
+            )
 
         context = {
-            "buy_common": buy_common,
-            "sell_common": sell_common,
-            "close_curr": close_curr,
-            "close_prev": close_prev,
-            "ts_curr": ts_curr,
-            "ppo_curr": ppo_curr,
-            "ppo_prev": ppo_prev,
-            "ppo_sig_curr": ppo_sig_curr,
-            "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr": rsi_curr,
-            "rsi_prev": rsi_prev,
-            "vwap_curr": vwap_curr,
-            "vwap_prev": vwap_prev,
-            "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1,
-            "mmh_reversal_buy": mmh_reversal_buy,
-            "mmh_reversal_sell": mmh_reversal_sell,
-            "pivots": piv,
-            "vwap": not pd.Series(dtype=float).equals(vwap),
-            "candle_quality_failed_buy": base_buy_common and not buy_common_candle_ok,
-            "candle_quality_failed_sell": base_sell_common and not sell_common_candle_ok,
-        }
+            "buy_common": buy_common,
+            "sell_common": sell_common,
+            "close_curr": close_curr,
+            "close_prev": close_prev,
+            "ts_curr": ts_curr,
+            "ppo_curr": ppo_curr,
+            "ppo_prev": ppo_prev,
+            "ppo_sig_curr": ppo_sig_curr,
+            "ppo_sig_prev": ppo_sig_prev,
+            "rsi_curr": rsi_curr,
+            "rsi_prev": rsi_prev,
+            "vwap_curr": vwap_curr,
+            "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr,
+            "mmh_m1": mmh_m1,
+            "mmh_reversal_buy": mmh_reversal_buy,
+            "mmh_reversal_sell": mmh_reversal_sell,
+            "pivots": piv,
+            "vwap": not pd.Series(dtype=float).equals(vwap),
+            # UPDATED: Store both failure flag AND reason
+            "candle_quality_failed_buy": base_buy_common and not buy_candle_passed,
+            "candle_quality_failed_sell": base_sell_common and not sell_candle_passed,
+            "candle_rejection_reason_buy": buy_candle_reason if (base_buy_common and not buy_candle_passed) else None,
+            "candle_rejection_reason_sell": sell_candle_reason if (base_sell_common and not sell_candle_passed) else None,
+        }
 
         ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
         ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
@@ -2267,18 +2452,34 @@ async def evaluate_pair_and_alert(
             new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
 
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
-        reasons = []
-        if not context["buy_common"] and not context["sell_common"]:
-            reasons.append("Trend filter blocked")
-        if context.get("candle_quality_failed_buy") or context.get("candle_quality_failed_sell"):
-            reasons.append("Candle quality failed")
-        suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
+        reasons = []
+        
+        # Check trend filter
+        if not context["buy_common"] and not context["sell_common"]:
+            reasons.append("Trend filter blocked")
+        
+        # Check candle quality with detailed reasons
+        if context.get("candle_quality_failed_buy"):
+            buy_reason = context.get("candle_rejection_reason_buy", "Unknown")
+            reasons.append(f"BUY candle quality: {buy_reason}")
+        
+        if context.get("candle_quality_failed_sell"):
+            sell_reason = context.get("candle_rejection_reason_sell", "Unknown")
+            reasons.append(f"SELL candle quality: {sell_reason}")
+        
+        suppression_reason = "; ".join(reasons) if reasons else "No conditions met" 
 
-        new_state["summary"] = {
-            "cloud": cloud,
-            "mmh_hist": round(mmh_curr, 4),
-            "suppression": suppression_reason
-        }
+        new_state["summary"] = {
+            "cloud": cloud,
+            "mmh_hist": round(mmh_curr, 4),
+            "suppression": suppression_reason,
+            "candle_quality": {
+                "buy_passed": not context.get("candle_quality_failed_buy", False),
+                "sell_passed": not context.get("candle_quality_failed_sell", False),
+                "buy_reason": context.get("candle_rejection_reason_buy"),
+                "sell_reason": context.get("candle_rejection_reason_sell"),
+            }
+        }
 
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
