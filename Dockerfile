@@ -44,8 +44,10 @@ COPY wrapper.py config_macd.json ./
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app/src" \
+    PYTHONDONTWRITEBYTECODE=1 \
     CONFIG_FILE=config_macd.json \
-    TZ=Asia/Kolkata
+    TZ=Asia/Kolkata \
+    PORT=10000
 
 # Security: Run as non-root
 RUN useradd -m -u 1000 botuser && \
