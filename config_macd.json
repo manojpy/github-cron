@@ -4,7 +4,7 @@
   "REDIS_URL": "__SET_IN_GITHUB_SECRETS__",
   "DELTA_API_BASE": "https://api.delta.exchange",
   "DEBUG_MODE": false,
-  "SEND_TEST_MESSAGE": false,
+  "SEND_TEST_MESSAGE": true,
   "BOT_NAME": "Unified Alert Bot",
   "PAIRS": [
     "BTCUSD",
