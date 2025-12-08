@@ -94,7 +94,7 @@ jobs:
         id: run_bot
         env:
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
-          
+        run: |
           # OPTIMIZED: Set resource limits to prevent runaway containers
           docker run --rm \
             --name trading-bot-${{ github.run_id }} \
