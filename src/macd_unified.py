@@ -36,16 +36,16 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, Cli
 try:
     import orjson
     
-def json_dumps(obj: Any) -> str:
-    """Fast JSON serialization using orjson with NumPy support"""
-    return orjson.dumps(
-        obj,
-        option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
-    ).decode('utf-8')
+    def json_dumps(obj: Any) -> str:
+        """Fast JSON serialization using orjson with NumPy support"""
+        return orjson.dumps(
+            obj,
+            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+        ).decode('utf-8')
 
-def json_loads(s: str | bytes) -> Any:
-    """Fast JSON deserialization using orjson"""
-    return orjson.loads(s)
+    def json_loads(s: str | bytes) -> Any:
+        """Fast JSON deserialization using orjson"""
+        return orjson.loads(s)
     
     JSON_BACKEND = "orjson"
 except ImportError:
