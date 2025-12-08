@@ -36,7 +36,7 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, Cli
 try:
     import orjson
     
-    def json_dumps(obj: Any) -> str:
+def json_dumps(obj: Any) -> str:
     """Fast JSON serialization using orjson with NumPy support"""
     return orjson.dumps(
         obj,
