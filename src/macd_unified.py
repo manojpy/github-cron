@@ -2700,8 +2700,6 @@ async def run_once() -> bool:
                         f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
                     ))
 
-                await sdb._prune_old_records(cfg.STATE_EXPIRY_DAYS)
-
                 if cfg.SEND_TEST_MESSAGE:
                     await telegram_queue.send(escape_markdown_v2(
                         f"🚀 Unified Bot - Run Started\n"
