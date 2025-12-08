@@ -2688,29 +2688,37 @@ async def run_once() -> bool:
 
             try:
                 dms = DeadMansSwitch(sdb, cfg.DEAD_MANS_COOLDOWN_SECONDS)
-                
                 await dms.update_heartbeat()
-                
+
                 dms_result = await dms.should_alert()
                 if dms_result == "RECOVERED":
-                    await telegram_queue.send(escape_markdown_v2(f"✅ {cfg.BOT_NAME} - BOT RECOVERED\nBot is running normally again."))
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"✅ {cfg.BOT_NAME} - BOT RECOVERED\nBot is running normally again."
+                    ))
                 elif dms_result is True:
-                    await telegram_queue.send(escape_markdown_v2(f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"))
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
+                    ))
 
                 await sdb._prune_old_records(cfg.STATE_EXPIRY_DAYS)
 
                 if cfg.SEND_TEST_MESSAGE:
-                    await telegram_queue.send(escape_markdown_v2(f"🚀 Unified Bot - Run Started\nDate : {format_ist_time(datetime.now(timezone.utc))}\nCorr. ID: {correlation_id}"))
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"🚀 Unified Bot - Run Started\n"
+                        f"Date : {format_ist_time(datetime.now(timezone.utc))}\n"
+                        f"Corr. ID: {correlation_id}"
+                    ))
 
                 # === START NEW BLOCK: Cached products fetch ===
                 PRODUCTS_CACHE = {"data": None, "until": 0.0}  # module-level cache
-                
+
                 now = time.time()
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
                     logger_run.info("Fetching fresh products list from Delta API...")
                     prod_resp = await fetcher.fetch_products()
-                if not prod_resp:
-                    logger_run.error("Failed to fetch products map") or return False
+                    if not prod_resp:
+                        logger_run.error("Failed to fetch products map")
+                        return False
                     PRODUCTS_CACHE["data"] = prod_resp
                     PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
                 else:
@@ -2719,16 +2727,17 @@ async def run_once() -> bool:
 
                 products_map = build_products_map_from_api_result(prod_resp)
                 # === END NEW BLOCK ===
+
                 pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
-                
+
                 if len(pairs_to_process) < len(cfg.PAIRS):
                     missing = set(cfg.PAIRS) - set(pairs_to_process)
                     logger_run.warning(f"Missing products for pairs: {missing}")
-                
+
                 logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
 
                 heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
-                
+
                 # ============================================================================
                 # NEW: Use worker pool instead of batch processing
                 # ============================================================================
@@ -2737,12 +2746,15 @@ async def run_once() -> bool:
                     sdb, telegram_queue, correlation_id,
                     memory_monitor, lock, reference_time
                 )
-                
+
                 # Process results
+                processed_pairs = set()
+                alerts_sent = 0
+                failed_pairs = set()
                 for pair_result in all_results:
                     pair_name, state = pair_result
                     processed_pairs.add(pair_name)
-                if state and state.get("state") == "ALERT_SENT":
+                    if state and state.get("state") == "ALERT_SENT":
                         alerts_sent += state["summary"].get("alerts", 0)
 
                 heartbeat_task.cancel()
@@ -2752,9 +2764,9 @@ async def run_once() -> bool:
                     pass
 
                 await dms.update_heartbeat()
-                
+
                 run_duration = time.time() - start_time
-                
+
                 used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
                 redis_status = "OK" if not sdb.degraded else "DEGRADED"
                 summary = (
@@ -2762,11 +2774,14 @@ async def run_once() -> bool:
                     f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
                 )
                 logger_run.info(summary)
-                
+
                 if alerts_sent > MAX_ALERTS_PER_RUN:
-                    telegram_msg = f"⚠️ HIGH VOLUME: {alerts_sent} alerts | Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
+                    telegram_msg = (
+                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
+                        f"Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
+                    )
                     await telegram_queue.send(escape_markdown_v2(telegram_msg))
-                
+
                 if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
                     METRIC_RUN_DURATION.observe(run_duration)
 
@@ -2814,6 +2829,7 @@ async def run_once() -> bool:
         
         await SessionManager.close_session()
         TRACE_ID.set("")
+
 
 try:
     import uvloop
