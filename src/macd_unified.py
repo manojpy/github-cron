@@ -326,8 +326,6 @@ def setup_logging() -> logging.Logger:
     return logger
 
 logger = setup_logging()
-logger.info(f"🚀 Using JSON backend: {JSON_BACKEND}")
-logger.info(f"Using DELTA_API_BASE: {cfg.DELTA_API_BASE}")
 
 shutdown_event = asyncio.Event()
 
@@ -419,9 +417,8 @@ def print_startup_banner_once() -> None:
         return
     _STARTUP_BANNER_PRINTED = True
     logger.info(
-        f"UNIFIED TRADING BOT - PERFORMANCE OPTIMIZED\n"
-        f"Version: {__version__} | Time: {format_ist_time(datetime.now(timezone.utc), '%d-%m-%Y @%H:%M IST')}\n"
-        f"Pairs: {len(cfg.PAIRS)} | Debug: {cfg.DEBUG_MODE} | Lock Expiry: {Constants.REDIS_LOCK_EXPIRY}s | Run Timeout: {cfg.RUN_TIMEOUT_SECONDS}s"
+        f"🚀 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {Constants.REDIS_LOCK_EXPIRY}s"
     )
 
 print_startup_banner_once()
@@ -563,7 +560,8 @@ class RedisStateStore:
             )
             ok = await self._ping_with_retry(timeout)
             if ok:
-                logger.info("Connected to RedisStateStore (decode_responses=True, max_connections=10)")
+                if cfg.DEBUG_MODE:
+                    logger.debug("Connected to RedisStateStore (decode_responses=True, max_connections=10)")
                 self.degraded = False
                 self.degraded_alerted = False
                 self._connection_attempts = 0
@@ -591,7 +589,8 @@ class RedisStateStore:
 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
-            logger.info(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
+            if cfg.DEBUG_MODE:
+                logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
                 test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
@@ -607,7 +606,8 @@ class RedisStateStore:
                     await self._safe_redis_op(
                         self._redis.delete(test_key), 1.0, "smoke_cleanup"
                     )
-                    logger.info("✅ Redis fully operational (smoke test passed)")
+                    expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
+                    logger.info(f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)")
                     
                     info = await self._safe_redis_op(
                         self._redis.info("memory"), 3.0, "info_memory", lambda r: r
@@ -616,7 +616,8 @@ class RedisStateStore:
                         policy = info.get("maxmemory_policy", "unknown")
                         if policy in ("volatile-lru", "allkeys-lru"):
                             logger.warning(f"⚠️ Redis using {policy} - keys may be evicted under memory pressure")
-                    
+    
+                
                     self.degraded = False
                     self.degraded_alerted = False
                     return
@@ -1077,7 +1078,7 @@ class RedisLock:
                 self.token = token
                 self.acquired_by_me = True
                 self.last_extend_time = time.time()
-                logger.info(f"Acquired Redis lock: {self.lock_key} (expires in {self.expire}s)")
+                logger.info(f"🔒 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)")
                 return True
 
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
@@ -1143,7 +1144,7 @@ class RedisLock:
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
                 timeout=timeout,
             )
-            logger.info(f"Released Redis lock: {self.lock_key}")
+            logger.info(f"🔓 Lock released")
         except Exception as e:
             logger.error(f"Error releasing Redis lock: {e}")
         finally:
@@ -2191,20 +2192,6 @@ async def evaluate_pair_and_alert(
             df_15m, i15, is_buy=False
         )
 
-        if base_buy_common and not buy_candle_passed:
-            logger_pair.info(
-                f"⚠️ BUY alert blocked by candle quality | "
-                f"{pair_name} @ {format_ist_time(ts_curr)} | "
-                f"Reason: {buy_candle_reason}"
-            )
-
-        if base_sell_common and not sell_candle_passed:
-            logger_pair.info(
-                f"⚠️ SELL alert blocked by candle quality | "
-                f"{pair_name} @ {format_ist_time(ts_curr)} | "
-                f"Reason: {sell_candle_reason}"
-            )
-
         buy_common  = base_buy_common  and buy_candle_passed
         sell_common = base_sell_common and sell_candle_passed
 
@@ -2407,8 +2394,23 @@ async def evaluate_pair_and_alert(
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
 
-        indicator_total_time = time.time() - indicator_total_start
+        # Single-line consolidated pair result
+        cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
+        status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
+        
+        if alerts_to_send:
+            status_msg += f" | 🔔 {len(alerts_to_send)} alerts sent"
+        elif base_buy_common and not buy_candle_passed:
+            status_msg += f" | BUY blocked: {buy_candle_reason}"
+        elif base_sell_common and not sell_candle_passed:
+            status_msg += f" | SELL blocked: {sell_candle_reason}"
+        else:
+            status_msg += " | No signals"
+        
+        logger_pair.info(status_msg)
+
         if cfg.DEBUG_MODE:
+            indicator_total_time = time.time() - indicator_total_start
             logger_pair.debug(f"ALL indicators: {indicator_total_time:.2f}s | "
                             f"Pair total: {time.time() - pair_start_time:.2f}s")
 
@@ -2526,15 +2528,17 @@ async def worker_process_pair(
                     async with results_lock:
                         results.append(result)
                     
+                if cfg.DEBUG_MODE:
                     pair, state = result
                     summary = state.get("summary", {})
-                    logger_worker.info(
+                    logger_worker.debug(
                         f"Worker {worker_id} completed {pair} | "
                         f"cloud={summary.get('cloud','n/a')} | "
                         f"mmh_hist={summary.get('mmh_hist','n/a')}"
                     )
                 else:
-                    logger_worker.warning(f"Worker {worker_id}: {pair_name} returned None")
+                    if cfg.DEBUG_MODE:
+                        logger_worker.debug(f"Worker {worker_id}: {pair_name} returned None")
                     if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
                         METRIC_FAILED_PAIRS.inc()
                 
@@ -2606,7 +2610,7 @@ async def process_pairs_with_workers(
     
     # Determine number of workers (use MAX_PARALLEL_FETCH as worker count)
     num_workers = cfg.MAX_PARALLEL_FETCH
-    logger_main.info(f"🚀 Starting worker pool with {num_workers} workers for {len(pairs_to_process)} pairs")
+    logger_main.info(f"📊 Processing {len(pairs_to_process)} pairs with {num_workers}-worker pool")
     
     # Create worker tasks
     workers = []
@@ -2630,8 +2634,6 @@ async def process_pairs_with_workers(
     
     # Wait for all workers to complete
     await asyncio.gather(*workers, return_exceptions=True)
-    
-    logger_main.info(f"✅ Worker pool completed: {len(results)} successful results")
     
     return results
 
@@ -2753,10 +2755,10 @@ async def run_once() -> bool:
                 run_duration = time.time() - start_time
                 
                 used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
+                redis_status = "OK" if not sdb.degraded else "DEGRADED"
                 summary = (
-                    f"✓ RUN SUMMARY | Alerts: {alerts_sent} | Pairs OK: {len(processed_pairs)} | "
-                    f"Failed: {len(failed_pairs)} | Runtime: {run_duration:.1f}s | "
-                    f"Mem: {used_mb:.1f}MB | Redis: {'OK' if not sdb.degraded else 'DEGRADED'}"
+                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
+                    f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
                 )
                 logger_run.info(summary)
                 
@@ -2766,8 +2768,6 @@ async def run_once() -> bool:
                 
                 if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
                     METRIC_RUN_DURATION.observe(run_duration)
-                
-                logger.info(f"⏰ finished@ {format_ist_time()}")
 
                 if cfg.ENABLE_HEALTH_TRACKER:
                     await health_tracker.record_overall({
@@ -2817,9 +2817,9 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info("✅ uvloop enabled (high-performance event loop)")
+    logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
-    logger.info("ℹ️ uvloop not available, using default event loop")
+    logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
