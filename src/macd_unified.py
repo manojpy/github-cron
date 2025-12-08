@@ -1489,7 +1489,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         
         # Calculate standard deviation with minimum periods
         sd = close.rolling(window=50, min_periods=10).std(ddof=0) * resp_clamped
-        sd = sd.fillna(method='bfill').fillna(method='ffill').fillna(0.01)
+        sd = sd.bfill().ffill().fillna(0.01)
         sd = sd.clip(lower=0.001)  # Prevent zero SD
         
         # Vectorized worm calculation using cumsum approach
@@ -1508,7 +1508,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         
         # Calculate moving average with minimum periods
         ma = close.rolling(window=period, min_periods=max(10, period // 3)).mean()
-        ma = ma.fillna(method='bfill').fillna(method='ffill').fillna(close)
+        ma = ma.bfill().ffill().fillna(close)
         
         # Calculate raw with safe division
         worm_safe = worm.replace(0, np.nan).fillna(0.001)
@@ -1520,15 +1520,14 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         min_med = raw.rolling(window=period, min_periods=max(10, period // 3)).min()
         max_med = raw.rolling(window=period, min_periods=max(10, period // 3)).max()
         
-        min_med = min_med.fillna(method='bfill').fillna(method='ffill').fillna(raw.min())
-        max_med = max_med.fillna(method='bfill').fillna(method='ffill').fillna(raw.max())
+        min_med = min_med.bfill().ffill().fillna(raw.min())
+        max_med = max_med.bfill().ffill().fillna(raw.max())
         
         # Safe normalization
         denom = (max_med - min_med).replace(0, 1.0).clip(lower=0.0001)
         temp = ((raw - min_med) / denom).clip(lower=0.0, upper=1.0).fillna(0.5)
         
         # Vectorized value calculation using exponential weighted approach
-        # This replaces the loop while maintaining similar behavior
         alpha = 0.5  # Smoothing factor
         value = temp - 0.5
         value = value.ewm(alpha=alpha, adjust=False).mean() + 0.5
@@ -1570,6 +1569,7 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
         return pd.Series([0.0] * (len(df) if df is not None else 0), 
                         index=(df.index if df is not None else pd.Index([])), 
                         name="hist")
+
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
