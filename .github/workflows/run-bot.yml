@@ -30,7 +30,13 @@ jobs:
     steps:
       - name: Log execution context
         run: |
-          echo "🚀 Run #${{ github.run_number }} | $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M IST')"
+          echo "🚀 Triggered via: ${{ github.event_name }}"
+          echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
+          echo "⏰ Unix Timestamp: $(date +%s)"
+          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+          echo "📋 Run ID: ${{ github.run_id }}"
+          echo "🔢 Run Number: ${{ github.run_number }}"
 
       # OPTIMIZED: Only checkout config file, not entire repo
       - name: Checkout config
@@ -95,6 +101,9 @@ jobs:
         env:
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
+          echo "🤖 Starting trading bot execution..."
+          
+          # OPTIMIZED: Set resource limits to prevent runaway containers
           docker run --rm \
             --name trading-bot-${{ github.run_id }} \
             --memory="512m" \
@@ -124,10 +133,23 @@ jobs:
           EXIT_CODE=$?
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
           
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "❌ Exit code: $EXIT_CODE"
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Bot execution completed successfully"
+          else
+            echo "❌ Bot execution failed with exit code: $EXIT_CODE"
             exit $EXIT_CODE
           fi
+
+      # NEW: Capture execution metrics
+      - name: Log execution summary
+        if: always()
+        run: |
+          echo "📊 Execution Summary:"
+          echo "  - Workflow: ${{ github.workflow }}"
+          echo "  - Run ID: ${{ github.run_id }}"
+          echo "  - Status: ${{ job.status }}"
+          echo "  - Exit Code: ${{ steps.run_bot.outputs.exit_code || 'N/A' }}"
+          echo "  - Duration: ${{ job.status }} at $(date)"
 
       # OPTIMIZED: Enhanced failure notification with more context
       - name: Notify on failure
@@ -138,6 +160,11 @@ jobs:
           echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "📋 Run Number: ${{ github.run_number }}"
           echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+          
+          # Optional: Send failure notification via curl to your monitoring endpoint
+          # curl -X POST "https://your-monitoring-endpoint.com/webhook" \
+          #   -H "Content-Type: application/json" \
+          #   -d "{\"status\":\"failed\",\"run_id\":\"${{ github.run_id }}\",\"time\":\"$(date -u)\"}"
 
       # OPTIONAL: Clean up Docker resources
       - name: Cleanup
