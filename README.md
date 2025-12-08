@@ -1,10 +1,10 @@
-# 📡 Automated MACD Alert Bot  
+# 📡 Automated Alert Bot  
 **Dockerized Trading Alert System — Triggered Every 15 Minutes via Cron-jobs.org**
 
 This repository contains a fully-containerized Python trading alert bot.  
 It runs on GitHub and is triggered *externally* via **Cron-jobs.org**, which calls the GitHub API every 15 minutes to run the workflow and send alerts to Telegram.
 
-The bot processes market data, evaluates MACD-based conditions, and sends formatted alerts to a Telegram chat.
+The bot processes market data, evaluates  conditions, and sends formatted alerts to a Telegram chat.
 
 ---
 
@@ -17,14 +17,14 @@ The bot processes market data, evaluates MACD-based conditions, and sends format
 - Optimized startup speed (uv-based installation, bytecode compilation)
 
 ### 📊 Trading Logic
-- Unified MACD strategy implemented in `src/macd_unified.py`
+- Unified strategy implemented in `src/macd_unified.py`
 - Configurable via `config_macd.json`
 - Designed to run every **15 minutes** on completed candles
 - Supports multiple trading pairs (customizable)
 
 ### 📬 Notifications
 - Sends alerts to Telegram via bot API  
-- Includes pair name, MACD signal, confirmation, timestamps, etc.
+- Includes pair name, signal, confirmation, timestamps, etc.
 
 ### 🕒 Execution
 - Triggered automatically using **Cron-jobs.org → GitHub API → Actions workflow**
@@ -108,7 +108,7 @@ Accept: application/vnd.github+json
 - Sends Telegram alerts  
 
 ### `macd_unified.py`
-- MACD calculation  
+- Indicator calculation  
 - Signal logic  
 - Alert formatting  
 
