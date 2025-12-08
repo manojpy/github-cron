@@ -2817,24 +2817,22 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info("✅ uvloop enabled for high-performance async I/O")
+    logger.info("✅ uvloop enabled (high-performance event loop)")
 except ImportError:
-    logger.info("ℹ️ uvloop not available, using default asyncio event loop")
+    logger.info("ℹ️ uvloop not available, using default event loop")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
-    parser.add_argument("--once", action="store_true", help="Run one pass and exit (overrides config)")
+    parser.add_argument("--once", action="store_true", help="Run one pass and exit")
     parser.add_argument("--debug", action="store_true", help="Set logger to DEBUG")
     args = parser.parse_args()
 
-    # Apply CLI overrides
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
-    # Determine execution mode
     SHOULD_LOOP = cfg.ENABLE_AUTO_RESTART
     if args.once:
         SHOULD_LOOP = False
@@ -2871,7 +2869,6 @@ if __name__ == "__main__":
                 logger.warning(f"Sleeping {cooldown}s before next restart...")
                 time.sleep(cooldown)
     else:
-        # One-shot mode (Default for Cron usage)
         try:
             success = asyncio.run(run_once())
             if success:
