@@ -1471,105 +1471,61 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     return validate_indicator_series(smooth_rsi, "SmoothRSI")
 
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
-    """
-    Vectorized Magical Momentum Histogram calculation with numerical stability
-    """
     try:
         if df is None or "close" not in df or df.empty:
             return pd.Series(dtype=float)
-        
         close = pd.to_numeric(df["close"], errors="coerce").astype(float)
         rows = len(close)
-        
-        if rows < 2:
-            return pd.Series([0.0] * rows, index=close.index, name="hist")
-        
-        # Clamp responsiveness
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        
-        # Calculate standard deviation with minimum periods
-        sd = close.rolling(window=50, min_periods=10).std(ddof=0) * resp_clamped
-        sd = sd.bfill().ffill().fillna(0.01)
-        sd = sd.clip(lower=0.001)  # Prevent zero SD
-        
-        # Vectorized worm calculation using cumsum approach
-        diff = close.diff().fillna(0.0)
-        sign_diff = np.sign(diff)
-        abs_diff = np.abs(diff)
-        
-        # Create mask where abs(diff) > sd
-        exceeds_sd = abs_diff > sd.values
-        
-        # Calculate delta: if exceeds, use sign*sd, else use diff
-        delta = np.where(exceeds_sd, sign_diff * sd.values, diff.values)
-        
-        # Calculate worm as cumulative sum of deltas starting from first close
-        worm = pd.Series(np.concatenate([[close.iloc[0]], close.iloc[0] + np.cumsum(delta[1:])]), index=close.index)
-        
-        # Calculate moving average with minimum periods
-        ma = close.rolling(window=period, min_periods=max(10, period // 3)).mean()
-        ma = ma.bfill().ffill().fillna(close)
-        
-        # Calculate raw with safe division
-        worm_safe = worm.replace(0, np.nan).fillna(0.001)
-        raw = (worm - ma) / worm_safe
+        sd = close.rolling(window=50, min_periods=1).std(ddof=0) * resp_clamped
+        sd = validate_indicator_series(sd, "MMH_SD")
+        worm_arr = np.empty(rows, dtype=float)
+        first_val = float(close.iloc[0]) if pd.notna(close.iloc[0]) else 0.0
+        worm_arr[0] = first_val
+        for i in range(1, rows):
+            src = float(close.iloc[i]) if pd.notna(close.iloc[i]) else worm_arr[i - 1]
+            prev_worm = worm_arr[i - 1]
+            diff = src - prev_worm
+            sd_i = sd.iloc[i]
+            if np.isnan(sd_i):
+                delta = diff
+            else:
+                delta = (np.sign(diff) * sd_i) if (abs(diff) > sd_i) else diff
+            worm_arr[i] = prev_worm + delta
+        worm = pd.Series(worm_arr, index=close.index)
+        ma = close.rolling(window=period, min_periods=1).mean()
+        ma = validate_indicator_series(ma, "MMH_MA")
+        raw = (worm - ma) / worm.replace(0, np.nan)
         raw = raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        raw = raw.clip(lower=-10, upper=10)  # Prevent extreme values
-        
-        # Normalize using rolling min/max
-        min_med = raw.rolling(window=period, min_periods=max(10, period // 3)).min()
-        max_med = raw.rolling(window=period, min_periods=max(10, period // 3)).max()
-        
-        min_med = min_med.bfill().ffill().fillna(raw.min())
-        max_med = max_med.bfill().ffill().fillna(raw.max())
-        
-        # Safe normalization
-        denom = (max_med - min_med).replace(0, 1.0).clip(lower=0.0001)
-        temp = ((raw - min_med) / denom).clip(lower=0.0, upper=1.0).fillna(0.5)
-        
-        # Vectorized value calculation using exponential weighted approach
-        alpha = 0.5  # Smoothing factor
-        value = temp - 0.5
-        value = value.ewm(alpha=alpha, adjust=False).mean() + 0.5
-        value = value.clip(lower=-0.9999, upper=0.9999)
-        
-        # Safe log calculation
+        raw = validate_indicator_series(raw, "MMH_RAW")
+        min_med = raw.rolling(window=period, min_periods=1).min()
+        max_med = raw.rolling(window=period, min_periods=1).max()
+        denom = (max_med - min_med).replace(0, 1e-12)
+        temp = (raw - min_med) / denom
+        temp = temp.clip(lower=0.0, upper=1.0).fillna(0.5)
+        temp = validate_indicator_series(temp, "MMH_TEMP")
+        value_arr = np.zeros(rows, dtype=float)
+        value_arr[0] = 1.0
+        for i in range(1, rows):
+            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
+            t = float(temp.iloc[i]) if not np.isnan(temp.iloc[i]) else 0.5
+            v = t - 0.5 + 0.5 * prev_v
+            value_arr[i] = max(-0.9999, min(0.9999, v))
+        value = pd.Series(value_arr, index=close.index)
         temp2 = (1.0 + value) / (1.0 - value)
-        temp2 = temp2.replace([np.inf, -np.inf], np.nan)
-        temp2 = temp2.clip(lower=0.0001, upper=10000)
-        temp2 = temp2.fillna(1.0)
-        
-        # Calculate momentum
+        temp2 = temp2.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        temp2 = temp2.clip(lower=1e-8, upper=1e8)
         momentum = 0.25 * np.log(temp2)
-        momentum = momentum.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        momentum = momentum.clip(lower=-5, upper=5)  # Prevent extreme momentum values
-        
-        # Apply smoothing with exponential weighted average (replaces loop)
-        hist = momentum.ewm(alpha=0.5, adjust=False).mean()
-        hist = hist.fillna(0.0).replace([np.inf, -np.inf], 0.0)
-        
-        # Final safety checks
-        hist = hist.clip(lower=-10, upper=10)
-        hist = hist.fillna(0.0)
-        
-        # Ensure no zeros in the middle of the series (interpolate if needed)
-        if (hist == 0.0).sum() > rows * 0.5:  # If more than 50% zeros
-            hist = hist.replace(0.0, np.nan).interpolate(method='linear', limit_direction='both').fillna(0.0)
-        
-        hist.name = "hist"
-        
-        if cfg.DEBUG_MODE:
-            non_zero = (hist != 0.0).sum()
-            logger.debug(f"MMH stats: min={hist.min():.4f}, max={hist.max():.4f}, mean={hist.mean():.4f}, non-zero={non_zero}/{rows}")
-        
-        return hist
-        
+        momentum = validate_indicator_series(momentum, "MMH_MOMENTUM")
+        momentum_arr = momentum.to_numpy(dtype=float)
+        for i in range(1, rows):
+            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+            momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+        hist = pd.Series(momentum_arr, index=close.index, name="hist")
+        return validate_indicator_series(hist, "MMH_HIST")
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
-        return pd.Series([0.0] * (len(df) if df is not None else 0), 
-                        index=(df.index if df is not None else pd.Index([])), 
-                        name="hist")
-
+        return pd.Series([0.0] * (len(df) if df is not None else 0), index=(df.index if df is not None else pd.Index([])), name="hist")
 
 def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty:
