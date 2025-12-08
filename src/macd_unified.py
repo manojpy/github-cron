@@ -2710,7 +2710,7 @@ async def run_once() -> bool:
                     logger_run.info("Fetching fresh products list from Delta API...")
                     prod_resp = await fetcher.fetch_products()
                     if not prod_resp:
-                        logger_run.error("Failed to fetch products map") or return False
+                    logger_run.error("Failed to fetch products map") or return False
                     PRODUCTS_CACHE["data"] = prod_resp
                     PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
                 else:
