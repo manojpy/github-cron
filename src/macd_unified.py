@@ -2709,7 +2709,7 @@ async def run_once() -> bool:
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
                     logger_run.info("Fetching fresh products list from Delta API...")
                     prod_resp = await fetcher.fetch_products()
-                    if not prod_resp:
+                if not prod_resp:
                     logger_run.error("Failed to fetch products map") or return False
                     PRODUCTS_CACHE["data"] = prod_resp
                     PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
@@ -2742,7 +2742,7 @@ async def run_once() -> bool:
                 for pair_result in all_results:
                     pair_name, state = pair_result
                     processed_pairs.add(pair_name)
-                    if state and state.get("state") == "ALERT_SENT":
+                if state and state.get("state") == "ALERT_SENT":
                         alerts_sent += state["summary"].get("alerts", 0)
 
                 heartbeat_task.cancel()
