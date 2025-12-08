@@ -14,12 +14,10 @@ import asyncio
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 def log_env_summary():
-    """Print a raw summary of the environment before logger init if possible."""
-    print("=" * 70)
-    print("🚀 Wrapper Starting")
-    print(f"   GITHUB_RUN_ID: {os.getenv('GITHUB_RUN_ID', 'N/A')}")
-    print(f"   PAIRS Configured: {len(os.getenv('PAIRS', '').split(',')) if os.getenv('PAIRS') else 'Using Config File'}")
-    print("=" * 70)
+    """Print a minimal summary before logger init."""
+    run_id = os.getenv('GITHUB_RUN_ID', 'local')
+    if run_id != 'local':
+        print(f"🚀 Run ID: {run_id}")
 
 try:
     log_env_summary()
@@ -38,16 +36,14 @@ async def main() -> int:
     Returns: 0 (Success), 1 (Config Error), 2 (Runtime Error)
     """
     try:
-        logger.info(f"📋 Loaded Bot: {cfg.BOT_NAME} | Workers: {cfg.MAX_PARALLEL_FETCH}")
         
         # Execute the optimized run
         success = await run_once()
         
         if success:
-            logger.info("✅ Wrapper: Execution successful")
             return 0
         else:
-            logger.error("⚠️ Wrapper: Execution reported failure")
+            logger.error("❌ Execution failed")
             return 2
             
     except KeyboardInterrupt:
