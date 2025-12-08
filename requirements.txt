@@ -17,10 +17,11 @@ redis[hiredis]==5.2.1
 
 # Data validation and settings management
 pydantic==2.10.3
+pydantic-settings==2.6.1  # If you're using Settings classes
 
 # System and process utilities
 psutil==6.1.0
-orjson==3.9.15
+orjson==3.10.12  # Latest stable version with bug fixes
 
 # Timezone database
 tzdata==2024.2
@@ -30,3 +31,9 @@ typing-extensions==4.12.2
 
 # Prometheus metrics (optional but recommended)
 prometheus-client==0.21.0
+
+# =============================================================================
+# Optional: Uncomment if needed
+# =============================================================================
+# python-telegram-bot==21.7  # If using telegram bot library
+# aiofiles==24.1.0  # If doing async file operations 

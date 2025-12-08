@@ -1,127 +1,70 @@
-# ============================================================================
-# Python
-# ============================================================================
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
-*.egg-info/
-dist/
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
 *.egg
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.hypothesis/
-*.cover
-.python-version
 
-# ============================================================================
 # Virtual environments
-# ============================================================================
 venv/
-env/
 ENV/
-.venv/
-.virtualenv/
-pip-selfcheck.json
+env/
+.venv
 
-# ============================================================================
-# IDEs
-# ============================================================================
-.vscode/
+# PyCharm
 .idea/
-*.swp
-*.swo
-*~
-.project
-.pydevproject
-.settings/
-*.sublime-project
-*.sublime-workspace
 
-# ============================================================================
-# Logs and temporary files
-# ============================================================================
-*.log
-last_run.log
-macd_bot.log
-*.log.*
-*.pid
-*.lock
+# VS Code
+.vscode/
 
-# ============================================================================
-# Environment variables (NEVER commit secrets!)
-# ============================================================================
+# Environment variables
 .env
 .env.local
 .env.*.local
-.env.production
-.env.development
-*.secret
-*.key
-*.pem
-config_macd.local.json
 
-# ============================================================================
-# Redis dumps (if running locally)
-# ============================================================================
-dump.rdb
-*.rdb
+# Logs
+*.log
+logs/
+macd_bot.log
 
-# ============================================================================
 # OS files
-# ============================================================================
 .DS_Store
 Thumbs.db
-desktop.ini
-$RECYCLE.BIN/
 
-# ============================================================================
-# Cache directories
-# ============================================================================
-.cache/
-.pip_cache/
-*.cache
+# PID files
+*.pid
+/tmp/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+
+# mypy
 .mypy_cache/
 .dmypy.json
 dmypy.json
-.ruff_cache/
-
-# ============================================================================
-# Jupyter Notebooks (if you use them for analysis)
-# ============================================================================
-.ipynb_checkpoints
-*.ipynb
-
-# ============================================================================
-# Docker (optional - uncomment if you don't want to track images)
-# ============================================================================
-# *.tar
-# *.tar.gz
-
-# ============================================================================
-# Local development
-# ============================================================================
-scratch/
-tmp/
-temp/
-local/
-dev/
-
-# ============================================================================
-# Testing artifacts
-# ============================================================================
-.pytest_cache/
-.coverage.*
-coverage.xml
-*.cover
-nosetests.xml
-
-# ============================================================================
-# Documentation builds
-# ============================================================================
-docs/_build/
-site/
