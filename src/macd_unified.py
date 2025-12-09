@@ -8,29 +8,32 @@ import logging
 import logging.handlers
 import ssl
 import signal
+import hashlib
 import re
-import gc
 import uuid
 import argparse
 import psutil
 import math
-from collections import deque
+from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
-
-# Third-party imports
+import gc
 import aiohttp
-from aiohttp import web, ClientConnectorError, ClientResponseError, TCPConnector, ClientError
+from aiohttp import web
 import pandas as pd
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
+from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit
-   
+
+# ============================================================================
+# PERFORMANCE ENHANCEMENT: Use orjson for faster JSON operations
+# ============================================================================
 try:
     import orjson
     
@@ -47,7 +50,7 @@ except ImportError:
     import json
     json_dumps = json.dumps
     json_loads = json.loads
-    JSON_BACKEND = "stdlib" 
+    JSON_BACKEND = "stdlib"
 
 PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "false").lower() in ("1", "true", "yes")
 try:
@@ -61,7 +64,6 @@ except Exception:
 
 __version__ = "1.1.0-performance-optimized"
 
-# --- CONSTANTS ---
 class Constants:
     MIN_WICK_RATIO = 0.2
     PPO_THRESHOLD_BUY = 0.20
@@ -78,13 +80,12 @@ class Constants:
     MEMORY_CHECK_INTERVAL = 30
     MEMORY_LIMIT_PERCENT = float(os.getenv("MEMORY_LIMIT_PERCENT", 85.0))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
-    MAX_PRICE_CHANGE_PERCENT = 40.0  # Stricter flash crash protection
+    MAX_PRICE_CHANGE_PERCENT = 50.0
     MAX_CANDLE_GAP_MULTIPLIER = 2.0
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
     PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "10000"))
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
-    MIN_CANDLE_BODY_PERCENT = 0.02  # Ignore candles smaller than 0.02% move (noise/doji)
 
 HEALTH_SERVER_ENABLED = os.getenv("HEALTH_SERVER_ENABLED", "false").lower() in ("1", "true", "yes")
 HEALTH_HTTP_PORT = int(os.getenv("HEALTH_HTTP_PORT", "10001"))
@@ -116,18 +117,15 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         except Exception:
             return str(dt_or_ts)
 
-# --- CONFIGURATION ---
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     REDIS_URL: str = Field(..., min_length=1)
     DELTA_API_BASE: str = Field(..., min_length=1)
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
-    LOG_MINIMAL: bool = Field(default=False, env='LOG_MINIMAL', description="Reduce logs to start/summary/end only")
     SEND_TEST_MESSAGE: bool = True
     BOT_NAME: str = "Unified Alert Bot"
-    PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "SOLUSD"], min_length=1)
-    # ... (Keep your existing indicator settings X1, X2, PPO, etc. here) ...
+    PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"], min_length=1)
     PPO_FAST: int = 7
     PPO_SLOW: int = 16
     PPO_SIGNAL: int = 5
@@ -147,7 +145,12 @@ class BotConfig(BaseModel):
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
+    JITTER_MIN: float = 0.1
+    JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
+    BATCH_SIZE: int = 4
+    TCP_CONN_LIMIT: int = 8
+    TCP_CONN_LIMIT_PER_HOST: int = 10
     TELEGRAM_RETRIES: int = 3
     TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000
@@ -169,16 +172,15 @@ class BotConfig(BaseModel):
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
     INDICATOR_THREAD_LIMIT: int = 3
-    DRY_RUN_MODE: bool = False
-    MIN_RUN_TIMEOUT: int = 300
-    MAX_ALERTS_PER_PAIR: int = 8
+    DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
+    MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
+    MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
             raise ValueError('Invalid Telegram bot token format')
         return v
-
 
     @field_validator('TELEGRAM_CHAT_ID')
     def validate_chat_id(cls, v: str) -> str:
@@ -196,7 +198,6 @@ class BotConfig(BaseModel):
     def validate_logic(self) -> 'BotConfig':
         if self.PPO_FAST >= self.PPO_SLOW:
             raise ValueError('PPO_FAST must be less than PPO_SLOW')
-        return self
 
         if self.RUN_TIMEOUT_SECONDS < self.MIN_RUN_TIMEOUT:
             raise ValueError(
@@ -1433,87 +1434,6 @@ class RateLimitedFetcher:
             "current_queue_size": len(self.requests),
             "max_per_minute": self.max_per_minute
         }
-
-class DataQualityGate:
-    """
-    Validates candle data before processing to prevent false alerts.
-    """
-    @staticmethod
-    def validate(df: pd.DataFrame, pair_name: str, interval_str: str) -> Tuple[bool, str]:
-        if df is None or df.empty:
-            return False, "Empty DataFrame"
-        
-        # 1. Critical Column Check
-        required_cols = {"close", "open", "high", "low", "volume", "timestamp"}
-        if not required_cols.issubset(df.columns):
-             return False, "Missing required columns"
-
-        # 2. Data Health (NaNs or Zero Close)
-        if df["close"].isna().any() or (df["close"] <= 0).any():
-            return False, "Invalid close prices (NaN or <= 0)"
-            
-        # 3. Timestamp Monotonicity
-        if not df["timestamp"].is_monotonic_increasing:
-             return False, "Timestamps not monotonic"
-
-        # 4. History Length Check
-        required_len = 100  # Need enough for EMAs/RMA
-        if len(df) < required_len:
-            return False, f"Insufficient history: {len(df)} < {required_len}"
-
-        # 5. Timestamp Drift (Freshness Check)
-        last_ts = int(df["timestamp"].iloc[-1])
-        now_ts = int(time.time())
-        
-        # Allow up to 2 intervals of lag + 5 min buffer (e.g., for 15m, allow 35m total lag)
-        interval_min = 1440 if interval_str == "D" else int(interval_str)
-        max_lag = (interval_min * 60 * 2) + 300 
-        
-        # Only check lag if we aren't using a backtest trigger timestamp
-        if not os.getenv("TRIGGER_TIMESTAMP") and (now_ts - last_ts) > max_lag:
-            return False, f"Stale data. Last candle: {format_ist_time(last_ts)}"
-
-        if (last_ts - now_ts) > 300: # Future timestamp check (clock skew)
-             return False, f"Future timestamp detected: {last_ts}"
-
-        # 6. Flash Crash / Pump Protection (Last candle)
-        # Check percentage change of last closed candle vs previous
-        if len(df) >= 2:
-            prev_close = df["close"].iloc[-2]
-            curr_close = df["close"].iloc[-1]
-            if prev_close > 0:
-                pct_change = abs(curr_close - prev_close) / prev_close * 100
-                if pct_change > Constants.MAX_PRICE_CHANGE_PERCENT:
-                    return False, f"Extreme volatility: {pct_change:.2f}% > Limit"
-
-        # 7. Dead Candle / Zero Volume (Last candle)
-        last_candle = df.iloc[-1]
-        if last_candle["volume"] <= 0:
-            return False, "Zero volume detected"
-        
-        rng = last_candle["high"] - last_candle["low"]
-        if rng == 0:
-            return False, "Flat candle (High == Low)"
-
-        # 8. Body Size / Noise Filter (Avoid tiny Dojis triggering reversals)
-        body_size = abs(last_candle["close"] - last_candle["open"])
-        if last_candle["open"] > 0:
-            body_pct = (body_size / last_candle["open"]) * 100
-            if body_pct < Constants.MIN_CANDLE_BODY_PERCENT:
-                # Optional: You might want to allow this but flag it. 
-                # For strict filtering:
-                return False, f"Candle body too small ({body_pct:.3f}%) - Noise"
-
-        # 9. Gap Detection (Time)
-        time_diffs = df["timestamp"].diff().dropna()
-        if len(time_diffs) > 0:
-            median_diff = time_diffs.median()
-            last_gap = time_diffs.iloc[-1]
-            # If the last gap is > 3x the expected interval, data is missing
-            if last_gap > (median_diff * 3):
-                 return False, f"Large time gap detected: {last_gap}s"
-
-        return True, "Passed"
 
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None, redis_store: Optional[RedisStateStore] = None):
@@ -2809,29 +2729,21 @@ async def evaluate_pair_and_alert(
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
 
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
+        status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
         
-        # Only log per-pair details if NOT in minimal mode OR if alerts were sent
-        if alerts_to_send or not cfg.LOG_MINIMAL:
-            status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
-            
-            if alerts_to_send:
-                status_msg += f" | 🔔 {len(alerts_to_send)} ALERTS SENT"
-                # Always log alert events even in minimal mode
-                logger.info(status_msg) 
-            elif base_buy_common and not buy_candle_passed:
-                status_msg += f" | BUY blocked: {buy_candle_reason}"
-                logger.info(status_msg)
-            elif base_sell_common and not sell_candle_passed:
-                status_msg += f" | SELL blocked: {sell_candle_reason}"
-                logger.info(status_msg)
-            else:
-                # This is the "spammy" log we suppress in minimal mode
-                if not cfg.LOG_MINIMAL:
-                    status_msg += " | No signals"
-                    logger.info(status_msg)
+        if alerts_to_send:
+            status_msg += f" | 🔔 {len(alerts_to_send)} alerts sent"
+        elif base_buy_common and not buy_candle_passed:
+            status_msg += f" | BUY blocked: {buy_candle_reason}"
+        elif base_sell_common and not sell_candle_passed:
+            status_msg += f" | SELL blocked: {sell_candle_reason}"
+        else:
+            status_msg += " | No signals"
+        
+        logger_pair.info(status_msg)
 
         if cfg.DEBUG_MODE:
-            logger.debug(f"Pair total: {time.time() - pair_start_time:.2f}s")
+            logger_pair.debug(f"Pair total: {time.time() - pair_start_time:.2f}s")
 
         return pair_name, new_state
 
@@ -2851,78 +2763,39 @@ async def evaluate_pair_and_alert(
         finally:
             PAIR_ID.set("")
 
-async def check_pair(
-    pair_name: str, 
-    fetcher: DataFetcher, 
-    products_map: Dict[str, dict], 
-    state_db: RedisStateStore, 
-    telegram_queue: TelegramQueue, 
-    correlation_id: str, 
-    reference_time: int
-) -> Optional[Tuple[str, Dict[str, Any]]]:
-    
-    # 1. Context Logging Setup
-    # Only create a logger if we are NOT in minimal mode or if an error happens
-    logger_pair = logging.getLogger(f"macd_bot.{pair_name}") if not cfg.LOG_MINIMAL else None
-
+async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[str, dict], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
     try:
         if shutdown_event.is_set():
             return None
-            
         product_info = products_map.get(pair_name)
         if not product_info:
+            logger.warning(f"Product info not found for {pair_name}")
             return None
         symbol = product_info["symbol"]
         
         daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10
 
-        # 2. Fetch Data
         tasks = [
             fetcher.fetch_candles(symbol, "15", 300, reference_time),
             fetcher.fetch_candles(symbol, "5", 400, reference_time),
-            # Optimize: Don't fetch daily if pivot is disabled
             fetcher.fetch_candles(symbol, "D", daily_limit, reference_time) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        df_15m = parse_candles_result(results[0]) if not isinstance(results[0], Exception) else None
+        df_5m = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
+        df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
+
+        valid_15m, reason_15m = validate_candle_df(df_15m, 220)
+        valid_5m, reason_5m = validate_candle_df(df_5m, 280)
+    
+        if not valid_15m or not valid_5m:
+            logger.warning(f"Insufficient data for {pair_name}: 15m={reason_15m}, 5m={reason_5m}")
+            return None
         
-        # Check for exceptions
-        for res in results:
-            if isinstance(res, Exception):
-                if logger_pair: logger_pair.warning(f"Fetch failed for {pair_name}: {res}")
-                return None
-
-        # Parse
-        df_15m = parse_candles_result(results[0])
-        df_5m = parse_candles_result(results[1])
-        df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT else None
-
-        # --- 3. DATA QUALITY GATE ---
-        # Validate 15m (Primary timeframe)
-        valid_15, reason_15 = DataQualityGate.validate(df_15m, pair_name, "15")
-        if not valid_15:
-            # In minimal mode, we generally don't log skips unless debugging is needed
-            # But let's log warnings for "Flash Crashes" or "Stale Data" as they are important
-            if "Stale" in reason_15 or "Volatility" in reason_15 or not cfg.LOG_MINIMAL:
-                 logger.warning(f"⛔ Skipped {pair_name}: {reason_15}")
-            return None
-
-        # Validate 5m (Secondary)
-        valid_5, reason_5 = DataQualityGate.validate(df_5m, pair_name, "5")
-        if not valid_5:
-            if not cfg.LOG_MINIMAL:
-                logger.warning(f"⛔ Skipped {pair_name} (5m): {reason_5}")
-            return None
-        # ----------------------------
-
-        # 4. Evaluate
-        return await evaluate_pair_and_alert(
-            pair_name, df_15m, df_5m, df_daily, state_db, 
-            telegram_queue, correlation_id, reference_time
-        )
-
+        return await evaluate_pair_and_alert(pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id, reference_time)
     except Exception as e:
-        logger.error(f"❌ Error in check_pair for {pair_name}: {e}")
+        logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
 
 async def worker_process_pair(
@@ -2940,21 +2813,21 @@ async def worker_process_pair(
     results_lock: asyncio.Lock
 ) -> None:
     """
-    Worker coroutine: Processes pairs from queue, handles memory GC, and extends locks.
+    Worker coroutine that processes pairs from the queue.
+    Each worker runs independently and picks up work as it becomes available.
     """
     logger_worker = logging.getLogger(f"macd_bot.worker_{worker_id}")
     
     while True:
         try:
             try:
-                # Non-blocking check with timeout to allow shutdown checks
                 pair_name = await asyncio.wait_for(pair_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 if pair_queue.empty():
                     break
                 continue
             
-            if pair_name is None: # Poison pill
+            if pair_name is None:
                 pair_queue.task_done()
                 break
             
@@ -2962,8 +2835,8 @@ async def worker_process_pair(
                 pair_queue.task_done()
                 break
             
-            # --- PROCESS PAIR ---
-            # check_pair now includes the DataQualityGate logic internally
+            logger_worker.debug(f"Worker {worker_id} processing {pair_name}")
+            
             try:
                 result = await check_pair(
                     pair_name, fetcher, products_map, state_db,
@@ -2973,32 +2846,60 @@ async def worker_process_pair(
                 if result:
                     async with results_lock:
                         results.append(result)
-            except Exception as e:
-                logger_worker.error(f"Worker {worker_id} crash on {pair_name}: {e}")
-            
-            # --- MEMORY & LOCK MANAGEMENT ---
-            # Only check occasionally (probabilistic) to save CPU
-            if worker_id == 0 and random.random() < 0.1: 
-                # Extension check
-                if lock.should_extend():
-                    if not await lock.extend(timeout=3.0):
-                        logger_worker.critical("Lock lost during processing - aborting")
-                        pair_queue.task_done()
-                        break
+                    
+                    if cfg.DEBUG_MODE:
+                        pair, state = result
+                        summary = state.get("summary", {})
+                        logger_worker.debug(
+                            f"Worker {worker_id} completed {pair} | "
+                            f"cloud={summary.get('cloud','n/a')} | "
+                            f"mmh_hist={summary.get('mmh_hist','n/a')}"
+                        )
+                else:
+                    if cfg.DEBUG_MODE:
+                        logger_worker.debug(f"Worker {worker_id}: {pair_name} returned None")
+                    if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
+                        METRIC_FAILED_PAIRS.inc()
                 
-                # Memory check (Critical Gate)
-                if memory_monitor.is_critical():
-                    logger_worker.critical("Worker memory critical - triggering GC")
-                    import gc
+            except Exception as e:
+                logger_worker.error(f"Worker {worker_id} error processing {pair_name}: {e}")
+                if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
+                    METRIC_FAILED_PAIRS.inc()
+            
+            # OPTIMIZATION: Memory check with GC trigger
+            if worker_id == 0 and memory_monitor.should_check():
+                import gc
+                used_bytes, mem_percent = memory_monitor.check_memory()
+                if PROMETHEUS_ENABLED and METRIC_MEMORY_USAGE:
+                    METRIC_MEMORY_USAGE.set(float(used_bytes) / 1048576.0)
+                
+                # If memory is > 70% (warn level), force cleanup
+                if mem_percent > 70.0:
+                    logger_worker.debug(f"Worker {worker_id}: Memory at {mem_percent:.1f}%, triggering GC")
                     gc.collect()
-
+                
+                if memory_monitor.is_critical():
+                    logger_worker.critical(f"🚨 Worker {worker_id}: Memory critical ({mem_percent:.1f}%)")
+                    pair_queue.task_done()
+                    break
+            
+            # Lock extension check
+            if lock.should_extend():
+                if not await lock.extend(timeout=3.0):
+                    logger_worker.error(f"Worker {worker_id}: Failed to extend Redis lock")
+                    pair_queue.task_done()
+                    break
+            
             pair_queue.task_done()
             
         except asyncio.CancelledError:
+            logger_worker.debug(f"Worker {worker_id} cancelled")
             break
         except Exception as e:
             logger_worker.error(f"Worker {worker_id} unexpected error: {e}")
             break
+    
+    logger_worker.debug(f"Worker {worker_id} exiting")
 
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
@@ -3012,23 +2913,30 @@ async def process_pairs_with_workers(
     reference_time: int
 ) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    Orchestrates the worker pool for parallel processing.
+    Process all pairs using a worker pool architecture.
+    
+    This is the key performance optimization:
+    - Creates a queue of pairs to process
+    - Spawns multiple workers that process pairs concurrently
+    - Workers pick up new pairs as soon as they finish the current one
+    - Much more efficient than batch processing with wait times
     """
-    # Create queue
+    logger_main = logging.getLogger("macd_bot.worker_pool")
+    
+    # Create queue and add all pairs
     pair_queue: asyncio.Queue = asyncio.Queue()
     for pair in pairs_to_process:
         await pair_queue.put(pair)
     
+    # Results storage
     results: List[Tuple[str, Dict[str, Any]]] = []
     results_lock = asyncio.Lock()
     
-    # Determine worker count (Limit to MAX_PARALLEL_FETCH)
+    # Determine number of workers (use MAX_PARALLEL_FETCH as worker count)
     num_workers = cfg.MAX_PARALLEL_FETCH
+    logger_main.info(f"📊 Processing {len(pairs_to_process)} pairs with {num_workers}-worker pool")
     
-    if not cfg.LOG_MINIMAL:
-        logging.getLogger("macd_bot").info(f"⚡ Starting {num_workers} workers for {len(pairs_to_process)} pairs")
-    
-    # Spawn workers
+    # Create worker tasks
     workers = []
     for worker_id in range(num_workers):
         worker = asyncio.create_task(
@@ -3041,51 +2949,39 @@ async def process_pairs_with_workers(
         )
         workers.append(worker)
     
-    # Wait for queue to drain
+    # Wait for all pairs to be processed
     await pair_queue.join()
     
-    # Poison pills
+    # Send poison pills to workers to signal shutdown
     for _ in range(num_workers):
         await pair_queue.put(None)
     
-    # Wait for completion
+    # Wait for all workers to complete
     await asyncio.gather(*workers, return_exceptions=True)
     
     return results
 
 async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
-    """
-    Main execution lifecycle:
-    1. Setup Resources (Redis, Lock, DMS)
-    2. Fetch Metadata (Products)
-    3. Run Worker Pool
-    4. Report Summary
-    """
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
-    
-    # Context-aware logger
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     
-    # --- MINIMAL LOG: START ---
-    if not cfg.LOG_MINIMAL:
-        logger_run.info(f"🚀 Run Start | Trigger: {get_trigger_timestamp()}")
-    else:
-        # In minimal mode, only log start if it's the very first run or specific intervals
-        pass
-
-    # Resource holders
-    local_health_server: Optional[HealthHttpServer] = None
-    lock: Optional[RedisLock] = None
-    watchdog: Optional[WatchdogTask] = None
-    sdb: Optional[RedisStateStore] = None
-    lock_acquired = False
+    reference_time = get_trigger_timestamp()
+    logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
+    
+    processed_pairs = set()
+    failed_pairs = set()
+    alerts_sent = 0
+    MAX_ALERTS_PER_RUN = 50
     
     memory_monitor = MemoryMonitor(Constants.MEMORY_LIMIT_PERCENT)
-    
+    local_health_server: Optional[HealthHttpServer] = None
+    lock_acquired = False
+    lock: Optional[RedisLock] = None
+    watchdog: Optional[WatchdogTask] = None
+
     try:
-        # 1. Watchdog & Health
         watchdog = WatchdogTask(cfg.RUN_TIMEOUT_SECONDS, grace_seconds=120)
         watchdog.start()
 
@@ -3093,105 +2989,199 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
             local_health_server = HealthHttpServer(HEALTH_HTTP_PORT)
             await local_health_server.start()
 
-        # 2. Memory Safety Check
         if memory_monitor.is_critical():
-            logger_run.critical("🚨 Startup Memory Critical - Aborting Run")
+            mem_percent = memory_monitor.check_memory()[1]
+            logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
             return False
 
-        # 3. Redis Connection (Reuse or Create)
+        # OPTIMIZATION: Use existing Redis connection or create new one
         if existing_redis is not None:
             sdb = existing_redis
+            logger_run.debug("Using persistent Redis connection")
         else:
             sdb = RedisStateStore(cfg.REDIS_URL)
             await sdb.connect()
+            logger_run.debug("Created new Redis connection")
 
-        # 4. Global Lock Acquisition
-        lock = RedisLock(sdb._redis, "macd_bot_run")
-        lock_acquired = await lock.acquire(timeout=5.0)
-        
-        if not lock_acquired:
-            if not cfg.LOG_MINIMAL:
-                logger_run.warning("⏳ Run skipped: Lock held by another instance")
-            return False
-
-        # 5. Core Logic
         try:
-            # Dead Man's Switch Update
-            dms = DeadMansSwitch(sdb, cfg.DEAD_MANS_COOLDOWN_SECONDS)
-            await dms.update_heartbeat()
+            if sdb.degraded and not sdb.degraded_alerted:
+                logger_run.critical("⚠️ Redis is in degraded mode - alert deduplication disabled!")
+                
+                telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+                await telegram_queue.send(escape_markdown_v2(
+                    f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                    f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
+                    f"Time: {format_ist_time()}"
+                ))
+                sdb.degraded_alerted = True
             
-            # Setup Dependencies
             fetcher = DataFetcher(cfg.DELTA_API_BASE, redis_store=sdb)
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+
+            global health_tracker
+            health_tracker = HealthTracker(sdb)
+
+            lock = RedisLock(sdb._redis, "macd_bot_run")
+            lock_acquired = await lock.acquire(timeout=5.0)
             
-            # Product Caching (Memory + Time based)
-            PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
-            if PRODUCTS_CACHE["data"] is None or time.time() > PRODUCTS_CACHE["until"]:
-                if not cfg.LOG_MINIMAL: logger_run.info("Fetching products from API...")
-                prod_resp = await fetcher.fetch_products()
-                if not prod_resp:
-                    logger_run.error("❌ Failed to fetch products")
-                    return False
-                PRODUCTS_CACHE["data"] = prod_resp
-                PRODUCTS_CACHE["until"] = time.time() + 28800 # 8 Hours
-                run_once._products_cache = PRODUCTS_CACHE
-            
-            products_map = build_products_map_from_api_result(PRODUCTS_CACHE["data"])
-            pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
+            if not lock_acquired:
+                logger_run.warning("❌ Another instance is running (Redis lock held)")
+                return False
 
-            # Run Worker Pool
-            results = await process_pairs_with_workers(
-                fetcher, products_map, pairs_to_process,
-                sdb, telegram_queue, correlation_id,
-                memory_monitor, lock, get_trigger_timestamp()
-            )
+            try:
+                dms = DeadMansSwitch(sdb, cfg.DEAD_MANS_COOLDOWN_SECONDS)
+                await dms.update_heartbeat()
 
-            # 6. Summary & Metrics
-            alerts_sent = sum(1 for _, res in results if res.get("state") == "ALERT_SENT")
-            failed_count = len(pairs_to_process) - len(results)
-            run_duration = time.time() - start_time
-            
-            # --- MINIMAL LOG: SUMMARY (Always Printed) ---
-            summary_msg = (
-                f"🏁 {len(pairs_to_process)} Pairs | "
-                f"✅ {len(results)} | "
-                f"❌ {failed_count} | "
-                f"🔔 {alerts_sent} Alerts | "
-                f"⏱ {run_duration:.2f}s"
-            )
-            # Use standard logger for summary to ensure it hits stdout even if level logic changes
-            logging.getLogger("macd_bot").info(summary_msg)
+                dms_result = await dms.should_alert()
+                if dms_result == "RECOVERED":
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"✅ {cfg.BOT_NAME} - BOT RECOVERED\nBot is running normally again."
+                    ))
+                elif dms_result is True:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
+                    ))
 
-            if cfg.ENABLE_HEALTH_TRACKER:
-                global health_tracker
-                if 'health_tracker' not in globals(): health_tracker = HealthTracker(sdb)
-                await health_tracker.record_overall({
-                    "pairs": len(results),
-                    "alerts": alerts_sent,
-                    "duration": run_duration
-                })
+                if cfg.SEND_TEST_MESSAGE:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"🚀 Unified Bot - Run Started\n"
+                        f"Date : {format_ist_time(datetime.now(timezone.utc))}\n"
+                        f"Corr. ID: {correlation_id}"
+                    ))
 
-            return True
+                # OPTIMIZATION: Cached products fetch (module-level cache)
+                PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
+                
+                now = time.time()
+                if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
+                    logger_run.info("Fetching fresh products list from Delta API...")
+                    prod_resp = await fetcher.fetch_products()
+                    if not prod_resp:
+                        logger_run.error("Failed to fetch products map")
+                        return False
+                    PRODUCTS_CACHE["data"] = prod_resp
+                    PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
+                    run_once._products_cache = PRODUCTS_CACHE
+                else:
+                    logger_run.debug("Using cached products list")
+                    prod_resp = PRODUCTS_CACHE["data"]
+
+                products_map = build_products_map_from_api_result(prod_resp)
+
+                pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
+
+                if len(pairs_to_process) < len(cfg.PAIRS):
+                    missing = set(cfg.PAIRS) - set(pairs_to_process)
+                    logger_run.warning(f"Missing products for pairs: {missing}")
+
+                logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
+
+                heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
+
+                # Use optimized worker pool
+                all_results = await process_pairs_with_workers(
+                    fetcher, products_map, pairs_to_process,
+                    sdb, telegram_queue, correlation_id,
+                    memory_monitor, lock, reference_time
+                )
+
+                # Process results
+                processed_pairs = set()
+                alerts_sent = 0
+                failed_pairs = set()
+                for pair_result in all_results:
+                    pair_name, state = pair_result
+                    processed_pairs.add(pair_name)
+                    if state and state.get("state") == "ALERT_SENT":
+                        alerts_sent += state["summary"].get("alerts", 0)
+
+                heartbeat_task.cancel()
+                try:
+                    await asyncio.wait_for(heartbeat_task, timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+
+                await dms.update_heartbeat()
+
+                fetcher_stats = fetcher.get_stats()
+                logger_run.info(
+                    f"📡 Fetch stats | "
+                    f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+                    f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
+                    f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
+                    f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
+                    f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
+                    f"CB Candles: {fetcher_stats['circuit_breakers']['candles']}"
+                )
+
+                run_duration = time.time() - start_time
+
+                used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
+                redis_status = "OK" if not sdb.degraded else "DEGRADED"
+                summary = (
+                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
+                    f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
+                )
+                logger_run.info(summary)
+
+                if alerts_sent > MAX_ALERTS_PER_RUN:
+                    telegram_msg = (
+                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
+                        f"Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
+                    )
+                    await telegram_queue.send(escape_markdown_v2(telegram_msg))
+
+                if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
+                    METRIC_RUN_DURATION.observe(run_duration)
+
+                if cfg.ENABLE_HEALTH_TRACKER:
+                    await health_tracker.record_overall({
+                        "pairs_processed": len(all_results),
+                        "alerts_sent": alerts_sent,
+                        "duration": run_duration,
+                        "correlation_id": correlation_id
+                    })
+                return True
+
+            except asyncio.TimeoutError:
+                logger_run.error("Run timed out")
+                return False
+            except Exception as e:
+                logger_run.exception(f"Error within Redis context: {e}")
+                raise
+            finally:
+                if lock_acquired and lock and lock.acquired_by_me:
+                    await lock.release(timeout=3.0)
+                else:
+                    logger_run.debug("Lock not acquired by this instance, skipping release")
 
         finally:
-            # Lock Release
-            if lock_acquired and lock:
-                await lock.release()
+            # OPTIMIZATION: Only close if we created the connection
+            if existing_redis is None:
+                await sdb.close()
 
-    except Exception as e:
-        logger_run.exception(f"🔥 Fatal error in run_once: {e}")
+    except asyncio.CancelledError:
+        logger_run.info("Run cancelled (Task Cancellation)")
         return False
-        
+    except Exception as e:
+        logger_run.exception(f"❌ Fatal error in run_once: {e}")
+        try:
+            await cancel_all_tasks(grace_seconds=5)
+        except Exception:
+            pass
+        return False
     finally:
-        # Cleanup
-        if watchdog: await watchdog.stop()
-        if local_health_server: await local_health_server.stop()
+        if watchdog:
+            await watchdog.stop()
+        
+        if local_health_server:
+            try:
+                await local_health_server.stop()
+                logger_run.debug("Health server stopped")
+            except Exception as e:
+                logger_run.error(f"Failed to stop health server: {e}")
+        
         await SessionManager.close_session()
-        
-        # Only close Redis if we created it (not if passed from loop)
-        if existing_redis is None and sdb:
-            await sdb.close()
-        
         TRACE_ID.set("")
 
 try:
