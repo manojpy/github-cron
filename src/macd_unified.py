@@ -23,6 +23,7 @@ from contextvars import ContextVar
 import gc
 import aiohttp
 from aiohttp import web
+from prometheus_client import start_http_server
 import pandas as pd
 import numpy as np
 import redis.asyncio as redis
