@@ -249,7 +249,6 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
-logger = setup_logging()
 
 class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -320,7 +319,7 @@ def setup_logging() -> logging.Logger:
         logger.addHandler(console)
         
         return logger
-    
+        
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
@@ -350,6 +349,7 @@ def setup_logging() -> logging.Logger:
                 logger.warning(f"Failed to setup file logging: {e}")
     
     return logger
+logger = setup_logging()
 
 class MinimalLogger:
     """
