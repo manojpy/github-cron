@@ -177,6 +177,9 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
+    LOG_LEVEL: str = "INFO"
+    LOG_MINIMAL: bool = Field(default=False, env='LOG_MINIMAL', description="Minimal 3-line output mode for cron jobs")
+    ENABLE_VWAP: bool = True
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -297,9 +300,26 @@ class JsonFormatter(SafeFormatter):
         return json_dumps(base)
 
 def setup_logging() -> logging.Logger:
+    """
+    Setup logging with support for minimal mode.
+    When LOG_MINIMAL=true, suppresses most logs except critical errors.
+    """
     logger = logging.getLogger("macd_bot")
     for h in logger.handlers[:]:
         logger.removeHandler(h)
+    
+    if cfg.LOG_MINIMAL:
+        level = logging.CRITICAL
+        logger.setLevel(level)
+        logger.propagate = False
+        
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(level)
+        console.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+        logger.addHandler(console)
+        
+        return logger
+    
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
@@ -325,35 +345,84 @@ def setup_logging() -> logging.Logger:
             file_handler.addFilter(TraceContextFilter())
             logger.addHandler(file_handler)
         except Exception as e:
-            logger.warning(f"Failed to setup file logging: {e}")
+            if not cfg.LOG_MINIMAL:
+                logger.warning(f"Failed to setup file logging: {e}")
+    
     return logger
 
-logger = setup_logging()
+class MinimalLogger:
+    """
+    Minimal logger for cron jobs - outputs only 3 lines per run:
+    1. Run start
+    2. Alerts summary
+    3. Run end with duration
+    """
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self.run_start_time = 0.0
+        self.correlation_id = ""
+        self.alerts_buffer = []
+        self.stats = {
+            "pairs_processed": 0,
+            "pairs_failed": 0,
+            "alerts_sent": 0,
+            "duration": 0.0
+        }
+    
+    def start_run(self, correlation_id: str) -> None:
+        """Mark run start."""
+        if not self.enabled:
+            return
+        self.run_start_time = time.time()
+        self.correlation_id = correlation_id
+        self.alerts_buffer = []
+        self.stats = {
+            "pairs_processed": 0,
+            "pairs_failed": 0,
+            "alerts_sent": 0,
+            "duration": 0.0
+        }
+        print(f"[{format_ist_time()}] RUN_START | ID:{correlation_id}")
+    
+    def record_alert(self, pair: str, alert_count: int) -> None:
+        """Record alert for summary."""
+        if not self.enabled:
+            return
+        self.alerts_buffer.append((pair, alert_count))
+        self.stats["alerts_sent"] += alert_count
+    
+    def record_pair_result(self, pair: str, success: bool) -> None:
+        """Record pair processing result."""
+        if not self.enabled:
+            return
+        if success:
+            self.stats["pairs_processed"] += 1
+        else:
+            self.stats["pairs_failed"] += 1
+    
+    def end_run(self, success: bool) -> None:
+        """Print final summary."""
+        if not self.enabled:
+            return
+        
+        self.stats["duration"] = time.time() - self.run_start_time
+        
+        if self.alerts_buffer:
+            alert_summary = ", ".join([f"{p}({c})" for p, c in self.alerts_buffer[:10]])
+            if len(self.alerts_buffer) > 10:
+                alert_summary += f" +{len(self.alerts_buffer) - 10} more"
+        else:
+            alert_summary = "none"
+        
+        status = "✅ SUCCESS" if success else "❌ FAILED"
+        print(
+            f"[{format_ist_time()}] RUN_END | {status} | "
+            f"Pairs:{self.stats['pairs_processed']}/{self.stats['pairs_processed'] + self.stats['pairs_failed']} | "
+            f"Alerts:{self.stats['alerts_sent']} ({alert_summary}) | "
+            f"Duration:{self.stats['duration']:.1f}s"
+        )
 
-shutdown_event = asyncio.Event()
-
-def _sync_signal_handler(sig: int, frame: Any) -> None:
-    logger.warning(f"Received signal {sig}, initiating async shutdown...")
-    try:
-        loop = asyncio.get_running_loop()
-        loop.call_soon_threadsafe(shutdown_event.set)
-    except RuntimeError:
-        pass
-
-signal.signal(signal.SIGTERM, _sync_signal_handler)
-signal.signal(signal.SIGINT, _sync_signal_handler)
-
-async def cancel_all_tasks(grace_seconds: int = 5) -> None:
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    if not tasks:
-        return
-    logger.info(f"Cancelling {len(tasks)} tasks...")
-    for t in tasks:
-        t.cancel()
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=grace_seconds)
-    except asyncio.TimeoutError:
-        logger.warning("Timeout while cancelling tasks")
+minimal_logger = MinimalLogger(enabled=cfg.LOG_MINIMAL)
 
 class MemoryMonitor:
     def __init__(self, limit_percent: float = Constants.MEMORY_LIMIT_PERCENT):
@@ -478,50 +547,85 @@ def _exp_backoff_sleep(attempt: int, base: float, cap: float) -> float:
     sleep = min(cap, base * (2 ** (attempt - 1)))
     return max(0.05, sleep * random.uniform(0.5, 1.5))
 
+class RetryCategory:
+    NETWORK = "network"
+    RATE_LIMIT = "rate_limit"
+    API_ERROR = "api_error"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
+def categorize_exception(exc: Exception) -> str:
+    """Categorize exception type for better retry handling."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return RetryCategory.TIMEOUT
+    elif isinstance(exc, (ClientConnectorError, aiohttp.ClientConnectorError)):
+        return RetryCategory.NETWORK
+    elif isinstance(exc, ClientResponseError):
+        if hasattr(exc, 'status') and exc.status == 429:
+            return RetryCategory.RATE_LIMIT
+        return RetryCategory.API_ERROR
+    elif isinstance(exc, (ClientError, aiohttp.ClientError)):
+        return RetryCategory.NETWORK
+    return RetryCategory.UNKNOWN
+
 async def retry_async(
     fn: Callable,
     *args,
     retries: int = 3,
     base_backoff: float = 0.8,
     cap: float = 30.0,
-    on_error: Optional[Callable[[Exception, int], None]] = None,
+    jitter_min: float = 0.05,
+    jitter_max: float = 0.5,
+    on_error: Optional[Callable[[Exception, int, str], None]] = None,
     **kwargs
 ):
+    """
+    Enhanced retry with exponential backoff, jitter, and error categorization.
+    
+    Args:
+        fn: Async function to retry
+        retries: Maximum number of retry attempts
+        base_backoff: Base delay in seconds
+        cap: Maximum delay cap in seconds
+        jitter_min: Minimum jitter fraction (0.05 = 5%)
+        jitter_max: Maximum jitter fraction (0.5 = 50%)
+        on_error: Callback(exception, attempt, category)
+    """
     last_exc: Optional[Exception] = None
+    
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
             raise asyncio.CancelledError()
+        
         try:
             return await fn(*args, **kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             last_exc = e
+            category = categorize_exception(e)
+            
             if on_error:
                 try:
-                    on_error(e, attempt)
+                    on_error(e, attempt, category)
                 except Exception:
                     pass
+            
             if attempt >= retries:
                 break
-            await asyncio.sleep(_exp_backoff_sleep(attempt, base_backoff, cap))
-    raise last_exc or RuntimeError("retry_async: unknown failure")
-
-def get_trigger_timestamp() -> int:
-    trigger_ts_str = os.getenv("TRIGGER_TIMESTAMP")
-    if trigger_ts_str:
-        try:
-            trigger_ts = int(trigger_ts_str)
-            now = int(time.time())
-            if abs(now - trigger_ts) > 600:
-                logger.warning(f"TRIGGER_TIMESTAMP ({trigger_ts}) is >10 min from now ({now}), using current time")
-                return now
-            logger.debug(f"Using TRIGGER_TIMESTAMP from env: {trigger_ts}")
-            return trigger_ts
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid TRIGGER_TIMESTAMP: {trigger_ts_str}, using current time")
+            
+            base_delay = min(cap, base_backoff * (2 ** (attempt - 1)))
+            jitter = base_delay * random.uniform(jitter_min, jitter_max)
+            sleep_time = base_delay + jitter
+            
+            logger.debug(
+                f"Retry attempt {attempt}/{retries} after {sleep_time:.2f}s | "
+                f"Category: {category} | Error: {str(e)[:100]}"
+            )
+            
+            await asyncio.sleep(sleep_time)
     
-    return int(time.time())
+    raise last_exc or RuntimeError("retry_async: unknown failure")
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
     interval_seconds = interval_minutes * 60
@@ -901,8 +1005,6 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
-
-
     async def get_circuit_breaker_state(self, breaker_name: str) -> Optional[Dict[str, Any]]:
         if self.degraded:
             return None
@@ -917,17 +1019,12 @@ class RedisStateStore:
         return result
 
     async def set_circuit_breaker_state(
-        self, breaker_name: str, failure_count: int, last_failure_time: Optional[float]
+        self, breaker_name: str, data: Dict[str, Any]
     ) -> None:
         if self.degraded:
             return
         
         key = f"{self.cb_prefix}{breaker_name}"
-        data = {
-            "failure_count": failure_count,
-            "last_failure_time": last_failure_time,
-            "updated_at": time.time()
-        }
         await self._safe_redis_op(
             self._redis.set(key, json_dumps(data), ex=3600),
             timeout=2.0,
@@ -935,7 +1032,19 @@ class RedisStateStore:
         )
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, timeout: int = 300, name: str = "default", redis_store: Optional[RedisStateStore] = None):
+    """
+    Enhanced circuit breaker with half-open state, decay, and per-entity tracking.
+    Prevents cascading failures by temporarily blocking calls after repeated failures.
+    """
+    def __init__(
+        self, 
+        failure_threshold: int = 5, 
+        timeout: int = 300, 
+        name: str = "default", 
+        redis_store: Optional[RedisStateStore] = None,
+        half_open_max_calls: int = 3,
+        success_threshold: int = 2
+    ):
         self.failure_count = 0
         self.last_failure_time: Optional[float] = None
         self.threshold = failure_threshold
@@ -945,6 +1054,10 @@ class CircuitBreaker:
         self.name = name
         self.redis_store = redis_store
         self._loaded_from_redis = False
+        self.half_open_attempts = 0
+        self.half_open_max_calls = half_open_max_calls
+        self.half_open_successes = 0
+        self.success_threshold = success_threshold
 
     async def _load_state_from_redis(self) -> None:
         if self._loaded_from_redis or not self.redis_store:
@@ -955,58 +1068,119 @@ class CircuitBreaker:
         if state:
             self.failure_count = state.get("failure_count", 0)
             self.last_failure_time = state.get("last_failure_time")
-            logger.info(f"Circuit breaker '{self.name}' loaded from Redis: failures={self.failure_count}")
+            self.state = state.get("state", "CLOSED")
+            self.half_open_attempts = state.get("half_open_attempts", 0)
+            self.half_open_successes = state.get("half_open_successes", 0)
+            logger.info(f"Circuit breaker '{self.name}' loaded: state={self.state}, failures={self.failure_count}")
 
     async def _persist_state_to_redis(self) -> None:
         if self.redis_store:
-            await self.redis_store.set_circuit_breaker_state(
-                self.name, self.failure_count, self.last_failure_time
-            )
+            data = {
+                "failure_count": self.failure_count,
+                "last_failure_time": self.last_failure_time,
+                "state": self.state,
+                "half_open_attempts": self.half_open_attempts,
+                "half_open_successes": self.half_open_successes,
+                "updated_at": time.time()
+            }
+            await self.redis_store.set_circuit_breaker_state(self.name, data)
 
     async def is_open(self) -> bool:
+        """Check if circuit breaker is open (blocking calls)."""
         await self._load_state_from_redis()
         
         async with self.lock:
-            if self.failure_count < self.threshold:
-                self.state = "CLOSED"
+            if self.state == "CLOSED":
                 if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
                     METRIC_CB_OPEN.set(0.0)
                 return False
-            if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
-                self.failure_count = 0
-                self.last_failure_time = None
-                self.state = "CLOSED"
-                logger.info(f"Circuit breaker '{self.name}' reset after timeout")
-                await self._persist_state_to_redis()
+            
+            if self.state == "OPEN":
+                if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
+                    self.state = "HALF_OPEN"
+                    self.half_open_attempts = 0
+                    self.half_open_successes = 0
+                    logger.info(f"Circuit breaker '{self.name}' entering HALF_OPEN state")
+                    await self._persist_state_to_redis()
+                    if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                        METRIC_CB_OPEN.set(0.5)
+                    return False
+                
                 if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
+                    METRIC_CB_OPEN.set(1.0)
+                return True
+            
+            if self.state == "HALF_OPEN":
+                if self.half_open_attempts >= self.half_open_max_calls:
+                    if self.half_open_successes >= self.success_threshold:
+                        self.state = "CLOSED"
+                        self.failure_count = 0
+                        self.last_failure_time = None
+                        logger.info(f"Circuit breaker '{self.name}' CLOSED after successful test calls")
+                        await self._persist_state_to_redis()
+                        if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                            METRIC_CB_OPEN.set(0.0)
+                        return False
+                    else:
+                        self.state = "OPEN"
+                        self.last_failure_time = time.time()
+                        logger.warning(f"Circuit breaker '{self.name}' reopened after failed test calls")
+                        await self._persist_state_to_redis()
+                        if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                            METRIC_CB_OPEN.set(1.0)
+                        return True
+                
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(0.5)
                 return False
-            self.state = "OPEN"
-            if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                METRIC_CB_OPEN.set(1.0)
-            return True
+            
+            return False
 
     async def record_failure(self) -> int:
+        """Record a failure and potentially open the circuit."""
         await self._load_state_from_redis()
         
         async with self.lock:
+            if self.state == "HALF_OPEN":
+                self.half_open_attempts += 1
+                self.state = "OPEN"
+                self.last_failure_time = time.time()
+                logger.warning(f"Circuit breaker '{self.name}': HALF_OPEN test failed, reopening")
+                await self._persist_state_to_redis()
+                if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
+                    METRIC_CB_FAILURES.inc()
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(1.0)
+                return self.failure_count
+            
             self.failure_count += 1
             self.last_failure_time = time.time()
             logger.warning(f"Circuit breaker '{self.name}': failure {self.failure_count}/{self.threshold}")
             await self._persist_state_to_redis()
+            
             if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
                 METRIC_CB_FAILURES.inc()
+            
             if self.failure_count >= self.threshold:
                 self.state = "OPEN"
                 logger.critical(f"Circuit breaker '{self.name}' OPEN for {self.timeout}s")
                 if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
                     METRIC_CB_OPEN.set(1.0)
+            
             return self.failure_count
 
     async def record_success(self) -> None:
+        """Record a success and potentially close the circuit."""
         await self._load_state_from_redis()
         
         async with self.lock:
+            if self.state == "HALF_OPEN":
+                self.half_open_attempts += 1
+                self.half_open_successes += 1
+                logger.info(f"Circuit breaker '{self.name}': HALF_OPEN test success ({self.half_open_successes}/{self.success_threshold})")
+                await self._persist_state_to_redis()
+                return
+            
             if self.failure_count > 0:
                 self.failure_count = 0
                 self.last_failure_time = None
@@ -1017,6 +1191,7 @@ class CircuitBreaker:
                     METRIC_CB_OPEN.set(0.0)
 
     async def call(self, func: Callable, *args, **kwargs):
+        """Execute a function with circuit breaker protection."""
         if await self.is_open():
             raise Exception(f"Circuit breaker '{self.name}' is OPEN (state: {self.state})")
         try:
@@ -1137,73 +1312,183 @@ class RedisLock:
             self.token = None
             self.acquired_by_me = False
 
-async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15, circuit_breaker: Optional[CircuitBreaker] = None) -> Optional[Dict[str, Any]]:
+async def async_fetch_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    retries: int = 3,
+    backoff: float = 1.5,
+    timeout: int = 15,
+    circuit_breaker: Optional[CircuitBreaker] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Enhanced JSON fetch with circuit breaker, categorized retries, and detailed logging.
+    """
     if circuit_breaker and await circuit_breaker.is_open():
         logger.warning(f"Circuit breaker open; skipping fetch {url}")
         return None
+    
     session = await SessionManager.get_session()
     last_error = None
+    retry_stats = {
+        RetryCategory.NETWORK: 0,
+        RetryCategory.RATE_LIMIT: 0,
+        RetryCategory.API_ERROR: 0,
+        RetryCategory.TIMEOUT: 0,
+        RetryCategory.UNKNOWN: 0
+    }
+    
+    def on_retry_error(exc: Exception, attempt: int, category: str) -> None:
+        retry_stats[category] = retry_stats.get(category, 0) + 1
+        logger.debug(
+            f"Fetch retry {attempt}/{retries} | URL: {url[:80]} | "
+            f"Category: {category} | Error: {str(exc)[:100]}"
+        )
     
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
             return None
+        
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     wait_sec = min(int(retry_after) if retry_after else 1, Constants.CIRCUIT_BREAKER_MAX_WAIT)
-                    logger.warning(f"Rate limited (429), waiting {wait_sec}s")
-                    await asyncio.sleep(wait_sec + random.uniform(0, 0.5))
+                    jitter = random.uniform(0.1, 0.5)
+                    total_wait = wait_sec + jitter
+                    
+                    logger.warning(
+                        f"Rate limited (429) | URL: {url[:80]} | "
+                        f"Retry-After: {retry_after} | Waiting: {total_wait:.2f}s"
+                    )
+                    retry_stats[RetryCategory.RATE_LIMIT] += 1
+                    
+                    await asyncio.sleep(total_wait)
                     continue
+                
                 if resp.status >= 500:
-                    logger.warning(f"Server error {resp.status} on attempt {attempt}/{retries}")
+                    retry_stats[RetryCategory.API_ERROR] += 1
+                    logger.warning(
+                        f"Server error {resp.status} on attempt {attempt}/{retries} | "
+                        f"URL: {url[:80]}"
+                    )
+                    
                     if attempt < retries:
-                        await asyncio.sleep(_exp_backoff_sleep(attempt, backoff, Constants.CIRCUIT_BREAKER_MAX_WAIT / 10))
+                        base_delay = min(
+                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                            backoff * (2 ** (attempt - 1))
+                        )
+                        jitter = base_delay * random.uniform(0.1, 0.5)
+                        await asyncio.sleep(base_delay + jitter)
                     continue
+                
                 if resp.status >= 400:
-                    logger.error(f"Client error {resp.status} for {url}")
+                    logger.error(
+                        f"Client error {resp.status} for {url[:80]} | "
+                        f"This usually indicates invalid request"
+                    )
                     return None
+                
                 data = await resp.json(loads=json_loads)
+                
                 if circuit_breaker:
                     await circuit_breaker.record_success()
+                
+                if any(retry_stats.values()):
+                    logger.info(
+                        f"Fetch succeeded after retries | URL: {url[:80]} | "
+                        f"Stats: {retry_stats}"
+                    )
+                
                 return data
+                
         except (asyncio.TimeoutError, ClientConnectorError, ClientError, ClientResponseError) as e:
             last_error = e
-            logger.warning(f"Fetch error on attempt {attempt}/{retries}: {e}")
+            category = categorize_exception(e)
+            retry_stats[category] = retry_stats.get(category, 0) + 1
+            
+            logger.warning(
+                f"Fetch error (attempt {attempt}/{retries}) | "
+                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+            )
+            
             if attempt < retries:
-                await asyncio.sleep(_exp_backoff_sleep(attempt, backoff, Constants.CIRCUIT_BREAKER_MAX_WAIT / 10))
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                await asyncio.sleep(base_delay + jitter)
+        
         except Exception as e:
             last_error = e
-            logger.exception(f"Unexpected fetch error for {url}: {e}")
+            retry_stats[RetryCategory.UNKNOWN] += 1
+            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
     
     if circuit_breaker:
         await circuit_breaker.record_failure()
+    
     if PROMETHEUS_ENABLED and METRIC_FETCH_ERRORS:
         METRIC_FETCH_ERRORS.inc()
     
-    logger.error(f"Failed to fetch {url} after {retries} attempts: {last_error}")
+    logger.error(
+        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
+        f"Stats: {retry_stats} | Last error: {last_error}"
+    )
     return None
 
 class RateLimitedFetcher:
+    """
+    Token bucket rate limiter with detailed metrics and logging.
+    """
     def __init__(self, max_per_minute: int = 60, concurrency: int = 4):
         self.max_per_minute = max_per_minute
         self.semaphore = asyncio.Semaphore(concurrency)
         self.requests: deque[float] = deque()
         self.lock = asyncio.Lock()
+        self.total_waits = 0
+        self.total_wait_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
+        """Execute function with rate limiting."""
         async with self.lock:
             now = time.time()
+            
             while self.requests and now - self.requests[0] > 60:
                 self.requests.popleft()
+            
             if len(self.requests) >= self.max_per_minute:
                 sleep_time = 60 - (now - self.requests[0])
-                logger.debug(f"Rate limit reached, sleeping {sleep_time:.2f}s")
-                await asyncio.sleep(sleep_time + random.uniform(0.05, 0.2))
+                jitter = random.uniform(0.05, 0.2)
+                total_sleep = sleep_time + jitter
+                
+                self.total_waits += 1
+                self.total_wait_time += total_sleep
+                
+                logger.debug(
+                    f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
+                    f"sleeping {total_sleep:.2f}s | Total waits: {self.total_waits}"
+                )
+                
+                await asyncio.sleep(total_sleep)
+                
+                now = time.time()
+                while self.requests and now - self.requests[0] > 60:
+                    self.requests.popleft()
+            
             self.requests.append(time.time())
+        
         async with self.semaphore:
             return await func(*args, **kwargs)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get rate limiter statistics."""
+        return {
+            "total_waits": self.total_waits,
+            "total_wait_time_seconds": round(self.total_wait_time, 2),
+            "current_queue_size": len(self.requests),
+            "max_per_minute": self.max_per_minute
+        }
 
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None, redis_store: Optional[RedisStateStore] = None):
@@ -1211,22 +1496,59 @@ class DataFetcher:
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
-        self.circuit_breaker_products = CircuitBreaker(name="products_api", redis_store=redis_store)
-        self.circuit_breaker_candles = CircuitBreaker(name="candles_api", redis_store=redis_store)
+        self.circuit_breaker_products = CircuitBreaker(
+            name="products_api",
+            redis_store=redis_store,
+            failure_threshold=5,
+            timeout=300
+        )
+        self.circuit_breaker_candles = CircuitBreaker(
+            name="candles_api",
+            redis_store=redis_store,
+            failure_threshold=5,
+            timeout=300
+        )
         self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
+        self.fetch_stats = {
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0
+        }
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
+        """Fetch products list with circuit breaker protection."""
         url = f"{self.api_base}/v2/products"
+        
         async with self.semaphore:
             result = await self.rate_limiter.call(
-                async_fetch_json, url, retries=5, backoff=2.0,
-                timeout=self.timeout, circuit_breaker=self.circuit_breaker_products
+                async_fetch_json,
+                url,
+                retries=5,
+                backoff=2.0,
+                timeout=self.timeout,
+                circuit_breaker=self.circuit_breaker_products
             )
-            if result and self.circuit_breaker_products.state == "OPEN":
-                await self.circuit_breaker_products.record_success()
+            
+            if result:
+                self.fetch_stats["products_success"] += 1
+                if self.circuit_breaker_products.state == "OPEN":
+                    await self.circuit_breaker_products.record_success()
+                logger.debug(f"Products fetch successful | URL: {url}")
+            else:
+                self.fetch_stats["products_failed"] += 1
+                logger.warning(f"Products fetch failed | URL: {url}")
+            
             return result
 
-    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    async def fetch_candles(
+        self,
+        symbol: str,
+        resolution: str,
+        limit: int,
+        reference_time: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch candles with circuit breaker and enhanced logging."""
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1245,6 +1567,7 @@ class DataFetcher:
         }
 
         url = f"{self.api_base}/v2/chart/history"
+        
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1255,37 +1578,76 @@ class DataFetcher:
                 timeout=self.timeout,
                 circuit_breaker=self.circuit_breaker_candles
             )
+            
+            if data:
+                self.fetch_stats["candles_success"] += 1
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(
+                    f"Candles fetch failed | Symbol: {symbol} | "
+                    f"Resolution: {resolution} | Params: {params}"
+                )
+            
+            return data
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get fetcher statistics."""
+        stats = self.fetch_stats.copy()
+        stats["rate_limiter"] = self.rate_limiter.get_stats()
+        stats["circuit_breakers"] = {
+            "products": self.circuit_breaker_products.state,
+            "candles": self.circuit_breaker_candles.state
+        }
+        return stats
 
-        return data
-
-def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, Optional[str]]:
+def validate_candle_df(df: pd.DataFrame, required_len: int = 0, pair_name: str = "") -> Tuple[bool, Optional[str]]:
+    """
+    Comprehensive data quality gate: checks timestamp drift, volume, price spikes,
+    gaps, and candle body quality before allowing any alert logic.
+    """
     try:
         if df is None or df.empty:
             return False, "DataFrame is empty"
+        
+        if len(df) < required_len:
+            return False, f"Insufficient data: {len(df)} < {required_len}"
         
         if df["close"].isna().any() or (df["close"] <= 0).any():
             if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                 METRIC_DATA_QUALITY_FAILURES.labels(reason="invalid_close").inc()
             return False, "Invalid close prices (NaN or <= 0)"
         
+        if df["volume"].isna().any():
+            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
+                METRIC_DATA_QUALITY_FAILURES.labels(reason="nan_volume").inc()
+            return False, "NaN volumes detected"
+        
+        zero_volume_count = (df["volume"] == 0).sum()
+        if zero_volume_count > len(df) * 0.1:
+            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
+                METRIC_DATA_QUALITY_FAILURES.labels(reason="excessive_zero_volume").inc()
+            return False, f"Too many zero-volume candles: {zero_volume_count}/{len(df)}"
+        
         if not df["timestamp"].is_monotonic_increasing:
             if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                 METRIC_DATA_QUALITY_FAILURES.labels(reason="timestamp_not_monotonic").inc()
             return False, "Timestamps not monotonic increasing"
         
-        if len(df) < required_len:
-            return False, f"Insufficient data: {len(df)} < {required_len}"
-        
         if len(df) >= 2:
             time_diffs = df["timestamp"].diff().dropna()
             if len(time_diffs) > 0:
                 median_diff = time_diffs.median()
+                if median_diff <= 0:
+                    if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
+                        METRIC_DATA_QUALITY_FAILURES.labels(reason="invalid_time_diff").inc()
+                    return False, "Invalid time differences between candles"
+                
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 gaps = time_diffs[time_diffs > max_expected_gap]
                 if len(gaps) > 0:
                     if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                         METRIC_DATA_QUALITY_FAILURES.labels(reason="candle_gaps").inc()
-                    logger.warning(f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
+                    logger.warning(f"{pair_name}: {len(gaps)} candle gaps detected (median: {median_diff}s, max gap: {gaps.max()}s)")
         
         if len(df) >= 2:
             price_changes = (df["close"].pct_change().abs() * 100).dropna()
@@ -1293,12 +1655,39 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
             if len(extreme_changes) > 0:
                 if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                     METRIC_DATA_QUALITY_FAILURES.labels(reason="price_spike").inc()
-                logger.warning(f"Detected {len(extreme_changes)} extreme price changes (max: {extreme_changes.max():.2f}%)")
-                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
+                logger.warning(f"{pair_name}: Extreme price spike detected: {extreme_changes.max():.2f}%")
+                return False, f"Extreme price spike: {extreme_changes.max():.2f}%"
+        
+        candle_bodies = (df["close"] - df["open"]).abs()
+        candle_ranges = df["high"] - df["low"]
+        body_ratios = candle_bodies / candle_ranges.replace(0, np.nan)
+        body_ratios = body_ratios.dropna()
+        
+        if len(body_ratios) > 0:
+            tiny_bodies = body_ratios[body_ratios < 0.05]
+            if len(tiny_bodies) > len(df) * 0.3:
+                logger.warning(f"{pair_name}: {len(tiny_bodies)} candles with tiny bodies (<5% of range)")
+        
+        for col in ["high", "low", "open"]:
+            if df[col].isna().any() or (df[col] <= 0).any():
+                if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
+                    METRIC_DATA_QUALITY_FAILURES.labels(reason=f"invalid_{col}").inc()
+                return False, f"Invalid {col} prices"
+        
+        invalid_hloc = ((df["high"] < df["low"]) | 
+                       (df["high"] < df["open"]) | 
+                       (df["high"] < df["close"]) |
+                       (df["low"] > df["open"]) | 
+                       (df["low"] > df["close"]))
+        if invalid_hloc.any():
+            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
+                METRIC_DATA_QUALITY_FAILURES.labels(reason="invalid_hloc_relationship").inc()
+            return False, "Invalid HLOC relationships detected"
         
         return True, None
+        
     except Exception as e:
-        logger.error(f"DataFrame validation failed: {e}")
+        logger.error(f"DataFrame validation failed for {pair_name}: {e}")
         return False, f"Validation error: {str(e)}"
 
 def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFrame]:
@@ -2381,6 +2770,11 @@ async def evaluate_pair_and_alert(
 
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
+         
+        if cfg.LOG_MINIMAL:
+            if alerts_to_send:
+                minimal_logger.record_alert(pair_name, len(alerts_to_send))
+            minimal_logger.record_pair_result(pair_name, success=True)
 
         # Single-line consolidated pair result
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
@@ -2443,11 +2837,15 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         df_5m = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
         df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
 
-        valid_15m, reason_15m = validate_candle_df(df_15m, 220)
-        valid_5m, reason_5m = validate_candle_df(df_5m, 280)
+        valid_15m, reason_15m = validate_candle_df(df_15m, 220, pair_name)
+        valid_5m, reason_5m = validate_candle_df(df_5m, 280, pair_name)
     
-        if not valid_15m or not valid_5m:
-            logger.warning(f"Insufficient data for {pair_name}: 15m={reason_15m}, 5m={reason_5m}")
+        if not valid_15m:
+            logger.warning(f"{pair_name}: 15m data quality failed - {reason_15m}")
+            return None
+        
+        if not valid_5m:
+            logger.warning(f"{pair_name}: 5m data quality failed - {reason_5m}")
             return None
         
         return await evaluate_pair_and_alert(pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id, reference_time)
@@ -2625,15 +3023,23 @@ async def process_pairs_with_workers(
     
     return results
 
-
 async def run_once() -> bool:
+    """
+    Main execution function with minimal logging support.
+    When LOG_MINIMAL=true, outputs only 3 lines per run.
+    """
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     
+    if cfg.LOG_MINIMAL:
+        minimal_logger.start_run(correlation_id)
+    
     reference_time = get_trigger_timestamp()
-    logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
+    
+    if not cfg.LOG_MINIMAL:
+        logger_run.info(f"🚀 Run started | Ref time: {reference_time} ({format_ist_time(reference_time)}) | Corr ID: {correlation_id}")
     
     processed_pairs = set()
     failed_pairs = set()
@@ -2645,6 +3051,7 @@ async def run_once() -> bool:
     lock_acquired = False
     lock: Optional[RedisLock] = None
     watchdog: Optional[WatchdogTask] = None
+    run_success = False
 
     try:
         watchdog = WatchdogTask(cfg.RUN_TIMEOUT_SECONDS, grace_seconds=120)
@@ -2656,7 +3063,7 @@ async def run_once() -> bool:
 
         if memory_monitor.is_critical():
             mem_percent = memory_monitor.check_memory()[1]
-            logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
+            logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent:.1f}%)")
             return False
 
         async with RedisStateStore(cfg.REDIS_URL) as sdb:
@@ -2664,11 +3071,12 @@ async def run_once() -> bool:
                 logger_run.critical("⚠️ Redis is in degraded mode - alert deduplication disabled!")
                 
                 telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-                await telegram_queue.send(escape_markdown_v2(
-                    f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
-                    f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
-                    f"Time: {format_ist_time()}"
-                ))
+                if not cfg.LOG_MINIMAL:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                        f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
+                        f"Time: {format_ist_time()}"
+                    ))
                 sdb.degraded_alerted = True
             
             fetcher = DataFetcher(cfg.DELTA_API_BASE, redis_store=sdb)
@@ -2681,7 +3089,8 @@ async def run_once() -> bool:
             lock_acquired = await lock.acquire(timeout=5.0)
             
             if not lock_acquired:
-                logger_run.warning("❌ Another instance is running (Redis lock held)")
+                if not cfg.LOG_MINIMAL:
+                    logger_run.warning("❌ Another instance is running (Redis lock held)")
                 return False
 
             try:
@@ -2695,63 +3104,75 @@ async def run_once() -> bool:
                     ))
                 elif dms_result is True:
                     await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
+                        f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT\nBot has not run successfully in {cfg.DEAD_MANS_COOLDOWN_SECONDS}s"
                     ))
 
-                if cfg.SEND_TEST_MESSAGE:
+                if cfg.SEND_TEST_MESSAGE and not cfg.LOG_MINIMAL:
                     await telegram_queue.send(escape_markdown_v2(
-                        f"🚀 Unified Bot - Run Started\n"
-                        f"Date : {format_ist_time(datetime.now(timezone.utc))}\n"
-                        f"Corr. ID: {correlation_id}"
+                        f"🚀 {cfg.BOT_NAME} - Run Started\n"
+                        f"Time: {format_ist_time(datetime.now(timezone.utc))}\n"
+                        f"Corr ID: {correlation_id}\n"
+                        f"Pairs: {len(cfg.PAIRS)}"
                     ))
 
-                # === START NEW BLOCK: Cached products fetch ===
-                PRODUCTS_CACHE = {"data": None, "until": 0.0}  # module-level cache
-
+                PRODUCTS_CACHE = {"data": None, "until": 0.0}
+                
                 now = time.time()
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
-                    logger_run.info("Fetching fresh products list from Delta API...")
+                    if not cfg.LOG_MINIMAL:
+                        logger_run.info("Fetching fresh products list from Delta API...")
                     prod_resp = await fetcher.fetch_products()
                     if not prod_resp:
-                        logger_run.error("Failed to fetch products map")
+                        logger_run.critical("❌ Failed to fetch products map")
                         return False
                     PRODUCTS_CACHE["data"] = prod_resp
-                    PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
+                    PRODUCTS_CACHE["until"] = now + 28_800
                 else:
-                    logger_run.debug("Using cached products list")
                     prod_resp = PRODUCTS_CACHE["data"]
 
                 products_map = build_products_map_from_api_result(prod_resp)
-                # === END NEW BLOCK ===
-
+                
                 pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
                 if len(pairs_to_process) < len(cfg.PAIRS):
                     missing = set(cfg.PAIRS) - set(pairs_to_process)
-                    logger_run.warning(f"Missing products for pairs: {missing}")
+                    if not cfg.LOG_MINIMAL:
+                        logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
 
-                logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
+                if not cfg.LOG_MINIMAL:
+                    logger_run.info(
+                        f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture | "
+                        f"Workers: {cfg.MAX_PARALLEL_FETCH} | Timeout: {cfg.RUN_TIMEOUT_SECONDS}s"
+                    )
 
                 heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
 
-                # ============================================================================
-                # NEW: Use worker pool instead of batch processing
-                # ============================================================================
                 all_results = await process_pairs_with_workers(
                     fetcher, products_map, pairs_to_process,
                     sdb, telegram_queue, correlation_id,
                     memory_monitor, lock, reference_time
                 )
 
-                # Process results
-                processed_pairs = set()
-                alerts_sent = 0
-                failed_pairs = set()
                 for pair_result in all_results:
-                    pair_name, state = pair_result
-                    processed_pairs.add(pair_name)
-                    if state and state.get("state") == "ALERT_SENT":
-                        alerts_sent += state["summary"].get("alerts", 0)
+                    if pair_result:
+                        pair_name, state = pair_result
+                        processed_pairs.add(pair_name)
+                        if state and state.get("state") == "ALERT_SENT":
+                            pair_alerts = state["summary"].get("alerts", 0)
+                            alerts_sent += pair_alerts
+                        
+                        if cfg.ENABLE_HEALTH_TRACKER:
+                            await health_tracker.record_pair_result(
+                                pair_name,
+                                success=True,
+                                info={"state": state.get("state"), "ts": int(time.time())}
+                            )
+
+                failed_pairs = set(pairs_to_process) - processed_pairs
+                
+                if cfg.LOG_MINIMAL:
+                    for fp in failed_pairs:
+                        minimal_logger.record_pair_result(fp, success=False)
 
                 heartbeat_task.cancel()
                 try:
@@ -2761,20 +3182,43 @@ async def run_once() -> bool:
 
                 await dms.update_heartbeat()
 
-                run_duration = time.time() - start_time
+                if not cfg.LOG_MINIMAL:
+                    fetcher_stats = fetcher.get_stats()
+                    logger_run.info(
+                        f"📡 Fetch stats | "
+                        f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+                        f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
+                        f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
+                        f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
+                        f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
+                        f"CB Candles: {fetcher_stats['circuit_breakers']['candles']}"
+                    )
 
+                run_duration = time.time() - start_time
                 used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
                 redis_status = "OK" if not sdb.degraded else "DEGRADED"
-                summary = (
-                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
-                    f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
-                )
-                logger_run.info(summary)
+                
+                if not cfg.LOG_MINIMAL:
+                    summary = (
+                        f"✅ RUN COMPLETE | "
+                        f"Duration: {run_duration:.1f}s | "
+                        f"Pairs: {len(processed_pairs)}/{len(pairs_to_process)} | "
+                        f"Alerts: {alerts_sent} | "
+                        f"Failed: {len(failed_pairs)} | "
+                        f"Memory: {int(used_mb)}MB | "
+                        f"Redis: {redis_status}"
+                    )
+                    logger_run.info(summary)
 
-                if alerts_sent > MAX_ALERTS_PER_RUN:
+                    if failed_pairs:
+                        logger_run.warning(f"⚠️ Failed pairs: {failed_pairs}")
+
+                if alerts_sent > MAX_ALERTS_PER_RUN and not cfg.LOG_MINIMAL:
                     telegram_msg = (
-                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
-                        f"Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
+                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts sent\n"
+                        f"Pairs processed: {len(processed_pairs)}\n"
+                        f"Failed pairs: {len(failed_pairs)}\n"
+                        f"Duration: {run_duration:.1f}s"
                     )
                     await telegram_queue.send(escape_markdown_v2(telegram_msg))
 
@@ -2786,27 +3230,29 @@ async def run_once() -> bool:
                         "pairs_processed": len(all_results),
                         "alerts_sent": alerts_sent,
                         "duration": run_duration,
-                        "correlation_id": correlation_id
+                        "correlation_id": correlation_id,
+                        "failed_pairs": list(failed_pairs)
                     })
+                
+                run_success = True
                 return True
 
             except asyncio.TimeoutError:
-                logger_run.error("Run timed out")
+                logger_run.critical("❌ Run timed out")
                 return False
             except Exception as e:
-                logger_run.exception(f"Error within Redis context: {e}")
+                logger_run.critical(f"❌ Error within Redis context: {e}")
                 raise
             finally:
                 if lock_acquired and lock and lock.acquired_by_me:
                     await lock.release(timeout=3.0)
-                else:
-                    logger_run.debug("Lock not acquired by this instance, skipping release")
 
     except asyncio.CancelledError:
-        logger_run.info("Run cancelled (Task Cancellation)")
+        if not cfg.LOG_MINIMAL:
+            logger_run.info("Run cancelled (Task Cancellation)")
         return False
     except Exception as e:
-        logger_run.exception(f"❌ Fatal error in run_once: {e}")
+        logger_run.critical(f"❌ Fatal error in run_once: {e}")
         try:
             await cancel_all_tasks(grace_seconds=5)
         except Exception:
@@ -2819,13 +3265,30 @@ async def run_once() -> bool:
         if local_health_server:
             try:
                 await local_health_server.stop()
-                logger_run.debug("Health server stopped")
-            except Exception as e:
-                logger_run.error(f"Failed to stop health server: {e}")
+            except Exception:
+                pass
         
         await SessionManager.close_session()
         TRACE_ID.set("")
+        
+        if cfg.LOG_MINIMAL:
+            minimal_logger.end_run(run_success)
+```
 
+## 6. Example Output
+
+**Normal mode (LOG_MINIMAL=false):**
+```
+2025-01-10 14:30:15.123 | INFO     | macd_bot | run_once:2200 | 🚀 Run started | Ref time: 1736511015
+2025-01-10 14:30:15.456 | DEBUG    | macd_bot | fetch_candles:980 | Fetching BTCUSD 15m candles
+... (hundreds of lines) ...
+2025-01-10 14:30:45.789 | INFO     | macd_bot | run_once:2380 | ✅ RUN COMPLETE | Duration: 30.5s
+```
+
+**Minimal mode (LOG_MINIMAL=true):**
+```
+[2025-01-10 14:30:15 IST] RUN_START | ID:a3f7b2c1
+[2025-01-10 14:30:45 IST] RUN_END | ✅ SUCCESS | Pairs:12/12 | Alerts:5 (BTCUSD(2), ETHUSD(1), SOLUSD(2)) | Duration:30.5s
 
 try:
     import uvloop
