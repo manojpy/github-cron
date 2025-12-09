@@ -20,11 +20,12 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
+import redis.asyncio as aioredis
 import aiohttp
 from aiohttp import web
 import pandas as pd
 import numpy as np
-from redis import asyncio as redis
+import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
@@ -177,8 +178,6 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
-    LOG_MINIMAL: bool = Field(default=False, env='LOG_MINIMAL', description="Minimal 3-line output mode for cron jobs")
-
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -299,26 +298,9 @@ class JsonFormatter(SafeFormatter):
         return json_dumps(base)
 
 def setup_logging() -> logging.Logger:
-    """
-    Setup logging with support for minimal mode.
-    When LOG_MINIMAL=true, suppresses most logs except critical errors.
-    """
     logger = logging.getLogger("macd_bot")
     for h in logger.handlers[:]:
         logger.removeHandler(h)
-    
-    if cfg.LOG_MINIMAL:
-        level = logging.CRITICAL
-        logger.setLevel(level)
-        logger.propagate = False
-        
-        console = logging.StreamHandler(sys.stdout)
-        console.setLevel(level)
-        console.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
-        logger.addHandler(console)
-        
-        return logger
-    
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
@@ -344,85 +326,12 @@ def setup_logging() -> logging.Logger:
             file_handler.addFilter(TraceContextFilter())
             logger.addHandler(file_handler)
         except Exception as e:
-            if not cfg.LOG_MINIMAL:
-                logger.warning(f"Failed to setup file logging: {e}")
-    
+            logger.warning(f"Failed to setup file logging: {e}")
     return logger
+
 logger = setup_logging()
 
-class MinimalLogger:
-    """
-    Minimal logger for cron jobs - outputs only 3 lines per run:
-    1. Run start
-    2. Alerts summary
-    3. Run end with duration
-    """
-    def __init__(self, enabled: bool = False):
-        self.enabled = enabled
-        self.run_start_time = 0.0
-        self.correlation_id = ""
-        self.alerts_buffer = []
-        self.stats = {
-            "pairs_processed": 0,
-            "pairs_failed": 0,
-            "alerts_sent": 0,
-            "duration": 0.0
-        }
-    
-    def start_run(self, correlation_id: str) -> None:
-        """Mark run start."""
-        if not self.enabled:
-            return
-        self.run_start_time = time.time()
-        self.correlation_id = correlation_id
-        self.alerts_buffer = []
-        self.stats = {
-            "pairs_processed": 0,
-            "pairs_failed": 0,
-            "alerts_sent": 0,
-            "duration": 0.0
-        }
-        print(f"[{format_ist_time()}] RUN_START | ID:{correlation_id}")
-    
-    def record_alert(self, pair: str, alert_count: int) -> None:
-        """Record alert for summary."""
-        if not self.enabled:
-            return
-        self.alerts_buffer.append((pair, alert_count))
-        self.stats["alerts_sent"] += alert_count
-    
-    def record_pair_result(self, pair: str, success: bool) -> None:
-        """Record pair processing result."""
-        if not self.enabled:
-            return
-        if success:
-            self.stats["pairs_processed"] += 1
-        else:
-            self.stats["pairs_failed"] += 1
-    
-    def end_run(self, success: bool) -> None:
-        """Print final summary."""
-        if not self.enabled:
-            return
-        
-        self.stats["duration"] = time.time() - self.run_start_time
-        
-        if self.alerts_buffer:
-            alert_summary = ", ".join([f"{p}({c})" for p, c in self.alerts_buffer[:10]])
-            if len(self.alerts_buffer) > 10:
-                alert_summary += f" +{len(self.alerts_buffer) - 10} more"
-        else:
-            alert_summary = "none"
-        
-        status = "✅ SUCCESS" if success else "❌ FAILED"
-        print(
-            f"[{format_ist_time()}] RUN_END | {status} | "
-            f"Pairs:{self.stats['pairs_processed']}/{self.stats['pairs_processed'] + self.stats['pairs_failed']} | "
-            f"Alerts:{self.stats['alerts_sent']} ({alert_summary}) | "
-            f"Duration:{self.stats['duration']:.1f}s"
-        )
-
-minimal_logger = MinimalLogger(enabled=cfg.LOG_MINIMAL)
+shutdown_event = asyncio.Event()
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -680,43 +589,19 @@ def validate_candle_timestamp(candle_ts: int, expected_ts: int, tolerance_second
     return True
 
 class RedisStateStore:
-    """
-    Async-only Redis state store (redis-py >= 5 style):
-      - Requires:  from redis import asyncio as redis
-      - Never mixes with: import redis.asyncio as aioredis  (remove it completely)
-    """
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
-
         self.state_prefix = "pair_state:"
         self.meta_prefix = "metadata:"
         self.alert_prefix = "alert:"
         self.cb_prefix = "circuit_breaker:"
-
         self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
-
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
-
-    # ----------------------------
-    # Connection / lifecycle
-    # ----------------------------
-    def _assert_async_client(self) -> None:
-        """
-        Fail fast if the wrong (sync) Redis client accidentally ends up here.
-        """
-        if self._redis is None:
-            return
-        if not asyncio.iscoroutinefunction(self._redis.get):
-            raise TypeError(
-                "RedisStateStore received a non-async Redis client. "
-                "Ensure you use: 'from redis import asyncio as redis' "
-                "and remove any 'import redis.asyncio as aioredis'."
-            )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -728,8 +613,6 @@ class RedisStateStore:
                 max_connections=10,
                 decode_responses=True,
             )
-            self._assert_async_client()
-
             ok = await self._ping_with_retry(timeout)
             if ok:
                 if cfg.DEBUG_MODE:
@@ -738,9 +621,8 @@ class RedisStateStore:
                 self.degraded_alerted = False
                 self._connection_attempts = 0
                 return True
-
-            raise RedisConnectionError("ping failed after retries")
-
+            else:
+                raise RedisConnectionError("ping failed after retries")
         except Exception as exc:
             logger.error(f"Redis connection attempt failed: {exc}")
             if self._redis:
@@ -766,31 +648,36 @@ class RedisStateStore:
                 logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
-                # smoke test
                 test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
                 test_val = "ok"
                 if (
-                    await self._safe_redis_op(self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set")
-                    and await self._safe_redis_op(self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val)
-                ):
-                    await self._safe_redis_op(self._redis.delete(test_key), 1.0, "smoke_cleanup")
-
-                    expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
-                    logger.info(
-                        f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)"
+                    await self._safe_redis_op(
+                        self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set"
                     )
-
-                    info = await self._safe_redis_op(self._redis.info("memory"), 3.0, "info_memory", lambda r: r)
+                    and await self._safe_redis_op(
+                        self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val
+                    )
+                ):
+                    await self._safe_redis_op(
+                        self._redis.delete(test_key), 1.0, "smoke_cleanup"
+                    )
+                    expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
+                    logger.info(f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)")
+                    
+                    info = await self._safe_redis_op(
+                        self._redis.info("memory"), 3.0, "info_memory", lambda r: r
+                    )
                     if info:
                         policy = info.get("maxmemory_policy", "unknown")
                         if policy in ("volatile-lru", "allkeys-lru"):
                             logger.warning(f"⚠️ Redis using {policy} - keys may be evicted under memory pressure")
-
+    
+                
                     self.degraded = False
                     self.degraded_alerted = False
                     return
-
-                logger.warning("Redis smoke test failed, marking degraded")
+                else:
+                    logger.warning("Redis smoke test failed, marking degraded")
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
                 delay = cfg.REDIS_RETRY_DELAY * attempt
@@ -801,15 +688,15 @@ class RedisStateStore:
         self.degraded = True
         self._redis = None
 
-        logger.warning(
-            "\n🚨 REDIS DEGRADED MODE ACTIVE:\n"
-            "- Alert deduplication:  DISABLED (may get duplicates)\n"
-            "- State persistence:    DISABLED (alerts reset each run)\n"
-            "- Health tracking:      DISABLED\n"
-            "- Lock extension:       DISABLED\n"
-            "- Circuit breaker:      DISABLED (will reset each run)\n"
-            "- Trading alerts:       STILL ACTIVE (core functionality preserved)\n"
-        )
+        logger.warning("""
+🚨 REDIS DEGRADED MODE ACTIVE:
+- Alert deduplication:  DISABLED (may get duplicates)
+- State persistence:    DISABLED (alerts reset each run)
+- Health tracking:      DISABLED
+- Lock extension:       DISABLED
+- Circuit breaker:      DISABLED (will reset each run)
+- Trading alerts:       STILL ACTIVE (core functionality preserved)
+""")
 
         if cfg.FAIL_ON_REDIS_DOWN:
             raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
@@ -829,12 +716,11 @@ class RedisStateStore:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    # ----------------------------
-    # Core helpers
-    # ----------------------------
     async def _ping_with_retry(self, timeout: float) -> bool:
         return (
-            await self._safe_redis_op(self._redis.ping(), timeout, "ping", lambda r: bool(r))
+            await self._safe_redis_op(
+                self._redis.ping(), timeout, "ping", lambda r: bool(r)
+            )
         ) is True
 
     async def _safe_redis_op(
@@ -858,14 +744,17 @@ class RedisStateStore:
                 retries=3,
                 base_backoff=0.6,
                 cap=3.0,
-                on_error=lambda e, a: logger.debug(f"Redis {op_name} error (attempt {a}): {e}"),
+                on_error=lambda e, a: logger.debug(
+                    f"Redis {op_name} error (attempt {a}): {e}"
+                ),
             )
 
             if PROMETHEUS_ENABLED and METRIC_REDIS_OP_TIME:
-                METRIC_REDIS_OP_TIME.labels(operation=op_name).observe(time.time() - start_time)
+                METRIC_REDIS_OP_TIME.labels(operation=op_name).observe(
+                    time.time() - start_time
+                )
 
             return parser(result) if parser else result
-
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
             logger.error(f"Redis {op_name} failed: {e}")
             return None
@@ -873,9 +762,6 @@ class RedisStateStore:
             logger.error(f"Failed to {op_name}: {e}")
             return None
 
-    # ----------------------------
-    # Public API (state/metadata/alerts)
-    # ----------------------------
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
             self._redis.get(f"{self.state_prefix}{key}"),
@@ -884,12 +770,22 @@ class RedisStateStore:
             lambda r: json_loads(r) if r else None,
         )
 
-    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
+    async def set(
+        self,
+        key: str,
+        state: Optional[Any],
+        ts: Optional[int] = None,
+        timeout: float = 2.0,
+    ) -> None:
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            self._redis.set(redis_key, data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None),
+            self._redis.set(
+                redis_key,
+                data,
+                ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
+            ),
             timeout,
             f"set {key}",
         )
@@ -902,14 +798,20 @@ class RedisStateStore:
             lambda r: r if r else None,
         )
 
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
+    async def set_metadata(
+        self, key: str, value: str, timeout: float = 2.0
+    ) -> None:
         await self._safe_redis_op(
-            self._redis.set(f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds),
+            self._redis.set(
+                f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds
+            ),
             timeout,
             f"set_metadata {key}",
         )
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
+    async def check_recent_alert(
+        self, pair: str, alert_key: str, ts: int
+    ) -> bool:
         if self.degraded:
             return True
 
@@ -917,7 +819,9 @@ class RedisStateStore:
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
         result = await self._safe_redis_op(
-            self._redis.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
+            self._redis.set(
+                recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
+            ),
             timeout=2.0,
             op_name=f"check_recent_alert {pair}:{alert_key}",
             parser=lambda r: bool(r),
@@ -928,7 +832,9 @@ class RedisStateStore:
 
         return result is True
 
-    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
+    async def batch_check_recent_alerts(
+        self, checks: List[Tuple[str, str, int]]
+    ) -> Dict[str, bool]:
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -940,15 +846,22 @@ class RedisStateStore:
                 window = ts // 900
                 recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
                 keys_map[recent_key] = f"{pair}:{alert_key}"
-                pipeline.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                pipeline.set(
+                    recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
+                )
 
             results = await asyncio.wait_for(pipeline.execute(), timeout=3.0)
 
-            output: Dict[str, bool] = {}
+            output = {}
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
                 should_send = bool(results[idx]) if idx < len(results) else True
                 output[composite_key] = should_send
-                if (not should_send) and PROMETHEUS_ENABLED and METRIC_ALERT_DEDUP_HITS:
+
+                if (
+                    not should_send
+                    and PROMETHEUS_ENABLED
+                    and METRIC_ALERT_DEDUP_HITS
+                ):
                     pair = composite_key.split(":")[0]
                     METRIC_ALERT_DEDUP_HITS.labels(pair=pair).inc()
 
@@ -958,7 +871,9 @@ class RedisStateStore:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]:
+    async def mget_states(
+        self, keys: List[str], timeout: float = 2.0
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
         if not self._redis or not keys:
             return {}
 
@@ -2816,11 +2731,6 @@ async def evaluate_pair_and_alert(
         if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
             METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
 
-        if cfg.LOG_MINIMAL:
-            if alerts_to_send:
-                minimal_logger.record_alert(pair_name, len(alerts_to_send))
-            minimal_logger.record_pair_result(pair_name, success=True)
-
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
         
@@ -3055,24 +2965,13 @@ async def process_pairs_with_workers(
     return results
 
 async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
-    """
-    Main execution function with minimal logging support.
-    When LOG_MINIMAL=true, outputs only 3 lines per run.
-    """
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
-    run_success = False
-    
-    # Start minimal logger if enabled
-    if cfg.LOG_MINIMAL:
-        minimal_logger.start_run(correlation_id)
     
     reference_time = get_trigger_timestamp()
-    
-    if not cfg.LOG_MINIMAL:
-        logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
+    logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
     
     processed_pairs = set()
     failed_pairs = set()
@@ -3095,31 +2994,28 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
         if memory_monitor.is_critical():
             mem_percent = memory_monitor.check_memory()[1]
-            logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent:.1f}%)")
+            logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
             return False
 
         # OPTIMIZATION: Use existing Redis connection or create new one
         if existing_redis is not None:
             sdb = existing_redis
-            if not cfg.LOG_MINIMAL:
-                logger_run.debug("Using persistent Redis connection")
+            logger_run.debug("Using persistent Redis connection")
         else:
             sdb = RedisStateStore(cfg.REDIS_URL)
             await sdb.connect()
-            if not cfg.LOG_MINIMAL:
-                logger_run.debug("Created new Redis connection")
+            logger_run.debug("Created new Redis connection")
 
         try:
             if sdb.degraded and not sdb.degraded_alerted:
                 logger_run.critical("⚠️ Redis is in degraded mode - alert deduplication disabled!")
                 
                 telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-                if not cfg.LOG_MINIMAL:
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
-                        f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
-                        f"Time: {format_ist_time()}"
-                    ))
+                await telegram_queue.send(escape_markdown_v2(
+                    f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                    f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
+                    f"Time: {format_ist_time()}"
+                ))
                 sdb.degraded_alerted = True
             
             fetcher = DataFetcher(cfg.DELTA_API_BASE, redis_store=sdb)
@@ -3132,8 +3028,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
             lock_acquired = await lock.acquire(timeout=5.0)
             
             if not lock_acquired:
-                if not cfg.LOG_MINIMAL:
-                    logger_run.warning("❌ Another instance is running (Redis lock held)")
+                logger_run.warning("❌ Another instance is running (Redis lock held)")
                 return False
 
             try:
@@ -3150,7 +3045,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                         f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
                     ))
 
-                if cfg.SEND_TEST_MESSAGE and not cfg.LOG_MINIMAL:
+                if cfg.SEND_TEST_MESSAGE:
                     await telegram_queue.send(escape_markdown_v2(
                         f"🚀 Unified Bot - Run Started\n"
                         f"Date : {format_ist_time(datetime.now(timezone.utc))}\n"
@@ -3162,18 +3057,16 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                 
                 now = time.time()
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
-                    if not cfg.LOG_MINIMAL:
-                        logger_run.info("Fetching fresh products list from Delta API...")
+                    logger_run.info("Fetching fresh products list from Delta API...")
                     prod_resp = await fetcher.fetch_products()
                     if not prod_resp:
-                        logger_run.critical("❌ Failed to fetch products map")
+                        logger_run.error("Failed to fetch products map")
                         return False
                     PRODUCTS_CACHE["data"] = prod_resp
                     PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
                     run_once._products_cache = PRODUCTS_CACHE
                 else:
-                    if not cfg.LOG_MINIMAL:
-                        logger_run.debug("Using cached products list")
+                    logger_run.debug("Using cached products list")
                     prod_resp = PRODUCTS_CACHE["data"]
 
                 products_map = build_products_map_from_api_result(prod_resp)
@@ -3182,11 +3075,9 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 if len(pairs_to_process) < len(cfg.PAIRS):
                     missing = set(cfg.PAIRS) - set(pairs_to_process)
-                    if not cfg.LOG_MINIMAL:
-                        logger_run.warning(f"Missing products for pairs: {missing}")
+                    logger_run.warning(f"Missing products for pairs: {missing}")
 
-                if not cfg.LOG_MINIMAL:
-                    logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
+                logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
 
                 heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
 
@@ -3202,26 +3093,10 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                 alerts_sent = 0
                 failed_pairs = set()
                 for pair_result in all_results:
-                    if pair_result:
-                        pair_name, state = pair_result
-                        processed_pairs.add(pair_name)
-                        if state and state.get("state") == "ALERT_SENT":
-                            pair_alerts = state["summary"].get("alerts", 0)
-                            alerts_sent += pair_alerts
-                        
-                        if cfg.ENABLE_HEALTH_TRACKER:
-                            await health_tracker.record_pair_result(
-                                pair_name,
-                                success=True,
-                                info={"state": state.get("state"), "ts": int(time.time())}
-                            )
-
-                failed_pairs = set(pairs_to_process) - processed_pairs
-                
-                # Record failed pairs in minimal logger
-                if cfg.LOG_MINIMAL:
-                    for fp in failed_pairs:
-                        minimal_logger.record_pair_result(fp, success=False)
+                    pair_name, state = pair_result
+                    processed_pairs.add(pair_name)
+                    if state and state.get("state") == "ALERT_SENT":
+                        alerts_sent += state["summary"].get("alerts", 0)
 
                 heartbeat_task.cancel()
                 try:
@@ -3231,33 +3106,28 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 await dms.update_heartbeat()
 
-                if not cfg.LOG_MINIMAL:
-                    fetcher_stats = fetcher.get_stats()
-                    logger_run.info(
-                        f"📡 Fetch stats | "
-                        f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
-                        f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
-                        f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
-                        f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
-                        f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
-                        f"CB Candles: {fetcher_stats['circuit_breakers']['candles']}"
-                    )
+                fetcher_stats = fetcher.get_stats()
+                logger_run.info(
+                    f"📡 Fetch stats | "
+                    f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+                    f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
+                    f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
+                    f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
+                    f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
+                    f"CB Candles: {fetcher_stats['circuit_breakers']['candles']}"
+                )
 
                 run_duration = time.time() - start_time
 
-                if not cfg.LOG_MINIMAL:
-                    used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
-                    redis_status = "OK" if not sdb.degraded else "DEGRADED"
-                    summary = (
-                        f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
-                        f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
-                    )
-                    logger_run.info(summary)
+                used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
+                redis_status = "OK" if not sdb.degraded else "DEGRADED"
+                summary = (
+                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
+                    f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
+                )
+                logger_run.info(summary)
 
-                    if failed_pairs:
-                        logger_run.warning(f"⚠️ Failed pairs: {failed_pairs}")
-
-                if alerts_sent > MAX_ALERTS_PER_RUN and not cfg.LOG_MINIMAL:
+                if alerts_sent > MAX_ALERTS_PER_RUN:
                     telegram_msg = (
                         f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
                         f"Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
@@ -3272,24 +3142,21 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                         "pairs_processed": len(all_results),
                         "alerts_sent": alerts_sent,
                         "duration": run_duration,
-                        "correlation_id": correlation_id,
-                        "failed_pairs": list(failed_pairs)
+                        "correlation_id": correlation_id
                     })
-                
-                run_success = True
                 return True
 
             except asyncio.TimeoutError:
-                logger_run.critical("❌ Run timed out")
+                logger_run.error("Run timed out")
                 return False
             except Exception as e:
-                logger_run.critical(f"❌ Error within Redis context: {e}")
+                logger_run.exception(f"Error within Redis context: {e}")
                 raise
             finally:
                 if lock_acquired and lock and lock.acquired_by_me:
                     await lock.release(timeout=3.0)
-                    if not cfg.LOG_MINIMAL:
-                        logger_run.debug("🔓 Redis lock released")
+                else:
+                    logger_run.debug("Lock not acquired by this instance, skipping release")
 
         finally:
             # OPTIMIZATION: Only close if we created the connection
@@ -3297,11 +3164,10 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                 await sdb.close()
 
     except asyncio.CancelledError:
-        if not cfg.LOG_MINIMAL:
-            logger_run.info("Run cancelled (Task Cancellation)")
+        logger_run.info("Run cancelled (Task Cancellation)")
         return False
     except Exception as e:
-        logger_run.critical(f"❌ Fatal error in run_once: {e}")
+        logger_run.exception(f"❌ Fatal error in run_once: {e}")
         try:
             await cancel_all_tasks(grace_seconds=5)
         except Exception:
@@ -3314,17 +3180,12 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
         if local_health_server:
             try:
                 await local_health_server.stop()
-                if not cfg.LOG_MINIMAL:
-                    logger_run.debug("Health server stopped")
+                logger_run.debug("Health server stopped")
             except Exception as e:
                 logger_run.error(f"Failed to stop health server: {e}")
         
         await SessionManager.close_session()
         TRACE_ID.set("")
-        
-        # End minimal logger
-        if cfg.LOG_MINIMAL:
-            minimal_logger.end_run(run_success)
 
 try:
     import uvloop
