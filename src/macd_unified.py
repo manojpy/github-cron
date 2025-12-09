@@ -249,6 +249,7 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
+logger = setup_logging()
 
 class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
