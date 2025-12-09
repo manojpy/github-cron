@@ -101,6 +101,7 @@ jobs:
         env:
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
+          set +x
           echo "🐳 Launching container for run-id $GITHUB_RUN_ID"
 
           
