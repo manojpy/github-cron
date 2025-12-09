@@ -916,17 +916,12 @@ class RedisStateStore:
         return result
 
     async def set_circuit_breaker_state(
-        self, breaker_name: str, failure_count: int, last_failure_time: Optional[float]
+        self, breaker_name: str, data: Dict[str, Any]
     ) -> None:
         if self.degraded:
             return
         
         key = f"{self.cb_prefix}{breaker_name}"
-        data = {
-            "failure_count": failure_count,
-            "last_failure_time": last_failure_time,
-            "updated_at": time.time()
-        }
         await self._safe_redis_op(
             self._redis.set(key, json_dumps(data), ex=3600),
             timeout=2.0,
@@ -934,7 +929,19 @@ class RedisStateStore:
         )
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, timeout: int = 300, name: str = "default", redis_store: Optional[RedisStateStore] = None):
+    """
+    Enhanced circuit breaker with half-open state, decay, and per-entity tracking.
+    Prevents cascading failures by temporarily blocking calls after repeated failures.
+    """
+    def __init__(
+        self, 
+        failure_threshold: int = 5, 
+        timeout: int = 300, 
+        name: str = "default", 
+        redis_store: Optional[RedisStateStore] = None,
+        half_open_max_calls: int = 3,
+        success_threshold: int = 2
+    ):
         self.failure_count = 0
         self.last_failure_time: Optional[float] = None
         self.threshold = failure_threshold
@@ -944,6 +951,10 @@ class CircuitBreaker:
         self.name = name
         self.redis_store = redis_store
         self._loaded_from_redis = False
+        self.half_open_attempts = 0
+        self.half_open_max_calls = half_open_max_calls
+        self.half_open_successes = 0
+        self.success_threshold = success_threshold
 
     async def _load_state_from_redis(self) -> None:
         if self._loaded_from_redis or not self.redis_store:
@@ -954,58 +965,119 @@ class CircuitBreaker:
         if state:
             self.failure_count = state.get("failure_count", 0)
             self.last_failure_time = state.get("last_failure_time")
-            logger.info(f"Circuit breaker '{self.name}' loaded from Redis: failures={self.failure_count}")
+            self.state = state.get("state", "CLOSED")
+            self.half_open_attempts = state.get("half_open_attempts", 0)
+            self.half_open_successes = state.get("half_open_successes", 0)
+            logger.info(f"Circuit breaker '{self.name}' loaded: state={self.state}, failures={self.failure_count}")
 
     async def _persist_state_to_redis(self) -> None:
         if self.redis_store:
-            await self.redis_store.set_circuit_breaker_state(
-                self.name, self.failure_count, self.last_failure_time
-            )
+            data = {
+                "failure_count": self.failure_count,
+                "last_failure_time": self.last_failure_time,
+                "state": self.state,
+                "half_open_attempts": self.half_open_attempts,
+                "half_open_successes": self.half_open_successes,
+                "updated_at": time.time()
+            }
+            await self.redis_store.set_circuit_breaker_state(self.name, data)
 
     async def is_open(self) -> bool:
+        """Check if circuit breaker is open (blocking calls)."""
         await self._load_state_from_redis()
         
         async with self.lock:
-            if self.failure_count < self.threshold:
-                self.state = "CLOSED"
+            if self.state == "CLOSED":
                 if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
                     METRIC_CB_OPEN.set(0.0)
                 return False
-            if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
-                self.failure_count = 0
-                self.last_failure_time = None
-                self.state = "CLOSED"
-                logger.info(f"Circuit breaker '{self.name}' reset after timeout")
-                await self._persist_state_to_redis()
+            
+            if self.state == "OPEN":
+                if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
+                    self.state = "HALF_OPEN"
+                    self.half_open_attempts = 0
+                    self.half_open_successes = 0
+                    logger.info(f"Circuit breaker '{self.name}' entering HALF_OPEN state")
+                    await self._persist_state_to_redis()
+                    if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                        METRIC_CB_OPEN.set(0.5)
+                    return False
+                
                 if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
+                    METRIC_CB_OPEN.set(1.0)
+                return True
+            
+            if self.state == "HALF_OPEN":
+                if self.half_open_attempts >= self.half_open_max_calls:
+                    if self.half_open_successes >= self.success_threshold:
+                        self.state = "CLOSED"
+                        self.failure_count = 0
+                        self.last_failure_time = None
+                        logger.info(f"Circuit breaker '{self.name}' CLOSED after successful test calls")
+                        await self._persist_state_to_redis()
+                        if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                            METRIC_CB_OPEN.set(0.0)
+                        return False
+                    else:
+                        self.state = "OPEN"
+                        self.last_failure_time = time.time()
+                        logger.warning(f"Circuit breaker '{self.name}' reopened after failed test calls")
+                        await self._persist_state_to_redis()
+                        if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                            METRIC_CB_OPEN.set(1.0)
+                        return True
+                
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(0.5)
                 return False
-            self.state = "OPEN"
-            if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                METRIC_CB_OPEN.set(1.0)
-            return True
+            
+            return False
 
     async def record_failure(self) -> int:
+        """Record a failure and potentially open the circuit."""
         await self._load_state_from_redis()
         
         async with self.lock:
+            if self.state == "HALF_OPEN":
+                self.half_open_attempts += 1
+                self.state = "OPEN"
+                self.last_failure_time = time.time()
+                logger.warning(f"Circuit breaker '{self.name}': HALF_OPEN test failed, reopening")
+                await self._persist_state_to_redis()
+                if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
+                    METRIC_CB_FAILURES.inc()
+                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
+                    METRIC_CB_OPEN.set(1.0)
+                return self.failure_count
+            
             self.failure_count += 1
             self.last_failure_time = time.time()
             logger.warning(f"Circuit breaker '{self.name}': failure {self.failure_count}/{self.threshold}")
             await self._persist_state_to_redis()
+            
             if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
                 METRIC_CB_FAILURES.inc()
+            
             if self.failure_count >= self.threshold:
                 self.state = "OPEN"
                 logger.critical(f"Circuit breaker '{self.name}' OPEN for {self.timeout}s")
                 if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
                     METRIC_CB_OPEN.set(1.0)
+            
             return self.failure_count
 
     async def record_success(self) -> None:
+        """Record a success and potentially close the circuit."""
         await self._load_state_from_redis()
         
         async with self.lock:
+            if self.state == "HALF_OPEN":
+                self.half_open_attempts += 1
+                self.half_open_successes += 1
+                logger.info(f"Circuit breaker '{self.name}': HALF_OPEN test success ({self.half_open_successes}/{self.success_threshold})")
+                await self._persist_state_to_redis()
+                return
+            
             if self.failure_count > 0:
                 self.failure_count = 0
                 self.last_failure_time = None
@@ -1016,6 +1088,7 @@ class CircuitBreaker:
                     METRIC_CB_OPEN.set(0.0)
 
     async def call(self, func: Callable, *args, **kwargs):
+        """Execute a function with circuit breaker protection."""
         if await self.is_open():
             raise Exception(f"Circuit breaker '{self.name}' is OPEN (state: {self.state})")
         try:
