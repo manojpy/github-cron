@@ -7,7 +7,7 @@ aiohttp[speedups]==3.10.11
 
 # High-performance async event loop (30-40% faster than asyncio)
 uvloop==0.22.1
-
+numba>=0.62.0,<0.63.0
 # Data processing
 pandas==2.2.3
 numpy==2.1.3
