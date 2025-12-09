@@ -25,6 +25,7 @@ import aiohttp
 from aiohttp import web
 import pandas as pd
 import numpy as np
+import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
