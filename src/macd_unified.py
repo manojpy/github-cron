@@ -3106,12 +3106,15 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 await dms.update_heartbeat()
 
-                # Get and log fetch statistics
                 fetcher_stats = fetcher.get_stats()
                 logger_run.info(
-                    f"Fetch stats | Products: {fetcher_stats['products_success']}âœ…/{fetcher_stats['products_failed']}âŒ | "
-                    f"Candles: {fetcher_stats['candles_success']}âœ…/{fetcher_stats['candles_failed']}âŒ | "
-                    f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']}"
+                    f"📡 Fetch stats | "
+                    f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+                    f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
+                    f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
+                    f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
+                    f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
+                    f"CB Candles: {fetcher_stats['circuit_breakers']['candles']}"
                 )
 
                 run_duration = time.time() - start_time
