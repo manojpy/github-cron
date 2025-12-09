@@ -3273,23 +3273,6 @@ async def run_once() -> bool:
         
         if cfg.LOG_MINIMAL:
             minimal_logger.end_run(run_success)
-```
-
-## 6. Example Output
-
-**Normal mode (LOG_MINIMAL=false):**
-```
-2025-01-10 14:30:15.123 | INFO     | macd_bot | run_once:2200 | 🚀 Run started | Ref time: 1736511015
-2025-01-10 14:30:15.456 | DEBUG    | macd_bot | fetch_candles:980 | Fetching BTCUSD 15m candles
-... (hundreds of lines) ...
-2025-01-10 14:30:45.789 | INFO     | macd_bot | run_once:2380 | ✅ RUN COMPLETE | Duration: 30.5s
-```
-
-**Minimal mode (LOG_MINIMAL=true):**
-```
-[2025-01-10 14:30:15 IST] RUN_START | ID:a3f7b2c1
-[2025-01-10 14:30:45 IST] RUN_END | ✅ SUCCESS | Pairs:12/12 | Alerts:5 (BTCUSD(2), ETHUSD(1), SOLUSD(2)) | Duration:30.5s
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
