@@ -20,12 +20,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
-import redis.asyncio as aioredis
 import aiohttp
 from aiohttp import web
 import pandas as pd
 import numpy as np
-import redis.asyncio as redis
+from redis import asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
@@ -705,6 +704,7 @@ class RedisStateStore:
                 max_connections=10,
                 decode_responses=True,
             )
+
             ok = await self._ping_with_retry(timeout)
             if ok:
                 if cfg.DEBUG_MODE:
