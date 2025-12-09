@@ -479,33 +479,84 @@ def _exp_backoff_sleep(attempt: int, base: float, cap: float) -> float:
     sleep = min(cap, base * (2 ** (attempt - 1)))
     return max(0.05, sleep * random.uniform(0.5, 1.5))
 
+class RetryCategory:
+    NETWORK = "network"
+    RATE_LIMIT = "rate_limit"
+    API_ERROR = "api_error"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
+def categorize_exception(exc: Exception) -> str:
+    """Categorize exception type for better retry handling."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return RetryCategory.TIMEOUT
+    elif isinstance(exc, (ClientConnectorError, aiohttp.ClientConnectorError)):
+        return RetryCategory.NETWORK
+    elif isinstance(exc, ClientResponseError):
+        if hasattr(exc, 'status') and exc.status == 429:
+            return RetryCategory.RATE_LIMIT
+        return RetryCategory.API_ERROR
+    elif isinstance(exc, (ClientError, aiohttp.ClientError)):
+        return RetryCategory.NETWORK
+    return RetryCategory.UNKNOWN
+
 async def retry_async(
     fn: Callable,
     *args,
     retries: int = 3,
     base_backoff: float = 0.8,
     cap: float = 30.0,
-    on_error: Optional[Callable[[Exception, int], None]] = None,
+    jitter_min: float = 0.05,
+    jitter_max: float = 0.5,
+    on_error: Optional[Callable[[Exception, int, str], None]] = None,
     **kwargs
 ):
+    """
+    Enhanced retry with exponential backoff, jitter, and error categorization.
+    
+    Args:
+        fn: Async function to retry
+        retries: Maximum number of retry attempts
+        base_backoff: Base delay in seconds
+        cap: Maximum delay cap in seconds
+        jitter_min: Minimum jitter fraction (0.05 = 5%)
+        jitter_max: Maximum jitter fraction (0.5 = 50%)
+        on_error: Callback(exception, attempt, category)
+    """
     last_exc: Optional[Exception] = None
+    
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
             raise asyncio.CancelledError()
+        
         try:
             return await fn(*args, **kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             last_exc = e
+            category = categorize_exception(e)
+            
             if on_error:
                 try:
-                    on_error(e, attempt)
+                    on_error(e, attempt, category)
                 except Exception:
                     pass
+            
             if attempt >= retries:
                 break
-            await asyncio.sleep(_exp_backoff_sleep(attempt, base_backoff, cap))
+            
+            base_delay = min(cap, base_backoff * (2 ** (attempt - 1)))
+            jitter = base_delay * random.uniform(jitter_min, jitter_max)
+            sleep_time = base_delay + jitter
+            
+            logger.debug(
+                f"Retry attempt {attempt}/{retries} after {sleep_time:.2f}s | "
+                f"Category: {category} | Error: {str(e)[:100]}"
+            )
+            
+            await asyncio.sleep(sleep_time)
+    
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
 def get_trigger_timestamp() -> int:
@@ -1209,73 +1260,183 @@ class RedisLock:
             self.token = None
             self.acquired_by_me = False
 
-async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15, circuit_breaker: Optional[CircuitBreaker] = None) -> Optional[Dict[str, Any]]:
+async def async_fetch_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    retries: int = 3,
+    backoff: float = 1.5,
+    timeout: int = 15,
+    circuit_breaker: Optional[CircuitBreaker] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Enhanced JSON fetch with circuit breaker, categorized retries, and detailed logging.
+    """
     if circuit_breaker and await circuit_breaker.is_open():
         logger.warning(f"Circuit breaker open; skipping fetch {url}")
         return None
+    
     session = await SessionManager.get_session()
     last_error = None
+    retry_stats = {
+        RetryCategory.NETWORK: 0,
+        RetryCategory.RATE_LIMIT: 0,
+        RetryCategory.API_ERROR: 0,
+        RetryCategory.TIMEOUT: 0,
+        RetryCategory.UNKNOWN: 0
+    }
+    
+    def on_retry_error(exc: Exception, attempt: int, category: str) -> None:
+        retry_stats[category] = retry_stats.get(category, 0) + 1
+        logger.debug(
+            f"Fetch retry {attempt}/{retries} | URL: {url[:80]} | "
+            f"Category: {category} | Error: {str(exc)[:100]}"
+        )
     
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
             return None
+        
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     wait_sec = min(int(retry_after) if retry_after else 1, Constants.CIRCUIT_BREAKER_MAX_WAIT)
-                    logger.warning(f"Rate limited (429), waiting {wait_sec}s")
-                    await asyncio.sleep(wait_sec + random.uniform(0, 0.5))
+                    jitter = random.uniform(0.1, 0.5)
+                    total_wait = wait_sec + jitter
+                    
+                    logger.warning(
+                        f"Rate limited (429) | URL: {url[:80]} | "
+                        f"Retry-After: {retry_after} | Waiting: {total_wait:.2f}s"
+                    )
+                    retry_stats[RetryCategory.RATE_LIMIT] += 1
+                    
+                    await asyncio.sleep(total_wait)
                     continue
+                
                 if resp.status >= 500:
-                    logger.warning(f"Server error {resp.status} on attempt {attempt}/{retries}")
+                    retry_stats[RetryCategory.API_ERROR] += 1
+                    logger.warning(
+                        f"Server error {resp.status} on attempt {attempt}/{retries} | "
+                        f"URL: {url[:80]}"
+                    )
+                    
                     if attempt < retries:
-                        await asyncio.sleep(_exp_backoff_sleep(attempt, backoff, Constants.CIRCUIT_BREAKER_MAX_WAIT / 10))
+                        base_delay = min(
+                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                            backoff * (2 ** (attempt - 1))
+                        )
+                        jitter = base_delay * random.uniform(0.1, 0.5)
+                        await asyncio.sleep(base_delay + jitter)
                     continue
+                
                 if resp.status >= 400:
-                    logger.error(f"Client error {resp.status} for {url}")
+                    logger.error(
+                        f"Client error {resp.status} for {url[:80]} | "
+                        f"This usually indicates invalid request"
+                    )
                     return None
+                
                 data = await resp.json(loads=json_loads)
+                
                 if circuit_breaker:
                     await circuit_breaker.record_success()
+                
+                if any(retry_stats.values()):
+                    logger.info(
+                        f"Fetch succeeded after retries | URL: {url[:80]} | "
+                        f"Stats: {retry_stats}"
+                    )
+                
                 return data
+                
         except (asyncio.TimeoutError, ClientConnectorError, ClientError, ClientResponseError) as e:
             last_error = e
-            logger.warning(f"Fetch error on attempt {attempt}/{retries}: {e}")
+            category = categorize_exception(e)
+            retry_stats[category] = retry_stats.get(category, 0) + 1
+            
+            logger.warning(
+                f"Fetch error (attempt {attempt}/{retries}) | "
+                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+            )
+            
             if attempt < retries:
-                await asyncio.sleep(_exp_backoff_sleep(attempt, backoff, Constants.CIRCUIT_BREAKER_MAX_WAIT / 10))
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                await asyncio.sleep(base_delay + jitter)
+        
         except Exception as e:
             last_error = e
-            logger.exception(f"Unexpected fetch error for {url}: {e}")
+            retry_stats[RetryCategory.UNKNOWN] += 1
+            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
     
     if circuit_breaker:
         await circuit_breaker.record_failure()
+    
     if PROMETHEUS_ENABLED and METRIC_FETCH_ERRORS:
         METRIC_FETCH_ERRORS.inc()
     
-    logger.error(f"Failed to fetch {url} after {retries} attempts: {last_error}")
+    logger.error(
+        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
+        f"Stats: {retry_stats} | Last error: {last_error}"
+    )
     return None
 
 class RateLimitedFetcher:
+    """
+    Token bucket rate limiter with detailed metrics and logging.
+    """
     def __init__(self, max_per_minute: int = 60, concurrency: int = 4):
         self.max_per_minute = max_per_minute
         self.semaphore = asyncio.Semaphore(concurrency)
         self.requests: deque[float] = deque()
         self.lock = asyncio.Lock()
+        self.total_waits = 0
+        self.total_wait_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
+        """Execute function with rate limiting."""
         async with self.lock:
             now = time.time()
+            
             while self.requests and now - self.requests[0] > 60:
                 self.requests.popleft()
+            
             if len(self.requests) >= self.max_per_minute:
                 sleep_time = 60 - (now - self.requests[0])
-                logger.debug(f"Rate limit reached, sleeping {sleep_time:.2f}s")
-                await asyncio.sleep(sleep_time + random.uniform(0.05, 0.2))
+                jitter = random.uniform(0.05, 0.2)
+                total_sleep = sleep_time + jitter
+                
+                self.total_waits += 1
+                self.total_wait_time += total_sleep
+                
+                logger.debug(
+                    f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
+                    f"sleeping {total_sleep:.2f}s | Total waits: {self.total_waits}"
+                )
+                
+                await asyncio.sleep(total_sleep)
+                
+                now = time.time()
+                while self.requests and now - self.requests[0] > 60:
+                    self.requests.popleft()
+            
             self.requests.append(time.time())
+        
         async with self.semaphore:
             return await func(*args, **kwargs)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get rate limiter statistics."""
+        return {
+            "total_waits": self.total_waits,
+            "total_wait_time_seconds": round(self.total_wait_time, 2),
+            "current_queue_size": len(self.requests),
+            "max_per_minute": self.max_per_minute
+        }
 
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None, redis_store: Optional[RedisStateStore] = None):
@@ -1283,22 +1444,59 @@ class DataFetcher:
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
-        self.circuit_breaker_products = CircuitBreaker(name="products_api", redis_store=redis_store)
-        self.circuit_breaker_candles = CircuitBreaker(name="candles_api", redis_store=redis_store)
+        self.circuit_breaker_products = CircuitBreaker(
+            name="products_api",
+            redis_store=redis_store,
+            failure_threshold=5,
+            timeout=300
+        )
+        self.circuit_breaker_candles = CircuitBreaker(
+            name="candles_api",
+            redis_store=redis_store,
+            failure_threshold=5,
+            timeout=300
+        )
         self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
+        self.fetch_stats = {
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0
+        }
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
+        """Fetch products list with circuit breaker protection."""
         url = f"{self.api_base}/v2/products"
+        
         async with self.semaphore:
             result = await self.rate_limiter.call(
-                async_fetch_json, url, retries=5, backoff=2.0,
-                timeout=self.timeout, circuit_breaker=self.circuit_breaker_products
+                async_fetch_json,
+                url,
+                retries=5,
+                backoff=2.0,
+                timeout=self.timeout,
+                circuit_breaker=self.circuit_breaker_products
             )
-            if result and self.circuit_breaker_products.state == "OPEN":
-                await self.circuit_breaker_products.record_success()
+            
+            if result:
+                self.fetch_stats["products_success"] += 1
+                if self.circuit_breaker_products.state == "OPEN":
+                    await self.circuit_breaker_products.record_success()
+                logger.debug(f"Products fetch successful | URL: {url}")
+            else:
+                self.fetch_stats["products_failed"] += 1
+                logger.warning(f"Products fetch failed | URL: {url}")
+            
             return result
 
-    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    async def fetch_candles(
+        self,
+        symbol: str,
+        resolution: str,
+        limit: int,
+        reference_time: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch candles with circuit breaker and enhanced logging."""
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1317,6 +1515,7 @@ class DataFetcher:
         }
 
         url = f"{self.api_base}/v2/chart/history"
+        
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1327,8 +1526,27 @@ class DataFetcher:
                 timeout=self.timeout,
                 circuit_breaker=self.circuit_breaker_candles
             )
-
-        return data
+            
+            if data:
+                self.fetch_stats["candles_success"] += 1
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(
+                    f"Candles fetch failed | Symbol: {symbol} | "
+                    f"Resolution: {resolution} | Params: {params}"
+                )
+            
+            return data
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get fetcher statistics."""
+        stats = self.fetch_stats.copy()
+        stats["rate_limiter"] = self.rate_limiter.get_stats()
+        stats["circuit_breakers"] = {
+            "products": self.circuit_breaker_products.state,
+            "candles": self.circuit_breaker_candles.state
+        }
+        return stats
 
 def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, Optional[str]]:
     try:
@@ -2887,6 +3105,14 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                     pass
 
                 await dms.update_heartbeat()
+
+                # Get and log fetch statistics
+                fetcher_stats = fetcher.get_stats()
+                logger_run.info(
+                    f"Fetch stats | Products: {fetcher_stats['products_success']}âœ…/{fetcher_stats['products_failed']}âŒ | "
+                    f"Candles: {fetcher_stats['candles_success']}âœ…/{fetcher_stats['candles_failed']}âŒ | "
+                    f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']}"
+                )
 
                 run_duration = time.time() - start_time
 
