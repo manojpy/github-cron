@@ -25,7 +25,6 @@ import aiohttp
 from aiohttp import web
 import pandas as pd
 import numpy as np
-import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
@@ -161,7 +160,6 @@ class BotConfig(BaseModel):
     ENABLE_HEALTH_TRACKER: bool = True
     DEAD_MANS_COOLDOWN_SECONDS: int = 1200
     LOG_LEVEL: str = "INFO"
-    ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
@@ -177,7 +175,6 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
-    LOG_LEVEL: str = "INFO"
     LOG_MINIMAL: bool = Field(default=False, env='LOG_MINIMAL', description="Minimal 3-line output mode for cron jobs")
     ENABLE_VWAP: bool = True
 
@@ -319,7 +316,7 @@ def setup_logging() -> logging.Logger:
         logger.addHandler(console)
         
         return logger
-        
+    
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
@@ -349,7 +346,22 @@ def setup_logging() -> logging.Logger:
                 logger.warning(f"Failed to setup file logging: {e}")
     
     return logger
+
 logger = setup_logging()
+
+_STARTUP_BANNER_PRINTED = False
+
+def print_startup_banner_once() -> None:
+    global _STARTUP_BANNER_PRINTED
+    if _STARTUP_BANNER_PRINTED:
+        return
+    _STARTUP_BANNER_PRINTED = True
+    logger.info(
+        f"🚀 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {Constants.REDIS_LOCK_EXPIRY}s"
+    )
+
+print_startup_banner_once() 
 
 class MinimalLogger:
     """
@@ -481,20 +493,6 @@ if PROMETHEUS_ENABLED and Counter and Gauge and Histogram:
         logger.info(f"Prometheus metrics server started on port {Constants.PROMETHEUS_PORT}")
     except Exception as e:
         logger.warning(f"Failed to start Prometheus metrics: {e}")
-
-_STARTUP_BANNER_PRINTED = False
-
-def print_startup_banner_once() -> None:
-    global _STARTUP_BANNER_PRINTED
-    if _STARTUP_BANNER_PRINTED:
-        return
-    _STARTUP_BANNER_PRINTED = True
-    logger.info(
-        f"🚀 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
-        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {Constants.REDIS_LOCK_EXPIRY}s"
-    )
-
-print_startup_banner_once()
 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
@@ -3274,6 +3272,7 @@ async def run_once() -> bool:
         
         if cfg.LOG_MINIMAL:
             minimal_logger.end_run(run_success)
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
