@@ -627,6 +627,16 @@ async def retry_async(
     
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
+def get_trigger_timestamp(reference_time: Optional[int] = None) -> int:
+    """
+    Get the reference timestamp for candle calculations.
+    If no reference_time provided, uses current time.
+    """
+    if reference_time is not None:
+        return int(reference_time)
+    return int(time.time())
+
+
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
     interval_seconds = interval_minutes * 60
     current_window = reference_time // interval_seconds
