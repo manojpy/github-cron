@@ -9,6 +9,7 @@ import logging.handlers
 import ssl
 import signal
 import re
+import gc
 import uuid
 import argparse
 import psutil
