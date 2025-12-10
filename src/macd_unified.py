@@ -91,8 +91,6 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "10000"))
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
-    NUMBA_CACHE = True
-    NUMBA_PARALLEL = True
     INDICATOR_WORKERS = min(4, os.cpu_count() or 4)
     FETCH_BATCH_SIZE = 12
 
@@ -1942,7 +1940,7 @@ def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
         logger.error(f"Failed to validate indicator {name}: {e}")
         return pd.Series([0.0] * len(series), index=series.index)
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _ema_numba(data: np.ndarray, length: int) -> np.ndarray:
     """Pure Numba EMA - 50x faster than pandas.ewm()"""
     n = len(data)
@@ -1967,7 +1965,7 @@ def calculate_ema(series: pd.Series, length: int) -> pd.Series:
     result = _ema_numba(data, length)
     return pd.Series(result, index=series.index)
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _sma_numba(data: np.ndarray, period: int) -> np.ndarray:
     """Pure Numba SMA - 40x faster than pandas.rolling()"""
     n = len(data)
@@ -1996,7 +1994,7 @@ def calculate_sma(data: pd.Series, period: int) -> pd.Series:
     result = _sma_numba(arr, period)
     return validate_indicator_series(pd.Series(result, index=data.index), "SMA")
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _rma_numba(data: np.ndarray, period: int) -> np.ndarray:
     """Pure Numba RMA - 45x faster than pandas.ewm()"""
     n = len(data)
@@ -2021,7 +2019,7 @@ def calculate_rma(data: pd.Series, period: int) -> pd.Series:
     result = _rma_numba(arr, period)
     return validate_indicator_series(pd.Series(result, index=data.index), "RMA")
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _ppo_numba(close: np.ndarray, fast: int, slow: int, signal: int, 
                use_sma: bool = False) -> tuple:
     """Pure Numba PPO calculation - 60x faster"""
@@ -2065,7 +2063,7 @@ def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int,
         validate_indicator_series(signal_series, "PPO_SIGNAL")
     )
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _rsi_numba(close: np.ndarray, period: int) -> np.ndarray:
     """Pure Numba RSI calculation - 70x faster"""
     n = len(close)
@@ -2095,7 +2093,7 @@ def _rsi_numba(close: np.ndarray, period: int) -> np.ndarray:
     
     return rsi
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _kalman_filter_numba(src: np.ndarray, length: int, R: float = 0.01, 
                          Q: float = 0.1) -> np.ndarray:
     """Pure Numba Kalman filter - 80x faster"""
@@ -2136,7 +2134,7 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
         pd.Series(smooth_rsi, index=df.index), "SmoothRSI"
     )
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _smooth_rng_numba(close: np.ndarray, t: int, m: float) -> np.ndarray:
     """Pure Numba smooth range calculation"""
     n = len(close)
@@ -2154,7 +2152,7 @@ def _smooth_rng_numba(close: np.ndarray, t: int, m: float) -> np.ndarray:
     
     return smooth_rng
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _rng_filt_numba(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     """Pure Numba range filter"""
     n = len(x)
@@ -2195,7 +2193,7 @@ def calculate_cirrus_cloud(df: pd.DataFrame):
     
     return upw, dnw, pd.Series(filtx1, index=df.index), pd.Series(filtx12, index=df.index)
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _vwap_daily_numba(timestamps: np.ndarray, high: np.ndarray, low: np.ndarray,
                       close: np.ndarray, volume: np.ndarray) -> np.ndarray:
     """Pure Numba VWAP with daily reset - 100x faster"""
@@ -2273,7 +2271,7 @@ def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_tim
         else:
             return None
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     """Numba-compiled worm calculation loop - 100x faster than Python"""
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -2294,7 +2292,7 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     
     return worm_arr
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """Numba-compiled value calculation loop"""
     value_arr = np.zeros(rows, dtype=np.float64)
@@ -2308,7 +2306,7 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     
     return value_arr
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     """Numba-compiled momentum accumulation loop"""
     for i in range(1, rows):
@@ -2316,7 +2314,7 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _calc_rolling_std(data: np.ndarray, window: int) -> np.ndarray:
     """Fast rolling standard deviation using Numba"""
     n = len(data)
@@ -2352,7 +2350,7 @@ def _calc_rolling_std(data: np.ndarray, window: int) -> np.ndarray:
     
     return result
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _calc_rolling_mean(data: np.ndarray, window: int) -> np.ndarray:
     """Fast rolling mean using Numba"""
     n = len(data)
@@ -2377,7 +2375,7 @@ def _calc_rolling_mean(data: np.ndarray, window: int) -> np.ndarray:
     
     return result
 
-@njit(cache=True, fastmath=True)
+@njit(cache=False, fastmath=True)
 def _calc_rolling_min_max(data: np.ndarray, window: int) -> tuple:
     """Fast rolling min/max using Numba"""
     n = len(data)
@@ -4021,99 +4019,3 @@ if __name__ == "__main__":
         except Exception as exc:
             logger.critical(f"Fatal error: {exc}", exc_info=True)
             sys.exit(1)
-
-
-
-
-
-
-# ============================================================================
-# PART 2: NUMBA-OPTIMIZED INDICATOR CALCULATIONS
-# ============================================================================
-# These replacements provide 50-100x speedup over Pandas operations
-# ============================================================================
-
-# ============================================================================
-# SECTION A: REPLACE EMA CALCULATION
-# ============================================================================
-# LOCATION: Find function "def calculate_ema" (around line 1150)
-# ACTION: REPLACE entire function with this optimized version
-# ============================================================================
-
-
-# ============================================================================
-# SECTION G: OPTIMIZE VWAP CALCULATION
-# ============================================================================
-# LOCATION: Find function "def calculate_vwap_daily_reset" (around line 1430)
-# ACTION: REPLACE entire function
-# ============================================================================
-
-@njit(cache=True, fastmath=True)
-def _vwap_daily_numba(timestamps: np.ndarray, high: np.ndarray, low: np.ndarray,
-                      close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    """Pure Numba VWAP with daily reset - 100x faster"""
-    n = len(timestamps)
-    vwap = np.empty(n, dtype=np.float64)
-    
-    cum_vol = 0.0
-    cum_hlc3_vol = 0.0
-    current_day = 0
-    
-    for i in range(n):
-        # Get day from timestamp (seconds to days)
-        day = int(timestamps[i] // 86400)
-        
-        # Reset on new day
-        if i == 0 or day != current_day:
-            cum_vol = 0.0
-            cum_hlc3_vol = 0.0
-            current_day = day
-        
-        # Calculate HLC3
-        hlc3 = (high[i] + low[i] + close[i]) / 3.0
-        
-        # Update cumulative values
-        cum_vol += volume[i]
-        cum_hlc3_vol += hlc3 * volume[i]
-        
-        # Calculate VWAP
-        if cum_vol > 0:
-            vwap[i] = cum_hlc3_vol / cum_vol
-        else:
-            vwap[i] = close[i]
-    
-    return vwap
-
-def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
-    """Optimized VWAP using Numba"""
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    
-    timestamps = df["timestamp"].values.astype(np.int64)
-    high = df["high"].values.astype(np.float64)
-    low = df["low"].values.astype(np.float64)
-    close = df["close"].values.astype(np.float64)
-    volume = df["volume"].values.astype(np.float64)
-    
-    vwap = _vwap_daily_numba(timestamps, high, low, close, volume)
-    
-    return validate_indicator_series(
-        pd.Series(vwap, index=df.index), "VWAP"
-    )
-
-
-# ============================================================================
-# SUMMARY OF PART 2 CHANGES:
-# ============================================================================
-# REPLACED 7 function groups with Numba-optimized versions:
-# 1. calculate_ema() - 50x faster
-# 2. calculate_sma() - 40x faster  
-# 3. calculate_rma() - 45x faster
-# 4. calculate_ppo() - 60x faster
-# 5. calculate_smooth_rsi() - 70x faster
-# 6. calculate_cirrus_cloud() - 50x faster
-# 7. calculate_vwap_daily_reset() - 100x faster
-#
-# TOTAL SPEEDUP: Indicator calculations now 50-100x faster
-# NO CHANGES to logic, parameters, or output values
-# ============================================================================
