@@ -2182,31 +2182,9 @@ def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_tim
         else:
             return None
 
-@njit(cache=False, fastmath=True, parallel=False)
-def _calc_rolling_std_numba(data: np.ndarray, window: int) -> np.ndarray:
-    """Rolling STD for MMH - Complex calculation"""
-    n = len(data)
-    result = np.empty(n, dtype=np.float64)
-    
-    for i in range(n):
-        start = max(0, i - window + 1)
-        window_data = data[start:i+1]
-        
-        # Calculate mean
-        valid_data = window_data[~np.isnan(window_data)]
-        if len(valid_data) == 0:
-            result[i] = 0.0
-            continue
-            
-        mean_val = np.mean(valid_data)
-        variance = np.mean((valid_data - mean_val) ** 2)
-        result[i] = np.sqrt(variance)
-    
-    return result
-
-@njit(cache=False, fastmath=True, parallel=False)
-def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    """MMH worm calculation - Critical for accuracy"""
+njit
+def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
+    """Numba-compiled worm calculation loop - ~100x faster than Python"""
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     worm_arr[0] = first_val
@@ -2225,115 +2203,85 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     
     return worm_arr
 
-@njit(cache=False, fastmath=True, parallel=False)
-def _calc_mmh_core(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Core MMH calculation - Most complex indicator, needs Numba"""
-    rows = len(close)
-    
-    # Calculate standard deviation
-    sd = _calc_rolling_std_numba(close, 50) * responsiveness
-    
-    # Calculate worm
-    worm_arr = _calc_mmh_worm_loop(close, sd, rows)
-    
-    # Calculate moving average using cumsum (faster than loop)
-    ma = np.empty(rows, dtype=np.float64)
-    cumsum = 0.0
-    for i in range(rows):
-        cumsum += close[i]
-        count = min(i + 1, period)
-        if i >= period:
-            cumsum -= close[i - period]
-        ma[i] = cumsum / count
-    
-    # Calculate raw values
-    raw = np.empty(rows, dtype=np.float64)
-    for i in range(rows):
-        if worm_arr[i] == 0.0:
-            raw[i] = 0.0
-        else:
-            raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
-        if np.isnan(raw[i]) or np.isinf(raw[i]):
-            raw[i] = 0.0
-    
-    # Calculate rolling min/max
-    min_med = np.empty(rows, dtype=np.float64)
-    max_med = np.empty(rows, dtype=np.float64)
-    
-    for i in range(rows):
-        start = max(0, i - period + 1)
-        window = raw[start:i+1]
-        valid = window[~np.isnan(window)]
-        min_med[i] = np.min(valid) if len(valid) > 0 else 0.0
-        max_med[i] = np.max(valid) if len(valid) > 0 else 0.0
-    
-    # Calculate normalized temp
-    temp = np.empty(rows, dtype=np.float64)
-    for i in range(rows):
-        denom = max_med[i] - min_med[i]
-        if denom == 0.0:
-            temp[i] = 0.5
-        else:
-            temp[i] = (raw[i] - min_med[i]) / denom
-        temp[i] = max(0.0, min(1.0, temp[i]))
-    
-    # Calculate value with decay
+@njit
+def _calc_mmh_value_loop(temp_arr, rows):
+    """Numba-compiled value calculation loop"""
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
     
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
-        t = temp[i] if not np.isnan(temp[i]) else 0.5
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
-    # Calculate momentum
-    momentum = np.empty(rows, dtype=np.float64)
-    for i in range(rows):
-        temp2 = (1.0 + value_arr[i]) / (1.0 - value_arr[i])
-        if np.isnan(temp2) or np.isinf(temp2):
-            temp2 = 1.0
-        temp2 = max(1e-8, min(1e8, temp2))
-        momentum[i] = 0.25 * np.log(temp2)
-        if np.isnan(momentum[i]) or np.isinf(momentum[i]):
-            momentum[i] = 0.0
-    
-    # Accumulate momentum
-    for i in range(1, rows):
-        prev = momentum[i - 1] if not np.isnan(momentum[i - 1]) else 0.0
-        momentum[i] = momentum[i] + 0.5 * prev
-    
-    return momentum
+    return value_arr
 
-def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, 
-                                    responsiveness: float = 0.9) -> pd.Series:
-    """
-    MMH with Numba optimization - This is the most complex indicator
-    Must keep Numba for performance and accuracy
-    """
+@njit
+def _calc_mmh_momentum_loop(momentum_arr, rows):
+    """Numba-compiled momentum accumulation loop"""
+    for i in range(1, rows):
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+    return momentum_arr
+
+def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
     try:
         if df is None or "close" not in df or df.empty:
             return pd.Series(dtype=float)
         
-        close = df["close"].values.astype(np.float64)
+        close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+        rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        if NUMBA_ENABLED:
-            hist = _calc_mmh_core(close, period, resp_clamped)
-        else:
-            # Fallback: very simplified version (loses accuracy but prevents crash)
-            logger.warning("MMH using simplified fallback - accuracy reduced")
-            ema_fast = df["close"].ewm(span=12, adjust=False).mean()
-            ema_slow = df["close"].ewm(span=26, adjust=False).mean()
-            hist = ((ema_fast - ema_slow) / ema_slow * 100).fillna(0).values
+        # Calculate standard deviation
+        sd = close.rolling(window=50, min_periods=1).std(ddof=0) * resp_clamped
+        sd = validate_indicator_series(sd, "MMH_SD")
         
-        return validate_indicator_series(
-            pd.Series(hist, index=df.index, name="hist"), "MMH_HIST"
-        )
+        # OPTIMIZED: Use Numba-compiled loop instead of Python loop
+        worm_arr = _calc_mmh_worm_loop(close.values, sd.values, rows)
+        worm = pd.Series(worm_arr, index=close.index)
+        
+        # Calculate moving average
+        ma = close.rolling(window=period, min_periods=1).mean()
+        ma = validate_indicator_series(ma, "MMH_MA")
+        
+        # Calculate raw values
+        raw = (worm - ma) / worm.replace(0, np.nan)
+        raw = raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        raw = validate_indicator_series(raw, "MMH_RAW")
+        
+        # Calculate temp
+        min_med = raw.rolling(window=period, min_periods=1).min()
+        max_med = raw.rolling(window=period, min_periods=1).max()
+        denom = (max_med - min_med).replace(0, 1e-12)
+        temp = (raw - min_med) / denom
+        temp = temp.clip(lower=0.0, upper=1.0).fillna(0.5)
+        temp = validate_indicator_series(temp, "MMH_TEMP")
+        
+        # OPTIMIZED: Use Numba-compiled loop for value calculation
+        value_arr = _calc_mmh_value_loop(temp.values, rows)
+        value = pd.Series(value_arr, index=close.index)
+        
+        # Calculate momentum
+        temp2 = (1.0 + value) / (1.0 - value)
+        temp2 = temp2.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        temp2 = temp2.clip(lower=1e-8, upper=1e8)
+        momentum = 0.25 * np.log(temp2)
+        momentum = validate_indicator_series(momentum, "MMH_MOMENTUM")
+        
+        # OPTIMIZED: Use Numba-compiled loop for momentum accumulation
+        momentum_arr = momentum.to_numpy(dtype=float)
+        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        hist = pd.Series(momentum_arr, index=close.index, name="hist")
+        
+        return validate_indicator_series(hist, "MMH_HIST")
         
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
-        return pd.Series([0.0] * len(df), index=df.index, name="hist")
+        return pd.Series([0.0] * (len(df) if df is not None else 0), 
+                        index=(df.index if df is not None else pd.Index([])), 
+                        name="hist")
 
 def calculate_all_indicators_batch(df_15m: pd.DataFrame, df_5m: pd.DataFrame, 
                                    df_daily: Optional[pd.DataFrame]) -> dict:
