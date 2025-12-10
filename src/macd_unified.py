@@ -1758,7 +1758,7 @@ def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.
     smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
     return validate_indicator_series(smooth_rsi, "SmoothRSI")
 
-@njit
+@njit(cache=True, fastmath=False, parallel=False, nogil=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Numba-compiled worm calculation loop - ~100x faster than Python"""
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -1779,7 +1779,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit
+@njit(cache=True, fastmath=False, parallel=False, nogil=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     """Numba-compiled value calculation loop"""
     value_arr = np.zeros(rows, dtype=np.float64)
@@ -1793,7 +1793,7 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit
+@njit(cache=True, fastmath=False, parallel=False, nogil=True)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     """Numba-compiled momentum accumulation loop"""
     for i in range(1, rows):
