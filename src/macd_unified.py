@@ -1763,71 +1763,44 @@ class DataFetcher:
         return stats
 
 def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    """
-    OPTIMIZED: Faster DataFrame validation using numpy operations.
-    
-    Changes:
-    - Use numpy vectorized operations instead of pandas
-    - Minimize temporary array allocations
-    - Short-circuit on first failure
-    """
     try:
-        # Quick checks first
         if df is None or df.empty:
             return False, "DataFrame is empty"
         
-        if len(df) < required_len:
-            return False, f"Insufficient data: {len(df)} < {required_len}"
-        
-        # OPTIMIZED: Use numpy arrays for faster validation
-        close_arr = df["close"].values
-        timestamp_arr = df["timestamp"].values
-        
-        # Check for invalid close prices
-        if np.any(np.isnan(close_arr)) or np.any(close_arr <= 0):
+        if df["close"].isna().any() or (df["close"] <= 0).any():
             if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                 METRIC_DATA_QUALITY_FAILURES.labels(reason="invalid_close").inc()
             return False, "Invalid close prices (NaN or <= 0)"
         
-        # Check timestamp monotonicity
-        if len(timestamp_arr) > 1:
-            if not np.all(timestamp_arr[1:] >= timestamp_arr[:-1]):
-                if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
-                    METRIC_DATA_QUALITY_FAILURES.labels(reason="timestamp_not_monotonic").inc()
-                return False, "Timestamps not monotonic increasing"
+        if not df["timestamp"].is_monotonic_increasing:
+            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
+                METRIC_DATA_QUALITY_FAILURES.labels(reason="timestamp_not_monotonic").inc()
+            return False, "Timestamps not monotonic increasing"
         
-        # Check for gaps (optional, can be disabled for speed)
+        if len(df) < required_len:
+            return False, f"Insufficient data: {len(df)} < {required_len}"
+        
         if len(df) >= 2:
-            time_diffs = np.diff(timestamp_arr)
+            time_diffs = df["timestamp"].diff().dropna()
             if len(time_diffs) > 0:
-                median_diff = np.median(time_diffs)
+                median_diff = time_diffs.median()
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 gaps = time_diffs[time_diffs > max_expected_gap]
-                
                 if len(gaps) > 0:
                     if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                         METRIC_DATA_QUALITY_FAILURES.labels(reason="candle_gaps").inc()
-                    logger.warning(
-                        f"Detected {len(gaps)} candle gaps "
-                        f"(median: {median_diff}s, max gap: {np.max(gaps)}s)"
-                    )
+                    logger.warning(f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
         
-        # Check for extreme price changes
-        if len(close_arr) >= 2:
-            price_changes = np.abs(np.diff(close_arr) / close_arr[:-1]) * 100
+        if len(df) >= 2:
+            price_changes = (df["close"].pct_change().abs() * 100).dropna()
             extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-            
             if len(extreme_changes) > 0:
                 if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                     METRIC_DATA_QUALITY_FAILURES.labels(reason="price_spike").inc()
-                logger.warning(
-                    f"Detected {len(extreme_changes)} extreme price changes "
-                    f"(max: {np.max(extreme_changes):.2f}%)"
-                )
-                return False, f"Extreme price spike detected: {np.max(extreme_changes):.2f}%"
+                logger.warning(f"Detected {len(extreme_changes)} extreme price changes (max: {extreme_changes.max():.2f}%)")
+                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
         
         return True, None
-        
     except Exception as e:
         logger.error(f"DataFrame validation failed: {e}")
         return False, f"Validation error: {str(e)}"
