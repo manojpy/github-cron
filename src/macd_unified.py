@@ -2182,7 +2182,7 @@ def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_tim
         else:
             return None
 
-njit
+@njit(cache=False, fastmath=True, parallel=False)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Numba-compiled worm calculation loop - ~100x faster than Python"""
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -2203,7 +2203,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit
+@njit(cache=False, fastmath=True, parallel=False)
 def _calc_mmh_value_loop(temp_arr, rows):
     """Numba-compiled value calculation loop"""
     value_arr = np.zeros(rows, dtype=np.float64)
@@ -2217,7 +2217,7 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit
+@njit(cache=False, fastmath=True, parallel=False)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     """Numba-compiled momentum accumulation loop"""
     for i in range(1, rows):
@@ -3284,7 +3284,6 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
     except Exception as e:
         logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
-
 
 async def worker_process_pair(
     worker_id: int,
