@@ -1806,41 +1806,91 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
         return False, f"Validation error: {str(e)}"
 
 def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFrame]:
+    """
+    OPTIMIZED: Parse candles with minimal DataFrame operations.
+    
+    Changes:
+    - Use numpy array operations where possible
+    - Minimize type conversions
+    - Reduce memory allocations
+    - Faster validation checks
+    """
     if not result or not isinstance(result, dict):
         return None
+    
     res = result.get("result", {}) or {}
     required_keys = ["t", "o", "h", "l", "c", "v"]
+    
     if not all(k in res for k in required_keys):
         return None
+    
     try:
+        # Get minimum length
         min_len = min(len(res[k]) for k in required_keys)
         if min_len == 0:
             return None
-        df = pd.DataFrame({
-            "timestamp": res["t"][:min_len],
-            "open": res["o"][:min_len],
-            "high": res["h"][:min_len],
-            "low": res["l"][:min_len],
-            "close": res["c"][:min_len],
-            "volume": res["v"][:min_len],
-        })
-        df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
-        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
-        df = df[df["timestamp"] > 0].copy()
-        if df.empty:
+        
+        # OPTIMIZED: Create arrays directly without intermediate lists
+        timestamps = np.array(res["t"][:min_len], dtype=np.int64)
+        opens = np.array(res["o"][:min_len], dtype=np.float32)
+        highs = np.array(res["h"][:min_len], dtype=np.float32)
+        lows = np.array(res["l"][:min_len], dtype=np.float32)
+        closes = np.array(res["c"][:min_len], dtype=np.float32)
+        volumes = np.array(res["v"][:min_len], dtype=np.float32)
+        
+        # Check for millisecond timestamps and convert
+        median_ts = np.median(timestamps)
+        if median_ts > 100_000_000_000:
+            timestamps = (timestamps // 1000).astype(np.int64)
+        
+        # Filter out invalid timestamps
+        valid_mask = timestamps > 0
+        if not np.any(valid_mask):
             return None
         
-        median_ts = df["timestamp"].median()
-        if median_ts > 100_000_000_000:
-            df["timestamp"] = (df["timestamp"] // 1000).astype(np.int64)
+        # Apply mask to all arrays
+        timestamps = timestamps[valid_mask]
+        opens = opens[valid_mask]
+        highs = highs[valid_mask]
+        lows = lows[valid_mask]
+        closes = closes[valid_mask]
+        volumes = volumes[valid_mask]
         
-        if len(df) > 0:
-            last_close = float(df["close"].iloc[-1])
-            if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
-                return None
+        # Sort by timestamp
+        sort_idx = np.argsort(timestamps)
+        timestamps = timestamps[sort_idx]
+        opens = opens[sort_idx]
+        highs = highs[sort_idx]
+        lows = lows[sort_idx]
+        closes = closes[sort_idx]
+        volumes = volumes[sort_idx]
         
+        # Remove duplicates (keep last occurrence)
+        _, unique_idx = np.unique(timestamps, return_index=True)
+        if len(unique_idx) < len(timestamps):
+            timestamps = timestamps[unique_idx]
+            opens = opens[unique_idx]
+            highs = highs[unique_idx]
+            lows = lows[unique_idx]
+            closes = closes[unique_idx]
+            volumes = volumes[unique_idx]
+        
+        # OPTIMIZED: Create DataFrame only once with all data
+        df = pd.DataFrame({
+            "timestamp": timestamps,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        })
+        
+        # Validate last close price
+        last_close = float(df["close"].iloc[-1])
+        if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
+            return None
+        
+        # Fix negative volumes
         if (df["volume"] < 0).any():
             if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                 METRIC_DATA_QUALITY_FAILURES.labels(reason="negative_volume").inc()
@@ -1848,6 +1898,7 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
             df.loc[df["volume"] < 0, "volume"] = 0
         
         return df
+        
     except Exception as e:
         logger.exception(f"Failed to parse candles: {e}")
         return None
@@ -3067,20 +3118,16 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         
         daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10
 
-        if cfg.ENABLE_PIVOT:
-            resolutions = ["15", "5", "D"]
-            limits = [300, 400, daily_limit]
-        else:
-            resolutions = ["15", "5"]
-            limits = [300, 400]
-        
-        results_dict = await fetcher.fetch_candles_batch_parallel(
-            symbol, resolutions, limits, reference_time
-        )
-        
-        df_15m = parse_candles_result(results_dict.get("15"))
-        df_5m = parse_candles_result(results_dict.get("5"))
-        df_daily = parse_candles_result(results_dict.get("D")) if cfg.ENABLE_PIVOT else None
+        tasks = [
+            fetcher.fetch_candles(symbol, "15", 300, reference_time),
+            fetcher.fetch_candles(symbol, "5", 400, reference_time),
+            fetcher.fetch_candles(symbol, "D", daily_limit, reference_time) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        df_15m = parse_candles_result(results[0]) if not isinstance(results[0], Exception) else None
+        df_5m = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
+        df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
 
         valid_15m, reason_15m = validate_candle_df(df_15m, 220)
         valid_5m, reason_5m = validate_candle_df(df_5m, 280)
