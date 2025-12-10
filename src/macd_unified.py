@@ -1,7 +1,4 @@
 from __future__ import annotations
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import ctypes
-import resource
 import os
 import sys
 import time
@@ -90,44 +87,6 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "10000"))
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
-    INDICATOR_WORKERS = min(4, os.cpu_count() or 4)
-    FETCH_BATCH_SIZE = 12
-
-CANDLE_DTYPE = np.dtype([
-    ('timestamp', 'i8'),
-    ('open', 'f4'),
-    ('high', 'f4'),
-    ('low', 'f4'),
-    ('close', 'f4'),
-    ('volume', 'f4')
-])
-
-INDICATOR_DTYPE = np.dtype([
-    ('ppo', 'f4'),
-    ('ppo_signal', 'f4'),
-    ('rsi', 'f4'),
-    ('vwap', 'f4'),
-    ('mmh', 'f4')
-])
-
-def create_candle_array(size: int) -> np.ndarray:
-    """Create structured numpy array for candle data - 15x faster than DataFrame"""
-    return np.zeros(size, dtype=CANDLE_DTYPE)
-
-def candles_to_structured_array(df: pd.DataFrame) -> np.ndarray:
-    """Convert DataFrame to structured numpy array for faster processing"""
-    if df is None or df.empty:
-        return create_candle_array(0)
-    
-    arr = create_candle_array(len(df))
-    arr['timestamp'] = df['timestamp'].values.astype(np.int64)
-    arr['open'] = df['open'].values.astype(np.float32)
-    arr['high'] = df['high'].values.astype(np.float32)
-    arr['low'] = df['low'].values.astype(np.float32)
-    arr['close'] = df['close'].values.astype(np.float32)
-    arr['volume'] = df['volume'].values.astype(np.float32)
-    return arr
-
 
 HEALTH_SERVER_ENABLED = os.getenv("HEALTH_SERVER_ENABLED", "false").lower() in ("1", "true", "yes")
 HEALTH_HTTP_PORT = int(os.getenv("HEALTH_HTTP_PORT", "10001"))
@@ -371,47 +330,6 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 shutdown_event = asyncio.Event()
-
-try:
-    mem_limit = cfg.MEMORY_LIMIT_BYTES
-    resource.setrlimit(resource.RLIMIT_AS, (mem_limit * 2, mem_limit * 2))
-    logger.info(f"Memory limit set to {mem_limit / 1_000_000:.0f}MB (soft limit)")
-except Exception as e:
-    logger.warning(f"Could not set memory limit: {e}")
-
-gc.set_threshold(2000, 15, 15)
-
-# Disable automatic collection during critical operations
-# (will be manually triggered when needed)
-if not cfg.DEBUG_MODE:
-    gc.disable()
-    logger.info("Automatic GC disabled - using manual collection for better performance")
-else:
-    logger.info(f"GC thresholds set to: {gc.get_threshold()}")
-
-def zero_sensitive_memory(obj: Any) -> None:
-    """
-    SECURITY: Zero out sensitive data from memory (best effort).
-    
-    Note: This is NOT guaranteed to work on all Python implementations.
-    CPython may optimize away the zeroing. Use for defense-in-depth only.
-    """
-    if obj is None:
-        return
-    
-    try:
-        import ctypes
-        obj_id = id(obj)
-        size = sys.getsizeof(obj)
-        
-        # Attempt to zero the memory
-        ctypes.memset(obj_id, 0, size)
-        
-        if cfg.DEBUG_MODE:
-            logger.debug(f"Zeroed {size} bytes at memory address {hex(obj_id)}")
-            
-    except Exception as e:
-        logger.warning(f"Memory zeroing failed (non-critical): {e}")
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -1011,104 +929,27 @@ class RedisStateStore:
         updates: List[Tuple[str, Any, Optional[int]]],
         timeout: float = 4.0,
     ) -> None:
-        """
-        OPTIMIZED: Batch version of set() with single pipeline.
-        Previously: Multiple individual Redis calls per pair
-        Now: Single pipeline with all updates
-        
-        Speedup: 10-15x faster for batch operations
-        """
+        """Batch version of set() - used for alert state changes"""
         if self.degraded or not updates or not self._redis:
             return
 
         try:
             pipe = self._redis.pipeline()
             now = int(time.time())
-            
             for key, state, custom_ts in updates:
                 ts = custom_ts if custom_ts is not None else now
                 data = json_dumps({"state": state, "ts": ts})
                 full_key = f"{self.state_prefix}{key}"
-                
                 if self.expiry_seconds > 0:
                     pipe.set(full_key, data, ex=self.expiry_seconds)
                 else:
                     pipe.set(full_key, data)
-            
-            # Execute entire pipeline in one Redis roundtrip
             await asyncio.wait_for(pipe.execute(), timeout=timeout)
-            
-            if cfg.DEBUG_MODE:
-                logger.debug(f"Batch updated {len(updates)} states in single pipeline")
-                
-        except asyncio.TimeoutError:
-            logger.error(f"Batch state update timed out after {timeout}s")
+        except Exception as e:
+            logger.error(f"Batch state update failed (falling back to individual): {e}")
             # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
-        except Exception as e:
-            logger.error(f"Batch state update failed: {e}")
-            # Fallback to individual sets
-            for key, state, custom_ts in updates:
-                await self.set(key, state, custom_ts)
-
-    async def finalize_pair_state_pipeline(
-        self, 
-        pair: str, 
-        alerts_to_activate: List[str],
-        alerts_to_reset: List[str],
-        timeout: float = 3.0
-    ) -> bool:
-        """
-        OPTIMIZED: Single pipeline for all state changes per pair.
-        
-        Previously: 
-        - mget_states (1 call)
-        - batch_set_states for activations (1 call)
-        - batch_set_states for resets (1 call)
-        - check_recent_alert for each alert (N calls)
-        Total: 3 + N roundtrips per pair
-        
-        Now: 1 single pipeline roundtrip per pair
-        Speedup: 10-20x reduction in Redis calls
-        """
-        if self.degraded or not self._redis:
-            return True
-        
-        try:
-            pipe = self._redis.pipeline()
-            ts = int(time.time())
-            
-            # Activate alerts
-            for alert_key in alerts_to_activate:
-                full_key = f"{self.state_prefix}{pair}:{alert_key}"
-                data = json_dumps({"state": "ACTIVE", "ts": ts})
-                pipe.set(full_key, data, ex=self.expiry_seconds)
-            
-            # Reset alerts
-            for alert_key in alerts_to_reset:
-                full_key = f"{self.state_prefix}{pair}:{alert_key}"
-                data = json_dumps({"state": "INACTIVE", "ts": ts})
-                pipe.set(full_key, data, ex=self.expiry_seconds)
-            
-            # Execute all in one roundtrip
-            await asyncio.wait_for(pipe.execute(), timeout=timeout)
-            
-            if cfg.DEBUG_MODE:
-                logger.debug(
-                    f"Pipeline finalized {pair}: "
-                    f"{len(alerts_to_activate)} activations, "
-                    f"{len(alerts_to_reset)} resets"
-                )
-            
-            return True
-            
-        except asyncio.TimeoutError:
-            logger.error(f"Pipeline timeout for {pair} after {timeout}s")
-            return False
-        except Exception as e:
-            logger.error(f"Pipeline failed for {pair}: {e}")
-            return False
 
     async def get_circuit_breaker_state(self, breaker_name: str) -> Optional[Dict[str, Any]]:
         if self.degraded:
@@ -1596,14 +1437,10 @@ class RateLimitedFetcher:
         }
 
 class DataFetcher:
-    def __init__(self, api_base: str, max_parallel: Optional[int] = None, 
-                 redis_store: Optional[RedisStateStore] = None):
+    def __init__(self, api_base: str, max_parallel: Optional[int] = None, redis_store: Optional[RedisStateStore] = None):
         self.api_base = api_base.rstrip("/")
-        
-        # OPTIMIZED: Increase parallelism for batch fetching
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
-        self.semaphore = asyncio.Semaphore(max_parallel * 3)  # 3x more concurrent fetches
-        
+        self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
         self.circuit_breaker_products = CircuitBreaker(
             name="products_api",
@@ -1622,9 +1459,7 @@ class DataFetcher:
             "products_success": 0,
             "products_failed": 0,
             "candles_success": 0,
-            "candles_failed": 0,
-            "batch_fetches": 0,
-            "parallel_fetches": 0
+            "candles_failed": 0
         }
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
@@ -1679,57 +1514,6 @@ class DataFetcher:
 
         url = f"{self.api_base}/v2/chart/history"
         
-    async def fetch_candles_batch_parallel(
-        self,
-        symbol: str,
-        resolutions: List[str],
-        limits: List[int],
-        reference_time: Optional[int] = None
-    ) -> Dict[str, Optional[Dict[str, Any]]]:
-        """
-        OPTIMIZED: Fetch multiple timeframes in parallel for same symbol.
-        
-        Previously: Sequential fetches
-        - fetch_candles("15") → wait 800ms
-        - fetch_candles("5")  → wait 800ms  
-        - fetch_candles("D")  → wait 800ms
-        Total: ~2.4s per pair
-        
-        Now: All 3 timeframes fetch in parallel
-        Total: ~800ms per pair (3x speedup)
-        
-        For 12 pairs: 28.8s → 9.6s (19s saved)
-        """
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
-        
-        # Create fetch tasks for all timeframes
-        tasks = []
-        resolution_map = {}
-        
-        for resolution, limit in zip(resolutions, limits):
-            task = self.fetch_candles(symbol, resolution, limit, reference_time)
-            tasks.append(task)
-            resolution_map[len(tasks) - 1] = resolution
-        
-        # Execute all fetches in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Map results back to resolutions
-        output = {}
-        for idx, result in enumerate(results):
-            resolution = resolution_map[idx]
-            if isinstance(result, Exception):
-                logger.error(f"Parallel fetch failed for {symbol} {resolution}: {result}")
-                output[resolution] = None
-            else:
-                output[resolution] = result
-        
-        self.fetch_stats["batch_fetches"] += 1
-        self.fetch_stats["parallel_fetches"] += len(resolutions)
-        
-        return output
-
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1806,91 +1590,41 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
         return False, f"Validation error: {str(e)}"
 
 def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFrame]:
-    """
-    OPTIMIZED: Parse candles with minimal DataFrame operations.
-    
-    Changes:
-    - Use numpy array operations where possible
-    - Minimize type conversions
-    - Reduce memory allocations
-    - Faster validation checks
-    """
     if not result or not isinstance(result, dict):
         return None
-    
     res = result.get("result", {}) or {}
     required_keys = ["t", "o", "h", "l", "c", "v"]
-    
     if not all(k in res for k in required_keys):
         return None
-    
     try:
-        # Get minimum length
         min_len = min(len(res[k]) for k in required_keys)
         if min_len == 0:
             return None
-        
-        # OPTIMIZED: Create arrays directly without intermediate lists
-        timestamps = np.array(res["t"][:min_len], dtype=np.int64)
-        opens = np.array(res["o"][:min_len], dtype=np.float32)
-        highs = np.array(res["h"][:min_len], dtype=np.float32)
-        lows = np.array(res["l"][:min_len], dtype=np.float32)
-        closes = np.array(res["c"][:min_len], dtype=np.float32)
-        volumes = np.array(res["v"][:min_len], dtype=np.float32)
-        
-        # Check for millisecond timestamps and convert
-        median_ts = np.median(timestamps)
-        if median_ts > 100_000_000_000:
-            timestamps = (timestamps // 1000).astype(np.int64)
-        
-        # Filter out invalid timestamps
-        valid_mask = timestamps > 0
-        if not np.any(valid_mask):
-            return None
-        
-        # Apply mask to all arrays
-        timestamps = timestamps[valid_mask]
-        opens = opens[valid_mask]
-        highs = highs[valid_mask]
-        lows = lows[valid_mask]
-        closes = closes[valid_mask]
-        volumes = volumes[valid_mask]
-        
-        # Sort by timestamp
-        sort_idx = np.argsort(timestamps)
-        timestamps = timestamps[sort_idx]
-        opens = opens[sort_idx]
-        highs = highs[sort_idx]
-        lows = lows[sort_idx]
-        closes = closes[sort_idx]
-        volumes = volumes[sort_idx]
-        
-        # Remove duplicates (keep last occurrence)
-        _, unique_idx = np.unique(timestamps, return_index=True)
-        if len(unique_idx) < len(timestamps):
-            timestamps = timestamps[unique_idx]
-            opens = opens[unique_idx]
-            highs = highs[unique_idx]
-            lows = lows[unique_idx]
-            closes = closes[unique_idx]
-            volumes = volumes[unique_idx]
-        
-        # OPTIMIZED: Create DataFrame only once with all data
         df = pd.DataFrame({
-            "timestamp": timestamps,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
+            "timestamp": res["t"][:min_len],
+            "open": res["o"][:min_len],
+            "high": res["h"][:min_len],
+            "low": res["l"][:min_len],
+            "close": res["c"][:min_len],
+            "volume": res["v"][:min_len],
         })
-        
-        # Validate last close price
-        last_close = float(df["close"].iloc[-1])
-        if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
+        df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
+        df = df[df["timestamp"] > 0].copy()
+        if df.empty:
             return None
         
-        # Fix negative volumes
+        median_ts = df["timestamp"].median()
+        if median_ts > 100_000_000_000:
+            df["timestamp"] = (df["timestamp"] // 1000).astype(np.int64)
+        
+        if len(df) > 0:
+            last_close = float(df["close"].iloc[-1])
+            if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
+                return None
+        
         if (df["volume"] < 0).any():
             if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                 METRIC_DATA_QUALITY_FAILURES.labels(reason="negative_volume").inc()
@@ -1898,7 +1632,6 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
             df.loc[df["volume"] < 0, "volume"] = 0
         
         return df
-        
     except Exception as e:
         logger.exception(f"Failed to parse candles: {e}")
         return None
@@ -2139,93 +1872,6 @@ def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
     vwap = df2["cum_hlc3_vol"] / df2["cum_vol"].replace(0, np.nan)
     return validate_indicator_series(vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0), "VWAP")
 
-def calculate_all_indicators_batch(df_15m: pd.DataFrame, df_5m: pd.DataFrame, 
-                                   df_daily: Optional[pd.DataFrame]) -> dict:
-    """
-    Calculate all indicators in a single execution context.
-    This reduces overhead by ~75% compared to individual calls.
-    
-    Returns dict with all calculated indicators.
-    """
-    results = {}
-    
-    try:
-        # PPO (15m timeframe)
-        ppo, ppo_signal = calculate_ppo(
-            df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA
-        )
-        results['ppo'] = ppo
-        results['ppo_signal'] = ppo_signal
-        
-        # Smooth RSI (15m timeframe)
-        results['smooth_rsi'] = calculate_smooth_rsi(
-            df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
-        )
-        
-        # VWAP (15m timeframe)
-        if cfg.ENABLE_VWAP:
-            results['vwap'] = calculate_vwap_daily_reset(df_15m)
-        else:
-            results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
-        
-        # MMH (15m timeframe) - now using fully optimized Numba version
-        mmh = calculate_magical_momentum_hist(df_15m)
-        results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
-        
-        # Cirrus Cloud (15m timeframe)
-        if cfg.CIRRUS_CLOUD_ENABLED:
-            upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
-            results['upw'] = upw
-            results['dnw'] = dnw
-            results['filtx1'] = filtx1
-            results['filtx12'] = filtx12
-        else:
-            results['upw'] = pd.Series(False, index=df_15m.index)
-            results['dnw'] = pd.Series(False, index=df_15m.index)
-            results['filtx1'] = pd.Series(index=df_15m.index, dtype=float)
-            results['filtx12'] = pd.Series(index=df_15m.index, dtype=float)
-        
-        # RMA calculations
-        results['rma50_15'] = calculate_rma(df_15m["close"], cfg.RMA_50_PERIOD)
-        results['rma200_5'] = calculate_rma(df_5m["close"], cfg.RMA_200_PERIOD)
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Batch indicator calculation failed: {e}")
-        # Return empty results on error
-        return {
-            'ppo': pd.Series(index=df_15m.index, dtype=float),
-            'ppo_signal': pd.Series(index=df_15m.index, dtype=float),
-            'smooth_rsi': pd.Series(index=df_15m.index, dtype=float),
-            'vwap': pd.Series(index=df_15m.index, dtype=float),
-            'mmh': pd.Series(index=df_15m.index, dtype=float),
-            'upw': pd.Series(False, index=df_15m.index),
-            'dnw': pd.Series(False, index=df_15m.index),
-            'filtx1': pd.Series(index=df_15m.index, dtype=float),
-            'filtx12': pd.Series(index=df_15m.index, dtype=float),
-            'rma50_15': pd.Series(index=df_15m.index, dtype=float),
-            'rma200_5': pd.Series(index=df_5m.index, dtype=float),
-        }
-
-def cleanup_indicator_memory(indicators: dict) -> None:
-    """
-    Explicit memory cleanup for indicator data.
-    Helps prevent memory leaks in long-running processes.
-    """
-    try:
-        for key in list(indicators.keys()):
-            if key in indicators:
-                del indicators[key]
-        indicators.clear()
-        
-        # Force garbage collection if memory usage is high
-        import gc
-        gc.collect()
-    except Exception as e:
-        logger.warning(f"Memory cleanup warning (non-critical): {e}")
-
-
 def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
     try:
         row = df_15m.iloc[idx]
@@ -2372,7 +2018,6 @@ class TelegramQueue:
         self.chat_id = chat_id
         self.token_bucket = TokenBucket(cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
         self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=300, name="telegram_api")
-        zero_sensitive_memory(token)
 
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
@@ -2722,6 +2367,50 @@ async def _heartbeat_updater(dms: DeadMansSwitch, sdb: RedisStateStore) -> None:
     except Exception as e:
         logger.error(f"Heartbeat updater error: {e}")
 
+def calculate_all_indicators_sync(df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame]) -> dict:
+    """
+    Calculate all indicators in a single thread execution.
+    This reduces context switching overhead by ~75%.
+    """
+    results = {}
+    
+    # PPO
+    ppo, ppo_signal = calculate_ppo(
+        df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA
+    )
+    results['ppo'] = ppo
+    results['ppo_signal'] = ppo_signal
+    
+    # Smooth RSI
+    results['smooth_rsi'] = calculate_smooth_rsi(
+        df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
+    )
+    
+    # VWAP
+    if cfg.ENABLE_VWAP:
+        results['vwap'] = calculate_vwap_daily_reset(df_15m)
+    else:
+        results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
+    
+    # MMH (now using optimized Numba version)
+    mmh = calculate_magical_momentum_hist(df_15m)
+    results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
+    
+    # Cirrus Cloud
+    if cfg.CIRRUS_CLOUD_ENABLED:
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
+        results['upw'] = upw
+        results['dnw'] = dnw
+    else:
+        results['upw'] = pd.Series(False, index=df_15m.index)
+        results['dnw'] = pd.Series(False, index=df_15m.index)
+    
+    # RMA calculations
+    results['rma50_15'] = calculate_rma(df_15m["close"], cfg.RMA_50_PERIOD)
+    results['rma200_5'] = calculate_rma(df_5m["close"], cfg.RMA_200_PERIOD)
+    
+    return results
+
 async def evaluate_pair_and_alert(
     pair_name: str,
     df_15m: pd.DataFrame,
@@ -2747,7 +2436,7 @@ async def evaluate_pair_and_alert(
         # OPTIMIZED: Calculate all indicators in one thread call
         indicator_start = time.time()
         indicators = await asyncio.to_thread(
-            calculate_all_indicators_batch, df_15m, df_5m, df_daily
+            calculate_all_indicators_sync, df_15m, df_5m, df_daily
         )
         
         if PROMETHEUS_ENABLED and METRIC_INDICATOR_CALC_TIME:
@@ -2966,15 +2655,9 @@ async def evaluate_pair_and_alert(
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        if states_to_update or resets_to_apply:
-            alerts_to_activate = [key.split(":")[-1] for key, _, _ in states_to_update]
-            alerts_to_reset = [key.split(":")[-1] for key, _, _ in resets_to_apply]
-            
-            await sdb.finalize_pair_state_pipeline(
-                pair_name, 
-                alerts_to_activate,
-                alerts_to_reset
-            )
+        all_state_changes = states_to_update + resets_to_apply
+        if all_state_changes:
+            await sdb.batch_set_states(all_state_changes)
 
         if raw_alerts:
             dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
@@ -3070,39 +2753,14 @@ async def evaluate_pair_and_alert(
         return None
 
     finally:
-        # OPTIMIZED: Aggressive memory cleanup
         try:
-            # Delete DataFrames
-            if 'df_15m' in locals():
-                del df_15m
-            if 'df_5m' in locals():
-                del df_5m
-            if 'df_daily' in locals():
-                del df_daily
-            
-            # Delete indicators dictionary
-            if 'indicators' in locals():
-                cleanup_indicator_memory(indicators)
-                del indicators
-            
-            # Delete individual indicator variables if they exist
-            for var_name in ['ppo', 'ppo_signal', 'smooth_rsi', 'vwap', 'mmh', 
-                            'upw', 'dnw', 'filtx1', 'filtx12', 
-                            'rma50_15_series', 'rma200_5_series']:
-                if var_name in locals():
-                    del locals()[var_name]
-            
-            # Delete context dictionary
-            if 'context' in locals():
-                del context
-            
-            # Force garbage collection for this pair (every 3rd pair)
-            if hash(pair_name) % 3 == 0:
-                import gc
-                gc.collect(generation=0)  # Quick collection only
-                
+            del df_15m, df_5m, df_daily
+            if 'ppo' in locals():
+                del ppo, ppo_signal, smooth_rsi, vwap, mmh
+            if cfg.CIRRUS_CLOUD_ENABLED and 'upw' in locals():
+                del upw, dnw
         except Exception as e:
-            logger.warning(f"Cleanup error for {pair_name} (non-critical): {e}")
+            logger.warning(f"Cleanup error (non-critical): {e}")
         finally:
             PAIR_ID.set("")
 
@@ -3213,40 +2871,18 @@ async def worker_process_pair(
             if worker_id == 0 and memory_monitor.should_check():
                 import gc
                 used_bytes, mem_percent = memory_monitor.check_memory()
-                
                 if PROMETHEUS_ENABLED and METRIC_MEMORY_USAGE:
                     METRIC_MEMORY_USAGE.set(float(used_bytes) / 1048576.0)
                 
-                # Three-tier memory management
-                if mem_percent > 85.0:
-                    # Critical: Full GC + object deletion
-                    logger_worker.warning(
-                        f"Worker {worker_id}: Memory critical at {mem_percent:.1f}%, "
-                        f"forcing full cleanup"
-                    )
-                    gc.collect(generation=2)  # Full collection
-                    
-                    if memory_monitor.is_critical():
-                        logger_worker.critical(
-                            f"🚨 Worker {worker_id}: Memory exceeded limit, stopping worker"
-                        )
-                        pair_queue.task_done()
-                        break
-                        
-                elif mem_percent > 70.0:
-                    # Warning: Quick GC
-                    logger_worker.debug(
-                        f"Worker {worker_id}: Memory at {mem_percent:.1f}%, "
-                        f"triggering quick GC"
-                    )
-                    gc.collect(generation=1)  # Generation 1 only
-                    
-                elif mem_percent > 60.0:
-                    # Info: Log only
-                    logger_worker.debug(
-                        f"Worker {worker_id}: Memory at {mem_percent:.1f}% (healthy)"
-                    )
-
+                # If memory is > 70% (warn level), force cleanup
+                if mem_percent > 70.0:
+                    logger_worker.debug(f"Worker {worker_id}: Memory at {mem_percent:.1f}%, triggering GC")
+                    gc.collect()
+                
+                if memory_monitor.is_critical():
+                    logger_worker.critical(f"🚨 Worker {worker_id}: Memory critical ({mem_percent:.1f}%)")
+                    pair_queue.task_done()
+                    break
             
             # Lock extension check
             if lock.should_extend():
@@ -3323,17 +2959,6 @@ async def process_pairs_with_workers(
     
     # Wait for all workers to complete
     await asyncio.gather(*workers, return_exceptions=True)
-    
-    # ADDED: Post-processing cleanup
-    logger_main.info(f"All workers completed. Processed {len(results)} pairs successfully.")
-    
-    # Trigger garbage collection after all workers finish
-    if not cfg.DEBUG_MODE:
-        import gc
-        gc.enable()
-        collected = gc.collect()
-        gc.disable()
-        logger_main.debug(f"Post-worker GC collected {collected} objects")
     
     return results
 
@@ -3484,8 +3109,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                     f"📡 Fetch stats | "
                     f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
                     f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
-                    f"Batch fetches: {fetcher_stats.get('batch_fetches', 0)} "
-                    f"({fetcher_stats.get('parallel_fetches', 0)} parallel) | "
                     f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
                     f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
                     f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
@@ -3558,25 +3181,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                 logger_run.debug("Health server stopped")
             except Exception as e:
                 logger_run.error(f"Failed to stop health server: {e}")
-        
-        # ADDED: Final cleanup before shutdown
-        try:
-            # Delete large objects
-            if 'all_results' in locals():
-                del all_results
-            if 'products_map' in locals():
-                del products_map
-            if 'fetcher' in locals():
-                del fetcher
-            
-            # Force final garbage collection
-            import gc
-            gc.collect()
-            
-            logger_run.debug("Final cleanup completed")
-            
-        except Exception as e:
-            logger_run.warning(f"Final cleanup error (non-critical): {e}")
         
         await SessionManager.close_session()
         TRACE_ID.set("")
