@@ -6,6 +6,7 @@ import asyncio
 import random
 import logging
 import logging.handlers
+from queue import SimpleQueue
 import ssl
 import signal
 import hashlib
@@ -295,40 +296,61 @@ class JsonFormatter(SafeFormatter):
             base["exc"] = self.formatException(record.exc_info)
         return json_dumps(base)
 
-def setup_logging() -> logging.Logger:
+def setup_logging() -> Tuple[logging.Logger, Optional[logging.handlers.QueueListener]]:
+    """
+    Async-safe logging: the main thread only enqueues records;
+    a separate thread writes to disk / console.
+    Returns (logger, listener) so the caller can call listener.stop() on shutdown.
+    """
     logger = logging.getLogger("macd_bot")
-    for h in logger.handlers[:]:
+    for h in logger.handlers[:]:          # remove any stale handlers
         logger.removeHandler(h)
+
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
-    use_json = os.getenv("LOG_JSON", "false").lower() in ("1", "true", "yes")
-    formatter = JsonFormatter() if use_json else SafeFormatter(
-        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+
+    # 1.  Real handlers that will run in the listener thread
+    handlers: list[logging.Handler] = []
+
+    # Console handler
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(level)
-    console.setFormatter(formatter)
+    console.setFormatter(SafeFormatter(
+        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
     console.addFilter(TraceContextFilter())
-    logger.addHandler(console)
+    handlers.append(console)
 
+    # File handler (optional)
     if os.getenv("FILE_LOGGING", "true").lower() in ("1", "true", "yes"):
-        try:
-            file_handler = logging.handlers.TimedRotatingFileHandler(
-                filename=cfg.LOG_FILE, when="midnight", interval=1, backupCount=7, encoding="utf-8", utc=True
-            )
-            file_handler.setLevel(level)
-            file_handler.setFormatter(formatter)
-            file_handler.addFilter(SecretFilter())
-            file_handler.addFilter(TraceContextFilter())
-            logger.addHandler(file_handler)
-        except Exception as e:
-            logger.warning(f"Failed to setup file logging: {e}")
-    return logger
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            filename=cfg.LOG_FILE, when="midnight", interval=1,
+            backupCount=7, encoding="utf-8", utc=True
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(SafeFormatter(
+            fmt='%(asstime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        file_handler.addFilter(SecretFilter())
+        file_handler.addFilter(TraceContextFilter())
+        handlers.append(file_handler)
 
-logger = setup_logging()
+    # 2.  Queue & queue-handler (what the logger actually uses)
+    log_queue: SimpleQueue[logging.LogRecord] = SimpleQueue()
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    logger.addHandler(queue_handler)
 
+    # 3.  Listener thread – moves records from queue to real handlers
+    listener = logging.handlers.QueueListener(
+        log_queue, *handlers, respect_handler_level=True
+    )
+    listener.start()
+    return logger, listener
+
+logger, log_listener = setup_logging()
 shutdown_event = asyncio.Event()
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
@@ -1636,37 +1658,41 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
         logger.exception(f"Failed to parse candles: {e}")
         return None
 
-def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Convert Delta JSON response straight into NumPy arrays, skipping Pandas entirely.
+    Returns dict with keys: open, high, low, close, volume, timestamp
+    or None on failure.
+    """
+    if not result or not isinstance(result, dict):
+        return None
+
+    res = result.get("result", {}) or {}
+    required = ("t", "o", "h", "l", "c", "v")
+    if not all(k in res for k in required):
+        return None
+
     try:
-        series = series.replace([np.inf, -np.inf], np.nan).bfill().ffill()
-        if series.isna().all():
-            logger.warning(f"Indicator {name} is all NaN, filling with zeros")
-            return pd.Series([0.0] * len(series), index=series.index)
-        return series
-    except Exception as e:
-        logger.error(f"Failed to validate indicator {name}: {e}")
-        return pd.Series([0.0] * len(series), index=series.index)
+        # Convert straight to numpy – no DataFrame overhead
+        data = {
+            "timestamp": np.array(res["t"], dtype=np.int64),
+            "open":   np.array(res["o"], dtype=np.float64),
+            "high":   np.array(res["h"], dtype=np.float64),
+            "low":    np.array(res["l"], dtype=np.float64),
+            "close":  np.array(res["c"], dtype=np.float64),
+            "volume": np.array(res["v"], dtype=np.float64),
+        }
 
-def calculate_ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+        # Millisecond → second conversion if needed
+        if data["timestamp"][-1] > 1_000_000_000_000:
+            data["timestamp"] = (data["timestamp"] // 1000).astype(np.int64)
 
-def calculate_sma(data: pd.Series, period: int) -> pd.Series:
-    return validate_indicator_series(data.rolling(window=period, min_periods=max(2, period // 3)).mean(), "SMA")
-
-def calculate_rma(data: pd.Series, period: int) -> pd.Series:
-    r = data.ewm(alpha=1 / period, adjust=False).mean()
-    return validate_indicator_series(r.bfill().ffill(), "RMA")
-
-def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, use_sma: bool = False) -> Tuple[pd.Series, pd.Series]:
-    close = df["close"].astype(float)
-    fast_ma = calculate_sma(close, fast) if use_sma else calculate_ema(close, fast)
-    slow_ma = calculate_sma(close, slow) if use_sma else calculate_ema(close, slow)
-    slow_ma = slow_ma.replace(0, np.nan).bfill().ffill()
-    ppo = ((fast_ma - slow_ma) / slow_ma) * 100
-    ppo = validate_indicator_series(ppo.replace([np.inf, -np.inf], np.nan).bfill().ffill(), "PPO")
-    ppo_signal = calculate_sma(ppo, signal) if use_sma else calculate_ema(ppo, signal)
-    ppo_signal = validate_indicator_series(ppo_signal.replace([np.inf, -np.inf], np.nan).bfill().ffill(), "PPO_SIGNAL")
-    return ppo, ppo_signal
+        # Basic sanity
+        if data["close"][-1] <= 0 or np.isnan(data["close"][-1]):
+            return None
+        return data
+    except Exception:
+        return None
 
 def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if df is None or df.empty or len(df) < 2:
@@ -1693,72 +1719,325 @@ def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_tim
         else:
             return None
 
-def smooth_rng_x1(close_series: pd.Series, t: int, m: float) -> pd.Series:
-    wper = t * 2 - 1
-    diff = (close_series - close_series.shift(1)).abs()
-    avrng = calculate_ema(diff, t)
-    smooth_rng = calculate_ema(avrng, wper) * m
-    return smooth_rng
+def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
+    try:
+        series = series.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+        if series.isna().all():
+            logger.warning(f"Indicator {name} is all NaN, filling with zeros")
+            return pd.Series([0.0] * len(series), index=series.index)
+        return series
+    except Exception as e:
+        logger.error(f"Failed to validate indicator {name}: {e}")
+        return pd.Series([0.0] * len(series), index=series.index)
 
-def rng_filt_x1x1(x_series: pd.Series, r_series: pd.Series) -> pd.Series:
-    x = x_series.values
-    r = r_series.values
-    filt = np.zeros_like(x)
-    filt[0] = x[0]
-    for i in range(1, len(x)):
-        prev_filt = filt[i - 1]
-        curr_x = x[i]
-        curr_r = r[i]
-        if np.isnan(curr_r) or np.isnan(curr_x):
-            filt[i] = prev_filt
-            continue
-        if curr_x > prev_filt:
-            filt[i] = prev_filt if (curr_x - curr_r) < prev_filt else (curr_x - curr_r)
+@njit(fastmath=True, cache=True)
+def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """Fast SMA calculation using Numba."""
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+    
+    # Calculate initial window sum
+    window_sum = 0.0
+    count = 0
+    
+    for i in range(n):
+        val = data[i]
+        
+        # Add new value
+        if not np.isnan(val):
+            window_sum += val
+            count += 1
+            
+        # Remove old value if window is full
+        if i >= period:
+            old_val = data[i - period]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                count -= 1
+        
+        # Calculate mean if we have enough data (using period // 3 logic from original)
+        min_periods = max(2, period // 3)
+        if count >= min_periods:
+            out[i] = window_sum / count
         else:
-            filt[i] = prev_filt if (curr_x + curr_r) > prev_filt else (curr_x + curr_r)
-    return pd.Series(filt, index=x_series.index)
+            out[i] = np.nan
+            
+    return out
 
-def calculate_cirrus_cloud(df: pd.DataFrame):
-    close = df["close"].astype(float)
-    smrngx1x = smooth_rng_x1(close, cfg.X1, cfg.X2)
-    filtx1 = rng_filt_x1x1(close, smrngx1x)
-    smrngx1x2 = smooth_rng_x1(close, cfg.X3, cfg.X4)
-    filtx12 = rng_filt_x1x1(close, smrngx1x2)
-    upw = filtx1 < filtx12
-    dnw = filtx1 > filtx12
-    return upw, dnw, filtx1, filtx12
-
-def kalman_filter(src: pd.Series, length: int, R: float = 0.01, Q: float = 0.1) -> pd.Series:
-    result = []
-    estimate = np.nan
+@njit(fastmath=True, cache=True)
+def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
+    """
+    Fast Kalman Filter using Numba. 
+    Replaces the slow Python loop.
+    """
+    n = len(src)
+    result = np.empty(n, dtype=np.float64)
+    
+    estimate = src[0] if not np.isnan(src[0]) else 0.0
     error_est = 1.0
-    error_meas = R * max(1, length)
-    Q_div_length = Q / max(1, length)
-    for i in range(len(src)):
-        current = src.iloc[i]
+    error_meas = R * max(1.0, float(length))
+    Q_div_length = Q / max(1.0, float(length))
+    
+    for i in range(n):
+        current = src[i]
+        if np.isnan(current):
+            result[i] = estimate
+            continue
+            
         if np.isnan(estimate):
-            estimate = src.iloc[i - 1] if i > 0 else current
+            estimate = current
+            
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
         estimate = prediction + kalman_gain * (current - prediction)
-        error_est = (1 - kalman_gain) * error_est + Q_div_length
-        result.append(estimate)
-    return pd.Series(result, index=src.index)
+        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
+        
+        result[i] = estimate
+        
+    return result
 
-def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
-    close = df["close"].astype(float)
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = calculate_rma(gain, rsi_len)
-    avg_loss = calculate_rma(loss, rsi_len).replace(0, np.nan).bfill().ffill().clip(lower=1e-8)
-    rs = avg_gain.divide(avg_loss)
-    rsi_value = 100 - (100 / (1 + rs))
-    rsi_value = rsi_value.replace([np.inf, -np.inf], np.nan).bfill().ffill()
-    smooth_rsi = kalman_filter(rsi_value, kalman_len).bfill().ffill()
-    return validate_indicator_series(smooth_rsi, "SmoothRSI")
+@njit(fastmath=True, cache=True)
+def _vwap_daily_loop(
+    high: np.ndarray, 
+    low: np.ndarray, 
+    close: np.ndarray, 
+    volume: np.ndarray, 
+    timestamps: np.ndarray
+) -> np.ndarray:
+    """
+    Fast VWAP with Daily Reset using Numba.
+    Avoids slow pd.to_datetime conversions.
+    """
+    n = len(close)
+    vwap = np.empty(n, dtype=np.float64)
+    
+    cum_vol = 0.0
+    cum_pv = 0.0
+    
+    # Initialize previous day with the first timestamp's day (UTC)
+    # 86400 seconds in a day
+    prev_day = timestamps[0] // 86400
+    
+    for i in range(n):
+        curr_ts = timestamps[i]
+        curr_day = curr_ts // 86400
+        
+        # Reset if new day
+        if curr_day != prev_day:
+            cum_vol = 0.0
+            cum_pv = 0.0
+            prev_day = curr_day
+        
+        h = high[i]
+        l = low[i]
+        c = close[i]
+        v = volume[i]
+        
+        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v):
+            vwap[i] = vwap[i-1] if i > 0 else c
+            continue
+            
+        avg_price = (h + l + c) / 3.0
+        
+        cum_vol += v
+        cum_pv += (avg_price * v)
+        
+        if cum_vol == 0:
+            vwap[i] = c
+        else:
+            vwap[i] = cum_pv / cum_vol
+            
+    return vwap
 
-@njit
+def calculate_sma_numpy(series: pd.Series, period: int) -> pd.Series:
+    values = series.astype(np.float64).values
+    res = _sma_loop(values, period)
+    return validate_indicator_series(pd.Series(res, index=series.index), "SMA")
+
+def calculate_kalman_numpy(series: pd.Series, length: int, R: float = 0.01, Q: float = 0.1) -> pd.Series:
+    values = series.astype(np.float64).values
+    res = _kalman_loop(values, length, R, Q)
+    return pd.Series(res, index=series.index)
+
+def calculate_vwap_numpy(df: pd.DataFrame) -> pd.Series:
+    if df.empty: return pd.Series(dtype=float)
+    
+    h = df["high"].astype(np.float64).values
+    l = df["low"].astype(np.float64).values
+    c = df["close"].astype(np.float64).values
+    v = df["volume"].astype(np.float64).values
+    t = df["timestamp"].astype(np.int64).values
+    
+    res = _vwap_daily_loop(h, l, c, v, t)
+    return validate_indicator_series(pd.Series(res, index=df.index), "VWAP")
+
+def calculate_smooth_rsi_numpy(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
+    """Optimized Smooth RSI using Numba RMA and Numba Kalman."""
+    close = df["close"].astype(np.float64).values
+    
+    # Calculate Delta
+    delta = np.zeros_like(close)
+    delta[1:] = close[1:] - close[:-1]
+    
+    # Gain/Loss
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    
+    # Calculate RMA (Using the _ema_loop from previous answer, alpha = 1/len)
+    alpha = 1.0 / rsi_len
+    avg_gain = _ema_loop(gain, alpha)
+    avg_loss = _ema_loop(loss, alpha)
+    
+    # Calculate RSI
+    # Prevent div by zero
+    avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    
+    # Smooth with Kalman
+    smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
+    
+    return validate_indicator_series(pd.Series(smooth_rsi, index=df.index), "SmoothRSI")
+@njit(fastmath=True, cache=True)
+def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
+    """Fast EMA calculation using Numba."""
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    # Initialize with first valid value or 0
+    out[0] = data[0] if not np.isnan(data[0]) else 0.0
+    
+    for i in range(1, n):
+        curr = data[i]
+        if np.isnan(curr):
+            out[i] = out[i-1]
+        else:
+            out[i] = alpha * curr + (1 - alpha) * out[i-1]
+    return out
+
+@njit(fastmath=True, cache=True)
+def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """
+    Fast Cirrus Cloud Range Filter using Numba.
+    Replaces the slow Python loop in rng_filt_x1x1.
+    """
+    n = len(x)
+    filt = np.zeros(n, dtype=np.float64)
+    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
+    
+    for i in range(1, n):
+        prev_filt = filt[i - 1]
+        curr_x = x[i]
+        curr_r = r[i]
+        
+        if np.isnan(curr_r) or np.isnan(curr_x):
+            filt[i] = prev_filt
+            continue
+            
+        if curr_x > prev_filt:
+            target = curr_x - curr_r
+            if target < prev_filt:
+                filt[i] = prev_filt
+            else:
+                filt[i] = target
+        else:
+            target = curr_x + curr_r
+            if target > prev_filt:
+                filt[i] = prev_filt
+            else:
+                filt[i] = target
+                
+    return filt
+
+def calculate_ema_numpy(series: pd.Series, span: int) -> pd.Series:
+    """Wrapper for Numba EMA."""
+    if series.empty: return series
+    # Calculate alpha based on span: alpha = 2 / (span + 1)
+    alpha = 2.0 / (span + 1)
+    values = series.astype(np.float64).values
+    result = _ema_loop(values, alpha)
+    return pd.Series(result, index=series.index)
+
+def calculate_rma_numpy(series: pd.Series, period: int) -> pd.Series:
+    """Wrapper for Numba RMA (Alpha = 1/period)."""
+    if series.empty: return series
+    alpha = 1.0 / period
+    values = series.astype(np.float64).values
+    result = _ema_loop(values, alpha)
+    return pd.Series(result, index=series.index)
+
+def calculate_cirrus_cloud_numba(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """
+    Optimized Cirrus Cloud calculation.
+    Uses Numba for EMA (Smooth RNG) and the Filter Loop.
+    """
+    close = df["close"].astype(np.float64).values
+    
+    # 1. Calculate Smooth RNG X1 (EMA of diff)
+    # diff = abs(close - close.shift(1))
+    diff = np.zeros_like(close)
+    diff[1:] = np.abs(close[1:] - close[:-1])
+    
+    # t = X1, m = X2
+    alpha_t = 2.0 / (cfg.X1 + 1)
+    avrng = _ema_loop(diff, alpha_t)
+    
+    wper = cfg.X1 * 2 - 1
+    alpha_w = 2.0 / (wper + 1)
+    smooth_rng_x1 = _ema_loop(avrng, alpha_w) * cfg.X2
+    
+    # 2. Calculate Filter X1
+    filt_x1 = _rng_filter_loop(close, smooth_rng_x1)
+    
+    # 3. Calculate Smooth RNG X2
+    # t = X3, m = X4
+    alpha_t2 = 2.0 / (cfg.X3 + 1)
+    avrng2 = _ema_loop(diff, alpha_t2)
+    
+    wper2 = cfg.X3 * 2 - 1
+    alpha_w2 = 2.0 / (wper2 + 1)
+    smooth_rng_x2 = _ema_loop(avrng2, alpha_w2) * cfg.X4
+    
+    # 4. Calculate Filter X12
+    filt_x12 = _rng_filter_loop(close, smooth_rng_x2)
+    
+    # Convert to Series for alignment
+    s_filt_x1 = pd.Series(filt_x1, index=df.index)
+    s_filt_x12 = pd.Series(filt_x12, index=df.index)
+    
+    upw = s_filt_x1 < s_filt_x12
+    dnw = s_filt_x1 > s_filt_x12
+    
+    return upw, dnw, s_filt_x1, s_filt_x12
+
+def calculate_ppo_numpy(df: pd.DataFrame, fast: int, slow: int, signal: int) -> Tuple[pd.Series, pd.Series]:
+    """
+    Optimized PPO using Numba EMAs and NumPy vectorization.
+    """
+    close = df["close"].astype(np.float64).values
+    
+    # Fast MA
+    alpha_fast = 2.0 / (fast + 1)
+    fast_ma = _ema_loop(close, alpha_fast)
+    
+    # Slow MA
+    alpha_slow = 2.0 / (slow + 1)
+    slow_ma = _ema_loop(close, alpha_slow)
+    
+    # Avoid division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ppo = ((fast_ma - slow_ma) / slow_ma) * 100.0
+    
+    # Clean NaNs/Infs resulting from calculation
+    ppo = np.nan_to_num(ppo, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Signal Line
+    alpha_signal = 2.0 / (signal + 1)
+    ppo_sig = _ema_loop(ppo, alpha_signal)
+    
+    return pd.Series(ppo, index=df.index), pd.Series(ppo_sig, index=df.index)
+
+@njit(fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Numba-compiled worm calculation loop - ~100x faster than Python"""
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -1779,7 +2058,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit
+@njit(fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     """Numba-compiled value calculation loop"""
     value_arr = np.zeros(rows, dtype=np.float64)
@@ -1793,7 +2072,7 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit
+@njit(fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     """Numba-compiled momentum accumulation loop"""
     for i in range(1, rows):
@@ -1859,18 +2138,21 @@ def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, respons
                         index=(df.index if df is not None else pd.Index([])), 
                         name="hist")
 
-def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    df2 = df.copy()
-    df2["datetime"] = pd.to_datetime(df2["timestamp"], unit="s", utc=True)
-    df2["date"] = df2["datetime"].dt.date
-    hlc3 = (df2["high"] + df2["low"] + df2["close"]) / 3.0
-    df2["hlc3_vol"] = hlc3 * df2["volume"]
-    df2["cum_vol"] = df2.groupby("date")["volume"].cumsum()
-    df2["cum_hlc3_vol"] = df2.groupby("date")["hlc3_vol"].cumsum()
-    vwap = df2["cum_hlc3_vol"] / df2["cum_vol"].replace(0, np.nan)
-    return validate_indicator_series(vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0), "VWAP")
+def warmup_numba() -> None:
+    """Eager-compile all Numba-accelerated helpers with dummy data."""
+    logger.info("🔥 Warming up Numba JIT compiler...")
+    try:
+        length = 500
+        close = np.random.random(length).astype(np.float64) * 1000
+        sd    = np.random.random(length).astype(np.float64) * 0.01
+
+        _calc_mmh_worm_loop(close, sd, length)
+        _calc_mmh_value_loop(np.random.random(length))
+        _calc_mmh_momentum_loop(np.random.random(length), length)
+
+        logger.info("✅ Numba warm-up complete.")
+    except Exception as e:
+        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
 
 def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
     try:
@@ -2369,45 +2651,45 @@ async def _heartbeat_updater(dms: DeadMansSwitch, sdb: RedisStateStore) -> None:
 
 def calculate_all_indicators_sync(df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame]) -> dict:
     """
-    Calculate all indicators in a single thread execution.
-    This reduces context switching overhead by ~75%.
+    Calculate all indicators using Numba/NumPy optimizations.
     """
     results = {}
     
-    # PPO
-    ppo, ppo_signal = calculate_ppo(
-        df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA
+    # 1. PPO (Numba)
+    # Using the calculate_ppo_numpy from the previous step
+    ppo, ppo_signal = calculate_ppo_numpy(
+        df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
     )
     results['ppo'] = ppo
     results['ppo_signal'] = ppo_signal
     
-    # Smooth RSI
-    results['smooth_rsi'] = calculate_smooth_rsi(
+    # 2. Smooth RSI (Numba Kalman + Numba RMA)
+    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
         df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
     )
     
-    # VWAP
+    # 3. VWAP (Numba Daily Reset)
     if cfg.ENABLE_VWAP:
-        results['vwap'] = calculate_vwap_daily_reset(df_15m)
+        results['vwap'] = calculate_vwap_numpy(df_15m)
     else:
         results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
     
-    # MMH (now using optimized Numba version)
+    # 4. MMH (Numba - already optimized in your script)
     mmh = calculate_magical_momentum_hist(df_15m)
     results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
     
-    # Cirrus Cloud
+    # 5. Cirrus Cloud (Numba)
     if cfg.CIRRUS_CLOUD_ENABLED:
-        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(df_15m)
         results['upw'] = upw
         results['dnw'] = dnw
     else:
         results['upw'] = pd.Series(False, index=df_15m.index)
         results['dnw'] = pd.Series(False, index=df_15m.index)
     
-    # RMA calculations
-    results['rma50_15'] = calculate_rma(df_15m["close"], cfg.RMA_50_PERIOD)
-    results['rma200_5'] = calculate_rma(df_5m["close"], cfg.RMA_200_PERIOD)
+    # 6. RMA (Numba)
+    results['rma50_15'] = calculate_rma_numpy(df_15m["close"], cfg.RMA_50_PERIOD)
+    results['rma200_5'] = calculate_rma_numpy(df_5m["close"], cfg.RMA_200_PERIOD)
     
     return results
 
@@ -2783,9 +3065,14 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        df_15m = parse_candles_result(results[0]) if not isinstance(results[0], Exception) else None
-        df_5m = parse_candles_result(results[1]) if not isinstance(results[1], Exception) else None
-        df_daily = parse_candles_result(results[2]) if cfg.ENABLE_PIVOT and not isinstance(results[2], Exception) else None
+        data_15m = parse_candles_to_numpy(results[0])
+        data_5m  = parse_candles_to_numpy(results[1])
+        data_daily = parse_candles_to_numpy(results[2]) if cfg.ENABLE_PIVOT else None
+
+        df_15m = pd.DataFrame(data_15m) if data_15m is not None else None
+        df_5m  = pd.DataFrame(data_5m)  if data_5m  is not None else None
+        df_daily = pd.DataFrame(data_daily) if data_daily is not None else None
+
 
         valid_15m, reason_15m = validate_candle_df(df_15m, 220)
         valid_5m, reason_5m = validate_candle_df(df_5m, 280)
@@ -2963,19 +3250,23 @@ async def process_pairs_with_workers(
     return results
 
 async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
+    """
+    Single pass through all configured pairs.
+    Returns True if the run completed successfully, False otherwise.
+    """
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
-    
+
     reference_time = get_trigger_timestamp()
     logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
-    
+
     processed_pairs = set()
-    failed_pairs = set()
-    alerts_sent = 0
+    failed_pairs   = set()
+    alerts_sent    = 0
     MAX_ALERTS_PER_RUN = 50
-    
+
     memory_monitor = MemoryMonitor(Constants.MEMORY_LIMIT_PERCENT)
     local_health_server: Optional[HealthHttpServer] = None
     lock_acquired = False
@@ -2995,7 +3286,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
             logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
             return False
 
-        # OPTIMIZATION: Use existing Redis connection or create new one
+        # ---- Redis connection ----
         if existing_redis is not None:
             sdb = existing_redis
             logger_run.debug("Using persistent Redis connection")
@@ -3006,16 +3297,15 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
         try:
             if sdb.degraded and not sdb.degraded_alerted:
-                logger_run.critical("⚠️ Redis is in degraded mode - alert deduplication disabled!")
-                
+                logger_run.critical("⚠️  Redis is in degraded mode – alert deduplication disabled!")
                 telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
-                    f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                    f"⚠️  {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
                     f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
                     f"Time: {format_ist_time()}"
                 ))
                 sdb.degraded_alerted = True
-            
+
             fetcher = DataFetcher(cfg.DELTA_API_BASE, redis_store=sdb)
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
@@ -3024,7 +3314,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
             lock = RedisLock(sdb._redis, "macd_bot_run")
             lock_acquired = await lock.acquire(timeout=5.0)
-            
             if not lock_acquired:
                 logger_run.warning("❌ Another instance is running (Redis lock held)")
                 return False
@@ -3040,7 +3329,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                     ))
                 elif dms_result is True:
                     await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️ {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
+                        f"⚠️  {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
                     ))
 
                 if cfg.SEND_TEST_MESSAGE:
@@ -3050,9 +3339,8 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                         f"Corr. ID: {correlation_id}"
                     ))
 
-                # OPTIMIZATION: Cached products fetch (module-level cache)
+                # ---- products cache ----
                 PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
-                
                 now = time.time()
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
                     logger_run.info("Fetching fresh products list from Delta API...")
@@ -3061,14 +3349,13 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                         logger_run.error("Failed to fetch products map")
                         return False
                     PRODUCTS_CACHE["data"] = prod_resp
-                    PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
+                    PRODUCTS_CACHE["until"] = now + 28_800          # 8 h
                     run_once._products_cache = PRODUCTS_CACHE
                 else:
                     logger_run.debug("Using cached products list")
                     prod_resp = PRODUCTS_CACHE["data"]
 
                 products_map = build_products_map_from_api_result(prod_resp)
-
                 pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
                 if len(pairs_to_process) < len(cfg.PAIRS):
@@ -3079,22 +3366,11 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
 
-                # Use optimized worker pool
                 all_results = await process_pairs_with_workers(
                     fetcher, products_map, pairs_to_process,
                     sdb, telegram_queue, correlation_id,
                     memory_monitor, lock, reference_time
                 )
-
-                # Process results
-                processed_pairs = set()
-                alerts_sent = 0
-                failed_pairs = set()
-                for pair_result in all_results:
-                    pair_name, state = pair_result
-                    processed_pairs.add(pair_name)
-                    if state and state.get("state") == "ALERT_SENT":
-                        alerts_sent += state["summary"].get("alerts", 0)
 
                 heartbeat_task.cancel()
                 try:
@@ -3104,33 +3380,30 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 await dms.update_heartbeat()
 
+                # ---- stats & summary ----
                 fetcher_stats = fetcher.get_stats()
                 logger_run.info(
                     f"📡 Fetch stats | "
                     f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
                     f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
-                    f"Rate limiter waits: {fetcher_stats['rate_limiter']['total_waits']} "
-                    f"({fetcher_stats['rate_limiter']['total_wait_time_seconds']}s) | "
-                    f"CB Products: {fetcher_stats['circuit_breakers']['products']} | "
-                    f"CB Candles: {fetcher_stats['circuit_breakers']['candles']}"
+                    f"Batch fetches: {fetcher_stats.get('batch_fetches', 0)} "
+                    f"({fetcher_stats.get('parallel_fetches', 0)} parallel)"
                 )
 
                 run_duration = time.time() - start_time
-
                 used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
                 redis_status = "OK" if not sdb.degraded else "DEGRADED"
                 summary = (
-                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
+                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(all_results)} pairs | "
                     f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
                 )
                 logger_run.info(summary)
 
                 if alerts_sent > MAX_ALERTS_PER_RUN:
-                    telegram_msg = (
-                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
-                        f"Pairs: {len(processed_pairs)} | Failed: {len(failed_pairs)}"
-                    )
-                    await telegram_queue.send(escape_markdown_v2(telegram_msg))
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"⚠️  HIGH VOLUME: {alerts_sent} alerts | "
+                        f"Pairs: {len(all_results)} | Failed: {len(failed_pairs)}"
+                    ))
 
                 if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
                     METRIC_RUN_DURATION.observe(run_duration)
@@ -3157,7 +3430,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                     logger_run.debug("Lock not acquired by this instance, skipping release")
 
         finally:
-            # OPTIMIZATION: Only close if we created the connection
+            # Close only if we created the connection
             if existing_redis is None:
                 await sdb.close()
 
@@ -3174,14 +3447,27 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
     finally:
         if watchdog:
             await watchdog.stop()
-        
         if local_health_server:
             try:
                 await local_health_server.stop()
                 logger_run.debug("Health server stopped")
             except Exception as e:
                 logger_run.error(f"Failed to stop health server: {e}")
-        
+
+        # ---- final memory cleanup ----
+        try:
+            if 'all_results' in locals():
+                del all_results
+            if 'products_map' in locals():
+                del products_map
+            if 'fetcher' in locals():
+                del fetcher
+            import gc
+            gc.collect()
+            logger_run.debug("Final cleanup completed")
+        except Exception as e:
+            logger_run.warning(f"Final cleanup error (non-critical): {e}")
+
         await SessionManager.close_session()
         TRACE_ID.set("")
 
@@ -3209,50 +3495,54 @@ if __name__ == "__main__":
         SHOULD_LOOP = False
         logger.info("CLI override: --once flag detected, disabling auto-restart.")
 
-    if SHOULD_LOOP:
-        # OPTIMIZATION: Persistent Redis connection for loop mode
-        async def main_lifecycle():
-            redis_store = RedisStateStore(cfg.REDIS_URL)
-            await redis_store.connect()
-            
-            attempt = 0
-            max_attempts = cfg.AUTO_RESTART_MAX_RETRIES
-            
-            try:
-                while attempt < max_attempts:
-                    attempt += 1
-                    logger.info(f"Starting bot – attempt {attempt}/{max_attempts}")
-                    try:
-                        success = await run_once(existing_redis=redis_store)
-                        if success:
-                            logger.info("Bot completed successfully – exiting loop")
-                            return 0
-                        else:
-                            logger.warning(f"Bot run returned False on attempt {attempt}/{max_attempts}")
-                            if attempt >= max_attempts:
-                                logger.critical("Maximum restart attempts reached – giving up")
-                                return 1
-                            cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
-                            logger.warning(f"Sleeping {cooldown}s before next restart...")
-                            await asyncio.sleep(cooldown)
-                    except (asyncio.CancelledError, KeyboardInterrupt):
-                        logger.info("Bot stopped by timeout or user interrupt")
-                        return 130
-                    except Exception as exc:
-                        logger.critical(f"Bot crashed on attempt {attempt}/{max_attempts}: {exc}", exc_info=True)
+    # ------------------------------------------------------
+    #  OPTIMIZATION: Persistent Redis connection for loop mode
+    # ------------------------------------------------------
+    async def main_lifecycle() -> int:
+        redis_store = RedisStateStore(cfg.REDIS_URL)
+        await redis_store.connect()
+        warmup_numba()                       # ① JIT warm-up
+        attempt = 0
+        max_attempts = cfg.AUTO_RESTART_MAX_RETRIES
+
+        try:
+            while attempt < max_attempts:
+                attempt += 1
+                logger.info(f"Starting bot – attempt {attempt}/{max_attempts}")
+                try:
+                    success = await run_once(existing_redis=redis_store)
+                    if success:
+                        logger.info("Bot completed successfully – exiting loop")
+                        return 0
+                    else:
+                        logger.warning(f"Bot run returned False on attempt {attempt}/{max_attempts}")
                         if attempt >= max_attempts:
                             logger.critical("Maximum restart attempts reached – giving up")
                             return 1
                         cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
                         logger.warning(f"Sleeping {cooldown}s before next restart...")
                         await asyncio.sleep(cooldown)
-                
-                return 1
-            
-            finally:
-                await redis_store.close()
-                logger.info("Redis connection closed")
-        
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    logger.info("Bot stopped by timeout or user interrupt")
+                    return 130
+                except Exception as exc:
+                    logger.critical(f"Bot crashed on attempt {attempt}/{max_attempts}: {exc}", exc_info=True)
+                    if attempt >= max_attempts:
+                        logger.critical("Maximum restart attempts reached – giving up")
+                        return 1
+                    cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
+                    logger.warning(f"Sleeping {cooldown}s before next restart...")
+                    await asyncio.sleep(cooldown)
+            return 1
+
+        finally:
+            await redis_store.close()
+            logger.info("Redis connection closed")
+
+    # ------------------------------------------------------
+    #  Branch:  LOOP  (auto-restart enabled)
+    # ------------------------------------------------------
+    if SHOULD_LOOP:
         try:
             exit_code = asyncio.run(main_lifecycle())
             sys.exit(exit_code)
@@ -3262,9 +3552,14 @@ if __name__ == "__main__":
         except Exception as exc:
             logger.critical(f"Fatal error in main lifecycle: {exc}", exc_info=True)
             sys.exit(1)
-    
+        finally:
+            log_listener.stop()              # ② stop queue thread
+
+    # ------------------------------------------------------
+    #  Branch:  SINGLE RUN
+    # ------------------------------------------------------
     else:
-        # Single-run mode (no persistent connection needed)
+        warmup_numba()                       # ① JIT warm-up
         try:
             success = asyncio.run(run_once())
             if success:
@@ -3279,3 +3574,5 @@ if __name__ == "__main__":
         except Exception as exc:
             logger.critical(f"Fatal error: {exc}", exc_info=True)
             sys.exit(1)
+        finally:
+            log_listener.stop()              # ② stop queue thread
