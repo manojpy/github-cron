@@ -96,30 +96,6 @@ class Constants:
     INDICATOR_WORKERS = min(4, os.cpu_count() or 4)
     FETCH_BATCH_SIZE = 12
 
-def zero_sensitive_memory(obj: Any) -> None:
-    """
-    SECURITY: Zero out sensitive data from memory (best effort).
-    
-    Note: This is NOT guaranteed to work on all Python implementations.
-    CPython may optimize away the zeroing. Use for defense-in-depth only.
-    """
-    if obj is None:
-        return
-    
-    try:
-        import ctypes
-        obj_id = id(obj)
-        size = sys.getsizeof(obj)
-        
-        # Attempt to zero the memory
-        ctypes.memset(obj_id, 0, size)
-        
-        if cfg.DEBUG_MODE:
-            logger.debug(f"Zeroed {size} bytes at memory address {hex(obj_id)}")
-            
-    except Exception as e:
-        logger.warning(f"Memory zeroing failed (non-critical): {e}")
-
 CANDLE_DTYPE = np.dtype([
     ('timestamp', 'i8'),
     ('open', 'f4'),
@@ -312,6 +288,63 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("macd_bot")
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+    level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
+    logger.setLevel(level)
+    logger.propagate = False
+    use_json = os.getenv("LOG_JSON", "false").lower() in ("1", "true", "yes")
+    formatter = JsonFormatter() if use_json else SafeFormatter(
+        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(formatter)
+    console.addFilter(TraceContextFilter())
+    logger.addHandler(console)
+
+    if os.getenv("FILE_LOGGING", "true").lower() in ("1", "true", "yes"):
+        try:
+            file_handler = logging.handlers.TimedRotatingFileHandler(
+                filename=cfg.LOG_FILE, when="midnight", interval=1, backupCount=7, encoding="utf-8", utc=True
+            )
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            file_handler.addFilter(SecretFilter())
+            file_handler.addFilter(TraceContextFilter())
+            logger.addHandler(file_handler)
+        except Exception as e:
+            logger.warning(f"Failed to setup file logging: {e}")
+    return logger
+
+logger = setup_logging()
+
+def zero_sensitive_memory(obj: Any) -> None:
+    """
+    SECURITY: Zero out sensitive data from memory (best effort).
+    
+    Note: This is NOT guaranteed to work on all Python implementations.
+    CPython may optimize away the zeroing. Use for defense-in-depth only.
+    """
+    if obj is None:
+        return
+    
+    try:
+        import ctypes
+        obj_id = id(obj)
+        size = sys.getsizeof(obj)
+        
+        # Attempt to zero the memory
+        ctypes.memset(obj_id, 0, size)
+        
+        if cfg.DEBUG_MODE:
+            logger.debug(f"Zeroed {size} bytes at memory address {hex(obj_id)}")
+            
+    except Exception as e:
+        logger.warning(f"Memory zeroing failed (non-critical): {e}")
 
 try:
     mem_limit = cfg.MEMORY_LIMIT_BYTES
@@ -379,39 +412,7 @@ class JsonFormatter(SafeFormatter):
             base["exc"] = self.formatException(record.exc_info)
         return json_dumps(base)
 
-def setup_logging() -> logging.Logger:
-    logger = logging.getLogger("macd_bot")
-    for h in logger.handlers[:]:
-        logger.removeHandler(h)
-    level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
-    logger.setLevel(level)
-    logger.propagate = False
-    use_json = os.getenv("LOG_JSON", "false").lower() in ("1", "true", "yes")
-    formatter = JsonFormatter() if use_json else SafeFormatter(
-        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    console.setFormatter(formatter)
-    console.addFilter(TraceContextFilter())
-    logger.addHandler(console)
 
-    if os.getenv("FILE_LOGGING", "true").lower() in ("1", "true", "yes"):
-        try:
-            file_handler = logging.handlers.TimedRotatingFileHandler(
-                filename=cfg.LOG_FILE, when="midnight", interval=1, backupCount=7, encoding="utf-8", utc=True
-            )
-            file_handler.setLevel(level)
-            file_handler.setFormatter(formatter)
-            file_handler.addFilter(SecretFilter())
-            file_handler.addFilter(TraceContextFilter())
-            logger.addHandler(file_handler)
-        except Exception as e:
-            logger.warning(f"Failed to setup file logging: {e}")
-    return logger
-
-logger = setup_logging()
 
 shutdown_event = asyncio.Event()
 
