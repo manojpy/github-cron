@@ -395,7 +395,20 @@ def zero_sensitive_memory(obj: Any) -> None:
     except Exception as e:
         logger.warning(f"Memory zeroing failed (non-critical): {e}")
 
+# Conditional Numba setup with memory awareness
+NUMBA_ENABLED = True
 try:
+    from numba import njit
+    logger.info("✅ Numba available for selective optimization")
+except ImportError:
+    NUMBA_ENABLED = False
+    # Fallback decorator that does nothing
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    logger.warning("⚠️ Numba not available, using NumPy fallbacks")
+
     mem_limit = cfg.MEMORY_LIMIT_BYTES
     resource.setrlimit(resource.RLIMIT_AS, (mem_limit * 2, mem_limit * 2))
     logger.info(f"Memory limit set to {mem_limit / 1_000_000:.0f}MB (soft limit)")
@@ -1050,6 +1063,7 @@ class RedisStateStore:
             # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
+    
     async def finalize_pair_state_pipeline(
         self, 
         pair: str, 
@@ -1940,163 +1954,59 @@ def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
         logger.error(f"Failed to validate indicator {name}: {e}")
         return pd.Series([0.0] * len(series), index=series.index)
 
-@njit(cache=False, fastmath=True)
-def _ema_numba(data: np.ndarray, length: int) -> np.ndarray:
-    """Pure Numba EMA - 50x faster than pandas.ewm()"""
-    n = len(data)
-    result = np.empty(n, dtype=np.float64)
-    alpha = 2.0 / (length + 1.0)
-    
-    # Initialize with first valid value
-    result[0] = data[0]
-    
-    # Calculate EMA
-    for i in range(1, n):
-        if np.isnan(data[i]):
-            result[i] = result[i - 1]
-        else:
-            result[i] = alpha * data[i] + (1 - alpha) * result[i - 1]
-    
-    return result
-
 def calculate_ema(series: pd.Series, length: int) -> pd.Series:
-    """Optimized EMA using Numba"""
-    data = series.values.astype(np.float64)
-    result = _ema_numba(data, length)
-    return pd.Series(result, index=series.index)
-
-@njit(cache=False, fastmath=True)
-def _sma_numba(data: np.ndarray, period: int) -> np.ndarray:
-    """Pure Numba SMA - 40x faster than pandas.rolling()"""
-    n = len(data)
-    result = np.empty(n, dtype=np.float64)
-    
-    # Initialize first values with cumulative mean
-    cumsum = 0.0
-    for i in range(min(period, n)):
-        if not np.isnan(data[i]):
-            cumsum += data[i]
-        result[i] = cumsum / (i + 1)
-    
-    # Calculate rolling mean
-    for i in range(period, n):
-        if np.isnan(data[i]):
-            result[i] = result[i - 1]
-        else:
-            cumsum = cumsum - data[i - period] + data[i]
-            result[i] = cumsum / period
-    
-    return result
+    """Optimized EMA using pandas (fast enough for simple moving averages)"""
+    return series.ewm(span=length, adjust=False).mean()
 
 def calculate_sma(data: pd.Series, period: int) -> pd.Series:
-    """Optimized SMA using Numba"""
-    arr = data.values.astype(np.float64)
-    result = _sma_numba(arr, period)
-    return validate_indicator_series(pd.Series(result, index=data.index), "SMA")
-
-@njit(cache=False, fastmath=True)
-def _rma_numba(data: np.ndarray, period: int) -> np.ndarray:
-    """Pure Numba RMA - 45x faster than pandas.ewm()"""
-    n = len(data)
-    result = np.empty(n, dtype=np.float64)
-    alpha = 1.0 / period
-    
-    # Initialize
-    result[0] = data[0]
-    
-    # Calculate RMA
-    for i in range(1, n):
-        if np.isnan(data[i]):
-            result[i] = result[i - 1]
-        else:
-            result[i] = alpha * data[i] + (1 - alpha) * result[i - 1]
-    
-    return result
+    """Optimized SMA using pandas rolling (efficient and memory-friendly)"""
+    result = data.rolling(window=period, min_periods=1).mean()
+    return validate_indicator_series(result, "SMA")
 
 def calculate_rma(data: pd.Series, period: int) -> pd.Series:
-    """Optimized RMA using Numba"""
-    arr = data.values.astype(np.float64)
-    result = _rma_numba(arr, period)
-    return validate_indicator_series(pd.Series(result, index=data.index), "RMA")
-
-@njit(cache=False, fastmath=True)
-def _ppo_numba(close: np.ndarray, fast: int, slow: int, signal: int, 
-               use_sma: bool = False) -> tuple:
-    """Pure Numba PPO calculation - 60x faster"""
-    n = len(close)
-    
-    # Calculate fast and slow MA
-    if use_sma:
-        fast_ma = _sma_numba(close, fast)
-        slow_ma = _sma_numba(close, slow)
-    else:
-        fast_ma = _ema_numba(close, fast)
-        slow_ma = _ema_numba(close, slow)
-    
-    # Calculate PPO
-    ppo = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        if slow_ma[i] == 0.0 or np.isnan(slow_ma[i]):
-            ppo[i] = 0.0
-        else:
-            ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-    
-    # Calculate signal line
-    if use_sma:
-        ppo_signal = _sma_numba(ppo, signal)
-    else:
-        ppo_signal = _ema_numba(ppo, signal)
-    
-    return ppo, ppo_signal
+    """
+    RMA using pandas EWM with alpha=1/period
+    This is mathematically equivalent to Numba version but uses less memory
+    """
+    alpha = 1.0 / period
+    result = data.ewm(alpha=alpha, adjust=False).mean()
+    return validate_indicator_series(result, "RMA")
 
 def calculate_ppo(df: pd.DataFrame, fast: int, slow: int, signal: int, 
                   use_sma: bool = False) -> Tuple[pd.Series, pd.Series]:
-    """Optimized PPO using Numba"""
-    close = df["close"].values.astype(np.float64)
-    ppo, ppo_signal = _ppo_numba(close, fast, slow, signal, use_sma)
+    """
+    Optimized PPO using pandas - fast enough without Numba
+    PPO calculation is relatively simple, doesn't need JIT compilation
+    """
+    close = df["close"]
     
-    ppo_series = pd.Series(ppo, index=df.index)
-    signal_series = pd.Series(ppo_signal, index=df.index)
+    # Calculate fast and slow MA
+    if use_sma:
+        fast_ma = close.rolling(window=fast, min_periods=1).mean()
+        slow_ma = close.rolling(window=slow, min_periods=1).mean()
+    else:
+        fast_ma = close.ewm(span=fast, adjust=False).mean()
+        slow_ma = close.ewm(span=slow, adjust=False).mean()
+    
+    # Calculate PPO percentage
+    ppo = ((fast_ma - slow_ma) / slow_ma) * 100.0
+    ppo = ppo.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    
+    # Calculate signal line
+    if use_sma:
+        ppo_signal = ppo.rolling(window=signal, min_periods=1).mean()
+    else:
+        ppo_signal = ppo.ewm(span=signal, adjust=False).mean()
     
     return (
-        validate_indicator_series(ppo_series, "PPO"),
-        validate_indicator_series(signal_series, "PPO_SIGNAL")
+        validate_indicator_series(ppo, "PPO"),
+        validate_indicator_series(ppo_signal, "PPO_SIGNAL")
     )
 
-@njit(cache=False, fastmath=True)
-def _rsi_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """Pure Numba RSI calculation - 70x faster"""
-    n = len(close)
-    rsi = np.empty(n, dtype=np.float64)
-    
-    # Calculate price changes
-    delta = np.empty(n, dtype=np.float64)
-    delta[0] = 0.0
-    for i in range(1, n):
-        delta[i] = close[i] - close[i - 1]
-    
-    # Separate gains and losses
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    
-    # Calculate RMA of gains and losses
-    avg_gain = _rma_numba(gain, period)
-    avg_loss = _rma_numba(loss, period)
-    
-    # Calculate RSI
-    for i in range(n):
-        if avg_loss[i] == 0.0:
-            rsi[i] = 100.0
-        else:
-            rs = avg_gain[i] / max(avg_loss[i], 1e-10)
-            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-    
-    return rsi
-
-@njit(cache=False, fastmath=True)
+@njit(cache=False, fastmath=True, parallel=False)
 def _kalman_filter_numba(src: np.ndarray, length: int, R: float = 0.01, 
                          Q: float = 0.1) -> np.ndarray:
-    """Pure Numba Kalman filter - 80x faster"""
+    """Pure Numba Kalman filter - Complex algorithm, needs JIT"""
     n = len(src)
     result = np.empty(n, dtype=np.float64)
     
@@ -2111,7 +2021,6 @@ def _kalman_filter_numba(src: np.ndarray, length: int, R: float = 0.01,
             result[i] = estimate
             continue
         
-        # Kalman filter steps
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
         estimate = prediction + kalman_gain * (current - prediction)
@@ -2121,40 +2030,91 @@ def _kalman_filter_numba(src: np.ndarray, length: int, R: float = 0.01,
     return result
 
 def calculate_smooth_rsi(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
-    """Optimized Smooth RSI using Numba"""
-    close = df["close"].values.astype(np.float64)
+    """
+    Hybrid RSI: Use pandas for RSI, Numba only for Kalman filter
+    RSI calculation is simple enough for pandas
+    """
+    close = df["close"].values
     
-    # Calculate RSI
-    rsi_values = _rsi_numba(close, rsi_len)
+    # RSI calculation using pandas (memory efficient)
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
     
-    # Apply Kalman filter
-    smooth_rsi = _kalman_filter_numba(rsi_values, kalman_len)
+    avg_gain = gain.ewm(alpha=1.0/rsi_len, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0/rsi_len, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi_values = rsi.fillna(50.0).values
+    
+    # Only use Numba for the complex Kalman filter
+    if NUMBA_ENABLED:
+        smooth_rsi = _kalman_filter_numba(rsi_values, kalman_len)
+    else:
+        # Fallback: simple EMA smoothing
+        smooth_rsi = pd.Series(rsi_values).ewm(span=kalman_len, adjust=False).mean().values
     
     return validate_indicator_series(
         pd.Series(smooth_rsi, index=df.index), "SmoothRSI"
     )
 
-@njit(cache=False, fastmath=True)
-def _smooth_rng_numba(close: np.ndarray, t: int, m: float) -> np.ndarray:
-    """Pure Numba smooth range calculation"""
-    n = len(close)
+def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
+    """
+    Optimized VWAP using pandas groupby (memory efficient)
+    No need for Numba on this one - pandas handles it well
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
     
-    # Calculate absolute differences
+    df_copy = df.copy()
+    df_copy['date'] = pd.to_datetime(df_copy['timestamp'], unit='s', utc=True).dt.date
+    df_copy['hlc3'] = (df_copy['high'] + df_copy['low'] + df_copy['close']) / 3.0
+    df_copy['hlc3_volume'] = df_copy['hlc3'] * df_copy['volume']
+    
+    # Group by date and calculate cumulative VWAP
+    df_copy['cum_volume'] = df_copy.groupby('date')['volume'].cumsum()
+    df_copy['cum_hlc3_volume'] = df_copy.groupby('date')['hlc3_volume'].cumsum()
+    
+    vwap = df_copy['cum_hlc3_volume'] / df_copy['cum_volume'].replace(0, 1)
+    
+    return validate_indicator_series(
+        pd.Series(vwap.values, index=df.index), "VWAP"
+    )
+
+# Cirrus Cloud - Complex multi-stage calculation, keep Numba
+@njit(cache=False, fastmath=True, parallel=False)
+def _smooth_rng_numba(close: np.ndarray, t: int, m: float) -> np.ndarray:
+    """Cirrus Cloud helper - Complex range calculation"""
+    n = len(close)
     diff = np.empty(n, dtype=np.float64)
     diff[0] = 0.0
+    
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i - 1])
     
-    # Calculate EMA of differences
+    # EMA of differences
     wper = t * 2 - 1
-    avrng = _ema_numba(diff, t)
-    smooth_rng = _ema_numba(avrng, wper) * m
+    alpha_t = 2.0 / (t + 1.0)
+    alpha_wper = 2.0 / (wper + 1.0)
+    
+    # First EMA
+    avrng = np.empty(n, dtype=np.float64)
+    avrng[0] = diff[0]
+    for i in range(1, n):
+        avrng[i] = alpha_t * diff[i] + (1 - alpha_t) * avrng[i - 1]
+    
+    # Second EMA
+    smooth_rng = np.empty(n, dtype=np.float64)
+    smooth_rng[0] = avrng[0] * m
+    for i in range(1, n):
+        smooth_rng[i] = (alpha_wper * avrng[i] + (1 - alpha_wper) * smooth_rng[i - 1]) * m
     
     return smooth_rng
 
-@njit(cache=False, fastmath=True)
+@njit(cache=False, fastmath=True, parallel=False)
 def _rng_filt_numba(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """Pure Numba range filter"""
+    """Cirrus Cloud range filter - Keep Numba"""
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
     filt[0] = x[0]
@@ -2176,75 +2136,26 @@ def _rng_filt_numba(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     return filt
 
 def calculate_cirrus_cloud(df: pd.DataFrame):
-    """Optimized Cirrus Cloud using Numba"""
+    """Optimized Cirrus Cloud using Numba for complex parts"""
     close = df["close"].values.astype(np.float64)
     
-    # Calculate smooth ranges
-    smrngx1x = _smooth_rng_numba(close, cfg.X1, cfg.X2)
-    smrngx1x2 = _smooth_rng_numba(close, cfg.X3, cfg.X4)
+    if NUMBA_ENABLED:
+        smrngx1x = _smooth_rng_numba(close, cfg.X1, cfg.X2)
+        smrngx1x2 = _smooth_rng_numba(close, cfg.X3, cfg.X4)
+        filtx1 = _rng_filt_numba(close, smrngx1x)
+        filtx12 = _rng_filt_numba(close, smrngx1x2)
+    else:
+        # Fallback: simplified version without Numba
+        logger.warning("Cirrus Cloud using simplified fallback (Numba disabled)")
+        ema1 = df["close"].ewm(span=cfg.X1, adjust=False).mean()
+        ema2 = df["close"].ewm(span=cfg.X3, adjust=False).mean()
+        filtx1 = ema1.values
+        filtx12 = ema2.values
     
-    # Calculate filters
-    filtx1 = _rng_filt_numba(close, smrngx1x)
-    filtx12 = _rng_filt_numba(close, smrngx1x2)
-    
-    # Determine trends
     upw = pd.Series(filtx1 < filtx12, index=df.index)
     dnw = pd.Series(filtx1 > filtx12, index=df.index)
     
     return upw, dnw, pd.Series(filtx1, index=df.index), pd.Series(filtx12, index=df.index)
-
-@njit(cache=False, fastmath=True)
-def _vwap_daily_numba(timestamps: np.ndarray, high: np.ndarray, low: np.ndarray,
-                      close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-    """Pure Numba VWAP with daily reset - 100x faster"""
-    n = len(timestamps)
-    vwap = np.empty(n, dtype=np.float64)
-    
-    cum_vol = 0.0
-    cum_hlc3_vol = 0.0
-    current_day = 0
-    
-    for i in range(n):
-        # Get day from timestamp (seconds to days)
-        day = int(timestamps[i] // 86400)
-        
-        # Reset on new day
-        if i == 0 or day != current_day:
-            cum_vol = 0.0
-            cum_hlc3_vol = 0.0
-            current_day = day
-        
-        # Calculate HLC3
-        hlc3 = (high[i] + low[i] + close[i]) / 3.0
-        
-        # Update cumulative values
-        cum_vol += volume[i]
-        cum_hlc3_vol += hlc3 * volume[i]
-        
-        # Calculate VWAP
-        if cum_vol > 0:
-            vwap[i] = cum_hlc3_vol / cum_vol
-        else:
-            vwap[i] = close[i]
-    
-    return vwap
-
-def calculate_vwap_daily_reset(df: pd.DataFrame) -> pd.Series:
-    """Optimized VWAP using Numba"""
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    
-    timestamps = df["timestamp"].values.astype(np.int64)
-    high = df["high"].values.astype(np.float64)
-    low = df["low"].values.astype(np.float64)
-    close = df["close"].values.astype(np.float64)
-    volume = df["volume"].values.astype(np.float64)
-    
-    vwap = _vwap_daily_numba(timestamps, high, low, close, volume)
-    
-    return validate_indicator_series(
-        pd.Series(vwap, index=df.index), "VWAP"
-    )
 
 def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if df is None or df.empty or len(df) < 2:
@@ -2271,9 +2182,31 @@ def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_tim
         else:
             return None
 
-@njit(cache=False, fastmath=True)
+@njit(cache=False, fastmath=True, parallel=False)
+def _calc_rolling_std_numba(data: np.ndarray, window: int) -> np.ndarray:
+    """Rolling STD for MMH - Complex calculation"""
+    n = len(data)
+    result = np.empty(n, dtype=np.float64)
+    
+    for i in range(n):
+        start = max(0, i - window + 1)
+        window_data = data[start:i+1]
+        
+        # Calculate mean
+        valid_data = window_data[~np.isnan(window_data)]
+        if len(valid_data) == 0:
+            result[i] = 0.0
+            continue
+            
+        mean_val = np.mean(valid_data)
+        variance = np.mean((valid_data - mean_val) ** 2)
+        result[i] = np.sqrt(variance)
+    
+    return result
+
+@njit(cache=False, fastmath=True, parallel=False)
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Numba-compiled worm calculation loop - 100x faster than Python"""
+    """MMH worm calculation - Critical for accuracy"""
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     worm_arr[0] = first_val
@@ -2292,230 +2225,148 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     
     return worm_arr
 
-@njit(cache=False, fastmath=True)
-def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Numba-compiled value calculation loop"""
+@njit(cache=False, fastmath=True, parallel=False)
+def _calc_mmh_core(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Core MMH calculation - Most complex indicator, needs Numba"""
+    rows = len(close)
+    
+    # Calculate standard deviation
+    sd = _calc_rolling_std_numba(close, 50) * responsiveness
+    
+    # Calculate worm
+    worm_arr = _calc_mmh_worm_loop(close, sd, rows)
+    
+    # Calculate moving average using cumsum (faster than loop)
+    ma = np.empty(rows, dtype=np.float64)
+    cumsum = 0.0
+    for i in range(rows):
+        cumsum += close[i]
+        count = min(i + 1, period)
+        if i >= period:
+            cumsum -= close[i - period]
+        ma[i] = cumsum / count
+    
+    # Calculate raw values
+    raw = np.empty(rows, dtype=np.float64)
+    for i in range(rows):
+        if worm_arr[i] == 0.0:
+            raw[i] = 0.0
+        else:
+            raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
+        if np.isnan(raw[i]) or np.isinf(raw[i]):
+            raw[i] = 0.0
+    
+    # Calculate rolling min/max
+    min_med = np.empty(rows, dtype=np.float64)
+    max_med = np.empty(rows, dtype=np.float64)
+    
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        window = raw[start:i+1]
+        valid = window[~np.isnan(window)]
+        min_med[i] = np.min(valid) if len(valid) > 0 else 0.0
+        max_med[i] = np.max(valid) if len(valid) > 0 else 0.0
+    
+    # Calculate normalized temp
+    temp = np.empty(rows, dtype=np.float64)
+    for i in range(rows):
+        denom = max_med[i] - min_med[i]
+        if denom == 0.0:
+            temp[i] = 0.5
+        else:
+            temp[i] = (raw[i] - min_med[i]) / denom
+        temp[i] = max(0.0, min(1.0, temp[i]))
+    
+    # Calculate value with decay
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
     
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        t = temp[i] if not np.isnan(temp[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
-    return value_arr
-
-@njit(cache=False, fastmath=True)
-def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Numba-compiled momentum accumulation loop"""
+    # Calculate momentum
+    momentum = np.empty(rows, dtype=np.float64)
+    for i in range(rows):
+        temp2 = (1.0 + value_arr[i]) / (1.0 - value_arr[i])
+        if np.isnan(temp2) or np.isinf(temp2):
+            temp2 = 1.0
+        temp2 = max(1e-8, min(1e8, temp2))
+        momentum[i] = 0.25 * np.log(temp2)
+        if np.isnan(momentum[i]) or np.isinf(momentum[i]):
+            momentum[i] = 0.0
+    
+    # Accumulate momentum
     for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-    return momentum_arr
-
-@njit(cache=False, fastmath=True)
-def _calc_rolling_std(data: np.ndarray, window: int) -> np.ndarray:
-    """Fast rolling standard deviation using Numba"""
-    n = len(data)
-    result = np.empty(n, dtype=np.float64)
+        prev = momentum[i - 1] if not np.isnan(momentum[i - 1]) else 0.0
+        momentum[i] = momentum[i] + 0.5 * prev
     
-    for i in range(n):
-        start = max(0, i - window + 1)
-        end = i + 1
-        window_data = data[start:end]
-        
-        # Calculate mean
-        mean_val = 0.0
-        count = 0
-        for j in range(len(window_data)):
-            if not np.isnan(window_data[j]):
-                mean_val += window_data[j]
-                count += 1
-        
-        if count > 0:
-            mean_val /= count
-        
-        # Calculate variance
-        variance = 0.0
-        for j in range(len(window_data)):
-            if not np.isnan(window_data[j]):
-                diff = window_data[j] - mean_val
-                variance += diff * diff
-        
-        if count > 0:
-            result[i] = np.sqrt(variance / count)
-        else:
-            result[i] = 0.0
-    
-    return result
-
-@njit(cache=False, fastmath=True)
-def _calc_rolling_mean(data: np.ndarray, window: int) -> np.ndarray:
-    """Fast rolling mean using Numba"""
-    n = len(data)
-    result = np.empty(n, dtype=np.float64)
-    
-    for i in range(n):
-        start = max(0, i - window + 1)
-        end = i + 1
-        window_data = data[start:end]
-        
-        mean_val = 0.0
-        count = 0
-        for j in range(len(window_data)):
-            if not np.isnan(window_data[j]):
-                mean_val += window_data[j]
-                count += 1
-        
-        if count > 0:
-            result[i] = mean_val / count
-        else:
-            result[i] = data[i] if not np.isnan(data[i]) else 0.0
-    
-    return result
-
-@njit(cache=False, fastmath=True)
-def _calc_rolling_min_max(data: np.ndarray, window: int) -> tuple:
-    """Fast rolling min/max using Numba"""
-    n = len(data)
-    min_arr = np.empty(n, dtype=np.float64)
-    max_arr = np.empty(n, dtype=np.float64)
-    
-    for i in range(n):
-        start = max(0, i - window + 1)
-        end = i + 1
-        window_data = data[start:end]
-        
-        min_val = np.inf
-        max_val = -np.inf
-        
-        for j in range(len(window_data)):
-            if not np.isnan(window_data[j]):
-                if window_data[j] < min_val:
-                    min_val = window_data[j]
-                if window_data[j] > max_val:
-                    max_val = window_data[j]
-        
-        min_arr[i] = min_val if not np.isinf(min_val) else 0.0
-        max_arr[i] = max_val if not np.isinf(max_val) else 0.0
-    
-    return min_arr, max_arr
+    return momentum
 
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, 
                                     responsiveness: float = 0.9) -> pd.Series:
     """
-    Fully optimized MMH calculation using pure Numba.
-    100x faster than the original Pandas version.
+    MMH with Numba optimization - This is the most complex indicator
+    Must keep Numba for performance and accuracy
     """
     try:
         if df is None or "close" not in df or df.empty:
             return pd.Series(dtype=float)
         
         close = df["close"].values.astype(np.float64)
-        rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # Calculate standard deviation using optimized Numba function
-        sd = _calc_rolling_std(close, 50) * resp_clamped
+        if NUMBA_ENABLED:
+            hist = _calc_mmh_core(close, period, resp_clamped)
+        else:
+            # Fallback: very simplified version (loses accuracy but prevents crash)
+            logger.warning("MMH using simplified fallback - accuracy reduced")
+            ema_fast = df["close"].ewm(span=12, adjust=False).mean()
+            ema_slow = df["close"].ewm(span=26, adjust=False).mean()
+            hist = ((ema_fast - ema_slow) / ema_slow * 100).fillna(0).values
         
-        # Calculate worm using Numba
-        worm_arr = _calc_mmh_worm_loop(close, sd, rows)
-        
-        # Calculate moving average using Numba
-        ma = _calc_rolling_mean(close, period)
-        
-        # Calculate raw values
-        raw = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            if worm_arr[i] == 0.0:
-                raw[i] = 0.0
-            else:
-                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
-        
-        # Handle inf/nan
-        for i in range(rows):
-            if np.isnan(raw[i]) or np.isinf(raw[i]):
-                raw[i] = 0.0
-        
-        # Calculate rolling min/max using Numba
-        min_med, max_med = _calc_rolling_min_max(raw, period)
-        
-        # Calculate temp
-        temp = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            denom = max_med[i] - min_med[i]
-            if denom == 0.0:
-                temp[i] = 0.5
-            else:
-                temp[i] = (raw[i] - min_med[i]) / denom
-            # Clip to [0, 1]
-            temp[i] = max(0.0, min(1.0, temp[i]))
-        
-        # Calculate value using Numba
-        value_arr = _calc_mmh_value_loop(temp, rows)
-        
-        # Calculate momentum
-        momentum = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            temp2 = (1.0 + value_arr[i]) / (1.0 - value_arr[i])
-            # Handle division issues
-            if np.isnan(temp2) or np.isinf(temp2):
-                temp2 = 1.0
-            temp2 = max(1e-8, min(1e8, temp2))
-            momentum[i] = 0.25 * np.log(temp2)
-        
-        # Handle inf/nan in momentum
-        for i in range(rows):
-            if np.isnan(momentum[i]) or np.isinf(momentum[i]):
-                momentum[i] = 0.0
-        
-        # Accumulate momentum using Numba
-        momentum = _calc_mmh_momentum_loop(momentum, rows)
-        
-        hist = pd.Series(momentum, index=df.index, name="hist")
-        return validate_indicator_series(hist, "MMH_HIST")
+        return validate_indicator_series(
+            pd.Series(hist, index=df.index, name="hist"), "MMH_HIST"
+        )
         
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
-        return pd.Series([0.0] * (len(df) if df is not None else 0), 
-                        index=(df.index if df is not None else pd.Index([])), 
-                        name="hist")
+        return pd.Series([0.0] * len(df), index=df.index, name="hist")
 
 def calculate_all_indicators_batch(df_15m: pd.DataFrame, df_5m: pd.DataFrame, 
                                    df_daily: Optional[pd.DataFrame]) -> dict:
     """
-    Calculate all indicators in a single execution context.
-    This reduces overhead by ~75% compared to individual calls.
-    
-    Returns dict with all calculated indicators.
+    Calculate all indicators - now using selective Numba
+    Memory-efficient: Numba only for complex calculations
     """
     results = {}
     
     try:
-        # PPO (15m timeframe)
+        # PPO (now using pandas - simple enough)
         ppo, ppo_signal = calculate_ppo(
             df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL, cfg.PPO_USE_SMA
         )
         results['ppo'] = ppo
         results['ppo_signal'] = ppo_signal
         
-        # Smooth RSI (15m timeframe)
+        # Smooth RSI (hybrid: pandas + Numba Kalman)
         results['smooth_rsi'] = calculate_smooth_rsi(
             df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-        # VWAP (15m timeframe)
+        # VWAP (now using pandas groupby - efficient)
         if cfg.ENABLE_VWAP:
             results['vwap'] = calculate_vwap_daily_reset(df_15m)
         else:
             results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
         
-        # MMH (15m timeframe) - now using fully optimized Numba version
+        # MMH (CRITICAL: Keep Numba - most complex calculation)
         mmh = calculate_magical_momentum_hist(df_15m)
         results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
         
-        # Cirrus Cloud (15m timeframe)
+        # Cirrus Cloud (Keep Numba - complex range filtering)
         if cfg.CIRRUS_CLOUD_ENABLED:
             upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud(df_15m)
             results['upw'] = upw
@@ -2528,7 +2379,7 @@ def calculate_all_indicators_batch(df_15m: pd.DataFrame, df_5m: pd.DataFrame,
             results['filtx1'] = pd.Series(index=df_15m.index, dtype=float)
             results['filtx12'] = pd.Series(index=df_15m.index, dtype=float)
         
-        # RMA calculations
+        # RMA calculations (now using pandas ewm - simple enough)
         results['rma50_15'] = calculate_rma(df_15m["close"], cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma(df_5m["close"], cfg.RMA_200_PERIOD)
         
