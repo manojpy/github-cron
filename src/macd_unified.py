@@ -16,7 +16,6 @@ import hashlib
 import re
 import uuid
 import argparse
-import psutil
 import math
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
@@ -25,15 +24,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 import gc
-import aiohttp
-from aiohttp import web
 from prometheus_client import start_http_server
 import pandas as pd
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
-from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 
 
 # ============================================================================
@@ -356,7 +352,6 @@ def setup_logging() -> logging.Logger:
 
     if os.getenv("FILE_LOGGING", "true").lower() in ("1", "true", "yes"):
         try:
-            file_handler = logging.handlers.TimedRotatingFileHandler(
                 filename=cfg.LOG_FILE, when="midnight", interval=1, backupCount=7, encoding="utf-8", utc=True
             )
             file_handler.setLevel(level)
@@ -453,7 +448,6 @@ class MemoryMonitor:
         self.limit_percent = limit_percent
         self.last_check = 0.0
         self.interval = Constants.MEMORY_CHECK_INTERVAL
-        self.process = psutil.Process()
 
     def should_check(self) -> bool:
         now = time.time()
@@ -468,7 +462,6 @@ class MemoryMonitor:
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             return container_memory_mb >= limit_mb
         except Exception:
-            vm = psutil.virtual_memory()
             return vm.percent >= self.limit_percent
 
     def check_memory(self) -> Tuple[int, float]:
@@ -478,7 +471,6 @@ class MemoryMonitor:
             container_percent = (container_used / cfg.MEMORY_LIMIT_BYTES) * 100
             return container_used, float(container_percent)
         except Exception:
-            vm = psutil.virtual_memory()
             return int(vm.used), float(vm.percent)
 
 metrics_started = False
@@ -520,7 +512,6 @@ def print_startup_banner_once() -> None:
 print_startup_banner_once()
 
 class SessionManager:
-    _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
 
@@ -534,7 +525,6 @@ class SessionManager:
         return cls._ssl_context
 
     @classmethod
-    async def get_session(cls) -> aiohttp.ClientSession:
         async with cls._lock:
             if cls._session is None or cls._session.closed:
                 connector = TCPConnector(
@@ -545,13 +535,10 @@ class SessionManager:
                     enable_cleanup_closed=True,
                     ttl_dns_cache=300,
                 )
-                timeout = aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)
-                cls._session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
                     headers={'User-Agent': f'{cfg.BOT_NAME}/{__version__}'}
                 )
-                logger.debug("Created new shared aiohttp session")
             return cls._session
 
     @classmethod
@@ -565,7 +552,6 @@ class SessionManager:
                     logger.warning(f"Error closing session: {e}")
                 finally:
                     cls._session = None
-                    logger.debug("Closed shared aiohttp session")
 
 def _exp_backoff_sleep(attempt: int, base: float, cap: float) -> float:
     sleep = min(cap, base * (2 ** (attempt - 1)))
@@ -582,13 +568,11 @@ def categorize_exception(exc: Exception) -> str:
     """Categorize exception type for better retry handling."""
     if isinstance(exc, asyncio.TimeoutError):
         return RetryCategory.TIMEOUT
-    elif isinstance(exc, (ClientConnectorError, aiohttp.ClientConnectorError)):
         return RetryCategory.NETWORK
     elif isinstance(exc, ClientResponseError):
         if hasattr(exc, 'status') and exc.status == 429:
             return RetryCategory.RATE_LIMIT
         return RetryCategory.API_ERROR
-    elif isinstance(exc, (ClientError, aiohttp.ClientError)):
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
 
@@ -2703,7 +2687,6 @@ class DeadMansSwitch:
         self.last_check_time = 0.0
         self.startup_time = time.time()
         self.alert_recovered = False
-        self.heartbeat_key = "heartbeat:timestamp"
 
     def _parse_last_success(self, last_success: Optional[str]) -> Optional[int]:
         if not last_success:
@@ -2717,18 +2700,13 @@ class DeadMansSwitch:
             except Exception:
                 return None
 
-    async def update_heartbeat(self) -> None:
         if self.sdb.degraded:
             return
         try:
-            heartbeat_ttl = 1800
             await self.sdb._safe_redis_op(
-                self.sdb._redis.set(self.heartbeat_key, str(int(time.time())), ex=heartbeat_ttl),
                 timeout=2.0,
-                op_name="update_heartbeat"
             )
         except Exception as e:
-            logger.error(f"Failed to update heartbeat: {e}")
 
     async def should_alert(self) -> bool | str:
         try:
@@ -2739,26 +2717,18 @@ class DeadMansSwitch:
                 return False
             self.last_check_time = now
             
-            heartbeat_str = await self.sdb.get_metadata(self.heartbeat_key)
-            if not heartbeat_str:
                 return False
             
-            heartbeat_ts = self._parse_last_success(heartbeat_str)
-            if heartbeat_ts is None:
                 return False
             
-            time_since_heartbeat = now - heartbeat_ts
             
-            if time_since_heartbeat <= self.cooldown_seconds and self.alert_sent and not self.alert_recovered:
                 self.alert_recovered = True
                 return "RECOVERED"
             
-            if time_since_heartbeat > self.cooldown_seconds and not self.alert_sent:
                 self.alert_sent = True
                 self.alert_recovered = False
                 return True
             
-            if time_since_heartbeat <= self.cooldown_seconds and self.alert_sent:
                 self.alert_sent = False
             
             return False
@@ -2797,7 +2767,6 @@ class HealthHttpServer:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         try:
-            process = psutil.Process()
             container_memory_mb = process.memory_info().rss / 1024 / 1024
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             status = {
@@ -2854,11 +2823,9 @@ async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     async with indicator_semaphore:
         return await asyncio.to_thread(func, *args, **kwargs)
 
-async def _heartbeat_updater(dms: DeadMansSwitch, sdb: RedisStateStore) -> None:
     try:
         while not shutdown_event.is_set():
             await asyncio.sleep(60)
-            await dms.update_heartbeat()
     except asyncio.CancelledError:
         logger.debug("Heartbeat updater cancelled")
     except Exception as e:
@@ -3294,7 +3261,6 @@ async def worker_process_pair(
     telegram_queue: TelegramQueue,
     correlation_id: str,
     reference_time: int,
-    memory_monitor: MemoryMonitor,
     lock: RedisLock,
     results: List[Tuple[str, Dict[str, Any]]],
     results_lock: asyncio.Lock
@@ -3354,9 +3320,7 @@ async def worker_process_pair(
                     METRIC_FAILED_PAIRS.inc()
             
             # OPTIMIZATION: Memory check with GC trigger
-            if worker_id == 0 and memory_monitor.should_check():
                 import gc
-                used_bytes, mem_percent = memory_monitor.check_memory()
                 
                 if PROMETHEUS_ENABLED and METRIC_MEMORY_USAGE:
                     METRIC_MEMORY_USAGE.set(float(used_bytes) / 1048576.0)
@@ -3370,7 +3334,6 @@ async def worker_process_pair(
                     )
                     gc.collect(generation=2)  # Full collection
                     
-                    if memory_monitor.is_critical():
                         logger_worker.critical(
                             f"🚨 Worker {worker_id}: Memory exceeded limit, stopping worker"
                         )
@@ -3416,7 +3379,6 @@ async def process_pairs_with_workers(
     state_db: RedisStateStore,
     telegram_queue: TelegramQueue,
     correlation_id: str,
-    memory_monitor: MemoryMonitor,
     lock: RedisLock,
     reference_time: int
 ) -> List[Tuple[str, Dict[str, Any]]]:
@@ -3451,7 +3413,6 @@ async def process_pairs_with_workers(
             worker_process_pair(
                 worker_id, pair_queue, fetcher, products_map,
                 state_db, telegram_queue, correlation_id,
-                reference_time, memory_monitor, lock,
                 results, results_lock
             )
         )
@@ -3494,7 +3455,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
     
-    memory_monitor = MemoryMonitor(Constants.MEMORY_LIMIT_PERCENT)
     local_health_server: Optional[HealthHttpServer] = None
     lock_acquired = False
     lock: Optional[RedisLock] = None
@@ -3508,8 +3468,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
             local_health_server = HealthHttpServer(HEALTH_HTTP_PORT)
             await local_health_server.start()
 
-        if memory_monitor.is_critical():
-            mem_percent = memory_monitor.check_memory()[1]
             logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
             return False
 
@@ -3549,7 +3507,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
             try:
                 dms = DeadMansSwitch(sdb, cfg.DEAD_MANS_COOLDOWN_SECONDS)
-                await dms.update_heartbeat()
 
                 dms_result = await dms.should_alert()
                 if dms_result == "RECOVERED":
@@ -3595,13 +3552,11 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
 
-                heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
 
                 # Use optimized worker pool
                 all_results = await process_pairs_with_workers(
                     fetcher, products_map, pairs_to_process,
                     sdb, telegram_queue, correlation_id,
-                    memory_monitor, lock, reference_time
                 )
 
                 # Process results
@@ -3614,13 +3569,10 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                     if state and state.get("state") == "ALERT_SENT":
                         alerts_sent += state["summary"].get("alerts", 0)
 
-                heartbeat_task.cancel()
                 try:
-                    await asyncio.wait_for(heartbeat_task, timeout=1.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
 
-                await dms.update_heartbeat()
 
                 fetcher_stats = fetcher.get_stats()
                 logger_run.info(
@@ -3637,7 +3589,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 run_duration = time.time() - start_time
 
-                used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
                 redis_status = "OK" if not sdb.degraded else "DEGRADED"
                 summary = (
                     f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(processed_pairs)} pairs | "
@@ -3732,89 +3683,5 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
-    parser.add_argument("--once", action="store_true", help="Run one pass and exit")
-    parser.add_argument("--debug", action="store_true", help="Set logger to DEBUG")
-    args = parser.parse_args()
-
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-        for h in logger.handlers:
-            h.setLevel(logging.DEBUG)
-        logger.info("Debug mode enabled via CLI flag")
-
-    SHOULD_LOOP = cfg.ENABLE_AUTO_RESTART
-    if args.once:
-        SHOULD_LOOP = False
-        logger.info("CLI override: --once flag detected, disabling auto-restart.")
-
-    if SHOULD_LOOP:
-        # OPTIMIZATION: Persistent Redis connection for loop mode
-        async def main_lifecycle():
-            redis_store = RedisStateStore(cfg.REDIS_URL)
-            await redis_store.connect()
-            
-            attempt = 0
-            max_attempts = cfg.AUTO_RESTART_MAX_RETRIES
-            
-            try:
-                while attempt < max_attempts:
-                    attempt += 1
-                    logger.info(f"Starting bot – attempt {attempt}/{max_attempts}")
-                    try:
-                        success = await run_once(existing_redis=redis_store)
-                        if success:
-                            logger.info("Bot completed successfully – exiting loop")
-                            return 0
-                        else:
-                            logger.warning(f"Bot run returned False on attempt {attempt}/{max_attempts}")
-                            if attempt >= max_attempts:
-                                logger.critical("Maximum restart attempts reached – giving up")
-                                return 1
-                            cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
-                            logger.warning(f"Sleeping {cooldown}s before next restart...")
-                            await asyncio.sleep(cooldown)
-                    except (asyncio.CancelledError, KeyboardInterrupt):
-                        logger.info("Bot stopped by timeout or user interrupt")
-                        return 130
-                    except Exception as exc:
-                        logger.critical(f"Bot crashed on attempt {attempt}/{max_attempts}: {exc}", exc_info=True)
-                        if attempt >= max_attempts:
-                            logger.critical("Maximum restart attempts reached – giving up")
-                            return 1
-                        cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
-                        logger.warning(f"Sleeping {cooldown}s before next restart...")
-                        await asyncio.sleep(cooldown)
-                
-                return 1
-            
-            finally:
-                await redis_store.close()
-                logger.info("Redis connection closed")
-        
-        try:
-            exit_code = asyncio.run(main_lifecycle())
-            sys.exit(exit_code)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            sys.exit(130)
-        except Exception as exc:
-            logger.critical(f"Fatal error in main lifecycle: {exc}", exc_info=True)
-            sys.exit(1)
-    
-    else:
-        # Single-run mode (no persistent connection needed)
-        try:
-            success = asyncio.run(run_once())
-            if success:
-                logger.info("✅ Bot run completed successfully")
-                sys.exit(0)
-            else:
-                logger.error("❌ Bot run failed")
-                sys.exit(1)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            logger.info("Bot stopped by timeout or user")
-            sys.exit(130)
-        except Exception as exc:
-            logger.critical(f"Fatal error: {exc}", exc_info=True)
-            sys.exit(1)
+    import asyncio
+    asyncio.run(run_bot_once())
