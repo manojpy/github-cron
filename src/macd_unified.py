@@ -1806,91 +1806,41 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
         return False, f"Validation error: {str(e)}"
 
 def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFrame]:
-    """
-    OPTIMIZED: Parse candles with minimal DataFrame operations.
-    
-    Changes:
-    - Use numpy array operations where possible
-    - Minimize type conversions
-    - Reduce memory allocations
-    - Faster validation checks
-    """
     if not result or not isinstance(result, dict):
         return None
-    
     res = result.get("result", {}) or {}
     required_keys = ["t", "o", "h", "l", "c", "v"]
-    
     if not all(k in res for k in required_keys):
         return None
-    
     try:
-        # Get minimum length
         min_len = min(len(res[k]) for k in required_keys)
         if min_len == 0:
             return None
-        
-        # OPTIMIZED: Create arrays directly without intermediate lists
-        timestamps = np.array(res["t"][:min_len], dtype=np.int64)
-        opens = np.array(res["o"][:min_len], dtype=np.float32)
-        highs = np.array(res["h"][:min_len], dtype=np.float32)
-        lows = np.array(res["l"][:min_len], dtype=np.float32)
-        closes = np.array(res["c"][:min_len], dtype=np.float32)
-        volumes = np.array(res["v"][:min_len], dtype=np.float32)
-        
-        # Check for millisecond timestamps and convert
-        median_ts = np.median(timestamps)
-        if median_ts > 100_000_000_000:
-            timestamps = (timestamps // 1000).astype(np.int64)
-        
-        # Filter out invalid timestamps
-        valid_mask = timestamps > 0
-        if not np.any(valid_mask):
-            return None
-        
-        # Apply mask to all arrays
-        timestamps = timestamps[valid_mask]
-        opens = opens[valid_mask]
-        highs = highs[valid_mask]
-        lows = lows[valid_mask]
-        closes = closes[valid_mask]
-        volumes = volumes[valid_mask]
-        
-        # Sort by timestamp
-        sort_idx = np.argsort(timestamps)
-        timestamps = timestamps[sort_idx]
-        opens = opens[sort_idx]
-        highs = highs[sort_idx]
-        lows = lows[sort_idx]
-        closes = closes[sort_idx]
-        volumes = volumes[sort_idx]
-        
-        # Remove duplicates (keep last occurrence)
-        _, unique_idx = np.unique(timestamps, return_index=True)
-        if len(unique_idx) < len(timestamps):
-            timestamps = timestamps[unique_idx]
-            opens = opens[unique_idx]
-            highs = highs[unique_idx]
-            lows = lows[unique_idx]
-            closes = closes[unique_idx]
-            volumes = volumes[unique_idx]
-        
-        # OPTIMIZED: Create DataFrame only once with all data
         df = pd.DataFrame({
-            "timestamp": timestamps,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
+            "timestamp": res["t"][:min_len],
+            "open": res["o"][:min_len],
+            "high": res["h"][:min_len],
+            "low": res["l"][:min_len],
+            "close": res["c"][:min_len],
+            "volume": res["v"][:min_len],
         })
-        
-        # Validate last close price
-        last_close = float(df["close"].iloc[-1])
-        if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
+        df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
+        df = df[df["timestamp"] > 0].copy()
+        if df.empty:
             return None
         
-        # Fix negative volumes
+        median_ts = df["timestamp"].median()
+        if median_ts > 100_000_000_000:
+            df["timestamp"] = (df["timestamp"] // 1000).astype(np.int64)
+        
+        if len(df) > 0:
+            last_close = float(df["close"].iloc[-1])
+            if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
+                return None
+        
         if (df["volume"] < 0).any():
             if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
                 METRIC_DATA_QUALITY_FAILURES.labels(reason="negative_volume").inc()
@@ -1898,7 +1848,6 @@ def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFr
             df.loc[df["volume"] < 0, "volume"] = 0
         
         return df
-        
     except Exception as e:
         logger.exception(f"Failed to parse candles: {e}")
         return None
