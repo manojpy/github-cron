@@ -1611,53 +1611,6 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
         logger.error(f"DataFrame validation failed: {e}")
         return False, f"Validation error: {str(e)}"
 
-def parse_candles_result(result: Optional[Dict[str, Any]]) -> Optional[pd.DataFrame]:
-    if not result or not isinstance(result, dict):
-        return None
-    res = result.get("result", {}) or {}
-    required_keys = ["t", "o", "h", "l", "c", "v"]
-    if not all(k in res for k in required_keys):
-        return None
-    try:
-        min_len = min(len(res[k]) for k in required_keys)
-        if min_len == 0:
-            return None
-        df = pd.DataFrame({
-            "timestamp": res["t"][:min_len],
-            "open": res["o"][:min_len],
-            "high": res["h"][:min_len],
-            "low": res["l"][:min_len],
-            "close": res["c"][:min_len],
-            "volume": res["v"][:min_len],
-        })
-        df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
-        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(np.int64)
-        df = df[df["timestamp"] > 0].copy()
-        if df.empty:
-            return None
-        
-        median_ts = df["timestamp"].median()
-        if median_ts > 100_000_000_000:
-            df["timestamp"] = (df["timestamp"] // 1000).astype(np.int64)
-        
-        if len(df) > 0:
-            last_close = float(df["close"].iloc[-1])
-            if last_close <= 0 or np.isnan(last_close) or np.isinf(last_close):
-                return None
-        
-        if (df["volume"] < 0).any():
-            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
-                METRIC_DATA_QUALITY_FAILURES.labels(reason="negative_volume").inc()
-            logger.warning("Negative volume detected in candle data")
-            df.loc[df["volume"] < 0, "volume"] = 0
-        
-        return df
-    except Exception as e:
-        logger.exception(f"Failed to parse candles: {e}")
-        return None
-
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     """
     Convert Delta JSON response straight into NumPy arrays, skipping Pandas entirely.
@@ -1730,7 +1683,7 @@ def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
         logger.error(f"Failed to validate indicator {name}: {e}")
         return pd.Series([0.0] * len(series), index=series.index)
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     """Fast SMA calculation using Numba."""
     n = len(data)
@@ -1765,7 +1718,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     """
     Fast Kalman Filter using Numba. 
@@ -1797,7 +1750,7 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         
     return result
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _vwap_daily_loop(
     high: np.ndarray, 
     low: np.ndarray, 
@@ -1899,7 +1852,8 @@ def calculate_smooth_rsi_numpy(df: pd.DataFrame, rsi_len: int, kalman_len: int) 
     smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
     
     return validate_indicator_series(pd.Series(smooth_rsi, index=df.index), "SmoothRSI")
-@njit(fastmath=True, cache=True)
+
+@njit(fastmath=True, cache=False)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
     """Fast EMA calculation using Numba."""
     n = len(data)
@@ -1915,7 +1869,7 @@ def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
     return out
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     """
     Fast Cirrus Cloud Range Filter using Numba.
@@ -2037,7 +1991,7 @@ def calculate_ppo_numpy(df: pd.DataFrame, fast: int, slow: int, signal: int) -> 
     
     return pd.Series(ppo, index=df.index), pd.Series(ppo_sig, index=df.index)
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Numba-compiled worm calculation loop - ~100x faster than Python"""
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -2058,7 +2012,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _calc_mmh_value_loop(temp_arr, rows):
     """Numba-compiled value calculation loop"""
     value_arr = np.zeros(rows, dtype=np.float64)
@@ -2072,7 +2026,7 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=False)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     """Numba-compiled momentum accumulation loop"""
     for i in range(1, rows):
