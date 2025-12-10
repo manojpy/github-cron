@@ -22,7 +22,8 @@ pydantic-settings==2.6.1  # If you're using Settings classes
 # System and process utilities
 psutil==6.1.0
 orjson==3.10.12  # Latest stable version with bug fixes
-
+aiodns>=3.0.0
+brotli>=1.0.9
 # Timezone database
 tzdata==2024.2
 
