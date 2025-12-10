@@ -287,6 +287,15 @@ def load_config() -> BotConfig:
 
 cfg = load_config()
 
+MINIMAL_LOG = cfg.LOG_MINIMAL
+if MINIMAL_LOG:
+    # silence every logger except our own "macd_bot" root logger
+    logging.getLogger("aiohttp.access").setLevel(logging.CRITICAL + 1)
+    logging.getLogger("asyncio").setLevel(logging.CRITICAL + 1)
+    logging.getLogger("urllib3").setLevel(logging.CRITICAL + 1)
+    logging.getLogger("redis").setLevel(logging.CRITICAL + 1)
+    # keep our logger active but we will override its handler below
+
 class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -378,18 +387,6 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 shutdown_event = asyncio.Event()
-
-# ------------------------------------------------------------------
-# MINIMAL-LOG SWITCH  (3-lines mode for cron)
-# ------------------------------------------------------------------
-MINIMAL_LOG = cfg.LOG_MINIMAL
-if MINIMAL_LOG:
-    # silence every logger except our own "macd_bot" root logger
-    logging.getLogger("aiohttp.access").setLevel(logging.CRITICAL + 1)
-    logging.getLogger("asyncio").setLevel(logging.CRITICAL + 1)
-    logging.getLogger("urllib3").setLevel(logging.CRITICAL + 1)
-    logging.getLogger("redis").setLevel(logging.CRITICAL + 1)
-    # keep our logger active but we will override its handler below
 
 def zero_sensitive_memory(obj: Any) -> None:
     """
