@@ -12,16 +12,12 @@ import re
 import uuid
 import argparse
 import psutil
-import math
-from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 import gc
 import aiohttp
-from aiohttp import web
-import pandas as pd
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
@@ -34,15 +30,16 @@ from numba import njit
 # ============================================================================
 try:
     import orjson
-    
+
     def json_dumps(obj: Any) -> str:
-        """Fast JSON serialization using orjson with NumPy support"""
-        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS).decode('utf-8')
+        return orjson.dumps(
+            obj,
+            option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+        ).decode('utf-8')
 
     def json_loads(s: str | bytes) -> Any:
-        """Fast JSON deserialization using orjson"""
         return orjson.loads(s)
-    
+
     JSON_BACKEND = "orjson"
 except ImportError:
     import json
@@ -50,7 +47,7 @@ except ImportError:
     json_loads = json.loads
     JSON_BACKEND = "stdlib"
 
-__version__ = "1.2.0-cron-optimized"
+__version__ = "1.3.0-cron-optimized-numpy-only"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -172,20 +169,16 @@ class BotConfig(BaseModel):
     def validate_logic(self) -> 'BotConfig':
         if self.PPO_FAST >= self.PPO_SLOW:
             raise ValueError('PPO_FAST must be less than PPO_SLOW')
-
         if self.RUN_TIMEOUT_SECONDS < self.MIN_RUN_TIMEOUT:
             raise ValueError(
                 f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s) must be >= MIN_RUN_TIMEOUT ({self.MIN_RUN_TIMEOUT}s)'
             )
-
         if self.RUN_TIMEOUT_SECONDS >= Constants.REDIS_LOCK_EXPIRY:
             raise ValueError(
                 f'REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s) must be > RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s)'
             )
-
         if self.TELEGRAM_RATE_LIMIT_PER_MINUTE < 10 or self.TELEGRAM_RATE_LIMIT_PER_MINUTE > 30:
             raise ValueError('TELEGRAM_RATE_LIMIT_PER_MINUTE must be 10-30')
-
         return self
 
 def load_config() -> BotConfig:
@@ -223,10 +216,11 @@ class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = str(record.getMessage())
-            msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
-            msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
-            msg = re.sub(r'(redis://[^@]+@)', 'redis://[REDACTED]@', msg)
-            record.msg = msg
+            if ("bot" in msg and ":" in msg) or ("redis://" in msg) or ("chat_id=" in msg):
+                msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
+                msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
+                msg = re.sub(r'(redis://[^@]+@)', 'redis://[REDACTED]@', msg)
+                record.msg = msg
         except Exception:
             pass
         return True
@@ -245,22 +239,19 @@ class SafeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         record.args = None
         formatted = super().format(record)
-        formatted = self._SECRET_RE.sub("[REDACTED_TOKEN]", formatted)
-        formatted = self._CHAT_RE.sub("chat_id=[REDACTED]", formatted)
-        formatted = self._REDIS_RE.sub("redis://[REDACTED]@", formatted)
+        if ("bot" in formatted and ":" in formatted) or ("redis://" in formatted) or ("chat_id=" in formatted):
+            formatted = self._SECRET_RE.sub("[REDACTED_TOKEN]", formatted)
+            formatted = self._CHAT_RE.sub("chat_id=[REDACTED]", formatted)
+            formatted = self._REDIS_RE.sub("redis://[REDACTED]@", formatted)
         return formatted
 
 def setup_logging() -> logging.Logger:
-    """Simplified logging setup for short-lived cron jobs"""
     logger = logging.getLogger("macd_bot")
     for h in logger.handlers[:]:
         logger.removeHandler(h)
-
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
-
-    # Console handler - logs to stdout for container capture
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(level)
     console.setFormatter(SafeFormatter(
@@ -270,7 +261,6 @@ def setup_logging() -> logging.Logger:
     console.addFilter(SecretFilter())
     console.addFilter(TraceContextFilter())
     logger.addHandler(console)
-
     return logger
 
 logger = setup_logging()
@@ -337,7 +327,7 @@ class SessionManager:
                     ssl=cls._get_ssl_context(),
                     force_close=False,
                     enable_cleanup_closed=True,
-                    ttl_dns_cache=300,
+                    ttl_dns_cache=3600,
                 )
                 timeout = aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)
                 cls._session = aiohttp.ClientSession(
@@ -369,7 +359,6 @@ class RetryCategory:
     UNKNOWN = "unknown"
 
 def categorize_exception(exc: Exception) -> str:
-    """Categorize exception type for better retry handling."""
     if isinstance(exc, asyncio.TimeoutError):
         return RetryCategory.TIMEOUT
     elif isinstance(exc, (ClientConnectorError, aiohttp.ClientConnectorError)):
@@ -393,24 +382,10 @@ async def retry_async(
     on_error: Optional[Callable[[Exception, int, str], None]] = None,
     **kwargs
 ):
-    """
-    Enhanced retry with exponential backoff, jitter, and error categorization.
-    
-    Args:
-        fn: Async function to retry
-        retries: Maximum number of retry attempts
-        base_backoff: Base delay in seconds
-        cap: Maximum delay cap in seconds
-        jitter_min: Minimum jitter fraction (0.05 = 5%)
-        jitter_max: Maximum jitter fraction (0.5 = 50%)
-        on_error: Callback(exception, attempt, category)
-    """
     last_exc: Optional[Exception] = None
-    
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
             raise asyncio.CancelledError()
-        
         try:
             return await fn(*args, **kwargs)
         except asyncio.CancelledError:
@@ -418,27 +393,21 @@ async def retry_async(
         except Exception as e:
             last_exc = e
             category = categorize_exception(e)
-            
             if on_error:
                 try:
                     on_error(e, attempt, category)
                 except Exception:
                     pass
-            
             if attempt >= retries:
                 break
-            
             base_delay = min(cap, base_backoff * (2 ** (attempt - 1)))
             jitter = base_delay * random.uniform(jitter_min, jitter_max)
             sleep_time = base_delay + jitter
-            
             logger.debug(
                 f"Retry attempt {attempt}/{retries} after {sleep_time:.2f}s | "
                 f"Category: {category} | Error: {str(e)[:100]}"
             )
-            
             await asyncio.sleep(sleep_time)
-    
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
 def get_trigger_timestamp() -> int:
@@ -454,7 +423,6 @@ def get_trigger_timestamp() -> int:
             return trigger_ts
         except (ValueError, TypeError):
             logger.warning(f"Invalid TRIGGER_TIMESTAMP: {trigger_ts_str}, using current time")
-    
     return int(time.time())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
@@ -470,7 +438,675 @@ def validate_candle_timestamp(candle_ts: int, expected_ts: int, tolerance_second
         return False
     return True
 
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+    if not result or not isinstance(result, dict):
+        return None
+    res = result.get("result", {}) or {}
+    required = ("t", "o", "h", "l", "c", "v")
+    if not all(k in res for k in required):
+        return None
+    try:
+        data = {
+            "timestamp": np.array(res["t"], dtype=np.int64),
+            "open":   np.array(res["o"], dtype=np.float64),
+            "high":   np.array(res["h"], dtype=np.float64),
+            "low":    np.array(res["l"], dtype=np.float64),
+            "close":  np.array(res["c"], dtype=np.float64),
+            "volume": np.array(res["v"], dtype=np.float64),
+        }
+        if data["timestamp"][-1] > 1_000_000_000_000:
+            data["timestamp"] = (data["timestamp"] // 1000).astype(np.int64)
+        if data["close"][-1] <= 0 or np.isnan(data["close"][-1]):
+            return None
+        return data
+    except Exception:
+        return None
+
+def validate_candle_arrays(arr: Optional[Dict[str, np.ndarray]], required_len: int = 0, interval_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+    try:
+        if arr is None:
+            return False, "No data"
+        ts = arr.get("timestamp")
+        close = arr.get("close")
+        if ts is None or close is None or ts.size == 0 or close.size == 0:
+            return False, "Missing timestamp/close"
+        if required_len and ts.size < required_len:
+            return False, f"Insufficient data: {ts.size} < {required_len}"
+        if np.isnan(close).any() or np.any(close <= 0):
+            return False, "Invalid close prices (NaN or <= 0)"
+        if not np.all(ts[1:] >= ts[:-1]):
+            return False, "Timestamps not monotonic increasing"
+
+        if ts.size >= 2:
+            diffs = np.diff(ts)
+            if diffs.size > 0:
+                median_diff = np.median(diffs)
+                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
+                gaps = diffs[diffs > max_expected_gap]
+                if gaps.size > 0:
+                    logger.warning(f"Detected {gaps.size} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
+
+        if close.size >= 2:
+            pct = np.abs(np.diff(close) / close[:-1]) * 100.0
+            extreme = pct[pct > Constants.MAX_PRICE_CHANGE_PERCENT]
+            if extreme.size > 0:
+                logger.warning(f"Detected {extreme.size} extreme price changes (max: {extreme.max():.2f}%)")
+                return False, f"Extreme price spike detected: {extreme.max():.2f}%"
+
+        return True, None
+    except Exception as e:
+        logger.error(f"Array validation failed: {e}")
+        return False, f"Validation error: {str(e)}"
+
+def get_last_closed_index_from_array(ts: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
+    if ts is None or ts.size < 2:
+        return None
+    if reference_time is None:
+        reference_time = get_trigger_timestamp()
+    last_ts = int(ts[-1])
+    interval_seconds = interval_minutes * 60
+    publication_buffer = Constants.CANDLE_PUBLICATION_LAG_SEC
+    expected_last_closed = calculate_expected_candle_timestamp(reference_time, interval_minutes)
+    validate_candle_timestamp(last_ts, expected_last_closed, tolerance_seconds=interval_seconds)
+    if reference_time >= (last_ts + interval_seconds + publication_buffer):
+        return ts.size - 1
+    else:
+        return ts.size - 2 if ts.size >= 2 else None
+
+def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+    products_map: Dict[str, dict] = {}
+    if not api_products or not api_products.get("result"):
+        return products_map
+    valid_pattern = re.compile(r'^[A-Z0-9_]+$')
+    for p in api_products["result"]:
+        try:
+            symbol = p.get("symbol", "")
+            if not valid_pattern.match(symbol):
+                continue
+            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
+            if p.get("contract_type") == "perpetual_futures":
+                for pair_name in cfg.PAIRS:
+                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+                        products_map[pair_name] = {"id": p.get("id"), "symbol": p.get("symbol"), "contract_type": p.get("contract_type")}
+                        break
+        except Exception:
+            pass
+    return products_map
+
+class RateLimitedFetcher:
+    def __init__(self, max_per_minute: int = 60, concurrency: int = 4):
+        self.max_per_minute = max_per_minute
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.requests: deque[float] = deque()
+        self.lock = asyncio.Lock()
+        self.total_waits = 0
+        self.total_wait_time = 0.0
+
+    async def call(self, func: Callable, *args, **kwargs):
+        async with self.lock:
+            now = time.time()
+            while self.requests and now - self.requests[0] > 60:
+                self.requests.popleft()
+            if len(self.requests) >= self.max_per_minute:
+                sleep_time = 60 - (now - self.requests[0])
+                jitter = random.uniform(0.05, 0.2)
+                total_sleep = sleep_time + jitter
+                self.total_waits += 1
+                self.total_wait_time += total_sleep
+                logger.debug(
+                    f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
+                    f"sleeping {total_sleep:.2f}s | Total waits: {self.total_waits}"
+                )
+                await asyncio.sleep(total_sleep)
+                now = time.time()
+                while self.requests and now - self.requests[0] > 60:
+                    self.requests.popleft()
+            self.requests.append(time.time())
+        async with self.semaphore:
+            return await func(*args, **kwargs)
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "total_waits": self.total_waits,
+            "total_wait_time_seconds": round(self.total_wait_time, 2),
+            "current_queue_size": len(self.requests),
+            "max_per_minute": self.max_per_minute
+        }
+
+async def async_fetch_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    retries: int = 3,
+    backoff: float = 1.5,
+    timeout: int = 15
+) -> Optional[Dict[str, Any]]:
+    session = await SessionManager.get_session()
+    last_error = None
+    retry_stats = {
+        RetryCategory.NETWORK: 0,
+        RetryCategory.RATE_LIMIT: 0,
+        RetryCategory.API_ERROR: 0,
+        RetryCategory.TIMEOUT: 0,
+        RetryCategory.UNKNOWN: 0
+    }
+    for attempt in range(1, retries + 1):
+        if shutdown_event.is_set():
+            return None
+        try:
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                if resp.status == 429:
+                    retry_after = resp.headers.get('Retry-After')
+                    wait_sec = min(int(retry_after) if retry_after else 1, Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                    jitter = random.uniform(0.1, 0.5)
+                    total_wait = wait_sec + jitter
+                    logger.warning(
+                        f"Rate limited (429) | URL: {url[:80]} | "
+                        f"Retry-After: {retry_after} | Waiting: {total_wait:.2f}s"
+                    )
+                    retry_stats[RetryCategory.RATE_LIMIT] += 1
+                    await asyncio.sleep(total_wait)
+                    continue
+
+                if resp.status >= 500:
+                    retry_stats[RetryCategory.API_ERROR] += 1
+                    logger.warning(
+                        f"Server error {resp.status} on attempt {attempt}/{retries} | URL: {url[:80]}"
+                    )
+                    if attempt < retries:
+                        base_delay = min(Constants.CIRCUIT_BREAKER_MAX_WAIT / 10, backoff * (2 ** (attempt - 1)))
+                        jitter = base_delay * random.uniform(0.1, 0.5)
+                        await asyncio.sleep(base_delay + jitter)
+                    continue
+
+                if resp.status >= 400:
+                    logger.error(
+                        f"Client error {resp.status} for {url[:80]} | This usually indicates invalid request"
+                    )
+                    return None
+
+                data = await resp.json(loads=json_loads)
+                if any(retry_stats.values()):
+                    logger.info(
+                        f"Fetch succeeded after retries | URL: {url[:80]} | Stats: {retry_stats}"
+                    )
+                return data
+
+        except (asyncio.TimeoutError, ClientConnectorError, ClientError, ClientResponseError) as e:
+            last_error = e
+            category = categorize_exception(e)
+            retry_stats[category] = retry_stats.get(category, 0) + 1
+            logger.warning(
+                f"Fetch error (attempt {attempt}/{retries}) | Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+            )
+            if attempt < retries:
+                base_delay = min(Constants.CIRCUIT_BREAKER_MAX_WAIT / 10, backoff * (2 ** (attempt - 1)))
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                await asyncio.sleep(base_delay + jitter)
+        except Exception as e:
+            last_error = e
+            retry_stats[RetryCategory.UNKNOWN] += 1
+            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
+            break
+
+    logger.error(
+        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
+        f"Stats: {retry_stats} | Last error: {last_error}"
+    )
+    return None
+
+class DataFetcher:
+    def __init__(self, api_base: str, max_parallel: Optional[int] = None):
+        self.api_base = api_base.rstrip("/")
+        max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
+        self.semaphore = asyncio.Semaphore(max_parallel)
+        self.timeout = cfg.HTTP_TIMEOUT
+        self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
+        self.fetch_stats = {
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0
+        }
+
+    async def fetch_products(self) -> Optional[Dict[str, Any]]:
+        url = f"{self.api_base}/v2/products"
+        async with self.semaphore:
+            result = await self.rate_limiter.call(
+                async_fetch_json,
+                url,
+                retries=5,
+                backoff=2.0,
+                timeout=self.timeout
+            )
+            if result:
+                self.fetch_stats["products_success"] += 1
+                logger.debug(f"Products fetch successful | URL: {url}")
+            else:
+                self.fetch_stats["products_failed"] += 1
+                logger.warning(f"Products fetch failed | URL: {url}")
+            return result
+
+    async def fetch_candles(
+        self,
+        symbol: str,
+        resolution: str,
+        limit: int,
+        reference_time: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
+
+        minutes = int(resolution) if resolution != "D" else 1440
+        window = minutes * 60
+        current_window = reference_time // window
+        last_close = (current_window * window)
+        cushion = max(3, min(Constants.CANDLE_PUBLICATION_LAG_SEC, window - 3))
+        last_close -= cushion
+
+        params = {
+            "resolution": resolution,
+            "symbol": symbol,
+            "from": last_close - (limit * window),
+            "to": last_close
+        }
+        url = f"{self.api_base}/v2/chart/history"
+        async with self.semaphore:
+            data = await self.rate_limiter.call(
+                async_fetch_json,
+                url,
+                params=params,
+                retries=cfg.CANDLE_FETCH_RETRIES,
+                backoff=cfg.CANDLE_FETCH_BACKOFF,
+                timeout=self.timeout
+            )
+            if data:
+                self.fetch_stats["candles_success"] += 1
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(
+                    f"Candles fetch failed | Symbol: {symbol} | Resolution: {resolution} | Params: {params}"
+                )
+            return data
+
+# -----------------------------
+# Numba kernels
+# -----------------------------
+
+@njit(fastmath=True, cache=False)
+def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+    window_sum = 0.0
+    count = 0
+    for i in range(n):
+        val = data[i]
+        if not np.isnan(val):
+            window_sum += val
+            count += 1
+        if i >= period:
+            old_val = data[i - period]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                count -= 1
+        min_periods = max(2, period // 3)
+        if count >= min_periods:
+            out[i] = window_sum / count
+        else:
+            out[i] = np.nan
+    return out
+
+@njit(fastmath=True, cache=False)
+def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
+    n = len(src)
+    result = np.empty(n, dtype=np.float64)
+    estimate = src[0] if not np.isnan(src[0]) else 0.0
+    error_est = 1.0
+    error_meas = R * max(1.0, float(length))
+    Q_div_length = Q / max(1.0, float(length))
+    for i in range(n):
+        current = src[i]
+        if np.isnan(current):
+            result[i] = estimate
+            continue
+        if np.isnan(estimate):
+            estimate = current
+        prediction = estimate
+        kalman_gain = error_est / (error_est + error_meas)
+        estimate = prediction + kalman_gain * (current - prediction)
+        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
+        result[i] = estimate
+    return result
+
+@njit(fastmath=True, cache=False)
+def _vwap_daily_loop(high, low, close, volume, timestamps) -> np.ndarray:
+    n = len(close)
+    vwap = np.empty(n, dtype=np.float64)
+    cum_vol = 0.0
+    cum_pv = 0.0
+    prev_day = timestamps[0] // 86400
+    for i in range(n):
+        curr_ts = timestamps[i]
+        curr_day = curr_ts // 86400
+        if curr_day != prev_day:
+            cum_vol = 0.0
+            cum_pv = 0.0
+            prev_day = curr_day
+        h = high[i]
+        l = low[i]
+        c = close[i]
+        v = volume[i]
+        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v):
+            vwap[i] = vwap[i-1] if i > 0 else c
+            continue
+        avg_price = (h + l + c) / 3.0
+        cum_vol += v
+        cum_pv += (avg_price * v)
+        if cum_vol == 0:
+            vwap[i] = c
+        else:
+            vwap[i] = cum_pv / cum_vol
+    return vwap
+
+@njit(fastmath=True, cache=False)
+def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[0] = data[0] if not np.isnan(data[0]) else 0.0
+    for i in range(1, n):
+        curr = data[i]
+        if np.isnan(curr):
+            out[i] = out[i-1]
+        else:
+            out[i] = alpha * curr + (1 - alpha) * out[i-1]
+    return out
+
+@njit(fastmath=True, cache=False)
+def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    n = len(x)
+    filt = np.zeros(n, dtype=np.float64)
+    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
+    for i in range(1, n):
+        prev_filt = filt[i - 1]
+        curr_x = x[i]
+        curr_r = r[i]
+        if np.isnan(curr_r) or np.isnan(curr_x):
+            filt[i] = prev_filt
+            continue
+        if curr_x > prev_filt:
+            target = curr_x - curr_r
+            if target < prev_filt:
+                filt[i] = prev_filt
+            else:
+                filt[i] = target
+        else:
+            target = curr_x + curr_r
+            if target > prev_filt:
+                filt[i] = prev_filt
+            else:
+                filt[i] = target
+    return filt
+
+@njit(fastmath=True, cache=False)
+def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
+    worm_arr = np.empty(rows, dtype=np.float64)
+    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+    worm_arr[0] = first_val
+    for i in range(1, rows):
+        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
+        prev_worm = worm_arr[i - 1]
+        diff = src - prev_worm
+        sd_i = sd_arr[i]
+        if np.isnan(sd_i):
+            delta = diff
+        else:
+            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
+        worm_arr[i] = prev_worm + delta
+    return worm_arr
+
+@njit(fastmath=True, cache=False)
+def _calc_mmh_value_loop(temp_arr, rows):
+    value_arr = np.zeros(rows, dtype=np.float64)
+    value_arr[0] = 1.0
+    for i in range(1, rows):
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        v = t - 0.5 + 0.5 * prev_v
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    return value_arr
+
+@njit(fastmath=True, cache=False)
+def _calc_mmh_momentum_loop(momentum_arr, rows):
+    for i in range(1, rows):
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+    return momentum_arr
+
+# -----------------------------
+# Indicator sanitization
+# -----------------------------
+
+def sanitize_indicator_array(name: str, arr: np.ndarray) -> np.ndarray:
+    try:
+        arr = arr.copy()
+        arr[np.isinf(arr)] = np.nan
+        n = arr.size
+        if n == 0:
+            return arr
+        last = np.nan
+        for i in range(n):
+            if np.isnan(arr[i]):
+                arr[i] = last if not np.isnan(last) else arr[i]
+            else:
+                last = arr[i]
+        nextv = np.nan
+        for i in range(n - 1, -1, -1):
+            if np.isnan(arr[i]):
+                arr[i] = nextv if not np.isnan(nextv) else 0.0
+            else:
+                nextv = arr[i]
+        return arr
+    except Exception as e:
+        logger.error(f"Failed to sanitize indicator {name}: {e}")
+        return np.zeros_like(arr, dtype=np.float64)
+
+# -----------------------------
+# Pure-NumPy indicators
+# -----------------------------
+
+def calculate_vwap_numpy_arrays(data_15m: Dict[str, np.ndarray]) -> np.ndarray:
+    if data_15m is None or data_15m["close"].size == 0:
+        return np.empty(0, dtype=np.float64)
+    h = data_15m["high"].astype(np.float64)
+    l = data_15m["low"].astype(np.float64)
+    c = data_15m["close"].astype(np.float64)
+    v = data_15m["volume"].astype(np.float64)
+    t = data_15m["timestamp"].astype(np.int64)
+    res = _vwap_daily_loop(h, l, c, v, t)
+    return sanitize_indicator_array("VWAP", res)
+
+def calculate_smooth_rsi_numpy_array(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
+    close = close.astype(np.float64)
+    delta = np.zeros_like(close)
+    if close.size >= 2:
+        delta[1:] = close[1:] - close[:-1]
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    alpha = 1.0 / rsi_len
+    avg_gain = _ema_loop(gain, alpha)
+    avg_loss = _ema_loop(loss, alpha)
+    avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
+    return sanitize_indicator_array("SmoothRSI", smooth_rsi)
+
+def calculate_rma_numpy_array(values: np.ndarray, period: int) -> np.ndarray:
+    if values.size == 0:
+        return values
+    alpha = 1.0 / period
+    result = _ema_loop(values.astype(np.float64), alpha)
+    return result
+
+def calculate_cirrus_cloud_numba_arrays(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    close = close.astype(np.float64)
+    diff = np.zeros_like(close)
+    if close.size >= 2:
+        diff[1:] = np.abs(close[1:] - close[:-1])
+    alpha_t = 2.0 / (cfg.X1 + 1)
+    avrng = _ema_loop(diff, alpha_t)
+    wper = cfg.X1 * 2 - 1
+    alpha_w = 2.0 / (wper + 1)
+    smooth_rng_x1 = _ema_loop(avrng, alpha_w) * cfg.X2
+    filt_x1 = _rng_filter_loop(close, smooth_rng_x1)
+    alpha_t2 = 2.0 / (cfg.X3 + 1)
+    avrng2 = _ema_loop(diff, alpha_t2)
+    wper2 = cfg.X3 * 2 - 1
+    alpha_w2 = 2.0 / (wper2 + 1)
+    smooth_rng_x2 = _ema_loop(avrng2, alpha_w2) * cfg.X4
+    filt_x12 = _rng_filter_loop(close, smooth_rng_x2)
+    upw = filt_x1 < filt_x12
+    dnw = filt_x1 > filt_x12
+    return upw, dnw, filt_x1, filt_x12
+
+def calculate_ppo_numpy_arrays(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+    close = close.astype(np.float64)
+    alpha_fast = 2.0 / (fast + 1)
+    fast_ma = _ema_loop(close, alpha_fast)
+    alpha_slow = 2.0 / (slow + 1)
+    slow_ma = _ema_loop(close, alpha_slow)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ppo = ((fast_ma - slow_ma) / slow_ma) * 100.0
+    ppo = np.nan_to_num(ppo, nan=0.0, posinf=0.0, neginf=0.0)
+    alpha_signal = 2.0 / (signal + 1)
+    ppo_sig = _ema_loop(ppo, alpha_signal)
+    return ppo, ppo_sig
+
+def calculate_magical_momentum_hist_array(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
+    try:
+        if close is None or close.size == 0:
+            return np.empty(0, dtype=np.float64)
+        close = close.astype(np.float64)
+        rows = close.size
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        delta = np.zeros_like(close)
+        if rows >= 2:
+            delta[1:] = np.abs(close[1:] - close[:-1])
+        alpha_sd = 2.0 / (50 + 1)
+        sd = _ema_loop(delta, alpha_sd) * resp_clamped
+        sd = sanitize_indicator_array("MMH_SD", sd)
+        worm_arr = _calc_mmh_worm_loop(close, sd, rows)
+        ma = _sma_loop(close, period)
+        ma = sanitize_indicator_array("MMH_MA", ma)
+        raw = (worm_arr - ma) / np.where(worm_arr == 0.0, np.nan, worm_arr)
+        raw[np.isinf(raw)] = np.nan
+        raw = np.nan_to_num(raw, nan=0.0)
+        raw = sanitize_indicator_array("MMH_RAW", raw)
+        min_med = np.empty(rows, dtype=np.float64)
+        max_med = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            start = 0 if i - period + 1 < 0 else i - period + 1
+            window = raw[start:i+1]
+            min_med[i] = np.min(window) if window.size > 0 else 0.0
+            max_med[i] = np.max(window) if window.size > 0 else 1.0
+        denom = max_med - min_med
+        denom[denom == 0] = 1e-12
+        temp = (raw - min_med) / denom
+        temp = np.clip(temp, 0.0, 1.0)
+        temp = np.where(np.isnan(temp), 0.5, temp)
+        temp = sanitize_indicator_array("MMH_TEMP", temp)
+        value_arr = _calc_mmh_value_loop(temp, rows)
+        temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+        temp2[np.isinf(temp2)] = np.nan
+        temp2 = np.nan_to_num(temp2, nan=1.0)
+        temp2 = np.clip(temp2, 1e-8, 1e8)
+        momentum = 0.25 * np.log(temp2)
+        momentum = sanitize_indicator_array("MMH_MOMENTUM", momentum)
+        momentum_arr = momentum.astype(np.float64)
+        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        hist = momentum_arr
+        hist = sanitize_indicator_array("MMH_HIST", hist)
+        return hist
+    except Exception as e:
+        logger.error(f"MMH calculation failed: {e}")
+        return np.zeros(close.size, dtype=np.float64)
+
+indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
+
+async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
+    async with indicator_semaphore:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+def calculate_all_indicators_sync(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> dict:
+    results = {}
+    close_15 = data_15m["close"]
+    close_5 = data_5m["close"]
+    ppo, ppo_signal = calculate_ppo_numpy_arrays(close_15, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL)
+    results['ppo'] = ppo
+    results['ppo_signal'] = ppo_signal
+    results['smooth_rsi'] = calculate_smooth_rsi_numpy_array(close_15, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN)
+    if cfg.ENABLE_VWAP:
+        results['vwap'] = calculate_vwap_numpy_arrays(data_15m)
+    else:
+        results['vwap'] = np.zeros_like(close_15, dtype=np.float64)
+    mmh = calculate_magical_momentum_hist_array(close_15)
+    results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
+    if cfg.CIRRUS_CLOUD_ENABLED:
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba_arrays(close_15)
+        results['upw'] = upw
+        results['dnw'] = dnw
+    else:
+        results['upw'] = np.zeros_like(close_15, dtype=bool)
+        results['dnw'] = np.zeros_like(close_15, dtype=bool)
+    results['rma50_15'] = calculate_rma_numpy_array(close_15, cfg.RMA_50_PERIOD)
+    results['rma200_5'] = calculate_rma_numpy_array(close_5, cfg.RMA_200_PERIOD)
+    return results
+
+def check_candle_quality_with_reason_arrays(open_arr: np.ndarray, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray, idx: int, is_buy: bool) -> Tuple[bool, str]:
+    try:
+        if idx < 0 or idx >= close_arr.size:
+            return False, f"Invalid index {idx}"
+        o = float(open_arr[idx]); h = float(high_arr[idx]); l = float(low_arr[idx]); c = float(close_arr[idx])
+        candle_range = h - l
+        if candle_range < 1e-8:
+            return False, "Candle range too small"
+        if is_buy:
+            if c <= o:
+                return False, f"Not green candle (C={c:.4f} <= O={o:.4f})"
+            upper_wick = h - c
+            wick_ratio = upper_wick / candle_range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Upper wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+            return True, "Passed"
+        else:
+            if c >= o:
+                return False, f"Not red candle (C={c:.4f} >= O={o:.4f})"
+            lower_wick = c - l
+            wick_ratio = lower_wick / candle_range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Lower wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+            return True, "Passed"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+# -----------------------------
+# Redis state store with Lua dedup
+# -----------------------------
+
 class RedisStateStore:
+    DEDUP_LUA = """
+    -- KEYS[1] = recent_key
+    -- ARGV[1] = value
+    -- ARGV[2] = expiry seconds
+    if redis.call("EXISTS", KEYS[1]) == 1 then
+        return 0
+    else
+        redis.call("SET", KEYS[1], ARGV[1])
+        redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
+        return 1
+    end
+    """
+
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
@@ -483,6 +1119,7 @@ class RedisStateStore:
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
+        self._dedup_sha: Optional[str] = None
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -501,6 +1138,12 @@ class RedisStateStore:
                 self.degraded = False
                 self.degraded_alerted = False
                 self._connection_attempts = 0
+                try:
+                    self._dedup_sha = await self._redis.script_load(self.DEDUP_LUA)
+                    logger.debug("Loaded Lua script for alert deduplication")
+                except Exception as e:
+                    logger.warning(f"Failed to load Lua script for dedup: {e}")
+                    self._dedup_sha = None
                 return True
             else:
                 raise RedisConnectionError("ping failed after retries")
@@ -544,7 +1187,6 @@ class RedisStateStore:
                     )
                     expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
                     logger.info(f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)")
-                    
                     info = await self._safe_redis_op(
                         self._redis.info("memory"), 3.0, "info_memory", lambda r: r
                     )
@@ -552,7 +1194,6 @@ class RedisStateStore:
                         policy = info.get("maxmemory_policy", "unknown")
                         if policy in ("volatile-lru", "allkeys-lru"):
                             logger.warning(f"⚠️ Redis using {policy} - keys may be evicted under memory pressure")
-                    
                     self.degraded = False
                     self.degraded_alerted = False
                     return
@@ -567,14 +1208,12 @@ class RedisStateStore:
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
         self._redis = None
-
         logger.warning("""
 🚨 REDIS DEGRADED MODE ACTIVE:
 - Alert deduplication:  DISABLED (may get duplicates)
 - State persistence:    DISABLED (alerts reset each run)
 - Trading alerts:       STILL ACTIVE (core functionality preserved)
 """)
-
         if cfg.FAIL_ON_REDIS_DOWN:
             raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
 
@@ -600,30 +1239,19 @@ class RedisStateStore:
             )
         ) is True
 
-    async def _safe_redis_op(
-        self,
-        coro,
-        timeout: float,
-        op_name: str,
-        parser: Optional[Callable] = None,
-    ):
+    async def _safe_redis_op(self, coro, timeout: float, op_name: str, parser: Optional[Callable] = None):
         if not self._redis:
             return None
-
         async def _do():
             return await asyncio.wait_for(coro, timeout=timeout)
-
         try:
             result = await retry_async(
                 _do,
                 retries=3,
                 base_backoff=0.6,
                 cap=3.0,
-                on_error=lambda e, a, c: logger.debug(
-                    f"Redis {op_name} error (attempt {a}): {e}"
-                ),
+                on_error=lambda e, a, c: logger.debug(f"Redis {op_name} error (attempt {a}): {e}"),
             )
-
             return parser(result) if parser else result
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
             logger.error(f"Redis {op_name} failed: {e}")
@@ -640,102 +1268,19 @@ class RedisStateStore:
             lambda r: json_loads(r) if r else None,
         )
 
-    async def set(
-        self,
-        key: str,
-        state: Optional[Any],
-        ts: Optional[int] = None,
-        timeout: float = 2.0,
-    ) -> None:
+    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            self._redis.set(
-                redis_key,
-                data,
-                ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
-            ),
+            self._redis.set(redis_key, data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None),
             timeout,
             f"set {key}",
         )
 
-    async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
-        return await self._safe_redis_op(
-            self._redis.get(f"{self.meta_prefix}{key}"),
-            timeout,
-            f"get_metadata {key}",
-            lambda r: r if r else None,
-        )
-
-    async def set_metadata(
-        self, key: str, value: str, timeout: float = 2.0
-    ) -> None:
-        await self._safe_redis_op(
-            self._redis.set(
-                f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds
-            ),
-            timeout,
-            f"set_metadata {key}",
-        )
-
-    async def check_recent_alert(
-        self, pair: str, alert_key: str, ts: int
-    ) -> bool:
-        if self.degraded:
-            return True
-
-        window = ts // 900
-        recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
-
-        result = await self._safe_redis_op(
-            self._redis.set(
-                recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
-            ),
-            timeout=2.0,
-            op_name=f"check_recent_alert {pair}:{alert_key}",
-            parser=lambda r: bool(r),
-        )
-
-        return result is True
-
-    async def batch_check_recent_alerts(
-        self, checks: List[Tuple[str, str, int]]
-    ) -> Dict[str, bool]:
-        if self.degraded or not checks:
-            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-
-        try:
-            pipeline = self._redis.pipeline()
-            keys_map = {}
-
-            for pair, alert_key, ts in checks:
-                window = ts // 900
-                recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
-                keys_map[recent_key] = f"{pair}:{alert_key}"
-                pipeline.set(
-                    recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
-                )
-
-            results = await asyncio.wait_for(pipeline.execute(), timeout=3.0)
-
-            output = {}
-            for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
-                should_send = bool(results[idx]) if idx < len(results) else True
-                output[composite_key] = should_send
-
-            return output
-
-        except Exception as e:
-            logger.error(f"Batch check_recent_alerts failed: {e}")
-            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-
-    async def mget_states(
-        self, keys: List[str], timeout: float = 2.0
-    ) -> Dict[str, Optional[Dict[str, Any]]]:
+    async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]:
         if not self._redis or not keys:
             return {}
-
         redis_keys = [f"{self.state_prefix}{k}" for k in keys]
         results = await self._safe_redis_op(
             self._redis.mget(redis_keys),
@@ -743,10 +1288,8 @@ class RedisStateStore:
             f"mget {len(keys)} keys",
             lambda r: r if r else [],
         )
-
         if not results:
             return {}
-
         output: Dict[str, Optional[Dict[str, Any]]] = {}
         for idx, key in enumerate(keys):
             if idx < len(results) and results[idx]:
@@ -756,18 +1299,11 @@ class RedisStateStore:
                     output[key] = None
             else:
                 output[key] = None
-
         return output
 
-    async def batch_set_states(
-        self,
-        updates: List[Tuple[str, Any, Optional[int]]],
-        timeout: float = 4.0,
-    ) -> None:
-        """Batch version of set() - used for alert state changes"""
+    async def batch_set_states(self, updates: List[Tuple[str, Any, Optional[int]]], timeout: float = 4.0) -> None:
         if self.degraded or not updates or not self._redis:
             return
-
         try:
             pipe = self._redis.pipeline()
             now = int(time.time())
@@ -782,9 +1318,39 @@ class RedisStateStore:
             await asyncio.wait_for(pipe.execute(), timeout=timeout)
         except Exception as e:
             logger.error(f"Batch state update failed (falling back to individual): {e}")
-            # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
+
+    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
+        await self._safe_redis_op(
+            self._redis.set(f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds),
+            timeout,
+            f"set_metadata {key}",
+        )
+
+    async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
+        if self.degraded:
+            return True
+        window = ts // 900
+        recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
+        try:
+            if self._dedup_sha:
+                res = await self._redis.evalsha(self._dedup_sha, 1, recent_key, "1", str(Constants.ALERT_DEDUP_WINDOW_SEC))
+            else:
+                res = await self._redis.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+            return bool(res)
+        except Exception as e:
+            logger.error(f"Dedup check failed: {e}")
+            return True
+
+    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
+        if self.degraded or not checks:
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+        results: Dict[str, bool] = {}
+        for pair, alert_key, ts in checks:
+            ok = await self.check_recent_alert(pair, alert_key, ts)
+            results[f"{pair}:{alert_key}"] = ok
+        return results
 
 class RedisLock:
     RELEASE_LUA = """
@@ -795,12 +1361,7 @@ class RedisLock:
     end
     """
 
-    def __init__(
-        self,
-        redis_client: Optional[redis.Redis],
-        lock_key: str,
-        expire: int | None = None,
-    ):
+    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
         self.redis = redis_client
         self.lock_key = f"lock:{lock_key}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
@@ -815,17 +1376,13 @@ class RedisLock:
             return False
         try:
             token = str(uuid.uuid4())
-            ok = await asyncio.wait_for(
-                self.redis.set(self.lock_key, token, nx=True, ex=self.expire),
-                timeout=timeout,
-            )
+            ok = await asyncio.wait_for(self.redis.set(self.lock_key, token, nx=True, ex=self.expire), timeout=timeout)
             if ok:
                 self.token = token
                 self.acquired_by_me = True
                 self.last_extend_time = time.time()
                 logger.info(f"🔒 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)")
                 return True
-
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
             return False
         except Exception as e:
@@ -836,7 +1393,6 @@ class RedisLock:
         if not self.token or not self.redis or not self.acquired_by_me:
             self.lost = True
             return False
-
         try:
             raw_val = await asyncio.wait_for(self.redis.get(self.lock_key), timeout=timeout)
             if raw_val is None:
@@ -844,17 +1400,13 @@ class RedisLock:
                 self.lost = True
                 self.acquired_by_me = False
                 return False
-
             current_token = str(raw_val)
             if current_token != self.token:
                 logger.warning("Lock token mismatch on extend")
                 self.lost = True
                 self.acquired_by_me = False
                 return False
-
-            await asyncio.wait_for(
-                self.redis.expire(self.lock_key, self.expire), timeout=timeout
-            )
+            await asyncio.wait_for(self.redis.expire(self.lock_key, self.expire), timeout=timeout)
             self.last_extend_time = time.time()
             logger.debug(f"Extended Redis lock: {self.lock_key}")
             return True
@@ -867,11 +1419,9 @@ class RedisLock:
     def should_extend(self) -> bool:
         if not self.acquired_by_me or self.lost:
             return False
-
         base_interval = Constants.LOCK_EXTEND_INTERVAL
         jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
         extend_threshold = base_interval + jitter
-
         elapsed = time.time() - self.last_extend_time
         return elapsed >= extend_threshold
 
@@ -879,10 +1429,7 @@ class RedisLock:
         if not self.token or not self.redis or not self.acquired_by_me:
             return
         try:
-            await asyncio.wait_for(
-                self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token), timeout=timeout)
             logger.info(f"🔓 Lock released")
         except Exception as e:
             logger.error(f"Error releasing Redis lock: {e}")
@@ -890,974 +1437,13 @@ class RedisLock:
             self.token = None
             self.acquired_by_me = False
 
-async def async_fetch_json(
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    retries: int = 3,
-    backoff: float = 1.5,
-    timeout: int = 15
-) -> Optional[Dict[str, Any]]:
-    """
-    Enhanced JSON fetch with categorized retries and detailed logging.
-    """
-    session = await SessionManager.get_session()
-    last_error = None
-    retry_stats = {
-        RetryCategory.NETWORK: 0,
-        RetryCategory.RATE_LIMIT: 0,
-        RetryCategory.API_ERROR: 0,
-        RetryCategory.TIMEOUT: 0,
-        RetryCategory.UNKNOWN: 0
-    }
-    
-    for attempt in range(1, retries + 1):
-        if shutdown_event.is_set():
-            return None
-        
-        try:
-            async with session.get(url, params=params, timeout=timeout) as resp:
-                if resp.status == 429:
-                    retry_after = resp.headers.get('Retry-After')
-                    wait_sec = min(int(retry_after) if retry_after else 1, Constants.CIRCUIT_BREAKER_MAX_WAIT)
-                    jitter = random.uniform(0.1, 0.5)
-                    total_wait = wait_sec + jitter
-                    
-                    logger.warning(
-                        f"Rate limited (429) | URL: {url[:80]} | "
-                        f"Retry-After: {retry_after} | Waiting: {total_wait:.2f}s"
-                    )
-                    retry_stats[RetryCategory.RATE_LIMIT] += 1
-                    
-                    await asyncio.sleep(total_wait)
-                    continue
-                
-                if resp.status >= 500:
-                    retry_stats[RetryCategory.API_ERROR] += 1
-                    logger.warning(
-                        f"Server error {resp.status} on attempt {attempt}/{retries} | "
-                        f"URL: {url[:80]}"
-                    )
-                    
-                    if attempt < retries:
-                        base_delay = min(
-                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                            backoff * (2 ** (attempt - 1))
-                        )
-                        jitter = base_delay * random.uniform(0.1, 0.5)
-                        await asyncio.sleep(base_delay + jitter)
-                    continue
-                
-                if resp.status >= 400:
-                    logger.error(
-                        f"Client error {resp.status} for {url[:80]} | "
-                        f"This usually indicates invalid request"
-                    )
-                    return None
-                
-                data = await resp.json(loads=json_loads)
-                
-                if any(retry_stats.values()):
-                    logger.info(
-                        f"Fetch succeeded after retries | URL: {url[:80]} | "
-                        f"Stats: {retry_stats}"
-                    )
-                
-                return data
-                
-        except (asyncio.TimeoutError, ClientConnectorError, ClientError, ClientResponseError) as e:
-            last_error = e
-            category = categorize_exception(e)
-            retry_stats[category] = retry_stats.get(category, 0) + 1
-            
-            logger.warning(
-                f"Fetch error (attempt {attempt}/{retries}) | "
-                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
-            )
-            
-            if attempt < retries:
-                base_delay = min(
-                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                    backoff * (2 ** (attempt - 1))
-                )
-                jitter = base_delay * random.uniform(0.1, 0.5)
-                await asyncio.sleep(base_delay + jitter)
-        
-        except Exception as e:
-            last_error = e
-            retry_stats[RetryCategory.UNKNOWN] += 1
-            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
-            break
-    
-    logger.error(
-        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
-        f"Stats: {retry_stats} | Last error: {last_error}"
-    )
-    return None
+_ESCAPE_RE = re.compile(r'[_*
 
-class RateLimitedFetcher:
-    """
-    Token bucket rate limiter with detailed metrics and logging.
-    """
-    def __init__(self, max_per_minute: int = 60, concurrency: int = 4):
-        self.max_per_minute = max_per_minute
-        self.semaphore = asyncio.Semaphore(concurrency)
-        self.requests: deque[float] = deque()
-        self.lock = asyncio.Lock()
-        self.total_waits = 0
-        self.total_wait_time = 0.0
+\[\]
 
-    async def call(self, func: Callable, *args, **kwargs):
-        """Execute function with rate limiting."""
-        async with self.lock:
-            now = time.time()
-            
-            while self.requests and now - self.requests[0] > 60:
-                self.requests.popleft()
-            
-            if len(self.requests) >= self.max_per_minute:
-                sleep_time = 60 - (now - self.requests[0])
-                jitter = random.uniform(0.05, 0.2)
-                total_sleep = sleep_time + jitter
-                
-                self.total_waits += 1
-                self.total_wait_time += total_sleep
-                
-                logger.debug(
-                    f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
-                    f"sleeping {total_sleep:.2f}s | Total waits: {self.total_waits}"
-                )
-                
-                await asyncio.sleep(total_sleep)
-                
-                now = time.time()
-                while self.requests and now - self.requests[0] > 60:
-                    self.requests.popleft()
-            
-            self.requests.append(time.time())
-        
-        async with self.semaphore:
-            return await func(*args, **kwargs)
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get rate limiter statistics."""
-        return {
-            "total_waits": self.total_waits,
-            "total_wait_time_seconds": round(self.total_wait_time, 2),
-            "current_queue_size": len(self.requests),
-            "max_per_minute": self.max_per_minute
-        }
-
-class DataFetcher:
-    def __init__(self, api_base: str, max_parallel: Optional[int] = None):
-        self.api_base = api_base.rstrip("/")
-        max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
-        self.semaphore = asyncio.Semaphore(max_parallel)
-        self.timeout = cfg.HTTP_TIMEOUT
-        self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
-        self.fetch_stats = {
-            "products_success": 0,
-            "products_failed": 0,
-            "candles_success": 0,
-            "candles_failed": 0
-        }
-
-    async def fetch_products(self) -> Optional[Dict[str, Any]]:
-        """Fetch products list with rate limiting."""
-        url = f"{self.api_base}/v2/products"
-        
-        async with self.semaphore:
-            result = await self.rate_limiter.call(
-                async_fetch_json,
-                url,
-                retries=5,
-                backoff=2.0,
-                timeout=self.timeout
-            )
-            
-            if result:
-                self.fetch_stats["products_success"] += 1
-                logger.debug(f"Products fetch successful | URL: {url}")
-            else:
-                self.fetch_stats["products_failed"] += 1
-                logger.warning(f"Products fetch failed | URL: {url}")
-            
-            return result
-
-    async def fetch_candles(
-        self,
-        symbol: str,
-        resolution: str,
-        limit: int,
-        reference_time: Optional[int] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Fetch candles with enhanced logging."""
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
-
-        minutes = int(resolution) if resolution != "D" else 1440
-        window = minutes * 60
-        current_window = reference_time // window
-        last_close = (current_window * window)
-        cushion = max(3, min(Constants.CANDLE_PUBLICATION_LAG_SEC, window - 3))
-        last_close -= cushion
-
-        params = {
-            "resolution": resolution,
-            "symbol": symbol,
-            "from": last_close - (limit * window),
-            "to": last_close
-        }
-
-        url = f"{self.api_base}/v2/chart/history"
-        
-        async with self.semaphore:
-            data = await self.rate_limiter.call(
-                async_fetch_json,
-                url,
-                params=params,
-                retries=cfg.CANDLE_FETCH_RETRIES,
-                backoff=cfg.CANDLE_FETCH_BACKOFF,
-                timeout=self.timeout
-            )
-            
-            if data:
-                self.fetch_stats["candles_success"] += 1
-            else:
-                self.fetch_stats["candles_failed"] += 1
-                logger.warning(
-                    f"Candles fetch failed | Symbol: {symbol} | "
-                    f"Resolution: {resolution} | Params: {params}"
-                )
-            
-            return data
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get fetcher statistics."""
-        stats = self.fetch_stats.copy()
-        stats["rate_limiter"] = self.rate_limiter.get_stats()
-        return stats
-
-def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    try:
-        if df is None or df.empty:
-            return False, "DataFrame is empty"
-        
-        if df["close"].isna().any() or (df["close"] <= 0).any():
-            return False, "Invalid close prices (NaN or <= 0)"
-        
-        if not df["timestamp"].is_monotonic_increasing:
-            return False, "Timestamps not monotonic increasing"
-        
-        if len(df) < required_len:
-            return False, f"Insufficient data: {len(df)} < {required_len}"
-        
-        if len(df) >= 2:
-            time_diffs = df["timestamp"].diff().dropna()
-            if len(time_diffs) > 0:
-                median_diff = time_diffs.median()
-                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
-                gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > 0:
-                    logger.warning(f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
-        
-        if len(df) >= 2:
-            price_changes = (df["close"].pct_change().abs() * 100).dropna()
-            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-            if len(extreme_changes) > 0:
-                logger.warning(f"Detected {len(extreme_changes)} extreme price changes (max: {extreme_changes.max():.2f}%)")
-                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
-        
-        return True, None
-    except Exception as e:
-        logger.error(f"DataFrame validation failed: {e}")
-        return False, f"Validation error: {str(e)}"
-
-def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
-    """
-    Convert Delta JSON response straight into NumPy arrays, skipping Pandas entirely.
-    Returns dict with keys: open, high, low, close, volume, timestamp
-    or None on failure.
-    """
-    if not result or not isinstance(result, dict):
-        return None
-
-    res = result.get("result", {}) or {}
-    required = ("t", "o", "h", "l", "c", "v")
-    if not all(k in res for k in required):
-        return None
-
-    try:
-        # Convert straight to numpy – no DataFrame overhead
-        data = {
-            "timestamp": np.array(res["t"], dtype=np.int64),
-            "open":   np.array(res["o"], dtype=np.float64),
-            "high":   np.array(res["h"], dtype=np.float64),
-            "low":    np.array(res["l"], dtype=np.float64),
-            "close":  np.array(res["c"], dtype=np.float64),
-            "volume": np.array(res["v"], dtype=np.float64),
-        }
-
-        # Millisecond → second conversion if needed
-        if data["timestamp"][-1] > 1_000_000_000_000:
-            data["timestamp"] = (data["timestamp"] // 1000).astype(np.int64)
-
-        # Basic sanity
-        if data["close"][-1] <= 0 or np.isnan(data["close"][-1]):
-            return None
-        return data
-    except Exception:
-        return None
-
-def get_last_closed_index(df: pd.DataFrame, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
-    if df is None or df.empty or len(df) < 2:
-        return None
-    
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
-    
-    last_ts = int(df["timestamp"].iloc[-1])
-    interval_seconds = interval_minutes * 60
-    
-    publication_buffer = Constants.CANDLE_PUBLICATION_LAG_SEC
-    
-    expected_last_closed = calculate_expected_candle_timestamp(reference_time, interval_minutes)
-    
-    if not validate_candle_timestamp(last_ts, expected_last_closed, tolerance_seconds=interval_seconds):
-        logger.warning(f"Last candle timestamp ({last_ts}) doesn't match expected ({expected_last_closed})")
-    
-    if reference_time >= (last_ts + interval_seconds + publication_buffer):
-        return len(df) - 1
-    else:
-        if len(df) >= 2:
-            return len(df) - 2
-        else:
-            return None
-
-def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
-    try:
-        series = series.replace([np.inf, -np.inf], np.nan).bfill().ffill()
-        if series.isna().all():
-            logger.warning(f"Indicator {name} is all NaN, filling with zeros")
-            return pd.Series([0.0] * len(series), index=series.index)
-        return series
-    except Exception as e:
-        logger.error(f"Failed to validate indicator {name}: {e}")
-        return pd.Series([0.0] * len(series), index=series.index)
-
-def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
-    products_map: Dict[str, dict] = {}
-    if not api_products or not api_products.get("result"):
-        return products_map
-    valid_pattern = re.compile(r'^[A-Z0-9_]+$')
-    for p in api_products["result"]:
-        try:
-            symbol = p.get("symbol", "")
-            if not valid_pattern.match(symbol):
-                continue
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
-            if p.get("contract_type") == "perpetual_futures":
-                for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
-                        products_map[pair_name] = {"id": p.get("id"), "symbol": p.get("symbol"), "contract_type": p.get("contract_type")}
-                        break
-        except Exception:
-            pass
-    return products_map
-
-@njit(fastmath=True, cache=False)
-def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Fast SMA calculation using Numba."""
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
-    
-    # Calculate initial window sum
-    window_sum = 0.0
-    count = 0
-    
-    for i in range(n):
-        val = data[i]
-        
-        # Add new value
-        if not np.isnan(val):
-            window_sum += val
-            count += 1
-            
-        # Remove old value if window is full
-        if i >= period:
-            old_val = data[i - period]
-            if not np.isnan(old_val):
-                window_sum -= old_val
-                count -= 1
-        
-        # Calculate mean if we have enough data (using period // 3 logic from original)
-        min_periods = max(2, period // 3)
-        if count >= min_periods:
-            out[i] = window_sum / count
-        else:
-            out[i] = np.nan
-            
-    return out
-
-@njit(fastmath=True, cache=False)
-def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
-    """
-    Fast Kalman Filter using Numba. 
-    Replaces the slow Python loop.
-    """
-    n = len(src)
-    result = np.empty(n, dtype=np.float64)
-    
-    estimate = src[0] if not np.isnan(src[0]) else 0.0
-    error_est = 1.0
-    error_meas = R * max(1.0, float(length))
-    Q_div_length = Q / max(1.0, float(length))
-    
-    for i in range(n):
-        current = src[i]
-        if np.isnan(current):
-            result[i] = estimate
-            continue
-            
-        if np.isnan(estimate):
-            estimate = current
-            
-        prediction = estimate
-        kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current - prediction)
-        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
-        
-        result[i] = estimate
-        
-    return result
-
-@njit(fastmath=True, cache=False)
-def _vwap_daily_loop(
-    high: np.ndarray, 
-    low: np.ndarray, 
-    close: np.ndarray, 
-    volume: np.ndarray, 
-    timestamps: np.ndarray
-) -> np.ndarray:
-    """
-    Fast VWAP with Daily Reset using Numba.
-    Avoids slow pd.to_datetime conversions.
-    """
-    n = len(close)
-    vwap = np.empty(n, dtype=np.float64)
-    
-    cum_vol = 0.0
-    cum_pv = 0.0
-    
-    # Initialize previous day with the first timestamp's day (UTC)
-    # 86400 seconds in a day
-    prev_day = timestamps[0] // 86400
-    
-    for i in range(n):
-        curr_ts = timestamps[i]
-        curr_day = curr_ts // 86400
-        
-        # Reset if new day
-        if curr_day != prev_day:
-            cum_vol = 0.0
-            cum_pv = 0.0
-            prev_day = curr_day
-        
-        h = high[i]
-        l = low[i]
-        c = close[i]
-        v = volume[i]
-        
-        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v):
-            vwap[i] = vwap[i-1] if i > 0 else c
-            continue
-            
-        avg_price = (h + l + c) / 3.0
-        
-        cum_vol += v
-        cum_pv += (avg_price * v)
-        
-        if cum_vol == 0:
-            vwap[i] = c
-        else:
-            vwap[i] = cum_pv / cum_vol
-            
-    return vwap
-
-@njit(fastmath=True, cache=False)
-def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
-    """Fast EMA calculation using Numba."""
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    # Initialize with first valid value or 0
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-    
-    for i in range(1, n):
-        curr = data[i]
-        if np.isnan(curr):
-            out[i] = out[i-1]
-        else:
-            out[i] = alpha * curr + (1 - alpha) * out[i-1]
-    return out
-
-@njit(fastmath=True, cache=False)
-def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """
-    Fast Cirrus Cloud Range Filter using Numba.
-    Replaces the slow Python loop in rng_filt_x1x1.
-    """
-    n = len(x)
-    filt = np.zeros(n, dtype=np.float64)
-    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
-    
-    for i in range(1, n):
-        prev_filt = filt[i - 1]
-        curr_x = x[i]
-        curr_r = r[i]
-        
-        if np.isnan(curr_r) or np.isnan(curr_x):
-            filt[i] = prev_filt
-            continue
-            
-        if curr_x > prev_filt:
-            target = curr_x - curr_r
-            if target < prev_filt:
-                filt[i] = prev_filt
-            else:
-                filt[i] = target
-        else:
-            target = curr_x + curr_r
-            if target > prev_filt:
-                filt[i] = prev_filt
-            else:
-                filt[i] = target
-                
-    return filt
-
-@njit(fastmath=True, cache=False)
-def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    """Numba-compiled worm calculation loop - ~100x faster than Python"""
-    worm_arr = np.empty(rows, dtype=np.float64)
-    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
-    worm_arr[0] = first_val
-    
-    for i in range(1, rows):
-        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-        prev_worm = worm_arr[i - 1]
-        diff = src - prev_worm
-        sd_i = sd_arr[i]
-        
-        if np.isnan(sd_i):
-            delta = diff
-        else:
-            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
-        worm_arr[i] = prev_worm + delta
-    
-    return worm_arr
-
-@njit(fastmath=True, cache=False)
-def _calc_mmh_value_loop(temp_arr, rows):
-    """Numba-compiled value calculation loop"""
-    value_arr = np.zeros(rows, dtype=np.float64)
-    value_arr[0] = 1.0
-    
-    for i in range(1, rows):
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = t - 0.5 + 0.5 * prev_v
-        value_arr[i] = max(-0.9999, min(0.9999, v))
-    
-    return value_arr
-
-@njit(fastmath=True, cache=False)
-def _calc_mmh_momentum_loop(momentum_arr, rows):
-    """Numba-compiled momentum accumulation loop"""
-    for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-    return momentum_arr
-
-def calculate_sma_numpy(series: pd.Series, period: int) -> pd.Series:
-    values = series.astype(np.float64).values
-    res = _sma_loop(values, period)
-    return validate_indicator_series(pd.Series(res, index=series.index), "SMA")
-
-def calculate_kalman_numpy(series: pd.Series, length: int, R: float = 0.01, Q: float = 0.1) -> pd.Series:
-    values = series.astype(np.float64).values
-    res = _kalman_loop(values, length, R, Q)
-    return pd.Series(res, index=series.index)
-
-def calculate_vwap_numpy(df: pd.DataFrame) -> pd.Series:
-    if df.empty: return pd.Series(dtype=float)
-    
-    h = df["high"].astype(np.float64).values
-    l = df["low"].astype(np.float64).values
-    c = df["close"].astype(np.float64).values
-    v = df["volume"].astype(np.float64).values
-    t = df["timestamp"].astype(np.int64).values
-    
-    res = _vwap_daily_loop(h, l, c, v, t)
-    return validate_indicator_series(pd.Series(res, index=df.index), "VWAP")
-
-def calculate_smooth_rsi_numpy(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
-    """Optimized Smooth RSI using Numba RMA and Numba Kalman."""
-    close = df["close"].astype(np.float64).values
-    
-    # Calculate Delta
-    delta = np.zeros_like(close)
-    delta[1:] = close[1:] - close[:-1]
-    
-    # Gain/Loss
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    
-    # Calculate RMA (Using the _ema_loop, alpha = 1/len)
-    alpha = 1.0 / rsi_len
-    avg_gain = _ema_loop(gain, alpha)
-    avg_loss = _ema_loop(loss, alpha)
-    
-    # Calculate RSI
-    # Prevent div by zero
-    avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
-    rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    
-    # Smooth with Kalman
-    smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
-    
-    return validate_indicator_series(pd.Series(smooth_rsi, index=df.index), "SmoothRSI")
-
-def calculate_ema_numpy(series: pd.Series, span: int) -> pd.Series:
-    """Wrapper for Numba EMA."""
-    if series.empty: return series
-    # Calculate alpha based on span: alpha = 2 / (span + 1)
-    alpha = 2.0 / (span + 1)
-    values = series.astype(np.float64).values
-    result = _ema_loop(values, alpha)
-    return pd.Series(result, index=series.index)
-
-def calculate_rma_numpy(series: pd.Series, period: int) -> pd.Series:
-    """Wrapper for Numba RMA (Alpha = 1/period)."""
-    if series.empty: return series
-    alpha = 1.0 / period
-    values = series.astype(np.float64).values
-    result = _ema_loop(values, alpha)
-    return pd.Series(result, index=series.index)
-
-def calculate_cirrus_cloud_numba(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """
-    Optimized Cirrus Cloud calculation.
-    Uses Numba for EMA (Smooth RNG) and the Filter Loop.
-    """
-    close = df["close"].astype(np.float64).values
-    
-    # 1. Calculate Smooth RNG X1 (EMA of diff)
-    # diff = abs(close - close.shift(1))
-    diff = np.zeros_like(close)
-    diff[1:] = np.abs(close[1:] - close[:-1])
-    
-    # t = X1, m = X2
-    alpha_t = 2.0 / (cfg.X1 + 1)
-    avrng = _ema_loop(diff, alpha_t)
-    
-    wper = cfg.X1 * 2 - 1
-    alpha_w = 2.0 / (wper + 1)
-    smooth_rng_x1 = _ema_loop(avrng, alpha_w) * cfg.X2
-    
-    # 2. Calculate Filter X1
-    filt_x1 = _rng_filter_loop(close, smooth_rng_x1)
-    
-    # 3. Calculate Smooth RNG X2
-    # t = X3, m = X4
-    alpha_t2 = 2.0 / (cfg.X3 + 1)
-    avrng2 = _ema_loop(diff, alpha_t2)
-    
-    wper2 = cfg.X3 * 2 - 1
-    alpha_w2 = 2.0 / (wper2 + 1)
-    smooth_rng_x2 = _ema_loop(avrng2, alpha_w2) * cfg.X4
-    
-    # 4. Calculate Filter X12
-    filt_x12 = _rng_filter_loop(close, smooth_rng_x2)
-    
-    # Convert to Series for alignment
-    s_filt_x1 = pd.Series(filt_x1, index=df.index)
-    s_filt_x12 = pd.Series(filt_x12, index=df.index)
-    
-    upw = s_filt_x1 < s_filt_x12
-    dnw = s_filt_x1 > s_filt_x12
-    
-    return upw, dnw, s_filt_x1, s_filt_x12
-
-def calculate_ppo_numpy(df: pd.DataFrame, fast: int, slow: int, signal: int) -> Tuple[pd.Series, pd.Series]:
-    """
-    Optimized PPO using Numba EMAs and NumPy vectorization.
-    """
-    close = df["close"].astype(np.float64).values
-    
-    # Fast MA
-    alpha_fast = 2.0 / (fast + 1)
-    fast_ma = _ema_loop(close, alpha_fast)
-    
-    # Slow MA
-    alpha_slow = 2.0 / (slow + 1)
-    slow_ma = _ema_loop(close, alpha_slow)
-    
-    # Avoid division by zero
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ppo = ((fast_ma - slow_ma) / slow_ma) * 100.0
-    
-    # Clean NaNs/Infs resulting from calculation
-    ppo = np.nan_to_num(ppo, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Signal Line
-    alpha_signal = 2.0 / (signal + 1)
-    ppo_sig = _ema_loop(ppo, alpha_signal)
-    
-    return pd.Series(ppo, index=df.index), pd.Series(ppo_sig, index=df.index)
-
-def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
-    try:
-        if df is None or "close" not in df or df.empty:
-            return pd.Series(dtype=float)
-        
-        close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        
-        # Calculate standard deviation
-        sd = close.rolling(window=50, min_periods=1).std(ddof=0) * resp_clamped
-        sd = validate_indicator_series(sd, "MMH_SD")
-        
-        # OPTIMIZED: Use Numba-compiled loop instead of Python loop
-        worm_arr = _calc_mmh_worm_loop(close.values, sd.values, rows)
-        worm = pd.Series(worm_arr, index=close.index)
-        
-        # Calculate moving average
-        ma = close.rolling(window=period, min_periods=1).mean()
-        ma = validate_indicator_series(ma, "MMH_MA")
-        
-        # Calculate raw values
-        raw = (worm - ma) / worm.replace(0, np.nan)
-        raw = raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        raw = validate_indicator_series(raw, "MMH_RAW")
-        
-        # Calculate temp
-        min_med = raw.rolling(window=period, min_periods=1).min()
-        max_med = raw.rolling(window=period, min_periods=1).max()
-        denom = (max_med - min_med).replace(0, 1e-12)
-        temp = (raw - min_med) / denom
-        temp = temp.clip(lower=0.0, upper=1.0).fillna(0.5)
-        temp = validate_indicator_series(temp, "MMH_TEMP")
-        
-        # OPTIMIZED: Use Numba-compiled loop for value calculation
-        value_arr = _calc_mmh_value_loop(temp.values, rows)
-        value = pd.Series(value_arr, index=close.index)
-        
-        # Calculate momentum
-        temp2 = (1.0 + value) / (1.0 - value)
-        temp2 = temp2.replace([np.inf, -np.inf], np.nan).fillna(1.0)
-        temp2 = temp2.clip(lower=1e-8, upper=1e8)
-        momentum = 0.25 * np.log(temp2)
-        momentum = validate_indicator_series(momentum, "MMH_MOMENTUM")
-        
-        # OPTIMIZED: Use Numba-compiled loop for momentum accumulation
-        momentum_arr = momentum.to_numpy(dtype=float)
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
-        hist = pd.Series(momentum_arr, index=close.index, name="hist")
-        
-        return validate_indicator_series(hist, "MMH_HIST")
-        
-    except Exception as e:
-        logger.error(f"MMH calculation failed: {e}")
-        return pd.Series([0.0] * (len(df) if df is not None else 0), 
-                        index=(df.index if df is not None else pd.Index([])), 
-                        name="hist")
-
-def warmup_numba() -> None:
-    """Eager-compile all Numba-accelerated helpers with dummy data."""
-    logger.info("🔥 Warming up Numba JIT compiler...")
-    try:
-        length = 500
-        close = np.random.random(length).astype(np.float64) * 1000
-        sd    = np.random.random(length).astype(np.float64) * 0.01
-
-        _calc_mmh_worm_loop(close, sd, length)
-        _calc_mmh_value_loop(np.random.random(length).astype(np.float64), length)
-        _calc_mmh_momentum_loop(np.random.random(length).astype(np.float64), length)
-        _sma_loop(close, 50)
-        _ema_loop(close, 0.1)
-        _kalman_loop(close, 21, 0.01, 0.1)
-        _rng_filter_loop(close, sd)
-        _vwap_daily_loop(close, close, close, close, np.arange(length, dtype=np.int64))
-
-        logger.info("✅ Numba warm-up complete.")
-    except Exception as e:
-        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
-
-indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
-
-async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
-    async with indicator_semaphore:
-        return await asyncio.to_thread(func, *args, **kwargs)
-
-def calculate_all_indicators_sync(df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame]) -> dict:
-    """
-    Calculate all indicators using Numba/NumPy optimizations.
-    """
-    results = {}
-    
-    # 1. PPO (Numba)
-    ppo, ppo_signal = calculate_ppo_numpy(
-        df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
-    )
-    results['ppo'] = ppo
-    results['ppo_signal'] = ppo_signal
-    
-    # 2. Smooth RSI (Numba Kalman + Numba RMA)
-    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
-        df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
-    )
-    
-    # 3. VWAP (Numba Daily Reset)
-    if cfg.ENABLE_VWAP:
-        results['vwap'] = calculate_vwap_numpy(df_15m)
-    else:
-        results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
-    
-    # 4. MMH (Numba)
-    mmh = calculate_magical_momentum_hist(df_15m)
-    results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
-    
-    # 5. Cirrus Cloud (Numba)
-    if cfg.CIRRUS_CLOUD_ENABLED:
-        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(df_15m)
-        results['upw'] = upw
-        results['dnw'] = dnw
-    else:
-        results['upw'] = pd.Series(False, index=df_15m.index)
-        results['dnw'] = pd.Series(False, index=df_15m.index)
-    
-    # 6. RMA (Numba)
-    results['rma50_15'] = calculate_rma_numpy(df_15m["close"], cfg.RMA_50_PERIOD)
-    results['rma200_5'] = calculate_rma_numpy(df_5m["close"], cfg.RMA_200_PERIOD)
-    
-    return results
-
-def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
-    try:
-        row = df_15m.iloc[idx]
-        o = float(row["open"])
-        h = float(row["high"])
-        l = float(row["low"])
-        c = float(row["close"])
-
-        candle_range = h - l
-
-        if candle_range < 1e-8:
-            logger.debug(f"Candle range too small: {candle_range:.8f}")
-            return False
-
-        if is_buy:
-            if c <= o:
-                logger.debug(f"BUY rejected: Not green candle | O={o:.4f} C={c:.4f}")
-                return False
-
-            upper_wick = h - c
-            wick_ratio = upper_wick / candle_range
-
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                logger.debug(
-                    f"BUY REJECTED: Upper wick too large | "
-                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                    f"Candle Range (H-L)={candle_range:.4f} | "
-                    f"Upper Wick (H-C)={upper_wick:.4f} | "
-                    f"Wick Ratio={wick_ratio*100:.2f}% | "
-                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
-                )
-                return False
-
-            logger.debug(
-                f"BUY PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                f"Upper Wick={upper_wick:.4f} ({wick_ratio*100:.2f}%)"
-            )
-            return True
-
-        else:
-            if c >= o:
-                logger.debug(f"SELL rejected: Not red candle | O={o:.4f} C={c:.4f}")
-                return False
-
-            lower_wick = c - l
-            wick_ratio = lower_wick / candle_range
-
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                logger.debug(
-                    f"SELL REJECTED: Lower wick too large | "
-                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                    f"Candle Range (H-L)={candle_range:.4f} | "
-                    f"Lower Wick (C-L)={lower_wick:.4f} | "
-                    f"Wick Ratio={wick_ratio*100:.2f}% | "
-                    f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
-                )
-                return False
-
-            logger.debug(
-                f"SELL PASSED ✓ | O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-                f"Lower Wick={lower_wick:.4f} ({wick_ratio*100:.2f}%)"
-            )
-            return True
-
-    except Exception as e:
-        logger.error(f"check_common_conditions failed at idx={idx}, is_buy={is_buy}: {e}")
-        return False
-
-def check_candle_quality_with_reason(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> Tuple[bool, str]:
-    try:
-        if idx < 0 or idx >= len(df_15m):
-            return False, f"Invalid index {idx}"
-
-        row = df_15m.iloc[idx]
-        o = float(row["open"])
-        h = float(row["high"])
-        l = float(row["low"])
-        c = float(row["close"])
-
-        candle_range = h - l
-        if candle_range < 1e-8:
-            return False, "Candle range too small"
-
-        if is_buy:
-            if c <= o:
-                return False, f"Not green candle (C={c:.4f} <= O={o:.4f})"
-
-            upper_wick = h - c
-            wick_ratio = upper_wick / candle_range
-
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
-
-            return True, "Passed"
-
-        else:
-            if c >= o:
-                return False, f"Not red candle (C={c:.4f} >= O={o:.4f})"
-
-            lower_wick = c - l
-            wick_ratio = lower_wick / candle_range
-
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
-
-            return True, "Passed"
-
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-# Compiled once at import time - much faster
-_ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
+()~`>#+-=|{}.!]')
 
 def escape_markdown_v2(text: str) -> str:
-    """Fast MarkdownV2 escaping using pre-compiled regex"""
     if not isinstance(text, str):
         text = str(text)
     return _ESCAPE_RE.sub(r'\\\g<0>', text)
@@ -1928,12 +1514,10 @@ class TelegramQueue:
     async def send_batch(self, messages: List[str]) -> bool:
         if not messages:
             return True
-        
         if len(messages) > 5:
             summary = f"🚨 MARKET ALERT: {len(messages)} signals detected\n\n"
             preview = "\n".join([f"• {msg[:50]}..." for msg in messages[:10]])
             return await self.send(escape_markdown_v2(summary + preview))
-        
         max_len = 3800
         to_send = messages[:10]
         combined = "\n\n".join(to_send)
@@ -1995,6 +1579,8 @@ for level in PIVOT_LEVELS:
     ALERT_KEYS[f"pivot_up_{level}"] = f"ALERT:PIVOT_UP_{level}"
     ALERT_KEYS[f"pivot_down_{level}"] = f"ALERT:PIVOT_DOWN_{level}"
 
+INDICATOR_CACHE: Dict[str, Dict[str, Any]] = {}
+
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
     if sdb.degraded:
         return
@@ -2013,46 +1599,77 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
     if sdb.degraded or not keys:
         return {k: False for k in keys}
-    
     state_keys = [f"{pair}:{k}" for k in keys]
     results = await sdb.mget_states(state_keys)
-    
     output = {}
     for key in keys:
         state_key = f"{pair}:{key}"
         st = results.get(state_key)
         output[key] = st is not None and st.get("state") == "ACTIVE"
-    
     return output
+
+def compute_pivots_numpy(data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, float]:
+    piv: Dict[str, float] = {}
+    if not cfg.ENABLE_PIVOT or data_daily is None:
+        return piv
+    ts = data_daily.get("timestamp"); high = data_daily.get("high"); low = data_daily.get("low"); close = data_daily.get("close")
+    if ts is None or high is None or low is None or close is None or ts.size < 1:
+        return piv
+    today_utc = int(time.time()) // 86400
+    yesterday_day = today_utc - 1
+    days = ts // 86400
+    idxs = np.where(days == yesterday_day)[0]
+    if idxs.size == 0:
+        return piv
+    i = idxs[-1]
+    H_prev = float(high[i]); L_prev = float(low[i]); C_prev = float(close[i])
+    rng_prev = H_prev - L_prev
+    if rng_prev <= 1e-8:
+        return piv
+    P = (H_prev + L_prev + C_prev) / 3.0
+    piv = {
+        "P": P,
+        "R1": P + rng_prev * 0.382,
+        "R2": P + rng_prev * 0.618,
+        "R3": P + rng_prev,
+        "S1": P - rng_prev * 0.382,
+        "S2": P - rng_prev * 0.618,
+        "S3": P - rng_prev,
+    }
+    return piv
 
 async def evaluate_pair_and_alert(
     pair_name: str,
-    df_15m: pd.DataFrame,
-    df_5m: pd.DataFrame,
-    df_daily: Optional[pd.DataFrame],
+    data_15m: Dict[str, np.ndarray],
+    data_5m: Dict[str, np.ndarray],
+    data_daily: Optional[Dict[str, np.ndarray]],
     sdb: RedisStateStore,
     telegram_queue: TelegramQueue,
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    
+
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
 
     try:
-        i15 = get_last_closed_index(df_15m, 15, reference_time)
-        i5 = get_last_closed_index(df_5m, 5, reference_time)
+        ts15 = data_15m["timestamp"]; ts5 = data_5m["timestamp"]
+        i15 = get_last_closed_index_from_array(ts15, 15, reference_time)
+        i5 = get_last_closed_index_from_array(ts5, 5, reference_time)
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient closed candles for {pair_name}")
             return None
-   
-        # Calculate all indicators in one thread call
-        indicators = await asyncio.to_thread(
-            calculate_all_indicators_sync, df_15m, df_5m, df_daily
-        )
-        
-        # Extract indicators from results
+
+        cache_key = f"{pair_name}:{reference_time//900}"
+        if cache_key in INDICATOR_CACHE:
+            indicators = INDICATOR_CACHE[cache_key]
+        else:
+            gc.disable()
+            indicators = calculate_all_indicators_sync(data_15m, data_5m, data_daily)
+            gc.enable()
+            INDICATOR_CACHE[cache_key] = indicators
+
         ppo = indicators['ppo']
         ppo_signal = indicators['ppo_signal']
         smooth_rsi = indicators['smooth_rsi']
@@ -2063,76 +1680,42 @@ async def evaluate_pair_and_alert(
         rma50_15_series = indicators['rma50_15']
         rma200_5_series = indicators['rma200_5']
 
-        # Pivot calculations (if enabled)
-        piv: Dict[str, float] = {}
-        if cfg.ENABLE_PIVOT and df_daily is not None and len(df_daily) >= 2:
-            try:
-                df_daily = df_daily.sort_values("timestamp").reset_index(drop=True)
-                df_daily["date"] = pd.to_datetime(df_daily["timestamp"], unit="s", utc=True).dt.date
-                
-                yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-                completed_days = df_daily["date"] == yesterday
-                
-                if completed_days.sum() >= 1:
-                    prev_daily = df_daily[completed_days].iloc[-1]
-                    H_prev = float(prev_daily["high"])
-                    L_prev = float(prev_daily["low"])
-                    C_prev = float(prev_daily["close"])
-                    rng_prev = H_prev - L_prev
-                    if rng_prev > 1e-8:
-                        P = (H_prev + L_prev + C_prev) / 3.0
-                        piv = {
-                            "P": P,
-                            "R1": P + rng_prev * 0.382,
-                            "R2": P + rng_prev * 0.618,
-                            "R3": P + rng_prev,
-                            "S1": P - rng_prev * 0.382,
-                            "S2": P - rng_prev * 0.618,
-                            "S3": P - rng_prev,
-                        }
-                else:
-                    logger_pair.warning(f"Yesterday's daily candle not available yet for {pair_name}")
-            except Exception as e:
-                logger_pair.warning(f"Pivot calc failed for {pair_name}: {e}")
+        piv = compute_pivots_numpy(data_daily)
 
-        close_curr = float(df_15m["close"].iloc[i15])
-        close_prev = float(df_15m["close"].iloc[i15 - 1])
-        ts_curr = int(df_15m["timestamp"].iloc[i15])
+        close_curr = float(data_15m["close"][i15])
+        close_prev = float(data_15m["close"][i15 - 1])
+        ts_curr = int(data_15m["timestamp"][i15])
 
-        ppo_curr = float(ppo.iloc[i15])
-        ppo_prev = float(ppo.iloc[i15 - 1])
-        ppo_sig_curr = float(ppo_signal.iloc[i15])
-        ppo_sig_prev = float(ppo_signal.iloc[i15 - 1])
+        ppo_curr = float(ppo[i15]); ppo_prev = float(ppo[i15 - 1])
+        ppo_sig_curr = float(ppo_signal[i15]); ppo_sig_prev = float(ppo_signal[i15 - 1])
 
-        rsi_curr = float(smooth_rsi.iloc[i15])
-        rsi_prev = float(smooth_rsi.iloc[i15 - 1])
+        rsi_curr = float(smooth_rsi[i15]); rsi_prev = float(smooth_rsi[i15 - 1])
 
-        vwap_curr = float(vwap.iloc[i15]) if not vwap.empty else 0.0
-        vwap_prev = float(vwap.iloc[i15 - 1]) if not vwap.empty else 0.0
+        vwap_curr = float(vwap[i15]) if vwap.size else 0.0
+        vwap_prev = float(vwap[i15 - 1]) if vwap.size else 0.0
 
-        mmh_curr = float(mmh.iloc[i15])
-        mmh_m1   = float(mmh.iloc[i15 - 1])
+        mmh_curr = float(mmh[i15])
+        mmh_m1   = float(mmh[i15 - 1])
 
-        cloud_up   = bool(upw.iloc[i15]) and not bool(dnw.iloc[i15])
-        cloud_down = bool(dnw.iloc[i15]) and not bool(upw.iloc[i15])
+        cloud_up   = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
-        rma50_15 = float(rma50_15_series.iloc[i15])
-        rma200_5 = float(rma200_5_series.iloc[i5])
+        rma50_15 = float(rma50_15_series[i15])
+        rma200_5 = float(rma200_5_series[i5])
 
         base_buy_common  = rma50_15 < close_curr and rma200_5 < close_curr
         base_sell_common = rma50_15 > close_curr and rma200_5 > close_curr
 
         if base_buy_common:
             base_buy_common = base_buy_common and (mmh_curr > 0 and cloud_up)
-
         if base_sell_common:
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
-        buy_candle_passed,  buy_candle_reason  = check_candle_quality_with_reason(
-            df_15m, i15, is_buy=True
+        buy_candle_passed,  buy_candle_reason  = check_candle_quality_with_reason_arrays(
+            data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], i15, is_buy=True
         )
-        sell_candle_passed, sell_candle_reason = check_candle_quality_with_reason(
-            df_15m, i15, is_buy=False
+        sell_candle_passed, sell_candle_reason = check_candle_quality_with_reason_arrays(
+            data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], i15, is_buy=False
         )
 
         buy_common  = base_buy_common  and buy_candle_passed
@@ -2142,20 +1725,13 @@ async def evaluate_pair_and_alert(
         mmh_reversal_sell = False
 
         if i15 >= 3:
-            mmh_m3 = float(mmh.iloc[i15 - 3])
-            mmh_m2 = float(mmh.iloc[i15 - 2])
-
+            mmh_m3 = float(mmh[i15 - 3])
+            mmh_m2 = float(mmh[i15 - 2])
             mmh_reversal_buy = (
-                buy_common
-                and mmh_curr > 0
-                and mmh_m3 > mmh_m2 > mmh_m1
-                and mmh_curr > mmh_m1
+                buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
             )
             mmh_reversal_sell = (
-                sell_common
-                and mmh_curr < 0
-                and mmh_m3 < mmh_m2 < mmh_m1
-                and mmh_curr < mmh_m1
+                sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
 
         context = {
@@ -2177,7 +1753,7 @@ async def evaluate_pair_and_alert(
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
             "pivots": piv,
-            "vwap": not pd.Series(dtype=float).equals(vwap),
+            "vwap": vwap.size > 0,
             "candle_quality_failed_buy": base_buy_common and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_common and not sell_candle_passed,
             "candle_rejection_reason_buy": buy_candle_reason if (base_buy_common and not buy_candle_passed) else None,
@@ -2270,7 +1846,6 @@ async def evaluate_pair_and_alert(
         if raw_alerts:
             dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
             dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
-
             alerts_to_send = []
             for title, extra, alert_key in raw_alerts:
                 composite_key = f"{pair_name}:{alert_key}"
@@ -2278,7 +1853,6 @@ async def evaluate_pair_and_alert(
                     alerts_to_send.append((title, extra, alert_key))
                 else:
                     logger_pair.debug(f"Skipping duplicate alert: {composite_key}")
-
             alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
         else:
             alerts_to_send = []
@@ -2290,33 +1864,27 @@ async def evaluate_pair_and_alert(
             else:
                 items = [(title, extra) for title, extra, _ in alerts_to_send[:25]]
                 msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
-
             await telegram_queue.send(msg)
-
             new_state = {
                 "state": "ALERT_SENT",
                 "ts": int(time.time()),
                 "summary": {"alerts": len(alerts_to_send)}
             }
             logger_pair.info(f"✅ Sent {len(alerts_to_send)} alerts for {pair_name}: "
-                   f"{[ak for _, _, ak in alerts_to_send]}")
+                             f"{[ak for _, _, ak in alerts_to_send]}")
         else:
             new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
 
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         reasons = []
-
         if not context["buy_common"] and not context["sell_common"]:
             reasons.append("Trend filter blocked")
-
         if context.get("candle_quality_failed_buy"):
             buy_reason = context.get("candle_rejection_reason_buy", "Unknown")
             reasons.append(f"BUY candle quality: {buy_reason}")
-
         if context.get("candle_quality_failed_sell"):
             sell_reason = context.get("candle_rejection_reason_sell", "Unknown")
             reasons.append(f"SELL candle quality: {sell_reason}")
-
         suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
 
         new_state["summary"] = {
@@ -2331,9 +1899,7 @@ async def evaluate_pair_and_alert(
             }
         }
 
-        cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
-        
         if alerts_to_send:
             status_msg += f" | 🔔 {len(alerts_to_send)} alerts sent"
         elif base_buy_common and not buy_candle_passed:
@@ -2342,7 +1908,6 @@ async def evaluate_pair_and_alert(
             status_msg += f" | SELL blocked: {sell_candle_reason}"
         else:
             status_msg += " | No signals"
-        
         logger_pair.info(status_msg)
 
         if cfg.DEBUG_MODE:
@@ -2353,10 +1918,8 @@ async def evaluate_pair_and_alert(
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
-
     finally:
         try:
-            del df_15m, df_5m, df_daily
             if 'ppo' in locals():
                 del ppo, ppo_signal, smooth_rsi, vwap, mmh
             if cfg.CIRRUS_CLOUD_ENABLED and 'upw' in locals():
@@ -2366,16 +1929,25 @@ async def evaluate_pair_and_alert(
         finally:
             PAIR_ID.set("")
 
-async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[str, dict], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
+async def check_pair(
+    pair_name: str,
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    state_db: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str,
+    reference_time: int
+) -> Optional[Tuple[str, Dict[str, Any]]]:
     try:
         if shutdown_event.is_set():
             return None
+
         product_info = products_map.get(pair_name)
         if not product_info:
             logger.warning(f"Product info not found for {pair_name}")
             return None
         symbol = product_info["symbol"]
-        
+
         daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10
 
         tasks = [
@@ -2383,24 +1955,23 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
             fetcher.fetch_candles(symbol, "5", 400, reference_time),
             fetcher.fetch_candles(symbol, "D", daily_limit, reference_time) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
         ]
-
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        data_15m = parse_candles_to_numpy(results[0])
-        data_5m  = parse_candles_to_numpy(results[1])
-        data_daily = parse_candles_to_numpy(results[2]) if cfg.ENABLE_PIVOT else None
 
-        df_15m = pd.DataFrame(data_15m) if data_15m is not None else None
-        df_5m  = pd.DataFrame(data_5m)  if data_5m  is not None else None
-        df_daily = pd.DataFrame(data_daily) if data_daily is not None else None
+        data_15m = parse_candles_to_numpy(results[0] if not isinstance(results[0], Exception) else None)
+        data_5m  = parse_candles_to_numpy(results[1] if not isinstance(results[1], Exception) else None)
+        data_daily = parse_candles_to_numpy(results[2]) if (cfg.ENABLE_PIVOT and not isinstance(results[2], Exception)) else None
 
-        valid_15m, reason_15m = validate_candle_df(df_15m, 220)
-        valid_5m, reason_5m = validate_candle_df(df_5m, 280)
-    
+        valid_15m, reason_15m = validate_candle_arrays(data_15m, required_len=220)
+        valid_5m,  reason_5m  = validate_candle_arrays(data_5m, required_len=280)
+
         if not valid_15m or not valid_5m:
             logger.warning(f"Insufficient data for {pair_name}: 15m={reason_15m}, 5m={reason_5m}")
             return None
-        
-        return await evaluate_pair_and_alert(pair_name, df_15m, df_5m, df_daily, state_db, telegram_queue, correlation_id, reference_time)
+
+        return await evaluate_pair_and_alert(
+            pair_name, data_15m, data_5m, data_daily, state_db,
+            telegram_queue, correlation_id, reference_time
+        )
     except Exception as e:
         logger.exception(f"Error in check_pair for {pair_name}: {e}")
         return None
@@ -2418,12 +1989,7 @@ async def worker_process_pair(
     results: List[Tuple[str, Dict[str, Any]]],
     results_lock: asyncio.Lock
 ) -> None:
-    """
-    Worker coroutine that processes pairs from the queue.
-    Each worker runs independently and picks up work as it becomes available.
-    """
     logger_worker = logging.getLogger(f"macd_bot.worker_{worker_id}")
-    
     while True:
         try:
             try:
@@ -2432,27 +1998,23 @@ async def worker_process_pair(
                 if pair_queue.empty():
                     break
                 continue
-            
+
             if pair_name is None:
                 pair_queue.task_done()
                 break
-            
             if shutdown_event.is_set():
                 pair_queue.task_done()
                 break
-            
+
             logger_worker.debug(f"Worker {worker_id} processing {pair_name}")
-            
             try:
                 result = await check_pair(
                     pair_name, fetcher, products_map, state_db,
                     telegram_queue, correlation_id, reference_time
                 )
-                
                 if result:
                     async with results_lock:
                         results.append(result)
-                    
                     if cfg.DEBUG_MODE:
                         pair, state = result
                         summary = state.get("summary", {})
@@ -2464,26 +2026,24 @@ async def worker_process_pair(
                 else:
                     if cfg.DEBUG_MODE:
                         logger_worker.debug(f"Worker {worker_id}: {pair_name} returned None")
-                
             except Exception as e:
                 logger_worker.error(f"Worker {worker_id} error processing {pair_name}: {e}")
-            
-            # Lock extension check
+
             if lock.should_extend():
                 if not await lock.extend(timeout=3.0):
                     logger_worker.error(f"Worker {worker_id}: Failed to extend Redis lock")
                     pair_queue.task_done()
                     break
-            
+
             pair_queue.task_done()
-            
+
         except asyncio.CancelledError:
             logger_worker.debug(f"Worker {worker_id} cancelled")
             break
         except Exception as e:
             logger_worker.error(f"Worker {worker_id} unexpected error: {e}")
             break
-    
+
     logger_worker.debug(f"Worker {worker_id} exiting")
 
 async def process_pairs_with_workers(
@@ -2496,25 +2056,23 @@ async def process_pairs_with_workers(
     lock: RedisLock,
     reference_time: int
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Process all pairs using a worker pool architecture.
-    """
     logger_main = logging.getLogger("macd_bot.worker_pool")
-    
-    # Create queue and add all pairs
+
     pair_queue: asyncio.Queue = asyncio.Queue()
     for pair in pairs_to_process:
         await pair_queue.put(pair)
-    
-    # Results storage
+
     results: List[Tuple[str, Dict[str, Any]]] = []
     results_lock = asyncio.Lock()
-    
-    # Determine number of workers
-    num_workers = cfg.MAX_PARALLEL_FETCH
+
+    if len(pairs_to_process) <= cfg.MAX_PARALLEL_FETCH:
+        num_workers = max(2, len(pairs_to_process) // 2) if len(pairs_to_process) > 1 else 1
+    else:
+        num_workers = cfg.MAX_PARALLEL_FETCH
+    num_workers = min(num_workers, len(pairs_to_process)) if pairs_to_process else 1
+
     logger_main.info(f"📊 Processing {len(pairs_to_process)} pairs with {num_workers}-worker pool")
-    
-    # Create worker tasks
+
     workers = []
     for worker_id in range(num_workers):
         worker = asyncio.create_task(
@@ -2525,24 +2083,36 @@ async def process_pairs_with_workers(
             )
         )
         workers.append(worker)
-    
-    # Wait for all pairs to be processed
+
     await pair_queue.join()
-    
-    # Send poison pills to workers to signal shutdown
+
     for _ in range(num_workers):
         await pair_queue.put(None)
-    
-    # Wait for all workers to complete
+
     await asyncio.gather(*workers, return_exceptions=True)
-    
     return results
 
+def warmup_numba() -> None:
+    logger.info("🔥 Warming up Numba JIT compiler...")
+    try:
+        length = 500
+        close = np.random.random(length).astype(np.float64) * 1000
+        sd    = np.random.random(length).astype(np.float64) * 0.01
+        ts    = np.arange(length, dtype=np.int64)
+        vol   = np.random.random(length).astype(np.float64) * 100
+        _calc_mmh_worm_loop(close, sd, length)
+        _calc_mmh_value_loop(np.random.random(length).astype(np.float64), length)
+        _calc_mmh_momentum_loop(np.random.random(length).astype(np.float64), length)
+        _sma_loop(close, 50)
+        _ema_loop(close, 0.1)
+        _kalman_loop(close, 21, 0.01, 0.1)
+        _rng_filter_loop(close, sd)
+        _vwap_daily_loop(close, close, close, vol, ts)
+        logger.info("✅ Numba warm-up complete.")
+    except Exception as e:
+        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
+
 async def run_once() -> bool:
-    """
-    Single pass through all configured pairs.
-    Returns True if the run completed successfully, False otherwise.
-    """
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -2551,23 +2121,18 @@ async def run_once() -> bool:
     reference_time = get_trigger_timestamp()
     logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
 
-    alerts_sent = 0
-    MAX_ALERTS_PER_RUN = 50
-
     lock_acquired = False
     lock: Optional[RedisLock] = None
 
     try:
-        # Check memory at startup
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-        
+
         if container_memory_mb >= limit_mb:
             logger_run.critical(f"🚨 Memory limit exceeded at startup ({container_memory_mb:.1f}MB / {limit_mb:.1f}MB)")
             return False
 
-        # Redis connection
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
         logger_run.debug("Redis connection established")
@@ -2600,7 +2165,6 @@ async def run_once() -> bool:
                         f"Corr. ID: {correlation_id}"
                     ))
 
-                # Products cache (8-hour TTL)
                 PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
                 now = time.time()
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
@@ -2631,13 +2195,17 @@ async def run_once() -> bool:
                     lock, reference_time
                 )
 
-                # Stats & summary
                 fetcher_stats = fetcher.get_stats()
                 logger_run.info(
                     f"📡 Fetch stats | "
                     f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
                     f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
                 )
+
+                alerts_sent = 0
+                for _, state in all_results:
+                    summary = state.get("summary", {})
+                    alerts_sent += int(summary.get("alerts", 0))
 
                 run_duration = time.time() - start_time
                 container_memory_mb = process.memory_info().rss / 1024 / 1024
@@ -2648,10 +2216,10 @@ async def run_once() -> bool:
                 )
                 logger_run.info(summary)
 
+                MAX_ALERTS_PER_RUN = 50
                 if alerts_sent > MAX_ALERTS_PER_RUN:
                     await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
-                        f"Pairs: {len(all_results)}"
+                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | Pairs: {len(all_results)}"
                     ))
 
                 return True
@@ -2682,7 +2250,6 @@ async def run_once() -> bool:
             pass
         return False
     finally:
-        # Final memory cleanup
         try:
             if 'all_results' in locals():
                 del all_results
@@ -2694,11 +2261,70 @@ async def run_once() -> bool:
             logger_run.debug("Final cleanup completed")
         except Exception as e:
             logger_run.warning(f"Final cleanup error (non-critical): {e}")
-
         await SessionManager.close_session()
         TRACE_ID.set("")
 
-# Try to use uvloop for better performance
+# -----------------------------
+# Part 5 helpers (advanced performance & consistency)
+# -----------------------------
+
+GLOBAL_BUF_SIZE = 600
+GLOBAL_CLOSE_BUF = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+GLOBAL_DIFF_BUF  = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+GLOBAL_SD_BUF    = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+GLOBAL_VWAP_BUF  = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+GLOBAL_TEMP_BUF  = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+GLOBAL_MIN_BUF   = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+GLOBAL_MAX_BUF   = np.empty(GLOBAL_BUF_SIZE, dtype=np.float64)
+
+def _copy_into_buf(src: np.ndarray, buf: np.ndarray) -> np.ndarray:
+    n = src.size
+    if n <= buf.size:
+        buf[:n] = src
+        return buf[:n]
+    return src
+
+def arr_get(a: Dict[str, np.ndarray], key: str, default_len: int = 0, dtype=float) -> np.ndarray:
+    v = a.get(key)
+    if v is None:
+        return np.zeros(default_len, dtype=dtype)
+    return v
+
+def safe_float(x: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return fallback
+
+def ensure_bool_array(arr: np.ndarray, length: int) -> np.ndarray:
+    if arr is None or arr.size == 0:
+        return np.zeros(length, dtype=bool)
+    return arr.astype(bool)
+
+def _validate_alert_keys_on_import():
+    missing = []
+    for d in ALERT_DEFINITIONS:
+        k = d["key"]
+        if k not in ALERT_KEYS:
+            missing.append(k)
+    if missing:
+        logger.warning(f"Alert keys missing for definitions: {missing}")
+
+_validate_alert_keys_on_import()
+
+def coerce_data_types(data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    out = {}
+    for k, v in data.items():
+        if k == "timestamp":
+            out[k] = v.astype(np.int64, copy=False)
+        else:
+            out[k] = v.astype(np.float64, copy=False)
+    return out
+
+# -----------------------------
+# uvloop and CLI entrypoint
+# -----------------------------
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -2717,7 +2343,6 @@ if __name__ == "__main__":
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
-    # Warm up Numba JIT compiler
     warmup_numba()
 
     try:
