@@ -16,8 +16,15 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# Copy requirements first for better caching
 COPY requirements.txt .
-# Compile bytecode during install for faster startup
+
+# FIX THE pycares / aiodns incompatibility in a single command (no line-continuation issues)
+RUN uv pip install --no-cache --compile \
+    pycares==4.4.0 \
+    aiodns==3.2.0
+
+# Now install everything else from requirements.txt (it will reuse the fixed versions above)
 RUN uv pip install --no-cache --compile -r requirements.txt
 
 # ============================================================================
