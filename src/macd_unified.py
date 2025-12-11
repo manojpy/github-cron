@@ -731,6 +731,16 @@ class DataFetcher:
                 )
             return data
 
+        def get_stats(self) -> Dict[str, int]:
+    
+            return {
+                "products_success": int(self.fetch_stats.get("products_success", 0)),
+                "products_failed": int(self.fetch_stats.get("products_failed", 0)),
+                "candles_success": int(self.fetch_stats.get("candles_success", 0)),
+                "candles_failed": int(self.fetch_stats.get("candles_failed", 0)),
+            }
+
+
 # -----------------------------
 # Numba kernels
 # -----------------------------
@@ -986,25 +996,45 @@ def calculate_ppo_numpy_arrays(close: np.ndarray, fast: int, slow: int, signal: 
     return ppo, ppo_sig
 
 def calculate_magical_momentum_hist_array(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
+    """
+    Magical Momentum Histogram (MMH) — pure NumPy/Numba, warning-safe.
+
+    - Uses EMA of absolute returns as SD proxy (scaled by responsiveness).
+    - Computes worm, SMA, raw ratio, windowed min/max normalization.
+    - Stabilizes value transform and silences divide-by-zero warnings.
+    - Final momentum is accumulated via _calc_mmh_momentum_loop.
+    """
     try:
         if close is None or close.size == 0:
             return np.empty(0, dtype=np.float64)
+
         close = close.astype(np.float64)
         rows = close.size
+
+        # Responsiveness clamp for numeric stability
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+
+        # Absolute returns → EMA → SD proxy
         delta = np.zeros_like(close)
         if rows >= 2:
             delta[1:] = np.abs(close[1:] - close[:-1])
         alpha_sd = 2.0 / (50 + 1)
         sd = _ema_loop(delta, alpha_sd) * resp_clamped
         sd = sanitize_indicator_array("MMH_SD", sd)
+
+        # Worm and SMA
         worm_arr = _calc_mmh_worm_loop(close, sd, rows)
         ma = _sma_loop(close, period)
         ma = sanitize_indicator_array("MMH_MA", ma)
-        raw = (worm_arr - ma) / np.where(worm_arr == 0.0, np.nan, worm_arr)
+
+        # Raw = (worm - ma) / worm (avoid zero-division)
+        worm_safe = np.where(worm_arr == 0.0, np.nan, worm_arr)
+        raw = (worm_arr - ma) / worm_safe
         raw[np.isinf(raw)] = np.nan
         raw = np.nan_to_num(raw, nan=0.0)
         raw = sanitize_indicator_array("MMH_RAW", raw)
+
+        # Rolling min/max over 'period'
         min_med = np.empty(rows, dtype=np.float64)
         max_med = np.empty(rows, dtype=np.float64)
         for i in range(rows):
@@ -1012,24 +1042,33 @@ def calculate_magical_momentum_hist_array(close: np.ndarray, period: int = 144, 
             window = raw[start:i+1]
             min_med[i] = np.min(window) if window.size > 0 else 0.0
             max_med[i] = np.max(window) if window.size > 0 else 1.0
+
+        # Normalize to [0,1], fill NaNs to 0.5 (neutral)
         denom = max_med - min_med
         denom[denom == 0] = 1e-12
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.where(np.isnan(temp), 0.5, temp)
         temp = sanitize_indicator_array("MMH_TEMP", temp)
+
+        # Value transform → momentum (warning-safe)
         value_arr = _calc_mmh_value_loop(temp, rows)
-        temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+        safe_value = np.clip(value_arr, -0.9999, 0.9999)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            temp2 = (1.0 + safe_value) / (1.0 - safe_value)
         temp2[np.isinf(temp2)] = np.nan
         temp2 = np.nan_to_num(temp2, nan=1.0)
         temp2 = np.clip(temp2, 1e-8, 1e8)
+
         momentum = 0.25 * np.log(temp2)
         momentum = sanitize_indicator_array("MMH_MOMENTUM", momentum)
+
+        # Accumulated momentum → histogram
         momentum_arr = momentum.astype(np.float64)
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
-        hist = momentum_arr
-        hist = sanitize_indicator_array("MMH_HIST", hist)
+        hist = sanitize_indicator_array("MMH_HIST", momentum_arr)
         return hist
+
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
         return np.zeros(close.size, dtype=np.float64)
