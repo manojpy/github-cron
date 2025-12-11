@@ -5,11 +5,9 @@ import time
 import asyncio
 import random
 import logging
-import logging.handlers
-from queue import SimpleQueue
+from pathlib import Path
 import ssl
 import signal
-import hashlib
 import re
 import uuid
 import argparse
@@ -18,13 +16,11 @@ import math
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 import gc
 import aiohttp
 from aiohttp import web
-from prometheus_client import start_http_server
 import pandas as pd
 import numpy as np
 import redis.asyncio as redis
@@ -54,17 +50,7 @@ except ImportError:
     json_loads = json.loads
     JSON_BACKEND = "stdlib"
 
-PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "false").lower() in ("1", "true", "yes")
-try:
-    if PROMETHEUS_ENABLED:
-        from prometheus_client import Counter, Gauge, Histogram, start_http_server
-    else:
-        Counter = Gauge = Histogram = None
-except Exception:
-    PROMETHEUS_ENABLED = False
-    Counter = Gauge = Histogram = None
-
-__version__ = "1.1.0-performance-optimized"
+__version__ = "1.2.0-cron-optimized"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -76,21 +62,14 @@ class Constants:
     PPO_011_THRESHOLD = 0.11
     PPO_011_THRESHOLD_SELL = -0.11
     STARTUP_GRACE_PERIOD = int(os.getenv('STARTUP_GRACE_PERIOD', 300))
-    HEALTH_CHECK_PORT = int(os.getenv("PORT", "10000"))
     REDIS_LOCK_EXPIRY = max(int(os.getenv('REDIS_LOCK_EXPIRY', 900)), 900)
     CIRCUIT_BREAKER_MAX_WAIT = 300
-    MEMORY_CHECK_INTERVAL = 30
-    MEMORY_LIMIT_PERCENT = float(os.getenv("MEMORY_LIMIT_PERCENT", 85.0))
-    CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
     MAX_PRICE_CHANGE_PERCENT = 50.0
     MAX_CANDLE_GAP_MULTIPLIER = 2.0
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
-    PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "10000"))
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
-
-HEALTH_SERVER_ENABLED = os.getenv("HEALTH_SERVER_ENABLED", "false").lower() in ("1", "true", "yes")
-HEALTH_HTTP_PORT = int(os.getenv("HEALTH_HTTP_PORT", "10001"))
+    CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
 
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
@@ -142,7 +121,6 @@ class BotConfig(BaseModel):
     SRSI_RSI_LEN: int = 21
     SRSI_KALMAN_LEN: int = 5
     LOG_FILE: str = "macd_bot.log"
-    PID_LOCK_PATH: str = "/tmp/macd_bot.pid"
     MAX_PARALLEL_FETCH: int = Field(8, ge=1, le=16)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
@@ -157,9 +135,6 @@ class BotConfig(BaseModel):
     TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000
     STATE_EXPIRY_DAYS: int = 30
-    ENABLE_DMS_PLUGIN: bool = False
-    ENABLE_HEALTH_TRACKER: bool = True
-    DEAD_MANS_COOLDOWN_SECONDS: int = 1200
     LOG_LEVEL: str = "INFO"
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
@@ -168,9 +143,6 @@ class BotConfig(BaseModel):
     FAIL_ON_TELEGRAM_DOWN: bool = False
     TELEGRAM_RATE_LIMIT_PER_MINUTE: int = 20
     TELEGRAM_BURST_SIZE: int = 5
-    ENABLE_AUTO_RESTART: bool = False
-    AUTO_RESTART_MAX_RETRIES: int = 3
-    AUTO_RESTART_COOLDOWN_SEC: int = 10
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
     INDICATOR_THREAD_LIMIT: int = 3
@@ -278,79 +250,30 @@ class SafeFormatter(logging.Formatter):
         formatted = self._REDIS_RE.sub("redis://[REDACTED]@", formatted)
         return formatted
 
-class JsonFormatter(SafeFormatter):
-    def format(self, record: logging.LogRecord) -> str:
-        record.args = None
-        base = {
-            "ts": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z',
-            "level": record.levelname,
-            "logger": record.name,
-            "fn": f"{record.funcName}:{record.lineno}",
-            "msg": record.getMessage(),
-        }
-        if getattr(record, "trace_id", ""):
-            base["trace_id"] = record.trace_id
-        if getattr(record, "pair_id", ""):
-            base["pair_id"] = record.pair_id
-        if record.exc_info:
-            base["exc"] = self.formatException(record.exc_info)
-        return json_dumps(base)
-
-def setup_logging() -> Tuple[logging.Logger, Optional[logging.handlers.QueueListener]]:
-    """
-    Async-safe logging: the main thread only enqueues records;
-    a separate thread writes to disk / console.
-    Returns (logger, listener) so the caller can call listener.stop() on shutdown.
-    """
+def setup_logging() -> logging.Logger:
+    """Simplified logging setup for short-lived cron jobs"""
     logger = logging.getLogger("macd_bot")
-    for h in logger.handlers[:]:          # remove any stale handlers
+    for h in logger.handlers[:]:
         logger.removeHandler(h)
 
     level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
     logger.setLevel(level)
     logger.propagate = False
 
-    # 1.  Real handlers that will run in the listener thread
-    handlers: list[logging.Handler] = []
-
-    # Console handler
+    # Console handler - logs to stdout for container capture
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(level)
     console.setFormatter(SafeFormatter(
         fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     ))
+    console.addFilter(SecretFilter())
     console.addFilter(TraceContextFilter())
-    handlers.append(console)
+    logger.addHandler(console)
 
-    # File handler (optional)
-    if os.getenv("FILE_LOGGING", "true").lower() in ("1", "true", "yes"):
-        file_handler = logging.handlers.TimedRotatingFileHandler(
-            filename=cfg.LOG_FILE, when="midnight", interval=1,
-            backupCount=7, encoding="utf-8", utc=True
-        )
-        file_handler.setLevel(level)
-        file_handler.setFormatter(SafeFormatter(
-            fmt='%(asstime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-        file_handler.addFilter(SecretFilter())
-        file_handler.addFilter(TraceContextFilter())
-        handlers.append(file_handler)
+    return logger
 
-    # 2.  Queue & queue-handler (what the logger actually uses)
-    log_queue: SimpleQueue[logging.LogRecord] = SimpleQueue()
-    queue_handler = logging.handlers.QueueHandler(log_queue)
-    logger.addHandler(queue_handler)
-
-    # 3.  Listener thread – moves records from queue to real handlers
-    listener = logging.handlers.QueueListener(
-        log_queue, *handlers, respect_handler_level=True
-    )
-    listener.start()
-    return logger, listener
-
-logger, log_listener = setup_logging()
+logger = setup_logging()
 shutdown_event = asyncio.Event()
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
@@ -375,63 +298,6 @@ async def cancel_all_tasks(grace_seconds: int = 5) -> None:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=grace_seconds)
     except asyncio.TimeoutError:
         logger.warning("Timeout while cancelling tasks")
-
-class MemoryMonitor:
-    def __init__(self, limit_percent: float = Constants.MEMORY_LIMIT_PERCENT):
-        self.limit_percent = limit_percent
-        self.last_check = 0.0
-        self.interval = Constants.MEMORY_CHECK_INTERVAL
-        self.process = psutil.Process()
-
-    def should_check(self) -> bool:
-        now = time.time()
-        if now - self.last_check >= self.interval:
-            self.last_check = now
-            return True
-        return False
-
-    def is_critical(self) -> bool:
-        try:
-            container_memory_mb = self.process.memory_info().rss / 1024 / 1024
-            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-            return container_memory_mb >= limit_mb
-        except Exception:
-            vm = psutil.virtual_memory()
-            return vm.percent >= self.limit_percent
-
-    def check_memory(self) -> Tuple[int, float]:
-        try:
-            memory_info = self.process.memory_info()
-            container_used = int(memory_info.rss)
-            container_percent = (container_used / cfg.MEMORY_LIMIT_BYTES) * 100
-            return container_used, float(container_percent)
-        except Exception:
-            vm = psutil.virtual_memory()
-            return int(vm.used), float(vm.percent)
-
-metrics_started = False
-if PROMETHEUS_ENABLED and Counter and Gauge and Histogram:
-    try:
-        METRIC_ALERTS_SENT = Counter("bot_alerts_sent_total", "Total alerts sent", ["alert_type"])
-        METRIC_FETCH_ERRORS = Counter("bot_fetch_errors_total", "Total fetch errors")
-        METRIC_FAILED_PAIRS = Counter("bot_failed_pairs_total", "Total number of failed pairs")
-        METRIC_RUN_DURATION = Histogram("bot_run_duration_seconds", "Run duration in seconds")
-        METRIC_MEMORY_USAGE = Gauge("bot_memory_usage_mb", "Memory usage in MB")
-        METRIC_REDIS_LOCK_FAILS = Counter("bot_redis_lock_extend_failures_total", "Redis lock extend failures")
-        METRIC_REDIS_MEMORY_USED = Gauge("redis_used_memory_bytes", "Redis used_memory from INFO")
-        METRIC_REDIS_KEYS = Gauge("redis_keys_total", "Total keys in Redis (db0)")
-        METRIC_CB_OPEN = Gauge("circuit_breaker_open", "Circuit breaker open (1) or closed (0)")
-        METRIC_CB_FAILURES = Counter("circuit_breaker_failures_total", "Circuit breaker failure increments")
-        METRIC_INDICATOR_CALC_TIME = Histogram("indicator_calculation_seconds", "Time to calculate indicators", ["indicator"])
-        METRIC_REDIS_OP_TIME = Histogram("redis_operation_seconds", "Redis operation latency", ["operation"])
-        METRIC_DATA_QUALITY_FAILURES = Counter("data_quality_failures_total", "Data quality check failures", ["reason"])
-        METRIC_ALERT_DEDUP_HITS = Counter("alert_dedup_hits_total", "Alert deduplication hits", ["pair"])
-        METRIC_PAIR_PROCESSING_TIME = Histogram("pair_processing_seconds", "Per-pair processing time", ["pair"])
-        start_http_server(Constants.PROMETHEUS_PORT)
-        metrics_started = True
-        logger.info(f"Prometheus metrics server started on port {Constants.PROMETHEUS_PORT}")
-    except Exception as e:
-        logger.warning(f"Failed to start Prometheus metrics: {e}")
 
 _STARTUP_BANNER_PRINTED = False
 
@@ -494,10 +360,6 @@ class SessionManager:
                 finally:
                     cls._session = None
                     logger.debug("Closed shared aiohttp session")
-
-def _exp_backoff_sleep(attempt: int, base: float, cap: float) -> float:
-    sleep = min(cap, base * (2 ** (attempt - 1)))
-    return max(0.05, sleep * random.uniform(0.5, 1.5))
 
 class RetryCategory:
     NETWORK = "network"
@@ -615,7 +477,6 @@ class RedisStateStore:
         self.state_prefix = "pair_state:"
         self.meta_prefix = "metadata:"
         self.alert_prefix = "alert:"
-        self.cb_prefix = "circuit_breaker:"
         self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
@@ -691,8 +552,7 @@ class RedisStateStore:
                         policy = info.get("maxmemory_policy", "unknown")
                         if policy in ("volatile-lru", "allkeys-lru"):
                             logger.warning(f"⚠️ Redis using {policy} - keys may be evicted under memory pressure")
-    
-                
+                    
                     self.degraded = False
                     self.degraded_alerted = False
                     return
@@ -712,9 +572,6 @@ class RedisStateStore:
 🚨 REDIS DEGRADED MODE ACTIVE:
 - Alert deduplication:  DISABLED (may get duplicates)
 - State persistence:    DISABLED (alerts reset each run)
-- Health tracking:      DISABLED
-- Lock extension:       DISABLED
-- Circuit breaker:      DISABLED (will reset each run)
 - Trading alerts:       STILL ACTIVE (core functionality preserved)
 """)
 
@@ -753,8 +610,6 @@ class RedisStateStore:
         if not self._redis:
             return None
 
-        start_time = time.time()
-
         async def _do():
             return await asyncio.wait_for(coro, timeout=timeout)
 
@@ -764,15 +619,10 @@ class RedisStateStore:
                 retries=3,
                 base_backoff=0.6,
                 cap=3.0,
-                on_error=lambda e, a: logger.debug(
+                on_error=lambda e, a, c: logger.debug(
                     f"Redis {op_name} error (attempt {a}): {e}"
                 ),
             )
-
-            if PROMETHEUS_ENABLED and METRIC_REDIS_OP_TIME:
-                METRIC_REDIS_OP_TIME.labels(operation=op_name).observe(
-                    time.time() - start_time
-                )
 
             return parser(result) if parser else result
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
@@ -847,9 +697,6 @@ class RedisStateStore:
             parser=lambda r: bool(r),
         )
 
-        if result is False and PROMETHEUS_ENABLED and METRIC_ALERT_DEDUP_HITS:
-            METRIC_ALERT_DEDUP_HITS.labels(pair=pair).inc()
-
         return result is True
 
     async def batch_check_recent_alerts(
@@ -876,14 +723,6 @@ class RedisStateStore:
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
                 should_send = bool(results[idx]) if idx < len(results) else True
                 output[composite_key] = should_send
-
-                if (
-                    not should_send
-                    and PROMETHEUS_ENABLED
-                    and METRIC_ALERT_DEDUP_HITS
-                ):
-                    pair = composite_key.split(":")[0]
-                    METRIC_ALERT_DEDUP_HITS.labels(pair=pair).inc()
 
             return output
 
@@ -920,32 +759,6 @@ class RedisStateStore:
 
         return output
 
-    async def monitor_memory(self) -> Optional[Dict[str, Any]]:
-        if not self._redis:
-            return None
-        try:
-            info_raw = await self._safe_redis_op(
-                self._redis.info("all"),
-                timeout=3.0,
-                op_name="info all",
-                parser=lambda r: r,
-            )
-            if not info_raw:
-                return None
-
-            mem_used = info_raw.get("memory", {}).get("used_memory")
-            keys = info_raw.get("keyspace", {}).get("db0", {}).get("keys", 0)
-
-            if PROMETHEUS_ENABLED:
-                if METRIC_REDIS_MEMORY_USED and mem_used is not None:
-                    METRIC_REDIS_MEMORY_USED.set(float(mem_used))
-                if METRIC_REDIS_KEYS:
-                    METRIC_REDIS_KEYS.set(float(keys))
-
-            return {"used_memory": mem_used, "db0_keys": keys}
-        except Exception:
-            return None
-
     async def batch_set_states(
         self,
         updates: List[Tuple[str, Any, Optional[int]]],
@@ -972,203 +785,6 @@ class RedisStateStore:
             # Fallback to individual sets
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
-
-    async def get_circuit_breaker_state(self, breaker_name: str) -> Optional[Dict[str, Any]]:
-        if self.degraded:
-            return None
-        
-        key = f"{self.cb_prefix}{breaker_name}"
-        result = await self._safe_redis_op(
-            self._redis.get(key),
-            timeout=2.0,
-            op_name=f"get_cb_state {breaker_name}",
-            parser=lambda r: json_loads(r) if r else None,
-        )
-        return result
-
-    async def set_circuit_breaker_state(
-        self, breaker_name: str, data: Dict[str, Any]
-    ) -> None:
-        if self.degraded:
-            return
-        
-        key = f"{self.cb_prefix}{breaker_name}"
-        await self._safe_redis_op(
-            self._redis.set(key, json_dumps(data), ex=3600),
-            timeout=2.0,
-            op_name=f"set_cb_state {breaker_name}",
-        )
-
-class CircuitBreaker:
-    """
-    Enhanced circuit breaker with half-open state, decay, and per-entity tracking.
-    Prevents cascading failures by temporarily blocking calls after repeated failures.
-    """
-    def __init__(
-        self, 
-        failure_threshold: int = 5, 
-        timeout: int = 300, 
-        name: str = "default", 
-        redis_store: Optional[RedisStateStore] = None,
-        half_open_max_calls: int = 3,
-        success_threshold: int = 2
-    ):
-        self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.threshold = failure_threshold
-        self.timeout = timeout
-        self.lock = asyncio.Lock()
-        self.state = "CLOSED"
-        self.name = name
-        self.redis_store = redis_store
-        self._loaded_from_redis = False
-        self.half_open_attempts = 0
-        self.half_open_max_calls = half_open_max_calls
-        self.half_open_successes = 0
-        self.success_threshold = success_threshold
-
-    async def _load_state_from_redis(self) -> None:
-        if self._loaded_from_redis or not self.redis_store:
-            return
-        
-        self._loaded_from_redis = True
-        state = await self.redis_store.get_circuit_breaker_state(self.name)
-        if state:
-            self.failure_count = state.get("failure_count", 0)
-            self.last_failure_time = state.get("last_failure_time")
-            self.state = state.get("state", "CLOSED")
-            self.half_open_attempts = state.get("half_open_attempts", 0)
-            self.half_open_successes = state.get("half_open_successes", 0)
-            logger.info(f"Circuit breaker '{self.name}' loaded: state={self.state}, failures={self.failure_count}")
-
-    async def _persist_state_to_redis(self) -> None:
-        if self.redis_store:
-            data = {
-                "failure_count": self.failure_count,
-                "last_failure_time": self.last_failure_time,
-                "state": self.state,
-                "half_open_attempts": self.half_open_attempts,
-                "half_open_successes": self.half_open_successes,
-                "updated_at": time.time()
-            }
-            await self.redis_store.set_circuit_breaker_state(self.name, data)
-
-    async def is_open(self) -> bool:
-        """Check if circuit breaker is open (blocking calls)."""
-        await self._load_state_from_redis()
-        
-        async with self.lock:
-            if self.state == "CLOSED":
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-                return False
-            
-            if self.state == "OPEN":
-                if self.last_failure_time and (time.time() - self.last_failure_time > self.timeout):
-                    self.state = "HALF_OPEN"
-                    self.half_open_attempts = 0
-                    self.half_open_successes = 0
-                    logger.info(f"Circuit breaker '{self.name}' entering HALF_OPEN state")
-                    await self._persist_state_to_redis()
-                    if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                        METRIC_CB_OPEN.set(0.5)
-                    return False
-                
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(1.0)
-                return True
-            
-            if self.state == "HALF_OPEN":
-                if self.half_open_attempts >= self.half_open_max_calls:
-                    if self.half_open_successes >= self.success_threshold:
-                        self.state = "CLOSED"
-                        self.failure_count = 0
-                        self.last_failure_time = None
-                        logger.info(f"Circuit breaker '{self.name}' CLOSED after successful test calls")
-                        await self._persist_state_to_redis()
-                        if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                            METRIC_CB_OPEN.set(0.0)
-                        return False
-                    else:
-                        self.state = "OPEN"
-                        self.last_failure_time = time.time()
-                        logger.warning(f"Circuit breaker '{self.name}' reopened after failed test calls")
-                        await self._persist_state_to_redis()
-                        if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                            METRIC_CB_OPEN.set(1.0)
-                        return True
-                
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.5)
-                return False
-            
-            return False
-
-    async def record_failure(self) -> int:
-        """Record a failure and potentially open the circuit."""
-        await self._load_state_from_redis()
-        
-        async with self.lock:
-            if self.state == "HALF_OPEN":
-                self.half_open_attempts += 1
-                self.state = "OPEN"
-                self.last_failure_time = time.time()
-                logger.warning(f"Circuit breaker '{self.name}': HALF_OPEN test failed, reopening")
-                await self._persist_state_to_redis()
-                if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
-                    METRIC_CB_FAILURES.inc()
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(1.0)
-                return self.failure_count
-            
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            logger.warning(f"Circuit breaker '{self.name}': failure {self.failure_count}/{self.threshold}")
-            await self._persist_state_to_redis()
-            
-            if PROMETHEUS_ENABLED and METRIC_CB_FAILURES:
-                METRIC_CB_FAILURES.inc()
-            
-            if self.failure_count >= self.threshold:
-                self.state = "OPEN"
-                logger.critical(f"Circuit breaker '{self.name}' OPEN for {self.timeout}s")
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(1.0)
-            
-            return self.failure_count
-
-    async def record_success(self) -> None:
-        """Record a success and potentially close the circuit."""
-        await self._load_state_from_redis()
-        
-        async with self.lock:
-            if self.state == "HALF_OPEN":
-                self.half_open_attempts += 1
-                self.half_open_successes += 1
-                logger.info(f"Circuit breaker '{self.name}': HALF_OPEN test success ({self.half_open_successes}/{self.success_threshold})")
-                await self._persist_state_to_redis()
-                return
-            
-            if self.failure_count > 0:
-                self.failure_count = 0
-                self.last_failure_time = None
-                self.state = "CLOSED"
-                logger.info(f"Circuit breaker '{self.name}': reset after success")
-                await self._persist_state_to_redis()
-                if PROMETHEUS_ENABLED and METRIC_CB_OPEN:
-                    METRIC_CB_OPEN.set(0.0)
-
-    async def call(self, func: Callable, *args, **kwargs):
-        """Execute a function with circuit breaker protection."""
-        if await self.is_open():
-            raise Exception(f"Circuit breaker '{self.name}' is OPEN (state: {self.state})")
-        try:
-            result = await func(*args, **kwargs)
-            await self.record_success()
-            return result
-        except Exception:
-            await self.record_failure()
-            raise
 
 class RedisLock:
     RELEASE_LUA = """
@@ -1227,8 +843,6 @@ class RedisLock:
                 logger.warning("Lock lost during extend (key missing)")
                 self.lost = True
                 self.acquired_by_me = False
-                if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
-                    METRIC_REDIS_LOCK_FAILS.inc()
                 return False
 
             current_token = str(raw_val)
@@ -1236,8 +850,6 @@ class RedisLock:
                 logger.warning("Lock token mismatch on extend")
                 self.lost = True
                 self.acquired_by_me = False
-                if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
-                    METRIC_REDIS_LOCK_FAILS.inc()
                 return False
 
             await asyncio.wait_for(
@@ -1250,8 +862,6 @@ class RedisLock:
             logger.error(f"Error extending Redis lock: {e}")
             self.lost = True
             self.acquired_by_me = False
-            if PROMETHEUS_ENABLED and METRIC_REDIS_LOCK_FAILS:
-                METRIC_REDIS_LOCK_FAILS.inc()
             return False
 
     def should_extend(self) -> bool:
@@ -1285,16 +895,11 @@ async def async_fetch_json(
     params: Optional[Dict[str, Any]] = None,
     retries: int = 3,
     backoff: float = 1.5,
-    timeout: int = 15,
-    circuit_breaker: Optional[CircuitBreaker] = None
+    timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
     """
-    Enhanced JSON fetch with circuit breaker, categorized retries, and detailed logging.
+    Enhanced JSON fetch with categorized retries and detailed logging.
     """
-    if circuit_breaker and await circuit_breaker.is_open():
-        logger.warning(f"Circuit breaker open; skipping fetch {url}")
-        return None
-    
     session = await SessionManager.get_session()
     last_error = None
     retry_stats = {
@@ -1304,13 +909,6 @@ async def async_fetch_json(
         RetryCategory.TIMEOUT: 0,
         RetryCategory.UNKNOWN: 0
     }
-    
-    def on_retry_error(exc: Exception, attempt: int, category: str) -> None:
-        retry_stats[category] = retry_stats.get(category, 0) + 1
-        logger.debug(
-            f"Fetch retry {attempt}/{retries} | URL: {url[:80]} | "
-            f"Category: {category} | Error: {str(exc)[:100]}"
-        )
     
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
@@ -1358,9 +956,6 @@ async def async_fetch_json(
                 
                 data = await resp.json(loads=json_loads)
                 
-                if circuit_breaker:
-                    await circuit_breaker.record_success()
-                
                 if any(retry_stats.values()):
                     logger.info(
                         f"Fetch succeeded after retries | URL: {url[:80]} | "
@@ -1392,12 +987,6 @@ async def async_fetch_json(
             retry_stats[RetryCategory.UNKNOWN] += 1
             logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
-    
-    if circuit_breaker:
-        await circuit_breaker.record_failure()
-    
-    if PROMETHEUS_ENABLED and METRIC_FETCH_ERRORS:
-        METRIC_FETCH_ERRORS.inc()
     
     logger.error(
         f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
@@ -1459,23 +1048,11 @@ class RateLimitedFetcher:
         }
 
 class DataFetcher:
-    def __init__(self, api_base: str, max_parallel: Optional[int] = None, redis_store: Optional[RedisStateStore] = None):
+    def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
-        self.circuit_breaker_products = CircuitBreaker(
-            name="products_api",
-            redis_store=redis_store,
-            failure_threshold=5,
-            timeout=300
-        )
-        self.circuit_breaker_candles = CircuitBreaker(
-            name="candles_api",
-            redis_store=redis_store,
-            failure_threshold=5,
-            timeout=300
-        )
         self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
         self.fetch_stats = {
             "products_success": 0,
@@ -1485,7 +1062,7 @@ class DataFetcher:
         }
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
-        """Fetch products list with circuit breaker protection."""
+        """Fetch products list with rate limiting."""
         url = f"{self.api_base}/v2/products"
         
         async with self.semaphore:
@@ -1494,14 +1071,11 @@ class DataFetcher:
                 url,
                 retries=5,
                 backoff=2.0,
-                timeout=self.timeout,
-                circuit_breaker=self.circuit_breaker_products
+                timeout=self.timeout
             )
             
             if result:
                 self.fetch_stats["products_success"] += 1
-                if self.circuit_breaker_products.state == "OPEN":
-                    await self.circuit_breaker_products.record_success()
                 logger.debug(f"Products fetch successful | URL: {url}")
             else:
                 self.fetch_stats["products_failed"] += 1
@@ -1516,7 +1090,7 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """Fetch candles with circuit breaker and enhanced logging."""
+        """Fetch candles with enhanced logging."""
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1543,8 +1117,7 @@ class DataFetcher:
                 params=params,
                 retries=cfg.CANDLE_FETCH_RETRIES,
                 backoff=cfg.CANDLE_FETCH_BACKOFF,
-                timeout=self.timeout,
-                circuit_breaker=self.circuit_breaker_candles
+                timeout=self.timeout
             )
             
             if data:
@@ -1562,10 +1135,6 @@ class DataFetcher:
         """Get fetcher statistics."""
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
-        stats["circuit_breakers"] = {
-            "products": self.circuit_breaker_products.state,
-            "candles": self.circuit_breaker_candles.state
-        }
         return stats
 
 def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, Optional[str]]:
@@ -1574,13 +1143,9 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
             return False, "DataFrame is empty"
         
         if df["close"].isna().any() or (df["close"] <= 0).any():
-            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
-                METRIC_DATA_QUALITY_FAILURES.labels(reason="invalid_close").inc()
             return False, "Invalid close prices (NaN or <= 0)"
         
         if not df["timestamp"].is_monotonic_increasing:
-            if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
-                METRIC_DATA_QUALITY_FAILURES.labels(reason="timestamp_not_monotonic").inc()
             return False, "Timestamps not monotonic increasing"
         
         if len(df) < required_len:
@@ -1593,16 +1158,12 @@ def validate_candle_df(df: pd.DataFrame, required_len: int = 0) -> Tuple[bool, O
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 gaps = time_diffs[time_diffs > max_expected_gap]
                 if len(gaps) > 0:
-                    if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
-                        METRIC_DATA_QUALITY_FAILURES.labels(reason="candle_gaps").inc()
                     logger.warning(f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
         
         if len(df) >= 2:
             price_changes = (df["close"].pct_change().abs() * 100).dropna()
             extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
             if len(extreme_changes) > 0:
-                if PROMETHEUS_ENABLED and METRIC_DATA_QUALITY_FAILURES:
-                    METRIC_DATA_QUALITY_FAILURES.labels(reason="price_spike").inc()
                 logger.warning(f"Detected {len(extreme_changes)} extreme price changes (max: {extreme_changes.max():.2f}%)")
                 return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
         
@@ -1682,6 +1243,26 @@ def validate_indicator_series(series: pd.Series, name: str) -> pd.Series:
     except Exception as e:
         logger.error(f"Failed to validate indicator {name}: {e}")
         return pd.Series([0.0] * len(series), index=series.index)
+
+def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+    products_map: Dict[str, dict] = {}
+    if not api_products or not api_products.get("result"):
+        return products_map
+    valid_pattern = re.compile(r'^[A-Z0-9_]+$')
+    for p in api_products["result"]:
+        try:
+            symbol = p.get("symbol", "")
+            if not valid_pattern.match(symbol):
+                continue
+            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
+            if p.get("contract_type") == "perpetual_futures":
+                for pair_name in cfg.PAIRS:
+                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+                        products_map[pair_name] = {"id": p.get("id"), "symbol": p.get("symbol"), "contract_type": p.get("contract_type")}
+                        break
+        except Exception:
+            pass
+    return products_map
 
 @njit(fastmath=True, cache=False)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
@@ -1803,56 +1384,6 @@ def _vwap_daily_loop(
             
     return vwap
 
-def calculate_sma_numpy(series: pd.Series, period: int) -> pd.Series:
-    values = series.astype(np.float64).values
-    res = _sma_loop(values, period)
-    return validate_indicator_series(pd.Series(res, index=series.index), "SMA")
-
-def calculate_kalman_numpy(series: pd.Series, length: int, R: float = 0.01, Q: float = 0.1) -> pd.Series:
-    values = series.astype(np.float64).values
-    res = _kalman_loop(values, length, R, Q)
-    return pd.Series(res, index=series.index)
-
-def calculate_vwap_numpy(df: pd.DataFrame) -> pd.Series:
-    if df.empty: return pd.Series(dtype=float)
-    
-    h = df["high"].astype(np.float64).values
-    l = df["low"].astype(np.float64).values
-    c = df["close"].astype(np.float64).values
-    v = df["volume"].astype(np.float64).values
-    t = df["timestamp"].astype(np.int64).values
-    
-    res = _vwap_daily_loop(h, l, c, v, t)
-    return validate_indicator_series(pd.Series(res, index=df.index), "VWAP")
-
-def calculate_smooth_rsi_numpy(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
-    """Optimized Smooth RSI using Numba RMA and Numba Kalman."""
-    close = df["close"].astype(np.float64).values
-    
-    # Calculate Delta
-    delta = np.zeros_like(close)
-    delta[1:] = close[1:] - close[:-1]
-    
-    # Gain/Loss
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    
-    # Calculate RMA (Using the _ema_loop from previous answer, alpha = 1/len)
-    alpha = 1.0 / rsi_len
-    avg_gain = _ema_loop(gain, alpha)
-    avg_loss = _ema_loop(loss, alpha)
-    
-    # Calculate RSI
-    # Prevent div by zero
-    avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
-    rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    
-    # Smooth with Kalman
-    smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
-    
-    return validate_indicator_series(pd.Series(smooth_rsi, index=df.index), "SmoothRSI")
-
 @njit(fastmath=True, cache=False)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
     """Fast EMA calculation using Numba."""
@@ -1902,6 +1433,99 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 filt[i] = target
                 
     return filt
+
+@njit(fastmath=True, cache=False)
+def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
+    """Numba-compiled worm calculation loop - ~100x faster than Python"""
+    worm_arr = np.empty(rows, dtype=np.float64)
+    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+    worm_arr[0] = first_val
+    
+    for i in range(1, rows):
+        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
+        prev_worm = worm_arr[i - 1]
+        diff = src - prev_worm
+        sd_i = sd_arr[i]
+        
+        if np.isnan(sd_i):
+            delta = diff
+        else:
+            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
+        worm_arr[i] = prev_worm + delta
+    
+    return worm_arr
+
+@njit(fastmath=True, cache=False)
+def _calc_mmh_value_loop(temp_arr, rows):
+    """Numba-compiled value calculation loop"""
+    value_arr = np.zeros(rows, dtype=np.float64)
+    value_arr[0] = 1.0
+    
+    for i in range(1, rows):
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        v = t - 0.5 + 0.5 * prev_v
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    
+    return value_arr
+
+@njit(fastmath=True, cache=False)
+def _calc_mmh_momentum_loop(momentum_arr, rows):
+    """Numba-compiled momentum accumulation loop"""
+    for i in range(1, rows):
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+    return momentum_arr
+
+def calculate_sma_numpy(series: pd.Series, period: int) -> pd.Series:
+    values = series.astype(np.float64).values
+    res = _sma_loop(values, period)
+    return validate_indicator_series(pd.Series(res, index=series.index), "SMA")
+
+def calculate_kalman_numpy(series: pd.Series, length: int, R: float = 0.01, Q: float = 0.1) -> pd.Series:
+    values = series.astype(np.float64).values
+    res = _kalman_loop(values, length, R, Q)
+    return pd.Series(res, index=series.index)
+
+def calculate_vwap_numpy(df: pd.DataFrame) -> pd.Series:
+    if df.empty: return pd.Series(dtype=float)
+    
+    h = df["high"].astype(np.float64).values
+    l = df["low"].astype(np.float64).values
+    c = df["close"].astype(np.float64).values
+    v = df["volume"].astype(np.float64).values
+    t = df["timestamp"].astype(np.int64).values
+    
+    res = _vwap_daily_loop(h, l, c, v, t)
+    return validate_indicator_series(pd.Series(res, index=df.index), "VWAP")
+
+def calculate_smooth_rsi_numpy(df: pd.DataFrame, rsi_len: int, kalman_len: int) -> pd.Series:
+    """Optimized Smooth RSI using Numba RMA and Numba Kalman."""
+    close = df["close"].astype(np.float64).values
+    
+    # Calculate Delta
+    delta = np.zeros_like(close)
+    delta[1:] = close[1:] - close[:-1]
+    
+    # Gain/Loss
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    
+    # Calculate RMA (Using the _ema_loop, alpha = 1/len)
+    alpha = 1.0 / rsi_len
+    avg_gain = _ema_loop(gain, alpha)
+    avg_loss = _ema_loop(loss, alpha)
+    
+    # Calculate RSI
+    # Prevent div by zero
+    avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    
+    # Smooth with Kalman
+    smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
+    
+    return validate_indicator_series(pd.Series(smooth_rsi, index=df.index), "SmoothRSI")
 
 def calculate_ema_numpy(series: pd.Series, span: int) -> pd.Series:
     """Wrapper for Numba EMA."""
@@ -1991,49 +1615,6 @@ def calculate_ppo_numpy(df: pd.DataFrame, fast: int, slow: int, signal: int) -> 
     
     return pd.Series(ppo, index=df.index), pd.Series(ppo_sig, index=df.index)
 
-@njit(fastmath=True, cache=False)
-def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    """Numba-compiled worm calculation loop - ~100x faster than Python"""
-    worm_arr = np.empty(rows, dtype=np.float64)
-    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
-    worm_arr[0] = first_val
-    
-    for i in range(1, rows):
-        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-        prev_worm = worm_arr[i - 1]
-        diff = src - prev_worm
-        sd_i = sd_arr[i]
-        
-        if np.isnan(sd_i):
-            delta = diff
-        else:
-            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
-        worm_arr[i] = prev_worm + delta
-    
-    return worm_arr
-
-@njit(fastmath=True, cache=False)
-def _calc_mmh_value_loop(temp_arr, rows):
-    """Numba-compiled value calculation loop"""
-    value_arr = np.zeros(rows, dtype=np.float64)
-    value_arr[0] = 1.0
-    
-    for i in range(1, rows):
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = t - 0.5 + 0.5 * prev_v
-        value_arr[i] = max(-0.9999, min(0.9999, v))
-    
-    return value_arr
-
-@njit(fastmath=True, cache=False)
-def _calc_mmh_momentum_loop(momentum_arr, rows):
-    """Numba-compiled momentum accumulation loop"""
-    for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-    return momentum_arr
-
 def calculate_magical_momentum_hist(df: pd.DataFrame, period: int = 144, responsiveness: float = 0.9) -> pd.Series:
     try:
         if df is None or "close" not in df or df.empty:
@@ -2101,12 +1682,66 @@ def warmup_numba() -> None:
         sd    = np.random.random(length).astype(np.float64) * 0.01
 
         _calc_mmh_worm_loop(close, sd, length)
-        _calc_mmh_value_loop(np.random.random(length))
-        _calc_mmh_momentum_loop(np.random.random(length), length)
+        _calc_mmh_value_loop(np.random.random(length).astype(np.float64), length)
+        _calc_mmh_momentum_loop(np.random.random(length).astype(np.float64), length)
+        _sma_loop(close, 50)
+        _ema_loop(close, 0.1)
+        _kalman_loop(close, 21, 0.01, 0.1)
+        _rng_filter_loop(close, sd)
+        _vwap_daily_loop(close, close, close, close, np.arange(length, dtype=np.int64))
 
         logger.info("✅ Numba warm-up complete.")
     except Exception as e:
         logger.warning(f"Numba warm-up failed (non-fatal): {e}")
+
+indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
+
+async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
+    async with indicator_semaphore:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+def calculate_all_indicators_sync(df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame]) -> dict:
+    """
+    Calculate all indicators using Numba/NumPy optimizations.
+    """
+    results = {}
+    
+    # 1. PPO (Numba)
+    ppo, ppo_signal = calculate_ppo_numpy(
+        df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+    )
+    results['ppo'] = ppo
+    results['ppo_signal'] = ppo_signal
+    
+    # 2. Smooth RSI (Numba Kalman + Numba RMA)
+    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
+        df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
+    )
+    
+    # 3. VWAP (Numba Daily Reset)
+    if cfg.ENABLE_VWAP:
+        results['vwap'] = calculate_vwap_numpy(df_15m)
+    else:
+        results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
+    
+    # 4. MMH (Numba)
+    mmh = calculate_magical_momentum_hist(df_15m)
+    results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
+    
+    # 5. Cirrus Cloud (Numba)
+    if cfg.CIRRUS_CLOUD_ENABLED:
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(df_15m)
+        results['upw'] = upw
+        results['dnw'] = dnw
+    else:
+        results['upw'] = pd.Series(False, index=df_15m.index)
+        results['dnw'] = pd.Series(False, index=df_15m.index)
+    
+    # 6. RMA (Numba)
+    results['rma50_15'] = calculate_rma_numpy(df_15m["close"], cfg.RMA_50_PERIOD)
+    results['rma200_5'] = calculate_rma_numpy(df_5m["close"], cfg.RMA_200_PERIOD)
+    
+    return results
 
 def check_common_conditions(df_15m: pd.DataFrame, idx: int, is_buy: bool) -> bool:
     try:
@@ -2253,13 +1888,10 @@ class TelegramQueue:
         self.token = token
         self.chat_id = chat_id
         self.token_bucket = TokenBucket(cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
-        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=300, name="telegram_api")
 
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
-            await asyncio.wait_for(self.circuit_breaker.call(self._send_impl, message), timeout=30.0)
-            if PROMETHEUS_ENABLED and METRIC_ALERTS_SENT:
-                METRIC_ALERTS_SENT.labels(alert_type="general").inc()
+            await asyncio.wait_for(self._send_impl(message), timeout=30.0)
             return True
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
@@ -2330,26 +1962,6 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     body = "\n".join(bullets)
     return escape_markdown_v2(f"{headline}\n{body}")
 
-def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
-    products_map: Dict[str, dict] = {}
-    if not api_products or not api_products.get("result"):
-        return products_map
-    valid_pattern = re.compile(r'^[A-Z0-9_]+$')
-    for p in api_products["result"]:
-        try:
-            symbol = p.get("symbol", "")
-            if not valid_pattern.match(symbol):
-                continue
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
-            if p.get("contract_type") == "perpetual_futures":
-                for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
-                        products_map[pair_name] = {"id": p.get("id"), "symbol": p.get("symbol"), "contract_type": p.get("contract_type")}
-                        break
-        except Exception:
-            pass
-    return products_map
-
 class AlertDefinition(TypedDict):
     key: str
     title: str
@@ -2413,240 +2025,6 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
     
     return output
 
-class HealthTracker:
-    def __init__(self, sdb: RedisStateStore):
-        self.sdb = sdb
-
-    async def record_pair_result(self, pair: str, success: bool, info: Optional[Dict[str, Any]] = None) -> None:
-        if self.sdb.degraded:
-            return
-        key = f"health:pair:{pair}"
-        now = int(time.time())
-        payload = {"last_checked": now, "last_success": now if success else None, "success": bool(success)}
-        if info:
-            payload.update({"info": info})
-        await self.sdb.set_metadata(key, json_dumps(payload))
-
-    async def record_overall(self, summary: Dict[str, Any]) -> None:
-        if self.sdb.degraded:
-            return
-        key = "health:overall"
-        payload = {"ts": int(time.time()), "summary": summary}
-        await self.sdb.set_metadata(key, json_dumps(payload))
-
-class DeadMansSwitch:
-    def __init__(self, sdb: RedisStateStore, cooldown_seconds: int):
-        self.sdb = sdb
-        self.cooldown_seconds = cooldown_seconds
-        self.alert_sent = False
-        self.last_check_time = 0.0
-        self.startup_time = time.time()
-        self.alert_recovered = False
-        self.heartbeat_key = "heartbeat:timestamp"
-
-    def _parse_last_success(self, last_success: Optional[str]) -> Optional[int]:
-        if not last_success:
-            return None
-        try:
-            return int(last_success)
-        except Exception:
-            try:
-                dt = datetime.fromisoformat(last_success)
-                return int(dt.replace(tzinfo=timezone.utc).timestamp())
-            except Exception:
-                return None
-
-    async def update_heartbeat(self) -> None:
-        if self.sdb.degraded:
-            return
-        try:
-            heartbeat_ttl = 1800
-            await self.sdb._safe_redis_op(
-                self.sdb._redis.set(self.heartbeat_key, str(int(time.time())), ex=heartbeat_ttl),
-                timeout=2.0,
-                op_name="update_heartbeat"
-            )
-        except Exception as e:
-            logger.error(f"Failed to update heartbeat: {e}")
-
-    async def should_alert(self) -> bool | str:
-        try:
-            now = time.time()
-            if now - self.startup_time < Constants.STARTUP_GRACE_PERIOD:
-                return False
-            if now - self.last_check_time < 60:
-                return False
-            self.last_check_time = now
-            
-            heartbeat_str = await self.sdb.get_metadata(self.heartbeat_key)
-            if not heartbeat_str:
-                return False
-            
-            heartbeat_ts = self._parse_last_success(heartbeat_str)
-            if heartbeat_ts is None:
-                return False
-            
-            time_since_heartbeat = now - heartbeat_ts
-            
-            if time_since_heartbeat <= self.cooldown_seconds and self.alert_sent and not self.alert_recovered:
-                self.alert_recovered = True
-                return "RECOVERED"
-            
-            if time_since_heartbeat > self.cooldown_seconds and not self.alert_sent:
-                self.alert_sent = True
-                self.alert_recovered = False
-                return True
-            
-            if time_since_heartbeat <= self.cooldown_seconds and self.alert_sent:
-                self.alert_sent = False
-            
-            return False
-        except Exception as e:
-            logger.error(f"DeadMansSwitch check failed: {e}")
-            return False
-
-class HealthHttpServer:
-    def __init__(self, port: int):
-        self.port = port
-        self.app: Optional[web.Application] = None
-        self.runner: Optional[web.AppRunner] = None
-        self.site: Optional[web.TCPSite] = None
-
-    async def start(self):
-        try:
-            self.app = web.Application()
-            self.app.add_routes([web.get('/health', self.handle_health)])
-            self.runner = web.AppRunner(self.app)
-            await self.runner.setup()
-            self.site = web.TCPSite(self.runner, '0.0.0.0', self.port)
-            await self.site.start()
-            logger.info(f"Health HTTP server started on port {self.port}")
-        except Exception as e:
-            logger.error(f"Failed to start health HTTP server: {e}")
-
-    async def stop(self):
-        try:
-            if self.site:
-                await self.site.stop()
-            if self.runner:
-                await self.runner.cleanup()
-            logger.debug("Health HTTP server stopped")
-        except Exception as e:
-            logger.error(f"Error stopping health server: {e}")
-
-    async def handle_health(self, request: web.Request) -> web.Response:
-        try:
-            process = psutil.Process()
-            container_memory_mb = process.memory_info().rss / 1024 / 1024
-            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-            status = {
-                "status": "ok" if container_memory_mb < limit_mb else "degraded",
-                "version": __version__,
-                "memory_mb": round(container_memory_mb, 2),
-                "memory_limit_mb": round(limit_mb, 2),
-                "time": format_ist_time(time.time()),
-                "trace_id": TRACE_ID.get(),
-            }
-            return web.json_response(status)
-        except Exception as e:
-            return web.json_response({"status": "error", "error": str(e)}, status=500)
-
-class WatchdogTask:
-    def __init__(self, timeout_seconds: int, grace_seconds: int = 120):
-        self.timeout_seconds = timeout_seconds
-        self.grace_seconds = grace_seconds
-        self.start_time = time.time()
-        self.task: Optional[asyncio.Task] = None
-
-    async def _watchdog_loop(self):
-        try:
-            max_runtime = self.timeout_seconds + self.grace_seconds
-            while not shutdown_event.is_set():
-                await asyncio.sleep(10)
-                elapsed = time.time() - self.start_time
-                if elapsed > max_runtime:
-                    logger.critical(f"🚨 WATCHDOG: Process exceeded max runtime ({max_runtime}s). Force exiting.")
-                    os._exit(1)
-        except asyncio.CancelledError:
-            logger.debug("Watchdog task cancelled")
-        except Exception as e:
-            logger.error(f"Watchdog error: {e}")
-
-    def start(self):
-        if self.task is None:
-            self.task = asyncio.create_task(self._watchdog_loop())
-            logger.info(f"Watchdog started (max runtime: {self.timeout_seconds + self.grace_seconds}s)")
-
-    async def stop(self):
-        if self.task and not self.task.done():
-            self.task.cancel()
-            try:
-                await asyncio.wait_for(self.task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            self.task = None
-            logger.debug("Watchdog stopped")
-
-indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
-
-async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
-    async with indicator_semaphore:
-        return await asyncio.to_thread(func, *args, **kwargs)
-
-async def _heartbeat_updater(dms: DeadMansSwitch, sdb: RedisStateStore) -> None:
-    try:
-        while not shutdown_event.is_set():
-            await asyncio.sleep(60)
-            await dms.update_heartbeat()
-    except asyncio.CancelledError:
-        logger.debug("Heartbeat updater cancelled")
-    except Exception as e:
-        logger.error(f"Heartbeat updater error: {e}")
-
-def calculate_all_indicators_sync(df_15m: pd.DataFrame, df_5m: pd.DataFrame, df_daily: Optional[pd.DataFrame]) -> dict:
-    """
-    Calculate all indicators using Numba/NumPy optimizations.
-    """
-    results = {}
-    
-    # 1. PPO (Numba)
-    # Using the calculate_ppo_numpy from the previous step
-    ppo, ppo_signal = calculate_ppo_numpy(
-        df_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
-    )
-    results['ppo'] = ppo
-    results['ppo_signal'] = ppo_signal
-    
-    # 2. Smooth RSI (Numba Kalman + Numba RMA)
-    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
-        df_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
-    )
-    
-    # 3. VWAP (Numba Daily Reset)
-    if cfg.ENABLE_VWAP:
-        results['vwap'] = calculate_vwap_numpy(df_15m)
-    else:
-        results['vwap'] = pd.Series(index=df_15m.index, dtype=float)
-    
-    # 4. MMH (Numba - already optimized in your script)
-    mmh = calculate_magical_momentum_hist(df_15m)
-    results['mmh'] = mmh.fillna(0).replace([np.inf, -np.inf], 0)
-    
-    # 5. Cirrus Cloud (Numba)
-    if cfg.CIRRUS_CLOUD_ENABLED:
-        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(df_15m)
-        results['upw'] = upw
-        results['dnw'] = dnw
-    else:
-        results['upw'] = pd.Series(False, index=df_15m.index)
-        results['dnw'] = pd.Series(False, index=df_15m.index)
-    
-    # 6. RMA (Numba)
-    results['rma50_15'] = calculate_rma_numpy(df_15m["close"], cfg.RMA_50_PERIOD)
-    results['rma200_5'] = calculate_rma_numpy(df_5m["close"], cfg.RMA_200_PERIOD)
-    
-    return results
-
 async def evaluate_pair_and_alert(
     pair_name: str,
     df_15m: pd.DataFrame,
@@ -2669,16 +2047,10 @@ async def evaluate_pair_and_alert(
             logger_pair.warning(f"Insufficient closed candles for {pair_name}")
             return None
    
-        # OPTIMIZED: Calculate all indicators in one thread call
-        indicator_start = time.time()
+        # Calculate all indicators in one thread call
         indicators = await asyncio.to_thread(
             calculate_all_indicators_sync, df_15m, df_5m, df_daily
         )
-        
-        if PROMETHEUS_ENABLED and METRIC_INDICATOR_CALC_TIME:
-            METRIC_INDICATOR_CALC_TIME.labels(indicator="all_batch").observe(
-                time.time() - indicator_start
-            )
         
         # Extract indicators from results
         ppo = indicators['ppo']
@@ -2921,9 +2293,6 @@ async def evaluate_pair_and_alert(
 
             await telegram_queue.send(msg)
 
-            if PROMETHEUS_ENABLED and METRIC_ALERTS_SENT:
-                for _, _, alert_key in alerts_to_send:
-                    METRIC_ALERTS_SENT.labels(alert_type=alert_key).inc()
             new_state = {
                 "state": "ALERT_SENT",
                 "ts": int(time.time()),
@@ -2961,9 +2330,6 @@ async def evaluate_pair_and_alert(
                 "sell_reason": context.get("candle_rejection_reason_sell"),
             }
         }
-
-        if PROMETHEUS_ENABLED and METRIC_PAIR_PROCESSING_TIME:
-            METRIC_PAIR_PROCESSING_TIME.labels(pair=pair_name).observe(time.time() - pair_start_time)
 
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
@@ -3027,7 +2393,6 @@ async def check_pair(pair_name: str, fetcher: DataFetcher, products_map: Dict[st
         df_5m  = pd.DataFrame(data_5m)  if data_5m  is not None else None
         df_daily = pd.DataFrame(data_daily) if data_daily is not None else None
 
-
         valid_15m, reason_15m = validate_candle_df(df_15m, 220)
         valid_5m, reason_5m = validate_candle_df(df_5m, 280)
     
@@ -3049,7 +2414,6 @@ async def worker_process_pair(
     telegram_queue: TelegramQueue,
     correlation_id: str,
     reference_time: int,
-    memory_monitor: MemoryMonitor,
     lock: RedisLock,
     results: List[Tuple[str, Dict[str, Any]]],
     results_lock: asyncio.Lock
@@ -3100,30 +2464,9 @@ async def worker_process_pair(
                 else:
                     if cfg.DEBUG_MODE:
                         logger_worker.debug(f"Worker {worker_id}: {pair_name} returned None")
-                    if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
-                        METRIC_FAILED_PAIRS.inc()
                 
             except Exception as e:
                 logger_worker.error(f"Worker {worker_id} error processing {pair_name}: {e}")
-                if PROMETHEUS_ENABLED and METRIC_FAILED_PAIRS:
-                    METRIC_FAILED_PAIRS.inc()
-            
-            # OPTIMIZATION: Memory check with GC trigger
-            if worker_id == 0 and memory_monitor.should_check():
-                import gc
-                used_bytes, mem_percent = memory_monitor.check_memory()
-                if PROMETHEUS_ENABLED and METRIC_MEMORY_USAGE:
-                    METRIC_MEMORY_USAGE.set(float(used_bytes) / 1048576.0)
-                
-                # If memory is > 70% (warn level), force cleanup
-                if mem_percent > 70.0:
-                    logger_worker.debug(f"Worker {worker_id}: Memory at {mem_percent:.1f}%, triggering GC")
-                    gc.collect()
-                
-                if memory_monitor.is_critical():
-                    logger_worker.critical(f"🚨 Worker {worker_id}: Memory critical ({mem_percent:.1f}%)")
-                    pair_queue.task_done()
-                    break
             
             # Lock extension check
             if lock.should_extend():
@@ -3150,18 +2493,11 @@ async def process_pairs_with_workers(
     state_db: RedisStateStore,
     telegram_queue: TelegramQueue,
     correlation_id: str,
-    memory_monitor: MemoryMonitor,
     lock: RedisLock,
     reference_time: int
 ) -> List[Tuple[str, Dict[str, Any]]]:
     """
     Process all pairs using a worker pool architecture.
-    
-    This is the key performance optimization:
-    - Creates a queue of pairs to process
-    - Spawns multiple workers that process pairs concurrently
-    - Workers pick up new pairs as soon as they finish the current one
-    - Much more efficient than batch processing with wait times
     """
     logger_main = logging.getLogger("macd_bot.worker_pool")
     
@@ -3174,7 +2510,7 @@ async def process_pairs_with_workers(
     results: List[Tuple[str, Dict[str, Any]]] = []
     results_lock = asyncio.Lock()
     
-    # Determine number of workers (use MAX_PARALLEL_FETCH as worker count)
+    # Determine number of workers
     num_workers = cfg.MAX_PARALLEL_FETCH
     logger_main.info(f"📊 Processing {len(pairs_to_process)} pairs with {num_workers}-worker pool")
     
@@ -3185,8 +2521,7 @@ async def process_pairs_with_workers(
             worker_process_pair(
                 worker_id, pair_queue, fetcher, products_map,
                 state_db, telegram_queue, correlation_id,
-                reference_time, memory_monitor, lock,
-                results, results_lock
+                reference_time, lock, results, results_lock
             )
         )
         workers.append(worker)
@@ -3203,7 +2538,7 @@ async def process_pairs_with_workers(
     
     return results
 
-async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
+async def run_once() -> bool:
     """
     Single pass through all configured pairs.
     Returns True if the run completed successfully, False otherwise.
@@ -3216,55 +2551,40 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
     reference_time = get_trigger_timestamp()
     logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
 
-    processed_pairs = set()
-    failed_pairs   = set()
-    alerts_sent    = 0
+    alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
 
-    memory_monitor = MemoryMonitor(Constants.MEMORY_LIMIT_PERCENT)
-    local_health_server: Optional[HealthHttpServer] = None
     lock_acquired = False
     lock: Optional[RedisLock] = None
-    watchdog: Optional[WatchdogTask] = None
 
     try:
-        watchdog = WatchdogTask(cfg.RUN_TIMEOUT_SECONDS, grace_seconds=120)
-        watchdog.start()
-
-        if HEALTH_SERVER_ENABLED:
-            local_health_server = HealthHttpServer(HEALTH_HTTP_PORT)
-            await local_health_server.start()
-
-        if memory_monitor.is_critical():
-            mem_percent = memory_monitor.check_memory()[1]
-            logger_run.critical(f"🚨 Memory limit exceeded at startup ({mem_percent}%)")
+        # Check memory at startup
+        process = psutil.Process()
+        container_memory_mb = process.memory_info().rss / 1024 / 1024
+        limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+        
+        if container_memory_mb >= limit_mb:
+            logger_run.critical(f"🚨 Memory limit exceeded at startup ({container_memory_mb:.1f}MB / {limit_mb:.1f}MB)")
             return False
 
-        # ---- Redis connection ----
-        if existing_redis is not None:
-            sdb = existing_redis
-            logger_run.debug("Using persistent Redis connection")
-        else:
-            sdb = RedisStateStore(cfg.REDIS_URL)
-            await sdb.connect()
-            logger_run.debug("Created new Redis connection")
+        # Redis connection
+        sdb = RedisStateStore(cfg.REDIS_URL)
+        await sdb.connect()
+        logger_run.debug("Redis connection established")
 
         try:
             if sdb.degraded and not sdb.degraded_alerted:
-                logger_run.critical("⚠️  Redis is in degraded mode – alert deduplication disabled!")
+                logger_run.critical("⚠️ Redis is in degraded mode – alert deduplication disabled!")
                 telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
-                    f"⚠️  {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                    f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
                     f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
                     f"Time: {format_ist_time()}"
                 ))
                 sdb.degraded_alerted = True
 
-            fetcher = DataFetcher(cfg.DELTA_API_BASE, redis_store=sdb)
+            fetcher = DataFetcher(cfg.DELTA_API_BASE)
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-
-            global health_tracker
-            health_tracker = HealthTracker(sdb)
 
             lock = RedisLock(sdb._redis, "macd_bot_run")
             lock_acquired = await lock.acquire(timeout=5.0)
@@ -3273,19 +2593,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                 return False
 
             try:
-                dms = DeadMansSwitch(sdb, cfg.DEAD_MANS_COOLDOWN_SECONDS)
-                await dms.update_heartbeat()
-
-                dms_result = await dms.should_alert()
-                if dms_result == "RECOVERED":
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"✅ {cfg.BOT_NAME} - BOT RECOVERED\nBot is running normally again."
-                    ))
-                elif dms_result is True:
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️  {cfg.BOT_NAME} - DEAD MAN'S SWITCH ALERT"
-                    ))
-
                 if cfg.SEND_TEST_MESSAGE:
                     await telegram_queue.send(escape_markdown_v2(
                         f"🚀 Unified Bot - Run Started\n"
@@ -3293,7 +2600,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                         f"Corr. ID: {correlation_id}"
                     ))
 
-                # ---- products cache ----
+                # Products cache (8-hour TTL)
                 PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
                 now = time.time()
                 if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
@@ -3303,7 +2610,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                         logger_run.error("Failed to fetch products map")
                         return False
                     PRODUCTS_CACHE["data"] = prod_resp
-                    PRODUCTS_CACHE["until"] = now + 28_800          # 8 h
+                    PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
                     run_once._products_cache = PRODUCTS_CACHE
                 else:
                     logger_run.debug("Using cached products list")
@@ -3318,57 +2625,35 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
 
                 logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
 
-                heartbeat_task = asyncio.create_task(_heartbeat_updater(dms, sdb))
-
                 all_results = await process_pairs_with_workers(
                     fetcher, products_map, pairs_to_process,
                     sdb, telegram_queue, correlation_id,
-                    memory_monitor, lock, reference_time
+                    lock, reference_time
                 )
 
-                heartbeat_task.cancel()
-                try:
-                    await asyncio.wait_for(heartbeat_task, timeout=1.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-
-                await dms.update_heartbeat()
-
-                # ---- stats & summary ----
+                # Stats & summary
                 fetcher_stats = fetcher.get_stats()
                 logger_run.info(
                     f"📡 Fetch stats | "
                     f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
-                    f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌ | "
-                    f"Batch fetches: {fetcher_stats.get('batch_fetches', 0)} "
-                    f"({fetcher_stats.get('parallel_fetches', 0)} parallel)"
+                    f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
                 )
 
                 run_duration = time.time() - start_time
-                used_mb = memory_monitor.check_memory()[0] / 1024 / 1024
+                container_memory_mb = process.memory_info().rss / 1024 / 1024
                 redis_status = "OK" if not sdb.degraded else "DEGRADED"
                 summary = (
                     f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(all_results)} pairs | "
-                    f"{alerts_sent} alerts | Mem: {int(used_mb)}MB | Redis: {redis_status}"
+                    f"{alerts_sent} alerts | Mem: {int(container_memory_mb)}MB | Redis: {redis_status}"
                 )
                 logger_run.info(summary)
 
                 if alerts_sent > MAX_ALERTS_PER_RUN:
                     await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️  HIGH VOLUME: {alerts_sent} alerts | "
-                        f"Pairs: {len(all_results)} | Failed: {len(failed_pairs)}"
+                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
+                        f"Pairs: {len(all_results)}"
                     ))
 
-                if PROMETHEUS_ENABLED and METRIC_RUN_DURATION:
-                    METRIC_RUN_DURATION.observe(run_duration)
-
-                if cfg.ENABLE_HEALTH_TRACKER:
-                    await health_tracker.record_overall({
-                        "pairs_processed": len(all_results),
-                        "alerts_sent": alerts_sent,
-                        "duration": run_duration,
-                        "correlation_id": correlation_id
-                    })
                 return True
 
             except asyncio.TimeoutError:
@@ -3384,9 +2669,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                     logger_run.debug("Lock not acquired by this instance, skipping release")
 
         finally:
-            # Close only if we created the connection
-            if existing_redis is None:
-                await sdb.close()
+            await sdb.close()
 
     except asyncio.CancelledError:
         logger_run.info("Run cancelled (Task Cancellation)")
@@ -3399,16 +2682,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
             pass
         return False
     finally:
-        if watchdog:
-            await watchdog.stop()
-        if local_health_server:
-            try:
-                await local_health_server.stop()
-                logger_run.debug("Health server stopped")
-            except Exception as e:
-                logger_run.error(f"Failed to stop health server: {e}")
-
-        # ---- final memory cleanup ----
+        # Final memory cleanup
         try:
             if 'all_results' in locals():
                 del all_results
@@ -3416,7 +2690,6 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
                 del products_map
             if 'fetcher' in locals():
                 del fetcher
-            import gc
             gc.collect()
             logger_run.debug("Final cleanup completed")
         except Exception as e:
@@ -3425,6 +2698,7 @@ async def run_once(existing_redis: Optional[RedisStateStore] = None) -> bool:
         await SessionManager.close_session()
         TRACE_ID.set("")
 
+# Try to use uvloop for better performance
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -3434,7 +2708,6 @@ except ImportError:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
-    parser.add_argument("--once", action="store_true", help="Run one pass and exit")
     parser.add_argument("--debug", action="store_true", help="Set logger to DEBUG")
     args = parser.parse_args()
 
@@ -3444,89 +2717,20 @@ if __name__ == "__main__":
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
-    SHOULD_LOOP = cfg.ENABLE_AUTO_RESTART
-    if args.once:
-        SHOULD_LOOP = False
-        logger.info("CLI override: --once flag detected, disabling auto-restart.")
+    # Warm up Numba JIT compiler
+    warmup_numba()
 
-    # ------------------------------------------------------
-    #  OPTIMIZATION: Persistent Redis connection for loop mode
-    # ------------------------------------------------------
-    async def main_lifecycle() -> int:
-        redis_store = RedisStateStore(cfg.REDIS_URL)
-        await redis_store.connect()
-        warmup_numba()                       # ① JIT warm-up
-        attempt = 0
-        max_attempts = cfg.AUTO_RESTART_MAX_RETRIES
-
-        try:
-            while attempt < max_attempts:
-                attempt += 1
-                logger.info(f"Starting bot – attempt {attempt}/{max_attempts}")
-                try:
-                    success = await run_once(existing_redis=redis_store)
-                    if success:
-                        logger.info("Bot completed successfully – exiting loop")
-                        return 0
-                    else:
-                        logger.warning(f"Bot run returned False on attempt {attempt}/{max_attempts}")
-                        if attempt >= max_attempts:
-                            logger.critical("Maximum restart attempts reached – giving up")
-                            return 1
-                        cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
-                        logger.warning(f"Sleeping {cooldown}s before next restart...")
-                        await asyncio.sleep(cooldown)
-                except (asyncio.CancelledError, KeyboardInterrupt):
-                    logger.info("Bot stopped by timeout or user interrupt")
-                    return 130
-                except Exception as exc:
-                    logger.critical(f"Bot crashed on attempt {attempt}/{max_attempts}: {exc}", exc_info=True)
-                    if attempt >= max_attempts:
-                        logger.critical("Maximum restart attempts reached – giving up")
-                        return 1
-                    cooldown = cfg.AUTO_RESTART_COOLDOWN_SEC
-                    logger.warning(f"Sleeping {cooldown}s before next restart...")
-                    await asyncio.sleep(cooldown)
-            return 1
-
-        finally:
-            await redis_store.close()
-            logger.info("Redis connection closed")
-
-    # ------------------------------------------------------
-    #  Branch:  LOOP  (auto-restart enabled)
-    # ------------------------------------------------------
-    if SHOULD_LOOP:
-        try:
-            exit_code = asyncio.run(main_lifecycle())
-            sys.exit(exit_code)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            sys.exit(130)
-        except Exception as exc:
-            logger.critical(f"Fatal error in main lifecycle: {exc}", exc_info=True)
+    try:
+        success = asyncio.run(run_once())
+        if success:
+            logger.info("✅ Bot run completed successfully")
+            sys.exit(0)
+        else:
+            logger.error("❌ Bot run failed")
             sys.exit(1)
-        finally:
-            log_listener.stop()              # ② stop queue thread
-
-    # ------------------------------------------------------
-    #  Branch:  SINGLE RUN
-    # ------------------------------------------------------
-    else:
-        warmup_numba()                       # ① JIT warm-up
-        try:
-            success = asyncio.run(run_once())
-            if success:
-                logger.info("✅ Bot run completed successfully")
-                sys.exit(0)
-            else:
-                logger.error("❌ Bot run failed")
-                sys.exit(1)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            logger.info("Bot stopped by timeout or user")
-            sys.exit(130)
-        except Exception as exc:
-            logger.critical(f"Fatal error: {exc}", exc_info=True)
-            sys.exit(1)
-        finally:
-            log_listener.stop()              # ② stop queue thread
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Bot stopped by timeout or user")
+        sys.exit(130)
+    except Exception as exc:
+        logger.critical(f"Fatal error: {exc}", exc_info=True)
+        sys.exit(1)
