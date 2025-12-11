@@ -731,15 +731,16 @@ class DataFetcher:
                 )
             return data
 
-        def get_stats(self) -> Dict[str, int]:
-    
-            return {
-                "products_success": int(self.fetch_stats.get("products_success", 0)),
-                "products_failed": int(self.fetch_stats.get("products_failed", 0)),
-                "candles_success": int(self.fetch_stats.get("candles_success", 0)),
-                "candles_failed": int(self.fetch_stats.get("candles_failed", 0)),
-            }
-
+    def get_stats(self) -> Dict[str, int]:
+        """
+        Return a snapshot of fetch success/failure counters.
+        """
+        return {
+            "products_success": int(self.fetch_stats.get("products_success", 0)),
+            "products_failed": int(self.fetch_stats.get("products_failed", 0)),
+            "candles_success": int(self.fetch_stats.get("candles_success", 0)),
+            "candles_failed": int(self.fetch_stats.get("candles_failed", 0)),
+        }
 
 # -----------------------------
 # Numba kernels
