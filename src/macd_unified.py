@@ -24,6 +24,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit
+from collections import deque, defaultdict
 
 # ============================================================================
 # PERFORMANCE ENHANCEMENT: Use orjson for faster JSON operations
