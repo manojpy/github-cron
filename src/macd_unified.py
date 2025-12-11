@@ -1437,11 +1437,7 @@ class RedisLock:
             self.token = None
             self.acquired_by_me = False
 
-_ESCAPE_RE = re.compile(r'[_*
-
-\[\]
-
-()~`>#+-=|{}.!]')
+_ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
 def escape_markdown_v2(text: str) -> str:
     if not isinstance(text, str):
