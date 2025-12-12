@@ -1,0 +1,61 @@
+# Git files
+.git
+.gitignore
+.gitlab-ci.yml
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+.eggs
+
+# Virtual environments
+venv
+env
+ENV
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Documentation
+README.md
+*.md
+docs/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+tests/
+test_*
+*_test.py
+
+# CI/CD (kept for reference but not needed in image)
+.github/
+.gitlab/
+
+# Local development
+.env
+.env.local
+*.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
