@@ -1,4 +1,4 @@
-name: Run Unified MACD Bot
+name: Run Unified MACD Bot (Optimized Native)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ on:
         required: false
         type: boolean
         default: false
+  # Used by cron-jobs.org or external cron services
   repository_dispatch:
     types: [cron_trigger]
 
@@ -17,8 +18,8 @@ concurrency:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
-    # Reduced timeout as native execution is much faster
+    # --- IMPROVEMENT: Pinning to Ubuntu 24.04 LTS for stability and predictability ---
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     
     permissions:
@@ -32,28 +33,32 @@ jobs:
           echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
 
-      # OPTIMIZED: Checkout full code (needed for native run)
+      # 1. Checkout full code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # OPTIMIZED: Setup uv for lightning-fast dependency install
-      - name: Install uv
+      # 2. Setup uv for lightning-fast dependency install
+      - name: Install uv and Restore Cache
         uses: astral-sh/setup-uv@v1
         with:
           enable-cache: true
           cache-dependency-glob: "requirements.txt"
+        # CRITICAL FIX: Skip this step if the cache service fails (the intermittent GitHub error)
+        continue-on-error: true 
 
-      # OPTIMIZED: Setup Python 3.11
-      - name: Set up Python
+      # 3. Setup Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # OPTIMIZED: Install dependencies directly (No Docker overhead)
-      # Replicates the specific pycares/aiodns fix from your Dockerfile
-      - name: Install dependencies
+      # 4. Install dependencies directly on the runner
+      - name: Install dependencies (uv)
         run: |
+          echo "Installing Python dependencies..."
+          # Fix the pycares / aiodns issue locally
           uv pip install --system pycares==4.4.0 aiodns==3.2.0
+          # Install everything else from requirements.txt
           uv pip install --system -r requirements.txt
 
       - name: Set trigger timestamp
@@ -62,41 +67,32 @@ jobs:
           TS=$(date +%s)
           echo "ts=$TS" >> $GITHUB_OUTPUT
 
-      # OPTIMIZED: Run Python directly on "Bare Metal"
-      # No CPU limits, No Memory limits (Runner has 7GB RAM / 2 vCPUs)
-      - name: Run trading bot
+      # 5. Run Python directly
+      - name: Run trading bot (Native Execution)
         id: run_bot
         env:
-          # Secrets
+          # Secrets (retrieved from GitHub Secrets)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
-          # Config
+          # Config & Metadata
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
           CONFIG_FILE: config_macd.json
           TZ: Asia/Kolkata
-          # Metadata
           TRIGGER_TIMESTAMP: ${{ steps.timestamp.outputs.ts }}
-          GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-          GITHUB_WORKFLOW: ${{ github.workflow }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          echo "🤖 Starting trading bot (Native Mode)..."
+          echo "🤖 Starting wrapper.py..."
           python wrapper.py
 
       # Reporting
       - name: Log execution summary
         if: always()
-        run: |
-          echo "📊 Execution Summary:"
-          echo "  - Status: ${{ job.status }}"
-          echo "  - Duration: $(date)"
+        run: echo "📊 Execution Status: ${{ job.status }}"
 
       - name: Notify on failure
         if: failure()
         run: |
           echo "❌ Bot execution failed"
-          echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "🔗 Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
