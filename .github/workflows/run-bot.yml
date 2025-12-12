@@ -1,4 +1,4 @@
-name: Run Unified MACD Bot (optimized)
+name: Run Unified MACD Bot
 
 on:
   workflow_dispatch:
@@ -15,79 +15,49 @@ concurrency:
   group: trading-bot-execution
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
+
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-
     permissions:
       packages: read
-      deployments: write
 
     steps:
-      - name: Log execution context (short)
+      - name: Log execution context
         run: |
-          echo "Triggered via: ${{ github.event_name }} | Run: ${{ github.run_id }} | Num: ${{ github.run_number }}"
+          echo "🚀 Triggered via: ${{ github.event_name }}"
+          echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+          echo "📋 Run ID: ${{ github.run_id }}"
 
-      # Only checkout config (as before)
-      - name: Checkout config
-        uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          sparse-checkout: config_macd.json
-          sparse-checkout-cone-mode: false
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # NOTE: If your GHCR image is public, you can skip docker login to save time.
-      # If the image is private, uncomment the login step below.
-      # - name: Log in to GHCR
-      #   uses: docker/login-action@v3
-      #   with:
-      #     registry: ghcr.io
-      #     username: ${{ github.actor }}
-      #     password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull specific image tag (fast & reproducible)
-        id: pull_image
+      - name: Pull image
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
-          echo "Pulling $IMAGE..."
-          START=$(date +%s)
-          if docker pull --quiet "$IMAGE"; then
-            END=$(date +%s)
-            echo "pulled=true" >> $GITHUB_OUTPUT
-            echo "pull_seconds=$((END-START))" >> $GITHUB_OUTPUT
-          else
-            echo "pulled=false" >> $GITHUB_OUTPUT
-            echo "Failed to pull $IMAGE"
-            exit 1
-          fi
+          docker pull "$IMAGE"
+          docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
 
       - name: Set trigger timestamp
         id: timestamp
-        run: |
-          TS=$(date +%s)
-          echo "ts=$TS" >> $GITHUB_OUTPUT
+        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
 
-      - name: Validate configuration
-        run: |
-          if [ ! -f config_macd.json ]; then
-            echo "config_macd.json not found"
-            exit 1
-          fi
-          echo "Config present"
-
-      - name: Run trading bot (docker run)
+      - name: Run trading bot
         id: run_bot
         env:
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
-          set -o pipefail
-          IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
-          echo "Starting container from $IMAGE"
           docker run --rm \
             --name trading-bot-${{ github.run_id }} \
             --memory="512m" --memory-swap="512m" --cpus="1.0" \
-            --security-opt no-new-privileges \
-            --read-only \
+            --security-opt no-new-privileges --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=100m \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -95,19 +65,19 @@ jobs:
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e CONFIG_FILE=config_macd.json \
             -e TZ=Asia/Kolkata \
+            -e LOG_JSON=false \
+            -e FILE_LOGGING=false \
             -e DEBUG_MODE="$DEBUG_MODE" \
             -e TRIGGER_TIMESTAMP="${{ steps.timestamp.outputs.ts }}" \
-            -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
+            -e GITHUB_SHA="${{ github.sha }}" \
+            -e GITHUB_RUN_ID="${{ github.run_id }}" \
+            -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
+            -e GITHUB_WORKFLOW="${{ github.workflow }}" \
+            -e GITHUB_REPOSITORY="${{ github.repository }}" \
             "$IMAGE"
-          EXIT_CODE=$?
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Bot failed with $EXIT_CODE"
-            exit $EXIT_CODE
-          fi
 
-      - name: Log execution summary
-        if: always()
+      - name: Notify on failure
+        if: failure()
         run: |
-          echo "RunID: ${{ github.run_id }}, Pulled: ${{ steps.pull_image.outputs.pulled }}, PullTimeSec: ${{ steps.pull_image.outputs.pull_seconds || 'N/A' }}"
-          echo "ExitCode: ${{ steps.run_bot.outputs.exit_code || 'N/A' }}"
+          echo "❌ Bot execution failed"
+          echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
