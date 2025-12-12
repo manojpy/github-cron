@@ -11,37 +11,27 @@ on:
   repository_dispatch:
     types: [cron_trigger]
 
-# Prevent concurrent runs to avoid Redis lock conflicts
 concurrency:
   group: trading-bot-execution
   cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    
     permissions:
       packages: read
-      deployments: write
 
     steps:
       - name: Log execution context
         run: |
           echo "🚀 Triggered via: ${{ github.event_name }}"
           echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
-          echo "⏰ Unix Timestamp: $(date +%s)"
           echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
-          echo "🔋 Run ID: ${{ github.run_id }}"
-          echo "🔢 Run Number: ${{ github.run_number }}"
-
-      # OPTIMIZED: Only checkout config file, not entire repo
-      - name: Checkout config
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: config_macd.json
-          sparse-checkout-cone-mode: false
+          echo "📋 Run ID: ${{ github.run_id }}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -50,87 +40,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # CRITICAL OPTIMIZATION: Cache entire Docker image as tar file
-      - name: Cache Docker Image
-        id: cache_image
-        uses: actions/cache@v4
-        with:
-          path: /tmp/bot-image.tar
-          key: bot-image-${{ github.sha }}
-          restore-keys: |
-            bot-image-
-
-      # OPTIMIZED: Load from cache or pull fresh (saves ~6s on cache hit)
-      - name: Pull latest image
-        id: pull_image
+      - name: Pull image
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
-          
-          if [ -f /tmp/bot-image.tar ]; then
-            echo "📦 Loading image from cache..."
-            docker load -i /tmp/bot-image.tar
-            echo "✅ Image loaded from cache"
-            docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
-            docker inspect "$IMAGE" --format='Created: {{.Created}}'
-            echo "cache_hit=true" >> $GITHUB_OUTPUT
-          else
-            echo "⬇️ Pulling fresh image from GHCR..."
-            if docker pull "$IMAGE"; then
-              echo "✅ Image pulled successfully"
-              docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
-              docker inspect "$IMAGE" --format='Created: {{.Created}}'
-              echo "💾 Saving image to cache..."
-              docker save "$IMAGE" -o /tmp/bot-image.tar
-              echo "✅ Image cached for next run"
-              echo "cache_hit=false" >> $GITHUB_OUTPUT
-            else
-              echo "❌ Failed to pull image"
-              exit 1
-            fi
-          fi
+          docker pull "$IMAGE"
+          docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
 
       - name: Set trigger timestamp
         id: timestamp
-        run: |
-          TS=$(date +%s)
-          echo "ts=$TS" >> $GITHUB_OUTPUT
-          echo "📅 Trigger timestamp: $TS ($(date -d @$TS -u '+%Y-%m-%d %H:%M:%S UTC'))"
-
-      # Pre-flight checks
-      - name: Validate configuration
-        run: |
-          if [ ! -f config_macd.json ]; then
-            echo "❌ config_macd.json not found"
-            exit 1
-          fi
-          echo "✅ Configuration file exists"
-          
-          # Validate JSON syntax (optional, adds ~0s)
-          if command -v jq >/dev/null 2>&1; then
-            if jq empty config_macd.json 2>/dev/null; then
-              echo "✅ JSON syntax valid"
-            else
-              echo "❌ Invalid JSON syntax"
-              exit 1
-            fi
-          fi
+        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
 
       - name: Run trading bot
         id: run_bot
         env:
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
-          set +x
-          echo "🤖 Starting trading bot execution..."
-          
-          # Set resource limits to prevent runaway containers
           docker run --rm \
             --name trading-bot-${{ github.run_id }} \
-            --memory="512m" \
-            --memory-swap="512m" \
-            --cpus="1.0" \
-            --security-opt no-new-privileges \
-            --read-only \
+            --memory="512m" --memory-swap="512m" --cpus="1.0" \
+            --security-opt no-new-privileges --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=100m \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -147,47 +74,10 @@ jobs:
             -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
             -e GITHUB_WORKFLOW="${{ github.workflow }}" \
             -e GITHUB_REPOSITORY="${{ github.repository }}" \
-            -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
-            ghcr.io/${{ github.repository }}/trading-bot:latest
-          
-          EXIT_CODE=$?
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "✅ Bot execution completed successfully"
-          else
-            echo "❌ Bot execution failed with exit code: $EXIT_CODE"
-            exit $EXIT_CODE
-          fi
+            "$IMAGE"
 
-      # Capture execution metrics
-      - name: Log execution summary
-        if: always()
-        run: |
-          echo "📊 Execution Summary:"
-          echo "  - Workflow: ${{ github.workflow }}"
-          echo "  - Run ID: ${{ github.run_id }}"
-          echo "  - Run Number: ${{ github.run_number }}"
-          echo "  - Status: ${{ job.status }}"
-          echo "  - Exit Code: ${{ steps.run_bot.outputs.exit_code || 'N/A' }}"
-          echo "  - Cache Hit: ${{ steps.pull_image.outputs.cache_hit || 'N/A' }}"
-          echo "  - Completed at: $(date)"
-
-      # Enhanced failure notification with more context
       - name: Notify on failure
         if: failure()
         run: |
           echo "❌ Bot execution failed"
-          echo "⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "🔋 Run Number: ${{ github.run_number }}"
-          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
-          echo "💾 Cache Hit: ${{ steps.pull_image.outputs.cache_hit || 'N/A' }}"
-
-      # Docker cleanup (GitHub auto-cleans, but explicit is better)
-      - name: Cleanup
-        if: always()
-        run: |
-          echo "🧹 Cleaning up Docker resources..."
-          docker system prune -f --volumes || true
-          echo "✅ Cleanup complete"
