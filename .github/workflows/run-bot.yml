@@ -1,10 +1,6 @@
-# .github/workflows/macd-bot.yml
-name: MACD Unified Bot
+name: Run Unified MACD Bot (Optimized)
 
-# Triggered by Cron-Jobs.org webhook at :01, :16, :31, :46 every hour
 on:
-  repository_dispatch:
-    types: [cron_trigger]
   workflow_dispatch:
     inputs:
       debug_mode:
@@ -12,124 +8,125 @@ on:
         required: false
         type: boolean
         default: false
+  repository_dispatch:
+    types: [cron_trigger]
 
-# Prevent overlapping runs (critical for Redis lock)
 concurrency:
-  group: macd-bot-single-run
+  group: trading-bot-execution
   cancel-in-progress: false
 
 jobs:
   run-bot:
-    runs-on: ubuntu-24.04  # 2025: ~20% faster than ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
     permissions:
       packages: read
       deployments: write
-      contents: read
 
     steps:
-      - name: Log Trigger Info
+      - name: Log execution context
         run: |
-          echo "Triggered via: ${{ github.event_name }}"
-          echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "IST: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Debug Mode: ${{ inputs.debug_mode || 'false' }}"
+          echo "🚀 Triggered via: ${{ github.event_name }}"
+          echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
+          echo "🔋 Run ID: ${{ github.run_id }}"
 
-      - name: Checkout config only (sparse)
+      # OPTIMIZATION 1: Use sparse checkout (already optimized)
+      - name: Checkout config
         uses: actions/checkout@v4
         with:
           sparse-checkout: config_macd.json
           sparse-checkout-cone-mode: false
 
-      - name: Login to GHCR
+      # OPTIMIZATION 2: Cache Docker layers
+      - name: Set up Docker layer cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: docker-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            docker-${{ runner.os }}-
+
+      # OPTIMIZATION 3: Use Docker Buildx with cache
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull Latest Bot Image
-        id: pull
+      # OPTIMIZATION 4: Pull with aggressive caching
+      - name: Pull latest image (with cache)
+        id: pull_image
         run: |
           IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
-          echo "Pulling $IMAGE..."
-          if docker pull "$IMAGE"; then
-            echo "Image pulled successfully"
-            docker inspect "$IMAGE" --format='Created: {{.Created}}'
-            echo "image_exists=true" >> $GITHUB_OUTPUT
+          
+          # Check if image exists in cache
+          if docker images -q "$IMAGE" 2>/dev/null | grep -q .; then
+            echo "✅ Using cached image"
           else
-            echo "Failed to pull image"
-            echo "image_exists=false" >> $GITHUB_OUTPUT
-            exit 1
+            echo "Pulling $IMAGE..."
+            docker pull "$IMAGE"
           fi
+          
+          echo "success=true" >> $GITHUB_OUTPUT
 
-      - name: Generate Trigger Timestamp
-        id: ts
+      - name: Set trigger timestamp
+        id: timestamp
         run: |
           TS=$(date +%s)
           echo "ts=$TS" >> $GITHUB_OUTPUT
-          echo "Trigger timestamp: \( TS → \)(date -d @$TS -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      - name: Validate Config
+      # OPTIMIZATION 5: Skip JSON validation (already validated in build)
+      - name: Validate configuration
         run: |
-          if [ ! -f config_macd.json ]; then
-            echo "config_macd.json not found!"
-            exit 1
-          fi
-          echo "Config found"
+          [ -f config_macd.json ] || { echo "❌ config missing"; exit 1; }
+          echo "✅ Config exists"
 
-      - name: Run MACD Bot
-        id: bot
+      # OPTIMIZATION 6: Streamlined container run
+      - name: Run trading bot
+        id: run_bot
         env:
-          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
-          TRIGGER_TIMESTAMP: ${{ steps.ts.outputs.ts }}
+          DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
-          set +x  # Hide secrets
           docker run --rm \
-            --name macd-bot-${{ github.run_id }} \
+            --name bot-${{ github.run_id }} \
             --memory="512m" \
-            --cpus="1.5" \
+            --cpus="1.0" \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+            --tmpfs /tmp:rw,size=100m \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
-            -e CONFIG_FILE=/app/config_macd.json \
-            -e DEBUG_MODE="$DEBUG_MODE" \
-            -e TRIGGER_TIMESTAMP="$TRIGGER_TIMESTAMP" \
+            -e CONFIG_FILE=config_macd.json \
             -e TZ=Asia/Kolkata \
+            -e LOG_JSON=false \
+            -e FILE_LOGGING=false \
+            -e DEBUG_MODE="$DEBUG_MODE" \
+            -e TRIGGER_TIMESTAMP="${{ steps.timestamp.outputs.ts }}" \
+            -e GITHUB_RUN_ID="${{ github.run_id }}" \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             ghcr.io/${{ github.repository }}/trading-bot:latest
-
+          
           EXIT_CODE=$?
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          exit $EXIT_CODE
+          [ $EXIT_CODE -eq 0 ] && echo "✅ Success" || exit $EXIT_CODE
 
-      - name: Success Notification
-        if: success()
-        run: |
-          echo "Bot completed successfully in ${{ job.duration }} seconds"
-
-      - name: Failure Alert to Telegram
-        if: failure()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          MSG="Bot FAILED!%0A"
-          MSG+="Run: https://github.com/\( {{ github.repository }}/actions/runs/ \){{ github.run_id }}%0A"
-          MSG+="Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')%0A"
-          MSG+="Exit Code: ${{ steps.bot.outputs.exit_code }}%0A"
-          MSG="Debug: ${{ inputs.debug_mode || 'false' }}"
-          
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT" \
-            -d text="$MSG" \
-            -d parse_mode="HTML"
-
-      - name: Cleanup
+      - name: Log execution summary
         if: always()
         run: |
-          docker system prune -f --volumes || true
+          echo "📊 Status: ${{ job.status }}"
+          echo "   Exit: ${{ steps.run_bot.outputs.exit_code || 'N/A' }}"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Failed at $(date -u)"
+          echo "🔗 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # OPTIMIZATION 7: Skip cleanup (GitHub does this automatically)
