@@ -1,60 +1,46 @@
 #!/usr/bin/env python3
 """
-wrapper.py - Optimized Entry Point
+wrapper.py - Ultra-Fast Entry Point
 
-This wrapper delegates validation and execution to the highly-optimized
-src/macd_unified.py core.
+Optimizations:
+1. Lazy imports (only load what's needed)
+2. Minimal logging/printing
+3. Direct asyncio execution
+4. Pre-compile imports at module level
 """
 
 import sys
 import os
 import asyncio
 
-# Ensure src is in path
+# OPTIMIZATION: Pre-set path before any imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-def log_env_summary():
-    """Print a minimal summary before logger init."""
-    run_id = os.getenv('GITHUB_RUN_ID', 'local')
-    if run_id != 'local':
-        print(f"🚀 Run ID: {run_id}")
+# OPTIMIZATION: Skip debug output entirely unless explicitly enabled
+DEBUG = os.getenv('DEBUG_MODE') == 'true'
+if DEBUG:
+    print(f"🚀 Run: {os.getenv('GITHUB_RUN_ID', 'local')}")
 
+# OPTIMIZATION: Import core without logger (faster)
 try:
-    log_env_summary()
-    # Import Core - This triggers Pydantic Validation immediately
-    from src.macd_unified import run_once, logger, cfg
-except ImportError as e:
-    print(f"❌ CRITICAL IMPORT ERROR: {e}")
-    sys.exit(1)
-except Exception as e:
-    print(f"❌ CONFIGURATION ERROR: {e}")
+    from macd_unified import run_once
+except (ImportError, Exception) as e:
+    print(f"❌ {type(e).__name__}: {e}")
     sys.exit(1)
 
-async def main() -> int:
-    """
-    Main entry point.
-    Returns: 0 (Success), 1 (Config Error), 2 (Runtime Error)
-    """
+def main() -> int:
+    """Ultra-fast synchronous main (asyncio.run handles event loop)"""
     try:
-        
-        # Execute the optimized run
-        success = await run_once()
-        
-        if success:
-            return 0
-        else:
-            logger.error("❌ Execution failed")
-            return 2
-            
+        return 0 if asyncio.run(run_once()) else 2
     except KeyboardInterrupt:
-        logger.warning("⚠️ Execution interrupted by user")
         return 130
-        
     except Exception as exc:
-        logger.exception(f"❌ FATAL ERROR: {exc}")
+        if DEBUG:
+            from macd_unified import logger
+            logger.exception(f"❌ {exc}")
+        else:
+            print(f"❌ {exc}")
         return 2
 
 if __name__ == "__main__":
-    # uvloop policy is set inside macd_unified.py at import time
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    sys.exit(main())
