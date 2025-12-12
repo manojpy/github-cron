@@ -27,6 +27,11 @@ def suppress_pycparser_warning():
     )
 
 # ------------------------------------------------------------------
+# CRITICAL: Call the suppression function here, before any complex imports
+suppress_pycparser_warning()
+# ------------------------------------------------------------------
+
+
 # Ensure src is in path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
@@ -38,7 +43,8 @@ def log_env_summary():
 
 try:
     log_env_summary()
-    # Import Core - This triggers Pydantic Validation immediately
+    # Import Core - This triggers Pydantic Validation immediately.
+    # The warning filter is now active before this import.
     from src.macd_unified import run_once, logger, cfg
 except ImportError as e:
     print(f"❌ CRITICAL IMPORT ERROR: {e}")
@@ -73,6 +79,6 @@ async def main() -> int:
 
 if __name__ == "__main__":
     # uvloop policy is set inside macd_unified.py at import time
-    suppress_pycparser_warning()
+    # Removed suppress_pycparser_warning() call from here as it is now called globally
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
