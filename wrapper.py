@@ -1,46 +1,78 @@
 #!/usr/bin/env python3
 """
-wrapper.py - Ultra-Fast Entry Point
+wrapper.py - Optimized Entry Point
 
-Optimizations:
-1. Lazy imports (only load what's needed)
-2. Minimal logging/printing
-3. Direct asyncio execution
-4. Pre-compile imports at module level
+This wrapper delegates validation and execution to the highly-optimized
+src/macd_unified.py core.
 """
 
 import sys
 import os
 import asyncio
+import warnings
 
-# OPTIMIZATION: Pre-set path before any imports
+# --- Code to suppress the specific pycparser RuntimeWarning ---
+
+def suppress_pycparser_warning():
+    """
+    Suppresses the specific RuntimeWarning related to pycparser's parsing methods
+    lacking documentation, which frequently pollutes logs.
+    """
+    # The warning text is related to pycparser's internal workings.
+    # We filter specifically for RuntimeWarning, matching the message text.
+    warnings.filterwarnings(
+        "ignore",
+        message="parsing methods must have __doc__ for pycparser to work properly",
+        category=RuntimeWarning
+    )
+
+# ------------------------------------------------------------------
+# Ensure src is in path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-# OPTIMIZATION: Skip debug output entirely unless explicitly enabled
-DEBUG = os.getenv('DEBUG_MODE') == 'true'
-if DEBUG:
-    print(f"🚀 Run: {os.getenv('GITHUB_RUN_ID', 'local')}")
+def log_env_summary():
+    """Print a minimal summary before logger init."""
+    run_id = os.getenv('GITHUB_RUN_ID', 'local')
+    if run_id != 'local':
+        print(f"🚀 Run ID: {run_id}")
 
-# OPTIMIZATION: Import core without logger (faster)
 try:
-    from macd_unified import run_once
-except (ImportError, Exception) as e:
-    print(f"❌ {type(e).__name__}: {e}")
+    log_env_summary()
+    # Import Core - This triggers Pydantic Validation immediately
+    from src.macd_unified import run_once, logger, cfg
+except ImportError as e:
+    print(f"❌ CRITICAL IMPORT ERROR: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"❌ CONFIGURATION ERROR: {e}")
     sys.exit(1)
 
-def main() -> int:
-    """Ultra-fast synchronous main (asyncio.run handles event loop)"""
+async def main() -> int:
+    """
+    Main entry point.
+    Returns: 0 (Success), 1 (Config Error), 2 (Runtime Error)
+    """
     try:
-        return 0 if asyncio.run(run_once()) else 2
-    except KeyboardInterrupt:
-        return 130
-    except Exception as exc:
-        if DEBUG:
-            from macd_unified import logger
-            logger.exception(f"❌ {exc}")
+        
+        # Execute the optimized run
+        success = await run_once()
+        
+        if success:
+            return 0
         else:
-            print(f"❌ {exc}")
+            logger.error("❌ Execution failed")
+            return 2
+            
+    except KeyboardInterrupt:
+        logger.warning("⚠️ Execution interrupted by user")
+        return 130
+        
+    except Exception as exc:
+        logger.exception(f"❌ FATAL ERROR: {exc}")
         return 2
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # uvloop policy is set inside macd_unified.py at import time
+    suppress_pycparser_warning()
+    exit_code = asyncio.run(main())
+    sys.exit(exit_code)
