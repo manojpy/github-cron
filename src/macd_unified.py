@@ -2318,12 +2318,12 @@ def check_common_conditions(
         candle_range = high_val - low_val
 
         if candle_range < 1e-8:
-            logger.debug(f"Candle range too small: {candle_range:.8f}")
+            logger.debug(f"Candle range too small: {candle_range:.2f}")
             return False
 
         if is_buy:
             if close_val <= open_val:
-                logger.debug(f"BUY rejected: Not green candle | O={open_val:.4f} C={close_val:.4f}")
+                logger.debug(f"BUY rejected: Not green candle | O={open_val:.2f} C={close_val:.2f}")
                 return False
 
             upper_wick = high_val - close_val
@@ -2332,23 +2332,23 @@ def check_common_conditions(
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 logger.debug(
                     f"BUY REJECTED: Upper wick too large | "
-                    f"O={open_val:.4f} H={high_val:.4f} L={low_val:.4f} C={close_val:.4f} | "
-                    f"Candle Range (H-L)={candle_range:.4f} | "
-                    f"Upper Wick (H-C)={upper_wick:.4f} | "
+                    f"O={open_val:.2f} H={high_val:.2f} L={low_val:.2f} C={close_val:.2f} | "
+                    f"Candle Range (H-L)={candle_range:.2f} | "
+                    f"Upper Wick (H-C)={upper_wick:.2f} | "
                     f"Wick Ratio={wick_ratio*100:.2f}% | "
                     f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
                 )
                 return False
 
             logger.debug(
-                f"BUY PASSED ✓ | O={open_val:.4f} H={high_val:.4f} L={low_val:.4f} C={close_val:.4f} | "
-                f"Upper Wick={upper_wick:.4f} ({wick_ratio*100:.2f}%)"
+                f"BUY PASSED ✓ | O={open_val:.2f} H={high_val:.2f} L={low_val:.2f} C={close_val:.2f} | "
+                f"Upper Wick={upper_wick:.2f} ({wick_ratio*100:.2f}%)"
             )
             return True
 
         else:
             if close_val >= open_val:
-                logger.debug(f"SELL rejected: Not red candle | O={open_val:.4f} C={close_val:.4f}")
+                logger.debug(f"SELL rejected: Not red candle | O={open_val:.2f} C={close_val:.2f}")
                 return False
 
             lower_wick = close_val - low_val
@@ -2357,17 +2357,17 @@ def check_common_conditions(
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 logger.debug(
                     f"SELL REJECTED: Lower wick too large | "
-                    f"O={open_val:.4f} H={high_val:.4f} L={low_val:.4f} C={close_val:.4f} | "
-                    f"Candle Range (H-L)={candle_range:.4f} | "
-                    f"Lower Wick (C-L)={lower_wick:.4f} | "
+                    f"O={open_val:.2f} H={high_val:.2f} L={low_val:.2f} C={close_val:.2f} | "
+                    f"Candle Range (H-L)={candle_range:.2f} | "
+                    f"Lower Wick (C-L)={lower_wick:.2f} | "
                     f"Wick Ratio={wick_ratio*100:.2f}% | "
                     f"Threshold={Constants.MIN_WICK_RATIO*100:.0f}%"
                 )
                 return False
 
             logger.debug(
-                f"SELL PASSED ✓ | O={open_val:.4f} H={high_val:.4f} L={low_val:.4f} C={close_val:.4f} | "
-                f"Lower Wick={lower_wick:.4f} ({wick_ratio*100:.2f}%)"
+                f"SELL PASSED ✓ | O={open_val:.2f} H={high_val:.2f} L={low_val:.2f} C={close_val:.2f} | "
+                f"Lower Wick={lower_wick:.2f} ({wick_ratio*100:.2f}%)"
             )
             return True
 
