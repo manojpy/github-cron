@@ -19,6 +19,7 @@ from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callab
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
+from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 from aiohttp import web
@@ -253,8 +254,18 @@ class SafeFormatter(logging.Formatter):
         return formatted
 
 def setup_logging() -> logging.Logger:
-    """Simplified logging setup for short-lived cron jobs"""
+    """
+    Enhanced logging setup for short-lived cron jobs with trace context.
+    
+    Features:
+    - Trace ID in every log message for correlation
+    - Secret filtering for tokens/passwords
+    - Structured format for easy parsing
+    - Console output for container log capture
+    """
     logger = logging.getLogger("macd_bot")
+    
+    # Clear any existing handlers
     for h in logger.handlers[:]:
         logger.removeHandler(h)
 
@@ -265,18 +276,107 @@ def setup_logging() -> logging.Logger:
     # Console handler - logs to stdout for container capture
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(level)
+    
+    # Enhanced formatter with trace context
     console.setFormatter(SafeFormatter(
-        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | [%(trace_id)s] | %(funcName)s:%(lineno)d | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     ))
+    
+    # Add filters
     console.addFilter(SecretFilter())
     console.addFilter(TraceContextFilter())
+    
     logger.addHandler(console)
+    
+    # Log initial setup info
+    logger.debug(
+        f"Logging configured | Level: {logging.getLevelName(level)} | "
+        f"Format: structured with trace_id | Output: stdout"
+    )
 
     return logger
 
 logger = setup_logging()
 shutdown_event = asyncio.Event()
+
+def validate_runtime_config() -> None:
+    """
+    Validate runtime configuration and environment for early error detection.
+    
+    This catches configuration errors before any API calls are made,
+    saving time and preventing partial runs with invalid settings.
+    """
+    errors = []
+    warnings = []
+    
+    # Validate Redis URL format
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(cfg.REDIS_URL)
+        if parsed.scheme not in ('redis', 'rediss'):
+            errors.append(f"Invalid REDIS_URL scheme: {parsed.scheme} (must be redis:// or rediss://)")
+        if not parsed.hostname:
+            errors.append("REDIS_URL missing hostname")
+    except Exception as e:
+        errors.append(f"Failed to parse REDIS_URL: {e}")
+    
+    # Validate Telegram token format
+    if not re.match(r'^\d{6,}:[A-Za-z0-9_-]{20,}$', cfg.TELEGRAM_BOT_TOKEN):
+        errors.append("TELEGRAM_BOT_TOKEN format invalid (should be: 123456:ABC-DEF...)")
+    
+    # Validate Delta API URL
+    if not cfg.DELTA_API_BASE.startswith(('http://', 'https://')):
+        errors.append("DELTA_API_BASE must start with http:// or https://")
+    
+    # Validate numeric ranges
+    if cfg.MAX_PARALLEL_FETCH < 1 or cfg.MAX_PARALLEL_FETCH > 16:
+        warnings.append(f"MAX_PARALLEL_FETCH={cfg.MAX_PARALLEL_FETCH} is outside recommended range (1-16)")
+    
+    if cfg.HTTP_TIMEOUT < 5 or cfg.HTTP_TIMEOUT > 60:
+        warnings.append(f"HTTP_TIMEOUT={cfg.HTTP_TIMEOUT}s is outside recommended range (5-60s)")
+    
+    if cfg.RUN_TIMEOUT_SECONDS < 300:
+        errors.append(f"RUN_TIMEOUT_SECONDS={cfg.RUN_TIMEOUT_SECONDS}s is too low (minimum: 300s)")
+    
+    if cfg.RUN_TIMEOUT_SECONDS >= Constants.REDIS_LOCK_EXPIRY:
+        errors.append(
+            f"RUN_TIMEOUT_SECONDS ({cfg.RUN_TIMEOUT_SECONDS}s) must be less than "
+            f"REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s)"
+        )
+    
+    # Validate pairs configuration
+    if not cfg.PAIRS or len(cfg.PAIRS) == 0:
+        errors.append("PAIRS list is empty - no trading pairs configured")
+    
+    if len(cfg.PAIRS) > 20:
+        warnings.append(f"Large number of pairs ({len(cfg.PAIRS)}) may exceed timeout limits")
+    
+    # Validate memory limits
+    if cfg.MEMORY_LIMIT_BYTES < 200_000_000:  # 200MB minimum
+        warnings.append(f"MEMORY_LIMIT_BYTES={cfg.MEMORY_LIMIT_BYTES} is very low (minimum recommended: 200MB)")
+    
+    # Validate PPO parameters
+    if cfg.PPO_FAST >= cfg.PPO_SLOW:
+        errors.append(f"PPO_FAST ({cfg.PPO_FAST}) must be less than PPO_SLOW ({cfg.PPO_SLOW})")
+    
+    # Log results
+    if errors:
+        logger.critical("Configuration validation FAILED:")
+        for error in errors:
+            logger.critical(f"  ERROR: {error}")
+        raise ValueError(f"Configuration validation failed with {len(errors)} error(s)")
+    
+    if warnings:
+        logger.warning("Configuration warnings:")
+        for warning in warnings:
+            logger.warning(f"  WARNING: {warning}")
+    
+    logger.info(
+        f"Configuration validated successfully | "
+        f"Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s"
+    )
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -1094,52 +1194,174 @@ def calculate_all_indicators_numpy(
 # ============================================================================
 
 class SessionManager:
+    """
+    Enhanced singleton session manager with:
+    - Proper connection pooling
+    - Connection health monitoring
+    - Graceful cleanup
+    - DNS caching
+    - SSL context reuse
+    """
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _creation_time: ClassVar[float] = 0.0
+    _request_count: ClassVar[int] = 0
+    _session_reuse_limit: ClassVar[int] = 1000  # Recreate session after N requests
 
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
+        """
+        Create and cache SSL context for secure connections.
+        Reused across all sessions for performance.
+        """
         if cls._ssl_context is None:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
+            
+            # Security hardening
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+            
             cls._ssl_context = ctx
+            logger.debug("SSL context created with TLSv1.2+ minimum")
+        
         return cls._ssl_context
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
+        """
+        Get or create shared aiohttp session with health checking.
+        
+        Returns:
+            Shared ClientSession instance
+        """
         async with cls._lock:
+            # Check if session needs recreation
+            should_recreate = False
+            
             if cls._session is None or cls._session.closed:
+                should_recreate = True
+                reason = "no session" if cls._session is None else "session closed"
+            elif cls._request_count >= cls._session_reuse_limit:
+                should_recreate = True
+                reason = f"request limit reached ({cls._request_count})"
+                logger.info(f"Session recreation triggered: {reason}")
+            
+            if should_recreate:
+                # Close existing session if present
+                if cls._session and not cls._session.closed:
+                    try:
+                        await cls._session.close()
+                        await asyncio.sleep(0.25)  # Allow cleanup
+                    except Exception as e:
+                        logger.warning(f"Error closing old session: {e}")
+                
+                # Create new connector with optimized settings
                 connector = TCPConnector(
                     limit=cfg.TCP_CONN_LIMIT,
                     limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
                     ssl=cls._get_ssl_context(),
-                    force_close=False,
+                    force_close=False,  # Keep connections alive
                     enable_cleanup_closed=True,
-                    ttl_dns_cache=3600,  # Increased from 300 to 3600 for fewer DNS lookups
+                    ttl_dns_cache=3600,  # 1 hour DNS cache
+                    keepalive_timeout=30,  # Keep connections alive for 30s
+                    family=0,  # Allow both IPv4 and IPv6
                 )
-                timeout = aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)
+                
+                # Create timeout configuration
+                timeout = aiohttp.ClientTimeout(
+                    total=cfg.HTTP_TIMEOUT,
+                    connect=10,  # Connection timeout
+                    sock_read=cfg.HTTP_TIMEOUT,  # Socket read timeout
+                )
+                
+                # Create new session
                 cls._session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
-                    headers={'User-Agent': f'{cfg.BOT_NAME}/{__version__}'}
+                    headers={
+                        'User-Agent': f'{cfg.BOT_NAME}/{__version__}',
+                        'Accept': 'application/json',
+                        'Accept-Encoding': 'gzip, deflate',
+                    },
+                    json_serialize=json_dumps,  # Use orjson if available
+                    raise_for_status=False,  # Handle status codes manually
                 )
-                logger.debug("Created new shared aiohttp session")
+                
+                cls._creation_time = time.time()
+                cls._request_count = 0
+                
+                logger.info(
+                    f"HTTP session created | "
+                    f"Pool: {cfg.TCP_CONN_LIMIT} total, {cfg.TCP_CONN_LIMIT_PER_HOST} per host | "
+                    f"Timeout: {cfg.HTTP_TIMEOUT}s | "
+                    f"DNS cache: 3600s | "
+                    f"Keepalive: 30s"
+                )
+            
+            # Increment request counter
+            cls._request_count += 1
+            
             return cls._session
 
     @classmethod
     async def close_session(cls) -> None:
+        """
+        Gracefully close the shared session and free resources.
+        Safe to call multiple times.
+        """
         async with cls._lock:
             if cls._session and not cls._session.closed:
                 try:
+                    session_age = time.time() - cls._creation_time
+                    
+                    logger.debug(
+                        f"Closing HTTP session | "
+                        f"Age: {session_age:.1f}s | "
+                        f"Requests served: {cls._request_count}"
+                    )
+                    
                     await cls._session.close()
+                    
+                    # Give connections time to close gracefully
                     await asyncio.sleep(0.25)
+                    
+                    logger.info("HTTP session closed successfully")
+                    
                 except Exception as e:
                     logger.warning(f"Error closing session: {e}")
                 finally:
                     cls._session = None
-                    logger.debug("Closed shared aiohttp session")
+                    cls._request_count = 0
+                    cls._creation_time = 0.0
+            else:
+                logger.debug("Session already closed or not created")
+    
+    @classmethod
+    def get_stats(cls) -> Dict[str, Any]:
+        """
+        Get session statistics for monitoring.
+        
+        Returns:
+            Dictionary with session metrics
+        """
+        if cls._session is None:
+            return {
+                "active": False,
+                "request_count": 0,
+                "age_seconds": 0.0,
+            }
+        
+        age = time.time() - cls._creation_time if cls._creation_time > 0 else 0.0
+        
+        return {
+            "active": not cls._session.closed,
+            "request_count": cls._request_count,
+            "age_seconds": round(age, 1),
+            "requests_until_recreation": cls._session_reuse_limit - cls._request_count,
+        }
 
 class RetryCategory:
     NETWORK = "network"
@@ -1233,7 +1455,17 @@ async def async_fetch_json(
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
     """
-    Enhanced JSON fetch with categorized retries and detailed logging.
+    Enhanced JSON fetch with exponential backoff, jitter, and categorized retries.
+    
+    Args:
+        url: API endpoint URL
+        params: Query parameters
+        retries: Maximum number of retry attempts
+        backoff: Base backoff multiplier (exponential)
+        timeout: Request timeout in seconds
+    
+    Returns:
+        Parsed JSON response or None on failure
     """
     session = await SessionManager.get_session()
     last_error = None
@@ -1247,75 +1479,111 @@ async def async_fetch_json(
     
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
+            logger.debug(f"Shutdown requested, aborting fetch: {url[:80]}")
             return None
         
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
+                # Handle rate limiting (429)
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
-                    wait_sec = min(int(retry_after) if retry_after else 1, Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                    wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
                     jitter = random.uniform(0.1, 0.5)
                     total_wait = wait_sec + jitter
                     
+                    retry_stats[RetryCategory.RATE_LIMIT] += 1
                     logger.warning(
                         f"Rate limited (429) | URL: {url[:80]} | "
-                        f"Retry-After: {retry_after} | Waiting: {total_wait:.2f}s"
+                        f"Retry-After: {retry_after}s | Waiting: {total_wait:.2f}s | "
+                        f"Attempt: {attempt}/{retries}"
                     )
-                    retry_stats[RetryCategory.RATE_LIMIT] += 1
                     
                     await asyncio.sleep(total_wait)
                     continue
                 
+                # Handle server errors (5xx) - retry with exponential backoff
                 if resp.status >= 500:
                     retry_stats[RetryCategory.API_ERROR] += 1
                     logger.warning(
-                        f"Server error {resp.status} on attempt {attempt}/{retries} | "
-                        f"URL: {url[:80]}"
+                        f"Server error {resp.status} | URL: {url[:80]} | "
+                        f"Attempt: {attempt}/{retries}"
                     )
                     
                     if attempt < retries:
+                        # Exponential backoff with jitter
                         base_delay = min(
                             Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
                             backoff * (2 ** (attempt - 1))
                         )
                         jitter = base_delay * random.uniform(0.1, 0.5)
-                        await asyncio.sleep(base_delay + jitter)
+                        total_delay = base_delay + jitter
+                        
+                        logger.debug(f"Retrying after {total_delay:.2f}s...")
+                        await asyncio.sleep(total_delay)
                     continue
                 
+                # Handle client errors (4xx) - usually not retryable
                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
-                        f"This usually indicates invalid request"
+                        f"This usually indicates invalid request - not retrying"
                     )
                     return None
                 
+                # Success - parse JSON
                 data = await resp.json(loads=json_loads)
                 
+                # Log success with retry stats if there were any retries
                 if any(retry_stats.values()):
                     logger.info(
                         f"Fetch succeeded after retries | URL: {url[:80]} | "
-                        f"Stats: {retry_stats}"
+                        f"Attempts: {attempt} | Stats: {retry_stats}"
                     )
                 
                 return data
                 
-        except (asyncio.TimeoutError, ClientConnectorError, ClientError, ClientResponseError) as e:
+        except asyncio.TimeoutError as e:
             last_error = e
-            category = categorize_exception(e)
-            retry_stats[category] = retry_stats.get(category, 0) + 1
+            retry_stats[RetryCategory.TIMEOUT] += 1
             
             logger.warning(
-                f"Fetch error (attempt {attempt}/{retries}) | "
-                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+                f"Timeout (attempt {attempt}/{retries}) | "
+                f"URL: {url[:80]} | Timeout: {timeout}s"
             )
             
             if attempt < retries:
+                # Exponential backoff for timeouts
                 base_delay = min(
                     Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
                     backoff * (2 ** (attempt - 1))
                 )
                 jitter = base_delay * random.uniform(0.1, 0.5)
-                await asyncio.sleep(base_delay + jitter)
+                total_delay = base_delay + jitter
+                
+                logger.debug(f"Retrying after {total_delay:.2f}s...")
+                await asyncio.sleep(total_delay)
+        
+        except (ClientConnectorError, ClientError, ClientResponseError) as e:
+            last_error = e
+            category = categorize_exception(e)
+            retry_stats[category] = retry_stats.get(category, 0) + 1
+            
+            logger.warning(
+                f"Network error (attempt {attempt}/{retries}) | "
+                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+            )
+            
+            if attempt < retries:
+                # Exponential backoff with jitter
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                total_delay = base_delay + jitter
+                
+                logger.debug(f"Retrying after {total_delay:.2f}s...")
+                await asyncio.sleep(total_delay)
         
         except Exception as e:
             last_error = e
@@ -1323,6 +1591,7 @@ async def async_fetch_json(
             logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
     
+    # All retries exhausted
     logger.error(
         f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
         f"Stats: {retry_stats} | Last error: {last_error}"
@@ -1383,21 +1652,50 @@ class RateLimitedFetcher:
         }
 
 class DataFetcher:
+    """
+    Enhanced data fetcher with:
+    - Semaphore-based concurrency control
+    - Rate limiting using token bucket
+    - Detailed fetch statistics
+    """
+    
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
+        
+        # Semaphore to limit concurrent API calls
         self.semaphore = asyncio.Semaphore(max_parallel)
+        
         self.timeout = cfg.HTTP_TIMEOUT
-        self.rate_limiter = RateLimitedFetcher(max_per_minute=60)
+        
+        # Rate limiter: 60 requests/minute with burst of 5
+        self.rate_limiter = RateLimitedFetcher(
+            max_per_minute=60,
+            concurrency=max_parallel
+        )
+        
+        # Statistics tracking
         self.fetch_stats = {
             "products_success": 0,
             "products_failed": 0,
             "candles_success": 0,
-            "candles_failed": 0
+            "candles_failed": 0,
+            "total_wait_time": 0.0,
+            "rate_limit_hits": 0
         }
+        
+        logger.debug(
+            f"DataFetcher initialized | max_parallel={max_parallel} | "
+            f"rate_limit=60/min | timeout={self.timeout}s"
+        )
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
-        """Fetch products list with rate limiting."""
+        """
+        Fetch products list with rate limiting and concurrency control.
+        
+        Returns:
+            Products API response or None on failure
+        """
         url = f"{self.api_base}/v2/products"
         
         async with self.semaphore:
@@ -1425,14 +1723,28 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """Fetch candles with enhanced logging."""
+        """
+        Fetch candles with enhanced timing logic and concurrency control.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., "BTCUSD")
+            resolution: Timeframe (e.g., "15", "5", "D")
+            limit: Number of candles to fetch
+            reference_time: Reference timestamp for candle window calculation
+        
+        Returns:
+            Candles API response or None on failure
+        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
+        # Calculate time window
         minutes = int(resolution) if resolution != "D" else 1440
         window = minutes * 60
         current_window = reference_time // window
         last_close = (current_window * window)
+        
+        # Add publication lag cushion
         cushion = max(3, min(Constants.CANDLE_PUBLICATION_LAG_SEC, window - 3))
         last_close -= cushion
 
@@ -1457,6 +1769,22 @@ class DataFetcher:
             
             if data:
                 self.fetch_stats["candles_success"] += 1
+                
+                # Validate response has required fields
+                result = data.get("result", {})
+                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                    num_candles = len(result.get("t", []))
+                    logger.debug(
+                        f"Candles fetch successful | Symbol: {symbol} | "
+                        f"Resolution: {resolution} | Count: {num_candles}"
+                    )
+                else:
+                    logger.warning(
+                        f"Candles response missing required fields | Symbol: {symbol} | "
+                        f"Resolution: {resolution}"
+                    )
+                    self.fetch_stats["candles_failed"] += 1
+                    return None
             else:
                 self.fetch_stats["candles_failed"] += 1
                 logger.warning(
@@ -1467,10 +1795,103 @@ class DataFetcher:
             return data
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get fetcher statistics."""
+        """
+        Get comprehensive fetcher statistics.
+        
+        Returns:
+            Dictionary with fetch statistics and rate limiter metrics
+        """
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
+        
+        # Calculate success rates
+        total_products = stats["products_success"] + stats["products_failed"]
+        total_candles = stats["candles_success"] + stats["candles_failed"]
+        
+        if total_products > 0:
+            stats["products_success_rate"] = round(
+                stats["products_success"] / total_products * 100, 1
+            )
+        
+        if total_candles > 0:
+            stats["candles_success_rate"] = round(
+                stats["candles_success"] / total_candles * 100, 1
+            )
+        
         return stats
+
+    async def fetch_candles_batch(
+        self,
+        requests: List[Tuple[str, str, int]],
+        reference_time: Optional[int] = None
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Batch fetch candles for multiple pairs/resolutions.
+        
+        NOTE: This method is prepared for future optimization if Delta API
+        adds batch endpoint support. Currently falls back to individual fetches
+        with controlled concurrency.
+        
+        Args:
+            requests: List of (symbol, resolution, limit) tuples
+            reference_time: Reference timestamp for all requests
+        
+        Returns:
+            Dict mapping "symbol_resolution" to candle data
+            
+        Example:
+            requests = [
+                ("BTCUSD", "15", 300),
+                ("BTCUSD", "5", 400),
+                ("ETHUSD", "15", 300),
+            ]
+            results = await fetcher.fetch_candles_batch(requests)
+            btc_15m = results.get("BTCUSD_15")
+        """
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
+        
+        # TODO: If Delta API adds batch endpoint, implement here:
+        # POST /v2/chart/history/batch
+        # Body: [{"symbol": "BTCUSD", "resolution": "15", ...}, ...]
+        # This would reduce network round trips from N to 1
+        
+        logger.debug(
+            f"Batch fetching {len(requests)} candle requests "
+            f"(using concurrent individual fetches)"
+        )
+        
+        # Current implementation: Concurrent individual fetches
+        # Semaphore in fetch_candles() ensures we don't overwhelm the API
+        tasks = []
+        request_keys = []
+        
+        for symbol, resolution, limit in requests:
+            task = self.fetch_candles(symbol, resolution, limit, reference_time)
+            tasks.append(task)
+            request_keys.append(f"{symbol}_{resolution}")
+        
+        # Execute all fetches concurrently (bounded by self.semaphore)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Map results to request keys
+        output = {}
+        for key, result in zip(request_keys, results):
+            if isinstance(result, Exception):
+                logger.error(f"Batch fetch failed for {key}: {result}")
+                output[key] = None
+            else:
+                output[key] = result
+        
+        # Log summary
+        success_count = sum(1 for v in output.values() if v is not None)
+        logger.debug(
+            f"Batch fetch complete | "
+            f"Success: {success_count}/{len(requests)} | "
+            f"Failed: {len(requests) - success_count}"
+        )
+        
+        return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     """
@@ -1639,18 +2060,66 @@ class RedisStateStore:
     """
     
     def __init__(self, redis_url: str):
+        """
+        Initialize Redis state store with enhanced URL parsing.
+        
+        Args:
+            redis_url: Redis connection URL (e.g., redis://user:pass@host:port/db)
+        """
+        from urllib.parse import urlparse, parse_qs
+        
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
+        
+        # Parse Redis URL for validation and logging
+        try:
+            parsed = urlparse(redis_url)
+            
+            # Validate scheme
+            if parsed.scheme not in ('redis', 'rediss'):
+                raise ValueError(f"Invalid Redis URL scheme: {parsed.scheme}")
+            
+            # Extract connection details (for logging only - passwords redacted)
+            self.redis_host = parsed.hostname or 'localhost'
+            self.redis_port = parsed.port or 6379
+            self.redis_db = parsed.path.lstrip('/') or '0'
+            
+            # Log sanitized connection info
+            logger.debug(
+                f"Redis URL parsed | Host: {self.redis_host} | "
+                f"Port: {self.redis_port} | DB: {self.redis_db} | "
+                f"Secure: {parsed.scheme == 'rediss'}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to parse Redis URL: {e}")
+            # Set defaults
+            self.redis_host = 'localhost'
+            self.redis_port = 6379
+            self.redis_db = '0'
+        
+        # State management configuration
         self.state_prefix = "pair_state:"
         self.meta_prefix = "metadata:"
         self.alert_prefix = "alert:"
+        
+        # TTL configuration
         self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
+        
+        # Connection state tracking
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
         self._dedup_script_sha = None
+        
+        logger.debug(
+            f"RedisStateStore initialized | "
+            f"State TTL: {cfg.STATE_EXPIRY_DAYS}d | "
+            f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
+            f"Metadata TTL: 7d"
+        )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -2805,18 +3274,22 @@ async def check_pair(
         daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10
 
         # Fetch all timeframes in parallel
-        tasks = [
-            fetcher.fetch_candles(symbol, "15", 300, reference_time),
-            fetcher.fetch_candles(symbol, "5", 400, reference_time),
-            fetcher.fetch_candles(symbol, "D", daily_limit, reference_time) if cfg.ENABLE_PIVOT else asyncio.sleep(0),
+        # Fetch all timeframes using batch method
+        requests = [
+            (symbol, "15", 300),
+            (symbol, "5", 400),
         ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        if cfg.ENABLE_PIVOT:
+            requests.append((symbol, "D", daily_limit))
+        
+        # Batch fetch (currently uses concurrent individual fetches)
+        batch_results = await fetcher.fetch_candles_batch(requests, reference_time)
         
         # Parse directly to NumPy - NO PANDAS
-        data_15m = parse_candles_to_numpy(results[0])
-        data_5m = parse_candles_to_numpy(results[1])
-        data_daily = parse_candles_to_numpy(results[2]) if cfg.ENABLE_PIVOT else None
+        data_15m = parse_candles_to_numpy(batch_results.get(f"{symbol}_15"))
+        data_5m = parse_candles_to_numpy(batch_results.get(f"{symbol}_5"))
+        data_daily = parse_candles_to_numpy(batch_results.get(f"{symbol}_D")) if cfg.ENABLE_PIVOT else None
 
         # Validate using NumPy validation
         valid_15m, reason_15m = validate_candle_data(data_15m, 220)
@@ -2980,10 +3453,16 @@ async def process_pairs_with_workers(
 
 async def run_once() -> bool:
     """
-    Single pass through all configured pairs.
-    Returns True if the run completed successfully, False otherwise.
+    Single pass through all configured pairs with enhanced resource management.
     
-    OPTIMIZATION: reference_time computed ONCE at start and passed down
+    Returns:
+        True if the run completed successfully, False otherwise.
+    
+    Key improvements:
+    - Proper resource cleanup in finally block
+    - Enhanced error handling with categorization
+    - Memory monitoring throughout execution
+    - Graceful shutdown on timeout or cancellation
     """
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
@@ -2992,13 +3471,20 @@ async def run_once() -> bool:
 
     # OPTIMIZATION: Pre-compute reference_time once
     reference_time = get_trigger_timestamp()
-    logger_run.info(f"Using reference timestamp: {reference_time} ({format_ist_time(reference_time)})")
+    logger_run.info(
+        f"🚀 Run started | Correlation ID: {correlation_id} | "
+        f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
+    )
 
+    # Resource tracking for cleanup
+    sdb: Optional[RedisStateStore] = None
+    lock: Optional[RedisLock] = None
+    lock_acquired = False
+    fetcher: Optional[DataFetcher] = None
+    telegram_queue: Optional[TelegramQueue] = None
+    
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
-
-    lock_acquired = False
-    lock: Optional[RedisLock] = None
 
     try:
         # Check memory at startup
@@ -3007,125 +3493,199 @@ async def run_once() -> bool:
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
         
         if container_memory_mb >= limit_mb:
-            logger_run.critical(f"🚨 Memory limit exceeded at startup ({container_memory_mb:.1f}MB / {limit_mb:.1f}MB)")
+            logger_run.critical(
+                f"🚨 Memory limit exceeded at startup "
+                f"({container_memory_mb:.1f}MB / {limit_mb:.1f}MB)"
+            )
             return False
 
-        # Redis connection
+        # Initialize Redis connection
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
-        logger_run.debug("Redis connection established")
+        logger_run.debug("✅ Redis connection established")
 
-        try:
-            if sdb.degraded and not sdb.degraded_alerted:
-                logger_run.critical("⚠️ Redis is in degraded mode – alert deduplication disabled!")
-                telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-                await telegram_queue.send(escape_markdown_v2(
-                    f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
-                    f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
-                    f"Time: {format_ist_time()}"
-                ))
-                sdb.degraded_alerted = True
+        # Check Redis degraded mode
+        if sdb.degraded and not sdb.degraded_alerted:
+            logger_run.critical(
+                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
+            )
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+            await telegram_queue.send(escape_markdown_v2(
+                f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
+                f"Time: {format_ist_time()}"
+            ))
+            sdb.degraded_alerted = True
 
-            fetcher = DataFetcher(cfg.DELTA_API_BASE)
+        # Initialize services
+        fetcher = DataFetcher(cfg.DELTA_API_BASE)
+        if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
-            lock = RedisLock(sdb._redis, "macd_bot_run")
-            lock_acquired = await lock.acquire(timeout=5.0)
-            if not lock_acquired:
-                logger_run.warning("❌ Another instance is running (Redis lock held)")
+        # Acquire distributed lock
+        lock = RedisLock(sdb._redis, "macd_bot_run")
+        lock_acquired = await lock.acquire(timeout=5.0)
+        
+        if not lock_acquired:
+            logger_run.warning(
+                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
+            )
+            return False
+
+        logger_run.info("🔒 Distributed lock acquired successfully")
+
+        # Send startup notification
+        if cfg.SEND_TEST_MESSAGE:
+            await telegram_queue.send(escape_markdown_v2(
+                f"🚀 {cfg.BOT_NAME} - Run Started\n"
+                f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
+                f"Correlation ID: {correlation_id}\n"
+                f"Pairs: {len(cfg.PAIRS)}"
+            ))
+
+        # Products cache (8-hour TTL)
+        PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
+        now = time.time()
+        
+        if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
+            logger_run.info("📡 Fetching fresh products list from Delta API...")
+            prod_resp = await fetcher.fetch_products()
+            
+            if not prod_resp:
+                logger_run.error("❌ Failed to fetch products map - aborting run")
                 return False
+            
+            PRODUCTS_CACHE["data"] = prod_resp
+            PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
+            run_once._products_cache = PRODUCTS_CACHE
+            logger_run.info("✅ Products list cached for 8 hours")
+        else:
+            logger_run.debug("📦 Using cached products list")
+            prod_resp = PRODUCTS_CACHE["data"]
 
-            try:
-                if cfg.SEND_TEST_MESSAGE:
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"🚀 Unified Bot - Run Started\n"
-                        f"Date : {format_ist_time(datetime.now(timezone.utc))}\n"
-                        f"Corr. ID: {correlation_id}"
-                    ))
+        # Build products map
+        products_map = build_products_map_from_api_result(prod_resp)
+        pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
-                # Products cache (8-hour TTL)
-                PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
-                now = time.time()
-                if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
-                    logger_run.info("Fetching fresh products list from Delta API...")
-                    prod_resp = await fetcher.fetch_products()
-                    if not prod_resp:
-                        logger_run.error("Failed to fetch products map")
-                        return False
-                    PRODUCTS_CACHE["data"] = prod_resp
-                    PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
-                    run_once._products_cache = PRODUCTS_CACHE
-                else:
-                    logger_run.debug("Using cached products list")
-                    prod_resp = PRODUCTS_CACHE["data"]
+        if len(pairs_to_process) < len(cfg.PAIRS):
+            missing = set(cfg.PAIRS) - set(pairs_to_process)
+            logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
 
-                products_map = build_products_map_from_api_result(prod_resp)
-                pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
+        logger_run.info(
+            f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture"
+        )
 
-                if len(pairs_to_process) < len(cfg.PAIRS):
-                    missing = set(cfg.PAIRS) - set(pairs_to_process)
-                    logger_run.warning(f"Missing products for pairs: {missing}")
+        # Process all pairs with worker pool
+        all_results = await process_pairs_with_workers(
+            fetcher, products_map, pairs_to_process,
+            sdb, telegram_queue, correlation_id,
+            lock, reference_time
+        )
 
-                logger_run.info(f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture")
+        # Count alerts sent
+        for _, state in all_results:
+            if state.get("state") == "ALERT_SENT":
+                alerts_sent += state.get("summary", {}).get("alerts", 0)
 
-                all_results = await process_pairs_with_workers(
-                    fetcher, products_map, pairs_to_process,
-                    sdb, telegram_queue, correlation_id,
-                    lock, reference_time
-                )
-
-                # Stats & summary
-                fetcher_stats = fetcher.get_stats()
+        # Fetch and log statistics
+        fetcher_stats = fetcher.get_stats()
+        logger_run.info(
+            f"📡 Fetch statistics | "
+            f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+            f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
+        )
+        
+        if "rate_limiter" in fetcher_stats:
+            rate_stats = fetcher_stats["rate_limiter"]
+            if rate_stats.get("total_waits", 0) > 0:
                 logger_run.info(
-                    f"📡 Fetch stats | "
-                    f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
-                    f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
+                    f"🚦 Rate limiting stats | "
+                    f"Waits: {rate_stats['total_waits']} | "
+                    f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
                 )
 
-                run_duration = time.time() - start_time
-                container_memory_mb = process.memory_info().rss / 1024 / 1024
-                redis_status = "OK" if not sdb.degraded else "DEGRADED"
-                summary = (
-                    f"✅ RUN COMPLETE | {run_duration:.1f}s | {len(all_results)} pairs | "
-                    f"{alerts_sent} alerts | Mem: {int(container_memory_mb)}MB | Redis: {redis_status}"
-                )
-                logger_run.info(summary)
+        # Final memory check
+        final_memory_mb = process.memory_info().rss / 1024 / 1024
+        memory_delta = final_memory_mb - container_memory_mb
+        
+        # Run summary
+        run_duration = time.time() - start_time
+        redis_status = "OK" if not sdb.degraded else "DEGRADED"
+        
+        summary = (
+            f"✅ RUN COMPLETE | "
+            f"Duration: {run_duration:.1f}s | "
+            f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
+            f"Alerts: {alerts_sent} | "
+            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
+            f"Redis: {redis_status}"
+        )
+        logger_run.info(summary)
 
-                if alerts_sent > MAX_ALERTS_PER_RUN:
-                    await telegram_queue.send(escape_markdown_v2(
-                        f"⚠️ HIGH VOLUME: {alerts_sent} alerts | "
-                        f"Pairs: {len(all_results)}"
-                    ))
+        # Alert on high volume
+        if alerts_sent > MAX_ALERTS_PER_RUN:
+            await telegram_queue.send(escape_markdown_v2(
+                f"⚠️ HIGH ALERT VOLUME\n"
+                f"Alerts sent: {alerts_sent}\n"
+                f"Pairs processed: {len(all_results)}\n"
+                f"Time: {format_ist_time()}"
+            ))
 
-                return True
+        return True
 
-            except asyncio.TimeoutError:
-                logger_run.error("Run timed out")
-                return False
-            except Exception as e:
-                logger_run.exception(f"Error within Redis context: {e}")
-                raise
-            finally:
-                if lock_acquired and lock and lock.acquired_by_me:
-                    await lock.release(timeout=3.0)
-                else:
-                    logger_run.debug("Lock not acquired by this instance, skipping release")
-
-        finally:
-            await sdb.close()
-
-    except asyncio.CancelledError:
-        logger_run.info("Run cancelled (Task Cancellation)")
+    except asyncio.TimeoutError:
+        logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
         return False
+    
+    except asyncio.CancelledError:
+        logger_run.warning("🛑 Run cancelled (shutdown signal received)")
+        return False
+    
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
-        try:
-            await cancel_all_tasks(grace_seconds=5)
-        except Exception:
-            pass
+        
+        # Try to send error notification
+        if telegram_queue:
+            try:
+                await telegram_queue.send(escape_markdown_v2(
+                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
+                    f"Error: {str(e)[:200]}\n"
+                    f"Correlation ID: {correlation_id}\n"
+                    f"Time: {format_ist_time()}"
+                ))
+            except Exception:
+                logger_run.error("Failed to send error notification")
+        
         return False
+    
     finally:
-        # Final memory cleanup
+        # === CRITICAL: Guaranteed resource cleanup ===
+        logger_run.debug("🧹 Starting resource cleanup...")
+        
+        # Release distributed lock
+        if lock_acquired and lock and lock.acquired_by_me:
+            try:
+                await lock.release(timeout=3.0)
+                logger_run.debug("🔓 Redis lock released")
+            except Exception as e:
+                logger_run.error(f"Error releasing lock: {e}")
+        
+        # Close Redis connection
+        if sdb:
+            try:
+                await sdb.close()
+                logger_run.debug("✅ Redis connection closed")
+            except Exception as e:
+                logger_run.error(f"Error closing Redis: {e}")
+        
+        # Close HTTP session
+        try:
+            await SessionManager.close_session()
+            logger_run.debug("✅ HTTP session closed")
+        except Exception as e:
+            logger_run.error(f"Error closing HTTP session: {e}")
+        
+        # Memory cleanup
         try:
             if 'all_results' in locals():
                 del all_results
@@ -3133,13 +3693,21 @@ async def run_once() -> bool:
                 del products_map
             if 'fetcher' in locals():
                 del fetcher
+            if 'telegram_queue' in locals():
+                del telegram_queue
+            
+            # Force garbage collection
             gc.collect()
-            logger_run.debug("Final cleanup completed")
+            
+            logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
-            logger_run.warning(f"Final cleanup error (non-critical): {e}")
-
-        await SessionManager.close_session()
+            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
+        
+        # Clear context variables
         TRACE_ID.set("")
+        PAIR_ID.set("")
+        
+        logger_run.debug("🏁 Resource cleanup finished")
 
 # ============================================================================
 # ENTRY POINT
@@ -3154,19 +3722,41 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner")
-    parser.add_argument("--debug", action="store_true", help="Set logger to DEBUG")
+    parser = argparse.ArgumentParser(
+        prog="macd_unified",
+        description="Unified MACD/alerts runner with NumPy optimization"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
+    parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     args = parser.parse_args()
 
+    # Enable debug mode if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
-    # Warm up Numba JIT compiler
-    warmup_numba()
+    # Validate configuration
+    try:
+        validate_runtime_config()
+    except ValueError as e:
+        logger.critical(f"Configuration validation failed: {e}")
+        sys.exit(1)
+    
+    # Exit if validation-only mode
+    if args.validate_only:
+        logger.info("Configuration validation passed - exiting (--validate-only mode)")
+        sys.exit(0)
 
+    # Warm up Numba JIT compiler (unless skipped)
+    if not args.skip_warmup:
+        warmup_numba()
+    else:
+        logger.info("Skipping Numba warmup (--skip-warmup flag)")
+
+    # Run the bot
     try:
         success = asyncio.run(run_once())
         if success:
@@ -3176,7 +3766,7 @@ if __name__ == "__main__":
             logger.error("❌ Bot run failed")
             sys.exit(1)
     except (asyncio.CancelledError, KeyboardInterrupt):
-        logger.info("Bot stopped by timeout or user")
+        logger.info("Bot stopped by timeout or user interrupt")
         sys.exit(130)
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
