@@ -15,66 +15,85 @@ concurrency:
   group: trading-bot-execution
   cancel-in-progress: false
 
-env:
-  IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
-
 jobs:
   run-bot:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    # Reduced timeout as native execution is much faster
+    timeout-minutes: 5
+    
     permissions:
-      packages: read
+      contents: read
+      deployments: write
 
     steps:
       - name: Log execution context
         run: |
           echo "🚀 Triggered via: ${{ github.event_name }}"
           echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
-          echo "📋 Run ID: ${{ github.run_id }}"
+          echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      # OPTIMIZED: Checkout full code (needed for native run)
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # OPTIMIZED: Setup uv for lightning-fast dependency install
+      - name: Install uv
+        uses: astral-sh/setup-uv@v1
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          enable-cache: true
+          cache-dependency-glob: "requirements.txt"
 
-      - name: Pull image
+      # OPTIMIZED: Setup Python 3.11
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # OPTIMIZED: Install dependencies directly (No Docker overhead)
+      # Replicates the specific pycares/aiodns fix from your Dockerfile
+      - name: Install dependencies
         run: |
-          docker pull "$IMAGE"
-          docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
+          uv pip install --system pycares==4.4.0 aiodns==3.2.0
+          uv pip install --system -r requirements.txt
 
       - name: Set trigger timestamp
         id: timestamp
-        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
+        run: |
+          TS=$(date +%s)
+          echo "ts=$TS" >> $GITHUB_OUTPUT
 
+      # OPTIMIZED: Run Python directly on "Bare Metal"
+      # No CPU limits, No Memory limits (Runner has 7GB RAM / 2 vCPUs)
       - name: Run trading bot
         id: run_bot
         env:
+          # Secrets
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
+          # Config
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
+          CONFIG_FILE: config_macd.json
+          TZ: Asia/Kolkata
+          # Metadata
+          TRIGGER_TIMESTAMP: ${{ steps.timestamp.outputs.ts }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          docker run --rm \
-            --name trading-bot-${{ github.run_id }} \
-            --memory="512m" --memory-swap="512m" --cpus="1.0" \
-            --security-opt no-new-privileges --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
-            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
-            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
-            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
-            -e CONFIG_FILE=config_macd.json \
-            -e TZ=Asia/Kolkata \
-            -e LOG_JSON=false \
-            -e FILE_LOGGING=false \
-            -e DEBUG_MODE="$DEBUG_MODE" \
-            -e TRIGGER_TIMESTAMP="${{ steps.timestamp.outputs.ts }}" \
-            -e GITHUB_SHA="${{ github.sha }}" \
-            -e GITHUB_RUN_ID="${{ github.run_id }}" \
-            -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
-            -e GITHUB_WORKFLOW="${{ github.workflow }}" \
-            -e GITHUB_REPOSITORY="${{ github.repository }}" \
-            "$IMAGE"
+          echo "🤖 Starting trading bot (Native Mode)..."
+          python wrapper.py
+
+      # Reporting
+      - name: Log execution summary
+        if: always()
+        run: |
+          echo "📊 Execution Summary:"
+          echo "  - Status: ${{ job.status }}"
+          echo "  - Duration: $(date)"
 
       - name: Notify on failure
         if: failure()
