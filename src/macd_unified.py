@@ -828,11 +828,13 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         
         # OPTIMIZED: Use Numba-compiled loop for value calculation
         value_arr = _calc_mmh_value_loop(temp, rows)
+
+        value_arr = np.clip(value_arr, -0.9999999, 0.9999999)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
         
-        # Calculate momentum
-        temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-        temp2 = np.nan_to_num(temp2, nan=1.0, posinf=1e8, neginf=1e-8)
-        temp2 = np.clip(temp2, 1e-8, 1e8)
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
         
@@ -1556,30 +1558,48 @@ def get_last_closed_index_from_array(
     interval_minutes: int,
     reference_time: Optional[int] = None
 ) -> Optional[int]:
-    """Get last closed candle index from NumPy timestamp array"""
-    if timestamps is None or len(timestamps) < 2:
+    """
+    Get the index of the last fully closed candle from a NumPy timestamp array.
+    Uses a smart tolerance: warns only on real problems, not on 1-second drifts.
+    """
+    if timestamps is None or timestamps.size < 2:
         return None
-    
+
     if reference_time is None:
         reference_time = get_trigger_timestamp()
-    
+
     last_ts = int(timestamps[-1])
     interval_seconds = interval_minutes * 60
-    
-    publication_buffer = Constants.CANDLE_PUBLICATION_LAG_SEC
-    
+
+    # Expected timestamp of the most recently closed candle
     expected_last_closed = calculate_expected_candle_timestamp(reference_time, interval_minutes)
-    
-    if not validate_candle_timestamp(last_ts, expected_last_closed, tolerance_seconds=interval_seconds):
-        logger.warning(f"Last candle timestamp ({last_ts}) doesn't match expected ({expected_last_closed})")
-    
+
+    diff_seconds = abs(last_ts - expected_last_closed)
+
+    # Only warn if the candle is seriously off (more than 5 minutes)
+    if diff_seconds > 300:
+        logger.warning(
+            f"Last candle timestamp significantly off! "
+            f"Got {last_ts} ({format_ist_time(last_ts)}), "
+            f"expected ~{expected_last_closed} ({format_ist_time(expected_last_closed)}), "
+            f"diff={diff_seconds}s"
+        )
+    elif diff_seconds > 0:
+        # Optional: very quiet debug for tiny drifts (1–300 seconds) — usually normal
+        logger.debug(
+            f"Minor acceptable timestamp drift: {last_ts} vs expected {expected_last_closed} "
+            f"({diff_seconds}s)"
+        )
+
+    # Publication buffer: don't use a candle that's still forming
+    publication_buffer = Constants.CANDLE_PUBLICATION_LAG_SEC
+
     if reference_time >= (last_ts + interval_seconds + publication_buffer):
-        return len(timestamps) - 1
+        # Current time is well into the next candle → last one is fully closed
+        return timestamps.size - 1
     else:
-        if len(timestamps) >= 2:
-            return len(timestamps) - 2
-        else:
-            return None
+        # We're still inside the current candle → use the one before last
+        return timestamps.size - 2 if timestamps.size >= 2 else None
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
