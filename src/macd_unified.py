@@ -2859,25 +2859,25 @@ def check_candle_quality_with_reason(
 
         if is_buy:
             if close_val <= open_val:
-                return False, f"Not green candle (C={close_val:.4f} <= O={open_val:.4f})"
+                return False, f"Not green candle (C={close_val:.2f} <= O={open_val:.2f})"
 
             upper_wick = high_val - close_val
             wick_ratio = upper_wick / candle_range
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+                return False, f"Upper wick {wick_ratio*100:.0f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
 
             return True, "Passed"
 
         else:
             if close_val >= open_val:
-                return False, f"Not red candle (C={close_val:.4f} >= O={open_val:.4f})"
+                return False, f"Not red candle (C={close_val:.2f} >= O={open_val:.2f})"
 
             lower_wick = close_val - low_val
             wick_ratio = lower_wick / candle_range
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick {wick_ratio*100:.2f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
+                return False, f"Lower wick {wick_ratio*100:.0f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
 
             return True, "Passed"
 
