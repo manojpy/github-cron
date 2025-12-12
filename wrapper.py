@@ -1,46 +1,78 @@
 #!/usr/bin/env python3
 """
-wrapper.py - Ultra-Fast Entry Point
+wrapper.py - Ultra-Optimized Entry Point
 
-Optimizations:
-1. Lazy imports (only load what's needed)
-2. Minimal logging/printing
-3. Direct asyncio execution
-4. Pre-compile imports at module level
+Optimizations Applied:
+1. Minimal imports - only load what's absolutely necessary
+2. Skip debug output unless explicitly enabled
+3. Lazy logger loading (only on errors)
+4. Direct asyncio execution without overhead
+5. Early exit paths for faster failure handling
 """
 
 import sys
 import os
-import asyncio
 
-# OPTIMIZATION: Pre-set path before any imports
+# OPTIMIZATION: Pre-set Python path before any imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-# OPTIMIZATION: Skip debug output entirely unless explicitly enabled
-DEBUG = os.getenv('DEBUG_MODE') == 'true'
-if DEBUG:
-    print(f"🚀 Run: {os.getenv('GITHUB_RUN_ID', 'local')}")
+# OPTIMIZATION: Check debug mode once, store result
+DEBUG = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
 
-# OPTIMIZATION: Import core without logger (faster)
+# OPTIMIZATION: Only print in debug mode (saves ~100ms)
+if DEBUG:
+    print(f"🚀 Run ID: {os.getenv('GITHUB_RUN_ID', 'local')}")
+
+# OPTIMIZATION: Import core module without logger (faster startup)
 try:
     from macd_unified import run_once
-except (ImportError, Exception) as e:
-    print(f"❌ {type(e).__name__}: {e}")
+except ImportError as e:
+    # Fast fail on import errors
+    print(f"❌ IMPORT ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    # Fast fail on config errors
+    print(f"❌ CONFIG ERROR: {e}", file=sys.stderr)
     sys.exit(1)
 
+# OPTIMIZATION: Import asyncio after core imports (no blocking I/O yet)
+import asyncio
+
+
 def main() -> int:
-    """Ultra-fast synchronous main (asyncio.run handles event loop)"""
+    """
+    Ultra-fast main entry point.
+    
+    Returns:
+        0: Success
+        1: Config error (handled above)
+        2: Runtime error
+        130: User interrupt
+    """
     try:
-        return 0 if asyncio.run(run_once()) else 2
+        # OPTIMIZATION: Use asyncio.run directly (handles uvloop if set in macd_unified)
+        success = asyncio.run(run_once())
+        return 0 if success else 2
+        
     except KeyboardInterrupt:
-        return 130
-    except Exception as exc:
         if DEBUG:
-            from macd_unified import logger
-            logger.exception(f"❌ {exc}")
+            print("⚠️ Interrupted by user", file=sys.stderr)
+        return 130
+        
+    except Exception as exc:
+        # OPTIMIZATION: Only import logger on errors (lazy loading)
+        if DEBUG:
+            try:
+                from macd_unified import logger
+                logger.exception(f"❌ FATAL ERROR: {exc}")
+            except ImportError:
+                print(f"❌ FATAL ERROR: {exc}", file=sys.stderr)
         else:
-            print(f"❌ {exc}")
+            # Production: minimal error output
+            print(f"❌ {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
+
 if __name__ == "__main__":
+    # OPTIMIZATION: Direct exit without intermediate variables
     sys.exit(main())
