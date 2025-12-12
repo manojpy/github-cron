@@ -1,4 +1,4 @@
-name: Run Unified MACD Bot (Optimized Native)
+name: Run Unified MACD Bot
 
 on:
   workflow_dispatch:
@@ -8,7 +8,6 @@ on:
         required: false
         type: boolean
         default: false
-  # Used by cron-jobs.org or external cron services
   repository_dispatch:
     types: [cron_trigger]
 
@@ -16,83 +15,69 @@ concurrency:
   group: trading-bot-execution
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
+
 jobs:
   run-bot:
-    # --- IMPROVEMENT: Pinning to Ubuntu 24.04 LTS for stability and predictability ---
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    
+    timeout-minutes: 15
     permissions:
-      contents: read
-      deployments: write
+      packages: read
 
     steps:
       - name: Log execution context
         run: |
           echo "🚀 Triggered via: ${{ github.event_name }}"
           echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
+          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+          echo "📋 Run ID: ${{ github.run_id }}"
 
-      # 1. Checkout full code
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      # 2. Setup uv for lightning-fast dependency install
-      - name: Install uv and Restore Cache
-        uses: astral-sh/setup-uv@v1
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          enable-cache: true
-          cache-dependency-glob: "requirements.txt"
-        # CRITICAL FIX: Skip this step if the cache service fails (the intermittent GitHub error)
-        continue-on-error: true 
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. Setup Python 3.11
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # 4. Install dependencies directly on the runner
-      - name: Install dependencies (uv)
+      - name: Pull image
         run: |
-          echo "Installing Python dependencies..."
-          # Fix the pycares / aiodns issue locally
-          uv pip install --system pycares==4.4.0 aiodns==3.2.0
-          # Install everything else from requirements.txt
-          uv pip install --system -r requirements.txt
+          docker pull "$IMAGE"
+          docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
 
       - name: Set trigger timestamp
         id: timestamp
-        run: |
-          TS=$(date +%s)
-          echo "ts=$TS" >> $GITHUB_OUTPUT
+        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
 
-      # 5. Run Python directly
-      - name: Run trading bot (Native Execution)
+      - name: Run trading bot
         id: run_bot
         env:
-          # Secrets (retrieved from GitHub Secrets)
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          DELTA_API_BASE: ${{ secrets.DELTA_API_BASE }}
-          # Config & Metadata
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
-          CONFIG_FILE: config_macd.json
-          TZ: Asia/Kolkata
-          TRIGGER_TIMESTAMP: ${{ steps.timestamp.outputs.ts }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          echo "🤖 Starting wrapper.py..."
-          python wrapper.py
-
-      # Reporting
-      - name: Log execution summary
-        if: always()
-        run: echo "📊 Execution Status: ${{ job.status }}"
+          docker run --rm \
+            --name trading-bot-${{ github.run_id }} \
+            --memory="512m" --memory-swap="512m" --cpus="1.0" \
+            --security-opt no-new-privileges --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
+            -e CONFIG_FILE=config_macd.json \
+            -e TZ=Asia/Kolkata \
+            -e LOG_JSON=false \
+            -e FILE_LOGGING=false \
+            -e DEBUG_MODE="$DEBUG_MODE" \
+            -e TRIGGER_TIMESTAMP="${{ steps.timestamp.outputs.ts }}" \
+            -e GITHUB_SHA="${{ github.sha }}" \
+            -e GITHUB_RUN_ID="${{ github.run_id }}" \
+            -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
+            -e GITHUB_WORKFLOW="${{ github.workflow }}" \
+            -e GITHUB_REPOSITORY="${{ github.repository }}" \
+            "$IMAGE"
 
       - name: Notify on failure
         if: failure()
         run: |
           echo "❌ Bot execution failed"
-          echo "🔗 Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
