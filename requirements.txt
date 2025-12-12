@@ -29,3 +29,4 @@ tzdata==2024.2
 
 # Type hints compatibility
 typing-extensions==4.12.2
+pycparser==2.21
