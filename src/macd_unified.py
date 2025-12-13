@@ -3130,7 +3130,9 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
-    gc.disable() 
+    
+    gc.disable()  
+    
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -3232,24 +3234,18 @@ async def run_once() -> bool:
             f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture"
         )
 
-        gc.collect()
-        gc_was_enabled = gc.isenabled()
-        gc.disable()
+        all_results = await process_pairs_with_workers(
+            fetcher, products_map, pairs_to_process,
+            sdb, telegram_queue, correlation_id,
+            lock, reference_time
+        )
         
-        try:
-            all_results = await process_pairs_with_workers(
-                fetcher, products_map, pairs_to_process,
-                sdb, telegram_queue, correlation_id,
-                lock, reference_time
-            )
-        finally:
-            if gc_was_enabled:
-                gc.enable()
-            gc.collect()
-
-        for _, state in all_results:
-            if state.get("state") == "ALERT_SENT":
-                alerts_sent += state.get("summary", {}).get("alerts", 0)
+        alerts_sent = sum(
+            state.get("summary", {}).get("alerts", 0)
+            for _, state in all_results
+            # Ensure state is a dict before trying to access keys
+            if isinstance(state, dict) and state.get("state") == "ALERT_SENT"
+        )
 
         fetcher_stats = fetcher.get_stats()
         logger_run.info(
@@ -3277,7 +3273,7 @@ async def run_once() -> bool:
             f"✅ RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
-            f"Alerts: {alerts_sent} | "
+            f"Alerts: {alerts_sent} | " # THIS IS NOW CORRECT
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
@@ -3319,7 +3315,7 @@ async def run_once() -> bool:
     
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
-        
+       
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
@@ -3351,6 +3347,9 @@ async def run_once() -> bool:
                 del telegram_queue
             
             gc.collect()
+            
+            if gc.isenabled() is False:
+                 gc.enable()
             
             logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
