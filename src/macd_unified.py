@@ -3130,7 +3130,6 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
-    
     gc.disable()  
     
     correlation_id = uuid.uuid4().hex[:8]
@@ -3216,7 +3215,7 @@ async def run_once() -> bool:
                 return False
             
             PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
+            PRODUCTS_CACHE["until"] = now + 28_800
             run_once._products_cache = PRODUCTS_CACHE
             logger_run.info("✅ Products list cached for 8 hours")
         else:
@@ -3233,17 +3232,17 @@ async def run_once() -> bool:
         logger_run.info(
             f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture"
         )
-
+        
         all_results = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process,
             sdb, telegram_queue, correlation_id,
             lock, reference_time
         )
         
+        # --- FIXED ALERT COUNTER ---
         alerts_sent = sum(
             state.get("summary", {}).get("alerts", 0)
             for _, state in all_results
-            # Ensure state is a dict before trying to access keys
             if isinstance(state, dict) and state.get("state") == "ALERT_SENT"
         )
 
@@ -3273,7 +3272,7 @@ async def run_once() -> bool:
             f"✅ RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
-            f"Alerts: {alerts_sent} | " # THIS IS NOW CORRECT
+            f"Alerts: {alerts_sent} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
@@ -3315,7 +3314,7 @@ async def run_once() -> bool:
     
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
-       
+        
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
