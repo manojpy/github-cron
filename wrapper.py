@@ -9,27 +9,6 @@ src/macd_unified.py core.
 import sys
 import os
 import asyncio
-import warnings
-
-# --- Code to suppress the specific pycparser RuntimeWarning ---
-
-def suppress_pycparser_warning():
-    """
-    Suppresses the specific RuntimeWarning related to pycparser's parsing methods
-    lacking documentation, which frequently pollutes logs.
-    """
-    # The warning text is related to pycparser's internal workings.
-    # We filter specifically for RuntimeWarning, matching the message text.
-    warnings.filterwarnings(
-        "ignore",
-        message="parsing methods must have __doc__ for pycparser to work properly",
-        category=RuntimeWarning
-    )
-
-# ------------------------------------------------------------------
-# CRITICAL: Call the suppression function here, before any complex imports
-suppress_pycparser_warning()
-# ------------------------------------------------------------------
 
 
 # Ensure src is in path
