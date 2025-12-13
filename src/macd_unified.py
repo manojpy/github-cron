@@ -3130,7 +3130,7 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
-    gc.disable()  
+    gc.disable()
     
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
@@ -3215,7 +3215,7 @@ async def run_once() -> bool:
                 return False
             
             PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["until"] = now + 28_800
+            PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
             run_once._products_cache = PRODUCTS_CACHE
             logger_run.info("✅ Products list cached for 8 hours")
         else:
@@ -3232,19 +3232,18 @@ async def run_once() -> bool:
         logger_run.info(
             f"📊 Processing {len(pairs_to_process)} pairs using WORKER POOL architecture"
         )
-        
+
+        # Note: You can remove this gc.collect() and the gc.disable/enable block below
+        # since GC is already disabled at the top
         all_results = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process,
             sdb, telegram_queue, correlation_id,
             lock, reference_time
         )
-        
-        # --- FIXED ALERT COUNTER ---
-        alerts_sent = sum(
-            state.get("summary", {}).get("alerts", 0)
-            for _, state in all_results
-            if isinstance(state, dict) and state.get("state") == "ALERT_SENT"
-        )
+
+        for _, state in all_results:
+            if state.get("state") == "ALERT_SENT":
+                alerts_sent += state.get("summary", {}).get("alerts", 0)
 
         fetcher_stats = fetcher.get_stats()
         logger_run.info(
@@ -3345,10 +3344,8 @@ async def run_once() -> bool:
             if 'telegram_queue' in locals():
                 del telegram_queue
             
+            # Final gc.collect() is fine - it's manual, not automatic
             gc.collect()
-            
-            if gc.isenabled() is False:
-                 gc.enable()
             
             logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
