@@ -938,54 +938,46 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
     """
-    Optimized MMH calculation using Numba loops with extensive fallbacks
-    Returns: hist as NumPy array
+    Optimized MMH calculation using Numba-compiled rolling stats.
+    Returns: hist as NumPy array (float32 to match rest of pipeline)
     """
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+            return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # Calculate standard deviation using rolling window
-        sd = _rolling_std_numba(close, 50, responsiveness)
-            start = max(0, i - 49)  # 50-period window
-            window = close[start:i+1]
-            sd[i] = np.std(window, ddof=0) * resp_clamped if len(window) > 0 else 0.0
+        # 1. Rolling standard deviation (50-period window, as in original)
+        sd = _rolling_std_numba(close.astype(np.float32), 50, resp_clamped)
         
-        # OPTIMIZED: Use Numba-compiled loop instead of Python loop
-        worm_arr = _calc_mmh_worm_loop(close, sd, rows)
+        # 2. Worm calculation using Numba
+        worm_arr = _calc_mmh_worm_loop(close.astype(np.float32), sd, rows)
         
-        # Calculate moving average
-        ma = _rolling_mean_numba(close, period)
-            start = max(0, i - period + 1)
-            ma[i] = np.mean(close[start:i+1])
+        # 3. Rolling mean (period-length)
+        ma = _rolling_mean_numba(close.astype(np.float32), period)
         
-        # Calculate raw values
+        # 4. Raw values
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Calculate temp
+        # 5. Rolling min/max on raw
         min_med, max_med = _rolling_min_max_numba(raw, period)
-            start = max(0, i - period + 1)
-            window = raw[start:i+1]
-            min_med[i] = np.min(window) if len(window) > 0 else 0.0
-            max_med[i] = np.max(window) if len(window) > 0 else 1.0
         
+        # 6. Temp calculation
         denom = max_med - min_med
         denom = np.where(denom == 0, 1e-12, denom)
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
-        # OPTIMIZED: Use Numba-compiled loop for value calculation
+        # 7. Value calculation (Numba)
         value_arr = _calc_mmh_value_loop(temp, rows)
-
         value_arr = np.clip(value_arr, -0.9999999, 0.9999999)
-
+        
+        # 8. Momentum
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
             temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
@@ -993,18 +985,18 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
         
-        # OPTIMIZED: Use Numba-compiled loop for momentum accumulation
+        # 9. Final accumulation (Numba)
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
         
-        # Sanitize
-        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
+        # Sanitize and return as float32
+        momentum_arr = sanitize_indicator_array(momentum_arr.astype(np.float32), "MMH_Hist", default=0.0)
         
         return momentum_arr
         
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
-        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+        return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
 
 def warmup_numba() -> None:
     """
