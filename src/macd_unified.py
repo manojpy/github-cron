@@ -36,6 +36,7 @@ warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
 
+try:
     import orjson
     
     def json_dumps(obj: Any) -> str:
