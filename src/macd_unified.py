@@ -29,10 +29,6 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit
-import warnings
-warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
-
-
 
 # ============================================================================
 # PERFORMANCE ENHANCEMENT: Use orjson for faster JSON operations
@@ -956,25 +952,47 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 def warmup_numba() -> None:
-    """Eager-compile all Numba-accelerated helpers with dummy data."""
-    logger.info("🔥 Warming up Numba JIT compiler...")
-    try:
-        length = 500
-        close = np.random.random(length).astype(np.float64) * 1000
-        sd    = np.random.random(length).astype(np.float64) * 0.01
-
-        _calc_mmh_worm_loop(close, sd, length)
-        _calc_mmh_value_loop(np.random.random(length).astype(np.float64), length)
-        _calc_mmh_momentum_loop(np.random.random(length).astype(np.float64), length)
-        _sma_loop(close, 50)
-        _ema_loop(close, 0.1)
-        _kalman_loop(close, 21, 0.01, 0.1)
-        _rng_filter_loop(close, sd)
-        _vwap_daily_loop(close, close, close, close, np.arange(length, dtype=np.int64))
-
-        logger.info("✅ Numba warm-up complete.")
-    except Exception as e:
-        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
+    """
+    Eager-compile all Numba-accelerated helpers with dummy data.
+    Suppresses pycparser warnings during compilation.
+    """
+    import warnings
+    
+    # Suppress pycparser warnings during Numba JIT compilation
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
+        warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
+        
+        logger.info("Warming up Numba JIT compiler...")
+        
+        try:
+            length = 500
+            close = np.random.random(length).astype(np.float64) * 1000
+            high = close + np.random.random(length).astype(np.float64) * 10
+            low = close - np.random.random(length).astype(np.float64) * 10
+            volume = np.random.random(length).astype(np.float64) * 1000
+            timestamps = np.arange(length, dtype=np.int64) * 900
+            sd = np.random.random(length).astype(np.float64) * 0.01
+            
+            # Compile all Numba functions
+            _calc_mmh_worm_loop(close, sd, length)
+            _calc_mmh_value_loop(np.random.random(length).astype(np.float64), length)
+            _calc_mmh_momentum_loop(np.random.random(length).astype(np.float64), length)
+            _sma_loop(close, 50)
+            _ema_loop(close, 0.1)
+            _kalman_loop(close, 21, 0.01, 0.1)
+            _rng_filter_loop(close, sd)
+            _vwap_daily_loop(high, low, close, volume, timestamps)
+            _fast_array_copy(close, sd, length)  # Compile the copy function too
+            
+            # Call them again to ensure they're fully compiled (not just cached)
+            _sma_loop(close[:100], 20)
+            _ema_loop(close[:100], 0.2)
+            
+            logger.info("Numba warm-up complete.")
+            
+        except Exception as e:
+            logger.warning(f"Numba warm-up failed (non-fatal): {e}")
 
 indicator_semaphore = asyncio.Semaphore(cfg.INDICATOR_THREAD_LIMIT)
 
