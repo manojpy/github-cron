@@ -52,11 +52,13 @@ jobs:
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source $HOME/.cargo/env
 
       # OPTIMIZATION: Install dependencies with uv (5-10x faster than pip)
       - name: Install dependencies
         run: |
+          source $HOME/.cargo/env
+          
           # Fix pycares/aiodns compatibility
           uv pip install --system pycares==4.4.0 aiodns==3.2.0
           
