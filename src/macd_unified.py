@@ -35,7 +35,6 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
-
 try:
     import orjson
     
@@ -472,7 +471,7 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -502,7 +501,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -516,7 +515,7 @@ def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
     return out
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     n = len(src)
     result = np.empty(n, dtype=np.float64)
@@ -544,7 +543,7 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         
     return result
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _vwap_daily_loop(
     high: np.ndarray, 
     low: np.ndarray, 
@@ -590,7 +589,7 @@ def _vwap_daily_loop(
             
     return vwap
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     n = len(x)
     filt = np.zeros(n, dtype=np.float64)
@@ -620,7 +619,7 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 
     return filt
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
@@ -640,7 +639,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
@@ -653,14 +652,14 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     rows = len(close)
     sd = np.empty(rows, dtype=np.float64)
@@ -684,7 +683,7 @@ def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) ->
             sd[i] = 0.0
     return sd
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -700,7 +699,7 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else 0.0
     return ma
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
@@ -1710,35 +1709,35 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
         if close is None or len(close) == 0:
             return False, "Close array is empty"
         
-        if np.any(np.isnan(close)) or np.any(close <= 0):
-            return False, "Invalid close prices (NaN or <= 0)"
-        
         if timestamp is None or len(timestamp) == 0:
             return False, "Timestamp array is empty"
         
-        if not np.all(np.diff(timestamp) >= 0):  # allows equal timestamps (rare but safe)
-            return False, "Timestamps not non-decreasing"
-        
         if len(close) < required_len:
             return False, f"Insufficient data: {len(close)} < {required_len}"
+
+        if np.any(np.isnan(close)) or np.any(close <= 0):
+            return False, "Invalid close prices (NaN or <= 0)"
         
-        if len(close) >= 2:
+        if not np.all(np.diff(timestamp) >= 0):
+            return False, "Timestamps not non-decreasing"
+        
+        if cfg.DEBUG_MODE and len(close) >= 2:
             time_diffs = np.diff(timestamp)
             if len(time_diffs) > 0:
                 median_diff = np.median(time_diffs)
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 if np.any(time_diffs > max_expected_gap):
                     gaps = time_diffs[time_diffs > max_expected_gap]
-                    logger.warning(f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
-        
-        if len(close) >= 2:
+                    logger.debug(f"Validation: Detected {len(gaps)} candle gaps (median: {median_diff}s)")
+            
             price_changes = np.abs(np.diff(close) / close[:-1]) * 100
             extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
             if len(extreme_changes) > 0:
-                logger.warning(f"Detected {len(extreme_changes)} extreme price changes (max: {extreme_changes.max():.2f}%)")
+                logger.warning(f"Validation: Extreme price change detected: {extreme_changes.max():.2f}%")
                 return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
         
         return True, None
+
     except Exception as e:
         logger.error(f"Data validation failed: {e}")
         return False, f"Validation error: {str(e)}"
@@ -1819,7 +1818,7 @@ class RedisStateStore:
     """
     
     def __init__(self, redis_url: str):
-        from urllib.parse import urlparse, parse_qs
+        from urllib.parse import urlparse
         
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
@@ -1834,12 +1833,6 @@ class RedisStateStore:
             self.redis_port = parsed.port or 6379
             self.redis_db = parsed.path.lstrip('/') or '0'
             
-            logger.debug(
-                f"Redis URL parsed | Host: {self.redis_host} | "
-                f"Port: {self.redis_port} | DB: {self.redis_db} | "
-                f"Secure: {parsed.scheme == 'rediss'}"
-            )
-            
         except Exception as e:
             logger.error(f"Failed to parse Redis URL: {e}")
             self.redis_host = 'localhost'
@@ -1848,23 +1841,13 @@ class RedisStateStore:
         
         self.state_prefix = "pair_state:"
         self.meta_prefix = "metadata:"
-        self.alert_prefix = "alert:"
-        
         self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
-        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
         
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
         self._dedup_script_sha = None
-        
-        logger.debug(
-            f"RedisStateStore initialized | "
-            f"State TTL: {cfg.STATE_EXPIRY_DAYS}d | "
-            f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
-            f"Metadata TTL: 7d"
-        )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -1876,26 +1859,11 @@ class RedisStateStore:
                 max_connections=10,
                 decode_responses=True,
             )
-            ok = await self._ping_with_retry(timeout)
-            if ok:
-                if cfg.DEBUG_MODE:
-                    logger.debug("Connected to RedisStateStore (decode_responses=True, max_connections=10)")
-                self.degraded = False
-                self.degraded_alerted = False
-                self._connection_attempts = 0
-                
-                try:
-                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                    logger.debug("Loaded Redis Lua script for alert deduplication")
-                except Exception as e:
-                    logger.warning(f"Failed to load Lua script (will fallback): {e}")
-                    self._dedup_script_sha = None
-                
+            if await self._ping_with_retry(timeout):
                 return True
             else:
-                raise RedisConnectionError("ping failed after retries")
-        except Exception as exc:
-            logger.error(f"Redis connection attempt failed: {exc}")
+                raise RedisConnectionError("ping failed")
+        except Exception:
             if self._redis:
                 try:
                     await self._redis.aclose()
@@ -1908,65 +1876,34 @@ class RedisStateStore:
         if self._redis is not None and not self.degraded:
             try:
                 if await self._ping_with_retry(1.0):
-                    logger.debug("Redis connection healthy")
                     return
             except Exception:
-                logger.debug("Redis ping failed, attempting reconnect")
+                pass
 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
-            if cfg.DEBUG_MODE:
-                logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
-
             if await self._attempt_connect(timeout):
-                test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
-                test_val = "ok"
-                if (
-                    await self._safe_redis_op(
-                        self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set"
-                    )
-                    and await self._safe_redis_op(
-                        self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val
-                    )
-                ):
-                    await self._safe_redis_op(
-                        self._redis.delete(test_key), 1.0, "smoke_cleanup"
-                    )
-                    expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
-                    logger.info(f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)")
-                    
-                    info = await self._safe_redis_op(
-                        self._redis.info("memory"), 3.0, "info_memory", lambda r: r
-                    )
-                    if info:
-                        policy = info.get("maxmemory_policy", "unknown")
-                        if policy in ("volatile-lru", "allkeys-lru"):
-                            logger.warning(f"⚠️ Redis using {policy} - keys may be evicted under memory pressure")
-                    
-                    self.degraded = False
-                    self.degraded_alerted = False
-                    return
-                else:
-                    logger.warning("Redis smoke test failed, marking degraded")
+                self.degraded = False
+                self.degraded_alerted = False
+                
+                try:
+                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                except Exception as e:
+                    logger.warning(f"Failed to load Lua script (will fallback): {e}")
+                    self._dedup_script_sha = None
+                
+                logger.info(f"✅ Redis connected")
+                return
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
-                delay = cfg.REDIS_RETRY_DELAY * attempt
-                logger.warning(f"Retrying Redis connection in {delay}s...")
-                await asyncio.sleep(delay)
+                await asyncio.sleep(cfg.REDIS_RETRY_DELAY)
 
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
         self._redis = None
 
-        logger.warning("""
-🚨 REDIS DEGRADED MODE ACTIVE:
-- Alert deduplication:  DISABLED (may get duplicates)
-- State persistence:    DISABLED (alerts reset each run)
-- Trading alerts:       STILL ACTIVE (core functionality preserved)
-""")
-
         if cfg.FAIL_ON_REDIS_DOWN:
-            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
+            raise RedisConnectionError("Redis unavailable – FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
         if self._redis:
@@ -2006,20 +1943,13 @@ class RedisStateStore:
         try:
             result = await retry_async(
                 _do,
-                retries=3,
-                base_backoff=0.6,
-                cap=3.0,
-                on_error=lambda e, a, c: logger.debug(
-                    f"Redis {op_name} error (attempt {a}): {e}"
-                ),
+                retries=2,
+                base_backoff=0.5,
+                cap=2.0,
+                on_error=None,
             )
-
             return parser(result) if parser else result
-        except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
-            logger.error(f"Redis {op_name} failed: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to {op_name}: {e}")
+        except Exception:
             return None
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
@@ -2188,38 +2118,38 @@ class RedisStateStore:
             logger.error(f"Batch state update failed (falling back to individual): {e}")
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
-
-async def atomic_batch_update(
-    self,
-    updates: List[Tuple[str, Any, Optional[int]]],
-    deletes: List[str] = None
-) -> bool:
-    if self.degraded or not self._redis:
-        return False
     
-    try:
-        pipe = self._redis.pipeline()
-        now = int(time.time())
+    async def atomic_batch_update(
+        self,
+        updates: List[Tuple[str, Any, Optional[int]]],
+        deletes: List[str] = None
+    ) -> bool:
+        if self.degraded or not self._redis:
+            return False
         
-        for key, state, custom_ts in updates:
-            ts = custom_ts if custom_ts is not None else now
-            data = json_dumps({"state": state, "ts": ts})
-            full_key = f"{self.state_prefix}{key}"
-            if self.expiry_seconds > 0:
-                pipe.set(full_key, data, ex=self.expiry_seconds)
-            else:
-                pipe.set(full_key, data)
-        
-        if deletes:
-            for key in deletes:
-                pipe.delete(f"{self.state_prefix}{key}")
-        
-        await asyncio.wait_for(pipe.execute(), timeout=4.0)
-        return True
-        
-    except Exception as e:
-        logger.error(f"Atomic batch update failed: {e}")
-        return False
+        try:
+            pipe = self._redis.pipeline()
+            now = int(time.time())
+            
+            for key, state, custom_ts in updates:
+                ts = custom_ts if custom_ts is not None else now
+                data = json_dumps({"state": state, "ts": ts})
+                full_key = f"{self.state_prefix}{key}"
+                if self.expiry_seconds > 0:
+                    pipe.set(full_key, data, ex=self.expiry_seconds)
+                else:
+                    pipe.set(full_key, data)
+            
+            if deletes:
+                for key in deletes:
+                    pipe.delete(f"{self.state_prefix}{key}")
+            
+            await asyncio.wait_for(pipe.execute(), timeout=4.0)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Atomic batch update failed: {e}")
+            return False
 
 class RedisLock:
     RELEASE_LUA = """
@@ -2658,7 +2588,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
+    logger_pair = logger
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
 
@@ -3200,6 +3130,7 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
+    gc.disable() 
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -3466,11 +3397,6 @@ if __name__ == "__main__":
     if args.validate_only:
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
-
-    if not args.skip_warmup:
-        warmup_numba()
-    else:
-        logger.info("Skipping Numba warmup (--skip-warmup flag)")
 
     try:
         success = asyncio.run(run_once())
