@@ -3584,7 +3584,7 @@ async def run_once() -> bool:
             run_once._products_cache = PRODUCTS_CACHE
             logger_run.info("✅ Products list cached for 8 hours")
         else:
-            logger_run.debug("📦 Using cached products list")
+            logger_run.debug("�� Using cached products list")
             prod_resp = PRODUCTS_CACHE["data"]
 
         # Build products map
@@ -3746,6 +3746,8 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
+    warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
+    warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
