@@ -31,6 +31,14 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, Cli
 from numba import njit
 
 # ============================================================================
+# Suppress pycparser warnings from Numba (MUST BE BEFORE ANY NUMBA CODE RUNS)
+# ============================================================================
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
+warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
+
+
+# ============================================================================
 # PERFORMANCE ENHANCEMENT: Use orjson for faster JSON operations
 # ============================================================================
 try:
@@ -1310,7 +1318,6 @@ class SessionManager:
                         'Accept': 'application/json',
                         'Accept-Encoding': 'gzip, deflate',
                     },
-                    json_serialize=json_dumps,  # <-- REMOVE THIS LINE
                     raise_for_status=False,
                 )
                 
@@ -3746,8 +3753,6 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
-    warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
-    warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
