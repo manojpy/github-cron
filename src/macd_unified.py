@@ -248,7 +248,7 @@ class TraceContextFilter(logging.Filter):
         record.pair_id = PAIR_ID.get()
         return True
 
-class SafeFormatter(logging.Formatter)
+class SafeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         record.args = None
         formatted = super().format(record)
