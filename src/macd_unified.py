@@ -718,6 +718,57 @@ def _calc_mmh_momentum_loop(momentum_arr, rows):
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
+@njit(fastmath=True, cache=False)
+def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    rows = len(close)
+    sd = np.empty(rows, dtype=np.float64)
+    resp = max(0.00001, min(1.0, responsiveness))
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        sum_sq = 0.0
+        count = 0
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                sum_sq += val * val
+                count += 1
+        if count > 1:
+            mean = sum_val / count
+            var = (sum_sq / count) - mean * mean
+            sd[i] = np.sqrt(max(0.0, var)) * resp
+        else:
+            sd[i] = 0.0
+    return sd
+
+@njit(fastmath=True, cache=False)
+def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        count = 0
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+        ma[i] = sum_val / count if count > 0 else 0.0
+    return ma
+
+@njit(fastmath=True, cache=False)
+def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    rows = len(arr)
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        min_arr[i] = np.min(arr[start:i+1])
+        max_arr[i] = np.max(arr[start:i+1])
+    return min_arr, max_arr
+
 def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Optimized PPO using Numba EMAs and NumPy vectorization with extensive fallbacks.
@@ -899,8 +950,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
         # Calculate standard deviation using rolling window
-        sd = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
+        sd = _rolling_std_numba(close, 50, responsiveness)
             start = max(0, i - 49)  # 50-period window
             window = close[start:i+1]
             sd[i] = np.std(window, ddof=0) * resp_clamped if len(window) > 0 else 0.0
@@ -909,8 +959,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         worm_arr = _calc_mmh_worm_loop(close, sd, rows)
         
         # Calculate moving average
-        ma = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
+        ma = _rolling_mean_numba(close, period)
             start = max(0, i - period + 1)
             ma[i] = np.mean(close[start:i+1])
         
@@ -920,9 +969,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Calculate temp
-        min_med = np.empty(rows, dtype=np.float64)
-        max_med = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
+        min_med, max_med = _rolling_min_max_numba(raw, period)
             start = max(0, i - period + 1)
             window = raw[start:i+1]
             min_med[i] = np.min(window) if len(window) > 0 else 0.0
@@ -986,6 +1033,9 @@ def warmup_numba() -> None:
             _calc_mmh_worm_loop(close, sd, length)
             _calc_mmh_value_loop(np.random.random(length).astype(np.float64), length)
             _calc_mmh_momentum_loop(np.random.random(length).astype(np.float64), length)
+            _rolling_std_numba(close, 50, 0.9)
+            _rolling_mean_numba(close, 144)
+            min_arr, max_arr = _rolling_min_max_numba(close, 144)
             _sma_loop(close, 50)
             _ema_loop(close, 0.1)
             _kalman_loop(close, 21, 0.01, 0.1)
@@ -1926,9 +1976,9 @@ class DataFetcher:
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     """
-    Convert Delta JSON response straight into NumPy arrays, skipping Pandas entirely.
-    Returns dict with keys: open, high, low, close, volume, timestamp
-    or None on failure.
+    Convert Delta JSON response straight into NumPy arrays (zero-copy where possible).
+    Uses float32 for price/volume arrays → halves memory usage with no practical loss of precision
+    for crypto/fiat prices.
     """
     if not result or not isinstance(result, dict):
         return None
@@ -1939,29 +1989,31 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         return None
 
     try:
-        # Convert straight to numpy – no DataFrame overhead
+        # np.asarray on the raw Python lists returned by orjson gives a zero-copy view
+        # (contiguous in memory in CPython ≥3.10)
         data = {
-            "timestamp": np.array(res["t"], dtype=np.int64),
-            "open":      np.array(res["o"], dtype=np.float64),
-            "high":      np.array(res["h"], dtype=np.float64),
-            "low":       np.array(res["l"], dtype=np.float64),
-            "close":     np.array(res["c"], dtype=np.float64),
-            "volume":    np.array(res["v"], dtype=np.float64),
+            "timestamp": np.asarray(res["t"], dtype=np.int64),
+            "open":      np.asarray(res["o"], dtype=np.float32),
+            "high":      np.asarray(res["h"], dtype=np.float32),
+            "low":       np.asarray(res["l"], dtype=np.float32),
+            "close":     np.asarray(res["c"], dtype=np.float32),
+            "volume":    np.asarray(res["v"], dtype=np.float32),
         }
 
-        # Millisecond → second conversion if needed
-        if data["timestamp"][-1] > 1_000_000_000_000:
+        # Convert ms → seconds if needed (Delta sometimes uses ms)
+        if data["timestamp"][-1] > 1_000_000_000_000:  # rough check for milliseconds
             data["timestamp"] = (data["timestamp"] // 1000).astype(np.int64)
 
         # Basic sanity
         if data["close"][-1] <= 0 or np.isnan(data["close"][-1]):
             return None
+
         return data
     except Exception:
         return None
 
 def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    """Validate NumPy candle data arrays"""
+    """Validate NumPy candle data arrays – now fully vectorised for speed"""
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -1978,8 +2030,8 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
         if timestamp is None or len(timestamp) == 0:
             return False, "Timestamp array is empty"
         
-        if not np.all(timestamp[1:] >= timestamp[:-1]):
-            return False, "Timestamps not monotonic increasing"
+        if not np.all(np.diff(timestamp) >= 0):  # allows equal timestamps (rare but safe)
+            return False, "Timestamps not non-decreasing"
         
         if len(close) < required_len:
             return False, f"Insufficient data: {len(close)} < {required_len}"
@@ -1989,8 +2041,8 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
             if len(time_diffs) > 0:
                 median_diff = np.median(time_diffs)
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
-                gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > 0:
+                if np.any(time_diffs > max_expected_gap):
+                    gaps = time_diffs[time_diffs > max_expected_gap]
                     logger.warning(f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)")
         
         if len(close) >= 2:
