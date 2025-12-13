@@ -29,6 +29,10 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
+
+
 
 # ============================================================================
 # PERFORMANCE ENHANCEMENT: Use orjson for faster JSON operations
@@ -1279,6 +1283,7 @@ class SessionManager:
                 
                 # Create new session
                 # Create new session
+                # Create new session
                 cls._session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
@@ -1287,6 +1292,7 @@ class SessionManager:
                         'Accept': 'application/json',
                         'Accept-Encoding': 'gzip, deflate',
                     },
+                    json_serialize=json_dumps,  # <-- REMOVE THIS LINE
                     raise_for_status=False,
                 )
                 
