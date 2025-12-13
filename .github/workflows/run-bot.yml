@@ -1,4 +1,4 @@
-name: Run Unified MACD Bot (No Docker)
+name: Run Unified MACD Bot
 
 on:
   workflow_dispatch:
@@ -37,6 +37,7 @@ jobs:
         uses: actions/cache@v4
         id: cache_python
         with:
+          # Caching standard pip cache location, which uv also respects
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: |
@@ -48,18 +49,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      # OPTIMIZATION: Install uv for lightning-fast dependency installation
-      - name: Install uv
+      # OPTIMIZATION: Install uv and dependencies in a single step (reduces shell startup overhead)
+      - name: Install uv and dependencies
         run: |
+          # 1. Install uv
           curl -LsSf https://astral.sh/uv/install.sh | sh
           source $HOME/.cargo/env
-
-      # OPTIMIZATION: Install dependencies with uv (5-10x faster than pip)
-      - name: Install dependencies
-        run: |
-          source $HOME/.cargo/env
           
-          # Fix pycares/aiodns compatibility
+          # 2. Install dependencies using uv (fast!)
+          # Fix pycares/aiodns compatibility first (if needed by your environment)
           uv pip install --system pycares==4.4.0 aiodns==3.2.0
           
           # Install all other dependencies
@@ -67,20 +65,16 @@ jobs:
           
           echo "✅ Dependencies installed"
 
-      - name: Set trigger timestamp
+      # OPTIMIZATION: Use a shell step to get the current timestamp in India/Kolkata
+      - name: Get current timestamp
         id: timestamp
-        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
-
-      - name: Validate configuration
         run: |
-          if [ ! -f config_macd.json ]; then
-            echo "❌ config_macd.json not found"
-            exit 1
-          fi
-          echo "✅ Configuration valid"
+          # Get current epoch timestamp in seconds (as integer)
+          TS=$(TZ='Asia/Kolkata' date +%s)
+          echo "ts=$TS" >> $GITHUB_OUTPUT
+          echo "Current TS: $TS"
 
-      # OPTIMIZATION: Direct Python execution (no Docker overhead!)
-      - name: Run MACD Bot
+      - name: Run unified MACD bot
         id: run_bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -96,12 +90,14 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
           PYTHONUNBUFFERED: 1
+          # PYTHONOPTIMIZE=2 disables docstrings and asserts (minor speed boost)
           PYTHONOPTIMIZE: 2
 
         run: |
           set +x
           echo "🤖 Starting bot execution..."
           
+          # Execute the optimized Python wrapper
           python -u wrapper.py
           
           EXIT_CODE=$?
@@ -111,6 +107,7 @@ jobs:
             echo "✅ Bot execution completed successfully"
           else
             echo "❌ Bot execution failed with exit code: $EXIT_CODE"
+            # Exit with the same code to mark the job as failed
             exit $EXIT_CODE
           fi
 
@@ -125,5 +122,5 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: |
-          echo "❌ Failed at $(date -u '+%H:%M:%S')"
-          echo "🔗 https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "❌ Job failed. Check details in GitHub Actions."
+          # Add your notification logic here if needed (e.g., send a failure message via curl/bot)
