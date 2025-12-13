@@ -115,100 +115,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         except Exception:
             return str(dt_or_ts)
 
-class SecretFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = str(record.getMessage())
-            # Quick check before expensive regex
-            if any(x in msg for x in ("TOKEN", "redis://", "chat_id")):
-                msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
-                msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
-                msg = re.sub(r'(redis://[^@]+@)', 'redis://[REDACTED]@', msg)
-                record.msg = msg
-        except Exception:
-            pass
-        return True
-
-class TraceContextFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.trace_id = TRACE_ID.get()
-        record.pair_id = PAIR_ID.get()
-        return True
-
-class SafeFormatter(logging.Formatter):
-    """Safe log formatter with pre-compiled regex patterns for performance"""
-    
-    def format(self, record: logging.LogRecord) -> str:
-        record.args = None
-        formatted = super().format(record)
-        # Use pre-compiled patterns (3-5x faster than re.sub with string patterns)
-        formatted = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", formatted)
-        formatted = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", formatted)
-        formatted = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", formatted)
-        return formatted
-
-def setup_logging() -> logging.Logger:
-    """
-    Enhanced logging setup for short-lived cron jobs with trace context.
-    
-    Features:
-    - Trace ID in every log message for correlation
-    - Secret filtering for tokens/passwords
-    - Structured format for easy parsing
-    - Console output for container log capture
-    """
-    logger = logging.getLogger("macd_bot")
-    
-    # Clear any existing handlers
-    for h in logger.handlers[:]:
-        logger.removeHandler(h)
-
-    level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
-    logger.setLevel(level)
-    logger.propagate = False
-
-    # Console handler - logs to stdout for container capture
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    
-    # Enhanced formatter with trace context
-    console.setFormatter(SafeFormatter(
-        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | [%(trace_id)s] | %(funcName)s:%(lineno)d | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    ))
-    
-    # Add filters
-    console.addFilter(SecretFilter())
-    console.addFilter(TraceContextFilter())
-    
-    logger.addHandler(console)
-    
-    # Log initial setup info
-    logger.debug(
-        f"Logging configured | Level: {logging.getLevelName(level)} | "
-        f"Format: structured with trace_id | Output: stdout"
-    )
-
-    return logger
-
-logger = setup_logging()
-shutdown_event = asyncio.Event()
-
-def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
-    """
-    Lazy debug logging - only formats message if debug is actually enabled.
-    
-    This avoids expensive string formatting operations when debug logs
-    would be discarded anyway.
-    
-    Args:
-        condition: Additional condition (e.g., cfg.DEBUG_MODE)
-        logger_obj: Logger instance
-        msg_fn: Callable that returns the log message (only called if needed)
-    """
-    if condition and logger_obj.isEnabledFor(logging.DEBUG):
-        logger_obj.debug(msg_fn())
-
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
@@ -329,6 +235,100 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
+
+class SecretFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = str(record.getMessage())
+            # Quick check before expensive regex
+            if any(x in msg for x in ("TOKEN", "redis://", "chat_id")):
+                msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
+                msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
+                msg = re.sub(r'(redis://[^@]+@)', 'redis://[REDACTED]@', msg)
+                record.msg = msg
+        except Exception:
+            pass
+        return True
+
+class TraceContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.trace_id = TRACE_ID.get()
+        record.pair_id = PAIR_ID.get()
+        return True
+
+class SafeFormatter(logging.Formatter):
+    """Safe log formatter with pre-compiled regex patterns for performance"""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        record.args = None
+        formatted = super().format(record)
+        # Use pre-compiled patterns (3-5x faster than re.sub with string patterns)
+        formatted = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", formatted)
+        formatted = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", formatted)
+        formatted = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", formatted)
+        return formatted
+
+def setup_logging() -> logging.Logger:
+    """
+    Enhanced logging setup for short-lived cron jobs with trace context.
+    
+    Features:
+    - Trace ID in every log message for correlation
+    - Secret filtering for tokens/passwords
+    - Structured format for easy parsing
+    - Console output for container log capture
+    """
+    logger = logging.getLogger("macd_bot")
+    
+    # Clear any existing handlers
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+
+    level = logging.DEBUG if cfg.DEBUG_MODE else getattr(logging, cfg.LOG_LEVEL, logging.INFO)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    # Console handler - logs to stdout for container capture
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    
+    # Enhanced formatter with trace context
+    console.setFormatter(SafeFormatter(
+        fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | [%(trace_id)s] | %(funcName)s:%(lineno)d | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    
+    # Add filters
+    console.addFilter(SecretFilter())
+    console.addFilter(TraceContextFilter())
+    
+    logger.addHandler(console)
+    
+    # Log initial setup info
+    logger.debug(
+        f"Logging configured | Level: {logging.getLevelName(level)} | "
+        f"Format: structured with trace_id | Output: stdout"
+    )
+
+    return logger
+
+logger = setup_logging()
+shutdown_event = asyncio.Event()
+
+def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
+    """
+    Lazy debug logging - only formats message if debug is actually enabled.
+    
+    This avoids expensive string formatting operations when debug logs
+    would be discarded anyway.
+    
+    Args:
+        condition: Additional condition (e.g., cfg.DEBUG_MODE)
+        logger_obj: Logger instance
+        msg_fn: Callable that returns the log message (only called if needed)
+    """
+    if condition and logger_obj.isEnabledFor(logging.DEBUG):
+        logger_obj.debug(msg_fn())
 
 _VALIDATION_DONE = False
 
