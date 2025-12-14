@@ -28,7 +28,7 @@ jobs:
         run: |
           echo "🚀 Trading Bot Execution"
           echo "Trigger     : ${{ github.event_name }}"
-          echo "Run ID      : \( {{ github.run_id }} | # \){{ github.run_number }}"
+          echo "Run ID      : ${{ github.run_id }} | #${{ github.run_number }}"
           echo "Time (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "Time (IST)  : $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S')"
           echo "Debug mode  : ${{ inputs.debug_mode || 'false' }}"
@@ -59,11 +59,12 @@ jobs:
 
       - name: Pull and run bot
         id: run
-        env:
-          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
-          TRIGGER_TS: $(date +%s)
         run: |
           IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
+          
+          # Generate timestamp in shell (not in env context)
+          TRIGGER_TS=$(date +%s)
+          DEBUG_MODE="${{ inputs.debug_mode || 'false' }}"
           
           echo "📥 Pulling $IMAGE ..."
           docker pull "$IMAGE" > /dev/null
@@ -72,6 +73,7 @@ jobs:
             awk '{printf "%.1f MB", $1/1024/1024}')"
           
           echo "🤖 Starting bot execution..."
+          echo "⏰ Trigger timestamp: $TRIGGER_TS ($(date -u -d @$TRIGGER_TS '+%Y-%m-%d %H:%M:%S UTC'))"
           
           docker run --rm \
             --name bot-${{ github.run_id }} \
@@ -79,7 +81,6 @@ jobs:
             --memory-swap=512m \
             --cpus=1.0 \
             --security-opt=no-new-privileges:true \
-            --read-only \
             --tmpfs /tmp:size=100m,rw,noexec,nosuid \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -107,7 +108,7 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "Status    : ${{ job.status }}"
           echo "Exit Code : ${{ steps.run.outputs.exit_code || 'N/A' }}"
-          echo "Run URL   : https://github.com/\( {{ github.repository }}/actions/runs/ \){{ github.run_id }}"
+          echo "Run URL   : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: Cleanup Docker resources
