@@ -2849,7 +2849,7 @@ async def evaluate_pair_and_alert(
     Optimized evaluation function with:
     - Vectorized wick validation
     - Reduced logging overhead
-    - Conditional dedup checks
+    - Conditional dedup checks (fixed)
     - Better memory management
     """
     
@@ -2933,13 +2933,11 @@ async def evaluate_pair_and_alert(
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
         # ===== PHASE 5: Vectorized Candle Quality Check =====
-        # Pre-compute candle quality for all candles (vectorized - MUCH faster)
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
         
-        # Get rejection reasons only if needed (lazy evaluation)
         buy_candle_reason = None
         sell_candle_reason = None
         
@@ -2953,7 +2951,6 @@ async def evaluate_pair_and_alert(
                 open_curr, high_curr, low_curr, close_curr, is_buy=False
             )
 
-        # Final buy/sell conditions
         buy_common = base_buy_common and buy_candle_passed
         sell_common = base_sell_common and sell_candle_passed
 
@@ -3012,7 +3009,6 @@ async def evaluate_pair_and_alert(
         # ===== PHASE 8: Check Alert Conditions =====
         raw_alerts: List[Tuple[str, str, str]] = []
 
-        # Filter alert definitions based on enabled features
         alert_keys_to_check = []
         for def_ in ALERT_DEFINITIONS:
             if "pivots" in def_["requires"] and not context.get("pivots"):
@@ -3021,14 +3017,12 @@ async def evaluate_pair_and_alert(
                 continue
             alert_keys_to_check.append(def_["key"])
 
-        # Batch fetch previous states
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, [ALERT_KEYS[k] for k in alert_keys_to_check]
         )
 
         states_to_update = []
         
-        # Check each alert condition
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
@@ -3044,7 +3038,6 @@ async def evaluate_pair_and_alert(
             except Exception as e:
                 logger_pair.warning(f"Alert check failed for {pair_name}, key={def_['key']}: {e}")
 
-        # Batch update active alerts
         if states_to_update:
             await sdb.batch_set_states(states_to_update)
 
@@ -3098,29 +3091,26 @@ async def evaluate_pair_and_alert(
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        # Batch update all resets
         if resets_to_apply:
             await sdb.batch_set_states(resets_to_apply)
 
-        # ===== PHASE 10: Deduplication (Optimized) =====
+        # ===== PHASE 10: Deduplication (Fixed) =====
         alerts_to_send = []
         
         if not raw_alerts:
-            # No alerts - skip all dedup logic
             pass
         elif sdb.degraded:
-            # Degraded mode: send all alerts without dedup
             if cfg.DEBUG_MODE:
                 logger_pair.debug(f"Redis degraded, skipping dedup for {len(raw_alerts)} alerts")
             alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
         else:
-            # Normal mode: check dedup in batch
             dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
             dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
 
             for title, extra, alert_key in raw_alerts:
                 composite_key = f"{pair_name}:{alert_key}"
-                if dedup_results.get(composite_key, True):
+                # Only send if NOT seen recently
+                if not dedup_results.get(composite_key, False):
                     alerts_to_send.append((title, extra, alert_key))
                 else:
                     if cfg.DEBUG_MODE:
@@ -3185,12 +3175,6 @@ async def evaluate_pair_and_alert(
         }
 
         # ===== PHASE 13: Conditional Logging (Reduced Overhead) =====
-        is_important = (
-            alerts_to_send or 
-            context.get("candle_quality_failed_buy") or 
-            context.get("candle_quality_failed_sell")
-        )
-        
         status_msg = f"✔ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
         
         if alerts_to_send:
@@ -3203,7 +3187,6 @@ async def evaluate_pair_and_alert(
             status_msg += f" | SELL blocked: {sell_candle_reason}"
             logger_pair.info(status_msg)
         else:
-            # No signals - only log in debug mode
             if cfg.DEBUG_MODE:
                 logger_pair.debug(status_msg + " | No signals")
 
@@ -3228,7 +3211,8 @@ async def evaluate_pair_and_alert(
             if cfg.DEBUG_MODE:
                 logger_pair.warning(f"Cleanup error (non-critical): {e}")
         finally:
-            PAIR_ID.set("")     
+            PAIR_ID.set("")
+
        
 # ============================================================================
 # PART 9: WORKER POOL & PAIR PROCESSING
