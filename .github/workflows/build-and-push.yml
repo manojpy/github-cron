@@ -1,0 +1,104 @@
+name: Build & Push Docker Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'src/**'
+      - 'wrapper.py'
+      - 'config_macd.json'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.title=Trading Bot
+            org.opencontainers.image.description=Unified MACD Trading Alert Bot with NumPy optimization
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          # Advanced caching strategy
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=gha,mode=max
+          # Build optimizations
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+          # Disable provenance/sbom for smaller images
+          provenance: false
+          sbom: false
+
+      - name: Verify image
+        run: |
+          echo "✅ Image built and pushed successfully"
+          docker pull ${{ env.IMAGE_NAME }}:latest
+          
+          echo "📦 Image Details:"
+          docker inspect ${{ env.IMAGE_NAME }}:latest --format='Size: {{.Size}}' | \
+            awk '{printf "  Size: %.2f MB\n", $2/1024/1024}'
+          docker inspect ${{ env.IMAGE_NAME }}:latest --format='  Created: {{.Created}}'
+          docker inspect ${{ env.IMAGE_NAME }}:latest --format='  Architecture: {{.Architecture}}'
+
+      - name: Test image
+        run: |
+          echo "🧪 Running smoke test..."
+          docker run --rm \
+            --name test-container \
+            --entrypoint python \
+            ${{ env.IMAGE_NAME }}:latest \
+            -c "import sys; print(f'✅ Python {sys.version}'); sys.exit(0)"
+
+      - name: Cleanup old images
+        continue-on-error: true
+        run: |
+          echo "🧹 Cleaning up old untagged images..."
+          docker image prune -f --filter "until=720h"
