@@ -13,37 +13,10 @@ import asyncio
 # Ensure src directory is in Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-def log_startup_banner():
-    """Print minimal startup information before logger initialization."""
-    run_id = os.getenv('GITHUB_RUN_ID', 'local')
-    run_number = os.getenv('GITHUB_RUN_NUMBER', 'N/A')
-    
-    banner = [
-        "=" * 70,
-        "🤖 Trading Bot Starting",
-        "=" * 70,
-    ]
-    
-    if run_id != 'local':
-        banner.extend([
-            f"  Run ID:     {run_id}",
-            f"  Run #:      {run_number}",
-        ])
-    
-    banner.append("=" * 70)
-    print("\n".join(banner))
-
 # Import and validate configuration
 try:
-    log_startup_banner()
-    
     # Import core module - this triggers Pydantic validation immediately
     from src.macd_unified import run_once, logger, cfg, __version__
-    
-    logger.info(f"✅ Configuration loaded successfully")
-    logger.info(f"📦 Bot Version: {__version__}")
-    logger.info(f"🔧 Pairs: {len(cfg.PAIRS)}")
-    logger.info(f"🐛 Debug Mode: {cfg.DEBUG_MODE}")
     
 except ImportError as e:
     print(f"❌ CRITICAL IMPORT ERROR: {e}", file=sys.stderr)
@@ -66,13 +39,10 @@ async def main() -> int:
         130: Interrupted by user (SIGINT)
     """
     try:
-        logger.info("🚀 Starting bot execution...")
-        
         # Execute the main bot logic
         success = await run_once()
         
         if success:
-            logger.info("✅ Execution completed successfully")
             return 0
         else:
             logger.error("❌ Execution failed")
@@ -95,13 +65,6 @@ if __name__ == "__main__":
     
     try:
         exit_code = asyncio.run(main())
-        
-        # Log final status
-        if exit_code == 0:
-            print("\n✅ Bot execution completed successfully\n")
-        else:
-            print(f"\n❌ Bot execution failed with exit code: {exit_code}\n", file=sys.stderr)
-        
         sys.exit(exit_code)
         
     except Exception as e:
