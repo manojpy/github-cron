@@ -3447,7 +3447,7 @@ async def process_pairs_with_workers(
 
 async def run_once() -> bool:
     gc.disable()
-    
+
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -3459,13 +3459,18 @@ async def run_once() -> bool:
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
 
+    # ------------------------------------------------------------------
+    # Product cache: stored on the function object for single-process runs.
+    # If you scale horizontally/multi-process, consider moving this to Redis
+    # (e.g., sdb.set_metadata/get_metadata) or a small file-based cache.
+    # ------------------------------------------------------------------
     PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
     now = time.time()
 
     if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
         logger_run.info("📡 Fetching fresh products list from Delta API...")
 
-        # Create temporary fetcher just for products
+        # Temporary fetcher just for products
         temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
         prod_resp = await temp_fetcher.fetch_products()
 
@@ -3486,14 +3491,14 @@ async def run_once() -> bool:
 
     if len(pairs_to_process) < len(cfg.PAIRS):
         missing = set(cfg.PAIRS) - set(pairs_to_process)
-        logger_run.warning(f"⚠️ Missing products for pairs: {missing}")     
+        logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
 
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     lock_acquired = False
     fetcher: Optional[DataFetcher] = None
     telegram_queue: Optional[TelegramQueue] = None
-    
+
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
 
@@ -3501,7 +3506,7 @@ async def run_once() -> bool:
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-        
+
         if container_memory_mb >= limit_mb:
             logger_run.critical(
                 f"🚨 Memory limit exceeded at startup "
@@ -3514,10 +3519,9 @@ async def run_once() -> bool:
         await sdb.connect()
         logger_run.debug("✅ Redis connection established")
 
+        # Notify once if degraded (dedup disabled)
         if sdb.degraded and not sdb.degraded_alerted:
-            logger_run.critical(
-                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
-            )
+            logger_run.critical("⚠️ Redis is in degraded mode – alert deduplication disabled!")
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
@@ -3530,13 +3534,12 @@ async def run_once() -> bool:
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
+        # Use configurable lock timeout
         lock = RedisLock(sdb._redis, "macd_bot_run")
-        lock_acquired = await lock.acquire(timeout=5.0)
-        
+        lock_acquired = await lock.acquire(timeout=cfg.LOCK_TIMEOUT_SECONDS)
+
         if not lock_acquired:
-            logger_run.warning(
-                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
-            )
+            logger_run.warning("⏸️ Another instance is running (Redis lock held) - exiting gracefully")
             return False
 
         logger_run.info("🔒 Distributed lock acquired successfully")
@@ -3555,17 +3558,20 @@ async def run_once() -> bool:
             lock, reference_time
         )
 
+        # Count alerts across all pair results
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
 
+        # Fetcher stats
         fetcher_stats = fetcher.get_stats()
         logger_run.info(
             f"📡 Fetch statistics | "
             f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
             f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
         )
-        
+
+        # Optional rate limiter stats
         if "rate_limiter" in fetcher_stats:
             rate_stats = fetcher_stats["rate_limiter"]
             if rate_stats.get("total_waits", 0) > 0:
@@ -3575,12 +3581,13 @@ async def run_once() -> bool:
                     f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
                 )
 
+        # Memory and run summary
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
-        
+
         run_duration = time.time() - start_time
         redis_status = "OK" if not sdb.degraded else "DEGRADED"
-        
+
         summary = (
             f"✅ RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
@@ -3591,6 +3598,7 @@ async def run_once() -> bool:
         )
         logger_run.info(summary)
 
+        # Alert volume guard
         if alerts_sent > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"
@@ -3604,14 +3612,14 @@ async def run_once() -> bool:
     except asyncio.TimeoutError:
         logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
         return False
-    
+
     except asyncio.CancelledError:
         logger_run.warning("🛑 Run cancelled (shutdown signal received)")
         return False
-    
+
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
-        
+
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
@@ -3622,32 +3630,43 @@ async def run_once() -> bool:
                 ))
             except Exception:
                 logger_run.error("Failed to send error notification")
-        
+
         return False
-    
+
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
-        
+
+        # Always re-enable GC to avoid leaving it off
+        try:
+            gc.enable()
+        except Exception:
+            # Non-critical; proceed with cleanup
+            pass
+
+        # Release lock if held by this run
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
                 logger_run.debug("🔓 Redis lock released")
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}")
-        
+
+        # Close Redis connection
         if sdb:
             try:
                 await sdb.close()
                 logger_run.debug("✅ Redis connection closed")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
-        
+
+        # Close HTTP session(s)
         try:
             await SessionManager.close_session()
             logger_run.debug("✅ HTTP session closed")
         except Exception as e:
             logger_run.error(f"Error closing HTTP session: {e}")
-        
+
+        # Local memory cleanup
         try:
             if 'all_results' in locals():
                 del all_results
@@ -3657,16 +3676,16 @@ async def run_once() -> bool:
                 del fetcher
             if 'telegram_queue' in locals():
                 del telegram_queue
-            
+
             gc.collect()
-            
+
             logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
             logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
-        
+
         TRACE_ID.set("")
         PAIR_ID.set("")
-        
+
         logger_run.debug("🏁 Resource cleanup finished")
 
 # ============================================================================
