@@ -1,61 +1,75 @@
 # Git files
 .git
 .gitignore
-.gitlab-ci.yml
 
-# Python cache
-__pycache__
+# Python cache and build artifacts
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 *.so
 *.egg
-*.egg-info
-dist
-build
-.eggs
+*.egg-info/
+dist/
+build/
+.eggs/
 
 # Virtual environments
-venv
-env
-ENV
+venv/
+env/
+ENV/
 
-# IDE
-.vscode
-.idea
+# IDE and editor files
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
 
-# Documentation
+# Documentation (exclude from build context unless needed at runtime)
 README.md
 *.md
 docs/
 
-# Logs
+# Logs and temp files
 *.log
 logs/
+tmp/
+temp/
+*.tmp
 
-# OS files
+# OS junk
 .DS_Store
 Thumbs.db
 
 # Test files
 tests/
-test_*
+test_*/
 *_test.py
 
-# CI/CD (kept for reference but not needed in image)
+# CI/CD configs (very important to exclude – they can be large)
 .github/
 .gitlab/
+.gitlab-ci.yml
 
-# Local development
+# Local config and secrets
 .env
 .env.local
 *.local
 
-# Temporary files
-tmp/
-temp/
-*.tmp
+# Docker-specific (avoid sending large or irrelevant files)
+Dockerfile
+docker-compose.yml
+*.dockerignore
+
+# Your specific project files that are NOT needed in the image
+# (Only src/, wrapper.py, config_macd.json, and requirements.txt should be sent)
+# Exclude everything else at root if not explicitly needed
+# But better: explicitly allow what you need via selective COPY in Dockerfile (already done)
+
+# Optional: exclude large data or cache directories if you ever add them
+cache/
+data/
+*.csv
+*.jsonl
+*.db
