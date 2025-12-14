@@ -16,7 +16,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -43,9 +43,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Warm up base image to avoid cold pulls
+      - name: Warm up base image
+        run: docker pull python:3.11-slim-bookworm
+
       - name: Resolve base image digest
         run: |
-          docker pull python:3.11-slim-bookworm
           DIGEST=$(docker inspect python:3.11-slim-bookworm --format='{{index .RepoDigests 0}}')
           echo "BASE_DIGEST=$DIGEST" >> $GITHUB_ENV
 
@@ -70,8 +73,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
           platforms: linux/amd64,linux/arm64
           build-args: |
             BUILDKIT_INLINE_CACHE=1
