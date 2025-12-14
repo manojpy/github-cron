@@ -2,14 +2,14 @@ name: Build & Push Docker Image
 
 on:
   push:
-    branches: [ main ]  # Fixed spacing for consistency
+    branches: [main]
     paths:
       - 'requirements.txt'
       - 'Dockerfile'
       - 'src/**'
       - 'wrapper.py'
       - 'config_macd.json'
-      - '.dockerignore'  # Add this: changes here can affect build context
+      - '.dockerignore'
   workflow_dispatch:
 
 env:
@@ -23,20 +23,15 @@ jobs:
     permissions:
       contents: read
       packages: write
-      # Optional: add if you ever use attestations
-      # attestations: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Recommended for accurate git metadata (sha tags)
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # Remove custom driver-opts unless you have a specific reason
-      # Default Buildx setup is faster and more reliable on runners
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -53,8 +48,6 @@ jobs:
           tags: |
             type=sha,format=long,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
-            # Optional: add date tag for debugging
-            # type=raw,value={{date 'YYYYMMDD'}}
           labels: |
             org.opencontainers.image.title=Trading Bot
             org.opencontainers.image.description=Unified MACD Trading Alert Bot with NumPy optimization
@@ -63,6 +56,7 @@ jobs:
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
+        id: build
         with:
           context: .
           file: ./Dockerfile
@@ -77,20 +71,17 @@ jobs:
           provenance: false
           sbom: false
 
-      # Remove or simplify Verify image step
-      # Pulling again is redundant and slow (you just pushed it)
-      # - name: Verify image
-      #   run: ...
-
-      # Keep the smoke test — it's great!
-      - name: Test image locally (smoke test)
+      - name: Image build summary
         run: |
-          echo "🧪 Running smoke test on built image..."
-          docker run --rm \
-            ${{ env.IMAGE_NAME }}:latest \
-            python -c "import sys, numpy; print(f'✅ Python {sys.version.split()[0]} | NumPy {numpy.__version__}'); sys.exit(0)"
+          echo "✅ Image built and pushed successfully"
+          echo "📦 Image: ${{ env.IMAGE_NAME }}:latest"
+          echo "🔗 Digest: ${{ steps.build.outputs.digest }}"
+          echo "📏 Metadata: ${{ steps.build.outputs.metadata }}"
 
-      # Optional: better cleanup (only if you want to save runner disk)
-      # - name: Cleanup local images
-      #   if: always()
-      #   run: docker image prune -f
+      - name: Test image (smoke test)
+        run: |
+          echo "🧪 Running smoke test..."
+          docker run --rm \
+            --entrypoint python \
+            ${{ env.IMAGE_NAME }}:latest \
+            -c "import sys; print(f'✅ Python {sys.version}'); sys.exit(0)"
