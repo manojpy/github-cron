@@ -1,11 +1,14 @@
 # ============================================================================
-# Stage 1: Builder - Fast dependency installation with uv
+# Stage 0: Get uv binary from official lightweight image
 # ============================================================================
-FROM ghcr.io/astral-sh/uv:latest AS uv-builder  # Lightweight official uv image
+FROM ghcr.io/astral-sh/uv:latest AS uv-provider
 
+# ============================================================================
+# Stage 1: Builder - Install dependencies with uv
+# ============================================================================
 FROM python:3.11-slim-bookworm AS builder
 
-# Install only build dependencies (no curl needed)
+# Install only the build dependencies needed
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         gcc \
@@ -14,18 +17,23 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
-# Copy uv binary from official image
-COPY --from=uv-builder /uv /usr/local/bin/uv
+# Copy uv binary from the official uv image
+COPY --from=uv-provider /uv /usr/local/bin/uv
 
-# Create and activate virtual environment
+# Make uv executable (just in case)
+RUN chmod +x /usr/local/bin/uv
+
+# Create virtual environment
 ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV
+
+# Activate venv for subsequent commands
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Copy requirements early
+# Copy requirements first for better layer caching
 COPY requirements.txt .
 
-# Install dependencies
+# Install dependencies (pin pycares/aiodns for compatibility)
 RUN uv pip install --no-cache --compile-bytecode \
         pycares==4.4.0 \
         aiodns==3.2.0 && \
@@ -36,7 +44,7 @@ RUN uv pip install --no-cache --compile-bytecode \
 # ============================================================================
 FROM python:3.11-slim-bookworm
 
-# Install only essential runtime packages in one layer
+# Install runtime dependencies only
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgomp1 \
@@ -44,13 +52,12 @@ RUN apt-get update && \
         tzdata && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean && \
-    # Create non-root user early
     useradd -m -u 1000 botuser
 
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Set PATH for venv
+# Set environment variables
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -60,11 +67,11 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 WORKDIR /app
 
-# Copy application files
+# Copy application code
 COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
 
-# Set permissions and switch to non-root user
+# Set ownership and permissions
 RUN chown -R botuser:botuser /app && \
     chmod +x wrapper.py && \
     chmod 644 config_macd.json
