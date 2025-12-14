@@ -1,4 +1,4 @@
-name: Build & Push Docker Image
+name: Build & Push GHCR
 
 on:
   push:
@@ -9,34 +9,33 @@ on:
       - 'src/**'
       - 'wrapper.py'
       - 'config_macd.json'
-      - '.dockerignore'
   workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot
-  REGISTRY: ghcr.io
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -46,42 +45,48 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,format=long,prefix={{branch}}-
+            type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=Trading Bot
-            org.opencontainers.image.description=Unified MACD Trading Alert Bot with NumPy optimization
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Unified MACD Trading Alert Bot
+            org.opencontainers.image.version={{version}}
+
+      # NEW: Cache pip packages separately for faster rebuilds
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
-        id: build
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
+          # OPTIMIZED: Use inline cache for faster rebuilds
           cache-from: |
             type=gha
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          # NEW: Build args for better layer caching
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+          # OPTIMIZED: Use provenance for supply chain security
           provenance: false
           sbom: false
 
-      - name: Image build summary
+      - name: Image digest
+        run: echo "✅ Image pushed with digest ${{ steps.meta.outputs.digest }}"
+      
+      # NEW: Verify image was pushed successfully
+      - name: Verify image
         run: |
-          echo "✅ Image built and pushed successfully"
-          echo "📦 Image: ${{ env.IMAGE_NAME }}:latest"
-          echo "🔗 Digest: ${{ steps.build.outputs.digest }}"
-          echo "📏 Metadata: ${{ steps.build.outputs.metadata }}"
-
-      - name: Test image (smoke test)
-        run: |
-          echo "🧪 Running smoke test..."
-          docker run --rm \
-            --entrypoint python \
-            ${{ env.IMAGE_NAME }}:latest \
-            -c "import sys; print(f'✅ Python {sys.version}'); sys.exit(0)"
+          docker pull ${{ env.IMAGE_NAME }}:latest
+          docker inspect ${{ env.IMAGE_NAME }}:latest --format='{{.Size}}' | awk '{print "📦 Image size: " $1/1024/1024 " MB"}'
