@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-wrapper.py - Robust Entry Point for Unified MACD Trading Bot
-
+wrapper.py - Entry Point for Unified MACD Trading Bot
 Handles initialization, configuration validation, execution, and graceful error reporting.
 """
-
 import asyncio
 import os
 import signal
@@ -36,38 +34,41 @@ def _handle_signal(signum: int, frame) -> NoReturn:
     raise KeyboardInterrupt
 
 async def main() -> int:
-    """Main async entry point."""
+    """
+    Main async entry point.
+    
+    Returns:
+        0: Success
+        2: Runtime error
+        130: Interrupted (SIGINT/SIGTERM)
+    """
     try:
-        logger.info(f"🚀 Starting MACD Trading Bot v{__version__}")
-        logger.info(f"Trigger timestamp: {os.getenv('TRIGGER_TIMESTAMP', 'N/A')}")
-
+        # Execute the main bot logic
         success = await run_once()
-
+        
         if success:
-            logger.info("✅ Bot execution completed successfully")
             return 0
         else:
             logger.error("❌ Bot logic reported failure")
             return 2
-
+            
     except KeyboardInterrupt:
         logger.warning("⚠️  Execution interrupted (SIGINT/SIGTERM)")
         return 130
-
+        
     except asyncio.CancelledError:
         logger.warning("⚠️  Task cancelled (likely timeout)")
         return 130
-
+        
     except Exception as exc:
         logger.exception(f"❌ UNHANDLED EXCEPTION: {exc}")
         return 2
-
 
 if __name__ == "__main__":
     # Install signal handlers for container-friendly shutdown (SIGTERM from Docker/k8s)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
-
+    
     try:
         exit_code = asyncio.run(main())
         sys.exit(exit_code)
