@@ -2658,17 +2658,12 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Evaluate pair and generate alerts using pure NumPy arrays.
-    NO PANDAS DATAFRAMES - all operations on raw arrays.
-    """
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
 
     try:
-        # Get last closed candle indices from NumPy arrays
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
         
@@ -2676,17 +2671,14 @@ async def evaluate_pair_and_alert(
             logger_pair.warning(f"Insufficient closed candles for {pair_name}")
             return None
         
-        # OPTIMIZATION: Disable GC during heavy NumPy/Numba work
         gc.disable()
         try:
-            # Calculate all indicators in ONE thread call (pure NumPy)
             indicators = await asyncio.to_thread(
                 calculate_all_indicators_numpy, data_15m, data_5m, data_daily
             )
         finally:
             gc.enable()
         
-        # Extract indicator arrays
         ppo = indicators['ppo']
         ppo_signal = indicators['ppo_signal']
         smooth_rsi = indicators['smooth_rsi']
@@ -2698,7 +2690,6 @@ async def evaluate_pair_and_alert(
         rma200_5 = indicators['rma200_5']
         piv = indicators['pivots']
 
-        # Extract current candle data from NumPy arrays
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         high_15m = data_15m["high"]
@@ -2713,7 +2704,6 @@ async def evaluate_pair_and_alert(
         high_curr = float(high_15m[i15])
         low_curr = float(low_15m[i15])
 
-        # Extract indicator values at current/previous indices
         ppo_curr = float(ppo[i15])
         ppo_prev = float(ppo[i15 - 1])
         ppo_sig_curr = float(ppo_signal[i15])
@@ -2734,18 +2724,15 @@ async def evaluate_pair_and_alert(
         rma50_15_val = float(rma50_15[i15])
         rma200_5_val = float(rma200_5[i5])
 
-        # Base trend filters (RMA)
         base_buy_common = rma50_15_val < close_curr and rma200_5_val < close_curr
         base_sell_common = rma50_15_val > close_curr and rma200_5_val > close_curr
 
-        # Add cloud and MMH filters
         if base_buy_common:
             base_buy_common = base_buy_common and (mmh_curr > 0 and cloud_up)
 
         if base_sell_common:
             base_sell_common = base_sell_common and (mmh_curr < 0 and cloud_down)
 
-        # Check candle quality
         buy_candle_passed, buy_candle_reason = check_candle_quality_with_reason(
             open_curr, high_curr, low_curr, close_curr, is_buy=True
         )
@@ -2756,7 +2743,6 @@ async def evaluate_pair_and_alert(
         buy_common = base_buy_common and buy_candle_passed
         sell_common = base_sell_common and sell_candle_passed
 
-        # MMH Reversal logic
         mmh_reversal_buy = False
         mmh_reversal_sell = False
 
@@ -2777,7 +2763,6 @@ async def evaluate_pair_and_alert(
                 and mmh_curr < mmh_m1
             )
 
-        # Build context for alert evaluation
         context = {
             "buy_common": buy_common,
             "sell_common": sell_common,
@@ -2810,7 +2795,6 @@ async def evaluate_pair_and_alert(
 
         raw_alerts: List[Tuple[str, str, str]] = []
 
-        # Prepare alert keys to check
         alert_keys_to_check = []
         for def_ in ALERT_DEFINITIONS:
             if "pivots" in def_["requires"] and not context.get("pivots"):
@@ -2819,7 +2803,6 @@ async def evaluate_pair_and_alert(
                 continue
             alert_keys_to_check.append(def_["key"])
 
-        # Batch check previous alert states
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, [ALERT_KEYS[k] for k in alert_keys_to_check]
         )
@@ -2843,41 +2826,34 @@ async def evaluate_pair_and_alert(
                 if states_to_update:
                     await sdb.batch_set_states(states_to_update)
 
-        # Prepare state resets
         resets_to_apply = []
 
-        # PPO signal crossovers
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
 
-        # PPO zero crossovers
         if ppo_prev > 0 and ppo_curr <= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
         if ppo_prev < 0 and ppo_curr >= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
 
-        # PPO 0.11 crossovers
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
         if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
 
-        # RSI crossovers
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
 
-        # VWAP crossovers
         if context["vwap"]:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
             if close_prev < vwap_prev and close_curr >= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
 
-        # Pivot level crossovers
         if piv:
             for level_name, level_value in piv.items():
                 if close_prev > level_value and close_curr <= level_value:
@@ -2885,7 +2861,6 @@ async def evaluate_pair_and_alert(
                 if close_prev < level_value and close_curr >= level_value:
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level_name}']}", "INACTIVE", None))
 
-        # MMH reversal resets
         if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
@@ -2893,12 +2868,10 @@ async def evaluate_pair_and_alert(
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        # Batch apply all state changes
         all_state_changes = states_to_update + resets_to_apply
         if all_state_changes:
             await sdb.batch_set_states(all_state_changes)
 
-        # Deduplication and sending
         if raw_alerts:
             dedup_checks = [(pair_name, alert_key, ts_curr) for _, _, alert_key in raw_alerts]
             dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
@@ -2915,7 +2888,6 @@ async def evaluate_pair_and_alert(
         else:
             alerts_to_send = []
 
-        # Send alerts
         if alerts_to_send:
             if len(alerts_to_send) == 1:
                 title, extra, _ = alerts_to_send[0]
@@ -2936,7 +2908,6 @@ async def evaluate_pair_and_alert(
         else:
             new_state = {"state": "NO_SIGNAL", "ts": int(time.time())}
 
-        # Build summary
         cloud = "green" if cloud_up else ("red" if cloud_down else "neutral")
         reasons = []
 
@@ -2953,7 +2924,10 @@ async def evaluate_pair_and_alert(
 
         suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
 
+        alerts_count = new_state.get("summary", {}).get("alerts", 0)
+
         new_state["summary"] = {
+            "alerts": alerts_count,  # ← ADD THIS LINE
             "cloud": cloud,
             "mmh_hist": round(mmh_curr, 4),
             "suppression": suppression_reason,
@@ -2965,7 +2939,6 @@ async def evaluate_pair_and_alert(
             }
         }
 
-        # Logging
         status_msg = f"✓ {pair_name} | cloud={cloud} mmh={mmh_curr:.2f}"
         
         if alerts_to_send:
