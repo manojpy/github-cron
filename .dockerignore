@@ -3,8 +3,8 @@
 .gitignore
 .gitlab-ci.yml
 
-# Python cache
-__pycache__
+# Python cache / tooling
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -12,18 +12,26 @@ __pycache__
 *.so
 *.egg
 *.egg-info
-dist
-build
-.eggs
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.cache/
+.pip/
+.numba_cache/
 
 # Virtual environments
-venv
-env
-ENV
+venv/
+env/
+ENV/
+.venv/
 
 # IDE
-.vscode
-.idea
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
@@ -36,6 +44,7 @@ docs/
 # Logs
 *.log
 logs/
+macd_bot.log
 
 # OS files
 .DS_Store
@@ -51,11 +60,14 @@ test_*
 .gitlab/
 
 # Local development
-.env
-.env.local
+.env*
 *.local
 
 # Temporary files
 tmp/
 temp/
 *.tmp
+
+# Local DBs
+*.sqlite3
+*.db

@@ -28,16 +28,14 @@ wheels/
 venv/
 ENV/
 env/
-.venv
+.venv/
 
-# PyCharm
+# IDE
 .idea/
-
-# VS Code
 .vscode/
 
 # Environment variables
-.env
+.env*
 .env.local
 .env.*.local
 
@@ -54,9 +52,15 @@ Thumbs.db
 *.pid
 /tmp/
 
-# Test coverage
+# Test coverage / tooling caches
 .coverage
 htmlcov/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.cache/
+.numba_cache/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -66,5 +70,7 @@ htmlcov/
 
 # mypy
 .mypy_cache/
-.dmypy.json
-dmypy.json
+
+# Local DBs
+*.sqlite3
+*.db
