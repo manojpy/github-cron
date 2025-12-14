@@ -3123,11 +3123,7 @@ async def process_pairs_with_workers(
     results: List[Optional[Tuple[str, Dict[str, Any]]]] = [None] * len(pairs_to_process)
     pair_index_map = {pair: idx for idx, pair in enumerate(pairs_to_process)}
     
-    num_workers = min(
-        cfg.MAX_PARALLEL_FETCH,
-        len(pairs_to_process),
-        max(4, (len(pairs_to_process) + 2) // 3)
-    )
+    num_workers = min(cfg.MAX_PARALLEL_FETCH, len(pairs_to_process))
     
     logger_main.info(
         f"📊 Processing {len(pairs_to_process)} pairs with {num_workers}-worker pool"
