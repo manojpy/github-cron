@@ -1,72 +1,77 @@
 #!/usr/bin/env python3
 """
-wrapper.py - Optimized Entry Point for Trading Bot
+wrapper.py - Robust Entry Point for Unified MACD Trading Bot
 
-This wrapper provides a clean interface to the core macd_unified.py module,
-handling initialization, error reporting, and graceful shutdown.
+Handles initialization, configuration validation, execution, and graceful error reporting.
 """
 
-import sys
-import os
 import asyncio
+import os
+import signal
+import sys
+from typing import NoReturn
 
-# Ensure src directory is in Python path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Add src to path (robust to __file__ issues in some environments)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(SCRIPT_DIR, "src")
+sys.path.insert(0, SRC_DIR)
 
-# Import and validate configuration
+# Early import validation
 try:
-    # Import core module - this triggers Pydantic validation immediately
     from src.macd_unified import run_once, logger, cfg, __version__
-    
 except ImportError as e:
-    print(f"❌ CRITICAL IMPORT ERROR: {e}", file=sys.stderr)
-    print(f"💡 Ensure src/macd_unified.py exists and dependencies are installed", file=sys.stderr)
+    sys.stderr.write(f"❌ CRITICAL: Failed to import macd_unified.py: {e}\n")
+    sys.stderr.write("💡 Check that src/macd_unified.py exists and the image was built correctly.\n")
     sys.exit(1)
-    
 except Exception as e:
-    print(f"❌ CONFIGURATION ERROR: {e}", file=sys.stderr)
-    print(f"💡 Check config_macd.json and environment variables", file=sys.stderr)
+    # This catches Pydantic validation errors from cfg loading
+    sys.stderr.write(f"❌ CONFIGURATION ERROR: {e}\n")
+    sys.stderr.write("💡 Verify config_macd.json syntax and required fields.\n")
     sys.exit(1)
+
+def _handle_signal(signum: int, frame) -> NoReturn:
+    """Unified signal handler for graceful shutdown."""
+    sig_name = signal.strsignal(signum) if hasattr(signal, 'strsignal') else str(signum)
+    logger.warning(f"⚠️  Received signal {sig_name} ({signum}) – shutting down")
+    raise KeyboardInterrupt
 
 async def main() -> int:
-    """
-    Main execution entry point.
-    
-    Returns:
-        0: Success
-        1: Configuration error
-        2: Runtime error
-        130: Interrupted by user (SIGINT)
-    """
+    """Main async entry point."""
     try:
-        # Execute the main bot logic
+        logger.info(f"🚀 Starting MACD Trading Bot v{__version__}")
+        logger.info(f"Trigger timestamp: {os.getenv('TRIGGER_TIMESTAMP', 'N/A')}")
+
         success = await run_once()
-        
+
         if success:
+            logger.info("✅ Bot execution completed successfully")
             return 0
         else:
-            logger.error("❌ Execution failed")
+            logger.error("❌ Bot logic reported failure")
             return 2
-            
+
     except KeyboardInterrupt:
-        logger.warning("⚠️  Execution interrupted by user (SIGINT)")
+        logger.warning("⚠️  Execution interrupted (SIGINT/SIGTERM)")
         return 130
-        
+
     except asyncio.CancelledError:
-        logger.warning("⚠️  Execution cancelled (timeout or signal)")
+        logger.warning("⚠️  Task cancelled (likely timeout)")
         return 130
-        
+
     except Exception as exc:
-        logger.exception(f"❌ FATAL ERROR: {exc}")
+        logger.exception(f"❌ UNHANDLED EXCEPTION: {exc}")
         return 2
 
+
 if __name__ == "__main__":
-    # uvloop is automatically configured in macd_unified.py at import time
-    
+    # Install signal handlers for container-friendly shutdown (SIGTERM from Docker/k8s)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
         exit_code = asyncio.run(main())
         sys.exit(exit_code)
-        
     except Exception as e:
-        print(f"\n❌ FATAL: {e}\n", file=sys.stderr)
+        # Absolute last-resort fallback
+        sys.stderr.write(f"\nFATAL: Unexpected error in wrapper: {e}\n")
         sys.exit(2)
