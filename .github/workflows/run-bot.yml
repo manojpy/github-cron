@@ -5,13 +5,12 @@ on:
     inputs:
       debug_mode:
         description: 'Enable debug logging'
-        required: false
         type: boolean
         default: false
   repository_dispatch:
     types: [cron_trigger]
 
-# Prevent concurrent runs (Redis lock safety)
+# Prevent overlapping runs (Redis lock is primary safety, this is backup)
 concurrency:
   group: trading-bot-execution
   cancel-in-progress: false
@@ -19,8 +18,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    
+    timeout-minutes: 10
     permissions:
       packages: read
       contents: read
@@ -28,155 +26,93 @@ jobs:
     steps:
       - name: Log execution context
         run: |
-          echo "🚀 Bot Execution Started"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Trigger:    ${{ github.event_name }}"
-          echo "  Run ID:     ${{ github.run_id }}"
-          echo "  Run #:      ${{ github.run_number }}"
-          echo "  UTC Time:   $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "  IST Time:   $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
-          echo "  Timestamp:  $(date +%s)"
-          echo "  Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🚀 Trading Bot Execution"
+          echo "Trigger     : ${{ github.event_name }}"
+          echo "Run ID      : \( {{ github.run_id }} | # \){{ github.run_number }}"
+          echo "Time (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "Time (IST)  : $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S')"
+          echo "Debug mode  : ${{ inputs.debug_mode || 'false' }}"
 
-      # Only checkout config file (faster than full repo)
-      - name: Checkout config
+      - name: Checkout config only
         uses: actions/checkout@v4
         with:
-          sparse-checkout: config_macd.json
+          sparse-checkout: |
+            config_macd.json
           sparse-checkout-cone-mode: false
 
-      - name: Validate configuration
+      - name: Validate config_macd.json
         run: |
-          if [ ! -f config_macd.json ]; then
-            echo "❌ config_macd.json not found"
+          if [[ ! -f config_macd.json ]]; then
+            echo "❌ Missing config_macd.json"
             exit 1
           fi
-          
-          # Validate JSON syntax
-          if command -v jq >/dev/null 2>&1; then
-            if jq empty config_macd.json 2>/dev/null; then
-              echo "✅ Configuration file valid"
-            else
-              echo "❌ Invalid JSON syntax in config_macd.json"
-              exit 1
-            fi
-          else
-            echo "✅ Configuration file exists (jq not available for validation)"
-          fi
+          python -c "import json, sys; json.load(open('config_macd.json'))" && \
+            echo "✅ config_macd.json is valid JSON" || \
+            { echo "❌ Invalid JSON in config_macd.json"; exit 1; }
 
-      - name: Log in to GHCR
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull latest Docker image
-        id: pull_image
+      - name: Pull and run bot
+        id: run
+        env:
+          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
+          TRIGGER_TS: $(date +%s)
         run: |
           IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
-          echo "📥 Pulling $IMAGE..."
           
-          if docker pull "$IMAGE"; then
-            echo "✅ Image pulled successfully"
-            echo ""
-            echo "📦 Image Info:"
-            docker inspect "$IMAGE" --format='  ID: {{.Id}}'
-            docker inspect "$IMAGE" --format='  Created: {{.Created}}'
-            docker inspect "$IMAGE" --format='  Size: {{.Size}}' | \
-              awk '{printf "  Size: %.2f MB\n", $1/1024/1024}'
-            echo "success=true" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Failed to pull image"
-            echo ""
-            echo "💡 Troubleshooting steps:"
-            echo "   1. Check if 'Build & Push Docker Image' workflow has run successfully"
-            echo "   2. Verify GHCR permissions in Settings → Actions → General"
-            echo "   3. Check image exists: https://github.com/${{ github.repository }}/pkgs/container/trading-bot"
-            echo ""
-            exit 1
-          fi
-
-      - name: Set trigger timestamp
-        id: timestamp
-        run: |
-          TS=$(date +%s)
-          echo "ts=$TS" >> $GITHUB_OUTPUT
-          echo "📅 Trigger timestamp: $TS ($(date -d @$TS -u '+%Y-%m-%d %H:%M:%S UTC'))"
-
-      - name: Run trading bot
-        id: run_bot
-        env:
-          DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
-        run: |
-          set +x  # Don't echo secrets
+          echo "📥 Pulling $IMAGE ..."
+          docker pull "$IMAGE" > /dev/null
+          
+          echo "📦 Image size: $(docker inspect "$IMAGE" --format='{{.Size}}' | \
+            awk '{printf "%.1f MB", $1/1024/1024}')"
+          
           echo "🤖 Starting bot execution..."
-          echo ""
           
-          # Run with optimized resource limits
           docker run --rm \
-            --name trading-bot-${{ github.run_id }} \
-            --memory="512m" \
-            --memory-swap="512m" \
-            --cpus="1.0" \
-            --security-opt no-new-privileges \
+            --name bot-${{ github.run_id }} \
+            --memory=512m \
+            --memory-swap=512m \
+            --cpus=1.0 \
+            --security-opt=no-new-privileges:true \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+            --tmpfs /tmp:size=100m,rw,noexec,nosuid \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e CONFIG_FILE=config_macd.json \
-            -e TZ=Asia/Kolkata \
             -e DEBUG_MODE="$DEBUG_MODE" \
-            -e TRIGGER_TIMESTAMP="${{ steps.timestamp.outputs.ts }}" \
+            -e TRIGGER_TIMESTAMP="$TRIGGER_TS" \
             -e GITHUB_SHA="${{ github.sha }}" \
             -e GITHUB_RUN_ID="${{ github.run_id }}" \
             -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
+            -e NUMBA_CACHE_DIR=/tmp/numba_cache \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
-            ghcr.io/${{ github.repository }}/trading-bot:latest
+            "$IMAGE"
           
           EXIT_CODE=$?
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          
-          echo ""
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "✅ Bot execution completed successfully"
-          else
-            echo "❌ Bot execution failed with exit code: $EXIT_CODE"
-            exit $EXIT_CODE
-          fi
+          exit $EXIT_CODE
 
       - name: Execution summary
         if: always()
         run: |
           echo ""
-          echo "📊 Execution Summary"
+          echo "📊 Run Summary"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Status:     ${{ job.status }}"
-          echo "  Exit Code:  ${{ steps.run_bot.outputs.exit_code || 'N/A' }}"
-          echo "  Run ID:     ${{ github.run_id }}"
-          echo "  Completed:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "  Logs:       https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "Status    : ${{ job.status }}"
+          echo "Exit Code : ${{ steps.run.outputs.exit_code || 'N/A' }}"
+          echo "Run URL   : https://github.com/\( {{ github.repository }}/actions/runs/ \){{ github.run_id }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "❌ Bot execution failed"
-          echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "📋 Run Number: ${{ github.run_number }}"
-          echo "⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          
-          # Optional: Send webhook notification
-          # curl -X POST "https://your-webhook.com/notify" \
-          #   -H "Content-Type: application/json" \
-          #   -d '{"status":"failed","run_id":"${{ github.run_id }}"}'
-
-      - name: Cleanup
+      - name: Cleanup Docker resources
         if: always()
         run: |
           echo "🧹 Cleaning up Docker resources..."
-          docker system prune -f --volumes || true
+          docker system prune -f --volumes >/dev/null 2>&1 || true
           echo "✅ Cleanup complete"
