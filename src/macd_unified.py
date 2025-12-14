@@ -472,7 +472,7 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -502,7 +502,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -516,7 +516,7 @@ def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
     return out
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     n = len(src)
     result = np.empty(n, dtype=np.float64)
@@ -544,7 +544,7 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         
     return result
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _vwap_daily_loop(
     high: np.ndarray, 
     low: np.ndarray, 
@@ -590,7 +590,7 @@ def _vwap_daily_loop(
             
     return vwap
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     n = len(x)
     filt = np.zeros(n, dtype=np.float64)
@@ -620,7 +620,7 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 
     return filt
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
@@ -640,7 +640,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
@@ -653,14 +653,14 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     rows = len(close)
     sd = np.empty(rows, dtype=np.float64)
@@ -684,7 +684,7 @@ def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) ->
             sd[i] = 0.0
     return sd
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -700,7 +700,7 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else 0.0
     return ma
 
-@njit(fastmath=True, cache=False)
+@njit(fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
