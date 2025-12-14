@@ -46,7 +46,7 @@ jobs:
             echo "❌ Missing config_macd.json"
             exit 1
           fi
-          python -c "import json, sys; json.load(open('config_macd.json'))" && \
+          python -c "import json; json.load(open('config_macd.json'))" && \
             echo "✅ config_macd.json is valid JSON" || \
             { echo "❌ Invalid JSON in config_macd.json"; exit 1; }
 
@@ -61,25 +61,24 @@ jobs:
         id: run
         run: |
           IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
-          
-          # Generate timestamp in shell (not in env context)
           TRIGGER_TS=$(date +%s)
           DEBUG_MODE="${{ inputs.debug_mode || 'false' }}"
-          
+
           echo "📥 Pulling $IMAGE ..."
           docker pull "$IMAGE" > /dev/null
-          
+
           echo "📦 Image size: $(docker inspect "$IMAGE" --format='{{.Size}}' | \
             awk '{printf "%.1f MB", $1/1024/1024}')"
-          
+
           echo "🤖 Starting bot execution..."
           echo "⏰ Trigger timestamp: $TRIGGER_TS ($(date -u -d @$TRIGGER_TS '+%Y-%m-%d %H:%M:%S UTC'))"
-          
+
           docker run --rm \
             --name bot-${{ github.run_id }} \
             --memory=512m \
             --memory-swap=512m \
             --cpus=1.0 \
+            --read-only \
             --security-opt=no-new-privileges:true \
             --tmpfs /tmp:size=100m,rw,noexec,nosuid \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
@@ -95,10 +94,18 @@ jobs:
             -e NUMBA_CACHE_DIR=/tmp/numba_cache \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             "$IMAGE"
-          
+
           EXIT_CODE=$?
+          docker logs bot-${{ github.run_id }} > bot.log || true
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
           exit $EXIT_CODE
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs
+          path: bot.log
 
       - name: Execution summary
         if: always()
