@@ -57,7 +57,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and run bot
+      - name: Pull and run bot (stream logs)
         id: run
         run: |
           IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
@@ -73,6 +73,7 @@ jobs:
           echo "🤖 Starting bot execution..."
           echo "⏰ Trigger timestamp: $TRIGGER_TS ($(date -u -d @$TRIGGER_TS '+%Y-%m-%d %H:%M:%S UTC'))"
 
+          # Stream logs live to bot.log while container runs
           docker run --rm \
             --name bot-${{ github.run_id }} \
             --memory=512m \
@@ -93,10 +94,9 @@ jobs:
             -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
             -e NUMBA_CACHE_DIR=/tmp/numba_cache \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
-            "$IMAGE"
+            "$IMAGE" | tee bot.log
 
-          EXIT_CODE=$?
-          docker logs bot-${{ github.run_id }} > bot.log || true
+          EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
           exit $EXIT_CODE
 
