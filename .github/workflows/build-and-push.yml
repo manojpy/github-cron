@@ -16,10 +16,14 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+
+    concurrency:
+      group: trading-bot-build
+      cancel-in-progress: true
 
     steps:
       - name: Checkout source
@@ -39,6 +43,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve base image digest
+        run: |
+          docker pull python:3.11-slim-bookworm
+          DIGEST=$(docker inspect python:3.11-slim-bookworm --format='{{index .RepoDigests 0}}')
+          echo "BASE_DIGEST=$DIGEST" >> $GITHUB_ENV
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -52,15 +62,6 @@ jobs:
             org.opencontainers.image.description=Unified MACD Trading Alert Bot
             org.opencontainers.image.version={{version}}
 
-      # NEW: Cache pip packages separately for faster rebuilds
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -69,23 +70,18 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # OPTIMIZED: Use inline cache for faster rebuilds
-          cache-from: |
-            type=gha
-            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64
-          # NEW: Build args for better layer caching
+          platforms: linux/amd64,linux/arm64
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-          # OPTIMIZED: Use provenance for supply chain security
-          provenance: false
-          sbom: false
+            BASE_DIGEST=${{ env.BASE_DIGEST }}
+          provenance: true
+          sbom: true
 
       - name: Image digest
         run: echo "✅ Image pushed with digest ${{ steps.meta.outputs.digest }}"
-      
-      # NEW: Verify image was pushed successfully
+
       - name: Verify image
         run: |
           docker pull ${{ env.IMAGE_NAME }}:latest
