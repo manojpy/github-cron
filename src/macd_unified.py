@@ -2829,7 +2829,7 @@ def check_candle_quality_with_reason(
             return True, "Passed"
 
     except Exception as e:
-        return False, f"Error: {str(e)}
+        return False, f"Error: {str(e)}"
 
 # ============================================================================
 # COMPLETE OPTIMIZED evaluate_pair_and_alert FUNCTION
