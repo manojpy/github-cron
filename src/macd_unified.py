@@ -1605,6 +1605,7 @@ class DataFetcher:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
+        # Handle 'D' resolution specifically for daily candles
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
 
@@ -1654,35 +1655,42 @@ class DataFetcher:
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
 
                         diff = abs(expected_open_ts - last_candle_open_ts)
-
-                        # --- LOGGING CORRECTION START ---
-                        # Use INFO only for the primary 15m resolution, otherwise use DEBUG (hidden)
-                        log_func = logger.info if resolution == '15' else logger.debug
+                        
+                        # Check for the common case where API returns the current forming candle
+                        is_harmless_ahead = (
+                            diff > 300 and  # A large difference
+                            last_candle_open_ts > expected_open_ts and 
+                            diff <= interval_seconds # Only one interval ahead (900s for 15m)
+                        )
 
                         if diff > 300:
-                            # This is usually the Daily candle log you want to hide.
-                            # It now logs at DEBUG (hidden) unless the resolution is 15
-                            # and the mismatch is significant (which is a real problem).
-                            if resolution == '15':
+                            # 1. Log critical delay (API did not return the expected closed candle)
+                            if last_candle_open_ts < expected_open_ts:
                                 logger.warning(
-                                    f"⚠️ Timestamp Mismatch | Symbol: {symbol} | Resolution: {resolution} | "
+                                    f"⚠️ API DELAY CRITICAL | Symbol: {symbol} | Resolution: {resolution} | "
+                                    f"Expected Open: {format_ist_time(expected_open_ts)} | "
+                                    f"Latest Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s too old)"
+                                )
+                            # 2. Log noisy/harmless logs (Daily candles, or 15m candle being one interval ahead)
+                            elif is_harmless_ahead or resolution != '15':
+                                logger.debug(
+                                    f"API Ahead (Hidden) | Symbol: {symbol} | Resolution: {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
                                     f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
                                 )
+                            # 3. Log an unexplained, large mismatch for 15m (shouldn't happen)
                             else:
-                                logger.debug(
-                                    f"⚠️ Timestamp Mismatch | Symbol: {symbol} | Resolution: {resolution} | "
+                                logger.warning(
+                                    f"⚠️ TIMESTAMP MISMATCH | Symbol: {symbol} | Resolution: {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
                                     f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
                                 )
                         else:
-                            # This will be your desired 15m success log (INFO, visible)
-                            # All other, resolutions (like 'D') will be logged at DEBUG (hidden).
+                            # ALL SUCCESSFUL SCANS NOW LOG AT DEBUG (SILENTLY)
                             logger.debug(
                                 f"✅ Scanned candle | Symbol: {symbol} | Resolution: {resolution} | "
                                 f"Open: {format_ist_time(last_candle_open_ts)} → Close: {format_ist_time(last_candle_close_ts)}"
                             )
-                        # --- LOGGING CORRECTION END ---
                 else:
                     logger.warning(
                         f"Candles response missing required fields | Symbol: {symbol} | "
@@ -2733,7 +2741,7 @@ PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}",
-        "title": f"🟢📷 Cross above {level}",
+        "title": f"🟢⬆️ Cross above {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
             ctx["buy_common"] 
             and _validate_pivot_cross(ctx, level, is_buy=True)
@@ -2749,7 +2757,7 @@ BUY_PIVOT_DEFS = [
 SELL_PIVOT_DEFS = [
     {
         "key": f"pivot_down_{level}",
-        "title": f"🔴📶 Cross below {level}",
+        "title": f"🔴⬇️ Cross below {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
             ctx["sell_common"]
             and _validate_pivot_cross(ctx, level, is_buy=False)
@@ -3497,7 +3505,7 @@ async def process_pairs_with_workers(
         expected_close_ts -= interval_seconds
 
     logger_main.info(
-        f"✅ 15m Scan Target | Open: {format_ist_time(expected_open_ts)} → Close: {format_ist_time(expected_close_ts)} (Evaluation will use this closed candle)"
+        f"🎯 15m Scan Target | Open: {format_ist_time(expected_open_ts)} → Close: {format_ist_time(expected_close_ts)} (Evaluation will use this closed candle)"
     )
 
     fetch_start = time.time()
@@ -3580,7 +3588,7 @@ async def process_pairs_with_workers(
         return []
     
     # ===== PHASE 3: Evaluate Pairs in Parallel =====
-    logger_main.info(f"⚙️  Phase 3: Evaluating {len(valid_pairs_data)} pairs...")
+    logger_main.debug(f"⚙️  Phase 3: Evaluating {len(valid_pairs_data)} pairs...")
     eval_start = time.time()
     
     # Create evaluation tasks for all valid pairs
@@ -3643,6 +3651,7 @@ async def process_pairs_with_workers(
     )
     
     return valid_results
+
 # ============================================================================
 # PART 10: MAIN RUN LOOP & ENTRY POINT
 # ============================================================================
