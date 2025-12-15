@@ -1596,96 +1596,90 @@ class DataFetcher:
 
             return result
             
-async def fetch_candles(
-    self,
-    symbol: str,
-    resolution: str,
-    limit: int,
-    reference_time: Optional[int] = None
-) -> Optional[Dict[str, Any]]:
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
+    async def fetch_candles(
+        self, symbol: str, resolution: str, limit: int,
+        reference_time: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
 
-    minutes = int(resolution) if resolution != "D" else 1440
-    interval_seconds = minutes * 60
+        minutes = int(resolution) if resolution != "D" else 1440
+        interval_seconds = minutes * 60
 
-    current_period = reference_time // interval_seconds
-    expected_close_time = current_period * interval_seconds
+        current_period = reference_time // interval_seconds
+        expected_close_time = current_period * interval_seconds
 
-    if reference_time - expected_close_time < 10:
-        expected_close_time -= interval_seconds
+        if reference_time - expected_close_time < 10:
+            expected_close_time -= interval_seconds
 
-    to_time = expected_close_time + Constants.CANDLE_PUBLICATION_LAG_SEC
-    from_time = to_time - (limit * interval_seconds)
+        to_time = expected_close_time + Constants.CANDLE_PUBLICATION_LAG_SEC
+        from_time = to_time - (limit * interval_seconds)
 
-    params = {
-        "resolution": resolution,
-        "symbol": symbol,
-        "from": from_time,
-        "to": to_time
-    }
+        params = {
+            "resolution": resolution,
+            "symbol": symbol,
+            "from": from_time,
+            "to": to_time
+        }
 
-    url = f"{self.api_base}/v2/chart/history"
+        url = f"{self.api_base}/v2/chart/history"
 
-    # Log for debugging
-    logger.debug(
-        f"Fetching {symbol} {resolution} | "
-        f"Reference: {reference_time} ({format_ist_time(reference_time)}) | "
-        f"Expected close: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
-        f"Request window: {from_time} to {to_time}"
-    )
-
-    async with self.semaphore:
-        data = await self.rate_limiter.call(
-            async_fetch_json,
-            url,
-            params=params,
-            retries=cfg.CANDLE_FETCH_RETRIES,
-            backoff=cfg.CANDLE_FETCH_BACKOFF,
-            timeout=self.timeout
+        # Log for debugging
+        logger.debug(
+            f"Fetching {symbol} {resolution} | "
+            f"Reference: {reference_time} ({format_ist_time(reference_time)}) | "
+            f"Expected close: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
+            f"Request window: {from_time} to {to_time}"
         )
 
-        if data:
-            self.fetch_stats["candles_success"] += 1
-
-            result = data.get("result", {})
-            if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                num_candles = len(result.get("t", []))
-                last_candle_ts = result["t"][-1] if num_candles > 0 else 0
-
-                logger.debug(
-                    f"✅ Candles received | Symbol: {symbol} | "
-                    f"Resolution: {resolution} | Count: {num_candles} | "
-                    f"Last candle: {last_candle_ts} ({format_ist_time(last_candle_ts)})"
-                )
-
-                # Validate we got the expected last candle
-                if num_candles > 0:
-                    diff = abs(last_candle_ts - expected_close_time)
-                    if diff > 120:  # More than 2 minutes off
-                        logger.warning(
-                            f"⚠️ Last candle mismatch | Symbol: {symbol} | "
-                            f"Expected: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
-                            f"Got: {last_candle_ts} ({format_ist_time(last_candle_ts)}) | "
-                            f"Diff: {diff}s"
-                        )
-            else:
-                logger.warning(
-                    f"Candles response missing required fields | Symbol: {symbol} | "
-                    f"Resolution: {resolution}"
-                )
-                self.fetch_stats["candles_failed"] += 1
-                return None
-        else:
-            self.fetch_stats["candles_failed"] += 1
-            logger.warning(
-                f"Candles fetch failed | Symbol: {symbol} | "
-                f"Resolution: {resolution} | Params: {params}"
+        async with self.semaphore:
+            data = await self.rate_limiter.call(
+                async_fetch_json, url, params=params,
+                retries=cfg.CANDLE_FETCH_RETRIES,
+                backoff=cfg.CANDLE_FETCH_BACKOFF,
+                timeout=self.timeout
             )
 
-        return data
+            if data:
+                self.fetch_stats["candles_success"] += 1
 
-    
+                result = data.get("result", {})
+                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                    num_candles = len(result.get("t", []))
+                    last_candle_ts = result["t"][-1] if num_candles > 0 else 0
+
+                    logger.debug(
+                        f"✅ Candles received | Symbol: {symbol} | "
+                        f"Resolution: {resolution} | Count: {num_candles} | "
+                        f"Last candle: {last_candle_ts} ({format_ist_time(last_candle_ts)})"
+                    )
+
+                    # Validate we got the expected last candle
+                    if num_candles > 0:
+                        diff = abs(last_candle_ts - expected_close_time)
+                        if diff > 120:  # More than 2 minutes off
+                            logger.warning(
+                                f"⚠️ Last candle mismatch | Symbol: {symbol} | "
+                                f"Expected: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
+                                f"Got: {last_candle_ts} ({format_ist_time(last_candle_ts)}) | "
+                                f"Diff: {diff}s"
+                            )
+                else:
+                    logger.warning(
+                        f"Candles response missing required fields | Symbol: {symbol} | "
+                        f"Resolution: {resolution}"
+                    )
+                    self.fetch_stats["candles_failed"] += 1
+                    return None
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(
+                    f"Candles fetch failed | Symbol: {symbol} | "
+                    f"Resolution: {resolution} | Params: {params}"
+                )
+
+            return data
+            
     def get_stats(self) -> Dict[str, Any]:
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
