@@ -1578,25 +1578,24 @@ class DataFetcher:
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
 
-    async with self.semaphore:
-        result = await self.rate_limiter.call(
-            async_fetch_json,
-            url,
-            retries=5,
-            backoff=2.0,
-            timeout=self.timeout
-        )
+        async with self.semaphore:
+            result = await self.rate_limiter.call(
+                async_fetch_json,
+                url,
+                retries=5,
+                backoff=2.0,
+                timeout=self.timeout
+            )
 
-        if result:
-            self.fetch_stats["products_success"] += 1
-            logger.debug(f"Products fetch successful | URL: {url}")
-        else:
-            self.fetch_stats["products_failed"] += 1
-            logger.warning(f"Products fetch failed | URL: {url}")
+            if result:
+                self.fetch_stats["products_success"] += 1
+                logger.debug(f"Products fetch successful | URL: {url}")
+            else:
+                self.fetch_stats["products_failed"] += 1
+                logger.warning(f"Products fetch failed | URL: {url}")
 
-        return result
-
-
+            return result
+            
 async def fetch_candles(
     self,
     symbol: str,
