@@ -1691,7 +1691,7 @@ class DataFetcher:
         
         return output
 
-        async def fetch_all_candles_truly_parallel(
+    async def fetch_all_candles_truly_parallel(
         self,
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
         reference_time: Optional[int] = None
