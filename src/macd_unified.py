@@ -1034,13 +1034,7 @@ def calculate_pivot_levels_numpy(
         ).timestamp()
         yesterday_day_number = int(yesterday_ts) // 86400
         
-        logger.debug(
-            f"Pivot calc | Now: {now_utc.date()} | "
-            f"Yesterday: {yesterday} (day #{yesterday_day_number}) | "
-            f"Data range: {days.min()}-{days.max()}"
-        )
         
-        # Find candles from yesterday
         yesterday_mask = days == yesterday_day_number
         
         if not np.any(yesterday_mask):
@@ -1084,11 +1078,6 @@ def calculate_pivot_levels_numpy(
             "S3": P - rng_prev,
         }
         
-        logger.info(
-            f"📊 Pivots calculated from {num_candles} candles | "
-            f"H={H_prev:.2f} L={L_prev:.2f} C={C_prev:.2f} | "
-            f"P={P:.2f} S1={piv['S1']:.2f} R1={piv['R1']:.2f}"
-        )
         
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
