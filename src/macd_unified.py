@@ -1891,63 +1891,43 @@ def get_last_closed_index_from_array(
     reference_time: Optional[int] = None
 ) -> Optional[int]:
     """
-    Adaptive candle selection that handles API publication delays gracefully.
-
-    Key principle: Use the most recent COMPLETED candle available, even if it's
-    not the "expected" one due to API delays.
+    STRICT version: Only returns the index of a fully closed candle.
+    Never uses the ongoing/forming candle, even if API is delayed.
     """
     if timestamps is None or timestamps.size < 2:
+        logger.warning("No timestamps or insufficient data")
         return None
 
     if reference_time is None:
         reference_time = get_trigger_timestamp()
 
-    last_ts = int(timestamps[-1])
     interval_seconds = interval_minutes * 60
 
-    current_period = reference_time // interval_seconds
-    ideal_close = current_period * interval_seconds
+    # Start time of the CURRENT ongoing 15-minute period
+    current_period_start = (reference_time // interval_seconds) * interval_seconds
 
-    if reference_time - ideal_close < 10:
-        ideal_close -= interval_seconds
+    # Only consider candles whose timestamp is strictly BEFORE the current period starts
+    # (i.e., fully closed candles from previous periods)
+    valid_mask = timestamps < current_period_start
+    valid_indices = np.nonzero(valid_mask)[0]
 
-    api_lag_seconds = ideal_close - last_ts
-    max_acceptable_lag = interval_seconds * 2
-
-    if 0 <= api_lag_seconds <= max_acceptable_lag:
-        if api_lag_seconds >= 600:
-            logger.info(
-                f"📊 Using delayed candle | "
-                f"Latest: {format_ist_time(last_ts)} | "
-                f"Ideal: {format_ist_time(ideal_close)} | "
-                f"Lag: {api_lag_seconds//60}min {api_lag_seconds%60}s"
-            )
-        elif api_lag_seconds > 120:
-            logger.debug(
-                f"Minor API lag: {api_lag_seconds}s | "
-                f"Using candle from {format_ist_time(last_ts)}"
-            )
-        return timestamps.size - 1
-
-    elif api_lag_seconds < 0:
-        logger.warning(
-            f"⚠️ Last candle is newer than expected | "
-            f"Last: {format_ist_time(last_ts)} | "
-            f"Expected: {format_ist_time(ideal_close)} | "
-            f"Using second-to-last for safety"
+    if valid_indices.size == 0:
+        logger.info(
+            f"No fully closed {interval_minutes}m candle available yet | "
+            f"Latest ts: {format_ist_time(timestamps[-1])} | "
+            f"Current period start: {format_ist_time(current_period_start)}"
         )
-        return timestamps.size - 2 if timestamps.size >= 2 else None
+        return None
 
-    else:
-        logger.error(
-            f"❌ API severely delayed | "
-            f"Latest: {format_ist_time(last_ts)} | "
-            f"Expected: {format_ist_time(ideal_close)} | "
-            f"Lag: {api_lag_seconds//60}min ({api_lag_seconds}s) - EXCEEDS THRESHOLD"
-        )
-        return timestamps.size - 1
+    last_closed_idx = int(valid_indices[-1])
 
+    logger.debug(
+        f"Selected fully closed candle | "
+        f"Index: {last_closed_idx} | "
+        f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+    )
 
+    return last_closed_idx
 def validate_candle_timestamp(
     candle_ts: int,
     expected_ts: int,
