@@ -3344,7 +3344,7 @@ async def evaluate_pair_and_alert(
                 logger_pair.debug(status_msg + f" | 🔔 {len(alerts_to_send)} alerts sent")
         elif base_buy_trend and not buy_common:
             status_msg += f" | BUY blocked: {buy_candle_reason}"
-            logger_pair.info(status_msg)
+            logger_pair.debug(status_msg)
         elif base_sell_trend and not sell_common:
             status_msg += f" | SELL blocked: {sell_candle_reason}"
             logger_pair.info(status_msg)
@@ -3389,14 +3389,6 @@ async def process_pairs_with_workers(
     lock: RedisLock,
     reference_time: int
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Optimized 3-phase architecture:
-    Phase 1: Fetch ALL candles in parallel (true parallel, not sequential)
-    Phase 2: Parse and validate candle data
-    Phase 3: Evaluate pairs in parallel
-    
-    This eliminates the worker pool bottleneck and reduces runtime by 50-70%.
-    """
     logger_main = logging.getLogger("macd_bot.worker_pool")
     
     # ===== PHASE 1: Fetch ALL Candles in ONE Parallel Batch =====
@@ -3528,7 +3520,7 @@ async def process_pairs_with_workers(
         if state.get("state") == "ALERT_SENT"
     )
     
-    logger_main.info(
+    logger_main.debug(
         f"🎯 Processing complete | "
         f"Total: {total_duration:.2f}s | "
         f"Fetch: {fetch_duration:.1f}s ({fetch_duration/total_duration*100:.1f}%) | "
@@ -3550,13 +3542,7 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
-    """
-    Main execution function with optimizations:
-    - Early product cache check (before Redis)
-    - Connection pool reuse
-    - Parallel candle fetching
-    - Reduced logging overhead
-    """
+    
     gc.disable()
     
     correlation_id = uuid.uuid4().hex[:8]
