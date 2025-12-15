@@ -1677,8 +1677,8 @@ class DataFetcher:
                                 )
                         else:
                             # This will be your desired 15m success log (INFO, visible)
-                            # All other resolutions (like 'D') will be logged at DEBUG (hidden).
-                            log_func(
+                            # All other, resolutions (like 'D') will be logged at DEBUG (hidden).
+                            logger.debug(
                                 f"✅ Scanned candle | Symbol: {symbol} | Resolution: {resolution} | "
                                 f"Open: {format_ist_time(last_candle_open_ts)} → Close: {format_ist_time(last_candle_close_ts)}"
                             )
@@ -3486,6 +3486,20 @@ async def process_pairs_with_workers(
     
     # ===== PHASE 1: Fetch ALL Candles in ONE Parallel Batch =====
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
+
+    interval_seconds = 15 * 60 # 15 minutes
+    current_period = reference_time // interval_seconds
+    expected_open_ts = (current_period * interval_seconds) - interval_seconds
+    expected_close_ts = expected_open_ts + interval_seconds
+
+    if reference_time - expected_close_ts < 10:
+        expected_open_ts -= interval_seconds
+        expected_close_ts -= interval_seconds
+
+    logger_main.info(
+        f"✅ 15m Scan Target | Open: {format_ist_time(expected_open_ts)} → Close: {format_ist_time(expected_close_ts)} (Evaluation will use this closed candle)"
+    )
+
     fetch_start = time.time()
     
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10 if cfg.ENABLE_PIVOT else 0
@@ -3629,7 +3643,7 @@ async def process_pairs_with_workers(
     )
     
     return valid_results
-
+,
 # ============================================================================
 # PART 10: MAIN RUN LOOP & ENTRY POINT
 # ============================================================================
