@@ -1696,24 +1696,7 @@ class DataFetcher:
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
         reference_time: Optional[int] = None
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-        """
-        Fetch ALL candles for ALL pairs in ONE truly parallel batch.
-        This is the key optimization - eliminates sequential fetching bottleneck.
         
-        Args:
-            pair_requests: List of (symbol, [(resolution, limit), ...])
-            reference_time: Reference timestamp for candle alignment
-            
-        Returns:
-            Dict[symbol][resolution] = candle_data
-            
-        Example:
-            pair_requests = [
-                ("BTCUSD", [("15", 300), ("5", 400), ("D", 25)]),
-                ("ETHUSD", [("15", 300), ("5", 400), ("D", 25)])
-            ]
-            # This fires 6 requests simultaneously (not 2 batches of 3)
-        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
         
