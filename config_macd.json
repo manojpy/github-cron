@@ -2,7 +2,7 @@
   "TELEGRAM_BOT_TOKEN": "__SET_IN_GITHUB_SECRETS__",
   "TELEGRAM_CHAT_ID": "__SET_IN_GITHUB_SECRETS__",
   "REDIS_URL": "__SET_IN_GITHUB_SECRETS__",
-  "DELTA_API_BASE": "https://api.delta.exchange",
+  "DELTA_API_BASE": "https://api.india.delta.exchange",
   "DEBUG_MODE": false,
   "SEND_TEST_MESSAGE": false,
   "BOT_NAME": "Unified Alert Bot",
