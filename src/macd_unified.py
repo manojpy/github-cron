@@ -1930,23 +1930,35 @@ def get_last_closed_index_from_array(
     return last_closed_idx
 def validate_candle_timestamp(
     candle_ts: int,
-    expected_ts: int,
-    tolerance_seconds: int = 1800
+    reference_time: int,
+    interval_minutes: int,
+    tolerance_seconds: int = 120
 ) -> bool:
     """
-    Validate candle timestamp with RELAXED tolerance for Delta Exchange.
-    """
-    diff = abs(candle_ts - expected_ts)
+    Validate that the latest candle timestamp from Delta Exchange matches
+    the expected OPEN time of the last closed candle.
 
+    Delta labels candles by OPEN time (e.g. 21:30 candle covers 21:30–21:45).
+    Our reference_time is usually 'now', so we compute the last closed candle's
+    open timestamp and compare against the API's candle_ts.
+    """
+    interval_seconds = interval_minutes * 60
+    # Compute the open time of the last closed candle
+    current_window = reference_time // interval_seconds
+    expected_open_ts = (current_window * interval_seconds) - interval_seconds
+
+    diff = abs(candle_ts - expected_open_ts)
     if diff > tolerance_seconds:
-        logger.warning(
-            f"⚠️ Candle timestamp outside tolerance | "
-            f"Expected: {format_ist_time(expected_ts)} | "
-            f"Got: {format_ist_time(candle_ts)} | "
-            f"Diff: {diff}s (tolerance: {tolerance_seconds}s)"
+        logger.error(
+            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
+            f"got {candle_ts} (diff: {diff}s)"
         )
         return False
 
+    logger.debug(
+        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
+        f"Got: {candle_ts} | Diff: {diff}s"
+    )
     return True
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
