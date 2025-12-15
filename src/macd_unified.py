@@ -2730,7 +2730,7 @@ def validate_alert_definitions() -> None:
         logger.critical(error_msg)
         raise ValueError(error_msg)
     
-    logger.info(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions")
+    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions")
 
 # Run validation (this happens at import time)
 validate_alert_definitions()
@@ -2793,7 +2793,7 @@ def validate_alert_definitions() -> None:
         logger.critical(error_msg)
         raise ValueError(error_msg)
     
-    logger.info(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
+    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
 
 validate_alert_definitions()
 
@@ -3097,7 +3097,7 @@ async def evaluate_pair_and_alert(
             if not is_green_candle:
                 buy_candle_passed = False
                 buy_candle_reason = f"NOT GREEN CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
-                logger_pair.info(f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}")
+                logger_pair.debug(f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}")
             elif not buy_candle_passed:
                 _, buy_candle_reason = check_candle_quality_with_reason(
                     open_curr, high_curr, low_curr, close_curr, is_buy=True
@@ -3108,7 +3108,7 @@ async def evaluate_pair_and_alert(
             if not is_red_candle:
                 sell_candle_passed = False
                 sell_candle_reason = f"NOT RED CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
-                logger_pair.info(f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}")
+                logger_pair.debug(f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}")
             elif not sell_candle_passed:
                 _, sell_candle_reason = check_candle_quality_with_reason(
                     open_curr, high_curr, low_curr, close_curr, is_buy=False
@@ -3426,7 +3426,7 @@ async def process_pairs_with_workers(
     )
     
     fetch_duration = time.time() - fetch_start
-    logger_main.info(f"✅ Phase 1 complete in {fetch_duration:.2f}s")
+    logger_main.debug(f"✅ Phase 1 complete in {fetch_duration:.2f}s")
     
     # Extend lock if needed (long fetch operation)
     if lock.should_extend():
@@ -3435,7 +3435,7 @@ async def process_pairs_with_workers(
             return []
     
     # ===== PHASE 2: Parse and Validate Candles =====
-    logger_main.info("🔍 Phase 2: Parsing candle data...")
+    logger_main.debug("🔍 Phase 2: Parsing candle data...")
     parse_start = time.time()
     
     valid_pairs_data = {}
@@ -3471,7 +3471,7 @@ async def process_pairs_with_workers(
         }
     
     parse_duration = time.time() - parse_start
-    logger_main.info(
+    logger_main.debug(
         f"✅ Phase 2 complete in {parse_duration:.2f}s | "
         f"Valid pairs: {len(valid_pairs_data)}/{len(pairs_to_process)}"
     )
@@ -3614,7 +3614,7 @@ async def run_once() -> bool:
             PRODUCTS_CACHE["data"] = prod_resp
             PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
             run_once._products_cache = PRODUCTS_CACHE
-            logger_run.info("✅ Products list cached for 8 hours")
+            logger_run.debug("✅ Products list cached for 8 hours")
             
             products_map = build_products_map_from_api_result(prod_resp)
         else:
@@ -3666,7 +3666,7 @@ async def run_once() -> bool:
             )
             return False
 
-        logger_run.info("🔒 Distributed lock acquired successfully")
+        logger_run.debug("🔒 Distributed lock acquired successfully")
 
         # ===== PHASE 5: Send Test Message (Optional) =====
         if cfg.SEND_TEST_MESSAGE:
