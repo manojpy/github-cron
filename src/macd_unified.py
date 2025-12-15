@@ -1602,20 +1602,30 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
+        """
+        Adaptive candle fetching that handles Delta Exchange's publication delays.
+
+        Strategy: Request a wider time window and let get_last_closed_index_from_array
+        determine which candle to use based on what's actually available.
+        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
 
+        # Calculate expected close time
         current_period = reference_time // interval_seconds
         expected_close_time = current_period * interval_seconds
 
+        # If we're very close to the boundary, go back one period
         if reference_time - expected_close_time < 10:
             expected_close_time -= interval_seconds
 
-        to_time = expected_close_time + Constants.CANDLE_PUBLICATION_LAG_SEC
-        from_time = to_time - (limit * interval_seconds)
+        # Request extra candles to handle API delays
+        buffer_periods = 2
+        to_time = expected_close_time + (interval_seconds * buffer_periods) + Constants.CANDLE_PUBLICATION_LAG_SEC
+        from_time = to_time - ((limit + buffer_periods) * interval_seconds)
 
         params = {
             "resolution": resolution,
@@ -1625,13 +1635,6 @@ class DataFetcher:
         }
 
         url = f"{self.api_base}/v2/chart/history"
-
-        logger.debug(
-            f"Fetching {symbol} {resolution} | "
-            f"Reference: {reference_time} ({format_ist_time(reference_time)}) | "
-            f"Expected close: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
-            f"Request window: {from_time} to {to_time}"
-        )
 
         async with self.semaphore:
             data = await self.rate_limiter.call(
@@ -1649,22 +1652,23 @@ class DataFetcher:
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                     num_candles = len(result.get("t", []))
-                    last_candle_ts = result["t"][-1] if num_candles > 0 else 0
-
-                    logger.debug(
-                        f"✅ Candles received | Symbol: {symbol} | "
-                        f"Resolution: {resolution} | Count: {num_candles} | "
-                        f"Last candle: {last_candle_ts} ({format_ist_time(last_candle_ts)})"
-                    )
 
                     if num_candles > 0:
-                        diff = abs(last_candle_ts - expected_close_time)
-                        if diff > 120:
-                            logger.warning(
-                                f"⚠️ Last candle mismatch | Symbol: {symbol} | "
-                                f"Expected: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
-                                f"Got: {last_candle_ts} ({format_ist_time(last_candle_ts)}) | "
-                                f"Diff: {diff}s"
+                        last_candle_ts = result["t"][-1]
+                        diff = expected_close_time - last_candle_ts
+
+                        if diff > 300:  # More than 5 minutes behind
+                            logger.info(
+                                f"📡 Delta API delay | Symbol: {symbol} | "
+                                f"Expected: {format_ist_time(expected_close_time)} | "
+                                f"Latest available: {format_ist_time(last_candle_ts)} | "
+                                f"Lag: {diff//60}min {diff%60}s"
+                            )
+                        else:
+                            logger.debug(
+                                f"✅ Candles received | Symbol: {symbol} | "
+                                f"Resolution: {resolution} | Count: {num_candles} | "
+                                f"Last: {format_ist_time(last_candle_ts)}"
                             )
                 else:
                     logger.warning(
@@ -1677,7 +1681,7 @@ class DataFetcher:
                 self.fetch_stats["candles_failed"] += 1
                 logger.warning(
                     f"Candles fetch failed | Symbol: {symbol} | "
-                    f"Resolution: {resolution} | Params: {params}"
+                    f"Resolution: {resolution}"
                 )
 
             return data
@@ -1886,7 +1890,12 @@ def get_last_closed_index_from_array(
     interval_minutes: int,
     reference_time: Optional[int] = None
 ) -> Optional[int]:
-    
+    """
+    Adaptive candle selection that handles API publication delays gracefully.
+
+    Key principle: Use the most recent COMPLETED candle available, even if it's
+    not the "expected" one due to API delays.
+    """
     if timestamps is None or timestamps.size < 2:
         return None
 
@@ -1897,43 +1906,68 @@ def get_last_closed_index_from_array(
     interval_seconds = interval_minutes * 60
 
     current_period = reference_time // interval_seconds
-    expected_close = current_period * interval_seconds
-    
-    if reference_time - expected_close < 10:
-        expected_close -= interval_seconds
+    ideal_close = current_period * interval_seconds
 
-    diff_seconds = abs(last_ts - expected_close)
+    if reference_time - ideal_close < 10:
+        ideal_close -= interval_seconds
 
-    if diff_seconds > 120:
-        logger.warning(
-            f"Last candle timestamp drift detected | "
-            f"Expected close: {expected_close} ({format_ist_time(expected_close)}) | "
-            f"Got: {last_ts} ({format_ist_time(last_ts)}) | "
-            f"Diff: {diff_seconds}s | "
-            f"Reference: {reference_time} ({format_ist_time(reference_time)})"
-        )
-    elif diff_seconds > 30:
-        logger.debug(
-            f"Minor timestamp drift: {diff_seconds}s | "
-            f"Expected: {format_ist_time(expected_close)} | "
-            f"Got: {format_ist_time(last_ts)}"
-        )
+    api_lag_seconds = ideal_close - last_ts
+    max_acceptable_lag = interval_seconds * 2
 
-    if abs(last_ts - expected_close) <= interval_seconds:
-        # Last candle is the most recent closed one
+    if 0 <= api_lag_seconds <= max_acceptable_lag:
+        if api_lag_seconds >= 600:
+            logger.info(
+                f"📊 Using delayed candle | "
+                f"Latest: {format_ist_time(last_ts)} | "
+                f"Ideal: {format_ist_time(ideal_close)} | "
+                f"Lag: {api_lag_seconds//60}min {api_lag_seconds%60}s"
+            )
+        elif api_lag_seconds > 120:
+            logger.debug(
+                f"Minor API lag: {api_lag_seconds}s | "
+                f"Using candle from {format_ist_time(last_ts)}"
+            )
         return timestamps.size - 1
-    elif last_ts < expected_close:
-        
-        return timestamps.size - 1
-    else:
-        
+
+    elif api_lag_seconds < 0:
         logger.warning(
-            f"Last candle is newer than expected close time | "
-            f"Using second-to-last candle | "
+            f"⚠️ Last candle is newer than expected | "
             f"Last: {format_ist_time(last_ts)} | "
-            f"Expected: {format_ist_time(expected_close)}"
+            f"Expected: {format_ist_time(ideal_close)} | "
+            f"Using second-to-last for safety"
         )
         return timestamps.size - 2 if timestamps.size >= 2 else None
+
+    else:
+        logger.error(
+            f"❌ API severely delayed | "
+            f"Latest: {format_ist_time(last_ts)} | "
+            f"Expected: {format_ist_time(ideal_close)} | "
+            f"Lag: {api_lag_seconds//60}min ({api_lag_seconds}s) - EXCEEDS THRESHOLD"
+        )
+        return timestamps.size - 1
+
+
+def validate_candle_timestamp(
+    candle_ts: int,
+    expected_ts: int,
+    tolerance_seconds: int = 1800
+) -> bool:
+    """
+    Validate candle timestamp with RELAXED tolerance for Delta Exchange.
+    """
+    diff = abs(candle_ts - expected_ts)
+
+    if diff > tolerance_seconds:
+        logger.warning(
+            f"⚠️ Candle timestamp outside tolerance | "
+            f"Expected: {format_ist_time(expected_ts)} | "
+            f"Got: {format_ist_time(candle_ts)} | "
+            f"Diff: {diff}s (tolerance: {tolerance_seconds}s)"
+        )
+        return False
+
+    return True
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
