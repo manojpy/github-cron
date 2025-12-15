@@ -1596,93 +1596,93 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-    """
-    Adaptive candle fetching that handles Delta Exchange's publication delays.
+        """
+        Adaptive candle fetching that handles Delta Exchange's publication delays.
 
-    Strategy: Request a wider time window and let get_last_closed_index_from_array
-    determine which candle to use based on what's actually available.
-    Delta labels candles by OPEN time, so logs show open→close intervals.
-    """
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
+        Strategy: Request a wider time window and let get_last_closed_index_from_array
+        determine which candle to use based on what's actually available.
+        Delta labels candles by OPEN time, so logs show open→close intervals.
+        """
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
 
-    minutes = int(resolution) if resolution != "D" else 1440
-    interval_seconds = minutes * 60
+        minutes = int(resolution) if resolution != "D" else 1440
+        interval_seconds = minutes * 60
 
-    # Calculate expected open time of the last closed candle
-    current_period = reference_time // interval_seconds
-    expected_open_ts = (current_period * interval_seconds) - interval_seconds
-    expected_close_ts = expected_open_ts + interval_seconds
+        # Calculate expected open time of the last closed candle
+        current_period = reference_time // interval_seconds
+        expected_open_ts = (current_period * interval_seconds) - interval_seconds
+        expected_close_ts = expected_open_ts + interval_seconds
 
-    # If we're very close to the boundary, go back one period
-    if reference_time - expected_close_ts < 10:
-        expected_open_ts -= interval_seconds
-        expected_close_ts -= interval_seconds
+        # If we're very close to the boundary, go back one period
+        if reference_time - expected_close_ts < 10:
+            expected_open_ts -= interval_seconds
+            expected_close_ts -= interval_seconds
 
-    # Request extra candles to handle API delays
-    buffer_periods = 2
-    to_time = expected_close_ts + (interval_seconds * buffer_periods) + Constants.CANDLE_PUBLICATION_LAG_SEC
-    from_time = to_time - ((limit + buffer_periods) * interval_seconds)
+        # Request extra candles to handle API delays
+        buffer_periods = 2
+        to_time = expected_close_ts + (interval_seconds * buffer_periods) + Constants.CANDLE_PUBLICATION_LAG_SEC
+        from_time = to_time - ((limit + buffer_periods) * interval_seconds)
 
-    params = {
-        "resolution": resolution,
-        "symbol": symbol,
-        "from": from_time,
-        "to": to_time
-    }
+        params = {
+            "resolution": resolution,
+            "symbol": symbol,
+            "from": from_time,
+            "to": to_time
+        }
 
-    url = f"{self.api_base}/v2/chart/history"
+        url = f"{self.api_base}/v2/chart/history"
 
-    async with self.semaphore:
-        data = await self.rate_limiter.call(
-            async_fetch_json,
-            url,
-            params=params,
-            retries=cfg.CANDLE_FETCH_RETRIES,
-            backoff=cfg.CANDLE_FETCH_BACKOFF,
-            timeout=self.timeout
-        )
-
-        if data:
-            self.fetch_stats["candles_success"] += 1
-
-            result = data.get("result", {})
-            if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                num_candles = len(result.get("t", []))
-
-                if num_candles > 0:
-                    last_candle_open_ts = result["t"][-1]          # Delta labels by OPEN time
-                    last_candle_close_ts = last_candle_open_ts + interval_seconds
-
-                    diff = abs(expected_open_ts - last_candle_open_ts)
-
-                    if diff > 300:  # More than 5 minutes mismatch
-                        logger.info(
-                            f"📡 Scanned candle | Symbol: {symbol} | "
-                            f"Expected: open {format_ist_time(expected_open_ts)} → close {format_ist_time(expected_close_ts)} | "
-                            f"Latest available: open {format_ist_time(last_candle_open_ts)} → close {format_ist_time(last_candle_close_ts)}"
-                        )
-                    else:
-                        logger.debug(
-                            f"✅ Candles received | Symbol: {symbol} | "
-                            f"Resolution: {resolution} | Count: {num_candles} | "
-                            f"Scanned: open {format_ist_time(last_candle_open_ts)} → close {format_ist_time(last_candle_close_ts)}"
-                        )
-            else:
-                logger.warning(
-                    f"Candles response missing required fields | Symbol: {symbol} | "
-                    f"Resolution: {resolution}"
-                )
-                self.fetch_stats["candles_failed"] += 1
-                return None
-        else:
-            self.fetch_stats["candles_failed"] += 1
-            logger.warning(
-                f"Candles fetch failed | Symbol: {symbol} | "
-                f"Resolution: {resolution}"
+        async with self.semaphore:
+            data = await self.rate_limiter.call(
+                async_fetch_json,
+                url,
+                params=params,
+                retries=cfg.CANDLE_FETCH_RETRIES,
+                backoff=cfg.CANDLE_FETCH_BACKOFF,
+                timeout=self.timeout
             )
 
-        return data
+            if data:
+                self.fetch_stats["candles_success"] += 1
+
+                result = data.get("result", {})
+                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                    num_candles = len(result.get("t", []))
+
+                    if num_candles > 0:
+                        last_candle_open_ts = result["t"][-1]          # Delta labels by OPEN time
+                        last_candle_close_ts = last_candle_open_ts + interval_seconds
+
+                        diff = abs(expected_open_ts - last_candle_open_ts)
+
+                        if diff > 300:  # More than 5 minutes mismatch
+                            logger.info(
+                                f"📡 Scanned candle | Symbol: {symbol} | "
+                                f"Expected: open {format_ist_time(expected_open_ts)} → close {format_ist_time(expected_close_ts)} | "
+                                f"Latest available: open {format_ist_time(last_candle_open_ts)} → close {format_ist_time(last_candle_close_ts)}"
+                            )
+                        else:
+                            logger.debug(
+                                f"✅ Candles received | Symbol: {symbol} | "
+                                f"Resolution: {resolution} | Count: {num_candles} | "
+                                f"Scanned: open {format_ist_time(last_candle_open_ts)} → close {format_ist_time(last_candle_close_ts)}"
+                            )
+                else:
+                    logger.warning(
+                        f"Candles response missing required fields | Symbol: {symbol} | "
+                        f"Resolution: {resolution}"
+                    )
+                    self.fetch_stats["candles_failed"] += 1
+                    return None
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(
+                    f"Candles fetch failed | Symbol: {symbol} | "
+                    f"Resolution: {resolution}"
+                )
+
+            return data
 
     def get_stats(self) -> Dict[str, Any]:
         stats = self.fetch_stats.copy()
