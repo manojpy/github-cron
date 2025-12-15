@@ -1011,14 +1011,6 @@ def calculate_pivot_levels_numpy(
     close: np.ndarray,
     timestamps: np.ndarray
 ) -> Dict[str, float]:
-    """
-    FIXED: Calculate pivot levels using PREVIOUS DAY's H/L/C
-    
-    Critical fixes:
-    1. Use timestamp() instead of strftime('%s') 
-    2. Add extensive logging for debugging
-    3. Validate we're using correct day's data
-    """
     piv: Dict[str, float] = {}
     
     try:
@@ -1093,7 +1085,7 @@ def calculate_pivot_levels_numpy(
         }
         
         logger.info(
-            f"âœ… Pivots calculated from {num_candles} candles | "
+            f"📊 Pivots calculated from {num_candles} candles | "
             f"H={H_prev:.2f} L={L_prev:.2f} C={C_prev:.2f} | "
             f"P={P:.2f} S1={piv['S1']:.2f} R1={piv['R1']:.2f}"
         )
