@@ -2373,19 +2373,32 @@ class RedisStateStore:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
     async def mget_states(
-        self, keys: List[str], timeout: float = 2.0
-    ) -> Dict[str, Optional[Dict[str, Any]]]:
-        if not self._redis or not keys:
-            return {}
+    self, 
+    keys: List[str], 
+    timeout: float = 2.0
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    if not self._redis or not keys:
+        return {}
 
-        redis_keys = [f"{self.state_prefix}{k}" for k in keys]
-        results = await self._safe_redis_op(
-            self._redis.mget(redis_keys),
-            timeout,
-            f"mget {len(keys)} keys",
-            lambda r: r if r else [],
+    redis_keys = [f"{self.state_prefix}{k}" for k in keys]
+    
+    try:
+        async def _do_mget():
+            return await asyncio.wait_for(
+                self._redis.mget(redis_keys), 
+                timeout=timeout
+            )
+        
+        results = await retry_async(
+            _do_mget,
+            retries=2,
+            base_backoff=0.5,
+            cap=2.0,
+            on_error=lambda e, a, c: logger.debug(
+                f"Redis mget error (attempt {a}): {e}"
+            ) if cfg.DEBUG_MODE else None,
         )
-
+        
         if not results:
             return {}
 
@@ -2394,22 +2407,23 @@ class RedisStateStore:
             if idx < len(results) and results[idx]:
                 try:
                     output[key] = json_loads(results[idx])
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to parse state for {key}: {e}")
                     output[key] = None
             else:
                 output[key] = None
 
         return output
+        
+    except Exception as e:
+        logger.error(f"mget_states failed for {len(keys)} keys: {e}")
+        return {}
 
     async def batch_set_states(
         self,
         updates: List[Tuple[str, Any, Optional[int]]],
         timeout: float = 4.0,
     ) -> None:
-        """
-        Batch update multiple state keys atomically.
-        This is CRITICAL for preventing duplicate alerts.
-        """
         if self.degraded or not updates or not self._redis:
             return
 
@@ -2921,15 +2935,21 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         return {k: False for k in keys}
     
     state_keys = [f"{pair}:{k}" for k in keys]
-    results = await sdb.mget_states(state_keys)
     
-    output = {}
-    for key in keys:
-        state_key = f"{pair}:{key}"
-        st = results.get(state_key)
-        output[key] = st is not None and st.get("state") == "ACTIVE"
-    
-    return output
+    try:
+        results = await sdb.mget_states(state_keys)
+        
+        output = {}
+        for key in keys:
+            state_key = f"{pair}:{key}"
+            st = results.get(state_key)
+            output[key] = st is not None and st.get("state") == "ACTIVE"
+        
+        return output
+        
+    except Exception as e:
+        logger.error(f"check_multiple_alert_states failed for {pair}: {e}")
+        return {k: False for k in keys}
 
 @njit(fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
