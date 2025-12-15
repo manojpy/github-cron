@@ -1601,10 +1601,6 @@ class DataFetcher:
     ) -> Optional[Dict[str, Any]]:
         """
         Adaptive candle fetching that handles Delta Exchange's publication delays.
-
-        Strategy: Request a wider time window and let get_last_closed_index_from_array
-        determine which candle to use based on what's actually available.
-        Delta labels candles by OPEN time, so logs show open→close intervals.
         """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
@@ -1659,18 +1655,34 @@ class DataFetcher:
 
                         diff = abs(expected_open_ts - last_candle_open_ts)
 
-                        if diff > 300:  # More than 5 minutes mismatch
-                            logger.info(
-                                f"📡 Scanned candle | Symbol: {symbol} | "
-                                f"Expected: open {format_ist_time(expected_open_ts)} → close {format_ist_time(expected_close_ts)} | "
-                                f"Latest available: open {format_ist_time(last_candle_open_ts)} → close {format_ist_time(last_candle_close_ts)}"
-                            )
+                        # --- LOGGING CORRECTION START ---
+                        # Use INFO only for the primary 15m resolution, otherwise use DEBUG (hidden)
+                        log_func = logger.info if resolution == '15' else logger.debug
+
+                        if diff > 300:
+                            # This is usually the Daily candle log you want to hide.
+                            # It now logs at DEBUG (hidden) unless the resolution is 15
+                            # and the mismatch is significant (which is a real problem).
+                            if resolution == '15':
+                                logger.warning(
+                                    f"⚠️ Timestamp Mismatch | Symbol: {symbol} | Resolution: {resolution} | "
+                                    f"Expected: {format_ist_time(expected_open_ts)} | "
+                                    f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
+                                )
+                            else:
+                                logger.debug(
+                                    f"⚠️ Timestamp Mismatch | Symbol: {symbol} | Resolution: {resolution} | "
+                                    f"Expected: {format_ist_time(expected_open_ts)} | "
+                                    f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
+                                )
                         else:
-                            logger.debug(
-                                f"✅ Candles received | Symbol: {symbol} | "
-                                f"Resolution: {resolution} | Count: {num_candles} | "
-                                f"Scanned: open {format_ist_time(last_candle_open_ts)} → close {format_ist_time(last_candle_close_ts)}"
+                            # This will be your desired 15m success log (INFO, visible)
+                            # All other resolutions (like 'D') will be logged at DEBUG (hidden).
+                            log_func(
+                                f"✅ Scanned candle | Symbol: {symbol} | Resolution: {resolution} | "
+                                f"Open: {format_ist_time(last_candle_open_ts)} → Close: {format_ist_time(last_candle_close_ts)}"
                             )
+                        # --- LOGGING CORRECTION END ---
                 else:
                     logger.warning(
                         f"Candles response missing required fields | Symbol: {symbol} | "
@@ -2644,7 +2656,7 @@ class AlertDefinition(TypedDict):
 # ============================================================================
 
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key": "ppo_signal_up", "title": "🟢 PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
+    {"key": "ppo_signal_up", "title": "���� PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_signal_down", "title": "🔴 PPO cross below signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= ppo_sig["prev"]) and (ppo["curr"] < ppo_sig["curr"]) and (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_zero_up", "title": "🟢 PPO cross above 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["buy_common"] and (ppo["prev"] <= 0.0) and (ppo["curr"] > 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
     {"key": "ppo_zero_down", "title": "🔴 PPO cross below 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["sell_common"] and (ppo["prev"] >= 0.0) and (ppo["curr"] < 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
