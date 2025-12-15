@@ -2366,7 +2366,7 @@ class RedisStateStore:
                     output[key] = None
             return output
         except Exception as e:
-            logger.error(f"mget_states failed for {len(keys)} keys: {e}")
+            logger.error(f"mget_states failed for {len(keys)} keys: {e} | Keys sample: {keys[:5]}")
             return {}
 
     async def batch_set_states(
