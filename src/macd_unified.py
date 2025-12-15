@@ -1576,7 +1576,7 @@ class DataFetcher:
         )
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
-    url = f"{self.api_base}/v2/products"
+        url = f"{self.api_base}/v2/products"
 
     async with self.semaphore:
         result = await self.rate_limiter.call(
