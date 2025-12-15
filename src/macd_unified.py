@@ -2683,6 +2683,10 @@ class AlertDefinition(TypedDict):
     requires: List[str]
 
 
+# ============================================================================
+# ALERT DEFINITIONS - CORE ALERTS (Keep existing from line ~2620)
+# ============================================================================
+
 ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "ppo_signal_up", "title": "🟢 PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_signal_down", "title": "🔴 PPO cross below signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= ppo_sig["prev"]) and (ppo["curr"] < ppo_sig["curr"]) and (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
@@ -2699,10 +2703,9 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
 ]
 
 # ============================================================================
-# PIVOT ALERT DEFINITIONS WITH VALIDATION (Lines 2655-2668)
+# PIVOT VALIDATION HELPER (NEW - ADD THIS)
 # ============================================================================
 
-# Helper function for pivot validation (ADD THIS BEFORE THE DEFINITIONS)
 def _validate_pivot_cross(
     ctx: Dict[str, Any], 
     level: str, 
@@ -2715,10 +2718,11 @@ def _validate_pivot_cross(
     - Missing pivot data
     - Stale/incorrect pivot values (>50% away from price)
     - Non-existent crossovers
+    
+    This function is called at runtime during alert evaluation.
     """
+    # Check if pivot data exists
     if not ctx.get("pivots") or level not in ctx["pivots"]:
-        if cfg.DEBUG_MODE:
-            logger.debug(f"Pivot {level} not available in context")
         return False
     
     level_value = ctx["pivots"][level]
@@ -2730,36 +2734,32 @@ def _validate_pivot_cross(
     price_diff_pct = abs(level_value - close_curr) / close_curr * 100
     
     if price_diff_pct > 50.0:
-        logger.warning(
-            f"âŒ Pivot {level} validation failed | "
-            f"Level: ${level_value:.2f} | Price: ${close_curr:.2f} | "
-            f"Difference: {price_diff_pct:.1f}% (max: 50%) | "
-            f"This indicates stale/incorrect pivot data"
-        )
+        # Only log at runtime when logger is available
+        try:
+            import logging
+            log = logging.getLogger("macd_bot")
+            log.warning(
+                f"❌ Pivot {level} validation failed | "
+                f"Level: ${level_value:.2f} | Price: ${close_curr:.2f} | "
+                f"Difference: {price_diff_pct:.1f}% (max: 50%)"
+            )
+        except:
+            pass  # Fail silently if logging not available
         return False
     
     # Validate crossover actually happened
     if is_buy:
         # BUY: price crossed UP through level
-        crossed_up = (close_prev <= level_value) and (close_curr > level_value)
-        if not crossed_up and cfg.DEBUG_MODE:
-            logger.debug(
-                f"Pivot {level} BUY: no crossover | "
-                f"Prev={close_prev:.2f} Curr={close_curr:.2f} Level={level_value:.2f}"
-            )
-        return crossed_up
+        return (close_prev <= level_value) and (close_curr > level_value)
     else:
         # SELL: price crossed DOWN through level
-        crossed_down = (close_prev >= level_value) and (close_curr < level_value)
-        if not crossed_down and cfg.DEBUG_MODE:
-            logger.debug(
-                f"Pivot {level} SELL: no crossover | "
-                f"Prev={close_prev:.2f} Curr={close_curr:.2f} Level={level_value:.2f}"
-            )
-        return crossed_down
+        return (close_prev >= level_value) and (close_curr < level_value)
 
 
-# PIVOT ALERT DEFINITIONS (REPLACE LINES 2655-2668)
+# ============================================================================
+# PIVOT ALERT DEFINITIONS (FIXED VERSION)
+# ============================================================================
+
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 BUY_PIVOT_DEFS = [
@@ -2794,10 +2794,72 @@ SELL_PIVOT_DEFS = [
     for level in ["P", "S1", "S2", "R1", "R2", "R3"]
 ]
 
+# Add pivot definitions to main list
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
+
+# Build alert definitions map
 ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
 
+# ============================================================================
+# ALERT KEY VALIDATION (Consistency Safety)
+# ============================================================================
+
+def validate_alert_definitions() -> None:
+    errors = []
+    
+    keys_seen = set()
+    for def_ in ALERT_DEFINITIONS:
+        key = def_["key"]
+        if key in keys_seen:
+            errors.append(f"Duplicate alert key: {key}")
+        keys_seen.add(key)
+    
+    required_fields = ["key", "title", "check_fn", "extra_fn", "requires"]
+    for idx, def_ in enumerate(ALERT_DEFINITIONS):
+        for field in required_fields:
+            if field not in def_:
+                errors.append(f"Alert definition {idx} missing field: {field}")
+        
+        if not callable(def_.get("check_fn")):
+            errors.append(f"Alert {def_.get('key', idx)}: check_fn is not callable")
+        if not callable(def_.get("extra_fn")):
+            errors.append(f"Alert {def_.get('key', idx)}: extra_fn is not callable")
+        
+        if not isinstance(def_.get("requires", []), list):
+            errors.append(f"Alert {def_.get('key', idx)}: requires must be a list")
+    
+    if errors:
+        error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
+        logger.critical(error_msg)
+        raise ValueError(error_msg)
+    
+    logger.info(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions")
+
+# Run validation (this happens at import time)
+validate_alert_definitions()
+
+# ============================================================================
+# ALERT KEYS MAPPING (MUST BE AFTER ALERT_DEFINITIONS)
+# ============================================================================
+
+# Create alert keys map AFTER all definitions are added
+ALERT_KEYS: Dict[str, str] = {
+    d["key"]: f"ALERT:{d['key'].upper()}" 
+    for d in ALERT_DEFINITIONS
+}
+
+# Add explicit pivot key mappings (for backward compatibility)
+for level in PIVOT_LEVELS:
+    ALERT_KEYS[f"pivot_up_{level}"] = f"ALERT:PIVOT_UP_{level}"
+    ALERT_KEYS[f"pivot_down_{level}"] = f"ALERT:PIVOT_DOWN_{level}"
+
+# Verify all alert keys exist
+for def_ in ALERT_DEFINITIONS:
+    if def_["key"] not in ALERT_KEYS:
+        raise ValueError(f"Alert key {def_['key']} missing from ALERT_KEYS mapping")
+
+logger.debug(f"Alert keys initialized: {len(ALERT_KEYS)} mappings")
 # ============================================================================
 # ALERT KEY VALIDATION (Consistency Safety)
 # ============================================================================
