@@ -1990,8 +1990,12 @@ class RedisStateStore:
                         logger.debug("💾 Redis connection saved to global pool")
                 
                 try:
-                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                    if cfg.DEBUG_MODE:
+                    self._dedup_script_sha = await self._safe_redis_op(
+                        lambda: self._redis.script_load(self.DEDUP_LUA),
+                        2.0,
+                        "script_load_dedup"
+                    )
+                    if cfg.DEBUG_MODE and self._dedup_script_sha:
                         logger.debug("Loaded Redis Lua script for alert deduplication")
                 except Exception as e:
                     logger.warning(f"Failed to load Lua script (will fallback): {e}")
@@ -2031,8 +2035,10 @@ class RedisStateStore:
                     # Load Lua script if needed
                     if not self._dedup_script_sha:
                         try:
-                            self._dedup_script_sha = await self._redis.script_load(
-                                self.DEDUP_LUA
+                            self._dedup_script_sha = await self._safe_redis_op(
+                                lambda: self._redis.script_load(self.DEDUP_LUA),
+                                2.0,
+                                "script_load_dedup"
                             )
                         except Exception as e:
                             logger.warning(f"Lua script load failed: {e}")
@@ -2065,21 +2071,21 @@ class RedisStateStore:
                 test_val = "ok"
                 if (
                     await self._safe_redis_op(
-                        self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set"
+                        lambda: self._redis.set(test_key, test_val, ex=10), 2.0, "smoke_set"
                     )
                     and await self._safe_redis_op(
-                        self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val
+                        lambda: self._redis.get(test_key), 2.0, "smoke_get", lambda r: r == test_val
                     )
                 ):
                     await self._safe_redis_op(
-                        self._redis.delete(test_key), 1.0, "smoke_cleanup"
+                        lambda: self._redis.delete(test_key), 1.0, "smoke_cleanup"
                     )
                     expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
                     logger.info(f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)")
                     
                     # Check memory policy
                     info = await self._safe_redis_op(
-                        self._redis.info("memory"), 3.0, "info_memory", lambda r: r
+                        lambda: self._redis.info("memory"), 3.0, "info_memory", lambda r: r
                     )
                     if info:
                         policy = info.get("maxmemory_policy", "unknown")
@@ -2136,13 +2142,13 @@ class RedisStateStore:
     async def _ping_with_retry(self, timeout: float) -> bool:
         return (
             await self._safe_redis_op(
-                self._redis.ping(), timeout, "ping", lambda r: bool(r)
+                lambda: self._redis.ping(), timeout, "ping", lambda r: bool(r)
             )
         ) is True
 
     async def _safe_redis_op(
         self,
-        coro,
+        coro_factory,
         timeout: float,
         op_name: str,
         parser: Optional[Callable] = None,
@@ -2151,7 +2157,7 @@ class RedisStateStore:
             return None
 
         async def _do():
-            return await asyncio.wait_for(coro, timeout=timeout)
+            return await asyncio.wait_for(coro_factory(), timeout=timeout)
 
         try:
             result = await retry_async(
@@ -2174,7 +2180,7 @@ class RedisStateStore:
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
-            self._redis.get(f"{self.state_prefix}{key}"),
+            lambda: self._redis.get(f"{self.state_prefix}{key}"),
             timeout,
             f"get {key}",
             lambda r: json_loads(r) if r else None,
@@ -2191,7 +2197,7 @@ class RedisStateStore:
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            self._redis.set(
+            lambda: self._redis.set(
                 redis_key,
                 data,
                 ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
@@ -2202,7 +2208,7 @@ class RedisStateStore:
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
         return await self._safe_redis_op(
-            self._redis.get(f"{self.meta_prefix}{key}"),
+            lambda: self._redis.get(f"{self.meta_prefix}{key}"),
             timeout,
             f"get_metadata {key}",
             lambda r: r if r else None,
@@ -2212,7 +2218,7 @@ class RedisStateStore:
         self, key: str, value: str, timeout: float = 2.0
     ) -> None:
         await self._safe_redis_op(
-            self._redis.set(
+            lambda: self._redis.set(
                 f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds
             ),
             timeout,
@@ -2262,7 +2268,7 @@ class RedisStateStore:
 
         # Fallback: Use SET NX (set if not exists)
         result = await self._safe_redis_op(
-            self._redis.set(
+            lambda: self._redis.set(
                 recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC
             ),
             timeout=2.0,
@@ -2334,7 +2340,7 @@ class RedisStateStore:
 
         redis_keys = [f"{self.state_prefix}{k}" for k in keys]
         results = await self._safe_redis_op(
-            self._redis.mget(redis_keys),
+            lambda: self._redis.mget(redis_keys),
             timeout,
             f"mget {len(keys)} keys",
             lambda r: r if r else [],
@@ -3254,7 +3260,9 @@ async def evaluate_pair_and_alert(
         
         if alerts_to_send:
             status_msg += f" | 🔔 {len(alerts_to_send)} alerts sent"
-            logger_pair.info(status_msg)
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(status_msg)
+
         elif base_buy_common and not buy_candle_passed:
             status_msg += f" | BUY blocked: {buy_candle_reason}"
             logger_pair.info(status_msg)
