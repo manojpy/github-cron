@@ -1576,88 +1576,116 @@ class DataFetcher:
         )
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
-        url = f"{self.api_base}/v2/products"
-        
-        async with self.semaphore:
-            result = await self.rate_limiter.call(
-                async_fetch_json,
-                url,
-                retries=5,
-                backoff=2.0,
-                timeout=self.timeout
-            )
-            
-            if result:
-                self.fetch_stats["products_success"] += 1
-                logger.debug(f"Products fetch successful | URL: {url}")
-            else:
-                self.fetch_stats["products_failed"] += 1
-                logger.warning(f"Products fetch failed | URL: {url}")
-            
-            return result
+    url = f"{self.api_base}/v2/products"
 
-    async def fetch_candles(
-        self,
-        symbol: str,
-        resolution: str,
-        limit: int,
-        reference_time: Optional[int] = None
-    ) -> Optional[Dict[str, Any]]:
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
+    async with self.semaphore:
+        result = await self.rate_limiter.call(
+            async_fetch_json,
+            url,
+            retries=5,
+            backoff=2.0,
+            timeout=self.timeout
+        )
 
-        minutes = int(resolution) if resolution != "D" else 1440
-        window = minutes * 60
-        current_window = reference_time // window
-        last_close = (current_window * window)
-        
-        cushion = max(3, min(Constants.CANDLE_PUBLICATION_LAG_SEC, window - 3))
-        last_close -= cushion
+        if result:
+            self.fetch_stats["products_success"] += 1
+            logger.debug(f"Products fetch successful | URL: {url}")
+        else:
+            self.fetch_stats["products_failed"] += 1
+            logger.warning(f"Products fetch failed | URL: {url}")
 
-        params = {
-            "resolution": resolution,
-            "symbol": symbol,
-            "from": last_close - (limit * window),
-            "to": last_close
-        }
+        return result
 
-        url = f"{self.api_base}/v2/chart/history"
-        
-        async with self.semaphore:
-            data = await self.rate_limiter.call(
-                async_fetch_json,
-                url,
-                params=params,
-                retries=cfg.CANDLE_FETCH_RETRIES,
-                backoff=cfg.CANDLE_FETCH_BACKOFF,
-                timeout=self.timeout
-            )
-            
-            if data:
-                self.fetch_stats["candles_success"] += 1
-                
-                result = data.get("result", {})
-                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                    num_candles = len(result.get("t", []))
-                    logger.debug(
-                        f"Candles fetch successful | Symbol: {symbol} | "
-                        f"Resolution: {resolution} | Count: {num_candles}"
-                    )
-                else:
-                    logger.warning(
-                        f"Candles response missing required fields | Symbol: {symbol} | "
-                        f"Resolution: {resolution}"
-                    )
-                    self.fetch_stats["candles_failed"] += 1
-                    return None
-            else:
-                self.fetch_stats["candles_failed"] += 1
-                logger.warning(
-                    f"Candles fetch failed | Symbol: {symbol} | "
-                    f"Resolution: {resolution} | Params: {params}"
+
+async def fetch_candles(
+    self,
+    symbol: str,
+    resolution: str,
+    limit: int,
+    reference_time: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    if reference_time is None:
+        reference_time = get_trigger_timestamp()
+
+    minutes = int(resolution) if resolution != "D" else 1440
+    interval_seconds = minutes * 60
+
+    current_period = reference_time // interval_seconds
+    expected_close_time = current_period * interval_seconds
+
+    if reference_time - expected_close_time < 10:
+        expected_close_time -= interval_seconds
+
+    to_time = expected_close_time + Constants.CANDLE_PUBLICATION_LAG_SEC
+    from_time = to_time - (limit * interval_seconds)
+
+    params = {
+        "resolution": resolution,
+        "symbol": symbol,
+        "from": from_time,
+        "to": to_time
+    }
+
+    url = f"{self.api_base}/v2/chart/history"
+
+    # Log for debugging
+    logger.debug(
+        f"Fetching {symbol} {resolution} | "
+        f"Reference: {reference_time} ({format_ist_time(reference_time)}) | "
+        f"Expected close: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
+        f"Request window: {from_time} to {to_time}"
+    )
+
+    async with self.semaphore:
+        data = await self.rate_limiter.call(
+            async_fetch_json,
+            url,
+            params=params,
+            retries=cfg.CANDLE_FETCH_RETRIES,
+            backoff=cfg.CANDLE_FETCH_BACKOFF,
+            timeout=self.timeout
+        )
+
+        if data:
+            self.fetch_stats["candles_success"] += 1
+
+            result = data.get("result", {})
+            if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                num_candles = len(result.get("t", []))
+                last_candle_ts = result["t"][-1] if num_candles > 0 else 0
+
+                logger.debug(
+                    f"✅ Candles received | Symbol: {symbol} | "
+                    f"Resolution: {resolution} | Count: {num_candles} | "
+                    f"Last candle: {last_candle_ts} ({format_ist_time(last_candle_ts)})"
                 )
-            
-            return data
+
+                # Validate we got the expected last candle
+                if num_candles > 0:
+                    diff = abs(last_candle_ts - expected_close_time)
+                    if diff > 120:  # More than 2 minutes off
+                        logger.warning(
+                            f"⚠️ Last candle mismatch | Symbol: {symbol} | "
+                            f"Expected: {expected_close_time} ({format_ist_time(expected_close_time)}) | "
+                            f"Got: {last_candle_ts} ({format_ist_time(last_candle_ts)}) | "
+                            f"Diff: {diff}s"
+                        )
+            else:
+                logger.warning(
+                    f"Candles response missing required fields | Symbol: {symbol} | "
+                    f"Resolution: {resolution}"
+                )
+                self.fetch_stats["candles_failed"] += 1
+                return None
+        else:
+            self.fetch_stats["candles_failed"] += 1
+            logger.warning(
+                f"Candles fetch failed | Symbol: {symbol} | "
+                f"Resolution: {resolution} | Params: {params}"
+            )
+
+        return data
+
     
     def get_stats(self) -> Dict[str, Any]:
         stats = self.fetch_stats.copy()
@@ -1868,6 +1896,7 @@ def get_last_closed_index_from_array(
     interval_minutes: int,
     reference_time: Optional[int] = None
 ) -> Optional[int]:
+    
     if timestamps is None or timestamps.size < 2:
         return None
 
@@ -1877,29 +1906,43 @@ def get_last_closed_index_from_array(
     last_ts = int(timestamps[-1])
     interval_seconds = interval_minutes * 60
 
-    expected_last_closed = calculate_expected_candle_timestamp(reference_time, interval_minutes)
+    current_period = reference_time // interval_seconds
+    expected_close = current_period * interval_seconds
+    
+    if reference_time - expected_close < 10:
+        expected_close -= interval_seconds
 
-    diff_seconds = abs(last_ts - expected_last_closed)
+    diff_seconds = abs(last_ts - expected_close)
 
-    if diff_seconds > 300:
+    if diff_seconds > 120:
         logger.warning(
-            f"Last candle timestamp significantly off! "
-            f"Got {last_ts} ({format_ist_time(last_ts)}), "
-            f"expected ~{expected_last_closed} ({format_ist_time(expected_last_closed)}), "
-            f"diff={diff_seconds}s"
+            f"Last candle timestamp drift detected | "
+            f"Expected close: {expected_close} ({format_ist_time(expected_close)}) | "
+            f"Got: {last_ts} ({format_ist_time(last_ts)}) | "
+            f"Diff: {diff_seconds}s | "
+            f"Reference: {reference_time} ({format_ist_time(reference_time)})"
         )
-    elif diff_seconds > 0:
-        # Optional: very quiet debug for tiny drifts (1–300 seconds) — usually normal
+    elif diff_seconds > 30:
         logger.debug(
-            f"Minor acceptable timestamp drift: {last_ts} vs expected {expected_last_closed} "
-            f"({diff_seconds}s)"
+            f"Minor timestamp drift: {diff_seconds}s | "
+            f"Expected: {format_ist_time(expected_close)} | "
+            f"Got: {format_ist_time(last_ts)}"
         )
 
-    publication_buffer = Constants.CANDLE_PUBLICATION_LAG_SEC
-
-    if reference_time >= (last_ts + interval_seconds + publication_buffer):
+    if abs(last_ts - expected_close) <= interval_seconds:
+        # Last candle is the most recent closed one
+        return timestamps.size - 1
+    elif last_ts < expected_close:
+        
         return timestamps.size - 1
     else:
+        
+        logger.warning(
+            f"Last candle is newer than expected close time | "
+            f"Using second-to-last candle | "
+            f"Last: {format_ist_time(last_ts)} | "
+            f"Expected: {format_ist_time(expected_close)}"
+        )
         return timestamps.size - 2 if timestamps.size >= 2 else None
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
@@ -3528,7 +3571,7 @@ async def process_pairs_with_workers(
         f"Eval: {eval_duration:.1f}s ({eval_duration/total_duration*100:.1f}%)"
     )
     
-    logger_main.info(
+    logger_main.debug(
         f"📊 Results | "
         f"Pairs evaluated: {len(valid_results)}/{len(pairs_to_process)} | "
         f"Pairs with alerts: {alerts_sent} | "
