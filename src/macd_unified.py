@@ -434,12 +434,6 @@ def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: i
     last_closed_candle = (current_window * interval_seconds) - interval_seconds
     return last_closed_candle
 
-def validate_candle_timestamp(candle_ts: int, expected_ts: int, tolerance_seconds: int = 120) -> bool:
-    diff = abs(candle_ts - expected_ts)
-    if diff > tolerance_seconds:
-        logger.error(f"Candle timestamp mismatch! Expected ~{expected_ts}, got {candle_ts} (diff: {diff}s)")
-        return False
-
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
 def escape_markdown_v2(text: str) -> str:
@@ -3053,6 +3047,9 @@ async def evaluate_pair_and_alert(
     """
     Fixed: single INFO log per alert send, proper candle direction validation,
     and complete state return with clear suppression reasons.
+    
+    ADDED: Strict validation to ensure we only use fully closed 15m candles.
+    Prevents premature alerts on forming candles (e.g., mid-period pivot crosses).
     """
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
@@ -3065,6 +3062,24 @@ async def evaluate_pair_and_alert(
 
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient closed candles for {pair_name}")
+            return None
+
+        # ===== PHASE 1.5: Strict closed-candle timestamp validation =====
+        # Ensures the selected candle is truly the last *fully closed* one (open time matches expected)
+        # Prevents using the ongoing/forming candle even if get_last_closed_index_from_array selects it
+        latest_ts = int(data_15m["timestamp"][i15])
+        expected_open_ts = calculate_expected_candle_timestamp(reference_time, 15)
+
+        if not validate_candle_timestamp(
+            candle_ts=latest_ts,
+            reference_time=reference_time,
+            interval_minutes=15,
+            tolerance_seconds=300  # 5 minutes — generous for Delta publication delays
+        ):
+            logger_pair.info(
+                f"Skipping {pair_name} - latest 15m candle is not confirmed closed "
+                f"(got open {format_ist_time(latest_ts)}, expected ~{format_ist_time(expected_open_ts)})"
+            )
             return None
 
         # ===== PHASE 2: Calculate Indicators =====
