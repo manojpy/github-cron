@@ -430,9 +430,12 @@ def get_trigger_timestamp() -> int:
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
     interval_seconds = interval_minutes * 60
-    current_window = reference_time // interval_seconds
-    last_closed_candle = (current_window * interval_seconds) - interval_seconds
-    return last_closed_candle
+    
+    current_period_start = (reference_time // interval_seconds) * interval_seconds
+    
+    last_closed_candle_open = current_period_start - interval_seconds
+    
+    return last_closed_candle_open
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
