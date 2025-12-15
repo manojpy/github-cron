@@ -2327,12 +2327,6 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
-        """
-        Batch check multiple alerts for deduplication.
-        Returns dict mapping "pair:alert_key" -> should_send (bool)
-        
-        FIXED: Uses consistent window alignment and proper logging.
-        """
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2373,51 +2367,51 @@ class RedisStateStore:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
     async def mget_states(
-    self, 
-    keys: List[str], 
-    timeout: float = 2.0
-) -> Dict[str, Optional[Dict[str, Any]]]:
-    if not self._redis or not keys:
-        return {}
-
-    redis_keys = [f"{self.state_prefix}{k}" for k in keys]
-    
-    try:
-        async def _do_mget():
-            return await asyncio.wait_for(
-                self._redis.mget(redis_keys), 
-                timeout=timeout
-            )
-        
-        results = await retry_async(
-            _do_mget,
-            retries=2,
-            base_backoff=0.5,
-            cap=2.0,
-            on_error=lambda e, a, c: logger.debug(
-                f"Redis mget error (attempt {a}): {e}"
-            ) if cfg.DEBUG_MODE else None,
-        )
-        
-        if not results:
+        self, 
+        keys: List[str], 
+        timeout: float = 2.0
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        if not self._redis or not keys:
             return {}
 
-        output: Dict[str, Optional[Dict[str, Any]]] = {}
-        for idx, key in enumerate(keys):
-            if idx < len(results) and results[idx]:
-                try:
-                    output[key] = json_loads(results[idx])
-                except Exception as e:
-                    logger.debug(f"Failed to parse state for {key}: {e}")
-                    output[key] = None
-            else:
-                output[key] = None
-
-        return output
+        redis_keys = [f"{self.state_prefix}{k}" for k in keys]
+    
+        try:
+            async def _do_mget():
+                return await asyncio.wait_for(
+                    self._redis.mget(redis_keys), 
+                    timeout=timeout
+                )
         
-    except Exception as e:
-        logger.error(f"mget_states failed for {len(keys)} keys: {e}")
-        return {}
+            results = await retry_async(
+                _do_mget,
+                retries=2,
+                base_backoff=0.5,
+                cap=2.0,
+                on_error=lambda e, a, c: logger.debug(
+                    f"Redis mget error (attempt {a}): {e}"
+                ) if cfg.DEBUG_MODE else None,
+            )
+        
+            if not results:
+                return {}
+
+            output: Dict[str, Optional[Dict[str, Any]]] = {}
+            for idx, key in enumerate(keys):
+                if idx < len(results) and results[idx]:
+                    try:
+                        output[key] = json_loads(results[idx])
+                    except Exception as e:
+                        logger.debug(f"Failed to parse state for {key}: {e}")
+                        output[key] = None
+                else:
+                    output[key] = None
+
+            return output
+        
+        except Exception as e:
+            logger.error(f"mget_states failed for {len(keys)} keys: {e}")
+            return {}
 
     async def batch_set_states(
         self,
