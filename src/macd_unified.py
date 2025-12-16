@@ -752,14 +752,24 @@ def _calculate_mmh_full_numba(close: np.ndarray, period: int = 144, responsivene
     ma = _rolling_mean_numba(close, period)
     
     raw = np.empty(n, dtype=np.float64)
+    
+    # ----------------------------------------------------------------
+    # FIX: Robust check for zero division
+    # ----------------------------------------------------------------
     for i in range(n):
         w = worm_arr[i]
-        if w == 0.0 or np.isnan(w):
+        
+        # Check if the denominator (w) is effectively zero or invalid
+        if np.abs(w) < 1e-12 or np.isnan(w) or np.isinf(w):
             raw[i] = 0.0
         else:
+            # Safe division
             raw[i] = (w - ma[i]) / w
+            
+        # Final safety check 
         if np.isnan(raw[i]) or np.isinf(raw[i]):
             raw[i] = 0.0
+    # ----------------------------------------------------------------
             
     min_med, max_med = _rolling_min_max_numba(raw, period)
     
@@ -780,11 +790,7 @@ def _calculate_mmh_full_numba(close: np.ndarray, period: int = 144, responsivene
     for i in range(n):
         v = value_arr[i]
         
-        # NOTE: Since v is already tightly clipped in _calc_mmh_value_loop, 
-        # the argument to log will be strictly positive and finite.
-        
         val = (1.0 + v) / (1.0 - v)
-        # val will be positive, but a small guard remains for extreme underflow
         if val <= 0: val = 1e-10 
         
         momentum[i] = 0.25 * np.log(val)
@@ -799,7 +805,6 @@ def _calculate_mmh_full_numba(close: np.ndarray, period: int = 144, responsivene
             final_mmh[i] = 0.0
             
     return final_mmh
-
 
 @njit(fastmath=True, cache=True, nogil=True)
 def _calculate_cirrus_full_numba(close: np.ndarray, x1: int, x2: int, x3: int, x4: int) -> Tuple[np.ndarray, np.ndarray]:
