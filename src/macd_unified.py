@@ -1853,170 +1853,237 @@ class DataFetcher:
 
         return output
 
-    def validate_candle_timestamp(
-        candle_ts: int,
-        reference_time: int,
-        interval_minutes: int,
-        tolerance_seconds: int = 120,
-    ) -> bool:
-   
-        interval_seconds = interval_minutes * 60
-        current_window = reference_time // interval_seconds
-        expected_open_ts = (current_window * interval_seconds) - interval_seconds
 
-        diff = abs(candle_ts - expected_open_ts)
-        if diff > tolerance_seconds:
-            logger.error(
-                f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
-                f"got {candle_ts} (diff: {diff}s)"
-            )
-            return False
+# ============================================================================
+# HELPER FUNCTIONS FOR DATA PARSING AND VALIDATION
+# ============================================================================
 
-        logger.debug(
-            f"Candle timestamp validated | Expected open: {expected_open_ts} | "
-            f"Got: {candle_ts} | Diff: {diff}s"
-        )
-        return True
-
-
-    def parse_candles_to_numpy(
-        result: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, np.ndarray]]:
+def parse_candles_to_numpy(
+    result: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Parse Delta Exchange API candle response to NumPy arrays.
     
-        if not result or not isinstance(result, dict):
+    Args:
+        result: API response dict containing 'result' with t,o,h,l,c,v keys
+        
+    Returns:
+        Dict with numpy arrays or None if invalid
+    """
+    if not result or not isinstance(result, dict):
+        return None
+
+    res = result.get("result", {}) or {}
+    required = ("t", "o", "h", "l", "c", "v")
+    if not all(k in res for k in required):
+        return None
+
+    try:
+        n = len(res["t"])
+        if n == 0:
             return None
 
-        res = result.get("result", {}) or {}
-        required = ("t", "o", "h", "l", "c", "v")
-        if not all(k in res for k in required):
+        data = {
+            "timestamp": np.empty(n, dtype=np.int64),
+            "open": np.empty(n, dtype=np.float64),
+            "high": np.empty(n, dtype=np.float64),
+            "low": np.empty(n, dtype=np.float64),
+            "close": np.empty(n, dtype=np.float64),
+            "volume": np.empty(n, dtype=np.float64),
+        }
+
+        data["timestamp"][:] = res["t"]
+        data["open"][:] = res["o"]
+        data["high"][:] = res["h"]
+        data["low"][:] = res["l"]
+        data["close"][:] = res["c"]
+        data["volume"][:] = res["v"]
+
+        # Convert milliseconds to seconds if needed
+        if data["timestamp"][-1] > 1_000_000_000_000:
+            data["timestamp"] //= 1000
+
+        # Validate last candle
+        if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
             return None
 
-        try:
-            n = len(res["t"])
-            if n == 0:
-                return None
+        return data
 
-            data = {
-                "timestamp": np.empty(n, dtype=np.int64),
-                "open": np.empty(n, dtype=np.float64),
-                "high": np.empty(n, dtype=np.float64),
-                "low": np.empty(n, dtype=np.float64),
-                "close": np.empty(n, dtype=np.float64),
-                "volume": np.empty(n, dtype=np.float64),
-            }
+    except Exception as e:
+        logger.error(f"Failed to parse candles: {e}")
+        return None
 
-            data["timestamp"][:] = res["t"]
-            data["open"][:] = res["o"]
-            data["high"][:] = res["h"]
-            data["low"][:] = res["l"]
-            data["close"][:] = res["c"]
-            data["volume"][:] = res["v"]
 
-            # Convert milliseconds to seconds if needed
-            if data["timestamp"][-1] > 1_000_000_000_000:
-                data["timestamp"] //= 1000
-
-            # Validate last candle
-            if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
-                return None
-
-            return data
-
-        except Exception as e:
-            logger.error(f"Failed to parse candles: {e}")
-            return None
-
-    def validate_candle_data(
-        data: Optional[Dict[str, np.ndarray]],
-        required_len: int = 0,
-    ) -> Tuple[bool, Optional[str]]:
+def validate_candle_data(
+    data: Optional[Dict[str, np.ndarray]],
+    required_len: int = 0,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate candle data for completeness and quality.
     
-        try:
-            if data is None or not data:
-                return False, "Data is None or empty"
+    Checks:
+    - Data exists and is not empty
+    - Close prices are valid (not NaN, > 0)
+    - Timestamps are monotonically increasing
+    - Sufficient data length
+    - No excessive gaps in time series
+    - No extreme price spikes
+    
+    Args:
+        data: Dict of numpy arrays with OHLCV data
+        required_len: Minimum required candle count
+        
+    Returns:
+        Tuple of (is_valid: bool, error_reason: Optional[str])
+    """
+    try:
+        if data is None or not data:
+            return False, "Data is None or empty"
 
-            close = data.get("close")
-            timestamp = data.get("timestamp")
+        close = data.get("close")
+        timestamp = data.get("timestamp")
 
-            if close is None or len(close) == 0:
-                return False, "Close array is empty"
+        if close is None or len(close) == 0:
+            return False, "Close array is empty"
 
-            if np.any(np.isnan(close)) or np.any(close <= 0):
-                return False, "Invalid close prices (NaN or <= 0)"
+        if np.any(np.isnan(close)) or np.any(close <= 0):
+            return False, "Invalid close prices (NaN or <= 0)"
 
-            if timestamp is None or len(timestamp) == 0:
-                return False, "Timestamp array is empty"
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
 
-            # Strict monotonic check
-            if not np.all(timestamp[1:] >= timestamp[:-1]):
-                return False, "Timestamps not monotonic increasing"
+        # Strict monotonic check
+        if not np.all(timestamp[1:] >= timestamp[:-1]):
+            return False, "Timestamps not monotonic increasing"
 
-            if len(close) < required_len:
-                return False, f"Insufficient data: {len(close)} < {required_len}"
+        if len(close) < required_len:
+            return False, f"Insufficient data: {len(close)} < {required_len}"
 
-            if len(close) >= 2:
-                time_diffs = np.diff(timestamp)
-                if len(time_diffs) > 0:
-                    median_diff = np.median(time_diffs)
-                    max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
-                    gaps = time_diffs[time_diffs > max_expected_gap]
-                    if len(gaps) > 0:
-                        logger.warning(
-                            f"Detected {len(gaps)} candle gaps "
-                            f"(median: {median_diff}s, max gap: {gaps.max()}s)"
-                        )
-
-            if len(close) >= 2:
-                price_changes = np.abs(np.diff(close) / close[:-1]) * 100
-                extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-                if len(extreme_changes) > 0:
+        if len(close) >= 2:
+            time_diffs = np.diff(timestamp)
+            if len(time_diffs) > 0:
+                median_diff = np.median(time_diffs)
+                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
+                gaps = time_diffs[time_diffs > max_expected_gap]
+                if len(gaps) > 0:
                     logger.warning(
-                        f"Detected {len(extreme_changes)} extreme price changes "
-                        f"(max: {extreme_changes.max():.2f}%)"
+                        f"Detected {len(gaps)} candle gaps "
+                        f"(median: {median_diff}s, max gap: {gaps.max()}s)"
                     )
-                    return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
 
-            return True, None
-        except Exception as e:
-            logger.error(f"Data validation failed: {e}")
-            return False, f"Validation error: {str(e)}"
+        if len(close) >= 2:
+            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
+            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
+            if len(extreme_changes) > 0:
+                logger.warning(
+                    f"Detected {len(extreme_changes)} extreme price changes "
+                    f"(max: {extreme_changes.max():.2f}%)"
+                )
+                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
 
-    def get_last_closed_index_from_array(
-        timestamps: np.ndarray,
-        interval_minutes: int,
-        reference_time: Optional[int] = None,
-    ) -> Optional[int]:
+        return True, None
+    except Exception as e:
+        logger.error(f"Data validation failed: {e}")
+        return False, f"Validation error: {str(e)}"
+
+
+def get_last_closed_index_from_array(
+    timestamps: np.ndarray,
+    interval_minutes: int,
+    reference_time: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Find the index of the last fully closed candle in the timestamp array.
     
-        if timestamps is None or timestamps.size < 2:
-            logger.warning("No timestamps or insufficient data")
-            return None
+    A candle is considered "closed" if its close time is before the current period start.
+    For example, with 15m candles at 14:05:
+    - Current period: 14:00-14:15
+    - Last closed candle: 13:45-14:00 (index of 13:45)
+    
+    Args:
+        timestamps: Array of candle open timestamps
+        interval_minutes: Candle interval (e.g., 15 for 15m candles)
+        reference_time: Current time (defaults to trigger timestamp)
+        
+    Returns:
+        Index of last closed candle, or None if no closed candles available
+    """
+    if timestamps is None or timestamps.size < 2:
+        logger.warning("No timestamps or insufficient data")
+        return None
 
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
+    if reference_time is None:
+        reference_time = get_trigger_timestamp()
 
-        interval_seconds = interval_minutes * 60
-        current_period_start = (reference_time // interval_seconds) * interval_seconds
+    interval_seconds = interval_minutes * 60
+    current_period_start = (reference_time // interval_seconds) * interval_seconds
 
-        valid_mask = timestamps < current_period_start
-        valid_indices = np.nonzero(valid_mask)[0]
+    valid_mask = timestamps < current_period_start
+    valid_indices = np.nonzero(valid_mask)[0]
 
-        if valid_indices.size == 0:
-            logger.info(
-                f"No fully closed {interval_minutes}m candle available yet | "
-                f"Latest ts: {format_ist_time(timestamps[-1])} | "
-                f"Current period start: {format_ist_time(current_period_start)}"
-            )
-            return None
-
-        last_closed_idx = int(valid_indices[-1])
-        logger.debug(
-            f"Selected fully closed candle | Index: {last_closed_idx} | "
-            f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+    if valid_indices.size == 0:
+        logger.info(
+            f"No fully closed {interval_minutes}m candle available yet | "
+            f"Latest ts: {format_ist_time(timestamps[-1])} | "
+            f"Current period start: {format_ist_time(current_period_start)}"
         )
-        return last_closed_idx
+        return None
+
+    last_closed_idx = int(valid_indices[-1])
+    logger.debug(
+        f"Selected fully closed candle | Index: {last_closed_idx} | "
+        f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+    )
+    return last_closed_idx
+
+
+def validate_candle_timestamp(
+    candle_ts: int,
+    reference_time: int,
+    interval_minutes: int,
+    tolerance_seconds: int = 120,
+) -> bool:
+    """
+    Validate that a candle timestamp matches the expected closed candle time.
+    
+    Args:
+        candle_ts: Candle open timestamp to validate
+        reference_time: Current reference time
+        interval_minutes: Candle interval (e.g., 15)
+        tolerance_seconds: Allowed deviation in seconds (default: 120)
+        
+    Returns:
+        True if timestamp is valid, False otherwise
+    """
+    interval_seconds = interval_minutes * 60
+    current_window = reference_time // interval_seconds
+    expected_open_ts = (current_window * interval_seconds) - interval_seconds
+
+    diff = abs(candle_ts - expected_open_ts)
+    if diff > tolerance_seconds:
+        logger.error(
+            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
+            f"got {candle_ts} (diff: {diff}s)"
+        )
+        return False
+
+    logger.debug(
+        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
+        f"Got: {candle_ts} | Diff: {diff}s"
+    )
+    return True
 
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+    """
+    Build a mapping of trading pairs to their product information.
+    
+    Args:
+        api_products: API response containing product list
+        
+    Returns:
+        Dict mapping pair names to product details
+    """
     products_map: Dict[str, dict] = {}
     if not api_products or not api_products.get("result"):
         return products_map
@@ -2039,7 +2106,6 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
         except Exception:
             pass
     return products_map
-
 # ============================================================================
 # PART 3: REDIS STATE STORE & LOCKING
 # ============================================================================
@@ -2228,34 +2294,43 @@ class RedisStateStore:
                 pass
         self._redis = None
 
-
     @classmethod
     async def shutdown_global_pool(cls) -> None:
-        
+        """
+        Shutdown the global Redis connection pool.
+        Called during application shutdown to cleanly close all connections.
+        """
         async with cls._pool_lock:
-            if cls._global_pool and not cls._global_pool.closed:
+            if cls._global_pool:
                 try:
-                    pool_age = time.time() - cls._pool_created_at
-                    reuse_count = cls._pool_reuse_count
-                    
-                    logger.info(
-                        f"Shutting down global Redis pool | "
-                        f"Age: {pool_age:.1f}s | "
-                        f"Reuses: {reuse_count}"
-                    )
-                    
-                    await cls._global_pool.aclose()
-                    await asyncio.sleep(0.25)  # Allow cleanup
-                    
-                    cls._global_pool = None
-                    cls._pool_healthy = False
-                    cls._pool_created_at = 0.0
-                    cls._pool_reuse_count = 0
-                    
-                    logger.info("✅ Global Redis pool shutdown complete")
-                    
+                    if hasattr(cls._global_pool, 'connection_pool') and cls._global_pool.connection_pool:
+                        pool_age = time.time() - cls._pool_created_at
+                        reuse_count = cls._pool_reuse_count
+                        
+                        logger.info(
+                            f"Shutting down global Redis pool | "
+                            f"Age: {pool_age:.1f}s | "
+                            f"Reuses: {reuse_count}"
+                        )
+                        
+                        await cls._global_pool.aclose()
+                        await asyncio.sleep(0.25)  # Allow cleanup
+                        
+                        cls._global_pool = None
+                        cls._pool_healthy = False
+                        cls._pool_created_at = 0.0
+                        cls._pool_reuse_count = 0
+                        
+                        logger.info("✅ Global Redis pool shutdown complete")
+                    else:
+                        logger.debug("Redis pool already closed")
+                        cls._global_pool = None
+                        cls._pool_healthy = False
+                        
                 except Exception as e:
                     logger.error(f"Error shutting down global Redis pool: {e}")
+                    cls._global_pool = None
+                    cls._pool_healthy = False
             else:
                 logger.debug("Global Redis pool already closed or not created")
 
@@ -2510,6 +2585,7 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"Atomic batch update failed: {e}")
             return False
+
 
 class RedisLock:
     RELEASE_LUA = """
