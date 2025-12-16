@@ -3641,14 +3641,12 @@ async def run_once() -> bool:
         except Exception as e:
             logger_run.error(f"Error shutting down Redis pool: {e}")
         
-        # ===== Cleanup: Close HTTP Session =====
         try:
             await SessionManager.close_session()
             logger_run.debug("✅ HTTP session closed")
         except Exception as e:
             logger_run.error(f"Error closing HTTP session: {e}")
         
-        # ===== Cleanup: Memory =====
         try:
             if 'all_results' in locals():
                 del all_results
@@ -3665,18 +3663,12 @@ async def run_once() -> bool:
         except Exception as e:
             logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
         
-        # ===== Cleanup: Context Variables =====
         TRACE_ID.set("")
         PAIR_ID.set("")
         
         logger_run.debug("🏁 Resource cleanup finished")
         
-        # Re-enable garbage collection
         gc.enable()
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 try:
     import uvloop
