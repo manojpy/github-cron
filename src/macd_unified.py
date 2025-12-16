@@ -764,11 +764,12 @@ def _calculate_mmh_full_numba(close: np.ndarray, period: int = 144, responsivene
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
         
-        momentum_arr = momentum.copy()
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        
+        final_mmh= momentum.copy()
+        final_mmh = _calc_mmh_momentum_loop(final_mmh, rows)
         
         
-        return momentum_arr
+        return final_mmh
         
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
@@ -942,7 +943,7 @@ def calculate_all_indicators_numpy(
         results['vwap'] = np.zeros_like(close_15m)
     
     # 4. MMH (Sanitized internally)
-        results['momentum_arr'] = _calculate_mmh_full_numba(close_15m)
+        results['mmh'] = _calculate_mmh_full_numba(close_15m)
     
     # 5. Cirrus Cloud (Boolean output, sanitization not applicable)
     if cfg.CIRRUS_CLOUD_ENABLED:
