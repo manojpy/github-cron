@@ -1807,231 +1807,233 @@ class DataFetcher:
     async def fetch_all_candles_truly_parallel(
         self,
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
-        reference_time: Optional[int] = None
+        reference_time: Optional[int] = None,
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
+    
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
 
-    all_tasks = []
-    task_metadata = []
+        all_tasks = []
+        task_metadata = []
 
-    for symbol, resolutions in pair_requests:
-        for resolution, limit in resolutions:
-            task = self.fetch_candles(symbol, resolution, limit, reference_time)
-            all_tasks.append(task)
-            task_metadata.append((symbol, resolution))
+        for symbol, resolutions in pair_requests:
+            for resolution, limit in resolutions:
+                task = self.fetch_candles(symbol, resolution, limit, reference_time)
+                all_tasks.append(task)
+                task_metadata.append((symbol, resolution))
 
-    total_requests = len(all_tasks)
-    logger.info(
-        f"🚀 Parallel fetch: {total_requests} candle requests "
-        f"for {len(pair_requests)} pairs | All firing simultaneously"
-    )
-
-    results = await asyncio.gather(*all_tasks, return_exceptions=True)
-
-    output = {}
-    success_count = 0
-
-    for (symbol, resolution), result in zip(task_metadata, results):
-        if symbol not in output:
-            output[symbol] = {}
-
-        if isinstance(result, Exception):
-            logger.error(f"Fetch failed for {symbol} {resolution}: {result}")
-            output[symbol][resolution] = None
-        else:
-            output[symbol][resolution] = result
-            if result is not None:
-                success_count += 1
-
-    success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
-    logger.info(
-        f"✅ Parallel fetch complete | Success: {success_count}/{total_requests} "
-        f"({success_rate:.1f}%)"
-    )
-
-    return output
-
-def validate_candle_timestamp(
-    candle_ts: int,
-    reference_time: int,
-    interval_minutes: int,
-    tolerance_seconds: int = 120
-) -> bool:
-    """Validate that a candle timestamp matches the expected open time."""
-    interval_seconds = interval_minutes * 60
-    current_window = reference_time // interval_seconds
-    expected_open_ts = (current_window * interval_seconds) - interval_seconds
-
-    diff = abs(candle_ts - expected_open_ts)
-    if diff > tolerance_seconds:
-        logger.error(
-            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
-            f"got {candle_ts} (diff: {diff}s)"
-        )
-        return False
-
-    logger.debug(
-        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
-        f"Got: {candle_ts} | Diff: {diff}s"
-    )
-    return True
-
-
-def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
-    """Parse raw candle API result into NumPy arrays."""
-    if not result or not isinstance(result, dict):
-        return None
-
-    res = result.get("result", {}) or {}
-    required = ("t", "o", "h", "l", "c", "v")
-    if not all(k in res for k in required):
-        return None
-
-    try:
-        n = len(res["t"])
-        if n == 0:
-            return None
-
-        data = {
-            "timestamp": np.empty(n, dtype=np.int64),
-            "open": np.empty(n, dtype=np.float64),
-            "high": np.empty(n, dtype=np.float64),
-            "low": np.empty(n, dtype=np.float64),
-            "close": np.empty(n, dtype=np.float64),
-            "volume": np.empty(n, dtype=np.float64),
-        }
-
-        data["timestamp"][:] = res["t"]
-        data["open"][:] = res["o"]
-        data["high"][:] = res["h"]
-        data["low"][:] = res["l"]
-        data["close"][:] = res["c"]
-        data["volume"][:] = res["v"]
-
-        # Convert milliseconds to seconds if needed
-        if data["timestamp"][-1] > 1_000_000_000_000:
-            data["timestamp"] //= 1000
-
-        # Validate last candle
-        if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
-            return None
-
-        return data
-
-    except Exception as e:
-        logger.error(f"Failed to parse candles: {e}")
-        return None
-
-
-def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    """Validate NumPy candle data arrays."""
-    try:
-        if data is None or not data:
-            return False, "Data is None or empty"
-
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-
-        if close is None or len(close) == 0:
-            return False, "Close array is empty"
-
-        if np.any(np.isnan(close)) or np.any(close <= 0):
-            return False, "Invalid close prices (NaN or <= 0)"
-
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
-
-        # Strict monotonic check
-        if not np.all(timestamp[1:] >= timestamp[:-1]):
-            return False, "Timestamps not monotonic increasing"
-
-        if len(close) < required_len:
-            return False, f"Insufficient data: {len(close)} < {required_len}"
-
-        if len(close) >= 2:
-            time_diffs = np.diff(timestamp)
-            if len(time_diffs) > 0:
-                median_diff = np.median(time_diffs)
-                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
-                gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > 0:
-                    logger.warning(
-                        f"Detected {len(gaps)} candle gaps "
-                        f"(median: {median_diff}s, max gap: {gaps.max()}s)"
-                    )
-
-        if len(close) >= 2:
-            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
-            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-            if len(extreme_changes) > 0:
-                logger.warning(
-                    f"Detected {len(extreme_changes)} extreme price changes "
-                    f"(max: {extreme_changes.max():.2f}%)"
-                )
-                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
-
-        return True, None
-    except Exception as e:
-        logger.error(f"Data validation failed: {e}")
-        return False, f"Validation error: {str(e)}"
-
-def get_last_closed_index_from_array(
-    timestamps: np.ndarray,
-    interval_minutes: int,
-    reference_time: Optional[int] = None
-) -> Optional[int]:
-    """
-    STRICT version: Only returns the index of a fully closed candle.
-    Never uses the ongoing/forming candle, even if API is delayed.
-    """
-    if timestamps is None or timestamps.size < 2:
-        logger.warning("No timestamps or insufficient data")
-        return None
-
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
-
-    interval_seconds = interval_minutes * 60
-    current_period_start = (reference_time // interval_seconds) * interval_seconds
-
-    valid_mask = timestamps < current_period_start
-    valid_indices = np.nonzero(valid_mask)[0]
-
-    if valid_indices.size == 0:
+        total_requests = len(all_tasks)
         logger.info(
-            f"No fully closed {interval_minutes}m candle available yet | "
-            f"Latest ts: {format_ist_time(timestamps[-1])} | "
-            f"Current period start: {format_ist_time(current_period_start)}"
+            f"🚀 Parallel fetch: {total_requests} candle requests "
+            f"for {len(pair_requests)} pairs | All firing simultaneously"
         )
-        return None
 
-    last_closed_idx = int(valid_indices[-1])
-    logger.debug(
-        f"Selected fully closed candle | Index: {last_closed_idx} | "
-        f"TS: {format_ist_time(timestamps[last_closed_idx])}"
-    )
-    return last_closed_idx
+        results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
-    products_map: Dict[str, dict] = {}
-    if not api_products or not api_products.get("result"):
-        return products_map
-    valid_pattern = CompiledPatterns.VALID_SYMBOL
-    for p in api_products["result"]:
+        output = {}
+        success_count = 0
+
+        for (symbol, resolution), result in zip(task_metadata, results):
+            if symbol not in output:
+                output[symbol] = {}
+
+            if isinstance(result, Exception):
+                logger.error(f"Fetch failed for {symbol} {resolution}: {result}")
+                output[symbol][resolution] = None
+            else:
+                output[symbol][resolution] = result
+                if result is not None:
+                    success_count += 1
+
+        success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
+        logger.info(
+            f"✅ Parallel fetch complete | Success: {success_count}/{total_requests} "
+            f"({success_rate:.1f}%)"
+        )
+
+        return output
+
+    def validate_candle_timestamp(
+        candle_ts: int,
+        reference_time: int,
+        interval_minutes: int,
+        tolerance_seconds: int = 120,
+    ) -> bool:
+   
+        interval_seconds = interval_minutes * 60
+        current_window = reference_time // interval_seconds
+        expected_open_ts = (current_window * interval_seconds) - interval_seconds
+
+        diff = abs(candle_ts - expected_open_ts)
+        if diff > tolerance_seconds:
+            logger.error(
+                f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
+                f"got {candle_ts} (diff: {diff}s)"
+            )
+            return False
+
+        logger.debug(
+            f"Candle timestamp validated | Expected open: {expected_open_ts} | "
+            f"Got: {candle_ts} | Diff: {diff}s"
+        )
+        return True
+
+
+    def parse_candles_to_numpy(
+        result: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, np.ndarray]]:
+    
+        if not result or not isinstance(result, dict):
+            return None
+
+        res = result.get("result", {}) or {}
+        required = ("t", "o", "h", "l", "c", "v")
+        if not all(k in res for k in required):
+            return None
+
         try:
-            symbol = p.get("symbol", "")
-            if not valid_pattern.match(symbol):
-                continue
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
-            if p.get("contract_type") == "perpetual_futures":
-                for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
-                        products_map[pair_name] = {"id": p.get("id"), "symbol": p.get("symbol"), "contract_type": p.get("contract_type")}
-                        break
-        except Exception:
-            pass
-    return products_map
+            n = len(res["t"])
+            if n == 0:
+                return None
+
+            data = {
+                "timestamp": np.empty(n, dtype=np.int64),
+                "open": np.empty(n, dtype=np.float64),
+                "high": np.empty(n, dtype=np.float64),
+                "low": np.empty(n, dtype=np.float64),
+                "close": np.empty(n, dtype=np.float64),
+                "volume": np.empty(n, dtype=np.float64),
+            }
+
+            data["timestamp"][:] = res["t"]
+            data["open"][:] = res["o"]
+            data["high"][:] = res["h"]
+            data["low"][:] = res["l"]
+            data["close"][:] = res["c"]
+            data["volume"][:] = res["v"]
+
+            # Convert milliseconds to seconds if needed
+            if data["timestamp"][-1] > 1_000_000_000_000:
+                data["timestamp"] //= 1000
+
+            # Validate last candle
+            if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
+                return None
+
+            return data
+
+        except Exception as e:
+            logger.error(f"Failed to parse candles: {e}")
+            return None
+
+    def validate_candle_data(
+        data: Optional[Dict[str, np.ndarray]],
+        required_len: int = 0,
+    ) -> Tuple[bool, Optional[str]]:
+    
+        try:
+            if data is None or not data:
+                return False, "Data is None or empty"
+
+            close = data.get("close")
+            timestamp = data.get("timestamp")
+
+            if close is None or len(close) == 0:
+                return False, "Close array is empty"
+
+            if np.any(np.isnan(close)) or np.any(close <= 0):
+                return False, "Invalid close prices (NaN or <= 0)"
+
+            if timestamp is None or len(timestamp) == 0:
+                return False, "Timestamp array is empty"
+
+            # Strict monotonic check
+            if not np.all(timestamp[1:] >= timestamp[:-1]):
+                return False, "Timestamps not monotonic increasing"
+
+            if len(close) < required_len:
+                return False, f"Insufficient data: {len(close)} < {required_len}"
+
+            if len(close) >= 2:
+                time_diffs = np.diff(timestamp)
+                if len(time_diffs) > 0:
+                    median_diff = np.median(time_diffs)
+                    max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
+                    gaps = time_diffs[time_diffs > max_expected_gap]
+                    if len(gaps) > 0:
+                        logger.warning(
+                            f"Detected {len(gaps)} candle gaps "
+                            f"(median: {median_diff}s, max gap: {gaps.max()}s)"
+                        )
+
+            if len(close) >= 2:
+                price_changes = np.abs(np.diff(close) / close[:-1]) * 100
+                extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
+                if len(extreme_changes) > 0:
+                    logger.warning(
+                        f"Detected {len(extreme_changes)} extreme price changes "
+                        f"(max: {extreme_changes.max():.2f}%)"
+                    )
+                    return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
+
+            return True, None
+        except Exception as e:
+            logger.error(f"Data validation failed: {e}")
+            return False, f"Validation error: {str(e)}"
+
+    def get_last_closed_index_from_array(
+        timestamps: np.ndarray,
+        interval_minutes: int,
+        reference_time: Optional[int] = None,
+    ) -> Optional[int]:
+    
+        if timestamps is None or timestamps.size < 2:
+            logger.warning("No timestamps or insufficient data")
+            return None
+
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
+
+        interval_seconds = interval_minutes * 60
+        current_period_start = (reference_time // interval_seconds) * interval_seconds
+
+        valid_mask = timestamps < current_period_start
+        valid_indices = np.nonzero(valid_mask)[0]
+
+        if valid_indices.size == 0:
+            logger.info(
+                f"No fully closed {interval_minutes}m candle available yet | "
+                f"Latest ts: {format_ist_time(timestamps[-1])} | "
+                f"Current period start: {format_ist_time(current_period_start)}"
+            )
+            return None
+
+        last_closed_idx = int(valid_indices[-1])
+        logger.debug(
+            f"Selected fully closed candle | Index: {last_closed_idx} | "
+            f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+        )
+        return last_closed_idx
+
+    def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+        products_map: Dict[str, dict] = {}
+        if not api_products or not api_products.get("result"):
+            return products_map
+        valid_pattern = CompiledPatterns.VALID_SYMBOL
+        for p in api_products["result"]:
+            try:
+                symbol = p.get("symbol", "")
+                if not valid_pattern.match(symbol):
+                    continue
+                symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
+                if p.get("contract_type") == "perpetual_futures":
+                    for pair_name in cfg.PAIRS:
+                        if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+                            products_map[pair_name] = {"id": p.get("id"), "symbol": p.get("symbol"), "contract_type": p.get("contract_type")}
+                            break
+            except Exception:
+                pass
+        return products_map
 
 # ============================================================================
 # PART 3: REDIS STATE STORE & LOCKING
