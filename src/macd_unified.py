@@ -727,71 +727,53 @@ def _calculate_smooth_rsi_full_numba(close: np.ndarray, rsi_len: int, kalman_len
             
     return smooth_rsi
 
-@njit(fastmath=True, cache=True, nogil=True)
 def _calculate_mmh_full_numba(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    n = len(close)
-    if n < period:
-        return np.zeros(n, dtype=np.float64)
+    try:
+        if close is None or len(close) < period:
+            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
+            return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
         
-    # All arithmetic happens in compiled code
-    sd = _rolling_std_numba(close, 50, responsiveness)
-    worm_arr = _calc_mmh_worm_loop(close, sd, n)
-    ma = _rolling_mean_numba(close, period)
-    
-    raw = np.empty(n, dtype=np.float64)
-    
-    # ----------------------------------------------------------------
-    # FIX: Robust check for zero division
-    # ----------------------------------------------------------------
-    for i in range(n):
-        w = worm_arr[i]
+        rows = len(close)
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # Check if the denominator (w) is effectively zero or invalid
-        if np.abs(w) < 1e-12 or np.isnan(w) or np.isinf(w):
-            raw[i] = 0.0
-        else:
-            # Safe division
-            raw[i] = (w - ma[i]) / w
-            
-        # Final safety check 
-        if np.isnan(raw[i]) or np.isinf(raw[i]):
-            raw[i] = 0.0
-    # ----------------------------------------------------------------
-            
-    min_med, max_med = _rolling_min_max_numba(raw, period)
-    
-    temp = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        denom = max_med[i] - min_med[i]
-        if denom == 0:
-            denom = 1e-12
-        t = (raw[i] - min_med[i]) / denom
-        if t < 0.0: t = 0.0
-        if t > 1.0: t = 1.0
-        if np.isnan(t): t = 0.5
-        temp[i] = t
+        sd = _rolling_std_numba(close.astype(np.float32), 50, resp_clamped)
         
-    value_arr = _calc_mmh_value_loop(temp, n)
-    
-    momentum = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        v = value_arr[i]
+        worm_arr = _calc_mmh_worm_loop(close.astype(np.float32), sd, rows)
         
-        val = (1.0 + v) / (1.0 - v)
-        if val <= 0: val = 1e-10 
+        ma = _rolling_mean_numba(close.astype(np.float32), period)
         
-        momentum[i] = 0.25 * np.log(val)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw = (worm_arr - ma) / worm_arr
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        if np.isnan(momentum[i]) or np.isinf(momentum[i]):
-            momentum[i] = 0.0
-            
-    final_mmh = _calc_mmh_momentum_loop(momentum, n)
-    
-    for i in range(n):
-        if np.isnan(final_mmh[i]) or np.isinf(final_mmh[i]):
-            final_mmh[i] = 0.0
-            
-    return final_mmh
+        min_med, max_med = _rolling_min_max_numba(raw, period)
+        
+        denom = max_med - min_med
+        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
+        temp = (raw - min_med) / denom
+        temp = np.clip(temp, 0.0, 1.0)
+        temp = np.nan_to_num(temp, nan=0.5)
+        
+        value_arr = _calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
+        
+        momentum = 0.25 * np.log(temp2)
+        momentum = np.nan_to_num(momentum, nan=0.0)
+        
+        momentum_arr = momentum.copy()
+        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        
+        
+        return momentum_arr
+        
+    except Exception as e:
+        logger.error(f"MMH calculation failed: {e}")
+        return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
+
 
 @njit(fastmath=True, cache=True, nogil=True)
 def _calculate_cirrus_full_numba(close: np.ndarray, x1: int, x2: int, x3: int, x4: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -960,7 +942,7 @@ def calculate_all_indicators_numpy(
         results['vwap'] = np.zeros_like(close_15m)
     
     # 4. MMH (Sanitized internally)
-    results['mmh'] = _calculate_mmh_full_numba(close_15m)
+        results['momentum_arr'] = _calculate_mmh_full_numba(close_15m)
     
     # 5. Cirrus Cloud (Boolean output, sanitization not applicable)
     if cfg.CIRRUS_CLOUD_ENABLED:
