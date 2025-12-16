@@ -1918,24 +1918,7 @@ def validate_candle_data(
     data: Optional[Dict[str, np.ndarray]],
     required_len: int = 0,
 ) -> Tuple[bool, Optional[str]]:
-    """
-    Validate candle data for completeness and quality.
     
-    Checks:
-    - Data exists and is not empty
-    - Close prices are valid (not NaN, > 0)
-    - Timestamps are monotonically increasing
-    - Sufficient data length
-    - No excessive gaps in time series
-    - No extreme price spikes
-    
-    Args:
-        data: Dict of numpy arrays with OHLCV data
-        required_len: Minimum required candle count
-        
-    Returns:
-        Tuple of (is_valid: bool, error_reason: Optional[str])
-    """
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -2831,24 +2814,7 @@ def _validate_pivot_cross(
     level: str, 
     is_buy: bool
 ) -> bool:
-    """
-    Validate pivot level crossover with sanity checks.
     
-    Prevents false alerts from:
-    - Missing pivot data
-    - Stale/incorrect pivot values (>50% away from price)
-    - Non-existent crossovers
-    
-    This function is called at runtime during alert evaluation.
-    
-    Args:
-        ctx: Alert context dictionary with pivots, close prices
-        level: Pivot level name (P, S1, S2, S3, R1, R2, R3)
-        is_buy: True for BUY crossover (price crosses up), False for SELL (price crosses down)
-        
-    Returns:
-        True if crossover is valid, False otherwise
-    """
     # Check if pivot data exists
     if not ctx.get("pivots") or level not in ctx["pivots"]:
         return False
@@ -2891,12 +2857,12 @@ PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 BUY_PIVOT_DEFS = [
     {
-        "key": f"pivot_up_{level}",
+        "key": f"pivot_up_{level}", 
         "title": f"🟢⬆️ Cross above {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
-            ctx["buy_common"] 
+            ctx["buy_common"]
             and _validate_pivot_cross(ctx, level, is_buy=True)
-        ),
+        ), 
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, level=level: (
             f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
         ),
@@ -2998,15 +2964,7 @@ validate_alert_definitions()
 # ============================================================================
 
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
-    """
-    Set alert state in Redis.
     
-    Args:
-        sdb: Redis state store instance
-        pair: Trading pair name
-        key: Alert key
-        active: True to set ACTIVE, False to set INACTIVE
-    """
     if sdb.degraded:
         return
     
@@ -3017,17 +2975,7 @@ async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: boo
 
 
 async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
-    """
-    Check if alert was previously active.
     
-    Args:
-        sdb: Redis state store instance
-        pair: Trading pair name
-        key: Alert key
-        
-    Returns:
-        True if alert was active, False otherwise
-    """
     if sdb.degraded:
         return False
     
@@ -3037,17 +2985,7 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 
 
 async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
-    """
-    Batch check multiple alert states.
     
-    Args:
-        sdb: Redis state store instance
-        pair: Trading pair name
-        keys: List of alert keys to check
-        
-    Returns:
-        Dict mapping alert key to active status (True/False)
-    """
     if sdb.degraded or not keys:
         return {k: False for k in keys}
     
@@ -3080,23 +3018,7 @@ def _vectorized_wick_check_buy(
     close_arr: np.ndarray,
     min_wick_ratio: float
 ) -> np.ndarray:
-    """
-    Vectorized BUY wick validation.
     
-    Validates green candles for BUY alerts by checking:
-    - Candle is green (close > open)
-    - Upper wick is small (< min_wick_ratio of total range)
-    
-    Args:
-        open_arr: Open prices array
-        high_arr: High prices array
-        low_arr: Low prices array
-        close_arr: Close prices array
-        min_wick_ratio: Maximum allowed wick ratio (e.g., 0.2 = 20%)
-        
-    Returns:
-        Boolean array: True = passed validation, False = rejected
-    """
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
     
@@ -3130,23 +3052,7 @@ def _vectorized_wick_check_sell(
     close_arr: np.ndarray,
     min_wick_ratio: float
 ) -> np.ndarray:
-    """
-    Vectorized SELL wick validation.
-    
-    Validates red candles for SELL alerts by checking:
-    - Candle is red (close < open)
-    - Lower wick is small (< min_wick_ratio of total range)
-    
-    Args:
-        open_arr: Open prices array
-        high_arr: High prices array
-        low_arr: Low prices array
-        close_arr: Close prices array
-        min_wick_ratio: Maximum allowed wick ratio (e.g., 0.2 = 20%)
-        
-    Returns:
-        Boolean array: True = passed validation, False = rejected
-    """
+   
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
     
@@ -3179,23 +3085,7 @@ def check_common_conditions(
     close_val: float,
     is_buy: bool
 ) -> bool:
-    """
-    Fast path for single candle validation.
     
-    Validates a single candle for BUY or SELL conditions by checking:
-    - Candle direction (green for BUY, red for SELL)
-    - Wick size (upper for BUY, lower for SELL)
-    
-    Args:
-        open_val: Open price
-        high_val: High price
-        low_val: Low price
-        close_val: Close price
-        is_buy: True for BUY validation, False for SELL
-        
-    Returns:
-        True if candle passes validation, False otherwise
-    """
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
@@ -3228,24 +3118,7 @@ def check_candle_quality_with_reason(
     close_val: float,
     is_buy: bool
 ) -> Tuple[bool, str]:
-    """
-    Validate candle quality with detailed rejection reason.
     
-    Similar to check_common_conditions but returns detailed reason for rejection.
-    Used for debugging and logging.
-    
-    Args:
-        open_val: Open price
-        high_val: High price
-        low_val: Low price
-        close_val: Close price
-        is_buy: True for BUY validation, False for SELL
-        
-    Returns:
-        Tuple of (passed: bool, reason: str)
-        - (True, "Passed") if validation succeeds
-        - (False, "reason...") if validation fails with explanation
-    """
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
@@ -3293,13 +3166,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Fixed: single INFO log per alert send, proper candle direction validation,
-    and complete state return with clear suppression reasons.
     
-    ADDED: Strict validation to ensure we only use fully closed 15m candles.
-    Prevents premature alerts on forming candles (e.g., mid-period pivot crosses).
-    """
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
