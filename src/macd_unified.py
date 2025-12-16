@@ -238,7 +238,6 @@ class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = str(record.getMessage())
-            # Quick check before expensive regex
             if any(x in msg for x in ("TOKEN", "redis://", "chat_id")):
                 msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
                 msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
@@ -272,37 +271,28 @@ def setup_logging() -> logging.Logger:
     logger.setLevel(level)
     logger.propagate = False
     console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    
+    console.setLevel(level)    
     console.setFormatter(SafeFormatter(
         fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | [%(trace_id)s] | %(funcName)s:%(lineno)d | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
-    ))
-    
+    ))    
     console.addFilter(SecretFilter())
-    console.addFilter(TraceContextFilter())
-    
-    logger.addHandler(console)
-    
+    console.addFilter(TraceContextFilter())  
+    logger.addHandler(console)    
     logger.debug(
         f"Logging configured | Level: {logging.getLevelName(level)} | "
         f"Format: structured with trace_id | Output: stdout"
     )
 
     return logger
-
 logger = setup_logging()
 shutdown_event = asyncio.Event()
 
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
-    """Optimized debug logger - only calls msg_fn if debug enabled"""
     if condition and logger_obj.isEnabledFor(logging.DEBUG):
         logger_obj.debug(msg_fn())
-
-
-# ADD this helper for conditional info logging:
+        
 def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) -> None:
-    """Only log INFO for important events, use DEBUG otherwise"""
     if is_important:
         logger_obj.info(msg)
     elif cfg.DEBUG_MODE:
@@ -311,13 +301,6 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
 _VALIDATION_DONE = False
 
 def validate_runtime_config() -> None:
-    """
-    Validate runtime configuration that Pydantic can't check.
-    
-    Note: Business logic validation (PPO_FAST < PPO_SLOW, timeout constraints)
-    is handled by Pydantic's model_validator. This function only checks
-    external dependencies and format issues.
-    """
     global _VALIDATION_DONE
     if _VALIDATION_DONE:
         logger.debug("Configuration validation skipped (cached)")
@@ -326,8 +309,6 @@ def validate_runtime_config() -> None:
     errors = []
     warnings = []
     
-    # ✅ ONLY validate external/runtime constraints
-    # Check Redis URL format
     try:
         from urllib.parse import urlparse
         parsed = urlparse(cfg.REDIS_URL)
@@ -338,19 +319,15 @@ def validate_runtime_config() -> None:
     except Exception as e:
         errors.append(f"Failed to parse REDIS_URL: {e}")
     
-    # Check Telegram token format
     if not CompiledPatterns.SECRET_TOKEN.match(cfg.TELEGRAM_BOT_TOKEN):
         errors.append("TELEGRAM_BOT_TOKEN format invalid (should be: 123456:ABC-DEF...)")
     
-    # Check API base URL
     if not cfg.DELTA_API_BASE.startswith(('http://', 'https://')):
         errors.append("DELTA_API_BASE must start with http:// or https://")
     
-    # Check pairs configuration
     if not cfg.PAIRS or len(cfg.PAIRS) == 0:
         errors.append("PAIRS list is empty - no trading pairs configured")
     
-    # Performance warnings (not errors)
     if cfg.MAX_PARALLEL_FETCH < 1 or cfg.MAX_PARALLEL_FETCH > 16:
         warnings.append(f"MAX_PARALLEL_FETCH={cfg.MAX_PARALLEL_FETCH} is outside recommended range (1-16)")
     
@@ -363,14 +340,12 @@ def validate_runtime_config() -> None:
     if cfg.MEMORY_LIMIT_BYTES < 200_000_000:  # 200MB minimum
         warnings.append(f"MEMORY_LIMIT_BYTES={cfg.MEMORY_LIMIT_BYTES} is very low (minimum recommended: 200MB)")
     
-    # Report errors
     if errors:
         logger.critical("Configuration validation FAILED:")
         for error in errors:
             logger.critical(f"  ERROR: {error}")
         raise ValueError(f"Configuration validation failed with {len(errors)} error(s)")
     
-    # Report warnings
     if warnings:
         logger.warning("Configuration warnings:")
         for warning in warnings:
@@ -452,10 +427,6 @@ def escape_markdown_v2(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', text)
-
-# ============================================================================
-# PART 5: NUMBA-OPTIMIZED INDICATOR CALCULATIONS (ENHANCED SAFETY)
-# ============================================================================
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -556,8 +527,7 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         estimate = prediction + kalman_gain * (current - prediction)
         error_est = (1.0 - kalman_gain) * error_est + Q_div_length
         
-        result[i] = estimate
-        
+        result[i] = estimate        
     return result
 
 @njit(fastmath=True, cache=True)
@@ -572,8 +542,7 @@ def _vwap_daily_loop(
     vwap = np.empty(n, dtype=np.float64)
     
     cum_vol = 0.0
-    cum_pv = 0.0
-    
+    cum_pv = 0.0    
     prev_day = timestamps[0] // 86400
     
     for i in range(n):
@@ -602,8 +571,7 @@ def _vwap_daily_loop(
         if cum_vol == 0:
             vwap[i] = c
         else:
-            vwap[i] = cum_pv / cum_vol
-            
+            vwap[i] = cum_pv / cum_vol            
     return vwap
 
 @njit(fastmath=True, cache=True)
@@ -911,8 +879,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
 
 def warmup_numba() -> None:
-        logger.info("Warming up Numba JIT compiler (parallel)...")
-        
+        logger.info("Warming up Numba JIT compiler (parallel)...")        
         try:
             length = 100
             close = np.random.random(length).astype(np.float64) * 1000
@@ -945,13 +912,8 @@ def warmup_numba() -> None:
         except Exception as e:
             logger.warning(f"Numba warm-up failed (non-fatal): {e}")
 
-# Semaphore removed - direct threading is faster
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
-
-# ============================================================================
-# PRE-ALLOCATED NUMPY BUFFERS FOR ADVANCED OPTIMIZATION
-# ============================================================================
 
 _BUFFER_SIZE = 500
 _BUFFER_LOCK = asyncio.Lock()
@@ -1007,10 +969,6 @@ def copy_to_scratch(data: Dict[str, np.ndarray], buffers: Dict[str, np.ndarray])
         for i in range(n):
             buffers['timestamp'][i] = data['timestamp'][i]
 
-# ============================================================================
-# PART 6: PIVOT CALCULATIONS & ALERT LOGIC
-# ============================================================================
-
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
     low: np.ndarray,
@@ -1024,23 +982,16 @@ def calculate_pivot_levels_numpy(
             logger.warning("Pivot calc: insufficient data")
             return piv
         
-        # Convert timestamps to day numbers (Unix days)
         days = timestamps // 86400
-        
-        # Get yesterday's date properly
         now_utc = datetime.now(timezone.utc)
         yesterday = (now_utc - timedelta(days=1)).date()
-        
-        # CRITICAL FIX: Use timestamp() instead of strftime
         yesterday_ts = datetime(
             yesterday.year, 
             yesterday.month, 
             yesterday.day, 
             tzinfo=timezone.utc
         ).timestamp()
-        yesterday_day_number = int(yesterday_ts) // 86400
-        
-        
+        yesterday_day_number = int(yesterday_ts) // 86400        
         yesterday_mask = days == yesterday_day_number
         
         if not np.any(yesterday_mask):
@@ -1049,8 +1000,6 @@ def calculate_pivot_levels_numpy(
                 f"Available days: {np.unique(days)}"
             )
             return piv
-        
-        # Extract yesterday's data
         yesterday_high = high[yesterday_mask]
         yesterday_low = low[yesterday_mask]
         yesterday_close = close[yesterday_mask]
@@ -1060,7 +1009,6 @@ def calculate_pivot_levels_numpy(
             logger.warning("No candles found for yesterday")
             return piv
         
-        # Calculate H/L/C for yesterday
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
         C_prev = float(yesterday_close[-1])  # Last close of the day
@@ -1071,7 +1019,6 @@ def calculate_pivot_levels_numpy(
             logger.warning(f"Invalid pivot range: {rng_prev}")
             return piv
         
-        # Calculate pivot levels
         P = (H_prev + L_prev + C_prev) / 3.0
         
         piv = {
@@ -1083,8 +1030,7 @@ def calculate_pivot_levels_numpy(
             "S2": P - rng_prev * 0.618,
             "S3": P - rng_prev,
         }
-        
-        
+                
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
     
@@ -1095,8 +1041,7 @@ def calculate_all_indicators_numpy(
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
 ) -> Dict[str, np.ndarray]:
-    results = {}
-    
+    results = {}    
     close_15m = data_15m["close"]
     close_5m = data_5m["close"]
     
@@ -1145,10 +1090,6 @@ def calculate_all_indicators_numpy(
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Pre-compute wick validation for all candles at once.
-    Returns: (buy_quality, sell_quality) boolean arrays
-    """
     buy_quality = _vectorized_wick_check_buy(
         data_15m["open"],
         data_15m["high"],
@@ -1166,10 +1107,6 @@ def precompute_candle_quality(
     )
     
     return buy_quality, sell_quality
-
-# ============================================================================
-# SESSION MANAGEMENT & NETWORK
-# ============================================================================
 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
@@ -1196,7 +1133,6 @@ class SessionManager:
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
-        """Get or create the shared HTTP session."""
         async with cls._lock:
             should_recreate = False
 
@@ -1220,17 +1156,17 @@ class SessionManager:
                     limit=cfg.TCP_CONN_LIMIT,
                     limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
                     ssl=cls._get_ssl_context(),
-                    force_close=False,  # Keep connections alive
+                    force_close=False,
                     enable_cleanup_closed=True,
-                    ttl_dns_cache=3600,  # 1 hour DNS cache
-                    keepalive_timeout=60,  # Increased from 30s for better reuse
-                    family=0,  # Allow both IPv4 and IPv6
+                    ttl_dns_cache=3600,
+                    keepalive_timeout=60,
+                    family=0,
                 )
 
                 timeout = aiohttp.ClientTimeout(
                     total=cfg.HTTP_TIMEOUT,
-                    connect=10,  # Connection timeout
-                    sock_read=cfg.HTTP_TIMEOUT,  # Socket read timeout
+                    connect=10,
+                    sock_read=cfg.HTTP_TIMEOUT,
                 )
 
                 cls._session = aiohttp.ClientSession(
@@ -1254,13 +1190,10 @@ class SessionManager:
                     f"DNS cache: 3600s | "
                     f"Keepalive: 60s"
                 )
-
-            # ✅ FIXED: No increment here
             return cls._session
 
     @classmethod
     def track_request(cls) -> None:
-        """Track an actual HTTP request. Call this after successful request."""
         cls._request_count += 1
 
     @classmethod
@@ -1307,17 +1240,13 @@ class SessionManager:
             "requests_until_recreation": cls._session_reuse_limit - cls._request_count,
         }
 
-
-# --- Retry helpers ---
-
 class RetryCategory:
     NETWORK = "network"
     RATE_LIMIT = "rate_limit"
     API_ERROR = "api_error"
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
-
-
+    
 def categorize_exception(exc: Exception) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return RetryCategory.TIMEOUT
@@ -1330,7 +1259,6 @@ def categorize_exception(exc: Exception) -> str:
     elif isinstance(exc, (ClientError, aiohttp.ClientError)):
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
-
 
 async def retry_async(
     fn: Callable,
@@ -1379,10 +1307,6 @@ async def retry_async(
 
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
-# ============================================================================
-# PART 4: DATA FETCHING & VALIDATION
-# ============================================================================
-
 async def async_fetch_json(
     url: str,
     params: Optional[Dict[str, Any]] = None,
@@ -1390,26 +1314,7 @@ async def async_fetch_json(
     backoff: float = 1.5,
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
-    """
-    Fetch JSON data with comprehensive retry logic and error handling.
     
-    Features:
-    - Rate limiting detection (429 responses)
-    - Exponential backoff with jitter
-    - Server error retry (5xx)
-    - Timeout handling
-    - Request tracking for session management
-    
-    Args:
-        url: URL to fetch
-        params: Query parameters (optional)
-        retries: Maximum number of retry attempts
-        backoff: Base backoff multiplier for exponential retry
-        timeout: Request timeout in seconds
-        
-    Returns:
-        Parsed JSON dict on success, None on failure
-    """
     session = await SessionManager.get_session()
     last_error = None
     retry_stats = {
@@ -1427,7 +1332,6 @@ async def async_fetch_json(
         
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
-                # Handle rate limiting (429 Too Many Requests)
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
@@ -1444,7 +1348,6 @@ async def async_fetch_json(
                     await asyncio.sleep(total_wait)
                     continue
                 
-                # Handle server errors (5xx) - retryable
                 if resp.status >= 500:
                     retry_stats[RetryCategory.API_ERROR] += 1
                     logger.warning(
@@ -1464,21 +1367,16 @@ async def async_fetch_json(
                         await asyncio.sleep(total_delay)
                     continue
                 
-                # Handle client errors (4xx) - not retryable
                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
                     )
                     return None
-                
-                # Success (2xx)
                 data = await resp.json(loads=json_loads)
                 
-                # ✅ FIXED: Track successful request for session management
                 SessionManager.track_request()
                 
-                # Log retry statistics if any retries occurred
                 if any(retry_stats.values()):
                     logger.info(
                         f"Fetch succeeded after retries | URL: {url[:80]} | "
@@ -1534,7 +1432,6 @@ async def async_fetch_json(
             logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
     
-    # All retries exhausted
     logger.error(
         f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
         f"Stats: {retry_stats} | Last error: {last_error}"
@@ -1551,7 +1448,6 @@ class RateLimitedFetcher:
         self.total_wait_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
-        """Execute function with rate limiting."""
         async with self.lock:
             now = time.time()
             
@@ -1649,15 +1545,12 @@ class DataFetcher:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        # ✅ FIXED: Use helper function instead of duplicating logic
         minutes = int(resolution) if resolution != "D" else 1440
         
-        # Calculate expected open time using helper function
         expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
         interval_seconds = minutes * 60
         expected_close_ts = expected_open_ts + interval_seconds
 
-        # Request extra candles to handle API delays
         buffer_periods = 2
         to_time = expected_close_ts + (interval_seconds * buffer_periods) + Constants.CANDLE_PUBLICATION_LAG_SEC
         from_time = to_time - ((limit + buffer_periods) * interval_seconds)
@@ -1689,34 +1582,31 @@ class DataFetcher:
                     num_candles = len(result.get("t", []))
 
                     if num_candles > 0:
-                        last_candle_open_ts = result["t"][-1]          # Delta labels by OPEN time
+                        last_candle_open_ts = result["t"][-1]
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
 
                         diff = abs(expected_open_ts - last_candle_open_ts)
                         
-                        # Check for the common case where API returns the current forming candle
                         is_harmless_ahead = (
-                            diff > 300 and  # A large difference
+                            diff > 300 and
                             last_candle_open_ts > expected_open_ts and 
-                            diff <= interval_seconds # Only one interval ahead (900s for 15m)
+                            diff <= interval_seconds
                         )
 
                         if diff > 300:
-                            # 1. Log critical delay (API did not return the expected closed candle)
                             if last_candle_open_ts < expected_open_ts:
                                 logger.warning(
                                     f"⚠️ API DELAY CRITICAL | Symbol: {symbol} | Resolution: {resolution} | "
                                     f"Expected Open: {format_ist_time(expected_open_ts)} | "
                                     f"Latest Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s too old)"
                                 )
-                            # 2. Log noisy/harmless logs (Daily candles, or 15m candle being one interval ahead)
+                            
                             elif is_harmless_ahead or resolution != '15':
                                 logger.debug(
                                     f"API Ahead (Hidden) | Symbol: {symbol} | Resolution: {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
                                     f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
                                 )
-                            # 3. Log an unexplained, large mismatch for 15m (shouldn't happen)
                             else:
                                 logger.warning(
                                     f"⚠️ TIMESTAMP MISMATCH | Symbol: {symbol} | Resolution: {resolution} | "
@@ -1724,7 +1614,6 @@ class DataFetcher:
                                     f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
                                 )
                         else:
-                            # ALL SUCCESSFUL SCANS NOW LOG AT DEBUG (SILENTLY)
                             logger.debug(
                                 f"✅ Scanned candle | Symbol: {symbol} | Resolution: {resolution} | "
                                 f"Open: {format_ist_time(last_candle_open_ts)} → Close: {format_ist_time(last_candle_close_ts)}"
@@ -1853,23 +1742,9 @@ class DataFetcher:
 
         return output
 
-
-# ============================================================================
-# HELPER FUNCTIONS FOR DATA PARSING AND VALIDATION
-# ============================================================================
-
 def parse_candles_to_numpy(
     result: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, np.ndarray]]:
-    """
-    Parse Delta Exchange API candle response to NumPy arrays.
-    
-    Args:
-        result: API response dict containing 'result' with t,o,h,l,c,v keys
-        
-    Returns:
-        Dict with numpy arrays or None if invalid
-    """
     if not result or not isinstance(result, dict):
         return None
 
@@ -1899,11 +1774,9 @@ def parse_candles_to_numpy(
         data["close"][:] = res["c"]
         data["volume"][:] = res["v"]
 
-        # Convert milliseconds to seconds if needed
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
 
-        # Validate last candle
         if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
             return None
 
@@ -1934,8 +1807,7 @@ def validate_candle_data(
 
         if timestamp is None or len(timestamp) == 0:
             return False, "Timestamp array is empty"
-
-        # Strict monotonic check
+            
         if not np.all(timestamp[1:] >= timestamp[:-1]):
             return False, "Timestamps not monotonic increasing"
 
@@ -1969,28 +1841,11 @@ def validate_candle_data(
         logger.error(f"Data validation failed: {e}")
         return False, f"Validation error: {str(e)}"
 
-
 def get_last_closed_index_from_array(
     timestamps: np.ndarray,
     interval_minutes: int,
     reference_time: Optional[int] = None,
 ) -> Optional[int]:
-    """
-    Find the index of the last fully closed candle in the timestamp array.
-    
-    A candle is considered "closed" if its close time is before the current period start.
-    For example, with 15m candles at 14:05:
-    - Current period: 14:00-14:15
-    - Last closed candle: 13:45-14:00 (index of 13:45)
-    
-    Args:
-        timestamps: Array of candle open timestamps
-        interval_minutes: Candle interval (e.g., 15 for 15m candles)
-        reference_time: Current time (defaults to trigger timestamp)
-        
-    Returns:
-        Index of last closed candle, or None if no closed candles available
-    """
     if timestamps is None or timestamps.size < 2:
         logger.warning("No timestamps or insufficient data")
         return None
@@ -2026,18 +1881,6 @@ def validate_candle_timestamp(
     interval_minutes: int,
     tolerance_seconds: int = 120,
 ) -> bool:
-    """
-    Validate that a candle timestamp matches the expected closed candle time.
-    
-    Args:
-        candle_ts: Candle open timestamp to validate
-        reference_time: Current reference time
-        interval_minutes: Candle interval (e.g., 15)
-        tolerance_seconds: Allowed deviation in seconds (default: 120)
-        
-    Returns:
-        True if timestamp is valid, False otherwise
-    """
     interval_seconds = interval_minutes * 60
     current_window = reference_time // interval_seconds
     expected_open_ts = (current_window * interval_seconds) - interval_seconds
@@ -2058,15 +1901,6 @@ def validate_candle_timestamp(
 
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
-    """
-    Build a mapping of trading pairs to their product information.
-    
-    Args:
-        api_products: API response containing product list
-        
-    Returns:
-        Dict mapping pair names to product details
-    """
     products_map: Dict[str, dict] = {}
     if not api_products or not api_products.get("result"):
         return products_map
@@ -2089,9 +1923,6 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
         except Exception:
             pass
     return products_map
-# ============================================================================
-# PART 3: REDIS STATE STORE & LOCKING
-# ============================================================================
 
 class RedisStateStore:
     DEDUP_LUA = """
@@ -2105,7 +1936,6 @@ class RedisStateStore:
     end
     """
 
-    # Class-level pool for reuse across runs
     _global_pool: ClassVar[Optional[redis.Redis]] = None
     _pool_healthy: ClassVar[bool] = False
     _pool_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
@@ -2139,7 +1969,6 @@ class RedisStateStore:
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
-            # Use a reasonably sized pool
             self._redis = redis.from_url(
                 self.redis_url,
                 socket_connect_timeout=timeout,
@@ -2156,7 +1985,6 @@ class RedisStateStore:
                 self.degraded_alerted = False
                 self._connection_attempts = 0
 
-                # Save to global pool for reuse
                 async with RedisStateStore._pool_lock:
                     RedisStateStore._global_pool = self._redis
                     RedisStateStore._pool_healthy = True
@@ -2165,7 +1993,6 @@ class RedisStateStore:
                     if cfg.DEBUG_MODE:
                         logger.debug("💾 Redis connection saved to global pool")
 
-                # Load Lua script for dedup (best-effort)
                 try:
                     self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
                     if cfg.DEBUG_MODE:
@@ -2188,7 +2015,6 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        # Try reusing global pool first
         async with RedisStateStore._pool_lock:
             if RedisStateStore._global_pool and RedisStateStore._pool_healthy:
                 try:
@@ -2209,14 +2035,12 @@ class RedisStateStore:
                         logger.debug(f"Pool health check failed: {e}, creating new pool")
                     RedisStateStore._pool_healthy = False
 
-        # Fallback: new connection attempts
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
             if cfg.DEBUG_MODE:
                 logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
-                # Smoke test
                 test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
                 test_val = "ok"
                 set_ok = await self._safe_redis_op(
@@ -2233,7 +2057,6 @@ class RedisStateStore:
                     logger.info(
                         f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)"
                     )
-                    # Info memory (best-effort)
                     info = await self._safe_redis_op(lambda: self._redis.info("memory"), 3.0, "info_memory")
                     if info and cfg.DEBUG_MODE:
                         policy = info.get("maxmemory_policy", "unknown")
@@ -2264,10 +2087,6 @@ class RedisStateStore:
             raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
-        """
-        Close Redis connection BUT don't close global pool.
-        The global pool persists across runs for performance.
-        """
         if self._redis and self._redis != RedisStateStore._global_pool:
             try:
                 await self._redis.aclose()
@@ -2279,10 +2098,6 @@ class RedisStateStore:
 
     @classmethod
     async def shutdown_global_pool(cls) -> None:
-        """
-        Shutdown the global Redis connection pool.
-        Called during application shutdown to cleanly close all connections.
-        """
         async with cls._pool_lock:
             if cls._global_pool:
                 try:
@@ -2335,14 +2150,10 @@ class RedisStateStore:
         op_name: str,
         parser: Optional[Callable[[Any], Any]] = None,
     ):
-        """
-        Safely execute a Redis operation with a fresh coroutine.
-        fn must be a callable returning a coroutine (e.g., lambda: self._redis.get(key)).
-        """
         if not self._redis:
             return None
         try:
-            coro = fn()  # fresh coroutine each call
+            coro = fn()
             result = await asyncio.wait_for(coro, timeout=timeout)
             return parser(result) if parser else result
         except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
@@ -2402,17 +2213,13 @@ class RedisStateStore:
     async def check_recent_alert(
         self, pair: str, alert_key: str, ts: int
     ) -> bool:
-        """
-        Deduplicate alerts in a stable window.
-        Returns True if alert should be sent (new), False if duplicate.
-        """
+        
         if self.degraded:
             return True
 
         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
-        # Prefer Lua for atomicity; fallback to SET NX
         if self._dedup_script_sha:
             try:
                 result = await self._safe_redis_op(
@@ -2444,9 +2251,7 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
-        """
-        Batch dedup using pipeline. Returns mapping of 'pair:alert_key' -> should_send (True/False).
-        """
+        
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2569,7 +2374,6 @@ class RedisStateStore:
             logger.error(f"Atomic batch update failed: {e}")
             return False
 
-
 class RedisLock:
     RELEASE_LUA = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -2673,11 +2477,6 @@ class RedisLock:
         finally:
             self.token = None
             self.acquired_by_me = False
-
-
-# ============================================================================
-# PART 7: TELEGRAM QUEUE & MESSAGE FORMATTING
-# ============================================================================
 
 class TokenBucket:
     def __init__(self, rate: int, burst: int):
@@ -2786,10 +2585,6 @@ class AlertDefinition(TypedDict):
     extra_fn: Callable[[Any, Any, Any, Any, Dict[str, Any]], str]
     requires: List[str]
 
-# ============================================================================
-# PART 7: ALERT DEFINITIONS & VALIDATION (CORRECTED VERSION)
-# ============================================================================
-
 ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "ppo_signal_up", "title": "🟢🔺 PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_signal_down", "title": "🔴 PPO cross below signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= ppo_sig["prev"]) and (ppo["curr"] < ppo_sig["curr"]) and (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
@@ -2805,9 +2600,6 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "mmh_sell", "title": "🟣⬇️ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
 ]
 
-# ============================================================================
-# PIVOT VALIDATION HELPER
-# ============================================================================
 
 def _validate_pivot_cross(
     ctx: Dict[str, Any], 
