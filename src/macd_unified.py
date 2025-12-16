@@ -564,34 +564,34 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
 @njit(fastmath=True, cache=True, nogil=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm_arr = np.empty(rows, dtype=np.float64)
-    worm_arr[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+    worm_arr[0] = first_val
+    
     for i in range(1, rows):
         src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
+        
         if np.isnan(sd_i):
             delta = diff
         else:
             delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
         worm_arr[i] = prev_worm + delta
+    
     return worm_arr
 
 @njit(fastmath=True, cache=True, nogil=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
-    # Use a safe constant slightly less than 1.0
-    SAFE_CLIP = 0.999999999999999 # 15 nines (close to machine epsilon)
     
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
-        
-        # Safe clamping to prevent log/division errors in the next stage
-        # We ensure 'v' is strictly between -1 and 1
-        value_arr[i] = max(-SAFE_CLIP, min(SAFE_CLIP, v))
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    
     return value_arr
 
 @njit(fastmath=True, cache=True, nogil=True)
@@ -605,30 +605,24 @@ def _calc_mmh_momentum_loop(momentum_arr, rows):
 def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     rows = len(close)
     sd = np.empty(rows, dtype=np.float64)
-    resp = max(0.00001, min(1.0, float(responsiveness)))
-    
+    resp = max(0.00001, min(1.0, responsiveness))
     for i in range(rows):
         start = max(0, i - period + 1)
-        count = i - start + 1
-        if count < 2:
+        sum_val = 0.0
+        sum_sq = 0.0
+        count = 0
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                sum_sq += val * val
+                count += 1
+        if count > 1:
+            mean = sum_val / count
+            var = (sum_sq / count) - mean * mean
+            sd[i] = np.sqrt(max(0.0, var)) * resp
+        else:
             sd[i] = 0.0
-            continue
-
-        # Two-pass algorithm for numerical stability
-        mean = 0.0
-        for j in range(start, i + 1):
-            mean += close[j]
-        mean /= count
-        
-        sum_sq_diff = 0.0
-        for j in range(start, i + 1):
-            diff = close[j] - mean
-            sum_sq_diff += diff * diff
-            
-        var = sum_sq_diff / count
-        # Strict clipping to avoid negative variance from float errors
-        if var < 0.0: var = 0.0
-        sd[i] = np.sqrt(var) * resp
     return sd
 
 @njit(fastmath=True, cache=True, nogil=True)
@@ -654,15 +648,8 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
     max_arr = np.empty(rows, dtype=np.float64)
     for i in range(rows):
         start = max(0, i - period + 1)
-        # Manually finding min/max for the slice to avoid allocation
-        curr_min = arr[i]
-        curr_max = arr[i]
-        for j in range(start, i):
-            val = arr[j]
-            if val < curr_min: curr_min = val
-            if val > curr_max: curr_max = val
-        min_arr[i] = curr_min
-        max_arr[i] = curr_max
+        min_arr[i] = np.min(arr[start:i+1])
+        max_arr[i] = np.max(arr[start:i+1])
     return min_arr, max_arr
 
 # -----------------------------------------------------------------------------
