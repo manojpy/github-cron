@@ -436,65 +436,36 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError, OverflowError):
         return default
 
-def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
-    try:
-        if arr is None or len(arr) == 0:
-            logger.warning(f"Indicator {name} is None or empty")
-            return np.array([default], dtype=np.float64)
-        
-        arr = np.where(np.isinf(arr), np.nan, arr)
-        
-        nan_count = np.sum(np.isnan(arr))
-        if nan_count > 0:
-            logger.debug(f"Indicator {name} has {nan_count}/{len(arr)} NaN values, filling with {default}")
-        
-        arr = np.where(np.isnan(arr), default, arr)
-        
-        if np.all(arr == default):
-            logger.warning(f"Indicator {name} is all {default} after sanitization")
-        
-        return arr.astype(np.float64)
-        
-    except Exception as e:
-        logger.error(f"Failed to sanitize indicator {name}: {e}")
-        return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
+# -----------------------------------------------------------------------------
+# OPTIMIZED NUMBA INDICATOR FUNCTIONS (GIL-FREE)
+# -----------------------------------------------------------------------------
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    
     window_sum = 0.0
     count = 0
-    
     for i in range(n):
         val = data[i]
-        
         if not np.isnan(val):
             window_sum += val
             count += 1
-            
         if i >= period:
             old_val = data[i - period]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 count -= 1
-
-        min_periods = max(2, period // 3)
-        if count >= min_periods:
+        if count >= max(2, period // 3):
             out[i] = window_sum / count
-        else:
-            out[i] = np.nan
-            
     return out
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[0] = data[0] if not np.isnan(data[0]) else 0.0
-    
     for i in range(1, n):
         curr = data[i]
         if np.isnan(curr):
@@ -503,11 +474,10 @@ def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
     return out
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     n = len(src)
     result = np.empty(n, dtype=np.float64)
-    
     estimate = src[0] if not np.isnan(src[0]) else 0.0
     error_est = 1.0
     error_meas = R * max(1.0, float(length))
@@ -518,35 +488,37 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         if np.isnan(current):
             result[i] = estimate
             continue
-            
         if np.isnan(estimate):
             estimate = current
-            
+        
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
         estimate = prediction + kalman_gain * (current - prediction)
         error_est = (1.0 - kalman_gain) * error_est + Q_div_length
-        
         result[i] = estimate        
     return result
 
-@njit(fastmath=True, cache=True)
-def _vwap_daily_loop(
-    high: np.ndarray, 
-    low: np.ndarray, 
-    close: np.ndarray, 
-    volume: np.ndarray, 
-    timestamps: np.ndarray
-) -> np.ndarray:
+@njit(fastmath=True, cache=True, nogil=True)
+def _vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
+                     volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
     
     cum_vol = 0.0
     cum_pv = 0.0    
-    prev_day = timestamps[0] // 86400
+    
+    # SAFETY: Handle millisecond timestamps in first element
+    first_ts = timestamps[0]
+    if first_ts > 10_000_000_000:
+        first_ts = first_ts // 1000
+    prev_day = first_ts // 86400
     
     for i in range(n):
         curr_ts = timestamps[i]
+        # SAFETY: Auto-correct millisecond timestamps
+        if curr_ts > 10_000_000_000:
+            curr_ts = curr_ts // 1000
+            
         curr_day = curr_ts // 86400
         
         if curr_day != prev_day:
@@ -554,17 +526,12 @@ def _vwap_daily_loop(
             cum_pv = 0.0
             prev_day = curr_day
         
-        h = high[i]
-        l = low[i]
-        c = close[i]
-        v = volume[i]
-        
+        h, l, c, v = high[i], low[i], close[i], volume[i]
         if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v):
             vwap[i] = vwap[i-1] if i > 0 else c
             continue
             
         avg_price = (h + l + c) / 3.0
-        
         cum_vol += v
         cum_pv += (avg_price * v)
         
@@ -574,101 +541,97 @@ def _vwap_daily_loop(
             vwap[i] = cum_pv / cum_vol            
     return vwap
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     n = len(x)
     filt = np.zeros(n, dtype=np.float64)
     filt[0] = x[0] if not np.isnan(x[0]) else 0.0
-    
     for i in range(1, n):
         prev_filt = filt[i - 1]
         curr_x = x[i]
         curr_r = r[i]
-        
         if np.isnan(curr_r) or np.isnan(curr_x):
             filt[i] = prev_filt
             continue
-            
         if curr_x > prev_filt:
             target = curr_x - curr_r
-            if target < prev_filt:
-                filt[i] = prev_filt
-            else:
-                filt[i] = target
+            filt[i] = target if target >= prev_filt else prev_filt
         else:
             target = curr_x + curr_r
-            if target > prev_filt:
-                filt[i] = prev_filt
-            else:
-                filt[i] = target
-                
+            filt[i] = target if target <= prev_filt else prev_filt
     return filt
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm_arr = np.empty(rows, dtype=np.float64)
-    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
-    worm_arr[0] = first_val
-    
+    worm_arr[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     for i in range(1, rows):
         src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
-        
         if np.isnan(sd_i):
             delta = diff
         else:
             delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
         worm_arr[i] = prev_worm + delta
-    
     return worm_arr
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
+    # Use a safe constant slightly less than 1.0
+    SAFE_CLIP = 0.999999999999999 # 15 nines (close to machine epsilon)
     
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
-        value_arr[i] = max(-0.9999, min(0.9999, v))
-    
+        
+        # Safe clamping to prevent log/division errors in the next stage
+        # We ensure 'v' is strictly between -1 and 1
+        value_arr[i] = max(-SAFE_CLIP, min(SAFE_CLIP, v))
     return value_arr
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     rows = len(close)
     sd = np.empty(rows, dtype=np.float64)
-    resp = max(0.00001, min(1.0, responsiveness))
+    resp = max(0.00001, min(1.0, float(responsiveness)))
+    
     for i in range(rows):
         start = max(0, i - period + 1)
-        sum_val = 0.0
-        sum_sq = 0.0
-        count = 0
-        for j in range(start, i + 1):
-            val = close[j]
-            if not np.isnan(val):
-                sum_val += val
-                sum_sq += val * val
-                count += 1
-        if count > 1:
-            mean = sum_val / count
-            var = (sum_sq / count) - mean * mean
-            sd[i] = np.sqrt(max(0.0, var)) * resp
-        else:
+        count = i - start + 1
+        if count < 2:
             sd[i] = 0.0
+            continue
+
+        # Two-pass algorithm for numerical stability
+        mean = 0.0
+        for j in range(start, i + 1):
+            mean += close[j]
+        mean /= count
+        
+        sum_sq_diff = 0.0
+        for j in range(start, i + 1):
+            diff = close[j] - mean
+            sum_sq_diff += diff * diff
+            
+        var = sum_sq_diff / count
+        # Strict clipping to avoid negative variance from float errors
+        if var < 0.0: var = 0.0
+        sd[i] = np.sqrt(var) * resp
     return sd
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -684,290 +647,216 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else 0.0
     return ma
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, nogil=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
     for i in range(rows):
         start = max(0, i - period + 1)
-        min_arr[i] = np.min(arr[start:i+1])
-        max_arr[i] = np.max(arr[start:i+1])
+        # Manually finding min/max for the slice to avoid allocation
+        curr_min = arr[i]
+        curr_max = arr[i]
+        for j in range(start, i):
+            val = arr[j]
+            if val < curr_min: curr_min = val
+            if val > curr_max: curr_max = val
+        min_arr[i] = curr_min
+        max_arr[i] = curr_max
     return min_arr, max_arr
 
-def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
-    try:
-        if close is None or len(close) < max(fast, slow):
-            logger.warning(f"PPO: Insufficient data (len={len(close) if close is not None else 0})")
-            default_len = len(close) if close is not None else 1
-            return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
-        
-        alpha_fast = 2.0 / (fast + 1)
-        fast_ma = _ema_loop(close, alpha_fast)
-        
-        alpha_slow = 2.0 / (slow + 1)
-        slow_ma = _ema_loop(close, alpha_slow)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            ppo = ((fast_ma - slow_ma) / slow_ma) * 100.0
-        
-        ppo = np.nan_to_num(ppo, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        alpha_signal = 2.0 / (signal + 1)
-        ppo_sig = _ema_loop(ppo, alpha_signal)
-        
-        ppo = sanitize_indicator_array(ppo, "PPO", default=0.0)
-        ppo_sig = sanitize_indicator_array(ppo_sig, "PPO_Signal", default=0.0)
-        
-        return ppo, ppo_sig
-        
-    except Exception as e:
-        logger.error(f"PPO calculation failed: {e}")
-        default_len = len(close) if close is not None else 1
-        return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
+# -----------------------------------------------------------------------------
+# FUSED HEAVY-LIFTING NUMBA FUNCTIONS
+# -----------------------------------------------------------------------------
 
-def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
-    try:
-        if close is None or len(close) < rsi_len:
-            logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
-            return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
-        
-        delta = np.zeros_like(close)
-        delta[1:] = close[1:] - close[:-1]
-        
-        gain = np.where(delta > 0, delta, 0.0)
-        loss = np.where(delta < 0, -delta, 0.0)
-        
-        alpha = 1.0 / rsi_len
-        avg_gain = _ema_loop(gain, alpha)
-        avg_loss = _ema_loop(loss, alpha)
-        
-        avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
-        rs = avg_gain / avg_loss
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-        
-        smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
-        
-        smooth_rsi = sanitize_indicator_array(smooth_rsi, "Smooth_RSI", default=50.0)
-        
-        return smooth_rsi
-        
-    except Exception as e:
-        logger.error(f"Smooth RSI calculation failed: {e}")
-        return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
-
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
-                         volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
-    try:
-        if any(x is None or len(x) == 0 for x in [high, low, close, volume, timestamps]):
-            logger.warning("VWAP: Missing or empty input arrays")
-            return np.zeros_like(close) if close is not None else np.array([0.0])
-        
-        vwap = _vwap_daily_loop(high, low, close, volume, timestamps)
-        vwap = sanitize_indicator_array(vwap, "VWAP", default=close[-1] if len(close) > 0 else 0.0)
-        return vwap
-        
-    except Exception as e:
-        logger.error(f"VWAP calculation failed: {e}")
-        return np.zeros_like(close) if close is not None else np.array([0.0])
-
-def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
-    try:
-        if data is None or len(data) < period:
-            logger.warning(f"RMA: Insufficient data (len={len(data) if data is not None else 0})")
-            return np.zeros_like(data) if data is not None else np.array([0.0])
-        
-        alpha = 1.0 / period
-        rma = _ema_loop(data, alpha)
-        rma = sanitize_indicator_array(rma, f"RMA_{period}", default=0.0)
-        return rma
-        
-    except Exception as e:
-        logger.error(f"RMA calculation failed: {e}")
-        return np.zeros_like(data) if data is not None else np.array([0.0])
-
-def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    try:
-        if close is None or len(close) < max(cfg.X1, cfg.X3):
-            logger.warning(f"Cirrus Cloud: Insufficient data (len={len(close) if close is not None else 0})")
-            default_len = len(close) if close is not None else 1
-            return (np.zeros(default_len, dtype=bool), 
-                    np.zeros(default_len, dtype=bool),
-                    np.zeros(default_len, dtype=np.float64),
-                    np.zeros(default_len, dtype=np.float64))
-        
-        diff = np.zeros_like(close)
-        diff[1:] = np.abs(close[1:] - close[:-1])
-        
-        alpha_t = 2.0 / (cfg.X1 + 1)
-        avrng = _ema_loop(diff, alpha_t)
-        
-        wper = cfg.X1 * 2 - 1
-        alpha_w = 2.0 / (wper + 1)
-        smooth_rng_x1 = _ema_loop(avrng, alpha_w) * cfg.X2
-        
-        filt_x1 = _rng_filter_loop(close, smooth_rng_x1)
-        
-        alpha_t2 = 2.0 / (cfg.X3 + 1)
-        avrng2 = _ema_loop(diff, alpha_t2)
-        
-        wper2 = cfg.X3 * 2 - 1
-        alpha_w2 = 2.0 / (wper2 + 1)
-        smooth_rng_x2 = _ema_loop(avrng2, alpha_w2) * cfg.X4
-        
-        filt_x12 = _rng_filter_loop(close, smooth_rng_x2)
-        
-        upw = filt_x1 < filt_x12
-        dnw = filt_x1 > filt_x12
-        
-        return upw, dnw, filt_x1, filt_x12
-        
-    except Exception as e:
-        logger.error(f"Cirrus Cloud calculation failed: {e}")
-        default_len = len(close) if close is not None else 1
-        return (np.zeros(default_len, dtype=bool), 
-                np.zeros(default_len, dtype=bool),
-                np.zeros(default_len, dtype=np.float64),
-                np.zeros(default_len, dtype=np.float64))
-
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    try:
-        if close is None or len(close) < period:
-            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
-        
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        
-        sd = _rolling_std_numba(close.astype(np.float32), 50, resp_clamped)
-        
-        worm_arr = _calc_mmh_worm_loop(close.astype(np.float32), sd, rows)
-        
-        ma = _rolling_mean_numba(close.astype(np.float32), period)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            raw = (worm_arr - ma) / worm_arr
-        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        min_med, max_med = _rolling_min_max_numba(raw, period)
-        
-        denom = max_med - min_med
-        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
-        temp = (raw - min_med) / denom
-        temp = np.clip(temp, 0.0, 1.0)
-        temp = np.nan_to_num(temp, nan=0.5)
-        
-        value_arr = _calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
-        
-        momentum = 0.25 * np.log(temp2)
-        momentum = np.nan_to_num(momentum, nan=0.0)
-        
-        momentum_arr = momentum.copy()
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
-        
-        momentum_arr = sanitize_indicator_array(momentum_arr.astype(np.float32), "MMH_Hist", default=0.0)
-        
-        return momentum_arr
-        
-    except Exception as e:
-        logger.error(f"MMH calculation failed: {e}")
-        return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
-
-def warmup_numba() -> None:
-        logger.info("Warming up Numba JIT compiler (parallel)...")        
-        try:
-            length = 100
-            close = np.random.random(length).astype(np.float64) * 1000
-            high = close + np.random.random(length).astype(np.float64) * 10
-            low = close - np.random.random(length).astype(np.float64) * 10
-            volume = np.random.random(length).astype(np.float64) * 1000
-            timestamps = np.arange(length, dtype=np.int64) * 900
-            sd = np.random.random(length).astype(np.float64) * 0.01
-            temp = np.random.random(length).astype(np.float64)
-            
-            critical_funcs = [
-                lambda: _ema_loop(close, 0.1),
-                lambda: _sma_loop(close, 20),
-                lambda: _kalman_loop(close, 21, 0.01, 0.1),
-                lambda: _vwap_daily_loop(high, low, close, volume, timestamps),
-                lambda: _rng_filter_loop(close, sd),
-                lambda: _calc_mmh_worm_loop(close, sd, length),
-                lambda: _calc_mmh_value_loop(temp, length),
-                lambda: _rolling_std_numba(close, 50, 0.9),
-                lambda: _fast_array_copy(close, sd, length),
-            ]
-            
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [executor.submit(func) for func in critical_funcs]
-                concurrent.futures.wait(futures, timeout=10.0)
-            
-            logger.info("Numba warm-up complete (parallel compilation)")
-            
-        except Exception as e:
-            logger.warning(f"Numba warm-up failed (non-fatal): {e}")
-
-async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-_BUFFER_SIZE = 500
-_BUFFER_LOCK = asyncio.Lock()
-
-GLOBAL_CLOSE_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_HIGH_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_LOW_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_VOLUME_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_TIMESTAMP_BUF = np.empty(_BUFFER_SIZE, dtype=np.int64)
-GLOBAL_TEMP_BUF_1 = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_TEMP_BUF_2 = np.empty(_BUFFER_SIZE, dtype=np.float64)
-
-@njit(fastmath=True, cache=False, nogil=True)
-def _fast_array_copy(src: np.ndarray, dst: np.ndarray, n: int) -> None:
-    for i in range(n):
-        dst[i] = src[i]
-
-def get_scratch_buffers(size: int) -> Dict[str, np.ndarray]:
-    if size > _BUFFER_SIZE:
-        logger.debug(f"Buffer size {size} exceeds {_BUFFER_SIZE}, allocating new arrays")
-        return {
-            'close': np.empty(size, dtype=np.float64),
-            'high': np.empty(size, dtype=np.float64),
-            'low': np.empty(size, dtype=np.float64),
-            'volume': np.empty(size, dtype=np.float64),
-            'timestamp': np.empty(size, dtype=np.int64),
-            'temp1': np.empty(size, dtype=np.float64),
-            'temp2': np.empty(size, dtype=np.float64),
-        }
+@njit(fastmath=True, cache=True, nogil=True)
+def _calculate_ppo_full_numba(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+    if len(close) < max(fast, slow):
+        return np.zeros(len(close), dtype=np.float64), np.zeros(len(close), dtype=np.float64)
     
-    return {
-        'close': GLOBAL_CLOSE_BUF[:size],
-        'high': GLOBAL_HIGH_BUF[:size],
-        'low': GLOBAL_LOW_BUF[:size],
-        'volume': GLOBAL_VOLUME_BUF[:size],
-        'timestamp': GLOBAL_TIMESTAMP_BUF[:size],
-        'temp1': GLOBAL_TEMP_BUF_1[:size],
-        'temp2': GLOBAL_TEMP_BUF_2[:size],
-    }
+    alpha_fast = 2.0 / (fast + 1)
+    fast_ma = _ema_loop(close, alpha_fast)
+    
+    alpha_slow = 2.0 / (slow + 1)
+    slow_ma = _ema_loop(close, alpha_slow)
+    
+    ppo = np.empty_like(close)
+    for i in range(len(close)):
+        s = slow_ma[i]
+        if s == 0.0 or np.isnan(s):
+            ppo[i] = 0.0
+        else:
+            ppo[i] = ((fast_ma[i] - s) / s) * 100.0
+            
+    # Sanitize
+    for i in range(len(ppo)):
+        if np.isnan(ppo[i]) or np.isinf(ppo[i]):
+            ppo[i] = 0.0
+            
+    alpha_signal = 2.0 / (signal + 1)
+    ppo_sig = _ema_loop(ppo, alpha_signal)
+    
+    # Sanitize signal
+    for i in range(len(ppo_sig)):
+        if np.isnan(ppo_sig[i]) or np.isinf(ppo_sig[i]):
+            ppo_sig[i] = 0.0
+            
+    return ppo, ppo_sig
 
-def copy_to_scratch(data: Dict[str, np.ndarray], buffers: Dict[str, np.ndarray]) -> None:
-    n = len(data['close'])
-    if 'close' in buffers:
-        _fast_array_copy(data['close'], buffers['close'], n)
-    if 'high' in buffers and 'high' in data:
-        _fast_array_copy(data['high'], buffers['high'], n)
-    if 'low' in buffers and 'low' in data:
-        _fast_array_copy(data['low'], buffers['low'], n)
-    if 'volume' in buffers and 'volume' in data:
-        _fast_array_copy(data['volume'], buffers['volume'], n)
-    if 'timestamp' in buffers and 'timestamp' in data:
-        # Special handling for int64
-        for i in range(n):
-            buffers['timestamp'][i] = data['timestamp'][i]
+@njit(fastmath=True, cache=True, nogil=True)
+def _calculate_smooth_rsi_full_numba(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
+    n = len(close)
+    if n < rsi_len:
+        return np.full(n, 50.0, dtype=np.float64)
+    
+    gain = np.zeros(n, dtype=np.float64)
+    loss = np.zeros(n, dtype=np.float64)
+    
+    for i in range(1, n):
+        delta = close[i] - close[i-1]
+        if delta > 0:
+            gain[i] = delta
+        else:
+            loss[i] = -delta
+            
+    alpha = 1.0 / rsi_len
+    avg_gain = _ema_loop(gain, alpha)
+    avg_loss = _ema_loop(loss, alpha)
+    
+    rsi = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        l = avg_loss[i]
+        if l == 0:
+            l = 1e-10
+        rs = avg_gain[i] / l
+        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+        
+    smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
+    
+    # Sanitize
+    for i in range(n):
+        if np.isnan(smooth_rsi[i]) or np.isinf(smooth_rsi[i]):
+            smooth_rsi[i] = 50.0
+            
+    return smooth_rsi
+
+@njit(fastmath=True, cache=True, nogil=True)
+def _calculate_mmh_full_numba(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
+    n = len(close)
+    if n < period:
+        return np.zeros(n, dtype=np.float64)
+        
+    # All arithmetic happens in compiled code
+    sd = _rolling_std_numba(close, 50, responsiveness)
+    worm_arr = _calc_mmh_worm_loop(close, sd, n)
+    ma = _rolling_mean_numba(close, period)
+    
+    raw = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        w = worm_arr[i]
+        if w == 0.0 or np.isnan(w):
+            raw[i] = 0.0
+        else:
+            raw[i] = (w - ma[i]) / w
+        if np.isnan(raw[i]) or np.isinf(raw[i]):
+            raw[i] = 0.0
+            
+    min_med, max_med = _rolling_min_max_numba(raw, period)
+    
+    temp = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        denom = max_med[i] - min_med[i]
+        if denom == 0:
+            denom = 1e-12
+        t = (raw[i] - min_med[i]) / denom
+        if t < 0.0: t = 0.0
+        if t > 1.0: t = 1.0
+        if np.isnan(t): t = 0.5
+        temp[i] = t
+        
+    value_arr = _calc_mmh_value_loop(temp, n)
+    
+    momentum = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        v = value_arr[i]
+        
+        # NOTE: Since v is already tightly clipped in _calc_mmh_value_loop, 
+        # the argument to log will be strictly positive and finite.
+        
+        val = (1.0 + v) / (1.0 - v)
+        # val will be positive, but a small guard remains for extreme underflow
+        if val <= 0: val = 1e-10 
+        
+        momentum[i] = 0.25 * np.log(val)
+        
+        if np.isnan(momentum[i]) or np.isinf(momentum[i]):
+            momentum[i] = 0.0
+            
+    final_mmh = _calc_mmh_momentum_loop(momentum, n)
+    
+    for i in range(n):
+        if np.isnan(final_mmh[i]) or np.isinf(final_mmh[i]):
+            final_mmh[i] = 0.0
+            
+    return final_mmh
+
+
+@njit(fastmath=True, cache=True, nogil=True)
+def _calculate_cirrus_full_numba(close: np.ndarray, x1: int, x2: int, x3: int, x4: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(close)
+    if n < max(x1, x3):
+        return np.zeros(n, dtype=np.bool_), np.zeros(n, dtype=np.bool_)
+        
+    diff = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        diff[i] = np.abs(close[i] - close[i-1])
+        
+    # X1 Logic
+    alpha_t = 2.0 / (x1 + 1)
+    avrng = _ema_loop(diff, alpha_t)
+    
+    wper = x1 * 2 - 1
+    alpha_w = 2.0 / (wper + 1)
+    smooth_rng_x1 = _ema_loop(avrng, alpha_w)
+    for i in range(n):
+        smooth_rng_x1[i] *= x2
+        
+    filt_x1 = _rng_filter_loop(close, smooth_rng_x1)
+    
+    # X3 Logic
+    alpha_t2 = 2.0 / (x3 + 1)
+    avrng2 = _ema_loop(diff, alpha_t2)
+    
+    wper2 = x3 * 2 - 1
+    alpha_w2 = 2.0 / (wper2 + 1)
+    smooth_rng_x2 = _ema_loop(avrng2, alpha_w2)
+    for i in range(n):
+        smooth_rng_x2[i] *= x4
+        
+    filt_x12 = _rng_filter_loop(close, smooth_rng_x2)
+    
+    upw = np.zeros(n, dtype=np.bool_)
+    dnw = np.zeros(n, dtype=np.bool_)
+    
+    for i in range(n):
+        upw[i] = filt_x1[i] < filt_x12[i]
+        dnw[i] = filt_x1[i] > filt_x12[i]
+        
+    return upw, dnw
+
+@njit(fastmath=True, cache=True, nogil=True)
+def _calculate_rma_numba(data: np.ndarray, period: int) -> np.ndarray:
+    alpha = 1.0 / period
+    rma = _ema_loop(data, alpha)
+    # Sanitize
+    for i in range(len(rma)):
+        if np.isnan(rma[i]) or np.isinf(rma[i]):
+            rma[i] = 0.0
+    return rma
+
+# -----------------------------------------------------------------------------
+# HIGH-LEVEL PYTHON WRAPPERS
+# -----------------------------------------------------------------------------
 
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
@@ -979,44 +868,49 @@ def calculate_pivot_levels_numpy(
     
     try:
         if len(timestamps) < 2:
-            logger.warning("Pivot calc: insufficient data")
             return piv
         
-        days = timestamps // 86400
-        now_utc = datetime.now(timezone.utc)
-        yesterday = (now_utc - timedelta(days=1)).date()
-        yesterday_ts = datetime(
-            yesterday.year, 
-            yesterday.month, 
-            yesterday.day, 
-            tzinfo=timezone.utc
-        ).timestamp()
-        yesterday_day_number = int(yesterday_ts) // 86400        
-        yesterday_mask = days == yesterday_day_number
+        # 1. Convert all timestamps to day numbers (handles ms/s safety)
+        ts_normalized = np.where(timestamps > 10_000_000_000, timestamps // 1000, timestamps)
+        days = ts_normalized // 86400
+        unique_days = np.unique(days)
         
-        if not np.any(yesterday_mask):
-            logger.warning(
-                f"No data for yesterday (day #{yesterday_day_number}). "
-                f"Available days: {np.unique(days)}"
-            )
-            return piv
-        yesterday_high = high[yesterday_mask]
-        yesterday_low = low[yesterday_mask]
-        yesterday_close = close[yesterday_mask]
-        
-        num_candles = len(yesterday_high)
-        if num_candles == 0:
-            logger.warning("No candles found for yesterday")
+        if len(unique_days) < 2:
             return piv
         
+        # 3. Select the "Last Completed Day"
+        # The last element (unique_days[-1]) is the current, incomplete day.
+        current_day = unique_days[-1]
+        
+        # Robust Selection: Find the maximum day number that is NOT the current day.
+        # This handles cases where intermediate days might be missing (gaps).
+        completed_days = unique_days[unique_days < current_day]
+        
+        if len(completed_days) == 0:
+            # This should not happen if len(unique_days) >= 2, but is a safe guard
+            return piv 
+            
+        target_day = completed_days[-1] # This is the last completed day, regardless of gaps
+        
+        # 4. Create a mask for that specific completed day
+        day_mask = days == target_day
+        
+        yesterday_high = high[day_mask]
+        yesterday_low = low[day_mask]
+        yesterday_close = close[day_mask]
+        
+        if len(yesterday_high) == 0:
+            return piv
+        
+        # 5. Calculate Standard Pivot Points
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
-        C_prev = float(yesterday_close[-1])  # Last close of the day
+        C_prev = float(yesterday_close[-1])  # The close of the last candle of that day
         
         rng_prev = H_prev - L_prev
         
+        # Guard against zero division/invalid range
         if rng_prev < 1e-8:
-            logger.warning(f"Invalid pivot range: {rng_prev}")
             return piv
         
         P = (H_prev + L_prev + C_prev) / 3.0
@@ -1032,7 +926,7 @@ def calculate_pivot_levels_numpy(
         }
                 
     except Exception as e:
-        logger.error(f"Pivot calculation failed: {e}", exc_info=True)
+        logger.error(f"Pivot calculation failed: {e}")
     
     return piv
 
@@ -1040,43 +934,60 @@ def calculate_all_indicators_numpy(
     data_15m: Dict[str, np.ndarray],
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
-) -> Dict[str, np.ndarray]:
-    results = {}    
-    close_15m = data_15m["close"]
-    close_5m = data_5m["close"]
+) -> Dict[str, Any]:
+    """
+    Optimized wrapper calling only fused Numba functions (No Numpy overhead).
+    All array sanitization is handled within the Numba functions.
+    """
+    results: Dict[str, Any] = {}    
     
-    ppo, ppo_signal = calculate_ppo_numpy(
+    # Extract arrays once (copy-free views in numpy)
+    close_15m = data_15m["close"]
+    
+    # --- 15M Indicators (Heavy Lifting in Numba) ---
+    
+    # 1. PPO (Sanitized internally)
+    ppo, ppo_signal = _calculate_ppo_full_numba(
         close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
     )
     results['ppo'] = ppo
     results['ppo_signal'] = ppo_signal
     
-    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
+    # 2. Smooth RSI (Sanitized internally)
+    results['smooth_rsi'] = _calculate_smooth_rsi_full_numba(
         close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
     )
     
+    # 3. VWAP (Sanitized internally - no external call needed)
     if cfg.ENABLE_VWAP:
-        results['vwap'] = calculate_vwap_numpy(
+        results['vwap'] = _vwap_daily_loop(
             data_15m["high"], data_15m["low"], data_15m["close"],
             data_15m["volume"], data_15m["timestamp"]
         )
     else:
         results['vwap'] = np.zeros_like(close_15m)
     
-    mmh = calculate_magical_momentum_hist(close_15m)
-    results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
+    # 4. MMH (Sanitized internally)
+    results['mmh'] = _calculate_mmh_full_numba(close_15m)
     
+    # 5. Cirrus Cloud (Boolean output, sanitization not applicable)
     if cfg.CIRRUS_CLOUD_ENABLED:
-        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
+        upw, dnw = _calculate_cirrus_full_numba(
+            close_15m, cfg.X1, cfg.X2, cfg.X3, cfg.X4
+        )
         results['upw'] = upw
         results['dnw'] = dnw
     else:
         results['upw'] = np.zeros(len(close_15m), dtype=bool)
         results['dnw'] = np.zeros(len(close_15m), dtype=bool)
     
-    results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
-    results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
+    # 6. RMA (Sanitized internally - no external call needed)
+    results['rma50_15'] = _calculate_rma_numba(close_15m, cfg.RMA_50_PERIOD)
     
+    close_5m = data_5m["close"]
+    results['rma200_5'] = _calculate_rma_numba(close_5m, cfg.RMA_200_PERIOD)
+    
+    # 7. Pivots (Python/Numpy logic, returns a dict)
     if cfg.ENABLE_PIVOT and data_daily is not None:
         results['pivots'] = calculate_pivot_levels_numpy(
             data_daily["high"], data_daily["low"],
@@ -1086,6 +997,61 @@ def calculate_all_indicators_numpy(
         results['pivots'] = {}
     
     return results
+
+class DummyConfig:
+    PPO_FAST = 12
+    PPO_SLOW = 26
+    PPO_SIGNAL = 9
+    SRSI_RSI_LEN = 14
+    SRSI_KALMAN_LEN = 21
+    X1 = 5
+    X2 = 1.0
+    X3 = 13
+    X4 = 2.0
+
+WARMUP_CFG = DummyConfig()
+
+def warmup_numba() -> None:
+    logger.info("Warming up Numba JIT compiler...")         
+    try:
+        # Configuration and data generation remain the same
+        length = 100
+        close = np.random.random(length).astype(np.float64) * 1000
+        high = close + np.random.random(length).astype(np.float64) * 10
+        low = close - np.random.random(length).astype(np.float64) * 10
+        volume = np.random.random(length).astype(np.float64) * 1000
+        timestamps = np.arange(length, dtype=np.int64) * 900
+        sd = np.random.random(length).astype(np.float64) * 0.01
+        temp = np.random.random(length).astype(np.float64)
+            
+        critical_funcs = [
+            # List of all Numba function calls
+            lambda: _ema_loop(close, 0.1),
+            lambda: _sma_loop(close, 20),
+            lambda: _kalman_loop(close, 21, 0.01, 0.1),
+            lambda: _vwap_daily_loop(high, low, close, volume, timestamps),
+            lambda: _rng_filter_loop(close, sd),
+            lambda: _calc_mmh_worm_loop(close, sd, length),
+            lambda: _calc_mmh_value_loop(temp, length),
+            lambda: _rolling_std_numba(close, 50, 0.9),
+            lambda: _rolling_mean_numba(close, 20),
+            lambda: _calculate_ppo_full_numba(close, WARMUP_CFG.PPO_FAST, WARMUP_CFG.PPO_SLOW, WARMUP_CFG.PPO_SIGNAL),
+            lambda: _calculate_smooth_rsi_full_numba(close, WARMUP_CFG.SRSI_RSI_LEN, WARMUP_CFG.SRSI_KALMAN_LEN),
+            lambda: _calculate_mmh_full_numba(close),
+            lambda: _calculate_cirrus_full_numba(close, WARMUP_CFG.X1, WARMUP_CFG.X2, WARMUP_CFG.X3, WARMUP_CFG.X4),
+        ]
+        
+        # Simple synchronous execution (The Python thread pool is not strictly necessary for JIT release)
+        _ = [func() for func in critical_funcs]
+            
+        logger.info("Numba warm-up complete (synchronous compilation)")
+            
+    except Exception as e:
+        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
+
+async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
+    # This remains the same as it correctly uses the asyncio.to_thread wrapper
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
