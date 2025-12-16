@@ -72,6 +72,12 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
+    MMH_VALUE_CLIP = 0.9999999
+    ZERO_DIVISION_GUARD = 1e-12
+    INFINITY_CLAMP = 1e8
+    TELEGRAM_MAX_MESSAGE_LENGTH = 3800
+    TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
+    MAX_PIVOT_DISTANCE_PCT = 50.0
 
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
@@ -305,6 +311,13 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
 _VALIDATION_DONE = False
 
 def validate_runtime_config() -> None:
+    """
+    Validate runtime configuration that Pydantic can't check.
+    
+    Note: Business logic validation (PPO_FAST < PPO_SLOW, timeout constraints)
+    is handled by Pydantic's model_validator. This function only checks
+    external dependencies and format issues.
+    """
     global _VALIDATION_DONE
     if _VALIDATION_DONE:
         logger.debug("Configuration validation skipped (cached)")
@@ -313,6 +326,8 @@ def validate_runtime_config() -> None:
     errors = []
     warnings = []
     
+    # ✅ ONLY validate external/runtime constraints
+    # Check Redis URL format
     try:
         from urllib.parse import urlparse
         parsed = urlparse(cfg.REDIS_URL)
@@ -323,29 +338,24 @@ def validate_runtime_config() -> None:
     except Exception as e:
         errors.append(f"Failed to parse REDIS_URL: {e}")
     
+    # Check Telegram token format
     if not CompiledPatterns.SECRET_TOKEN.match(cfg.TELEGRAM_BOT_TOKEN):
         errors.append("TELEGRAM_BOT_TOKEN format invalid (should be: 123456:ABC-DEF...)")
     
+    # Check API base URL
     if not cfg.DELTA_API_BASE.startswith(('http://', 'https://')):
         errors.append("DELTA_API_BASE must start with http:// or https://")
     
+    # Check pairs configuration
+    if not cfg.PAIRS or len(cfg.PAIRS) == 0:
+        errors.append("PAIRS list is empty - no trading pairs configured")
+    
+    # Performance warnings (not errors)
     if cfg.MAX_PARALLEL_FETCH < 1 or cfg.MAX_PARALLEL_FETCH > 16:
         warnings.append(f"MAX_PARALLEL_FETCH={cfg.MAX_PARALLEL_FETCH} is outside recommended range (1-16)")
     
     if cfg.HTTP_TIMEOUT < 5 or cfg.HTTP_TIMEOUT > 60:
         warnings.append(f"HTTP_TIMEOUT={cfg.HTTP_TIMEOUT}s is outside recommended range (5-60s)")
-    
-    if cfg.RUN_TIMEOUT_SECONDS < 300:
-        errors.append(f"RUN_TIMEOUT_SECONDS={cfg.RUN_TIMEOUT_SECONDS}s is too low (minimum: 300s)")
-    
-    if cfg.RUN_TIMEOUT_SECONDS >= Constants.REDIS_LOCK_EXPIRY:
-        errors.append(
-            f"RUN_TIMEOUT_SECONDS ({cfg.RUN_TIMEOUT_SECONDS}s) must be less than "
-            f"REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s)"
-        )
-    
-    if not cfg.PAIRS or len(cfg.PAIRS) == 0:
-        errors.append("PAIRS list is empty - no trading pairs configured")
     
     if len(cfg.PAIRS) > 20:
         warnings.append(f"Large number of pairs ({len(cfg.PAIRS)}) may exceed timeout limits")
@@ -353,15 +363,14 @@ def validate_runtime_config() -> None:
     if cfg.MEMORY_LIMIT_BYTES < 200_000_000:  # 200MB minimum
         warnings.append(f"MEMORY_LIMIT_BYTES={cfg.MEMORY_LIMIT_BYTES} is very low (minimum recommended: 200MB)")
     
-    if cfg.PPO_FAST >= cfg.PPO_SLOW:
-        errors.append(f"PPO_FAST ({cfg.PPO_FAST}) must be less than PPO_SLOW ({cfg.PPO_SLOW})")
-    
+    # Report errors
     if errors:
         logger.critical("Configuration validation FAILED:")
         for error in errors:
             logger.critical(f"  ERROR: {error}")
         raise ValueError(f"Configuration validation failed with {len(errors)} error(s)")
     
+    # Report warnings
     if warnings:
         logger.warning("Configuration warnings:")
         for warning in warnings:
@@ -875,13 +884,13 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         min_med, max_med = _rolling_min_max_numba(raw, period)
         
         denom = max_med - min_med
-        denom = np.where(denom == 0, 1e-12, denom)
+        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
         value_arr = _calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -0.9999999, 0.9999999)
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
@@ -1176,20 +1185,21 @@ class SessionManager:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
-            
+
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-            
+
             cls._ssl_context = ctx
             logger.debug("SSL context created with TLSv1.2+ minimum")
-        
+
         return cls._ssl_context
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
+        """Get or create the shared HTTP session."""
         async with cls._lock:
             should_recreate = False
-            
+
             if cls._session is None or cls._session.closed:
                 should_recreate = True
                 reason = "no session" if cls._session is None else "session closed"
@@ -1197,7 +1207,7 @@ class SessionManager:
                 should_recreate = True
                 reason = f"request limit reached ({cls._request_count})"
                 logger.info(f"Session recreation triggered: {reason}")
-            
+
             if should_recreate:
                 if cls._session and not cls._session.closed:
                     try:
@@ -1205,7 +1215,7 @@ class SessionManager:
                         await asyncio.sleep(0.25)  # Allow cleanup
                     except Exception as e:
                         logger.warning(f"Error closing old session: {e}")
-                
+
                 connector = TCPConnector(
                     limit=cfg.TCP_CONN_LIMIT,
                     limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
@@ -1216,13 +1226,13 @@ class SessionManager:
                     keepalive_timeout=60,  # Increased from 30s for better reuse
                     family=0,  # Allow both IPv4 and IPv6
                 )
-                
+
                 timeout = aiohttp.ClientTimeout(
                     total=cfg.HTTP_TIMEOUT,
                     connect=10,  # Connection timeout
                     sock_read=cfg.HTTP_TIMEOUT,  # Socket read timeout
                 )
-                
+
                 cls._session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
@@ -1233,21 +1243,25 @@ class SessionManager:
                     },
                     raise_for_status=False,
                 )
-                
+
                 cls._creation_time = time.time()
                 cls._request_count = 0
-                
+
                 logger.info(
                     f"HTTP session created | "
                     f"Pool: {cfg.TCP_CONN_LIMIT} total, {cfg.TCP_CONN_LIMIT_PER_HOST} per host | "
                     f"Timeout: {cfg.HTTP_TIMEOUT}s | "
                     f"DNS cache: 3600s | "
-                    f"Keepalive: 30s"
+                    f"Keepalive: 60s"
                 )
-            
-            cls._request_count += 1
-            
+
+            # ✅ FIXED: No increment here
             return cls._session
+
+    @classmethod
+    def track_request(cls) -> None:
+        """Track an actual HTTP request. Call this after successful request."""
+        cls._request_count += 1
 
     @classmethod
     async def close_session(cls) -> None:
@@ -1255,19 +1269,17 @@ class SessionManager:
             if cls._session and not cls._session.closed:
                 try:
                     session_age = time.time() - cls._creation_time
-                    
+
                     logger.debug(
                         f"Closing HTTP session | "
-                        f"Age: {session_age:.1f}s | "
-                        f"Requests served: {cls._request_count}"
+                        f"Age: {session_age:.1f}s | Requests served: {cls._request_count}"
                     )
-                    
+
                     await cls._session.close()
-                    
                     await asyncio.sleep(0.25)
-                    
+
                     logger.info("HTTP session closed successfully")
-                    
+
                 except Exception as e:
                     logger.warning(f"Error closing session: {e}")
                 finally:
@@ -1276,7 +1288,7 @@ class SessionManager:
                     cls._creation_time = 0.0
             else:
                 logger.debug("Session already closed or not created")
-    
+
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
         if cls._session is None:
@@ -1285,9 +1297,9 @@ class SessionManager:
                 "request_count": 0,
                 "age_seconds": 0.0,
             }
-        
+
         age = time.time() - cls._creation_time if cls._creation_time > 0 else 0.0
-        
+
         return {
             "active": not cls._session.closed,
             "request_count": cls._request_count,
@@ -1295,12 +1307,16 @@ class SessionManager:
             "requests_until_recreation": cls._session_reuse_limit - cls._request_count,
         }
 
+
+# --- Retry helpers ---
+
 class RetryCategory:
     NETWORK = "network"
     RATE_LIMIT = "rate_limit"
     API_ERROR = "api_error"
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
+
 
 def categorize_exception(exc: Exception) -> str:
     if isinstance(exc, asyncio.TimeoutError):
@@ -1315,6 +1331,7 @@ def categorize_exception(exc: Exception) -> str:
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
 
+
 async def retry_async(
     fn: Callable,
     *args,
@@ -1327,11 +1344,11 @@ async def retry_async(
     **kwargs
 ):
     last_exc: Optional[Exception] = None
-    
+
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
             raise asyncio.CancelledError()
-        
+
         try:
             return await fn(*args, **kwargs)
         except asyncio.CancelledError:
@@ -1339,27 +1356,27 @@ async def retry_async(
         except Exception as e:
             last_exc = e
             category = categorize_exception(e)
-            
+
             if on_error:
                 try:
                     on_error(e, attempt, category)
                 except Exception:
                     pass
-            
+
             if attempt >= retries:
                 break
-            
+
             base_delay = min(cap, base_backoff * (2 ** (attempt - 1)))
             jitter = base_delay * random.uniform(jitter_min, jitter_max)
             sleep_time = base_delay + jitter
-            
+
             logger.debug(
                 f"Retry attempt {attempt}/{retries} after {sleep_time:.2f}s | "
                 f"Category: {category} | Error: {str(e)[:100]}"
             )
-            
+
             await asyncio.sleep(sleep_time)
-    
+
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
 # ============================================================================
@@ -1373,6 +1390,26 @@ async def async_fetch_json(
     backoff: float = 1.5,
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
+    """
+    Fetch JSON data with comprehensive retry logic and error handling.
+    
+    Features:
+    - Rate limiting detection (429 responses)
+    - Exponential backoff with jitter
+    - Server error retry (5xx)
+    - Timeout handling
+    - Request tracking for session management
+    
+    Args:
+        url: URL to fetch
+        params: Query parameters (optional)
+        retries: Maximum number of retry attempts
+        backoff: Base backoff multiplier for exponential retry
+        timeout: Request timeout in seconds
+        
+    Returns:
+        Parsed JSON dict on success, None on failure
+    """
     session = await SessionManager.get_session()
     last_error = None
     retry_stats = {
@@ -1390,6 +1427,7 @@ async def async_fetch_json(
         
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
+                # Handle rate limiting (429 Too Many Requests)
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
@@ -1406,6 +1444,7 @@ async def async_fetch_json(
                     await asyncio.sleep(total_wait)
                     continue
                 
+                # Handle server errors (5xx) - retryable
                 if resp.status >= 500:
                     retry_stats[RetryCategory.API_ERROR] += 1
                     logger.warning(
@@ -1425,6 +1464,7 @@ async def async_fetch_json(
                         await asyncio.sleep(total_delay)
                     continue
                 
+                # Handle client errors (4xx) - not retryable
                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
@@ -1432,8 +1472,13 @@ async def async_fetch_json(
                     )
                     return None
                 
+                # Success (2xx)
                 data = await resp.json(loads=json_loads)
                 
+                # ✅ FIXED: Track successful request for session management
+                SessionManager.track_request()
+                
+                # Log retry statistics if any retries occurred
                 if any(retry_stats.values()):
                     logger.info(
                         f"Fetch succeeded after retries | URL: {url[:80]} | "
@@ -1489,6 +1534,7 @@ async def async_fetch_json(
             logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
     
+    # All retries exhausted
     logger.error(
         f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
         f"Stats: {retry_stats} | Last error: {last_error}"
@@ -1599,25 +1645,17 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """
-        Adaptive candle fetching that handles Delta Exchange's publication delays.
-        """
+        
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        # Handle 'D' resolution specifically for daily candles
+        # ✅ FIXED: Use helper function instead of duplicating logic
         minutes = int(resolution) if resolution != "D" else 1440
+        
+        # Calculate expected open time using helper function
+        expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
         interval_seconds = minutes * 60
-
-        # Calculate expected open time of the last closed candle
-        current_period = reference_time // interval_seconds
-        expected_open_ts = (current_period * interval_seconds) - interval_seconds
         expected_close_ts = expected_open_ts + interval_seconds
-
-        # If we're very close to the boundary, go back one period
-        if reference_time - expected_close_ts < 10:
-            expected_open_ts -= interval_seconds
-            expected_close_ts -= interval_seconds
 
         # Request extra candles to handle API delays
         buffer_periods = 2
@@ -1771,51 +1809,77 @@ class DataFetcher:
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
         reference_time: Optional[int] = None
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
+    if reference_time is None:
+        reference_time = get_trigger_timestamp()
 
-        all_tasks = []
-        task_metadata = []
+    all_tasks = []
+    task_metadata = []
 
-        for symbol, resolutions in pair_requests:
-            for resolution, limit in resolutions:
-                task = self.fetch_candles(symbol, resolution, limit, reference_time)
-                all_tasks.append(task)
-                task_metadata.append((symbol, resolution))
+    for symbol, resolutions in pair_requests:
+        for resolution, limit in resolutions:
+            task = self.fetch_candles(symbol, resolution, limit, reference_time)
+            all_tasks.append(task)
+            task_metadata.append((symbol, resolution))
 
-        total_requests = len(all_tasks)
-        logger.info(
-            f"🚀 Parallel fetch: {total_requests} candle requests "
-            f"for {len(pair_requests)} pairs | "
-            f"All firing simultaneously"
+    total_requests = len(all_tasks)
+    logger.info(
+        f"🚀 Parallel fetch: {total_requests} candle requests "
+        f"for {len(pair_requests)} pairs | All firing simultaneously"
+    )
+
+    results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    output = {}
+    success_count = 0
+
+    for (symbol, resolution), result in zip(task_metadata, results):
+        if symbol not in output:
+            output[symbol] = {}
+
+        if isinstance(result, Exception):
+            logger.error(f"Fetch failed for {symbol} {resolution}: {result}")
+            output[symbol][resolution] = None
+        else:
+            output[symbol][resolution] = result
+            if result is not None:
+                success_count += 1
+
+    success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
+    logger.info(
+        f"✅ Parallel fetch complete | Success: {success_count}/{total_requests} "
+        f"({success_rate:.1f}%)"
+    )
+
+    return output
+
+def validate_candle_timestamp(
+    candle_ts: int,
+    reference_time: int,
+    interval_minutes: int,
+    tolerance_seconds: int = 120
+) -> bool:
+    """Validate that a candle timestamp matches the expected open time."""
+    interval_seconds = interval_minutes * 60
+    current_window = reference_time // interval_seconds
+    expected_open_ts = (current_window * interval_seconds) - interval_seconds
+
+    diff = abs(candle_ts - expected_open_ts)
+    if diff > tolerance_seconds:
+        logger.error(
+            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
+            f"got {candle_ts} (diff: {diff}s)"
         )
+        return False
 
-        results = await asyncio.gather(*all_tasks, return_exceptions=True)
+    logger.debug(
+        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
+        f"Got: {candle_ts} | Diff: {diff}s"
+    )
+    return True
 
-        output = {}
-        success_count = 0
-
-        for (symbol, resolution), result in zip(task_metadata, results):
-            if symbol not in output:
-                output[symbol] = {}
-
-            if isinstance(result, Exception):
-                logger.error(f"Fetch failed for {symbol} {resolution}: {result}")
-                output[symbol][resolution] = None
-            else:
-                output[symbol][resolution] = result
-                if result is not None:
-                    success_count += 1
-
-        success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
-        logger.info(
-            f"✅ Parallel fetch complete | "
-            f"Success: {success_count}/{total_requests} ({success_rate:.1f}%)"
-        )
-
-        return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+    """Parse raw candle API result into NumPy arrays."""
     if not result or not isinstance(result, dict):
         return None
 
@@ -1828,16 +1892,16 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         n = len(res["t"])
         if n == 0:
             return None
-        
+
         data = {
             "timestamp": np.empty(n, dtype=np.int64),
-            "open": np.empty(n, dtype=np.float32),
-            "high": np.empty(n, dtype=np.float32),
-            "low": np.empty(n, dtype=np.float32),
-            "close": np.empty(n, dtype=np.float32),
-            "volume": np.empty(n, dtype=np.float32),
+            "open": np.empty(n, dtype=np.float64),
+            "high": np.empty(n, dtype=np.float64),
+            "low": np.empty(n, dtype=np.float64),
+            "close": np.empty(n, dtype=np.float64),
+            "volume": np.empty(n, dtype=np.float64),
         }
-        
+
         data["timestamp"][:] = res["t"]
         data["open"][:] = res["o"]
         data["high"][:] = res["h"]
@@ -1845,42 +1909,46 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         data["close"][:] = res["c"]
         data["volume"][:] = res["v"]
 
+        # Convert milliseconds to seconds if needed
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
 
+        # Validate last candle
         if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
             return None
 
         return data
-        
-    except Exception:
+
+    except Exception as e:
+        logger.error(f"Failed to parse candles: {e}")
         return None
 
+
 def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    """Validate NumPy candle data arrays"""
+    """Validate NumPy candle data arrays."""
     try:
         if data is None or not data:
             return False, "Data is None or empty"
-        
+
         close = data.get("close")
         timestamp = data.get("timestamp")
-        
+
         if close is None or len(close) == 0:
             return False, "Close array is empty"
-        
+
         if np.any(np.isnan(close)) or np.any(close <= 0):
             return False, "Invalid close prices (NaN or <= 0)"
-        
+
         if timestamp is None or len(timestamp) == 0:
             return False, "Timestamp array is empty"
-        
-        # ✅ Restore strict monotonic check (no duplicates allowed)
+
+        # Strict monotonic check
         if not np.all(timestamp[1:] >= timestamp[:-1]):
             return False, "Timestamps not monotonic increasing"
-        
+
         if len(close) < required_len:
             return False, f"Insufficient data: {len(close)} < {required_len}"
-        
+
         if len(close) >= 2:
             time_diffs = np.diff(timestamp)
             if len(time_diffs) > 0:
@@ -1889,18 +1957,20 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
                 gaps = time_diffs[time_diffs > max_expected_gap]
                 if len(gaps) > 0:
                     logger.warning(
-                        f"Detected {len(gaps)} candle gaps (median: {median_diff}s, max gap: {gaps.max()}s)"
+                        f"Detected {len(gaps)} candle gaps "
+                        f"(median: {median_diff}s, max gap: {gaps.max()}s)"
                     )
-        
+
         if len(close) >= 2:
             price_changes = np.abs(np.diff(close) / close[:-1]) * 100
             extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
             if len(extreme_changes) > 0:
                 logger.warning(
-                    f"Detected {len(extreme_changes)} extreme price changes (max: {extreme_changes.max():.2f}%)"
+                    f"Detected {len(extreme_changes)} extreme price changes "
+                    f"(max: {extreme_changes.max():.2f}%)"
                 )
                 return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
-        
+
         return True, None
     except Exception as e:
         logger.error(f"Data validation failed: {e}")
@@ -1923,12 +1993,8 @@ def get_last_closed_index_from_array(
         reference_time = get_trigger_timestamp()
 
     interval_seconds = interval_minutes * 60
-
-    # Start time of the CURRENT ongoing 15-minute period
     current_period_start = (reference_time // interval_seconds) * interval_seconds
 
-    # Only consider candles whose timestamp is strictly BEFORE the current period starts
-    # (i.e., fully closed candles from previous periods)
     valid_mask = timestamps < current_period_start
     valid_indices = np.nonzero(valid_mask)[0]
 
@@ -1941,46 +2007,11 @@ def get_last_closed_index_from_array(
         return None
 
     last_closed_idx = int(valid_indices[-1])
-
     logger.debug(
-        f"Selected fully closed candle | "
-        f"Index: {last_closed_idx} | "
+        f"Selected fully closed candle | Index: {last_closed_idx} | "
         f"TS: {format_ist_time(timestamps[last_closed_idx])}"
     )
-
     return last_closed_idx
-def validate_candle_timestamp(
-    candle_ts: int,
-    reference_time: int,
-    interval_minutes: int,
-    tolerance_seconds: int = 120
-) -> bool:
-    """
-    Validate that the latest candle timestamp from Delta Exchange matches
-    the expected OPEN time of the last closed candle.
-
-    Delta labels candles by OPEN time (e.g. 21:30 candle covers 21:30–21:45).
-    Our reference_time is usually 'now', so we compute the last closed candle's
-    open timestamp and compare against the API's candle_ts.
-    """
-    interval_seconds = interval_minutes * 60
-    # Compute the open time of the last closed candle
-    current_window = reference_time // interval_seconds
-    expected_open_ts = (current_window * interval_seconds) - interval_seconds
-
-    diff = abs(candle_ts - expected_open_ts)
-    if diff > tolerance_seconds:
-        logger.error(
-            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
-            f"got {candle_ts} (diff: {diff}s)"
-        )
-        return False
-
-    logger.debug(
-        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
-        f"Got: {candle_ts} | Diff: {diff}s"
-    )
-    return True
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
@@ -2189,6 +2220,37 @@ class RedisStateStore:
             except Exception:
                 pass
         self._redis = None
+
+
+    @classmethod
+    async def shutdown_global_pool(cls) -> None:
+        
+        async with cls._pool_lock:
+            if cls._global_pool and not cls._global_pool.closed:
+                try:
+                    pool_age = time.time() - cls._pool_created_at
+                    reuse_count = cls._pool_reuse_count
+                    
+                    logger.info(
+                        f"Shutting down global Redis pool | "
+                        f"Age: {pool_age:.1f}s | "
+                        f"Reuses: {reuse_count}"
+                    )
+                    
+                    await cls._global_pool.aclose()
+                    await asyncio.sleep(0.25)  # Allow cleanup
+                    
+                    cls._global_pool = None
+                    cls._pool_healthy = False
+                    cls._pool_created_at = 0.0
+                    cls._pool_reuse_count = 0
+                    
+                    logger.info("✅ Global Redis pool shutdown complete")
+                    
+                except Exception as e:
+                    logger.error(f"Error shutting down global Redis pool: {e}")
+            else:
+                logger.debug("Global Redis pool already closed or not created")
 
     async def __aenter__(self):
         await self.connect()
@@ -2623,7 +2685,7 @@ class TelegramQueue:
             preview = "\n".join([f"• {msg[:50]}..." for msg in messages[:10]])
             return await self.send(escape_markdown_v2(summary + preview))
         
-        max_len = 3800
+        max_len = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
         to_send = messages[:10]
         combined = "\n\n".join(to_send)
         if len(combined) > max_len:
@@ -2658,13 +2720,12 @@ class AlertDefinition(TypedDict):
     extra_fn: Callable[[Any, Any, Any, Any, Dict[str, Any]], str]
     requires: List[str]
 
-
 # ============================================================================
-# ALERT DEFINITIONS - CORE ALERTS (Keep existing from line ~2620)
+# PART 7: ALERT DEFINITIONS & VALIDATION (CORRECTED VERSION)
 # ============================================================================
 
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key": "ppo_signal_up", "title": "���� PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
+    {"key": "ppo_signal_up", "title": "🟢🔺 PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_signal_down", "title": "🔴 PPO cross below signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= ppo_sig["prev"]) and (ppo["curr"] < ppo_sig["curr"]) and (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_zero_up", "title": "🟢 PPO cross above 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["buy_common"] and (ppo["prev"] <= 0.0) and (ppo["curr"] > 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
     {"key": "ppo_zero_down", "title": "🔴 PPO cross below 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["sell_common"] and (ppo["prev"] >= 0.0) and (ppo["curr"] < 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
@@ -2679,7 +2740,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
 ]
 
 # ============================================================================
-# PIVOT VALIDATION HELPER (NEW - ADD THIS)
+# PIVOT VALIDATION HELPER
 # ============================================================================
 
 def _validate_pivot_cross(
@@ -2696,6 +2757,14 @@ def _validate_pivot_cross(
     - Non-existent crossovers
     
     This function is called at runtime during alert evaluation.
+    
+    Args:
+        ctx: Alert context dictionary with pivots, close prices
+        level: Pivot level name (P, S1, S2, S3, R1, R2, R3)
+        is_buy: True for BUY crossover (price crosses up), False for SELL (price crosses down)
+        
+    Returns:
+        True if crossover is valid, False otherwise
     """
     # Check if pivot data exists
     if not ctx.get("pivots") or level not in ctx["pivots"]:
@@ -2709,7 +2778,7 @@ def _validate_pivot_cross(
     # This prevents alerts like "LTC S1=$80.90" when actual S1=$78.05
     price_diff_pct = abs(level_value - close_curr) / close_curr * 100
     
-    if price_diff_pct > 50.0:
+    if price_diff_pct > Constants.MAX_PIVOT_DISTANCE_PCT:
         # Only log at runtime when logger is available
         try:
             import logging
@@ -2719,7 +2788,7 @@ def _validate_pivot_cross(
                 f"Level: ${level_value:.2f} | Price: ${close_curr:.2f} | "
                 f"Difference: {price_diff_pct:.1f}% (max: 50%)"
             )
-        except:
+        except Exception:
             pass  # Fail silently if logging not available
         return False
     
@@ -2731,9 +2800,8 @@ def _validate_pivot_cross(
         # SELL: price crossed DOWN through level
         return (close_prev >= level_value) and (close_curr < level_value)
 
-
 # ============================================================================
-# PIVOT ALERT DEFINITIONS (FIXED VERSION)
+# PIVOT ALERT DEFINITIONS
 # ============================================================================
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
@@ -2778,48 +2846,10 @@ ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
 ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
 
 # ============================================================================
-# ALERT KEY VALIDATION (Consistency Safety)
+# ALERT KEYS MAPPING (BUILD BEFORE VALIDATION)
 # ============================================================================
 
-def validate_alert_definitions() -> None:
-    errors = []
-    
-    keys_seen = set()
-    for def_ in ALERT_DEFINITIONS:
-        key = def_["key"]
-        if key in keys_seen:
-            errors.append(f"Duplicate alert key: {key}")
-        keys_seen.add(key)
-    
-    required_fields = ["key", "title", "check_fn", "extra_fn", "requires"]
-    for idx, def_ in enumerate(ALERT_DEFINITIONS):
-        for field in required_fields:
-            if field not in def_:
-                errors.append(f"Alert definition {idx} missing field: {field}")
-        
-        if not callable(def_.get("check_fn")):
-            errors.append(f"Alert {def_.get('key', idx)}: check_fn is not callable")
-        if not callable(def_.get("extra_fn")):
-            errors.append(f"Alert {def_.get('key', idx)}: extra_fn is not callable")
-        
-        if not isinstance(def_.get("requires", []), list):
-            errors.append(f"Alert {def_.get('key', idx)}: requires must be a list")
-    
-    if errors:
-        error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
-        logger.critical(error_msg)
-        raise ValueError(error_msg)
-    
-    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions")
-
-# Run validation (this happens at import time)
-validate_alert_definitions()
-
-# ============================================================================
-# ALERT KEYS MAPPING (MUST BE AFTER ALERT_DEFINITIONS)
-# ============================================================================
-
-# Create alert keys map AFTER all definitions are added
+# Create alert keys map from all definitions
 ALERT_KEYS: Dict[str, str] = {
     d["key"]: f"ALERT:{d['key'].upper()}" 
     for d in ALERT_DEFINITIONS
@@ -2830,19 +2860,16 @@ for level in PIVOT_LEVELS:
     ALERT_KEYS[f"pivot_up_{level}"] = f"ALERT:PIVOT_UP_{level}"
     ALERT_KEYS[f"pivot_down_{level}"] = f"ALERT:PIVOT_DOWN_{level}"
 
-# Verify all alert keys exist
-for def_ in ALERT_DEFINITIONS:
-    if def_["key"] not in ALERT_KEYS:
-        raise ValueError(f"Alert key {def_['key']} missing from ALERT_KEYS mapping")
-
 logger.debug(f"Alert keys initialized: {len(ALERT_KEYS)} mappings")
+
 # ============================================================================
-# ALERT KEY VALIDATION (Consistency Safety)
+# ALERT VALIDATION (SINGLE DEFINITION - RUNS AFTER ALERT_KEYS IS BUILT)
 # ============================================================================
 
 def validate_alert_definitions() -> None:
     errors = []
     
+    # Check for duplicate keys
     keys_seen = set()
     for def_ in ALERT_DEFINITIONS:
         key = def_["key"]
@@ -2850,24 +2877,29 @@ def validate_alert_definitions() -> None:
             errors.append(f"Duplicate alert key: {key}")
         keys_seen.add(key)
     
+    # Check required fields
     required_fields = ["key", "title", "check_fn", "extra_fn", "requires"]
     for idx, def_ in enumerate(ALERT_DEFINITIONS):
         for field in required_fields:
             if field not in def_:
                 errors.append(f"Alert definition {idx} missing field: {field}")
         
+        # Validate callable functions
         if not callable(def_.get("check_fn")):
             errors.append(f"Alert {def_.get('key', idx)}: check_fn is not callable")
         if not callable(def_.get("extra_fn")):
             errors.append(f"Alert {def_.get('key', idx)}: extra_fn is not callable")
         
+        # Validate requires is a list
         if not isinstance(def_.get("requires", []), list):
             errors.append(f"Alert {def_.get('key', idx)}: requires must be a list")
     
+    # Validate all keys exist in ALERT_KEYS mapping
     for def_ in ALERT_DEFINITIONS:
         if def_["key"] not in ALERT_KEYS:
             errors.append(f"Alert key {def_['key']} missing from ALERT_KEYS mapping")
     
+    # Report errors
     if errors:
         error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
         logger.critical(error_msg)
@@ -2875,24 +2907,64 @@ def validate_alert_definitions() -> None:
     
     logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
 
+# Run validation at import time (after ALERT_KEYS is built)
 validate_alert_definitions()
 
+# ============================================================================
+# ALERT STATE MANAGEMENT
+# ============================================================================
+
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
+    """
+    Set alert state in Redis.
+    
+    Args:
+        sdb: Redis state store instance
+        pair: Trading pair name
+        key: Alert key
+        active: True to set ACTIVE, False to set INACTIVE
+    """
     if sdb.degraded:
         return
+    
     state_key = f"{pair}:{key}"
     ts = int(time.time())
     state_val = "ACTIVE" if active else "INACTIVE"
     await sdb.set(state_key, state_val, ts)
 
+
 async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
+    """
+    Check if alert was previously active.
+    
+    Args:
+        sdb: Redis state store instance
+        pair: Trading pair name
+        key: Alert key
+        
+    Returns:
+        True if alert was active, False otherwise
+    """
     if sdb.degraded:
         return False
+    
     state_key = f"{pair}:{key}"
     st = await sdb.get(state_key)
     return st is not None and st.get("state") == "ACTIVE"
 
+
 async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
+    """
+    Batch check multiple alert states.
+    
+    Args:
+        sdb: Redis state store instance
+        pair: Trading pair name
+        keys: List of alert keys to check
+        
+    Returns:
+        Dict mapping alert key to active status (True/False)
+    """
     if sdb.degraded or not keys:
         return {k: False for k in keys}
     
@@ -2913,6 +2985,10 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair}: {e}")
         return {k: False for k in keys}
 
+# ============================================================================
+# CANDLE QUALITY VALIDATION (NUMBA-OPTIMIZED)
+# ============================================================================
+
 @njit(fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
     open_arr: np.ndarray, 
@@ -2923,7 +2999,20 @@ def _vectorized_wick_check_buy(
 ) -> np.ndarray:
     """
     Vectorized BUY wick validation.
-    Returns boolean array: True = passed, False = rejected
+    
+    Validates green candles for BUY alerts by checking:
+    - Candle is green (close > open)
+    - Upper wick is small (< min_wick_ratio of total range)
+    
+    Args:
+        open_arr: Open prices array
+        high_arr: High prices array
+        low_arr: Low prices array
+        close_arr: Close prices array
+        min_wick_ratio: Maximum allowed wick ratio (e.g., 0.2 = 20%)
+        
+    Returns:
+        Boolean array: True = passed validation, False = rejected
     """
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
@@ -2949,6 +3038,7 @@ def _vectorized_wick_check_buy(
     
     return result
 
+
 @njit(fastmath=True, cache=True)
 def _vectorized_wick_check_sell(
     open_arr: np.ndarray, 
@@ -2959,7 +3049,20 @@ def _vectorized_wick_check_sell(
 ) -> np.ndarray:
     """
     Vectorized SELL wick validation.
-    Returns boolean array: True = passed, False = rejected
+    
+    Validates red candles for SELL alerts by checking:
+    - Candle is red (close < open)
+    - Lower wick is small (< min_wick_ratio of total range)
+    
+    Args:
+        open_arr: Open prices array
+        high_arr: High prices array
+        low_arr: Low prices array
+        close_arr: Close prices array
+        min_wick_ratio: Maximum allowed wick ratio (e.g., 0.2 = 20%)
+        
+    Returns:
+        Boolean array: True = passed validation, False = rejected
     """
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
@@ -2986,7 +3089,6 @@ def _vectorized_wick_check_sell(
     return result
 
 
-# Keep the old function for single-candle checks, but add fast path:
 def check_common_conditions(
     open_val: float,
     high_val: float,
@@ -2994,19 +3096,37 @@ def check_common_conditions(
     close_val: float,
     is_buy: bool
 ) -> bool:
-    """Fast path for single candle validation"""
+    """
+    Fast path for single candle validation.
+    
+    Validates a single candle for BUY or SELL conditions by checking:
+    - Candle direction (green for BUY, red for SELL)
+    - Wick size (upper for BUY, lower for SELL)
+    
+    Args:
+        open_val: Open price
+        high_val: High price
+        low_val: Low price
+        close_val: Close price
+        is_buy: True for BUY validation, False for SELL
+        
+    Returns:
+        True if candle passes validation, False otherwise
+    """
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False
 
         if is_buy:
+            # BUY: must be green candle with small upper wick
             if close_val <= open_val:
                 return False
             upper_wick = high_val - close_val
             wick_ratio = upper_wick / candle_range
             return wick_ratio < Constants.MIN_WICK_RATIO
         else:
+            # SELL: must be red candle with small lower wick
             if close_val >= open_val:
                 return False
             lower_wick = close_val - low_val
@@ -3017,6 +3137,7 @@ def check_common_conditions(
         logger.error(f"check_common_conditions failed: {e}")
         return False
 
+
 def check_candle_quality_with_reason(
     open_val: float,
     high_val: float,
@@ -3024,12 +3145,31 @@ def check_candle_quality_with_reason(
     close_val: float,
     is_buy: bool
 ) -> Tuple[bool, str]:
+    """
+    Validate candle quality with detailed rejection reason.
+    
+    Similar to check_common_conditions but returns detailed reason for rejection.
+    Used for debugging and logging.
+    
+    Args:
+        open_val: Open price
+        high_val: High price
+        low_val: Low price
+        close_val: Close price
+        is_buy: True for BUY validation, False for SELL
+        
+    Returns:
+        Tuple of (passed: bool, reason: str)
+        - (True, "Passed") if validation succeeds
+        - (False, "reason...") if validation fails with explanation
+    """
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False, "Candle range too small"
 
         if is_buy:
+            # BUY validation
             if close_val <= open_val:
                 return False, f"Not green candle (C={close_val:.2f} <= O={open_val:.2f})"
 
@@ -3042,6 +3182,7 @@ def check_candle_quality_with_reason(
             return True, "Passed"
 
         else:
+            # SELL validation
             if close_val >= open_val:
                 return False, f"Not red candle (C={close_val:.2f} >= O={open_val:.2f})"
 
@@ -3055,8 +3196,6 @@ def check_candle_quality_with_reason(
 
     except Exception as e:
         return False, f"Error: {str(e)}"
-
-
 # ============================================================================
 # PART 8: MAIN EVALUATION LOGIC (PURE NUMPY)
 # ============================================================================
@@ -3448,7 +3587,7 @@ async def evaluate_pair_and_alert(
             logger_pair.debug(status_msg)
         elif base_sell_trend and not sell_common:
             status_msg += f" | SELL blocked: {sell_candle_reason}"
-            logger_pair.info(status_msg)
+            logger_pair.debug(status_msg)
         else:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(status_msg + " | No signals")
@@ -3463,17 +3602,7 @@ async def evaluate_pair_and_alert(
         return None
 
     finally:
-        try:
-            del data_15m, data_5m, data_daily
-            if 'ppo' in locals():
-                del ppo, ppo_signal, smooth_rsi, vwap, mmh
-            if cfg.CIRRUS_CLOUD_ENABLED and 'upw' in locals():
-                del upw, dnw
-        except Exception as e:
-            if cfg.DEBUG_MODE:
-                logger_pair.warning(f"Cleanup error (non-critical): {e}")
-        finally:
-            PAIR_ID.set("")
+        PAIR_ID.set("")
 
 
 # ============================================================================
@@ -3653,13 +3782,15 @@ async def process_pairs_with_workers(
     return valid_results
 
 # ============================================================================
-# PART 10: MAIN RUN LOOP & ENTRY POINT
+# PART 10: MAIN RUN LOOP (CORRECTED VERSION)
 # ============================================================================
 
 async def run_once() -> bool:
     
+    # Disable garbage collection during processing for performance
     gc.disable()
     
+    # Generate correlation ID for request tracing
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -3671,6 +3802,7 @@ async def run_once() -> bool:
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
 
+    # Initialize service variables
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     lock_acquired = False
@@ -3694,7 +3826,7 @@ async def run_once() -> bool:
             return False
 
         # ===== PHASE 1: Product Cache Check (BEFORE Redis) =====
-        # This is a major optimization - check cache before any connections
+        # Major optimization - check cache before any connections
         PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
         now = time.time()
         
@@ -3720,7 +3852,7 @@ async def run_once() -> bool:
             products_map = build_products_map_from_api_result(prod_resp)
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️  Using cached products (TTL: {cache_ttl:.0f}s)")
+            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
         
@@ -3882,6 +4014,12 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
         
+        # ✅ ADDED: Shutdown global Redis pool
+        try:
+            await RedisStateStore.shutdown_global_pool()
+        except Exception as e:
+            logger_run.error(f"Error shutting down Redis pool: {e}")
+        
         # ===== Cleanup: Close HTTP Session =====
         try:
             await SessionManager.close_session()
@@ -3911,6 +4049,9 @@ async def run_once() -> bool:
         PAIR_ID.set("")
         
         logger_run.debug("🏁 Resource cleanup finished")
+        
+        # Re-enable garbage collection
+        gc.enable()
 
 # ============================================================================
 # ENTRY POINT
