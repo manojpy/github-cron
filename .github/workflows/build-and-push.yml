@@ -29,7 +29,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # Warm up BuildKit image to avoid registry hiccups
       - name: Warm up BuildKit image
         run: docker pull moby/buildkit:v0.12.5
 
@@ -46,15 +45,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Resolve digest, fallback to tag if empty
-      - name: Resolve base image digest
-        run: |
-          DIGEST=$(docker buildx imagetools inspect python:3.11-slim-bookworm --format '{{json .Digest}}' | tr -d '"')
-          if [ -z "$DIGEST" ]; then
-            DIGEST="python:3.11-slim-bookworm"
-          fi
-          echo "BASE_DIGEST=$DIGEST" >> $GITHUB_ENV
 
       - name: Extract metadata
         id: meta
@@ -78,21 +68,14 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-          # Prefer GHA cache first, then persistent registry cache
           cache-from: |
             type=gha
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-
-          # Persist both caches for maximum reuse
           cache-to: |
             type=gha,mode=max
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
-
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-            BASE_DIGEST=${{ env.BASE_DIGEST }}
-
           provenance: true
           sbom: true
 
