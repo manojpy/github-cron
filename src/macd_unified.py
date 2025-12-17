@@ -916,16 +916,16 @@ def warmup_numba() -> None:
             lambda: _rolling_mean_numba(close32, period=144),
         ]
                   
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [executor.submit(func) for func in critical_funcs]
-                concurrent.futures.wait(futures, timeout=10.0)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(func) for func in critical_funcs]
+            concurrent.futures.wait(futures, timeout=10.0)
             
-            logger.info("Numba warm-up complete (parallel compilation)")
+        logger.info("Numba warm-up complete (parallel compilation)")
             
-        except Exception as e:
-            logger.warning(f"Numba warm-up failed (non-fatal): {e}")
-
+    except Exception as e:
+        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
+        
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
