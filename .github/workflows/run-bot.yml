@@ -23,15 +23,6 @@ jobs:
       contents: read
 
     steps:
-      - name: Log execution context
-        run: |
-          echo "🚀 Trading Bot Execution"
-          echo "Trigger     : ${{ github.event_name }}"
-          echo "Run ID      : ${{ github.run_id }} | #${{ github.run_number }}"
-          echo "Time (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "Time (IST)  : $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S')"
-          echo "Debug mode  : ${{ inputs.debug_mode || 'false' }}"
-
       - name: Checkout config only
         uses: actions/checkout@v4
         with:
@@ -39,15 +30,12 @@ jobs:
             config_macd.json
           sparse-checkout-cone-mode: false
 
-      - name: Validate config_macd.json
-        run: |
-          if [[ ! -f config_macd.json ]]; then
-            echo "❌ Missing config_macd.json"
-            exit 1
-          fi
-          python -c "import json; json.load(open('config_macd.json'))" && \
-            echo "✅ config_macd.json is valid JSON" || \
-            { echo "❌ Invalid JSON in config_macd.json"; exit 1; }
+      # HIGH PERFORMANCE: Cache Numba JIT Compilations
+      - name: Numba Cache
+        uses: actions/cache@v4
+        with:
+          path: .numba_cache
+          key: numba-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -56,77 +44,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and run bot (stream logs)
+      - name: Pull and run bot
         id: run
         run: |
           IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
           TRIGGER_TS=$(date +%s)
-          DEBUG_MODE="${{ inputs.debug_mode || 'false' }}"
-
-          # Pull only if not present locally
-          if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-            echo "📥 Pulling $IMAGE ..."
-            docker pull "$IMAGE" > /dev/null
-          else
-            echo "✅ Image already present locally"
-          fi
-
-          echo "📦 Image size: $(docker inspect "$IMAGE" --format='{{.Size}}' | \
-            awk '{printf "%.1f MB", $1/1024/1024}')"
-
-          echo "🤖 Starting bot execution..."
-          echo "⏰ Trigger timestamp: $TRIGGER_TS ($(date -u -d @$TRIGGER_TS '+%Y-%m-%d %H:%M:%S UTC'))"
+          
+          # Create local cache dir if not exists
+          mkdir -p .numba_cache
 
           docker run --rm \
             --name bot-${{ github.run_id }} \
-            --memory=512m \
-            --memory-swap=512m \
+            --memory=768m \
             --cpus=1.0 \
-            --stop-timeout=20 \
             --read-only \
             --security-opt=no-new-privileges:true \
-            --tmpfs /tmp:size=100m,rw,noexec,nosuid \
+            --tmpfs /tmp:size=64m,rw,noexec,nosuid \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e CONFIG_FILE=config_macd.json \
-            -e DEBUG_MODE="$DEBUG_MODE" \
+            -e DEBUG_MODE="${{ inputs.debug_mode || 'false' }}" \
             -e TRIGGER_TIMESTAMP="$TRIGGER_TS" \
-            -e GITHUB_SHA="${{ github.sha }}" \
-            -e GITHUB_RUN_ID="${{ github.run_id }}" \
-            -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
-            -e NUMBA_CACHE_DIR=/tmp/numba_cache \
-            -e OMP_NUM_THREADS=1 \
-            -e NUMBA_NUM_THREADS=1 \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
-            "$IMAGE" | tee bot.log
+            -v "$(pwd)/.numba_cache:/tmp/numba_cache:rw" \
+            "$IMAGE"
 
-          EXIT_CODE=${PIPESTATUS[0]}
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          exit $EXIT_CODE
+          exit $?
 
-      - name: Upload logs
+      - name: Cleanup
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-logs
-          path: bot.log
-
-      - name: Execution summary
-        if: always()
-        run: |
-          echo ""
-          echo "📊 Run Summary"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "Status    : ${{ job.status }}"
-          echo "Exit Code : ${{ steps.run.outputs.exit_code || 'N/A' }}"
-          echo "Run URL   : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-      - name: Cleanup Docker resources
-        if: always()
-        run: |
-          echo "🧹 Cleaning up Docker resources..."
-          docker system prune -f --volumes >/dev/null 2>&1 || true
-          echo "✅ Cleanup complete"
+        run: docker system prune -f >/dev/null 2>&1 || true
