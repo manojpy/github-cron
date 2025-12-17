@@ -47,10 +47,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Resolve digest without pulling the base image locally
+      # Resolve digest, fallback to tag if empty
       - name: Resolve base image digest
         run: |
           DIGEST=$(docker buildx imagetools inspect python:3.11-slim-bookworm --format '{{json .Digest}}' | tr -d '"')
+          if [ -z "$DIGEST" ]; then
+            DIGEST="python:3.11-slim-bookworm"
+          fi
           echo "BASE_DIGEST=$DIGEST" >> $GITHUB_ENV
 
       - name: Extract metadata
