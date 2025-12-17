@@ -15,20 +15,21 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# Copy requirements first for better caching
 COPY requirements.txt .
 
-# Fix pycares / aiodns incompatibility and install dependencies
+# Fix specific incompatibilities and install requirements
 RUN uv pip install --no-cache --compile \
     pycares==4.4.0 \
     aiodns==3.2.0 && \
     uv pip install --no-cache --compile -r requirements.txt
 
 # ============================================================================
-# Stage 2: Runtime - Minimal & Optimized for Math
+# Stage 2: Runtime - Minimal & Optimized
 # ============================================================================
 FROM ${BASE_DIGEST} AS runtime
 
-# libgomp1 is critical for Numba's parallel (OpenMP) execution
+# libgomp1 is required for Numba's parallel execution
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libgomp1 ca-certificates tzdata \
@@ -38,28 +39,21 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy source code
+# --- CRITICAL FIX FOR NUMBA ---
+# Create a writable cache directory and give it full permissions.
+# This ensures Numba can find a "locator" to save JIT compiled code.
+RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
+
+# Copy source code and config
 COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
-
-# Create Numba Cache Directory
-RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
 
 # Environment Setup
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app/src" \
     PYTHONDONTWRITEBYTECODE=1 \
-    CONFIG_FILE=config_macd.json \
-    TZ=Asia/Kolkata \
-    NUMBA_CACHE_DIR=/tmp/numba_cache \
-    OMP_NUM_THREADS=1
+    NUMBA_CACHE_DIR=/tmp/numba_cache
 
-# Security: Run as non-root
-RUN useradd -m -u 1000 botuser && \
-    chown -R botuser:botuser /app /tmp/numba_cache && \
-    chmod +x wrapper.py
-
-USER botuser
-
-ENTRYPOINT ["python", "-u", "wrapper.py"]
+# Set entry point
+ENTRYPOINT ["python", "wrapper.py"]

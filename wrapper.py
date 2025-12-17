@@ -4,9 +4,10 @@ import os
 import signal
 import sys
 import logging
+import psutil
 from typing import NoReturn
 
-# Optimization: Force uvloop usage
+# Try to use uvloop for performance
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -14,38 +15,46 @@ except ImportError:
     pass
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SRC_DIR = os.path.join(SCRIPT_DIR, "src")
-sys.path.insert(0, SRC_DIR)
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-fallback_logger = logging.getLogger("wrapper")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("wrapper")
 
 try:
-    from src.macd_unified import run_once, logger, cfg, __version__
+    from src.macd_unified import run_once, __version__
 except ImportError as e:
-    fallback_logger.error(f"❌ CRITICAL: Failed to import macd_unified.py: {e}")
+    logger.critical(f"Failed to import core logic: {e}")
     sys.exit(1)
 
-def _handle_signal(signum: int, frame) -> NoReturn:
-    raise KeyboardInterrupt
+def log_resource_usage():
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / 1024 / 1024
+    logger.info(f"📊 Resource Usage: Memory: {mem_mb:.2f} MB")
 
 async def main() -> int:
     try:
-        logger.info(f"🚀 Starting Optimized Trading Bot v{__version__} (uvloop active)")
+        logger.info(f"🚀 Bot v{__version__} starting execution...")
         success = await run_once()
+        log_resource_usage()
         return 0 if success else 2
     except KeyboardInterrupt:
         return 130
+    except asyncio.CancelledError:
+        logger.warning("⏱️ Execution timed out")
+        return 130
     except Exception as exc:
-        logger.exception(f"❌ UNHANDLED EXCEPTION: {exc}")
+        logger.exception(f"🔥 Critical Failure: {exc}")
         return 3
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Graceful shutdown handler
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(loop.stop()))
 
     try:
-        sys.exit(asyncio.run(main()))
-    except Exception as e:
-        fallback_logger.critical(f"FATAL: {e}")
-        sys.exit(3)
+        sys.exit(loop.run_until_complete(main()))
+    finally:
+        loop.close()
