@@ -11,7 +11,7 @@ env:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Syntax Check
@@ -19,7 +19,7 @@ jobs:
 
   build:
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v4
