@@ -3,50 +3,43 @@ name: Build & Push GHCR
 on:
   push:
     branches: [main]
-    paths:
-      - 'requirements.txt'
-      - 'Dockerfile'
-      - 'src/**'
-      - 'wrapper.py'
-      - 'config_macd.json'
+    paths: ['requirements.txt', 'Dockerfile', 'src/**', 'wrapper.py']
   workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot
 
 jobs:
-  build:
+  validate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    concurrency:
-      group: trading-bot-build
-      cancel-in-progress: true
-
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Syntax Check
+        run: python3 -m py_compile wrapper.py src/*.py
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and Push
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
           push: true
           tags: ${{ env.IMAGE_NAME }}:latest
-          # Priority: Build only for linux/amd64 for maximum speed
-          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
