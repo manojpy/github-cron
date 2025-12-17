@@ -78,6 +78,7 @@ class Constants:
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
+    PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
@@ -925,7 +926,7 @@ def warmup_numba() -> None:
             
     except Exception as e:
         logger.warning(f"Numba warm-up failed (non-fatal): {e}")
-        
+
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
