@@ -22,15 +22,13 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # Copy requirements early for cache hits
 COPY requirements.txt .
 
-# Resolver-safe installs for aiodns/pycares, with uv cache
-RUN --mount=type=cache,target=/root/.cache/uv,type=gha \
-    uv pip install --compile --no-cache \
+# Resolver-safe installs for aiodns/pycares
+RUN uv pip install --compile --no-cache \
     pycares==4.4.0 \
     aiodns==3.1.1
 
 # Main dependency install (numpy/numba/etc.)
-RUN --mount=type=cache,target=/root/.cache/uv,type=gha \
-    uv pip install --compile --no-cache -r requirements.txt
+RUN uv pip install --compile --no-cache -r requirements.txt
 
 # ============================================================================
 # Stage 2: Runtime - minimal but compiled-lib safe
