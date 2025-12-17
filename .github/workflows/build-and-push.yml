@@ -29,7 +29,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # Warm up BuildKit image to avoid cold pull errors
+      # Warm up BuildKit image to avoid registry hiccups
       - name: Warm up BuildKit image
         run: docker pull moby/buildkit:v0.12.5
 
@@ -47,9 +47,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Resolve digest without pulling the base image locally
       - name: Resolve base image digest
         run: |
-          DIGEST=$(docker inspect python:3.11-slim-bookworm --format='{{index .RepoDigests 0}}')
+          DIGEST=$(docker buildx imagetools inspect python:3.11-slim-bookworm --format '{{json .Digest}}' | tr -d '"')
           echo "BASE_DIGEST=$DIGEST" >> $GITHUB_ENV
 
       - name: Extract metadata
