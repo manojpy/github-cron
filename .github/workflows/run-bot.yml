@@ -28,22 +28,22 @@ jobs:
           echo "🚀 Trading Bot Execution"
           echo "Trigger     : ${{ github.event_name }}"
           echo "Time (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "Debug mode  : ${{ inputs.debug_mode || 'false' }}"
 
       - name: Checkout config
         uses: actions/checkout@v4
         with:
+          # We only pull the config to keep the runner fast
           sparse-checkout: |
             config_macd.json
           sparse-checkout-cone-mode: false
 
-      # --- CRITICAL: CACHE NUMBA COMPILED CODE ---
       - name: Cache Numba JIT
         uses: actions/cache@v4
         with:
           path: numba_cache
-          # Key changes only if the core logic or dependencies change
-          key: ${{ runner.os }}-numba-${{ hashFiles('src/macd_unified.py', 'requirements.txt') }}
+          # Since src/ is NOT checked out here, we use the commit SHA.
+          # This ensures that if you change code in src/, the cache resets.
+          key: ${{ runner.os }}-numba-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-numba-
 
@@ -63,8 +63,12 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
           DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
         run: |
-          docker pull "$IMAGE"
+          # 1. CLEAN LOGS: Group the docker pull and use --quiet
+          echo "::group::📥 Pulling latest bot image"
+          docker pull --quiet "$IMAGE"
+          echo "::endgroup::"
           
+          # 2. EXECUTE: Run the container
           docker run --rm \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -76,6 +80,7 @@ jobs:
             -v "$(pwd)/numba_cache:/tmp/numba_cache" \
             "$IMAGE" | tee bot.log
 
+          # Capture the bot's exit code correctly
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
           exit $EXIT_CODE
