@@ -1753,7 +1753,7 @@ class DataFetcher:
                 task_metadata.append((symbol, resolution))
 
         total_requests = len(all_tasks)
-        logger.info(
+        logger.debug(
             f"🚀 Parallel fetch: {total_requests} candle requests "
             f"for {len(pair_requests)} pairs | All firing simultaneously"
         )
@@ -2157,7 +2157,7 @@ class RedisStateStore:
                         cls._pool_created_at = 0.0
                         cls._pool_reuse_count = 0
                         
-                        logger.info("✅ Global Redis pool shutdown complete")
+                        logger.debug("✅ Global Redis pool shutdown complete")
                     else:
                         logger.debug("Redis pool already closed")
                         cls._global_pool = None
@@ -3074,9 +3074,9 @@ async def evaluate_pair_and_alert(
 
         # RESTORED MISSING LOGGING BLOCKS
         if base_buy_trend and not buy_common:
-            logger_pair.debug(f"🚫 BUY rejected for {pair_name} | Reason: {buy_candle_reason or 'Unknown'} | Green={is_green_candle} Quality={buy_candle_passed}")
+            logger_pair.info(f"🚫 BUY rejected for {pair_name} | Reason: {buy_candle_reason or 'Unknown'} | Green={is_green_candle} Quality={buy_candle_passed}")
         if base_sell_trend and not sell_common:
-            logger_pair.debug(f"🚫 SELL rejected for {pair_name} | Reason: {sell_candle_reason or 'Unknown'} | Red={is_red_candle} Quality={sell_candle_passed}")
+            logger_pair.info(f"🚫 SELL rejected for {pair_name} | Reason: {sell_candle_reason or 'Unknown'} | Red={is_red_candle} Quality={sell_candle_passed}")
 
         mmh_reversal_buy = False
         mmh_reversal_sell = False
@@ -3205,7 +3205,7 @@ async def process_pairs_with_workers(
         expected_open_ts -= interval_seconds
         expected_close_ts -= interval_seconds
 
-    logger_main.info(
+    logger_main.debug(
         f"🎯 15m Scan Target | Open: {format_ist_time(expected_open_ts)} → Close: {format_ist_time(expected_close_ts)} (Evaluation will use this closed candle)"
     )
 
@@ -3395,7 +3395,7 @@ async def run_once() -> bool:
             PRODUCTS_CACHE["data"] = prod_resp
             PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
             run_once._products_cache = PRODUCTS_CACHE
-            logger_run.debug("✅ Products list cached for 8 hours")
+            logger_run.info("✅ Products list cached for 8 hours")
             
             products_map = build_products_map_from_api_result(prod_resp)
         else:
@@ -3453,7 +3453,7 @@ async def run_once() -> bool:
                 f"Pairs: {len(pairs_to_process)}"
             ))
 
-        logger_run.info(
+        logger_run.debug(
             f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
