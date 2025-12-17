@@ -445,30 +445,37 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError, OverflowError):
         return default
 
+@njit(nogil=True, fastmath=True, cache=True)
+def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
+    """Release GIL during sanitization"""
+    out = np.empty_like(arr)
+    for i in range(len(arr)):
+        val = arr[i]
+        if np.isnan(val) or np.isinf(val):
+            out[i] = default
+        else:
+            out[i] = val
+    return out
+
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
     try:
         if arr is None or len(arr) == 0:
             logger.warning(f"Indicator {name} is None or empty")
             return np.array([default], dtype=np.float64)
         
-        arr = np.where(np.isinf(arr), np.nan, arr)
+        # NEW: All heavy lifting releases GIL via Numba
+        sanitized = _sanitize_array_numba(arr, default)
         
-        nan_count = np.sum(np.isnan(arr))
-        if nan_count > 0:
-            logger.debug(f"Indicator {name} has {nan_count}/{len(arr)} NaN values, filling with {default}")
-        
-        arr = np.where(np.isnan(arr), default, arr)
-        
-        if np.all(arr == default):
+        if np.all(sanitized == default):
             logger.warning(f"Indicator {name} is all {default} after sanitization")
         
-        return arr.astype(np.float64)
+        return sanitized
         
     except Exception as e:
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -498,7 +505,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -512,7 +519,7 @@ def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
     return out
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     n = len(src)
     result = np.empty(n, dtype=np.float64)
@@ -539,7 +546,7 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         result[i] = estimate        
     return result
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _vwap_daily_loop(
     high: np.ndarray, 
     low: np.ndarray, 
@@ -583,7 +590,7 @@ def _vwap_daily_loop(
             vwap[i] = cum_pv / cum_vol            
     return vwap
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     n = len(x)
     filt = np.zeros(n, dtype=np.float64)
@@ -613,7 +620,7 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 
     return filt
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
@@ -633,7 +640,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     
     return worm_arr
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr, rows):
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
@@ -646,38 +653,50 @@ def _calc_mmh_value_loop(temp_arr, rows):
     
     return value_arr
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr, rows):
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
-@njit(fastmath=True, cache=True)
-def _rolling_std_numba(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    rows = len(close)
-    sd = np.empty(rows, dtype=np.float64)
+@njit(nogil=True, fastmath=True, cache=True)
+def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """
+    Numerically stable rolling standard deviation using Welford's online algorithm.
+    Releases GIL during computation.
+    
+    Welford's algorithm avoids catastrophic cancellation by updating mean and 
+    variance incrementally without storing all values.
+    """
+    n = len(close)
+    sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
-    for i in range(rows):
-        start = max(0, i - period + 1)
-        sum_val = 0.0
-        sum_sq = 0.0
+    
+    for i in range(n):
+        mean = 0.0
+        m2 = 0.0
         count = 0
+        
+        start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
-                sum_val += val
-                sum_sq += val * val
                 count += 1
+                delta = val - mean
+                mean += delta / count
+                delta2 = val - mean
+                m2 += delta * delta2
+        
         if count > 1:
-            mean = sum_val / count
-            var = (sum_sq / count) - mean * mean
-            sd[i] = np.sqrt(max(0.0, var)) * resp
+            variance = m2 / count
+            sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
+    
     return sd
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -693,7 +712,7 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else 0.0
     return ma
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
@@ -704,66 +723,124 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         max_arr[i] = np.max(arr[start:i+1])
     return min_arr, max_arr
 
-def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
-    try:
-        if close is None or len(close) < max(fast, slow):
-            logger.warning(f"PPO: Insufficient data (len={len(close) if close is not None else 0})")
-            default_len = len(close) if close is not None else 1
-            return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
-        
-        alpha_fast = 2.0 / (fast + 1)
-        fast_ma = _ema_loop(close, alpha_fast)
-        
-        alpha_slow = 2.0 / (slow + 1)
-        slow_ma = _ema_loop(close, alpha_slow)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            ppo = ((fast_ma - slow_ma) / slow_ma) * 100.0
-        
-        ppo = np.nan_to_num(ppo, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        alpha_signal = 2.0 / (signal + 1)
-        ppo_sig = _ema_loop(ppo, alpha_signal)
-        
-        ppo = sanitize_indicator_array(ppo, "PPO", default=0.0)
-        ppo_sig = sanitize_indicator_array(ppo_sig, "PPO_Signal", default=0.0)
-        
-        return ppo, ppo_sig
-        
-    except Exception as e:
-        logger.error(f"PPO calculation failed: {e}")
-        default_len = len(close) if close is not None else 1
-        return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
+@njit(nogil=True, fastmath=True, cache=True)
+def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Core PPO calculation - fully compiled with GIL released."""
+    n = len(close)
+    
+    alpha_fast = 2.0 / (fast + 1)
+    fast_ma = _ema_loop(close, alpha_fast)
+    
+    alpha_slow = 2.0 / (slow + 1)
+    slow_ma = _ema_loop(close, alpha_slow)
+    
+    ppo = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        if abs(slow_ma[i]) < 1e-12:
+            ppo[i] = 0.0
+        else:
+            ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
+    
+    alpha_signal = 2.0 / (signal + 1)
+    ppo_sig = _ema_loop(ppo, alpha_signal)
+    
+    return ppo, ppo_sig
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
+    """
+    Core RSI calculation with GIL released.
+    All operations compiled by Numba.
+    
+    Args:
+        close: Price array
+        rsi_len: RSI period
+    
+    Returns:
+        RSI array
+    """
+    n = len(close)
+    
+    # Calculate price changes
+    delta = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        delta[i] = close[i] - close[i-1]
+    
+    # Separate gains and losses
+    gain = np.zeros(n, dtype=np.float64)
+    loss = np.zeros(n, dtype=np.float64)
+    
+    for i in range(n):
+        if delta[i] > 0:
+            gain[i] = delta[i]
+        elif delta[i] < 0:
+            loss[i] = -delta[i]
+    
+    # Calculate EMAs of gains and losses
+    alpha = 1.0 / rsi_len
+    avg_gain = _ema_loop(gain, alpha)
+    avg_loss = _ema_loop(loss, alpha)
+    
+    # Calculate RSI with safe division
+    rsi = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        if avg_loss[i] < 1e-10:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+    
+    return rsi
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
+    """
+    Wrapper for smooth RSI - minimal GIL time.
+    All heavy lifting in _calculate_rsi_core with nogil=True.
+    
+    Args:
+        close: Price array
+        rsi_len: RSI period
+        kalman_len: Kalman smoothing period
+    
+    Returns:
+        Smoothed RSI array
+    """
     try:
         if close is None or len(close) < rsi_len:
             logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
             return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
         
-        delta = np.zeros_like(close)
-        delta[1:] = close[1:] - close[:-1]
+        # Core calculation releases GIL
+        rsi = _calculate_rsi_core(close, rsi_len)
         
-        gain = np.where(delta > 0, delta, 0.0)
-        loss = np.where(delta < 0, -delta, 0.0)
-        
-        alpha = 1.0 / rsi_len
-        avg_gain = _ema_loop(gain, alpha)
-        avg_loss = _ema_loop(loss, alpha)
-        
-        avg_loss = np.where(avg_loss == 0, 1e-10, avg_loss)
-        rs = avg_gain / avg_loss
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-        
+        # Kalman smoothing also releases GIL
         smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
-        smooth_rsi = sanitize_indicator_array(smooth_rsi, "Smooth_RSI", default=50.0)
+        # Sanitize with GIL released
+        smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
         
         return smooth_rsi
         
     except Exception as e:
         logger.error(f"Smooth RSI calculation failed: {e}")
         return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
+ 
+def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+    try:
+        if close is None or len(close) < max(fast, slow):
+            logger.warning(f"PPO: Insufficient data")
+            default_len = len(close) if close is not None else 1
+            return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
+        
+        ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
+        ppo = _sanitize_array_numba(ppo, 0.0)
+        ppo_sig = _sanitize_array_numba(ppo_sig, 0.0)
+        
+        return ppo, ppo_sig
+    except Exception as e:
+        logger.error(f"PPO calculation failed: {e}")
+        default_len = len(close) if close is not None else 1
+        return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
 def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
                          volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
@@ -848,7 +925,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        sd = _rolling_std_numba(close.astype(np.float32), 50, resp_clamped)
+        sd = _rolling_std_welford(close.astype(np.float32), 50, resp_clamped)
         
         worm_arr = _calc_mmh_worm_loop(close.astype(np.float32), sd, rows)
         
@@ -911,10 +988,12 @@ def warmup_numba() -> None:
             lambda: _kalman_loop(close64, 21, 0.01, 0.1),
             lambda: _vwap_daily_loop(high64, low64, close64, volume64, timestamps),
             lambda: _rng_filter_loop(close64, sd64),
-            # MMH-specific: force compilation with float32
+            lambda: _sanitize_array_numba(close64, 0.0),
+            lambda: _calculate_ppo_core(close64, 7, 16, 5),
+            lambda: _calculate_rsi_core(close64, 21),
+            lambda: _rolling_std_welford(close32, 50, 0.9),
             lambda: _calc_mmh_worm_loop(close32, sd32, length),
             lambda: _calc_mmh_value_loop(temp32, length),
-            lambda: _rolling_std_numba(close32, 50, 0.9),
             lambda: _rolling_mean_numba(close32, period=144),
         ]
                   
@@ -2719,7 +2798,7 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair}: {e}")
         return {k: False for k in keys}
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
     open_arr: np.ndarray, 
     high_arr: np.ndarray, 
@@ -2750,7 +2829,7 @@ def _vectorized_wick_check_buy(
     
     return result
 
-@njit(fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_sell(
     open_arr: np.ndarray, 
     high_arr: np.ndarray, 
