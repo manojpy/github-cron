@@ -956,13 +956,13 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
         
-        momentum_arr = sanitize_indicator_array(momentum_arr.astype(np.float32), "MMH_Hist", default=0.0)
+        momentum_arr = sanitize_indicator_array(momentum_arr.astype(np.float64), "MMH_Hist", default=0.0)
         
         return momentum_arr
         
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
-        return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
+        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 def warmup_numba() -> None:
     logger.info("Warming up Numba JIT compiler (parallel)...")        
