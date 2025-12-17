@@ -25,6 +25,7 @@ jobs:
     steps:
       - name: Log execution context
         run: |
+          set +x
           echo "🚀 Trading Bot Execution"
           echo "Trigger     : ${{ github.event_name }}"
           echo "Time (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
