@@ -16,7 +16,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -43,8 +43,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Warm up base image to avoid cold pulls
+      # Optional: warm base image only if you’ve seen digest resolution flake
       - name: Warm up base image
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: docker pull python:3.11-slim-bookworm
 
       - name: Resolve base image digest
@@ -71,16 +72,24 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+          # Prefer GHA cache first (fastest), then persistent registry cache
           cache-from: |
             type=gha
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
-          platforms: linux/amd64,linux/arm64
+
+          # Persist both to gha and registry for maximum reuse
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
           build-args: |
             BUILDKIT_INLINE_CACHE=1
             BASE_DIGEST=${{ env.BASE_DIGEST }}
+
           provenance: true
           sbom: true
 
@@ -90,4 +99,5 @@ jobs:
       - name: Verify image
         run: |
           docker pull ${{ env.IMAGE_NAME }}:latest
-          docker inspect ${{ env.IMAGE_NAME }}:latest --format='{{.Size}}' | awk '{print "📦 Image size: " $1/1024/1024 " MB"}'
+          docker inspect ${{ env.IMAGE_NAME }}:latest --format='{{.Size}}' | \
+            awk '{print "📦 Image size: " $1/1024/1024 " MB"}'

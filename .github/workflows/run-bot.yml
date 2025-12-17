@@ -10,7 +10,6 @@ on:
   repository_dispatch:
     types: [cron_trigger]
 
-# Prevent overlapping runs (Redis lock is primary safety, this is backup)
 concurrency:
   group: trading-bot-execution
   cancel-in-progress: false
@@ -64,8 +63,13 @@ jobs:
           TRIGGER_TS=$(date +%s)
           DEBUG_MODE="${{ inputs.debug_mode || 'false' }}"
 
-          echo "📥 Pulling $IMAGE ..."
-          docker pull "$IMAGE" > /dev/null
+          # Pull only if not present locally
+          if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "📥 Pulling $IMAGE ..."
+            docker pull "$IMAGE" > /dev/null
+          else
+            echo "✅ Image already present locally"
+          fi
 
           echo "📦 Image size: $(docker inspect "$IMAGE" --format='{{.Size}}' | \
             awk '{printf "%.1f MB", $1/1024/1024}')"
@@ -73,12 +77,12 @@ jobs:
           echo "🤖 Starting bot execution..."
           echo "⏰ Trigger timestamp: $TRIGGER_TS ($(date -u -d @$TRIGGER_TS '+%Y-%m-%d %H:%M:%S UTC'))"
 
-          # Stream logs live to bot.log while container runs
           docker run --rm \
             --name bot-${{ github.run_id }} \
             --memory=512m \
             --memory-swap=512m \
             --cpus=1.0 \
+            --stop-timeout=20 \
             --read-only \
             --security-opt=no-new-privileges:true \
             --tmpfs /tmp:size=100m,rw,noexec,nosuid \
@@ -93,6 +97,8 @@ jobs:
             -e GITHUB_RUN_ID="${{ github.run_id }}" \
             -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
             -e NUMBA_CACHE_DIR=/tmp/numba_cache \
+            -e OMP_NUM_THREADS=1 \
+            -e NUMBA_NUM_THREADS=1 \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             "$IMAGE" | tee bot.log
 
