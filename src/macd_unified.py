@@ -3160,7 +3160,7 @@ async def evaluate_pair_and_alert(
                 items = [(t, e) for t, e, _ in alerts_to_send[:25]]
                 msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
             if not cfg.DRY_RUN_MODE: await telegram_queue.send(msg)
-            logger_pair.info(f"✅ Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _,_,ak in alerts_to_send]}")
+            logger_pair.info(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _,_,ak in alerts_to_send]}")
 
         # 9. SUMMARY OUTPUT
         reasons = []
