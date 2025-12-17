@@ -2881,7 +2881,7 @@ async def evaluate_pair_and_alert(
             candle_ts=latest_ts,
             reference_time=reference_time,
             interval_minutes=15,
-            tolerance_seconds=300  # 5 minutes — generous for Delta publication delays
+            tolerance_seconds=300
         ):
             logger_pair.info(
                 f"Skipping {pair_name} - latest 15m candle is not confirmed closed "
@@ -2917,6 +2917,38 @@ async def evaluate_pair_and_alert(
         close_curr = float(close_15m[i15])
         close_prev = float(close_15m[i15 - 1])
         ts_curr = int(timestamps_15m[i15])
+
+        # <<< NEW: Daily reset of pivot breakout states for intraday trading >>>
+        if piv and cfg.ENABLE_PIVOT:
+            current_day = int(ts_curr // 86400)  # UTC day number
+            pivot_day_key = f"{pair_name}:pivot_day"
+            last_pivot_day_str = await sdb.get_metadata(pivot_day_key)
+            last_pivot_day = int(last_pivot_day_str) if last_pivot_day_str else None
+            
+            if last_pivot_day != current_day:
+                # New trading day → reset all pivot breakout states
+                delete_keys = []
+                for level in ["P", "S1", "S2", "S3", "R1", "R2", "R3"]:
+                    up_key = f"{pair_name}:{ALERT_KEYS[f'pivot_up_{level}']}"
+                    down_key = f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level}']}"
+                    delete_keys.extend([up_key, down_key])
+                
+                if delete_keys:
+                    success = await sdb.atomic_batch_update([], deletes=delete_keys)
+                    if not success:
+                        if cfg.DEBUG_MODE:
+                            logger_pair.warning(f"Atomic delete failed for pivot reset on {pair_name}, falling back to individual deletes")
+                        await asyncio.gather(*[sdb._redis.delete(k) for k in delete_keys], return_exceptions=True)
+                    
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"🗓️  New trading day ({format_ist_time(ts_curr, '%Y-%m-%d')}) — "
+                            f"reset {len(delete_keys)} pivot breakout states for {pair_name}"
+                        )
+                
+                # Update the day tracker
+                await sdb.set_metadata(pivot_day_key, str(current_day))
+        # <<< END NEW SECTION >>>
 
         open_curr = float(open_15m[i15])
         high_curr = float(high_15m[i15])
@@ -3042,7 +3074,6 @@ async def evaluate_pair_and_alert(
             "candle_rejection_reason_sell": sell_candle_reason,
             "is_green_candle": is_green_candle,
             "is_red_candle": is_red_candle,
-            # <<< NEW: Track pivot suppression reasons for logging >>>
             "pivot_suppressions": [],
         }
 
@@ -3073,7 +3104,6 @@ async def evaluate_pair_and_alert(
             try:
                 key = ALERT_KEYS[alert_key]
 
-                # <<< NEW: Special handling for pivot alerts to capture suppression reason >>>
                 trigger = False
                 if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                     level = alert_key.split("_")[-1]
@@ -3095,12 +3125,11 @@ async def evaluate_pair_and_alert(
                     else:
                         if cfg.DEBUG_MODE:
                             logger_pair.debug(f"🔁 Alert already active: {pair_name}:{alert_key}")
-                # <<< END NEW SECTION >>>
 
             except Exception as e:
                 logger_pair.warning(f"Alert check failed for {pair_name}, key={def_['key']}: {e}")
 
-        # Existing non-pivot state resets (unchanged)
+        # Non-pivot state resets
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
@@ -3199,7 +3228,6 @@ async def evaluate_pair_and_alert(
             reasons.append(f"BUY candle quality: {context.get('candle_rejection_reason_buy')}")
         if context.get("candle_quality_failed_sell"):
             reasons.append(f"SELL candle quality: {context.get('candle_rejection_reason_sell')}")
-        # <<< NEW: Include pivot suppression reasons >>>
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
 
