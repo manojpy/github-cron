@@ -1,73 +1,30 @@
-# Git files
-.git
-.gitignore
-.gitlab-ci.yml
-
-# Python cache / tooling
+# Exclude Python and OS artifacts
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
+*.py[cod]
+*$py.class
 *.so
-*.egg
-*.egg-info
-dist/
-build/
-.eggs/
-.pytest_cache/
-.mypy_cache/
-.coverage
-htmlcov/
-.cache/
-.pip/
-.numba_cache/
-
-# Virtual environments
-venv/
+.Python
 env/
-ENV/
+venv/
 .venv/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Documentation
-README.md
-*.md
-docs/
-
-# Logs
-*.log
-logs/
-macd_bot.log
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Test files
-tests/
-test_*
-*_test.py
-
-# CI/CD (kept for reference but not needed in image)
-.github/
-.gitlab/
-
-# Local development
 .env*
-*.local
 
-# Temporary files
+# Exclude Numba Caches (Crucial for build speed)
+.numba_cache/
+.cache/
+
+# Exclude Git and CI/CD
+.git/
+.github/
+.gitignore
+.dockerignore
+
+# Exclude documentation and logs
+README.md
+*.log
+*.md
+
+# Exclude local temporary files
 tmp/
 temp/
 *.tmp
-
-# Local DBs
-*.sqlite3
-*.db

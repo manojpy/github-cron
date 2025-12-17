@@ -2,75 +2,24 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-venv/
-ENV/
-env/
+# Environments
 .venv/
+venv/
+env/
 
-# IDE
-.idea/
-.vscode/
+# Caches and Temporary Files
+.numba_cache/*
+!.numba_cache/.gitkeep
+.cache/
+.pytest_cache/
 
-# Environment variables
-.env*
-.env.local
-.env.*.local
-
-# Logs
+# Bot Logs and Secrets
 *.log
-logs/
-macd_bot.log
+config_macd.json
+.env
 
-# OS files
+# OS Metadata
 .DS_Store
 Thumbs.db
-
-# PID files
-*.pid
-/tmp/
-
-# Test coverage / tooling caches
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.cache/
-.numba_cache/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pytest
-.pytest_cache/
-
-# mypy
-.mypy_cache/
-
-# Local DBs
-*.sqlite3
-*.db
