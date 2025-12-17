@@ -991,10 +991,10 @@ def warmup_numba() -> None:
             lambda: _sanitize_array_numba(close64, 0.0),
             lambda: _calculate_ppo_core(close64, 7, 16, 5),
             lambda: _calculate_rsi_core(close64, 21),
-            lambda: _rolling_std_welford(close32, 50, 0.9),
-            lambda: _calc_mmh_worm_loop(close32, sd32, length),
-            lambda: _calc_mmh_value_loop(temp32, length),
-            lambda: _rolling_mean_numba(close32, period=144),
+            lambda: _rolling_std_welford(close64, 50, 0.9),
+            lambda: _calc_mmh_worm_loop(close64, sd32, length),
+            lambda: _calc_mmh_value_loop(temp64, length),
+            lambda: _rolling_mean_numba(close64, period=144),
         ]
                   
         import concurrent.futures
@@ -3074,9 +3074,9 @@ async def evaluate_pair_and_alert(
 
         # RESTORED MISSING LOGGING BLOCKS
         if base_buy_trend and not buy_common:
-            logger_pair.info(f"🚫 BUY rejected for {pair_name} | Reason: {buy_candle_reason or 'Unknown'} | Green={is_green_candle} Quality={buy_candle_passed}")
+            logger_pair.debug(f"🚫 BUY rejected for {pair_name} | Reason: {buy_candle_reason or 'Unknown'} | Green={is_green_candle} Quality={buy_candle_passed}")
         if base_sell_trend and not sell_common:
-            logger_pair.info(f"🚫 SELL rejected for {pair_name} | Reason: {sell_candle_reason or 'Unknown'} | Red={is_red_candle} Quality={sell_candle_passed}")
+            logger_pair.debug(f"🚫 SELL rejected for {pair_name} | Reason: {sell_candle_reason or 'Unknown'} | Red={is_red_candle} Quality={sell_candle_passed}")
 
         mmh_reversal_buy = False
         mmh_reversal_sell = False
