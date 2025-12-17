@@ -77,7 +77,7 @@ class Constants:
     INFINITY_CLAMP = 1e8
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
-    MAX_PIVOT_DISTANCE_PCT = 50.0
+    MAX_PIVOT_DISTANCE_PCT = 100.0
 
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
@@ -164,6 +164,13 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
+
+    PIVOT_MAX_DISTANCE_PCT: float = Field(
+        default=100.0,
+        ge=10.0,
+        le=500.0,
+        description="Maximum allowed distance (%) between current price and pivot level for alert validity"
+    )
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -879,29 +886,36 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
 
 def warmup_numba() -> None:
-        logger.info("Warming up Numba JIT compiler (parallel)...")        
-        try:
-            length = 100
-            close = np.random.random(length).astype(np.float64) * 1000
-            high = close + np.random.random(length).astype(np.float64) * 10
-            low = close - np.random.random(length).astype(np.float64) * 10
-            volume = np.random.random(length).astype(np.float64) * 1000
-            timestamps = np.arange(length, dtype=np.int64) * 900
-            sd = np.random.random(length).astype(np.float64) * 0.01
-            temp = np.random.random(length).astype(np.float64)
-            
-            critical_funcs = [
-                lambda: _ema_loop(close, 0.1),
-                lambda: _sma_loop(close, 20),
-                lambda: _kalman_loop(close, 21, 0.01, 0.1),
-                lambda: _vwap_daily_loop(high, low, close, volume, timestamps),
-                lambda: _rng_filter_loop(close, sd),
-                lambda: _calc_mmh_worm_loop(close, sd, length),
-                lambda: _calc_mmh_value_loop(temp, length),
-                lambda: _rolling_std_numba(close, 50, 0.9),
-                lambda: _fast_array_copy(close, sd, length),
-            ]
-            
+    logger.info("Warming up Numba JIT compiler (parallel)...")        
+    try:
+        length = 100
+        # float64 data (used by most indicators: PPO, RSI, VWAP, Cirrus, etc.)
+        close64 = np.random.random(length).astype(np.float64) * 1000
+        high64 = close64 + np.random.random(length).astype(np.float64) * 10
+        low64 = close64 - np.random.random(length).astype(np.float64) * 10
+        volume64 = np.random.random(length).astype(np.float64) * 1000
+        timestamps = np.arange(length, dtype=np.int64) * 900
+        sd64 = np.random.random(length).astype(np.float64) * 0.01
+        temp64 = np.random.random(length).astype(np.float64)
+
+        # float32 data (used by MMH)
+        close32 = close64.astype(np.float32)
+        sd32 = sd64.astype(np.float32)
+        temp32 = temp64.astype(np.float32)
+
+        critical_funcs = [
+            lambda: _ema_loop(close64, 0.1),
+            lambda: _sma_loop(close64, 20),
+            lambda: _kalman_loop(close64, 21, 0.01, 0.1),
+            lambda: _vwap_daily_loop(high64, low64, close64, volume64, timestamps),
+            lambda: _rng_filter_loop(close64, sd64),
+            # MMH-specific: force compilation with float32
+            lambda: _calc_mmh_worm_loop(close32, sd32, length),
+            lambda: _calc_mmh_value_loop(temp32, length),
+            lambda: _rolling_std_numba(close32, 50, 0.9),
+            lambda: _rolling_mean_numba(close32, period=144),
+        ]
+                  
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(func) for func in critical_funcs]
@@ -914,60 +928,6 @@ def warmup_numba() -> None:
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
-
-_BUFFER_SIZE = 500
-_BUFFER_LOCK = asyncio.Lock()
-
-GLOBAL_CLOSE_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_HIGH_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_LOW_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_VOLUME_BUF = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_TIMESTAMP_BUF = np.empty(_BUFFER_SIZE, dtype=np.int64)
-GLOBAL_TEMP_BUF_1 = np.empty(_BUFFER_SIZE, dtype=np.float64)
-GLOBAL_TEMP_BUF_2 = np.empty(_BUFFER_SIZE, dtype=np.float64)
-
-@njit(fastmath=True, cache=False, nogil=True)
-def _fast_array_copy(src: np.ndarray, dst: np.ndarray, n: int) -> None:
-    for i in range(n):
-        dst[i] = src[i]
-
-def get_scratch_buffers(size: int) -> Dict[str, np.ndarray]:
-    if size > _BUFFER_SIZE:
-        logger.debug(f"Buffer size {size} exceeds {_BUFFER_SIZE}, allocating new arrays")
-        return {
-            'close': np.empty(size, dtype=np.float64),
-            'high': np.empty(size, dtype=np.float64),
-            'low': np.empty(size, dtype=np.float64),
-            'volume': np.empty(size, dtype=np.float64),
-            'timestamp': np.empty(size, dtype=np.int64),
-            'temp1': np.empty(size, dtype=np.float64),
-            'temp2': np.empty(size, dtype=np.float64),
-        }
-    
-    return {
-        'close': GLOBAL_CLOSE_BUF[:size],
-        'high': GLOBAL_HIGH_BUF[:size],
-        'low': GLOBAL_LOW_BUF[:size],
-        'volume': GLOBAL_VOLUME_BUF[:size],
-        'timestamp': GLOBAL_TIMESTAMP_BUF[:size],
-        'temp1': GLOBAL_TEMP_BUF_1[:size],
-        'temp2': GLOBAL_TEMP_BUF_2[:size],
-    }
-
-def copy_to_scratch(data: Dict[str, np.ndarray], buffers: Dict[str, np.ndarray]) -> None:
-    n = len(data['close'])
-    if 'close' in buffers:
-        _fast_array_copy(data['close'], buffers['close'], n)
-    if 'high' in buffers and 'high' in data:
-        _fast_array_copy(data['high'], buffers['high'], n)
-    if 'low' in buffers and 'low' in data:
-        _fast_array_copy(data['low'], buffers['low'], n)
-    if 'volume' in buffers and 'volume' in data:
-        _fast_array_copy(data['volume'], buffers['volume'], n)
-    if 'timestamp' in buffers and 'timestamp' in data:
-        # Special handling for int64
-        for i in range(n):
-            buffers['timestamp'][i] = data['timestamp'][i]
 
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
@@ -2601,47 +2561,43 @@ def _validate_pivot_cross(
     ctx: Dict[str, Any], 
     level: str, 
     is_buy: bool
-) -> bool:
-    
+) -> Tuple[bool, Optional[str]]:
+    """
+    Returns (is_valid_cross, suppression_reason_or_None)
+    """
     if not ctx.get("pivots") or level not in ctx["pivots"]:
-        return False
-    
+        return False, "Pivot level missing"
+
     level_value = ctx["pivots"][level]
     close_curr = ctx["close_curr"]
-    close_prev = ctx["close_prev"]
     
     price_diff_pct = abs(level_value - close_curr) / close_curr * 100
     
-    if price_diff_pct > Constants.MAX_PIVOT_DISTANCE_PCT:
-        try:
-            import logging
-            log = logging.getLogger("macd_bot")
-            log.warning(
-                f"❌ Pivot {level} validation failed | "
-                f"Level: ${level_value:.2f} | Price: ${close_curr:.2f} | "
-                f"Difference: {price_diff_pct:.1f}% (max: 50%)"
-            )
-        except Exception:
-            pass
-        return False
+    if price_diff_pct > cfg.PIVOT_MAX_DISTANCE_PCT:
+        reason = (
+            f"Pivot {level} too far: ${level_value:.2f} "
+            f"(diff {price_diff_pct:.1f}% > {cfg.PIVOT_MAX_DISTANCE_PCT}%)"
+        )
+        return False, reason
     
     if is_buy:
-        return (close_prev <= level_value) and (close_curr > level_value)
+        cross = (ctx["close_prev"] <= level_value) and (close_curr > level_value)
     else:
-        return (close_prev >= level_value) and (close_curr < level_value)
-
-PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
+        cross = (ctx["close_prev"] >= level_value) and (close_curr < level_value)
+    
+    return cross, None
 
 BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}", 
         "title": f"🟢⬆️ Cross above {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
-            ctx["buy_common"]
-            and _validate_pivot_cross(ctx, level, is_buy=True)
+            ctx["buy_common"] and _validate_pivot_cross(ctx, level, is_buy=True)[0]
         ), 
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, level=level: (
             f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
+            + (f" [Suppressed: {_validate_pivot_cross(ctx, level, True)[1]}]" 
+               if not _validate_pivot_cross(ctx, level, True)[0] and ctx.get("pivots") else "")
         ),
         "requires": ["pivots"]
     }
@@ -2653,11 +2609,12 @@ SELL_PIVOT_DEFS = [
         "key": f"pivot_down_{level}",
         "title": f"🔴⬇️ Cross below {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
-            ctx["sell_common"]
-            and _validate_pivot_cross(ctx, level, is_buy=False)
+            ctx["sell_common"] and _validate_pivot_cross(ctx, level, is_buy=False)[0]
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, level=level: (
             f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
+            + (f" [Suppressed: {_validate_pivot_cross(ctx, level, False)[1]}]" 
+               if not _validate_pivot_cross(ctx, level, False)[0] and ctx.get("pivots") else "")
         ),
         "requires": ["pivots"]
     }
@@ -3083,6 +3040,8 @@ async def evaluate_pair_and_alert(
             "candle_rejection_reason_sell": sell_candle_reason,
             "is_green_candle": is_green_candle,
             "is_red_candle": is_red_candle,
+            # <<< NEW: Track pivot suppression reasons for logging >>>
+            "pivot_suppressions": [],
         }
 
         ppo_ctx = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
@@ -3111,7 +3070,20 @@ async def evaluate_pair_and_alert(
                 continue
             try:
                 key = ALERT_KEYS[alert_key]
-                if def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx):
+
+                # <<< NEW: Special handling for pivot alerts to capture suppression reason >>>
+                trigger = False
+                if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
+                    level = alert_key.split("_")[-1]
+                    is_buy = alert_key.startswith("pivot_up_")
+                    valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
+                    if not valid_cross and reason and context.get("pivots"):
+                        context["pivot_suppressions"].append(reason)
+                    trigger = (is_buy and context["buy_common"] or not is_buy and context["sell_common"]) and valid_cross
+                else:
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+
+                if trigger:
                     if not previous_states.get(key, False):
                         extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
                         raw_alerts.append((def_["title"], extra, def_["key"]))
@@ -3121,9 +3093,12 @@ async def evaluate_pair_and_alert(
                     else:
                         if cfg.DEBUG_MODE:
                             logger_pair.debug(f"🔁 Alert already active: {pair_name}:{alert_key}")
+                # <<< END NEW SECTION >>>
+
             except Exception as e:
                 logger_pair.warning(f"Alert check failed for {pair_name}, key={def_['key']}: {e}")
 
+        # Existing non-pivot state resets (unchanged)
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
@@ -3142,7 +3117,6 @@ async def evaluate_pair_and_alert(
         if context["vwap"]:
             if close_prev >= vwap_prev and close_curr < vwap_curr:
                 all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-    
             if close_prev <= vwap_prev and close_curr > vwap_curr:
                 all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
 
@@ -3220,11 +3194,12 @@ async def evaluate_pair_and_alert(
         if not context["buy_common"] and not context["sell_common"]:
             reasons.append("Trend filter blocked")
         if context.get("candle_quality_failed_buy"):
-            buy_reason = context.get("candle_rejection_reason_buy", "Unknown")
-            reasons.append(f"BUY candle quality: {buy_reason}")
+            reasons.append(f"BUY candle quality: {context.get('candle_rejection_reason_buy')}")
         if context.get("candle_quality_failed_sell"):
-            sell_reason = context.get("candle_rejection_reason_sell", "Unknown")
-            reasons.append(f"SELL candle quality: {sell_reason}")
+            reasons.append(f"SELL candle quality: {context.get('candle_rejection_reason_sell')}")
+        # <<< NEW: Include pivot suppression reasons >>>
+        if context.get("pivot_suppressions"):
+            reasons.extend(context["pivot_suppressions"])
 
         suppression_reason = "; ".join(reasons) if reasons else "No conditions met"
         alerts_count = new_state.get("summary", {}).get("alerts", 0)
