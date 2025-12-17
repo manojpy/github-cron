@@ -64,7 +64,7 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
           DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
         run: |
-          # 1. CLEAN LOGS: Group the docker pull and use --quiet
+          set +x
           echo "::group::📥 Pulling latest bot image"
           docker pull --quiet "$IMAGE"
           echo "::endgroup::"
