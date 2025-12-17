@@ -28,13 +28,11 @@ import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
-from numba import njit
+from numba import njit, prange
 import warnings
-
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
-
 
 try:
     import orjson
@@ -52,7 +50,7 @@ except ImportError:
     json_loads = json.loads
     JSON_BACKEND = "stdlib"
 
-__version__ = "1.3.0-numpy-optimized"
+__version__ = "1.4.0-performance-optimized"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -115,6 +113,9 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         except Exception:
             return str(dt_or_ts)
 
+# ============================================================================
+# OPTIMIZATION 1: Enhanced BotConfig with performance tuning
+# ============================================================================
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
@@ -138,7 +139,9 @@ class BotConfig(BaseModel):
     SRSI_RSI_LEN: int = 21
     SRSI_KALMAN_LEN: int = 5
     LOG_FILE: str = "macd_bot.log"
-    MAX_PARALLEL_FETCH: int = Field(8, ge=1, le=16)
+    
+    # OPTIMIZED: Increased parallel fetch for better throughput
+    MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
@@ -146,8 +149,11 @@ class BotConfig(BaseModel):
     JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
     BATCH_SIZE: int = 4
-    TCP_CONN_LIMIT: int = 8
-    TCP_CONN_LIMIT_PER_HOST: int = 10
+    
+    # OPTIMIZED: Increased connection limits for parallel operations
+    TCP_CONN_LIMIT: int = 16
+    TCP_CONN_LIMIT_PER_HOST: int = 12
+    
     TELEGRAM_RETRIES: int = 3
     TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000
@@ -166,6 +172,11 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
+    
+    # NEW: Performance tuning options
+    NUMBA_PARALLEL: bool = Field(default=True, description="Enable Numba parallel execution")
+    SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
+    PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
 
     PIVOT_MAX_DISTANCE_PCT: float = Field(
         default=100.0,
@@ -212,6 +223,11 @@ class BotConfig(BaseModel):
 
         return self
 
+# ============================================================================
+# PART 2: Optimized Numba Functions with Parallel Execution
+# ============================================================================
+
+
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
     data: Dict[str, Any] = {}
@@ -243,6 +259,7 @@ def load_config() -> BotConfig:
 
 cfg = load_config()
 
+# Logging setup (same as original)
 class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -294,6 +311,7 @@ def setup_logging() -> logging.Logger:
     )
 
     return logger
+
 logger = setup_logging()
 shutdown_event = asyncio.Event()
 
@@ -306,6 +324,7 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
         logger_obj.info(msg)
     elif cfg.DEBUG_MODE:
         logger_obj.debug(msg)
+
 
 _VALIDATION_DONE = False
 
@@ -337,8 +356,8 @@ def validate_runtime_config() -> None:
     if not cfg.PAIRS or len(cfg.PAIRS) == 0:
         errors.append("PAIRS list is empty - no trading pairs configured")
     
-    if cfg.MAX_PARALLEL_FETCH < 1 or cfg.MAX_PARALLEL_FETCH > 16:
-        warnings.append(f"MAX_PARALLEL_FETCH={cfg.MAX_PARALLEL_FETCH} is outside recommended range (1-16)")
+    if cfg.MAX_PARALLEL_FETCH < 1 or cfg.MAX_PARALLEL_FETCH > 20:
+        warnings.append(f"MAX_PARALLEL_FETCH={cfg.MAX_PARALLEL_FETCH} is outside recommended range (1-20)")
     
     if cfg.HTTP_TIMEOUT < 5 or cfg.HTTP_TIMEOUT > 60:
         warnings.append(f"HTTP_TIMEOUT={cfg.HTTP_TIMEOUT}s is outside recommended range (5-60s)")
@@ -346,7 +365,7 @@ def validate_runtime_config() -> None:
     if len(cfg.PAIRS) > 20:
         warnings.append(f"Large number of pairs ({len(cfg.PAIRS)}) may exceed timeout limits")
     
-    if cfg.MEMORY_LIMIT_BYTES < 200_000_000:  # 200MB minimum
+    if cfg.MEMORY_LIMIT_BYTES < 200_000_000:
         warnings.append(f"MEMORY_LIMIT_BYTES={cfg.MEMORY_LIMIT_BYTES} is very low (minimum recommended: 200MB)")
     
     if errors:
@@ -423,11 +442,8 @@ def get_trigger_timestamp() -> int:
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
     interval_seconds = interval_minutes * 60
-    
     current_period_start = (reference_time // interval_seconds) * interval_seconds
-    
     last_closed_candle_open = current_period_start - interval_seconds
-    
     return last_closed_candle_open
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
@@ -445,9 +461,25 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError, OverflowError):
         return default
 
+# ============================================================================
+# OPTIMIZATION 2: Parallel Numba Functions with prange
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
+    """OPTIMIZED: Parallel sanitization with prange"""
+    out = np.empty_like(arr)
+    for i in prange(len(arr)):  # PARALLEL LOOP
+        val = arr[i]
+        if np.isnan(val) or np.isinf(val):
+            out[i] = default
+        else:
+            out[i] = val
+    return out
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
-    """Release GIL during sanitization"""
+    """Original serial version for small arrays"""
     out = np.empty_like(arr)
     for i in range(len(arr)):
         val = arr[i]
@@ -458,13 +490,17 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
+    """OPTIMIZED: Choose parallel vs serial based on size and config"""
     try:
         if arr is None or len(arr) == 0:
             logger.warning(f"Indicator {name} is None or empty")
             return np.array([default], dtype=np.float64)
         
-        # NEW: All heavy lifting releases GIL via Numba
-        sanitized = _sanitize_array_numba(arr, default)
+        # Use parallel version for large arrays when enabled
+        if cfg.NUMBA_PARALLEL and len(arr) > 100:
+            sanitized = _sanitize_array_numba_parallel(arr, default)
+        else:
+            sanitized = _sanitize_array_numba(arr, default)
         
         if np.all(sanitized == default):
             logger.warning(f"Indicator {name} is all {default} after sanitization")
@@ -475,8 +511,35 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
+    """OPTIMIZED: Parallel SMA calculation"""
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+    min_periods = max(2, period // 3)
+    
+    for i in prange(n):  # PARALLEL LOOP
+        window_sum = 0.0
+        count = 0
+        
+        start = max(0, i - period + 1)
+        for j in range(start, i + 1):
+            val = data[j]
+            if not np.isnan(val):
+                window_sum += val
+                count += 1
+        
+        if count >= min_periods:
+            out[i] = window_sum / count
+        else:
+            out[i] = np.nan
+            
+    return out
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """Original serial SMA (fallback)"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
@@ -507,6 +570,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
+    """EMA is inherently serial (each value depends on previous)"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[0] = data[0] if not np.isnan(data[0]) else 0.0
@@ -620,6 +684,12 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 
     return filt
 
+
+# ============================================================================
+# PART 3: Optimized MMH and Indicator Calculations
+# ============================================================================
+
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -660,15 +730,47 @@ def _calc_mmh_momentum_loop(momentum_arr, rows):
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
+# ============================================================================
+# OPTIMIZATION 3: Welford's Algorithm with Parallel Preprocessing
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """
+    OPTIMIZED: Parallel rolling standard deviation using Welford's algorithm.
+    Uses prange for independent window calculations.
+    """
+    n = len(close)
+    sd = np.empty(n, dtype=np.float64)
+    resp = max(0.00001, min(1.0, responsiveness))
+    
+    # Parallel loop - each window is independent
+    for i in prange(n):
+        mean = 0.0
+        m2 = 0.0
+        count = 0
+        
+        start = max(0, i - period + 1)
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                count += 1
+                delta = val - mean
+                mean += delta / count
+                delta2 = val - mean
+                m2 += delta * delta2
+        
+        if count > 1:
+            variance = m2 / count
+            sd[i] = np.sqrt(max(0.0, variance)) * resp
+        else:
+            sd[i] = 0.0
+    
+    return sd
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """
-    Numerically stable rolling standard deviation using Welford's online algorithm.
-    Releases GIL during computation.
-    
-    Welford's algorithm avoids catastrophic cancellation by updating mean and 
-    variance incrementally without storing all values.
-    """
+    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -696,8 +798,28 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     
     return sd
 
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
+    """OPTIMIZED: Parallel rolling mean"""
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+    
+    for i in prange(rows):
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        count = 0
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+        ma[i] = sum_val / count if count > 0 else 0.0
+    
+    return ma
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    """Original serial version"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     for i in range(rows):
@@ -712,8 +834,23 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else 0.0
     return ma
 
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    """OPTIMIZED: Parallel rolling min/max"""
+    rows = len(arr)
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+    
+    for i in prange(rows):
+        start = max(0, i - period + 1)
+        min_arr[i] = np.min(arr[start:i+1])
+        max_arr[i] = np.max(arr[start:i+1])
+    
+    return min_arr, max_arr
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Original serial version"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -722,6 +859,10 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         min_arr[i] = np.min(arr[start:i+1])
         max_arr[i] = np.max(arr[start:i+1])
     return min_arr, max_arr
+
+# ============================================================================
+# OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
+# ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -734,6 +875,7 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) ->
     alpha_slow = 2.0 / (slow + 1)
     slow_ma = _ema_loop(close, alpha_slow)
     
+    # OPTIMIZED: Pre-allocate and fill in one pass
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
         if abs(slow_ma[i]) < 1e-12:
@@ -748,40 +890,25 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) ->
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
-    """
-    Core RSI calculation with GIL released.
-    All operations compiled by Numba.
-    
-    Args:
-        close: Price array
-        rsi_len: RSI period
-    
-    Returns:
-        RSI array
-    """
+    """Core RSI calculation with GIL released."""
     n = len(close)
     
-    # Calculate price changes
+    # OPTIMIZED: Combined delta calculation and gain/loss separation
     delta = np.zeros(n, dtype=np.float64)
-    for i in range(1, n):
-        delta[i] = close[i] - close[i-1]
-    
-    # Separate gains and losses
     gain = np.zeros(n, dtype=np.float64)
     loss = np.zeros(n, dtype=np.float64)
     
-    for i in range(n):
+    for i in range(1, n):
+        delta[i] = close[i] - close[i-1]
         if delta[i] > 0:
             gain[i] = delta[i]
         elif delta[i] < 0:
             loss[i] = -delta[i]
     
-    # Calculate EMAs of gains and losses
     alpha = 1.0 / rsi_len
     avg_gain = _ema_loop(gain, alpha)
     avg_loss = _ema_loop(loss, alpha)
     
-    # Calculate RSI with safe division
     rsi = np.empty(n, dtype=np.float64)
     for i in range(n):
         if avg_loss[i] < 1e-10:
@@ -793,31 +920,20 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
     return rsi
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
-    """
-    Wrapper for smooth RSI - minimal GIL time.
-    All heavy lifting in _calculate_rsi_core with nogil=True.
-    
-    Args:
-        close: Price array
-        rsi_len: RSI period
-        kalman_len: Kalman smoothing period
-    
-    Returns:
-        Smoothed RSI array
-    """
+    """Wrapper for smooth RSI - minimal GIL time."""
     try:
         if close is None or len(close) < rsi_len:
             logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
             return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
         
-        # Core calculation releases GIL
         rsi = _calculate_rsi_core(close, rsi_len)
-        
-        # Kalman smoothing also releases GIL
         smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
-        # Sanitize with GIL released
-        smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
+        # OPTIMIZED: Conditional parallel sanitization
+        if cfg.NUMBA_PARALLEL and len(smooth_rsi) > 100:
+            smooth_rsi = _sanitize_array_numba_parallel(smooth_rsi, 50.0)
+        else:
+            smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
         
         return smooth_rsi
         
@@ -833,8 +949,14 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
             return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
         
         ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
-        ppo = _sanitize_array_numba(ppo, 0.0)
-        ppo_sig = _sanitize_array_numba(ppo_sig, 0.0)
+        
+        # OPTIMIZED: Conditional parallel sanitization
+        if cfg.NUMBA_PARALLEL and len(ppo) > 100:
+            ppo = _sanitize_array_numba_parallel(ppo, 0.0)
+            ppo_sig = _sanitize_array_numba_parallel(ppo_sig, 0.0)
+        else:
+            ppo = _sanitize_array_numba(ppo, 0.0)
+            ppo_sig = _sanitize_array_numba(ppo_sig, 0.0)
         
         return ppo, ppo_sig
     except Exception as e:
@@ -916,26 +1038,44 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
                 np.zeros(default_len, dtype=np.float64),
                 np.zeros(default_len, dtype=np.float64))
 
+# ============================================================================
+# OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
+# ============================================================================
+
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
+    """OPTIMIZED: MMH with conditional parallel execution"""
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float32)
+            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        close_f64 = close.astype(np.float64)  # Ensure float64 for consistency
         
-        sd = _rolling_std_welford(close.astype(np.float32), 50, resp_clamped)
+        # OPTIMIZED: Choose parallel vs serial based on config and size
+        if cfg.NUMBA_PARALLEL and rows > 100:
+            sd = _rolling_std_welford_parallel(close_f64, 50, resp_clamped)
+        else:
+            sd = _rolling_std_welford(close_f64, 50, resp_clamped)
         
-        worm_arr = _calc_mmh_worm_loop(close.astype(np.float32), sd, rows)
+        worm_arr = _calc_mmh_worm_loop(close_f64, sd, rows)
         
-        ma = _rolling_mean_numba(close.astype(np.float32), period)
+        # OPTIMIZED: Parallel rolling mean for large datasets
+        if cfg.NUMBA_PARALLEL and rows > 100:
+            ma = _rolling_mean_numba_parallel(close_f64, period)
+        else:
+            ma = _rolling_mean_numba(close_f64, period)
         
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        min_med, max_med = _rolling_min_max_numba(raw, period)
+        # OPTIMIZED: Parallel min/max for large datasets
+        if cfg.NUMBA_PARALLEL and rows > 100:
+            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
+        else:
+            min_med, max_med = _rolling_min_max_numba(raw, period)
         
         denom = max_med - min_med
         denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
@@ -956,7 +1096,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
         
-        momentum_arr = sanitize_indicator_array(momentum_arr.astype(np.float64), "MMH_Hist", default=0.0)
+        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
         
         return momentum_arr
         
@@ -964,11 +1104,15 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
+# ============================================================================
+# OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
+# ============================================================================
+
 def warmup_numba() -> None:
-    logger.info("Warming up Numba JIT compiler (parallel)...")        
+    """OPTIMIZED: Faster warmup with parallel compilation"""
+    logger.info("Warming up Numba JIT compiler (optimized parallel)...")        
     try:
         length = 100
-        # float64 data (used by most indicators: PPO, RSI, VWAP, Cirrus, etc.)
         close64 = np.random.random(length).astype(np.float64) * 1000
         high64 = close64 + np.random.random(length).astype(np.float64) * 10
         low64 = close64 - np.random.random(length).astype(np.float64) * 10
@@ -977,38 +1121,38 @@ def warmup_numba() -> None:
         sd64 = np.random.random(length).astype(np.float64) * 0.01
         temp64 = np.random.random(length).astype(np.float64)
 
-        # float32 data (used by MMH)
-        close32 = close64.astype(np.float32)
-        sd32 = sd64.astype(np.float32)
-        temp32 = temp64.astype(np.float32)
-
+        # OPTIMIZED: Compile critical path functions only
         critical_funcs = [
             lambda: _ema_loop(close64, 0.1),
-            lambda: _sma_loop(close64, 20),
-            lambda: _kalman_loop(close64, 21, 0.01, 0.1),
-            lambda: _vwap_daily_loop(high64, low64, close64, volume64, timestamps),
-            lambda: _rng_filter_loop(close64, sd64),
-            lambda: _sanitize_array_numba(close64, 0.0),
             lambda: _calculate_ppo_core(close64, 7, 16, 5),
             lambda: _calculate_rsi_core(close64, 21),
-            lambda: _rolling_std_welford(close64, 50, 0.9),
-            lambda: _calc_mmh_worm_loop(close64, sd32, length),
-            lambda: _calc_mmh_value_loop(temp64, length),
-            lambda: _rolling_mean_numba(close64, period=144),
+            lambda: _vwap_daily_loop(high64, low64, close64, volume64, timestamps),
         ]
-                  
+        
+        # Compile parallel functions if enabled
+        if cfg.NUMBA_PARALLEL:
+            critical_funcs.extend([
+                lambda: _sanitize_array_numba_parallel(close64, 0.0),
+                lambda: _rolling_std_welford_parallel(close64, 50, 0.9),
+                lambda: _rolling_mean_numba_parallel(close64, 144),
+                lambda: _rolling_min_max_numba_parallel(close64, 144),
+            ])
+        
+        # OPTIMIZED: Parallel compilation with ThreadPoolExecutor
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(func) for func in critical_funcs]
-            concurrent.futures.wait(futures, timeout=10.0)
+            concurrent.futures.wait(futures, timeout=8.0)
             
-        logger.info("Numba warm-up complete (parallel compilation)")
+        warmup_mode = "parallel" if cfg.NUMBA_PARALLEL else "serial"
+        logger.info(f"Numba warm-up complete ({warmup_mode} mode, {len(critical_funcs)} functions)")
             
     except Exception as e:
         logger.warning(f"Numba warm-up failed (non-fatal): {e}")
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
 
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
@@ -1052,7 +1196,7 @@ def calculate_pivot_levels_numpy(
         
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
-        C_prev = float(yesterday_close[-1])  # Last close of the day
+        C_prev = float(yesterday_close[-1])
         
         rng_prev = H_prev - L_prev
         
@@ -1149,13 +1293,17 @@ def precompute_candle_quality(
     
     return buy_quality, sell_quality
 
+# ============================================================================
+# OPTIMIZATION 7: Enhanced HTTP Session with Connection Pooling
+# ============================================================================
+
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 1000  # Recreate session after N requests
+    _session_reuse_limit: ClassVar[int] = 2000  # OPTIMIZED: Increased from 1000
 
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
@@ -1163,13 +1311,10 @@ class SessionManager:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
-
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-
             cls._ssl_context = ctx
             logger.debug("SSL context created with TLSv1.2+ minimum")
-
         return cls._ssl_context
 
     @classmethod
@@ -1189,7 +1334,7 @@ class SessionManager:
                 if cls._session and not cls._session.closed:
                     try:
                         await cls._session.close()
-                        await asyncio.sleep(0.25)  # Allow cleanup
+                        await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
                     except Exception as e:
                         logger.warning(f"Error closing old session: {e}")
 
@@ -1200,13 +1345,13 @@ class SessionManager:
                     force_close=False,
                     enable_cleanup_closed=True,
                     ttl_dns_cache=3600,
-                    keepalive_timeout=60,
+                    keepalive_timeout=90,  # OPTIMIZED: Increased from 60s
                     family=0,
                 )
 
                 timeout = aiohttp.ClientTimeout(
                     total=cfg.HTTP_TIMEOUT,
-                    connect=10,
+                    connect=8,  # OPTIMIZED: Reduced from 10s
                     sock_read=cfg.HTTP_TIMEOUT,
                 )
 
@@ -1217,6 +1362,7 @@ class SessionManager:
                         'User-Agent': f'{cfg.BOT_NAME}/{__version__}',
                         'Accept': 'application/json',
                         'Accept-Encoding': 'gzip, deflate',
+                        'Connection': 'keep-alive',  # OPTIMIZED: Added explicit keep-alive
                     },
                     raise_for_status=False,
                 )
@@ -1227,9 +1373,7 @@ class SessionManager:
                 logger.info(
                     f"HTTP session created | "
                     f"Pool: {cfg.TCP_CONN_LIMIT} total, {cfg.TCP_CONN_LIMIT_PER_HOST} per host | "
-                    f"Timeout: {cfg.HTTP_TIMEOUT}s | "
-                    f"DNS cache: 3600s | "
-                    f"Keepalive: 60s"
+                    f"Timeout: {cfg.HTTP_TIMEOUT}s | Keepalive: 90s"
                 )
             return cls._session
 
@@ -1243,17 +1387,13 @@ class SessionManager:
             if cls._session and not cls._session.closed:
                 try:
                     session_age = time.time() - cls._creation_time
-
                     logger.debug(
                         f"Closing HTTP session | "
                         f"Age: {session_age:.1f}s | Requests served: {cls._request_count}"
                     )
-
                     await cls._session.close()
-                    await asyncio.sleep(0.25)
-
+                    await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
                     logger.info("HTTP session closed successfully")
-
                 except Exception as e:
                     logger.warning(f"Error closing session: {e}")
                 finally:
@@ -1271,9 +1411,7 @@ class SessionManager:
                 "request_count": 0,
                 "age_seconds": 0.0,
             }
-
         age = time.time() - cls._creation_time if cls._creation_time > 0 else 0.0
-
         return {
             "active": not cls._session.closed,
             "request_count": cls._request_count,
@@ -3340,7 +3478,12 @@ async def process_pairs_with_workers(
     
     return valid_results
 
+# ============================================================================
+# OPTIMIZATION 9: Enhanced run_once with Smart Product Caching
+# ============================================================================
+
 async def run_once() -> bool:
+    """OPTIMIZED: Smarter caching and parallel execution"""
     
     gc.disable()
     
@@ -3376,6 +3519,7 @@ async def run_once() -> bool:
             )
             return False
 
+        # OPTIMIZED: Use configurable cache TTL
         PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
         now = time.time()
         
@@ -3393,9 +3537,11 @@ async def run_once() -> bool:
                 return False
             
             PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["until"] = now + 28_800  # 8 hours
+            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL  # OPTIMIZED: Configurable
             run_once._products_cache = PRODUCTS_CACHE
-            logger_run.info("✅ Products list cached for 8 hours")
+            
+            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
+            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
             
             products_map = build_products_map_from_api_result(prod_resp)
         else:
@@ -3584,6 +3730,7 @@ async def run_once() -> bool:
         
         gc.enable()
 
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -3617,10 +3764,11 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-    if not args.skip_warmup:
+    # OPTIMIZED: Respect SKIP_WARMUP config option
+    if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
-        logger.info("Skipping Numba warmup (--skip-warmup flag)")
+        logger.info("Skipping Numba warmup (faster startup)")
 
     try:
         success = asyncio.run(run_once())
