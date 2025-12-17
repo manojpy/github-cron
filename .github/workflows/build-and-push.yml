@@ -29,11 +29,15 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # Warm up BuildKit image to avoid cold pull errors
+      - name: Warm up BuildKit image
+        run: docker pull moby/buildkit:v0.12.5
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
-            image=moby/buildkit:latest
+            image=moby/buildkit:v0.12.5
             network=host
 
       - name: Log in to GitHub Container Registry
@@ -42,11 +46,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Optional: warm base image only if you’ve seen digest resolution flake
-      - name: Warm up base image
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: docker pull python:3.11-slim-bookworm
 
       - name: Resolve base image digest
         run: |
@@ -76,12 +75,12 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-          # Prefer GHA cache first (fastest), then persistent registry cache
+          # Prefer GHA cache first, then persistent registry cache
           cache-from: |
             type=gha
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
 
-          # Persist both to gha and registry for maximum reuse
+          # Persist both caches for maximum reuse
           cache-to: |
             type=gha,mode=max
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
