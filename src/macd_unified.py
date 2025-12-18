@@ -696,7 +696,7 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
 
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
+def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     worm_arr[0] = first_val
@@ -716,7 +716,7 @@ def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     return worm_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _calc_mmh_value_loop(temp_arr, rows):
+def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
     
@@ -729,7 +729,7 @@ def _calc_mmh_value_loop(temp_arr, rows):
     return value_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _calc_mmh_momentum_loop(momentum_arr, rows):
+def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
@@ -804,7 +804,7 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     return sd
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
+def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     """OPTIMIZED: Parallel rolling mean"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -3168,8 +3168,9 @@ async def evaluate_pair_and_alert(
     pair_start_time = time.time()
 
     try:
-        # 1. IDENTIFY CLOSED CANDLE INDICES
-        # We target the 15m closed candle strictly (e.g., 10:15 if current is 10:31)
+        # ===================================================================
+        # STEP 1: IDENTIFY CLOSED CANDLE INDICES
+        # ===================================================================
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
@@ -3177,14 +3178,50 @@ async def evaluate_pair_and_alert(
             logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
             return None
 
-        # Extract values
-        close_curr   = close_15m[i15]       # 15m close at last closed candle
-        close_5m_val = close_5m[i5]         # 5m close at last closed candle
-        rma50_15_val = rma50_15[i15]        # 15m RMA50
-        rma200_5_val = rma200_5[i5]         # 5m RMA200
+        # ===================================================================
+        # STEP 2: ✅ CALCULATE INDICATORS FIRST (before accessing any arrays)
+        # ===================================================================
+        indicators = await asyncio.to_thread(
+            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+        )
 
-        # 2. TIMESTAMP VALIDATION (STRICT ONLY FOR 15m)
-        latest_ts = int(data_15m["timestamp"][i15])
+        # Extract indicator arrays from dictionary
+        ppo = indicators['ppo']
+        ppo_signal = indicators['ppo_signal']
+        smooth_rsi = indicators['smooth_rsi']
+        vwap = indicators['vwap']
+        mmh = indicators['mmh']
+        upw = indicators['upw']
+        dnw = indicators['dnw']
+        rma50_15 = indicators['rma50_15']
+        rma200_5 = indicators['rma200_5']
+        piv = indicators['pivots']
+
+        # Extract raw data arrays from input dictionaries
+        close_15m = data_15m["close"]
+        open_15m = data_15m["open"]
+        high_15m = data_15m["high"]
+        low_15m = data_15m["low"]
+        timestamps_15m = data_15m["timestamp"]
+        close_5m = data_5m["close"]
+
+        # ===================================================================
+        # STEP 3: ✅ NOW extract values at target indices (after arrays exist)
+        # ===================================================================
+        close_curr   = close_15m[i15]       # already np.float64
+        close_prev   = close_15m[i15 - 1]   # already np.float64
+        close_5m_val = close_5m[i5]         # already np.float64
+        ts_curr      = int(timestamps_15m[i15])  # keep int() for timestamps
+
+        # Extract indicator values at target indices
+        rma50_15_val = rma50_15[i15]        # already np.float64
+        rma200_5_val = rma200_5[i5]         # already np.float64
+
+
+        # ===================================================================
+        # STEP 4: TIMESTAMP VALIDATION (STRICT ONLY FOR 15m)
+        # ===================================================================
+        latest_ts = int(timestamps_15m[i15])
         expected_open_ts = calculate_expected_candle_timestamp(reference_time, 15)
 
         if not validate_candle_timestamp(
@@ -3199,34 +3236,9 @@ async def evaluate_pair_and_alert(
             )
             return None
 
-        # 3. CALCULATE INDICATORS
-        indicators = await asyncio.to_thread(
-            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
-        )
-
-        ppo = indicators['ppo']
-        ppo_signal = indicators['ppo_signal']
-        smooth_rsi = indicators['smooth_rsi']
-        vwap = indicators['vwap']
-        mmh = indicators['mmh']
-        upw = indicators['upw']
-        dnw = indicators['dnw']
-        rma50_15 = indicators['rma50_15']
-        rma200_5 = indicators['rma200_5']
-        piv = indicators['pivots']
-
-        close_15m = data_15m["close"]
-        open_15m = data_15m["open"]
-        high_15m = data_15m["high"]
-        low_15m = data_15m["low"]
-        timestamps_15m = data_15m["timestamp"]
-
-        # 4. CAPTURE DATA FOR TARGET INDICES
-        close_curr = float(close_15m[i15])
-        close_prev = float(close_15m[i15 - 1])
-        ts_curr = int(timestamps_15m[i15])
-
-        # DAILY PIVOT RESET
+        # ===================================================================
+        # STEP 5: DAILY PIVOT RESET (after validation passes)
+        # ===================================================================
         if piv and cfg.ENABLE_PIVOT:
             current_day = int(ts_curr // 86400)
             pivot_day_key = f"{pair_name}:pivot_day"
@@ -3247,38 +3259,45 @@ async def evaluate_pair_and_alert(
                         await asyncio.gather(*[sdb._redis.delete(k) for k in delete_keys], return_exceptions=True)
                 await sdb.set_metadata(pivot_day_key, str(current_day))
 
-        open_curr = float(open_15m[i15])
-        high_curr = float(high_15m[i15])
-        low_curr = float(low_15m[i15])
-        ppo_curr, ppo_prev = float(ppo[i15]), float(ppo[i15 - 1])
-        ppo_sig_curr, ppo_sig_prev = float(ppo_signal[i15]), float(ppo_signal[i15 - 1])
-        rsi_curr, rsi_prev = float(smooth_rsi[i15]), float(smooth_rsi[i15 - 1])
-        vwap_curr = float(vwap[i15]) if len(vwap) > i15 else 0.0
-        vwap_prev = float(vwap[i15 - 1]) if len(vwap) > (i15 - 1) else 0.0
-        mmh_curr, mmh_m1 = float(mmh[i15]), float(mmh[i15 - 1])
+        # ===================================================================
+        # STEP 6: EXTRACT REMAINING CANDLE & INDICATOR DATA
+        # ===================================================================
+        open_curr = open_15m[i15]
+        high_curr = high_15m[i15]
+        low_curr  = low_15m[i15]
+
+        # Extract indicator values for current and previous candles
+        ppo_curr, ppo_prev       = ppo[i15], ppo[i15 - 1]
+        ppo_sig_curr, ppo_sig_prev = ppo_signal[i15], ppo_signal[i15 - 1]
+        rsi_curr, rsi_prev       = smooth_rsi[i15], smooth_rsi[i15 - 1]
+        vwap_curr = vwap[i15] if len(vwap) > i15 else 0.0
+        vwap_prev = vwap[i15 - 1] if len(vwap) > (i15 - 1) else 0.0
+        mmh_curr, mmh_m1         = mmh[i15], mmh[i15 - 1]
+     
+        # Cloud indicators
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-        rma50_15_val = float(rma50_15[i15])
         
-        # FIX: We use the i5 index specifically here for RMA 200
-        rma200_5_val = float(rma200_5[i5])
-        
+        # Candle color
         is_green_candle = close_curr > open_curr
         is_red_candle = close_curr < open_curr
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f} | Green={is_green_candle} Red={is_red_candle}")
 
-        # TREND & QUALITY FILTERS
+        # ===================================================================
+        # STEP 7: TREND & QUALITY FILTERS
+        # ===================================================================
         base_buy_trend  = (rma50_15_val < close_curr and rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr and rma200_5_val > close_5m_val)
 
-
+        # Add MMH and cloud confirmation
         if base_buy_trend: 
             base_buy_trend = base_buy_trend and (mmh_curr > 0 and cloud_up)
         if base_sell_trend: 
             base_sell_trend = base_sell_trend and (mmh_curr < 0 and cloud_down)
 
+        # Candle quality checks
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
@@ -3307,7 +3326,7 @@ async def evaluate_pair_and_alert(
         buy_common = base_buy_trend and buy_candle_passed and is_green_candle
         sell_common = base_sell_trend and sell_candle_passed and is_red_candle
 
-        # RESTORED MISSING LOGGING BLOCKS
+        # Log rejection reasons
         if base_buy_trend and not buy_common:
             logger_pair.debug(
                 f"🚫 BUY rejected for {pair_name} | "
@@ -3321,6 +3340,9 @@ async def evaluate_pair_and_alert(
                 f"Red={is_red_candle} Quality={sell_candle_passed}"
             )
 
+        # ===================================================================
+        # STEP 8: MMH REVERSAL LOGIC
+        # ===================================================================
         mmh_reversal_buy = False
         mmh_reversal_sell = False
         if i15 >= 3:
@@ -3338,7 +3360,9 @@ async def evaluate_pair_and_alert(
                 mmh_curr < mmh_m1
             )
 
-        # 5. CONTEXT PREP
+        # ===================================================================
+        # STEP 9: BUILD CONTEXT FOR ALERT EVALUATION
+        # ===================================================================
         context = {
             "buy_common": buy_common,
             "sell_common": sell_common,
@@ -3372,7 +3396,9 @@ async def evaluate_pair_and_alert(
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
         
-        # ✅ OPTIMIZED: Prepare for batched Redis operation
+        # ===================================================================
+        # STEP 10: PREPARE FOR BATCHED REDIS OPERATION
+        # ===================================================================
         raw_alerts = []
         alert_keys_to_check = [
             def_["key"] for def_ in ALERT_DEFINITIONS 
@@ -3384,10 +3410,12 @@ async def evaluate_pair_and_alert(
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
         all_state_changes = []
 
-        # ✅ STEP 1: Get previous states FIRST (needed for trigger logic)
+        # Get previous states FIRST (needed for trigger logic)
         previous_states = await check_multiple_alert_states(sdb, pair_name, redis_alert_keys)
 
-        # 6. TRIGGER LOGIC
+        # ===================================================================
+        # STEP 11: TRIGGER LOGIC - CHECK ALL ALERTS
+        # ===================================================================
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_: 
@@ -3428,7 +3456,9 @@ async def evaluate_pair_and_alert(
                     f"Alert check failed for {pair_name}, key={alert_key}: {e}"
                 )
 
-        # 7. STATE RESETS (for crossover alerts that can re-trigger)
+        # ===================================================================
+        # STEP 12: STATE RESETS (for crossover alerts that can re-trigger)
+        # ===================================================================
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             all_state_changes.append(
                 (f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None)
@@ -3471,7 +3501,9 @@ async def evaluate_pair_and_alert(
                 (f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None)
             )
 
-        # ✅ STEP 2: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
+        # ===================================================================
+        # STEP 13: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
+        # ===================================================================
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
         
         if all_state_changes or dedup_checks:
@@ -3486,7 +3518,9 @@ async def evaluate_pair_and_alert(
         else:
             dedup_results = {}
         
-        # 8. DEDUP & SEND
+        # ===================================================================
+        # STEP 14: DEDUP & SEND ALERTS
+        # ===================================================================
         alerts_to_send = []
         if raw_alerts:
             for title, extra, ak in raw_alerts:
@@ -3515,7 +3549,9 @@ async def evaluate_pair_and_alert(
                 f"{[ak for _, _, ak in alerts_to_send]}"
             )
 
-        # 9. SUMMARY OUTPUT
+        # ===================================================================
+        # STEP 15: SUMMARY OUTPUT
+        # ===================================================================
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
