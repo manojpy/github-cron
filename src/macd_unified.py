@@ -806,15 +806,20 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     """OPTIMIZED: Parallel rolling mean"""
-    rows = len(close)
+    rows = len(arr)
     ma = np.empty(rows, dtype=np.float64)
-    
+
     for i in prange(rows):
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
         for j in range(start, i + 1):
-            val = close[j]
+            val = arr[j]
+        if not np.isnan(val):
+            sum_val += val
+            count += 1
+    ma[i] = sum_val / count if count > 0 else 0.0
+
             if not np.isnan(val):
                 sum_val += val
                 count += 1
@@ -1114,6 +1119,69 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
+@njit(nogil=True, fastmath=True, cache=True)
+def _vectorized_wick_check_buy(
+    open_arr: np.ndarray, 
+    high_arr: np.ndarray, 
+    low_arr: np.ndarray, 
+    close_arr: np.ndarray,
+    min_wick_ratio: float
+) -> np.ndarray:
+    
+    n = len(close_arr)
+    result = np.zeros(n, dtype=np.bool_)
+    
+    for i in range(n):
+        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
+        
+        if c <= o:
+            result[i] = False
+            continue
+        
+        candle_range = h - l
+        if candle_range < 1e-8:
+            result[i] = False
+            continue
+        
+        upper_wick = h - c
+        wick_ratio = upper_wick / candle_range
+        
+        result[i] = wick_ratio < min_wick_ratio
+    
+    return result
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _vectorized_wick_check_sell(
+    open_arr: np.ndarray, 
+    high_arr: np.ndarray, 
+    low_arr: np.ndarray, 
+    close_arr: np.ndarray,
+    min_wick_ratio: float
+) -> np.ndarray:
+   
+    n = len(close_arr)
+    result = np.zeros(n, dtype=np.bool_)
+    
+    for i in range(n):
+        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
+        
+        if c >= o:
+            result[i] = False
+            continue
+        
+        candle_range = h - l
+        if candle_range < 1e-8:
+            result[i] = False
+            continue
+        
+        lower_wick = c - l
+        wick_ratio = lower_wick / candle_range
+        
+        result[i] = wick_ratio < min_wick_ratio
+    
+    return result
+
+
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================
@@ -1328,7 +1396,6 @@ def calculate_all_indicators_numpy(
         return results
         
     finally:
-        # CRITICAL: Re-enable GC only if it was enabled before
         if gc_was_enabled:
             gc.enable()
 
@@ -3020,68 +3087,6 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair}: {e}")
         return {k: False for k in keys}
 
-@njit(nogil=True, fastmath=True, cache=True)
-def _vectorized_wick_check_buy(
-    open_arr: np.ndarray, 
-    high_arr: np.ndarray, 
-    low_arr: np.ndarray, 
-    close_arr: np.ndarray,
-    min_wick_ratio: float
-) -> np.ndarray:
-    
-    n = len(close_arr)
-    result = np.zeros(n, dtype=np.bool_)
-    
-    for i in range(n):
-        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
-        
-        if c <= o:
-            result[i] = False
-            continue
-        
-        candle_range = h - l
-        if candle_range < 1e-8:
-            result[i] = False
-            continue
-        
-        upper_wick = h - c
-        wick_ratio = upper_wick / candle_range
-        
-        result[i] = wick_ratio < min_wick_ratio
-    
-    return result
-
-@njit(nogil=True, fastmath=True, cache=True)
-def _vectorized_wick_check_sell(
-    open_arr: np.ndarray, 
-    high_arr: np.ndarray, 
-    low_arr: np.ndarray, 
-    close_arr: np.ndarray,
-    min_wick_ratio: float
-) -> np.ndarray:
-   
-    n = len(close_arr)
-    result = np.zeros(n, dtype=np.bool_)
-    
-    for i in range(n):
-        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
-        
-        if c >= o:
-            result[i] = False
-            continue
-        
-        candle_range = h - l
-        if candle_range < 1e-8:
-            result[i] = False
-            continue
-        
-        lower_wick = c - l
-        wick_ratio = lower_wick / candle_range
-        
-        result[i] = wick_ratio < min_wick_ratio
-    
-    return result
-
 def check_common_conditions(
     open_val: float,
     high_val: float,
@@ -3645,7 +3650,6 @@ async def process_pairs_with_workers(
         # Just pass raw candles - parsing happens in worker
         valid_tasks.append((pair_name, candles))
 
-    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL
 
     # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
     logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
