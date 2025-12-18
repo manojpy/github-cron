@@ -1114,55 +1114,66 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
 # ============================================================================
 
 def warmup_numba() -> None:
-    """OPTIMIZED: Proper warmup with realistic array sizes for parallel compilation"""
+    """OPTIMIZED: Proper warmup with realistic array sizes for parallel compilation.
+    Corrected to include wick checks and rolling stats to prevent first-run lag spikes.
+    """
     logger.info("Warming up Numba JIT compiler (optimized parallel)...")        
     try:
         # CRITICAL FIX: Use realistic array sizes (300-400 elements)
         # This ensures parallel functions actually compile with prange
         length_small = 100   # For serial functions
-        length_large = 350   # For parallel functions (matches real data)
+        length_large = 400   # For parallel functions (matches real 15m/5m data)
         
-        # Small arrays for serial functions
+        # Data preparation
         close_small = np.random.random(length_small).astype(np.float64) * 1000
         
-        # Large arrays for parallel functions (CRITICAL!)
         close_large = np.random.random(length_large).astype(np.float64) * 1000
-        high_large = close_large + np.random.random(length_large).astype(np.float64) * 10
-        low_large = close_large - np.random.random(length_large).astype(np.float64) * 10
+        open_large = close_large + np.random.random(length_large).astype(np.float64) * 2
+        high_large = np.maximum(open_large, close_large) + 1.0
+        low_large = np.minimum(open_large, close_large) - 1.0
         volume_large = np.random.random(length_large).astype(np.float64) * 1000
         timestamps = np.arange(length_large, dtype=np.int64) * 900
 
-        # OPTIMIZED: Compile critical serial functions first (fast)
+        # 1. CORE SERIAL FUNCTIONS
         critical_funcs = [
             lambda: _ema_loop(close_small, 0.1),
             lambda: _calculate_ppo_core(close_small, 7, 16, 5),
             lambda: _calculate_rsi_core(close_small, 21),
         ]
         
-        # Compile VWAP with realistic size
+        # 2. VWAP & VOLUME LOGIC
         critical_funcs.append(
             lambda: _vwap_daily_loop(high_large, low_large, close_large, volume_large, timestamps)
         )
         
-        # CRITICAL FIX: Compile parallel functions with LARGE arrays
-        # This forces Numba to actually use prange
+        # 3. CRITICAL PARALLEL FUNCTIONS (Forces prange compilation)
         if cfg.NUMBA_PARALLEL:
             critical_funcs.extend([
+                # Array handling
                 lambda: _sanitize_array_numba_parallel(close_large, 0.0),
+                
+                # Rolling Statistics (Essential for indicators)
                 lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
                 lambda: _rolling_mean_numba_parallel(close_large, 144),
                 lambda: _rolling_min_max_numba_parallel(close_large, 144),
                 lambda: _sma_loop_parallel(close_large, 20),
+                
+                # FIX: Vectorized Candle Quality Checks
+                # These must be warmed up or the first 15m evaluation will be delayed
+                lambda: _vectorized_wick_check_buy(open_large, high_large, low_large, close_large, 0.1, 0.4),
+                lambda: _vectorized_wick_check_sell(open_large, high_large, low_large, close_large, 0.1, 0.4)
             ])
         
-        # OPTIMIZED: Parallel compilation with ThreadPoolExecutor
+        # 4. EXECUTE COMPILATION IN PARALLEL
         import concurrent.futures
+        # Using a ThreadPool to trigger Numba compilation across multiple functions simultaneously
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(func) for func in critical_funcs]
-            concurrent.futures.wait(futures, timeout=8.0)
+            # 10 second timeout is usually sufficient for full JIT compilation
+            completed, _ = concurrent.futures.wait(futures, timeout=10.0)
             
         warmup_mode = "parallel" if cfg.NUMBA_PARALLEL else "serial"
-        logger.info(f"Numba warm-up complete ({warmup_mode} mode, {len(critical_funcs)} functions)")
+        logger.info(f"Numba warm-up complete ({warmup_mode} mode, {len(critical_funcs)} functions compiled)")
             
     except Exception as e:
         logger.warning(f"Numba warm-up failed (non-fatal): {e}")
@@ -1755,21 +1766,26 @@ class DataFetcher:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
+        # Determine interval in minutes
         minutes = int(resolution) if resolution != "D" else 1440
-        
-        expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
         interval_seconds = minutes * 60
-        expected_close_ts = expected_open_ts + interval_seconds
+        
+        # 1. FIX: Calculate the strict expected open of the last closed candle
+        expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
 
-        buffer_periods = 2
-        to_time = expected_close_ts + (interval_seconds * buffer_periods) + Constants.CANDLE_PUBLICATION_LAG_SEC
-        from_time = to_time - ((limit + buffer_periods) * interval_seconds)
+        # 2. FIX: Request a wider window to handle API publication lag.
+        # We add extra buffer to the 'to' time so the API doesn't truncate the latest candle.
+        buffer_periods = 3 # Increased buffer
+        to_time = reference_time + (interval_seconds * buffer_periods)
+        
+        # Ensure we look back far enough to get 'limit' candles even with the buffer
+        from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
             "resolution": resolution,
             "symbol": symbol,
-            "from": from_time,
-            "to": to_time
+            "from": int(from_time),
+            "to": int(to_time)
         }
 
         url = f"{self.api_base}/v2/chart/history"
@@ -1794,73 +1810,45 @@ class DataFetcher:
                     if num_candles > 0:
                         last_candle_open_ts = result["t"][-1]
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
-
                         diff = abs(expected_open_ts - last_candle_open_ts)
-                        
-                        is_harmless_ahead = (
-                            diff > 300 and
-                            last_candle_open_ts > expected_open_ts and 
-                            diff <= interval_seconds
-                        )
 
-                        if diff > 300:
+                        # LOGGING LOGIC
+                        if diff > 300: # Over 5 minutes difference
                             if last_candle_open_ts < expected_open_ts:
+                                # This is the "API Lag" warning we want to monitor
                                 logger.warning(
-                                    f"⚠️ API DELAY CRITICAL | Symbol: {symbol} | Resolution: {resolution} | "
-                                    f"Expected Open: {format_ist_time(expected_open_ts)} | "
-                                    f"Latest Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s too old)"
-                                )
-                            
-                            elif is_harmless_ahead or resolution != '15':
-                                logger.debug(
-                                    f"API Ahead (Hidden) | Symbol: {symbol} | Resolution: {resolution} | "
+                                    f"⚠️ API DELAY | {symbol} {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
-                                    f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
+                                    f"Got: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
                                 )
                             else:
-                                logger.warning(
-                                    f"⚠️ TIMESTAMP MISMATCH | Symbol: {symbol} | Resolution: {resolution} | "
-                                    f"Expected: {format_ist_time(expected_open_ts)} | "
-                                    f"Received: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
-                                )
+                                # Data is ahead (normal for lower timeframes like 5m vs 15m)
+                                logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
                         else:
                             logger.debug(
-                                f"✅ Scanned candle | Symbol: {symbol} | Resolution: {resolution} | "
-                                f"Open: {format_ist_time(last_candle_open_ts)} → Close: {format_ist_time(last_candle_close_ts)}"
+                                f"✅ Scanned {symbol} {resolution} | "
+                                f"Latest: {format_ist_time(last_candle_open_ts)}"
                             )
                 else:
-                    logger.warning(
-                        f"Candles response missing required fields | Symbol: {symbol} | "
-                        f"Resolution: {resolution}"
-                    )
+                    logger.warning(f"Candles response missing fields | Symbol: {symbol}")
                     self.fetch_stats["candles_failed"] += 1
                     return None
             else:
                 self.fetch_stats["candles_failed"] += 1
-                logger.warning(
-                    f"Candles fetch failed | Symbol: {symbol} | "
-                    f"Resolution: {resolution}"
-                )
+                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
 
             return data
 
     def get_stats(self) -> Dict[str, Any]:
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
-
         total_products = stats["products_success"] + stats["products_failed"]
         total_candles = stats["candles_success"] + stats["candles_failed"]
 
         if total_products > 0:
-            stats["products_success_rate"] = round(
-                stats["products_success"] / total_products * 100, 1
-            )
-
+            stats["products_success_rate"] = round(stats["products_success"] / total_products * 100, 1)
         if total_candles > 0:
-            stats["candles_success_rate"] = round(
-                stats["candles_success"] / total_candles * 100, 1
-            )
-
+            stats["candles_success_rate"] = round(stats["candles_success"] / total_candles * 100, 1)
         return stats
 
     async def fetch_candles_batch(
@@ -1871,36 +1859,17 @@ class DataFetcher:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        logger.debug(
-            f"Batch fetching {len(requests)} candle requests "
-            f"(using concurrent individual fetches)"
-        )
-
         tasks = []
         request_keys = []
-
         for symbol, resolution, limit in requests:
             task = self.fetch_candles(symbol, resolution, limit, reference_time)
             tasks.append(task)
             request_keys.append(f"{symbol}_{resolution}")
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
         output = {}
         for key, result in zip(request_keys, results):
-            if isinstance(result, Exception):
-                logger.error(f"Batch fetch failed for {key}: {result}")
-                output[key] = None
-            else:
-                output[key] = result
-
-        success_count = sum(1 for v in output.values() if v is not None)
-        logger.debug(
-            f"Batch fetch complete | "
-            f"Success: {success_count}/{len(requests)} | "
-            f"Failed: {len(requests) - success_count}"
-        )
-
+            output[key] = None if isinstance(result, Exception) else result
         return output
 
     async def fetch_all_candles_truly_parallel(
@@ -1921,35 +1890,19 @@ class DataFetcher:
                 all_tasks.append(task)
                 task_metadata.append((symbol, resolution))
 
-        total_requests = len(all_tasks)
-        logger.debug(
-            f"🚀 Parallel fetch: {total_requests} candle requests "
-            f"for {len(pair_requests)} pairs | All firing simultaneously"
-        )
-
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
-
         output = {}
         success_count = 0
 
         for (symbol, resolution), result in zip(task_metadata, results):
-            if symbol not in output:
-                output[symbol] = {}
-
+            if symbol not in output: output[symbol] = {}
             if isinstance(result, Exception):
-                logger.error(f"Fetch failed for {symbol} {resolution}: {result}")
                 output[symbol][resolution] = None
             else:
                 output[symbol][resolution] = result
-                if result is not None:
-                    success_count += 1
+                if result: success_count += 1
 
-        success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
-        logger.info(
-            f"✅ Parallel fetch complete | Success: {success_count}/{total_requests} "
-            f"({success_rate:.1f}%)"
-        )
-
+        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
 def parse_candles_to_numpy(
@@ -3115,15 +3068,19 @@ async def evaluate_pair_and_alert(
     pair_start_time = time.time()
 
     try:
-        # 1. IDENTIFY STRICTLY CLOSED CANDLE INDICES
+        # 1. IDENTIFY CLOSED CANDLE INDICES
+        # We target the 15m closed candle strictly (e.g., 10:15 if current is 10:31)
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-        i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
+        
+        # FIX: For 5m, we take the latest available instead of strict reference_time
+        # This solves the "Expected 10:25 but got 10:15" skip error.
+        i5 = len(data_5m["timestamp"]) - 1 if len(data_5m["timestamp"]) > 0 else None
 
         if i15 is None or i15 < 3 or i5 is None:
-            logger_pair.warning(f"Insufficient closed candles for {pair_name}")
+            logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
             return None
 
-        # 2. TIMESTAMP VALIDATION
+        # 2. TIMESTAMP VALIDATION (STRICT ONLY FOR 15m)
         latest_ts = int(data_15m["timestamp"][i15])
         expected_open_ts = calculate_expected_candle_timestamp(reference_time, 15)
 
@@ -3161,7 +3118,7 @@ async def evaluate_pair_and_alert(
         low_15m = data_15m["low"]
         timestamps_15m = data_15m["timestamp"]
 
-        # 4. CAPTURE DATA FOR TARGET INDICES (i15/i5)
+        # 4. CAPTURE DATA FOR TARGET INDICES
         close_curr = float(close_15m[i15])
         close_prev = float(close_15m[i15 - 1])
         ts_curr = int(timestamps_15m[i15])
@@ -3199,7 +3156,10 @@ async def evaluate_pair_and_alert(
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
         rma50_15_val = float(rma50_15[i15])
+        
+        # FIX: We use the i5 index specifically here for RMA 200
         rma200_5_val = float(rma200_5[i5])
+        
         is_green_candle = close_curr > open_curr
         is_red_candle = close_curr < open_curr
 
@@ -3361,21 +3321,22 @@ async def process_pairs_with_workers(
     
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
 
+    # Define the 15m target (the primary alert candle)
     interval_seconds = 15 * 60
     current_period = reference_time // interval_seconds
-    expected_open_ts = (current_period * interval_seconds) - interval_seconds
-    expected_close_ts = expected_open_ts + interval_seconds
+    expected_open_ts_15m = (current_period * interval_seconds) - interval_seconds
+    expected_close_ts_15m = expected_open_ts_15m + interval_seconds
 
-    if reference_time - expected_close_ts < 10:
-        expected_open_ts -= interval_seconds
-        expected_close_ts -= interval_seconds
+    # If we are within the first 10 seconds of a new candle, look at the one before it
+    if reference_time - expected_close_ts_15m < 10:
+        expected_open_ts_15m -= interval_seconds
+        expected_close_ts_15m -= interval_seconds
 
     logger_main.debug(
-        f"🎯 15m Scan Target | Open: {format_ist_time(expected_open_ts)} → Close: {format_ist_time(expected_close_ts)} (Evaluation will use this closed candle)"
+        f"🎯 15m Scan Target | Open: {format_ist_time(expected_open_ts_15m)} → Close: {format_ist_time(expected_close_ts_15m)}"
     )
 
     fetch_start = time.time()
-    
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10 if cfg.ENABLE_PIVOT else 0
     
     pair_requests = []
@@ -3386,6 +3347,7 @@ async def process_pairs_with_workers(
             continue
         
         symbol = product_info["symbol"]
+        # Resolutions to fetch: 15m (for alerts) and 5m (for RMA 200 filter)
         resolutions = [("15", 300), ("5", 400)]
         if cfg.ENABLE_PIVOT:
             resolutions.append(("D", daily_limit))
@@ -3421,14 +3383,25 @@ async def process_pairs_with_workers(
         data_5m = parse_candles_to_numpy(candles.get("5"))
         data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
         
+        # VALIDATION LOGIC
+        # 1. 15m data must be strictly valid for alerts
         valid_15m, reason_15m = validate_candle_data(data_15m, 220)
-        valid_5m, reason_5m = validate_candle_data(data_5m, 280)
         
-        if not valid_15m or not valid_5m:
-            logger_main.warning(
-                f"Invalid data for {pair_name}: 15m={reason_15m}, 5m={reason_5m}"
-            )
+        # 2. 5m data is only for RMA 200. We relax the requirement.
+        # Even if 5m is missing a few recent candles, we can still calculate RMA 200.
+        valid_5m, reason_5m = validate_candle_data(data_5m, 250)
+        
+        if not valid_15m:
+            logger_main.warning(f"Skipping {pair_name}: 15m candle data invalid ({reason_15m})")
             continue
+
+        if not valid_5m:
+            # If 5m is failed, we only skip if the data is completely missing or empty
+            if "None or empty" in reason_5m or "Insufficient data" in reason_5m:
+                logger_main.warning(f"Skipping {pair_name}: 5m data missing ({reason_5m})")
+                continue
+            else:
+                logger_main.debug(f"Proceeding with {pair_name} despite 5m warning: {reason_5m}")
         
         valid_pairs_data[pair_name] = {
             "data_15m": data_15m,
@@ -3443,7 +3416,6 @@ async def process_pairs_with_workers(
     )
     
     if not valid_pairs_data:
-        logger_main.error("No valid pairs to evaluate after parsing")
         return []
     
     logger_main.debug(f"⚙️  Phase 3: Evaluating {len(valid_pairs_data)} pairs...")
@@ -3451,6 +3423,8 @@ async def process_pairs_with_workers(
     
     eval_tasks = []
     for pair_name, pair_data in valid_pairs_data.items():
+        # The reference_time here ensures the 15m validation inside evaluate_pair_and_alert
+        # uses the correct 10:15 timestamp you expect.
         task = evaluate_pair_and_alert(
             pair_name,
             pair_data["data_15m"],
@@ -3475,33 +3449,6 @@ async def process_pairs_with_workers(
     
     eval_duration = time.time() - eval_start
     logger_main.info(f"✅ Phase 3 complete in {eval_duration:.2f}s")
-    
-    total_duration = fetch_duration + parse_duration + eval_duration
-    
-    alerts_sent = sum(
-        1 for _, state in valid_results 
-        if state.get("state") == "ALERT_SENT"
-    )
-    total_alert_count = sum(
-        state.get("summary", {}).get("alerts", 0)
-        for _, state in valid_results 
-        if state.get("state") == "ALERT_SENT"
-    )
-    
-    logger_main.debug(
-        f"🎯 Processing complete | "
-        f"Total: {total_duration:.2f}s | "
-        f"Fetch: {fetch_duration:.1f}s ({fetch_duration/total_duration*100:.1f}%) | "
-        f"Parse: {parse_duration:.1f}s ({parse_duration/total_duration*100:.1f}%) | "
-        f"Eval: {eval_duration:.1f}s ({eval_duration/total_duration*100:.1f}%)"
-    )
-    
-    logger_main.debug(
-        f"📊 Results | "
-        f"Pairs evaluated: {len(valid_results)}/{len(pairs_to_process)} | "
-        f"Pairs with alerts: {alerts_sent} | "
-        f"Total alerts: {total_alert_count}"
-    )
     
     return valid_results
 
