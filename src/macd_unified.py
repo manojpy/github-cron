@@ -1717,50 +1717,47 @@ class DataFetcher:
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
 
-        # OPTIMIZATION: High-performance connector for parallel fetches
-        self.connector = TCPConnector(
-            limit=30,               # Allow more concurrent connections
-            ttl_dns_cache=300,      # Reduce DNS lookups
-            use_dns_cache=True,
-            ssl=False               # Set to True if your environment requires strict SSL
-        )
-        
-        # OPTIMIZATION: Persistent session to avoid SSL handshake overhead
-        self.session = aiohttp.ClientSession(
-            connector=self.connector,
-            json_serialize=json_dumps,
-            timeout=aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)
-        )
-
         self.semaphore = asyncio.Semaphore(max_parallel)
+        self.timeout = cfg.HTTP_TIMEOUT
+
         self.rate_limiter = RateLimitedFetcher(
-            max_per_minute=120,      # Increased for parallel efficiency
+            max_per_minute=60,
             concurrency=max_parallel
         )
 
         self.fetch_stats = {
-            "products_success": 0, "products_failed": 0,
-            "candles_success": 0, "candles_failed": 0,
-            "total_wait_time": 0.0
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0,
+            "total_wait_time": 0.0,
+            "rate_limit_hits": 0
         }
 
-    async def close(self):
-        """CRITICAL: Close the session when the bot shuts down"""
-        if not self.session.closed:
-            await self.session.close()
-        await self.connector.close()
+        logger.debug(
+            f"DataFetcher initialized | max_parallel={max_parallel} | "
+            f"rate_limit=60/min | timeout={self.timeout}s"
+        )
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
+
         async with self.semaphore:
-            # We pass the persistent session to the call
             result = await self.rate_limiter.call(
-                async_fetch_json, url, 
-                session=self.session,  # Using persistent session
-                retries=3, timeout=10
+                async_fetch_json,
+                url,
+                retries=5,
+                backoff=2.0,
+                timeout=self.timeout
             )
-            if result: self.fetch_stats["products_success"] += 1
-            else: self.fetch_stats["products_failed"] += 1
+
+            if result:
+                self.fetch_stats["products_success"] += 1
+                logger.debug(f"Products fetch successful | URL: {url}")
+            else:
+                self.fetch_stats["products_failed"] += 1
+                logger.warning(f"Products fetch failed | URL: {url}")
+
             return result
 
     async def fetch_candles(
@@ -1772,18 +1769,21 @@ class DataFetcher:
     ) -> Optional[Dict[str, Any]]:
         
         if reference_time is None:
-            reference_time = int(time.time())
+            reference_time = get_trigger_timestamp()
 
+        # Determine interval in minutes
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
         
-        # 1. Use the core timing function with the 45s lag fix
+        # 1. FIX: Calculate the strict expected open of the last closed candle
         expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
-        expected_close_ts = expected_open_ts + interval_seconds
 
-        # 2. OPTIMIZATION: Don't request "infinite" future. 
-        # Cap 'to' at expected_close + a small lag. This reduces JSON payload size.
-        to_time = expected_close_ts + 60 
+        # 2. FIX: Request a wider window to handle API publication lag.
+        # We add extra buffer to the 'to' time so the API doesn't truncate the latest candle.
+        buffer_periods = 3 # Increased buffer
+        to_time = reference_time + (interval_seconds * buffer_periods)
+        
+        # Ensure we look back far enough to get 'limit' candles even with the buffer
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
@@ -1797,34 +1797,85 @@ class DataFetcher:
 
         async with self.semaphore:
             data = await self.rate_limiter.call(
-                async_fetch_json, url,
-                session=self.session, # Using persistent session
+                async_fetch_json,
+                url,
                 params=params,
                 retries=cfg.CANDLE_FETCH_RETRIES,
-                timeout=15
+                backoff=cfg.CANDLE_FETCH_BACKOFF,
+                timeout=self.timeout
             )
 
-            if data and data.get("result"):
-                res = data["result"]
-                if not all(k in res for k in ("t", "o", "h", "l", "c", "v")):
+            if data:
+                self.fetch_stats["candles_success"] += 1
+
+                result = data.get("result", {})
+                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                    num_candles = len(result.get("t", []))
+
+                    if num_candles > 0:
+                        last_candle_open_ts = result["t"][-1]
+                        last_candle_close_ts = last_candle_open_ts + interval_seconds
+                        diff = abs(expected_open_ts - last_candle_open_ts)
+
+                        # LOGGING LOGIC
+                        if diff > 300: # Over 5 minutes difference
+                            if last_candle_open_ts < expected_open_ts:
+                                # This is the "API Lag" warning we want to monitor
+                                logger.warning(
+                                    f"⚠️ API DELAY | {symbol} {resolution} | "
+                                    f"Expected: {format_ist_time(expected_open_ts)} | "
+                                    f"Got: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
+                                )
+                            else:
+                                # Data is ahead (normal for lower timeframes like 5m vs 15m)
+                                logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
+                        else:
+                            logger.debug(
+                                f"✅ Scanned {symbol} {resolution} | "
+                                f"Latest: {format_ist_time(last_candle_open_ts)}"
+                            )
+                else:
+                    logger.warning(f"Candles response missing fields | Symbol: {symbol}")
+                    self.fetch_stats["candles_failed"] += 1
                     return None
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
 
-                # 3. FIX: Check if the last candle is "forming" and remove it
-                # This ensures your 15m evaluation is always on a CLOSED candle
-                if len(res["t"]) > 0 and res["t"][-1] > expected_open_ts:
-                    for key in ["t", "o", "h", "l", "c", "v"]:
-                        res[key] = res[key][:-1]
+            return data
 
-                # 4. Success Tracking
-                if len(res["t"]) > 0:
-                    self.fetch_stats["candles_success"] += 1
-                    last_got = res["t"][-1]
-                    if last_got < expected_open_ts:
-                        logger.warning(f"⚠️ API DELAY | {symbol} {resolution} | Missing latest closed candle")
-                    return data
-            
-            self.fetch_stats["candles_failed"] += 1
-            return None
+    def get_stats(self) -> Dict[str, Any]:
+        stats = self.fetch_stats.copy()
+        stats["rate_limiter"] = self.rate_limiter.get_stats()
+        total_products = stats["products_success"] + stats["products_failed"]
+        total_candles = stats["candles_success"] + stats["candles_failed"]
+
+        if total_products > 0:
+            stats["products_success_rate"] = round(stats["products_success"] / total_products * 100, 1)
+        if total_candles > 0:
+            stats["candles_success_rate"] = round(stats["candles_success"] / total_candles * 100, 1)
+        return stats
+
+    async def fetch_candles_batch(
+        self,
+        requests: List[Tuple[str, str, int]],
+        reference_time: Optional[int] = None
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        if reference_time is None:
+            reference_time = get_trigger_timestamp()
+
+        tasks = []
+        request_keys = []
+        for symbol, resolution, limit in requests:
+            task = self.fetch_candles(symbol, resolution, limit, reference_time)
+            tasks.append(task)
+            request_keys.append(f"{symbol}_{resolution}")
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        output = {}
+        for key, result in zip(request_keys, results):
+            output[key] = None if isinstance(result, Exception) else result
+        return output
 
     async def fetch_all_candles_truly_parallel(
         self,
@@ -1833,24 +1884,30 @@ class DataFetcher:
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
     
         if reference_time is None:
-            reference_time = int(time.time())
+            reference_time = get_trigger_timestamp()
 
         all_tasks = []
         task_metadata = []
 
         for symbol, resolutions in pair_requests:
-            for res_str, limit in resolutions:
-                all_tasks.append(self.fetch_candles(symbol, res_str, limit, reference_time))
-                task_metadata.append((symbol, res_str))
+            for resolution, limit in resolutions:
+                task = self.fetch_candles(symbol, resolution, limit, reference_time)
+                all_tasks.append(task)
+                task_metadata.append((symbol, resolution))
 
-        # Use gather to fire all 36+ requests at once
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
-        
         output = {}
-        for (symbol, res_str), result in zip(task_metadata, results):
-            if symbol not in output: output[symbol] = {}
-            output[symbol][res_str] = None if isinstance(result, Exception) else result
+        success_count = 0
 
+        for (symbol, resolution), result in zip(task_metadata, results):
+            if symbol not in output: output[symbol] = {}
+            if isinstance(result, Exception):
+                output[symbol][resolution] = None
+            else:
+                output[symbol][resolution] = result
+                if result: success_count += 1
+
+        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
 def parse_candles_to_numpy(
@@ -2033,7 +2090,6 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     return products_map
 
 class RedisStateStore:
-    
     DEDUP_LUA = """
     local key = KEYS[1]
     local ttl = ARGV[1]
@@ -2045,7 +2101,6 @@ class RedisStateStore:
     end
     """
 
-    # Global variables to persist connection across run cycles
     _global_pool: ClassVar[Optional[redis.Redis]] = None
     _pool_healthy: ClassVar[bool] = False
     _pool_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
@@ -2077,6 +2132,178 @@ class RedisStateStore:
                 f"Metadata TTL: 7d"
             )
 
+    async def _attempt_connect(self, timeout: float = 5.0) -> bool:
+        try:
+            self._redis = redis.from_url(
+                self.redis_url,
+                socket_connect_timeout=timeout,
+                socket_timeout=timeout,
+                retry_on_timeout=True,
+                max_connections=32,
+                decode_responses=True,
+            )
+            ok = await self._ping_with_retry(timeout)
+            if ok:
+                if cfg.DEBUG_MODE:
+                    logger.debug("Connected to RedisStateStore (decode_responses=True, max_connections=32)")
+                self.degraded = False
+                self.degraded_alerted = False
+                self._connection_attempts = 0
+
+                async with RedisStateStore._pool_lock:
+                    RedisStateStore._global_pool = self._redis
+                    RedisStateStore._pool_healthy = True
+                    RedisStateStore._pool_created_at = time.time()
+                    RedisStateStore._pool_reuse_count = 0
+                    if cfg.DEBUG_MODE:
+                        logger.debug("💾 Redis connection saved to global pool")
+
+                try:
+                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                    if cfg.DEBUG_MODE:
+                        logger.debug("Loaded Redis Lua script for alert deduplication")
+                except Exception as e:
+                    logger.warning(f"Failed to load Lua script (will fallback): {e}")
+                    self._dedup_script_sha = None
+
+                return True
+            else:
+                raise RedisConnectionError("ping failed after retries")
+        except Exception as exc:
+            logger.error(f"Redis connection attempt failed: {exc}")
+            if self._redis:
+                try:
+                    await self._redis.aclose()
+                except Exception:
+                    pass
+                self._redis = None
+            return False
+
+    async def connect(self, timeout: float = 5.0) -> None:
+        async with RedisStateStore._pool_lock:
+            if RedisStateStore._global_pool and RedisStateStore._pool_healthy:
+                try:
+                    await asyncio.wait_for(RedisStateStore._global_pool.ping(), timeout=1.0)
+                    self._redis = RedisStateStore._global_pool
+                    RedisStateStore._pool_reuse_count += 1
+
+                    if not self._dedup_script_sha:
+                        try:
+                            self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                        except Exception as e:
+                            logger.warning(f"Lua script load failed: {e}")
+
+                    self.degraded = False
+                    return
+                except Exception as e:
+                    if cfg.DEBUG_MODE:
+                        logger.debug(f"Pool health check failed: {e}, creating new pool")
+                    RedisStateStore._pool_healthy = False
+
+        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
+            self._connection_attempts = attempt
+            if cfg.DEBUG_MODE:
+                logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
+
+            if await self._attempt_connect(timeout):
+                test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
+                test_val = "ok"
+                set_ok = await self._safe_redis_op(
+                    lambda: self._redis.set(test_key, test_val, ex=10),
+                    2.0, "smoke_set"
+                )
+                get_ok = await self._safe_redis_op(
+                    lambda: self._redis.get(test_key),
+                    2.0, "smoke_get", parser=lambda r: r == test_val
+                )
+                if set_ok and get_ok:
+                    await self._safe_redis_op(lambda: self._redis.delete(test_key), 1.0, "smoke_cleanup")
+                    expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
+                    logger.info(
+                        f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)"
+                    )
+                    info = await self._safe_redis_op(lambda: self._redis.info("memory"), 3.0, "info_memory")
+                    if info and cfg.DEBUG_MODE:
+                        policy = info.get("maxmemory_policy", "unknown")
+                        logger.debug(f"Redis memory policy: {policy}")
+                    self.degraded = False
+                    self.degraded_alerted = False
+                    return
+                else:
+                    logger.warning("Redis smoke test failed, marking degraded")
+
+            if attempt < cfg.REDIS_CONNECTION_RETRIES:
+                delay = cfg.REDIS_RETRY_DELAY * attempt
+                logger.warning(f"Retrying Redis connection in {delay}s...")
+                await asyncio.sleep(delay)
+
+        logger.critical("❌ Redis connection failed after all retries")
+        self.degraded = True
+        self._redis = None
+
+        logger.warning("""
+🚨 REDIS DEGRADED MODE ACTIVE:
+- Alert deduplication:  DISABLED (may get duplicates)
+- State persistence:    DISABLED (alerts reset each run)
+- Trading alerts:       STILL ACTIVE (core functionality preserved)
+""")
+
+        if cfg.FAIL_ON_REDIS_DOWN:
+            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
+
+    async def close(self) -> None:
+        if self._redis and self._redis != RedisStateStore._global_pool:
+            try:
+                await self._redis.aclose()
+                if cfg.DEBUG_MODE:
+                    logger.debug("Closed non-pool Redis connection")
+            except Exception:
+                pass
+        self._redis = None
+
+    @classmethod
+    async def shutdown_global_pool(cls) -> None:
+        async with cls._pool_lock:
+            if cls._global_pool:
+                try:
+                    if hasattr(cls._global_pool, 'connection_pool') and cls._global_pool.connection_pool:
+                        pool_age = time.time() - cls._pool_created_at
+                        reuse_count = cls._pool_reuse_count
+                        
+                        logger.info(
+                            f"Shutting down global Redis pool | "
+                            f"Age: {pool_age:.1f}s | "
+                            f"Reuses: {reuse_count}"
+                        )
+                        
+                        await cls._global_pool.aclose()
+                        await asyncio.sleep(0.25)  # Allow cleanup
+                        
+                        cls._global_pool = None
+                        cls._pool_healthy = False
+                        cls._pool_created_at = 0.0
+                        cls._pool_reuse_count = 0
+                        
+                        logger.debug("✅ Global Redis pool shutdown complete")
+                    else:
+                        logger.debug("Redis pool already closed")
+                        cls._global_pool = None
+                        cls._pool_healthy = False
+                        
+                except Exception as e:
+                    logger.error(f"Error shutting down global Redis pool: {e}")
+                    cls._global_pool = None
+                    cls._pool_healthy = False
+            else:
+                logger.debug("Global Redis pool already closed or not created")
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
     async def _ping_with_retry(self, timeout: float) -> bool:
         result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
         return bool(result)
@@ -2091,7 +2318,6 @@ class RedisStateStore:
         if not self._redis:
             return None
         try:
-            # Execute the coroutine with a timeout
             coro = fn()
             result = await asyncio.wait_for(coro, timeout=timeout)
             return parser(result) if parser else result
@@ -2102,221 +2328,215 @@ class RedisStateStore:
             logger.error(f"Failed to {op_name}: {e}")
             return None
 
-    async def _attempt_connect(self, timeout: float = 5.0) -> bool:
-        try:
-            # Setup the asynchronous client
-            temp_redis = redis.from_url(
-                self.redis_url,
-                socket_connect_timeout=timeout,
-                socket_timeout=timeout,
-                retry_on_timeout=True,
-                max_connections=32,
-                decode_responses=True,
-            )
-            
-            # Verify connection
-            self._redis = temp_redis
-            ok = await self._ping_with_retry(timeout)
-            
-            if ok:
-                if cfg.DEBUG_MODE:
-                    logger.debug("Connected to RedisStateStore (Local Container Mode)")
-                
-                self.degraded = False
-                self.degraded_alerted = False
-                self._connection_attempts = 0
-
-                async with RedisStateStore._pool_lock:
-                    RedisStateStore._global_pool = self._redis
-                    RedisStateStore._pool_healthy = True
-                    RedisStateStore._pool_created_at = time.time()
-                    RedisStateStore._pool_reuse_count = 0
-                
-                # Load Lua script for atomic operations
-                try:
-                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                except Exception as e:
-                    logger.warning(f"Failed to load Lua script: {e}")
-                    self._dedup_script_sha = None
-                
-                return True
-            else:
-                raise RedisConnectionError("Ping failed")
-        except Exception as exc:
-            logger.error(f"Redis connection attempt failed: {exc}")
-            if self._redis:
-                try: await self._redis.aclose()
-                except: pass
-            self._redis = None
-            return False
-
-    async def connect(self, timeout: float = 5.0) -> None:
-        async with RedisStateStore._pool_lock:
-            if RedisStateStore._global_pool and RedisStateStore._pool_healthy:
-                try:
-                    await asyncio.wait_for(RedisStateStore._global_pool.ping(), timeout=1.0)
-                    self._redis = RedisStateStore._global_pool
-                    RedisStateStore._pool_reuse_count += 1
-                    # Ensure SHA is loaded for this instance
-                    if not self._dedup_script_sha:
-                        try: self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                        except: pass
-                    self.degraded = False
-                    return
-                except Exception as e:
-                    logger.debug(f"Pool health check failed: {e}")
-                    RedisStateStore._pool_healthy = False
-
-        # If we reach here, we need a new connection
-        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-            self._connection_attempts = attempt
-            if await self._attempt_connect(timeout):
-                # Perform smoke test
-                test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
-                set_ok = await self._safe_redis_op(lambda: self._redis.set(test_key, "1", ex=5), 1.0, "smoke_set")
-                if set_ok:
-                    await self._safe_redis_op(lambda: self._redis.delete(test_key), 1.0, "smoke_del")
-                    logger.info(f"✅ Redis connected and verified (Attempt {attempt})")
-                    return
-
-            if attempt < cfg.REDIS_CONNECTION_RETRIES:
-                await asyncio.sleep(cfg.REDIS_RETRY_DELAY * attempt)
-
-        # Failure State
-        self.degraded = True
-        self._redis = None
-        logger.critical("❌ Redis connection failed after all retries")
-        logger.warning("""
-🚨 REDIS DEGRADED MODE ACTIVE:
-- Alert deduplication:  DISABLED (may get duplicates)
-- State persistence:    DISABLED (alerts reset each run)
-- Trading alerts:        STILL ACTIVE (core functionality preserved)
-""")
-        if cfg.FAIL_ON_REDIS_DOWN:
-            raise RedisConnectionError("Redis unavailable - FAIL_ON_REDIS_DOWN=true")
-
-    async def close(self) -> None:
-        """Detaches handle but keeps global pool alive."""
-        # We specifically DO NOT call aclose() here on the global pool
-        if self._redis and self._redis != RedisStateStore._global_pool:
-            try: await self._redis.aclose()
-            except: pass
-        self._redis = None
-
-    @classmethod
-    async def shutdown_global_pool(cls) -> None:
-        """Call this ONLY when the total application process stops."""
-        async with cls._pool_lock:
-            if cls._global_pool:
-                try:
-                    logger.info("Shutting down global Redis pool...")
-                    await cls._global_pool.aclose()
-                except Exception as e:
-                    logger.error(f"Error shutting down global pool: {e}")
-                finally:
-                    cls._global_pool = None
-                    cls._pool_healthy = False
-
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()
-
-    # --- CRUD OPERATIONS ---
-
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.state_prefix}{key}"),
-            timeout, f"get {key}", parser=lambda r: json_loads(r) if r else None,
+            timeout,
+            f"get {key}",
+            parser=lambda r: json_loads(r) if r else None,
         )
 
-    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
+    async def set(
+        self,
+        key: str,
+        state: Optional[Any],
+        ts: Optional[int] = None,
+        timeout: float = 2.0,
+    ) -> None:
         ts = int(ts or time.time())
+        redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
         await self._safe_redis_op(
-            lambda: self._redis.set(f"{self.state_prefix}{key}", data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None),
-            timeout, f"set {key}"
+            lambda: self._redis.set(
+                redis_key,
+                data,
+                ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
+            ),
+            timeout,
+            f"set {key}",
         )
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
         return await self._safe_redis_op(
-            lambda: self._redis.get(f"{self.meta_prefix}{key}"), timeout, f"get_meta {key}"
+            lambda: self._redis.get(f"{self.meta_prefix}{key}"),
+            timeout,
+            f"get_metadata {key}",
+            parser=lambda r: r if r else None,
         )
 
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
+    async def set_metadata(
+        self, key: str, value: str, timeout: float = 2.0
+    ) -> None:
         await self._safe_redis_op(
-            lambda: self._redis.set(f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds),
-            timeout, f"set_meta {key}"
+            lambda: self._redis.set(
+                f"{self.meta_prefix}{key}", value, ex=self.metadata_expiry_seconds
+            ),
+            timeout,
+            f"set_metadata {key}",
         )
 
-    # --- DEDUPLICATION ---
+    async def check_recent_alert(
+        self, pair: str, alert_key: str, ts: int
+    ) -> bool:
+        
+        if self.degraded:
+            return True
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        if self.degraded: return True
         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
         if self._dedup_script_sha:
-            result = await self._safe_redis_op(
-                lambda: self._redis.evalsha(self._dedup_script_sha, 1, recent_key, str(Constants.ALERT_DEDUP_WINDOW_SEC)),
-                2.0, "evalsha_dedup"
-            )
-            if result is not None: return bool(result)
-        
-        # Fallback to SET NX
+            try:
+                result = await self._safe_redis_op(
+                    lambda: self._redis.evalsha(
+                        self._dedup_script_sha, 1, recent_key, str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                    ),
+                    timeout=2.0,
+                    op_name=f"evalsha_dedup_{pair}:{alert_key}",
+                )
+                should_send = bool(result)
+                if cfg.DEBUG_MODE and not should_send:
+                    logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
+                return should_send
+            except Exception as e:
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"Lua script failed, fallback to SET NX: {e}")
+
         result = await self._safe_redis_op(
             lambda: self._redis.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
-            2.0, "set_nx_dedup", parser=lambda r: bool(r)
+            timeout=2.0,
+            op_name=f"check_recent_alert {pair}:{alert_key}",
+            parser=lambda r: bool(r),
         )
-        return bool(result)
+        should_send = bool(result)
+        if cfg.DEBUG_MODE and not should_send:
+            logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
+        return should_send
 
-    # --- BATCH OPERATIONS ---
+    async def batch_check_recent_alerts(
+        self, checks: List[Tuple[str, str, int]]
+    ) -> Dict[str, bool]:
+        
+        if self.degraded or not checks:
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]:
-        if not self._redis or not keys: return {}
-        redis_keys = [f"{self.state_prefix}{k}" for k in keys]
         try:
-            results = await asyncio.wait_for(self._redis.mget(redis_keys), timeout=timeout)
-            output = {}
-            for idx, key in enumerate(keys):
-                val = results[idx] if idx < len(results) else None
-                output[key] = json_loads(val) if val else None
+            async with self._redis.pipeline() as pipe:
+                keys_map: Dict[str, str] = {}
+                for pair, alert_key, ts in checks:
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                    recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
+                    composite = f"{pair}:{alert_key}"
+                    keys_map[recent_key] = composite
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+
+                results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
+
+            output: Dict[str, bool] = {}
+            for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
+                # True if SET succeeded (new key = send alert)
+                should_send = bool(results[idx]) if idx < len(results) else True
+                output[composite_key] = should_send
+
+            if cfg.DEBUG_MODE:
+                duplicates = sum(1 for v in output.values() if not v)
+                if duplicates > 0:
+                    logger.debug(f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered")
+
             return output
         except Exception as e:
-            logger.error(f"mget_states failed: {e}")
+            logger.error(f"Batch check_recent_alerts failed: {e}")
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+
+    async def mget_states(
+        self,
+        keys: List[str],
+        timeout: float = 2.0
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        if not self._redis or not keys:
             return {}
 
-    async def batch_set_states(self, updates: List[Tuple[str, Any, Optional[int]]], timeout: float = 4.0) -> None:
-        if self.degraded or not updates or not self._redis: return
-        try:
-            async with self._redis.pipeline() as pipe:
-                now = int(time.time())
-                for key, state, custom_ts in updates:
-                    ts = custom_ts or now
-                    data = json_dumps({"state": state, "ts": ts})
-                    pipe.set(f"{self.state_prefix}{key}", data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None)
-                await asyncio.wait_for(pipe.execute(), timeout=timeout)
-        except Exception as e:
-            logger.error(f"batch_set_states failed: {e}")
+        redis_keys = [f"{self.state_prefix}{k}" for k in keys]
 
-    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-        if self.degraded or not self._redis: return False
+        try:
+            results = await asyncio.wait_for(self._redis.mget(redis_keys), timeout=timeout)
+            if not results:
+                return {}
+            output: Dict[str, Optional[Dict[str, Any]]] = {}
+            for idx, key in enumerate(keys):
+                val = results[idx] if idx < len(results) else None
+                if val:
+                    try:
+                        output[key] = json_loads(val)
+                    except Exception as e:
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"Failed to parse state for {key}: {e}")
+                        output[key] = None
+                else:
+                    output[key] = None
+            return output
+        except Exception as e:
+            logger.error(f"mget_states failed for {len(keys)} keys: {e} | Keys sample: {keys[:5]}")
+            return {}
+
+    async def batch_set_states(
+        self,
+        updates: List[Tuple[str, Any, Optional[int]]],
+        timeout: float = 4.0,
+    ) -> None:
+        if self.degraded or not updates or not self._redis:
+            return
+
         try:
             async with self._redis.pipeline() as pipe:
                 now = int(time.time())
                 for key, state, custom_ts in updates:
-                    ts = custom_ts or now
+                    ts = custom_ts if custom_ts is not None else now
                     data = json_dumps({"state": state, "ts": ts})
-                    pipe.set(f"{self.state_prefix}{key}", data, ex=self.expiry_seconds if self.expiry_seconds > 0 else None)
+                    full_key = f"{self.state_prefix}{key}"
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
+                await asyncio.wait_for(pipe.execute(), timeout=timeout)
+
+            if cfg.DEBUG_MODE:
+                logger.debug(f"Batch updated {len(updates)} states atomically")
+        except Exception as e:
+            logger.error(f"Batch state update failed (falling back to individual): {e}")
+            for key, state, custom_ts in updates:
+                await self.set(key, state, custom_ts)
+
+    async def atomic_batch_update(
+        self,
+        updates: List[Tuple[str, Any, Optional[int]]],
+        deletes: Optional[List[str]] = None,
+        timeout: float = 4.0,
+    ) -> bool:
+        if self.degraded or not self._redis:
+            return False
+
+        try:
+            async with self._redis.pipeline() as pipe:
+                now = int(time.time())
+
+                for key, state, custom_ts in updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    data = json_dumps({"state": state, "ts": ts})
+                    full_key = f"{self.state_prefix}{key}"
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
+
                 if deletes:
                     for key in deletes:
                         pipe.delete(f"{self.state_prefix}{key}")
+
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
         except Exception as e:
-            logger.error(f"atomic_batch_update failed: {e}")
+            logger.error(f"Atomic batch update failed: {e}")
             return False
 
 class RedisLock:
@@ -3184,7 +3404,7 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
-    """OPTIMIZED: Persistent pooling and atomic batch processing"""
+    """OPTIMIZED: Smarter caching and parallel execution"""
     
     gc.disable()
     
@@ -3220,7 +3440,7 @@ async def run_once() -> bool:
             )
             return False
 
-        # OPTIMIZED: Use configurable cache TTL for product map
+        # OPTIMIZED: Use configurable cache TTL
         PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
         now = time.time()
         
@@ -3238,15 +3458,18 @@ async def run_once() -> bool:
                 return False
             
             PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
+            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL  # OPTIMIZED: Configurable
             run_once._products_cache = PRODUCTS_CACHE
             
-            logger_run.info(f"✅ Products list cached for {cfg.PRODUCTS_CACHE_TTL / 3600:.1f} hours")
+            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
+            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
+            
             products_map = build_products_map_from_api_result(prod_resp)
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
             logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
-            products_map = build_products_map_from_api_result(PRODUCTS_CACHE["data"])
+            prod_resp = PRODUCTS_CACHE["data"]
+            products_map = build_products_map_from_api_result(prod_resp)
         
         pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
@@ -3258,32 +3481,33 @@ async def run_once() -> bool:
             logger_run.error("❌ No valid pairs to process - aborting run")
             return False
 
-        # --- REDIS INITIALIZATION ---
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
         
-        # Telegram notification if Redis goes down (only alert once)
-        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-        if sdb.degraded and not getattr(run_once, "_redis_degraded_alerted", False):
-            logger_run.critical("⚠️ Redis is in degraded mode – alert deduplication disabled!")
+        if sdb.degraded and not sdb.degraded_alerted:
+            logger_run.critical(
+                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
+            )
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
                 f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
                 f"Time: {format_ist_time()}"
             ))
-            run_once._redis_degraded_alerted = True
-        elif not sdb.degraded:
-            run_once._redis_degraded_alerted = False
+            sdb.degraded_alerted = True
 
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
+        if telegram_queue is None:
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
-        # --- DISTRIBUTED LOCK ---
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
         
         if not lock_acquired:
-            logger_run.warning("⏸️ Another instance is running (Redis lock held) - exiting gracefully")
+            logger_run.warning(
+                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
+            )
             return False
 
         logger_run.debug("🔒 Distributed lock acquired successfully")
@@ -3291,12 +3515,14 @@ async def run_once() -> bool:
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🚀 {cfg.BOT_NAME} - Run Started\n"
+                f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
                 f"Correlation ID: {correlation_id}\n"
                 f"Pairs: {len(pairs_to_process)}"
             ))
 
-        # --- CORE PROCESSING ---
-        logger_run.debug(f"📊 Processing {len(pairs_to_process)} pairs in parallel")
+        logger_run.debug(
+            f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
+        )
 
         all_results = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process,
@@ -3308,84 +3534,123 @@ async def run_once() -> bool:
             if state.get("state") == "ALERT_SENT":
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
 
-        # --- TELEMETRY ---
         fetcher_stats = fetcher.get_stats()
         logger_run.info(
-            f"📡 Fetch stats | Products: {fetcher_stats['products_success']}✅ | "
+            f"📡 Fetch statistics | "
+            f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
             f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
         )
         
+        if "rate_limiter" in fetcher_stats:
+            rate_stats = fetcher_stats["rate_limiter"]
+            if rate_stats.get("total_waits", 0) > 0:
+                logger_run.info(
+                    f"🚦 Rate limiting stats | "
+                    f"Waits: {rate_stats['total_waits']} | "
+                    f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
+                )
+
         final_memory_mb = process.memory_info().rss / 1024 / 1024
+        memory_delta = final_memory_mb - container_memory_mb
+        
         run_duration = time.time() - start_time
         redis_status = "OK" if not sdb.degraded else "DEGRADED"
         
-        logger_run.info(
-            f"✅ RUN COMPLETE | Duration: {run_duration:.1f}s | "
-            f"Alerts: {alerts_sent} | Memory: {int(final_memory_mb)}MB | Redis: {redis_status}"
+        summary = (
+            f"✅ RUN COMPLETE | "
+            f"Duration: {run_duration:.1f}s | "
+            f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
+            f"Alerts: {alerts_sent} | "
+            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
+            f"Redis: {redis_status}"
         )
+        logger_run.info(summary)
 
         if alerts_sent > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
-                f"⚠️ HIGH ALERT VOLUME\nAlerts: {alerts_sent}\nTime: {format_ist_time()}"
+                f"⚠️ HIGH ALERT VOLUME\n"
+                f"Alerts sent: {alerts_sent}\n"
+                f"Pairs processed: {len(all_results)}\n"
+                f"Time: {format_ist_time()}"
             ))
 
         return True
 
     except asyncio.TimeoutError:
-        logger_run.error("⏱️ Run timed out - exceeded maximum duration")
+        logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
         return False
     
     except asyncio.CancelledError:
-        logger_run.warning("🛑 Run cancelled by signal")
+        logger_run.warning("🛑 Run cancelled (shutdown signal received)")
         return False
     
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
+        
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
-                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\nID: {correlation_id}\nError: {str(e)[:100]}"
+                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
+                    f"Error: {str(e)[:200]}\n"
+                    f"Correlation ID: {correlation_id}\n"
+                    f"Time: {format_ist_time()}"
                 ))
-            except: pass
+            except Exception:
+                logger_run.error("Failed to send error notification")
+        
         return False
     
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
         
-        # Release Distributed Lock
-        if lock_acquired and lock:
+        if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
                 logger_run.debug("🔓 Redis lock released")
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}")
         
-        # Detach Redis Handle (Does NOT kill global pool)
         if sdb:
             try:
                 await sdb.close()
-                logger_run.debug("✅ Redis handle detached")
+                logger_run.debug("✅ Redis connection closed")
             except Exception as e:
-                logger_run.error(f"Error detaching Redis: {e}")
+                logger_run.error(f"Error closing Redis: {e}")
         
-        # Close HTTP Sessions
+        try:
+            await RedisStateStore.shutdown_global_pool()
+        except Exception as e:
+            logger_run.error(f"Error shutting down Redis pool: {e}")
+        
         try:
             await SessionManager.close_session()
             logger_run.debug("✅ HTTP session closed")
         except Exception as e:
             logger_run.error(f"Error closing HTTP session: {e}")
         
-        # Garbage Collection
         try:
-            if 'all_results' in locals(): del all_results
-            if 'products_map' in locals(): del products_map
+            if 'all_results' in locals():
+                del all_results
+            if 'products_map' in locals():
+                del products_map
+            if 'fetcher' in locals():
+                del fetcher
+            if 'telegram_queue' in locals():
+                del telegram_queue
+            
             gc.collect()
+            
             logger_run.debug("✅ Memory cleanup completed")
-        except: pass
+        except Exception as e:
+            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
         
         TRACE_ID.set("")
+        PAIR_ID.set("")
+        
         logger_run.debug("🏁 Resource cleanup finished")
+        
         gc.enable()
+
 
 try:
     import uvloop
@@ -3420,37 +3685,20 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
+    # OPTIMIZED: Respect SKIP_WARMUP config option
     if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
 
-    async def main_execution():
-        """
-        Wrapper to ensure global resources are cleaned up 
-        ONLY when the process is truly finished.
-        """
-        try:
-            success = await run_once()
-            if success:
-                logger.info("✅ Bot run completed successfully")
-                return 0
-            else:
-                logger.error("❌ Bot run failed")
-                return 1
-        finally:
-            # THIS is where the pool dies, at the very end of the process.
-            # Not inside run_once.
-            try:
-                await RedisStateStore.shutdown_global_pool()
-            except Exception as e:
-                logger.error(f"Error during final Redis shutdown: {e}")
-
-    # --- EXECUTION ---
     try:
-        # Use a single asyncio.run to manage the lifecycle
-        exit_code = asyncio.run(main_execution())
-        sys.exit(exit_code)
+        success = asyncio.run(run_once())
+        if success:
+            logger.info("✅ Bot run completed successfully")
+            sys.exit(0)
+        else:
+            logger.error("❌ Bot run failed")
+            sys.exit(1)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Bot stopped by timeout or user interrupt")
         sys.exit(130)
