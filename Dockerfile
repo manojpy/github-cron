@@ -29,7 +29,7 @@ RUN uv pip install --no-cache --compile \
 # ============================================================================
 FROM ${BASE_DIGEST} AS runtime
 
-# libgomp1 is required for Numba's parallel execution
+# CRITICAL: libgomp1 is required for Numba's parallel execution (prange)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libgomp1 ca-certificates tzdata \
@@ -39,21 +39,30 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# --- CRITICAL FIX FOR NUMBA ---
-# Create a writable cache directory and give it full permissions.
-# This ensures Numba can find a "locator" to save JIT compiled code.
+# CRITICAL FIX: Create writable cache directory for Numba JIT
+# This ensures Numba can save compiled functions
 RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
 
 # Copy source code and config
 COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
 
-# Environment Setup
+# OPTIMIZED: Environment variables for performance
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app/src" \
     PYTHONDONTWRITEBYTECODE=1 \
-    NUMBA_CACHE_DIR=/tmp/numba_cache
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    NUMBA_NUM_THREADS=4 \
+    NUMBA_THREADING_LAYER=omp \
+    TZ=Asia/Kolkata
+
+# OPTIMIZED: Run as non-root user (security best practice)
+RUN useradd -m -u 1000 botuser && \
+    chown -R botuser:botuser /app /tmp/numba_cache && \
+    chmod +x wrapper.py
+
+USER botuser
 
 # Set entry point
-ENTRYPOINT ["python", "wrapper.py"]
+ENTRYPOINT ["python", "-u", "wrapper.py"]

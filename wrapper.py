@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
+"""
+wrapper.py - Entry Point for Unified MACD Trading Bot
+Handles initialization, configuration validation, execution, and resource monitoring.
+"""
 import asyncio
 import os
 import signal
 import sys
 import logging
 import psutil
+import time
 from typing import NoReturn
 
-# Try to use uvloop for performance
+# OPTIMIZED: Try uvloop first for 2-4x faster event loop
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    UVLOOP_ENABLED = True
 except ImportError:
-    pass
+    UVLOOP_ENABLED = False
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
@@ -21,40 +27,104 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("wrapper")
 
 try:
-    from src.macd_unified import run_once, __version__
+    from src.macd_unified import run_once, __version__, cfg
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
     sys.exit(1)
 
-def log_resource_usage():
-    process = psutil.Process(os.getpid())
-    mem_mb = process.memory_info().rss / 1024 / 1024
-    logger.info(f"📊 Resource Usage: Memory: {mem_mb:.2f} MB")
+def _handle_signal(signum: int, frame) -> NoReturn:
+    """Unified signal handler for graceful shutdown."""
+    sig_name = signal.strsignal(signum) if hasattr(signal, 'strsignal') else str(signum)
+    logger.warning(f"⚠️  Received signal {sig_name} ({signum}) – shutting down")
+    raise KeyboardInterrupt
+
+# OPTIMIZED: Resource monitoring function
+def log_resource_usage(stage: str = "final") -> None:
+    """Log memory and CPU usage for performance monitoring."""
+    try:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        cpu_percent = process.cpu_percent(interval=0.1)
+        
+        logger.info(
+            f"📊 Resource Usage [{stage}] | "
+            f"Memory: {mem_mb:.1f}MB | "
+            f"CPU: {cpu_percent:.1f}%"
+        )
+        
+        # Warn if memory usage is high
+        if hasattr(cfg, 'MEMORY_LIMIT_BYTES'):
+            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+            if mem_mb > (limit_mb * 0.9):
+                logger.warning(
+                    f"⚠️  Memory usage at {mem_mb:.1f}MB "
+                    f"(90% of {limit_mb:.0f}MB limit)"
+                )
+    except Exception as e:
+        logger.debug(f"Could not log resource usage: {e}")
 
 async def main() -> int:
+    """
+    Main async entry point with enhanced monitoring.
+
+    Returns:
+        0: Success
+        2: Runtime error
+        3: Unhandled exception
+        130: Interrupted (SIGINT/SIGTERM)
+    """
+    start_time = time.time()
+    
     try:
-        logger.info(f"🚀 Bot v{__version__} starting execution...")
+        # Log startup info
+        uvloop_status = "✅ enabled" if UVLOOP_ENABLED else "⚠️  disabled"
+        numba_parallel = getattr(cfg, 'NUMBA_PARALLEL', False)
+        
+        logger.info(
+            f"🚀 Bot v{__version__} starting | "
+            f"uvloop: {uvloop_status} | "
+            f"Numba parallel: {numba_parallel}"
+        )
+        
+        # Log initial resource usage
+        log_resource_usage("startup")
+        
+        # Execute main bot logic
         success = await run_once()
-        log_resource_usage()
+        
+        # Calculate execution time
+        duration = time.time() - start_time
+        logger.info(f"⏱️  Execution time: {duration:.2f}s")
+        
+        # Log final resource usage
+        log_resource_usage("complete")
+        
         return 0 if success else 2
+        
     except KeyboardInterrupt:
+        duration = time.time() - start_time
+        logger.warning(f"⚠️  Interrupted after {duration:.1f}s (SIGINT/SIGTERM)")
         return 130
+        
     except asyncio.CancelledError:
-        logger.warning("⏱️ Execution timed out")
+        duration = time.time() - start_time
+        logger.warning(f"⚠️  Cancelled after {duration:.1f}s (timeout)")
         return 130
+        
     except Exception as exc:
-        logger.exception(f"🔥 Critical Failure: {exc}")
+        duration = time.time() - start_time
+        logger.exception(f"❌ UNHANDLED EXCEPTION after {duration:.1f}s: {exc}")
         return 3
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # Install signal handlers
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
     
-    # Graceful shutdown handler
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(loop.stop()))
-
     try:
-        sys.exit(loop.run_until_complete(main()))
-    finally:
-        loop.close()
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        logger.critical(f"FATAL: Unexpected error in wrapper: {e}")
+        sys.exit(3)
