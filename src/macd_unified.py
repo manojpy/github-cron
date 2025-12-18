@@ -3762,7 +3762,7 @@ async def run_once() -> bool:
 
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
-                f"�� {cfg.BOT_NAME} - Run Started\n"
+                f"🔥 {cfg.BOT_NAME} - Run Started\n"
                 f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
                 f"Correlation ID: {correlation_id}\n"
                 f"Pairs: {len(pairs_to_process)}"
@@ -3849,47 +3849,47 @@ async def run_once() -> bool:
         return False
     
     finally:
-    logger_run.debug("🧹 Starting resource cleanup...")
-    
-    if lock_acquired and lock and lock.acquired_by_me:
-        try:
-            await lock.release(timeout=3.0)
-            logger_run.debug("🔓 Redis lock released")
-        except Exception as e:
-            logger_run.error(f"Error releasing lock: {e}")
-    
-    if sdb:
-        try:
-            await sdb.close()
-            logger_run.debug("✅ Redis connection closed")
-        except Exception as e:
-            logger_run.error(f"Error closing Redis: {e}")
-    
-    # ✅ REMOVED: Redis pool shutdown (keeping alive)
-    # ✅ REMOVED: HTTP session close (keeping alive)
-    
-    try:
-        if 'all_results' in locals():
-            del all_results
-        if 'products_map' in locals():
-            del products_map
-        if 'fetcher' in locals():
-            del fetcher
-        if 'telegram_queue' in locals():
-            del telegram_queue
+        logger_run.debug("🧹 Starting resource cleanup...")
         
-        gc.collect()
+        if lock_acquired and lock and lock.acquired_by_me:
+            try:
+                await lock.release(timeout=3.0)
+                logger_run.debug("🔓 Redis lock released")
+            except Exception as e:
+                logger_run.error(f"Error releasing lock: {e}")
         
-        logger_run.debug("✅ Memory cleanup completed")
-    except Exception as e:
-        logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
-    
-    TRACE_ID.set("")
-    PAIR_ID.set("")
-    
-    logger_run.debug("🏁 Resource cleanup finished")
-    
-    gc.enable()
+        if sdb:
+            try:
+                await sdb.close()
+                logger_run.debug("✅ Redis connection closed")
+            except Exception as e:
+                logger_run.error(f"Error closing Redis: {e}")
+        
+        # ✅ REMOVED: Redis pool shutdown (keeping alive)
+        # ✅ REMOVED: HTTP session close (keeping alive)
+        
+        try:
+            if 'all_results' in locals():
+                del all_results
+            if 'products_map' in locals():
+                del products_map
+            if 'fetcher' in locals():
+                del fetcher
+            if 'telegram_queue' in locals():
+                del telegram_queue
+            
+            gc.collect()
+            
+            logger_run.debug("✅ Memory cleanup completed")
+        except Exception as e:
+            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
+        
+        TRACE_ID.set("")
+        PAIR_ID.set("")
+        
+        logger_run.debug("🏁 Resource cleanup finished")
+        
+        gc.enable()
         
 try:
     import uvloop
