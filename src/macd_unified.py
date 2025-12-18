@@ -815,10 +815,10 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nd
         count = 0
         for j in range(start, i + 1):
             val = arr[j]
-        if not np.isnan(val):
+            if not np.isnan(val):
             sum_val += val
             count += 1
-    ma[i] = sum_val / count if count > 0 else 0.0
+        ma[i] = sum_val / count if count > 0 else 0.0
 
             if not np.isnan(val):
                 sum_val += val
