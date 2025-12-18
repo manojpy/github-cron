@@ -10,13 +10,10 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}/trading-bot
 
 jobs:
-  # OPTIMIZED: Fast validation before heavy Docker build
   validate:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      
-      # OPTIMIZED: Parallel syntax check (saves 2-3 seconds)
       - name: Syntax Check
         run: |
           python3 -m py_compile wrapper.py src/*.py &
@@ -28,8 +25,6 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     permissions: { contents: read, packages: write }
-    
-    # OPTIMIZED: Prevent concurrent builds (saves resources)
     concurrency:
       group: trading-bot-build
       cancel-in-progress: true
@@ -45,11 +40,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # OPTIMIZED: Pre-pull base image for faster builds
       - name: Warm up base image
         run: docker pull python:3.11-slim-bookworm
 
-      # OPTIMIZED: Extract metadata for better tagging
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -68,19 +61,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
           provenance: true
           sbom: true
 
-      # OPTIMIZED: Verify build and check size
       - name: Verify image
         run: |
           docker pull ${{ env.IMAGE_NAME }}:latest
           SIZE_MB=$(docker inspect ${{ env.IMAGE_NAME }}:latest --format='{{.Size}}' | awk '{print $1/1024/1024}')
           echo "📦 Image size: ${SIZE_MB} MB"
-          
-          # Warn if image is too large
-          if (( $(echo "$SIZE_MB > 500" | bc -l) )); then
-            echo "⚠️ WARNING: Image size exceeds 500MB"
-          fi
