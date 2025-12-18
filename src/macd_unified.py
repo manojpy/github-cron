@@ -441,9 +441,14 @@ def get_trigger_timestamp() -> int:
     return int(time.time())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
+    
     interval_seconds = interval_minutes * 60
-    current_period_start = (reference_time // interval_seconds) * interval_seconds
+    
+    effective_time = reference_time - 45 
+    
+    current_period_start = (effective_time // interval_seconds) * interval_seconds
     last_closed_candle_open = current_period_start - interval_seconds
+    
     return last_closed_candle_open
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
@@ -3319,62 +3324,40 @@ async def process_pairs_with_workers(
 ) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
     
+    # 1. PHASE 1: PARALLEL DATA FETCH
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
-
-    # Define the 15m target (the primary alert candle)
-    interval_seconds = 15 * 60
-    current_period = reference_time // interval_seconds
-    expected_open_ts_15m = (current_period * interval_seconds) - interval_seconds
-    expected_close_ts_15m = expected_open_ts_15m + interval_seconds
-
-    # If we are within the first 10 seconds of a new candle, look at the one before it
-    if reference_time - expected_close_ts_15m < 10:
-        expected_open_ts_15m -= interval_seconds
-        expected_close_ts_15m -= interval_seconds
-
-    logger_main.debug(
-        f"🎯 15m Scan Target | Open: {format_ist_time(expected_open_ts_15m)} → Close: {format_ist_time(expected_close_ts_15m)}"
-    )
-
     fetch_start = time.time()
+    
+    # Calculate limits dynamically based on config
+    limit_15m = max(300, cfg.RMA_200_PERIOD + 50)
+    limit_5m = max(400, cfg.RMA_200_PERIOD + 100)
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10 if cfg.ENABLE_PIVOT else 0
     
     pair_requests = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
-        if not product_info:
-            logger_main.warning(f"No product info for {pair_name}")
-            continue
+        if not product_info: continue
         
         symbol = product_info["symbol"]
-        # Resolutions to fetch: 15m (for alerts) and 5m (for RMA 200 filter)
-        resolutions = [("15", 300), ("5", 400)]
+        resolutions = [("15", limit_15m), ("5", limit_5m)]
         if cfg.ENABLE_PIVOT:
             resolutions.append(("D", daily_limit))
         
         pair_requests.append((symbol, resolutions))
     
+    # Fetch all candles. We trust fetch_all_candles_truly_parallel to use 
+    # calculate_expected_candle_timestamp internally.
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
     
-    fetch_duration = time.time() - fetch_start
-    logger_main.debug(f"✅ Phase 1 complete in {fetch_duration:.2f}s")
-    
-    if lock.should_extend():
-        if not await lock.extend(timeout=2.0):
-            logger_main.error("Failed to extend Redis lock during fetch phase")
-            return []
-    
-    logger_main.debug("🔍 Phase 2: Parsing candle data...")
-    parse_start = time.time()
-    
-    valid_pairs_data = {}
+    # 2. PHASE 2: PARSE & VALIDATE
+    logger_main.debug("⚙️ Phase 2: Parsing and validating data...")
+    valid_tasks = []
     
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
-        if not product_info:
-            continue
+        if not product_info: continue
         
         symbol = product_info["symbol"]
         candles = all_candles.get(symbol, {})
@@ -3383,73 +3366,37 @@ async def process_pairs_with_workers(
         data_5m = parse_candles_to_numpy(candles.get("5"))
         data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
         
-        # VALIDATION LOGIC
-        # 1. 15m data must be strictly valid for alerts
-        valid_15m, reason_15m = validate_candle_data(data_15m, 220)
-        
-        # 2. 5m data is only for RMA 200. We relax the requirement.
-        # Even if 5m is missing a few recent candles, we can still calculate RMA 200.
-        valid_5m, reason_5m = validate_candle_data(data_5m, 250)
-        
-        if not valid_15m:
-            logger_main.warning(f"Skipping {pair_name}: 15m candle data invalid ({reason_15m})")
+        # Validation checks
+        v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+        if not v15:
+            logger_main.warning(f"Skipping {pair_name}: 15m invalid ({r15})")
             continue
+            
+        valid_tasks.append((pair_name, data_15m, data_5m, data_daily))
 
-        if not valid_5m:
-            # If 5m is failed, we only skip if the data is completely missing or empty
-            if "None or empty" in reason_5m or "Insufficient data" in reason_5m:
-                logger_main.warning(f"Skipping {pair_name}: 5m data missing ({reason_5m})")
-                continue
-            else:
-                logger_main.debug(f"Proceeding with {pair_name} despite 5m warning: {reason_5m}")
-        
-        valid_pairs_data[pair_name] = {
-            "data_15m": data_15m,
-            "data_5m": data_5m,
-            "data_daily": data_daily
-        }
-    
-    parse_duration = time.time() - parse_start
-    logger_main.debug(
-        f"✅ Phase 2 complete in {parse_duration:.2f}s | "
-        f"Valid pairs: {len(valid_pairs_data)}/{len(pairs_to_process)}"
-    )
-    
-    if not valid_pairs_data:
-        return []
-    
-    logger_main.debug(f"⚙️  Phase 3: Evaluating {len(valid_pairs_data)} pairs...")
+    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
+    logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
-    eval_tasks = []
-    for pair_name, pair_data in valid_pairs_data.items():
-        # The reference_time here ensures the 15m validation inside evaluate_pair_and_alert
-        # uses the correct 10:15 timestamp you expect.
-        task = evaluate_pair_and_alert(
-            pair_name,
-            pair_data["data_15m"],
-            pair_data["data_5m"],
-            pair_data["data_daily"],
-            state_db,
-            telegram_queue,
-            correlation_id,
-            reference_time
-        )
-        eval_tasks.append(task)
+    # Use MAX_PARALLEL_FETCH (e.g. 12) to limit concurrent Redis/CPU usage
+    semaphore = asyncio.Semaphore(cfg.MAX_PARALLEL_FETCH)
     
-    results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+    async def guarded_eval(task_data):
+        async with semaphore:
+            p_name, d15, d5, ddaily = task_data
+            try:
+                return await evaluate_pair_and_alert(
+                    p_name, d15, d5, ddaily, state_db, 
+                    telegram_queue, correlation_id, reference_time
+                )
+            except Exception as e:
+                logger_main.error(f"Error in {p_name} evaluation: {e}")
+                return None
+
+    results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
+    valid_results = [r for r in results if r is not None]
     
-    valid_results = []
-    for idx, result in enumerate(results):
-        if isinstance(result, Exception):
-            pair_name = list(valid_pairs_data.keys())[idx]
-            logger_main.error(f"Evaluation error for {pair_name}: {result}")
-        elif result is not None:
-            valid_results.append(result)
-    
-    eval_duration = time.time() - eval_start
-    logger_main.info(f"✅ Phase 3 complete in {eval_duration:.2f}s")
-    
+    logger_main.info(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
     return valid_results
 
 # ============================================================================
