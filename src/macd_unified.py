@@ -1305,10 +1305,23 @@ def calculate_all_indicators_numpy(
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
         
         if cfg.ENABLE_PIVOT and data_daily is not None:
-            results['pivots'] = calculate_pivot_levels_numpy(
-                data_daily["high"], data_daily["low"],
-                data_daily["close"], data_daily["timestamp"]
-            )
+            # Quick check: is price within 5% of yesterday's high/low range?
+            last_close = float(close_15m[-1])
+            daily_high = float(data_daily["high"][-1])
+            daily_low = float(data_daily["low"][-1])
+            daily_range = daily_high - daily_low
+            
+            # If price is far from yesterday's range, skip pivot calculation
+            if abs(last_close - daily_high) < daily_range * 0.5 or \
+               abs(last_close - daily_low) < daily_range * 0.5:
+                results['pivots'] = calculate_pivot_levels_numpy(
+                    data_daily["high"], data_daily["low"],
+                    data_daily["close"], data_daily["timestamp"]
+                )
+            else:
+                results['pivots'] = {}
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"Skipped pivot calc (price {last_close:.2f} far from range {daily_low:.2f}-{daily_high:.2f})")
         else:
             results['pivots'] = {}
         
@@ -2539,6 +2552,88 @@ class RedisStateStore:
             logger.error(f"Atomic batch update failed: {e}")
             return False
 
+    async def atomic_eval_batch(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        state_updates: List[Tuple[str, Any, Optional[int]]],
+        dedup_checks: List[Tuple[str, str, int]]
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """
+        ✅ NEW: Single atomic operation for entire evaluation:
+        1. Get previous states (MGET)
+        2. Set new states (pipeline)
+        3. Check dedup (pipeline)
+        
+        Returns: (previous_states_dict, dedup_results_dict)
+        """
+        if self.degraded:
+            empty_prev = {k: False for k in alert_keys}
+            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            return empty_prev, empty_dedup
+        
+        try:
+            async with self._redis.pipeline() as pipe:
+                # Phase 1: MGET for previous states
+                state_keys = [f"{pair}:{k}" for k in alert_keys]
+                pipe.mget(state_keys)
+                
+                # Phase 2: SET for state updates
+                now = int(time.time())
+                for key, state, custom_ts in state_updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    data = json_dumps({"state": state, "ts": ts})
+                    full_key = f"{self.state_prefix}{key}"
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
+                
+                # Phase 3: SET NX for dedup
+                for pair_name, alert_key, ts in dedup_checks:
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                
+                # Execute all at once
+                results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
+            
+            # Parse results
+            num_state_keys = len(state_keys)
+            num_updates = len(state_updates)
+            
+            # Previous states (first N results from MGET)
+            prev_states = {}
+            mget_results = results[0] if results else []
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                if val:
+                    try:
+                        parsed = json_loads(val)
+                        prev_states[key] = parsed.get("state") == "ACTIVE"
+                    except:
+                        prev_states[key] = False
+                else:
+                    prev_states[key] = False
+            
+            # Dedup results (results after MGET and SETs)
+            dedup_results = {}
+            dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
+            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+                result_idx = dedup_start_idx + idx
+                should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                dedup_results[f"{pair_name}:{alert_key}"] = should_send
+            
+            return prev_states, dedup_results
+            
+        except Exception as e:
+            logger.error(f"atomic_eval_batch failed: {e}")
+            # Fallback to individual operations
+            prev_states = await self.mget_states(state_keys)
+            await self.batch_set_states(state_updates)
+            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+            return prev_states, dedup_results
+
 class RedisLock:
     RELEASE_LUA = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -3175,8 +3270,10 @@ async def evaluate_pair_and_alert(
         base_buy_trend = (rma50_15_val < close_curr and rma200_5_val < close_curr)
         base_sell_trend = (rma50_15_val > close_curr and rma200_5_val > close_curr)
 
-        if base_buy_trend: base_buy_trend = base_buy_trend and (mmh_curr > 0 and cloud_up)
-        if base_sell_trend: base_sell_trend = base_sell_trend and (mmh_curr < 0 and cloud_down)
+        if base_buy_trend: 
+            base_buy_trend = base_buy_trend and (mmh_curr > 0 and cloud_up)
+        if base_sell_trend: 
+            base_sell_trend = base_sell_trend and (mmh_curr < 0 and cloud_down)
 
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
@@ -3189,7 +3286,9 @@ async def evaluate_pair_and_alert(
                 buy_candle_reason = f"NOT GREEN CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
                 logger_pair.debug(f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}")
             elif not buy_candle_passed:
-                _, buy_candle_reason = check_candle_quality_with_reason(open_curr, high_curr, low_curr, close_curr, is_buy=True)
+                _, buy_candle_reason = check_candle_quality_with_reason(
+                    open_curr, high_curr, low_curr, close_curr, is_buy=True
+                )
 
         if base_sell_trend:
             if not is_red_candle:
@@ -3197,120 +3296,261 @@ async def evaluate_pair_and_alert(
                 sell_candle_reason = f"NOT RED CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
                 logger_pair.debug(f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}")
             elif not sell_candle_passed:
-                _, sell_candle_reason = check_candle_quality_with_reason(open_curr, high_curr, low_curr, close_curr, is_buy=False)
+                _, sell_candle_reason = check_candle_quality_with_reason(
+                    open_curr, high_curr, low_curr, close_curr, is_buy=False
+                )
 
         buy_common = base_buy_trend and buy_candle_passed and is_green_candle
         sell_common = base_sell_trend and sell_candle_passed and is_red_candle
 
         # RESTORED MISSING LOGGING BLOCKS
         if base_buy_trend and not buy_common:
-            logger_pair.debug(f"🚫 BUY rejected for {pair_name} | Reason: {buy_candle_reason or 'Unknown'} | Green={is_green_candle} Quality={buy_candle_passed}")
+            logger_pair.debug(
+                f"🚫 BUY rejected for {pair_name} | "
+                f"Reason: {buy_candle_reason or 'Unknown'} | "
+                f"Green={is_green_candle} Quality={buy_candle_passed}"
+            )
         if base_sell_trend and not sell_common:
-            logger_pair.debug(f"🚫 SELL rejected for {pair_name} | Reason: {sell_candle_reason or 'Unknown'} | Red={is_red_candle} Quality={sell_candle_passed}")
+            logger_pair.debug(
+                f"🚫 SELL rejected for {pair_name} | "
+                f"Reason: {sell_candle_reason or 'Unknown'} | "
+                f"Red={is_red_candle} Quality={sell_candle_passed}"
+            )
 
         mmh_reversal_buy = False
         mmh_reversal_sell = False
         if i15 >= 3:
             mmh_m3, mmh_m2 = float(mmh[i15 - 3]), float(mmh[i15 - 2])
-            mmh_reversal_buy = (buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
-            mmh_reversal_sell = (sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
+            mmh_reversal_buy = (
+                buy_common and 
+                mmh_curr > 0 and 
+                mmh_m3 > mmh_m2 > mmh_m1 and 
+                mmh_curr > mmh_m1
+            )
+            mmh_reversal_sell = (
+                sell_common and 
+                mmh_curr < 0 and 
+                mmh_m3 < mmh_m2 < mmh_m1 and 
+                mmh_curr < mmh_m1
+            )
 
         # 5. CONTEXT PREP
         context = {
-            "buy_common": buy_common, "sell_common": sell_common, "close_curr": close_curr, "close_prev": close_prev,
-            "ts_curr": ts_curr, "ppo_curr": ppo_curr, "ppo_prev": ppo_prev, "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr": rsi_curr, "rsi_prev": rsi_prev, "vwap_curr": vwap_curr, "vwap_prev": vwap_prev, "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1, "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell, "pivots": piv,
-            "vwap": cfg.ENABLE_VWAP, "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
-            "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed, "candle_rejection_reason_buy": buy_candle_reason,
-            "candle_rejection_reason_sell": sell_candle_reason, "is_green_candle": is_green_candle, "is_red_candle": is_red_candle,
+            "buy_common": buy_common,
+            "sell_common": sell_common,
+            "close_curr": close_curr,
+            "close_prev": close_prev,
+            "ts_curr": ts_curr,
+            "ppo_curr": ppo_curr,
+            "ppo_prev": ppo_prev,
+            "ppo_sig_curr": ppo_sig_curr,
+            "ppo_sig_prev": ppo_sig_prev,
+            "rsi_curr": rsi_curr,
+            "rsi_prev": rsi_prev,
+            "vwap_curr": vwap_curr,
+            "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr,
+            "mmh_m1": mmh_m1,
+            "mmh_reversal_buy": mmh_reversal_buy,
+            "mmh_reversal_sell": mmh_reversal_sell,
+            "pivots": piv,
+            "vwap": cfg.ENABLE_VWAP,
+            "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
+            "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
+            "candle_rejection_reason_buy": buy_candle_reason,
+            "candle_rejection_reason_sell": sell_candle_reason,
+            "is_green_candle": is_green_candle,
+            "is_red_candle": is_red_candle,
             "pivot_suppressions": []
         }
 
-        ppo_ctx, ppo_sig_ctx, rsi_ctx = {"curr": ppo_curr, "prev": ppo_prev}, {"curr": ppo_sig_curr, "prev": ppo_sig_prev}, {"curr": rsi_curr, "prev": rsi_prev}
+        ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
+        ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
+        rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
+        
+        # ✅ OPTIMIZED: Prepare for batched Redis operation
         raw_alerts = []
-        alert_keys_to_check = [def_["key"] for def_ in ALERT_DEFINITIONS if not (("pivots" in def_["requires"] and not context.get("pivots")) or ("vwap" in def_["requires"] and not context.get("vwap")))]
-        previous_states = await check_multiple_alert_states(sdb, pair_name, [ALERT_KEYS[k] for k in alert_keys_to_check])
+        alert_keys_to_check = [
+            def_["key"] for def_ in ALERT_DEFINITIONS 
+            if not (
+                ("pivots" in def_["requires"] and not context.get("pivots")) or 
+                ("vwap" in def_["requires"] and not context.get("vwap"))
+            )
+        ]
+        redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
         all_state_changes = []
+
+        # ✅ STEP 1: Get previous states FIRST (needed for trigger logic)
+        previous_states = await check_multiple_alert_states(sdb, pair_name, redis_alert_keys)
 
         # 6. TRIGGER LOGIC
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-            if not def_: continue
+            if not def_: 
+                continue
+                
             try:
                 key = ALERT_KEYS[alert_key]
                 trigger = False
+                
+                # Special handling for pivot alerts
                 if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                     level = alert_key.split("_")[-1]
                     is_buy = alert_key.startswith("pivot_up_")
                     valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                    if not valid_cross and reason and context.get("pivots"): context["pivot_suppressions"].append(reason)
-                    trigger = (is_buy and context["buy_common"] or not is_buy and context["sell_common"]) and valid_cross
-                else: trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    
+                    if not valid_cross and reason and context.get("pivots"):
+                        context["pivot_suppressions"].append(reason)
+                    
+                    trigger = (
+                        (is_buy and context["buy_common"]) or 
+                        (not is_buy and context["sell_common"])
+                    ) and valid_cross
+                else:
+                    # Standard alert check
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
 
+                # Only add alert if triggered AND not previously active
                 if trigger and not previous_states.get(key, False):
                     extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
                     raw_alerts.append((def_["title"], extra, def_["key"]))
                     all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
-                    if cfg.DEBUG_MODE: logger_pair.debug(f"✅ NEW alert: {pair_name}:{alert_key}")
-            except Exception as e: logger_pair.warning(f"Alert check failed for {pair_name}, key={alert_key}: {e}")
+                    
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"✅ NEW alert: {pair_name}:{alert_key}")
+                        
+            except Exception as e:
+                logger_pair.warning(
+                    f"Alert check failed for {pair_name}, key={alert_key}: {e}"
+                )
 
-        # 7. STATE RESETS
-        if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr: all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-        if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr: all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+        # 7. STATE RESETS (for crossover alerts that can re-trigger)
+        if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
+            all_state_changes.append(
+                (f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None)
+            )
+        if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
+            all_state_changes.append(
+                (f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None)
+            )
+            
         if context["vwap"]:
-            if close_prev >= vwap_prev and close_curr < vwap_curr: all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-            if close_prev <= vwap_prev and close_curr > vwap_curr: all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+            if close_prev >= vwap_prev and close_curr < vwap_curr:
+                all_state_changes.append(
+                    (f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None)
+                )
+            if close_prev <= vwap_prev and close_curr > vwap_curr:
+                all_state_changes.append(
+                    (f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None)
+                )
+                
         if piv:
             for lvl_n, lvl_v in piv.items():
-                if close_prev > lvl_v and close_curr <= lvl_v: all_state_changes.append((f"{pair_name}:{ALERT_KEYS[f'pivot_up_{lvl_n}']}", "INACTIVE", None))
-                if close_prev < lvl_v and close_curr >= lvl_v: all_state_changes.append((f"{pair_name}:{ALERT_KEYS[f'pivot_down_{lvl_n}']}", "INACTIVE", None))
+                if close_prev > lvl_v and close_curr <= lvl_v:
+                    all_state_changes.append(
+                        (f"{pair_name}:{ALERT_KEYS[f'pivot_up_{lvl_n}']}", "INACTIVE", None)
+                    )
+                if close_prev < lvl_v and close_curr >= lvl_v:
+                    all_state_changes.append(
+                        (f"{pair_name}:{ALERT_KEYS[f'pivot_down_{lvl_n}']}", "INACTIVE", None)
+                    )
 
-        if (mmh_curr > 0 and mmh_curr <= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
-            all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
-        if (mmh_curr < 0 and mmh_curr >= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
-            all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
+        # MMH reversal resets
+        if (mmh_curr > 0 and mmh_curr <= mmh_m1) and \
+           await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
+            all_state_changes.append(
+                (f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None)
+            )
+        if (mmh_curr < 0 and mmh_curr >= mmh_m1) and \
+           await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
+            all_state_changes.append(
+                (f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None)
+            )
 
-        if all_state_changes: await sdb.batch_set_states(all_state_changes)
-
+        # ✅ STEP 2: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
+        dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
+        
+        if all_state_changes or dedup_checks:
+            # Use atomic batch - returns (prev_states, dedup_results)
+            # We already have prev_states, so we only need dedup_results
+            _, dedup_results = await sdb.atomic_eval_batch(
+                pair_name,
+                [],  # Empty - we already got previous states above
+                all_state_changes,
+                dedup_checks
+            )
+        else:
+            dedup_results = {}
+        
         # 8. DEDUP & SEND
         alerts_to_send = []
-        if raw_alerts and not sdb.degraded:
-            dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-            dedup_results = await sdb.batch_check_recent_alerts(dedup_checks)
+        if raw_alerts:
             for title, extra, ak in raw_alerts:
-                if dedup_results.get(f"{pair_name}:{ak}", True): alerts_to_send.append((title, extra, ak))
+                # Check if we should send (not a duplicate)
+                if dedup_results.get(f"{pair_name}:{ak}", True):
+                    alerts_to_send.append((title, extra, ak))
         
         if alerts_to_send:
+            # Limit alerts per pair
             alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
+            
+            # Format message
             if len(alerts_to_send) == 1:
                 title, extra, _ = alerts_to_send[0]
                 msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
             else:
                 items = [(t, e) for t, e, _ in alerts_to_send[:25]]
                 msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
-            if not cfg.DRY_RUN_MODE: await telegram_queue.send(msg)
-            logger_pair.info(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _,_,ak in alerts_to_send]}")
+            
+            # Send to Telegram
+            if not cfg.DRY_RUN_MODE:
+                await telegram_queue.send(msg)
+            
+            logger_pair.info(
+                f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                f"{[ak for _, _, ak in alerts_to_send]}"
+            )
 
         # 9. SUMMARY OUTPUT
         reasons = []
-        if not buy_common and not sell_common: reasons.append("Trend filter blocked")
-        if context.get("candle_quality_failed_buy"): reasons.append(f"BUY quality: {buy_candle_reason}")
-        if context.get("candle_quality_failed_sell"): reasons.append(f"SELL quality: {sell_candle_reason}")
-        if context.get("pivot_suppressions"): reasons.extend(context["pivot_suppressions"])
+        if not buy_common and not sell_common:
+            reasons.append("Trend filter blocked")
+        if context.get("candle_quality_failed_buy"):
+            reasons.append(f"BUY quality: {buy_candle_reason}")
+        if context.get("candle_quality_failed_sell"):
+            reasons.append(f"SELL quality: {sell_candle_reason}")
+        if context.get("pivot_suppressions"):
+            reasons.extend(context["pivot_suppressions"])
         
-        status_msg = f"✔ {pair_name} | cloud={'green' if cloud_up else 'red' if cloud_down else 'neutral'} mmh={mmh_curr:.2f}"
-        if not alerts_to_send: logger_pair.debug(status_msg + (" | No signals" if not (base_buy_trend or base_sell_trend) else ""))
+        status_msg = (
+            f"✔ {pair_name} | "
+            f"cloud={'green' if cloud_up else 'red' if cloud_down else 'neutral'} "
+            f"mmh={mmh_curr:.2f}"
+        )
+        
+        if not alerts_to_send:
+            logger_pair.debug(
+                status_msg + 
+                (" | No signals" if not (base_buy_trend or base_sell_trend) else "")
+            )
 
-        return pair_name, {"state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL", "ts": int(time.time()), 
-                     "summary": {"alerts": len(alerts_to_send), "cloud": "green" if cloud_up else "red" if cloud_down else "neutral", 
-                                 "mmh_hist": round(mmh_curr, 4), "suppression": "; ".join(reasons) or "No conditions met"}}
+        return pair_name, {
+            "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": len(alerts_to_send),
+                "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                "mmh_hist": round(mmh_curr, 4),
+                "suppression": "; ".join(reasons) or "No conditions met"
+            }
+        }
 
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
-    finally: PAIR_ID.set("")
-
+        
+    finally:
+        PAIR_ID.set("")
 
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
@@ -3328,10 +3568,9 @@ async def process_pairs_with_workers(
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
     
-    # Calculate limits dynamically based on config
-    limit_15m = max(300, cfg.RMA_200_PERIOD + 50)
-    limit_5m = max(400, cfg.RMA_200_PERIOD + 100)
-    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 10 if cfg.ENABLE_PIVOT else 0
+    limit_15m = max(200, cfg.RMA_200_PERIOD + 25)
+    limit_5m = max(300, cfg.RMA_200_PERIOD + 50)
+    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 5 if cfg.ENABLE_PIVOT else 0
     
     pair_requests = []
     for pair_name in pairs_to_process:
@@ -3352,7 +3591,8 @@ async def process_pairs_with_workers(
     )
     
     # 2. PHASE 2: PARSE & VALIDATE
-    logger_main.debug("⚙️ Phase 2: Parsing and validating data...")
+    # ✅ OPTIMIZED: PHASE 2 REMOVED - Parsing happens in Phase 3 workers
+    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     valid_tasks = []
     
     for pair_name in pairs_to_process:
@@ -3362,17 +3602,10 @@ async def process_pairs_with_workers(
         symbol = product_info["symbol"]
         candles = all_candles.get(symbol, {})
         
-        data_15m = parse_candles_to_numpy(candles.get("15"))
-        data_5m = parse_candles_to_numpy(candles.get("5"))
-        data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-        
-        # Validation checks
-        v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-        if not v15:
-            logger_main.warning(f"Skipping {pair_name}: 15m invalid ({r15})")
-            continue
-            
-        valid_tasks.append((pair_name, data_15m, data_5m, data_daily))
+        # Just pass raw candles - parsing happens in worker
+        valid_tasks.append((pair_name, candles))
+
+    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL
 
     # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
     logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
@@ -3383,10 +3616,21 @@ async def process_pairs_with_workers(
     
     async def guarded_eval(task_data):
         async with semaphore:
-            p_name, d15, d5, ddaily = task_data
+            p_name, candles = task_data
             try:
+                # ✅ Parse and validate inside worker (parallel execution)
+                data_15m = parse_candles_to_numpy(candles.get("15"))
+                data_5m = parse_candles_to_numpy(candles.get("5"))
+                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+                
+                # Quick validation
+                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                if not v15:
+                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                    return None
+                
                 return await evaluate_pair_and_alert(
-                    p_name, d15, d5, ddaily, state_db, 
+                    p_name, data_15m, data_5m, data_daily, state_db, 
                     telegram_queue, correlation_id, reference_time
                 )
             except Exception as e:
@@ -3514,7 +3758,7 @@ async def run_once() -> bool:
 
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
-                f"🚀 {cfg.BOT_NAME} - Run Started\n"
+                f"�� {cfg.BOT_NAME} - Run Started\n"
                 f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
                 f"Correlation ID: {correlation_id}\n"
                 f"Pairs: {len(pairs_to_process)}"
@@ -3601,57 +3845,48 @@ async def run_once() -> bool:
         return False
     
     finally:
-        logger_run.debug("🧹 Starting resource cleanup...")
-        
-        if lock_acquired and lock and lock.acquired_by_me:
-            try:
-                await lock.release(timeout=3.0)
-                logger_run.debug("🔓 Redis lock released")
-            except Exception as e:
-                logger_run.error(f"Error releasing lock: {e}")
-        
-        if sdb:
-            try:
-                await sdb.close()
-                logger_run.debug("✅ Redis connection closed")
-            except Exception as e:
-                logger_run.error(f"Error closing Redis: {e}")
-        
+    logger_run.debug("🧹 Starting resource cleanup...")
+    
+    if lock_acquired and lock and lock.acquired_by_me:
         try:
-            await RedisStateStore.shutdown_global_pool()
+            await lock.release(timeout=3.0)
+            logger_run.debug("🔓 Redis lock released")
         except Exception as e:
-            logger_run.error(f"Error shutting down Redis pool: {e}")
-        
+            logger_run.error(f"Error releasing lock: {e}")
+    
+    if sdb:
         try:
-            await SessionManager.close_session()
-            logger_run.debug("✅ HTTP session closed")
+            await sdb.close()
+            logger_run.debug("✅ Redis connection closed")
         except Exception as e:
-            logger_run.error(f"Error closing HTTP session: {e}")
+            logger_run.error(f"Error closing Redis: {e}")
+    
+    # ✅ REMOVED: Redis pool shutdown (keeping alive)
+    # ✅ REMOVED: HTTP session close (keeping alive)
+    
+    try:
+        if 'all_results' in locals():
+            del all_results
+        if 'products_map' in locals():
+            del products_map
+        if 'fetcher' in locals():
+            del fetcher
+        if 'telegram_queue' in locals():
+            del telegram_queue
         
-        try:
-            if 'all_results' in locals():
-                del all_results
-            if 'products_map' in locals():
-                del products_map
-            if 'fetcher' in locals():
-                del fetcher
-            if 'telegram_queue' in locals():
-                del telegram_queue
-            
-            gc.collect()
-            
-            logger_run.debug("✅ Memory cleanup completed")
-        except Exception as e:
-            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
+        gc.collect()
         
-        TRACE_ID.set("")
-        PAIR_ID.set("")
+        logger_run.debug("✅ Memory cleanup completed")
+    except Exception as e:
+        logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
+    
+    TRACE_ID.set("")
+    PAIR_ID.set("")
+    
+    logger_run.debug("🏁 Resource cleanup finished")
+    
+    gc.enable()
         
-        logger_run.debug("🏁 Resource cleanup finished")
-        
-        gc.enable()
-
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -3691,8 +3926,27 @@ if __name__ == "__main__":
     else:
         logger.info("Skipping Numba warmup (faster startup)")
 
+    async def main_with_cleanup():
+        """Run bot with proper cleanup on exit"""
+        try:
+            return await run_once()
+        finally:
+            # ✅ NEW: Cleanup persistent connections on shutdown
+            logger.info("🧹 Shutting down persistent connections...")
+            try:
+                await RedisStateStore.shutdown_global_pool()
+                logger.debug("✅ Redis pool closed")
+            except Exception as e:
+                logger.error(f"Error closing Redis pool: {e}")
+            
+            try:
+                await SessionManager.close_session()
+                logger.debug("✅ HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing HTTP session: {e}")
+    
     try:
-        success = asyncio.run(run_once())
+        success = asyncio.run(main_with_cleanup())
         if success:
             logger.info("✅ Bot run completed successfully")
             sys.exit(0)
@@ -3701,6 +3955,7 @@ if __name__ == "__main__":
             sys.exit(1)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Bot stopped by timeout or user interrupt")
+        # Cleanup happens in finally block above
         sys.exit(130)
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
