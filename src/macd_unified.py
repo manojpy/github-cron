@@ -2857,7 +2857,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "vwap_up","title": "🔵▲ Price cross above VWAP","check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and ctx["close_prev"] <= ctx["vwap_prev"] and ctx["close_curr"] > ctx["vwap_curr"] + 0.0002), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
     {"key": "vwap_down", "title": "🟣▼ Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and ctx["close_prev"] >= ctx["vwap_prev"] and ctx["close_curr"] < ctx["vwap_curr"] - 0.0002), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
     {"key": "mmh_buy", "title": "🔵⬆️ MMH Reversal BUY", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
-    {"key": "mmh_sell", "title": "🟣⬇�� MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_sell", "title": "🟣⬇ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
 ]
 
 def _validate_pivot_cross(
@@ -3171,14 +3171,17 @@ async def evaluate_pair_and_alert(
         # 1. IDENTIFY CLOSED CANDLE INDICES
         # We target the 15m closed candle strictly (e.g., 10:15 if current is 10:31)
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-        
-        # FIX: For 5m, we take the latest available instead of strict reference_time
-        # This solves the "Expected 10:25 but got 10:15" skip error.
-        i5 = len(data_5m["timestamp"]) - 1 if len(data_5m["timestamp"]) > 0 else None
+        i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
             return None
+
+        # Extract values
+        close_curr   = close_15m[i15]       # 15m close at last closed candle
+        close_5m_val = close_5m[i5]         # 5m close at last closed candle
+        rma50_15_val = rma50_15[i15]        # 15m RMA50
+        rma200_5_val = rma200_5[i5]         # 5m RMA200
 
         # 2. TIMESTAMP VALIDATION (STRICT ONLY FOR 15m)
         latest_ts = int(data_15m["timestamp"][i15])
@@ -3264,11 +3267,12 @@ async def evaluate_pair_and_alert(
         is_red_candle = close_curr < open_curr
 
         if cfg.DEBUG_MODE:
-            logger_pair.debug(f"Candle analysis | O={open_curr:.4f} C={close_curr:.4f} | Green={is_green_candle} Red={is_red_candle}")
+            logger_pair.debug(f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f} | Green={is_green_candle} Red={is_red_candle}")
 
         # TREND & QUALITY FILTERS
-        base_buy_trend = (rma50_15_val < close_curr and rma200_5_val < close_curr)
-        base_sell_trend = (rma50_15_val > close_curr and rma200_5_val > close_curr)
+        base_buy_trend  = (rma50_15_val < close_curr and rma200_5_val < close_5m_val)
+        base_sell_trend = (rma50_15_val > close_curr and rma200_5_val > close_5m_val)
+
 
         if base_buy_trend: 
             base_buy_trend = base_buy_trend and (mmh_curr > 0 and cloud_up)
