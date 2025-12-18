@@ -803,28 +803,6 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     
     return sd
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """OPTIMIZED: Parallel rolling mean"""
-    rows = len(arr)
-    ma = np.empty(rows, dtype=np.float64)
-
-    for i in prange(rows):
-        start = max(0, i - period + 1)
-        sum_val = 0.0
-        count = 0
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                sum_val += val
-                count += 1
-        ma[i] = sum_val / count if count > 0 else 0.0
-
-            if not np.isnan(val):
-                sum_val += val
-                count += 1
-        ma[i] = sum_val / count if count > 0 else 0.0   
-    return ma
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
