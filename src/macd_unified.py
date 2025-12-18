@@ -497,7 +497,7 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
             return np.array([default], dtype=np.float64)
         
         # Use parallel version for large arrays when enabled
-        if cfg.NUMBA_PARALLEL and len(arr) > 100:
+        if cfg.NUMBA_PARALLEL and len(arr) >= 200:
             sanitized = _sanitize_array_numba_parallel(arr, default)
         else:
             sanitized = _sanitize_array_numba(arr, default)
@@ -930,7 +930,7 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
         smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
         # OPTIMIZED: Conditional parallel sanitization
-        if cfg.NUMBA_PARALLEL and len(smooth_rsi) > 100:
+        if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
             smooth_rsi = _sanitize_array_numba_parallel(smooth_rsi, 50.0)
         else:
             smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
@@ -951,7 +951,7 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
         
         # OPTIMIZED: Conditional parallel sanitization
-        if cfg.NUMBA_PARALLEL and len(ppo) > 100:
+        if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
             ppo = _sanitize_array_numba_parallel(ppo, 0.0)
             ppo_sig = _sanitize_array_numba_parallel(ppo_sig, 0.0)
         else:
@@ -1051,28 +1051,33 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        close_f64 = close.astype(np.float64)  # Ensure float64 for consistency
         
-        # OPTIMIZED: Choose parallel vs serial based on config and size
-        if cfg.NUMBA_PARALLEL and rows > 100:
-            sd = _rolling_std_welford_parallel(close_f64, 50, resp_clamped)
+        # OPTIMIZED: Remove unnecessary type conversion
+        # Data is already float64 from parse_candles_to_numpy()
+        # OLD: close_f64 = close.astype(np.float64)
+        # NEW: Just ensure it's contiguous (zero-copy operation)
+        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
+        
+        # OPTIMIZED: Use higher threshold for expensive rolling std
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
-            sd = _rolling_std_welford(close_f64, 50, resp_clamped)
+            sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
-        worm_arr = _calc_mmh_worm_loop(close_f64, sd, rows)
+        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # OPTIMIZED: Parallel rolling mean for large datasets
-        if cfg.NUMBA_PARALLEL and rows > 100:
-            ma = _rolling_mean_numba_parallel(close_f64, period)
+        # OPTIMIZED: Higher threshold for rolling mean
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            ma = _rolling_mean_numba_parallel(close_c, period)
         else:
-            ma = _rolling_mean_numba(close_f64, period)
+            ma = _rolling_mean_numba(close_c, period)
         
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # OPTIMIZED: Parallel min/max for large datasets
-        if cfg.NUMBA_PARALLEL and rows > 100:
+        # OPTIMIZED: Higher threshold for min/max
+        if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
@@ -1109,33 +1114,45 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
 # ============================================================================
 
 def warmup_numba() -> None:
-    """OPTIMIZED: Faster warmup with parallel compilation"""
+    """OPTIMIZED: Proper warmup with realistic array sizes for parallel compilation"""
     logger.info("Warming up Numba JIT compiler (optimized parallel)...")        
     try:
-        length = 100
-        close64 = np.random.random(length).astype(np.float64) * 1000
-        high64 = close64 + np.random.random(length).astype(np.float64) * 10
-        low64 = close64 - np.random.random(length).astype(np.float64) * 10
-        volume64 = np.random.random(length).astype(np.float64) * 1000
-        timestamps = np.arange(length, dtype=np.int64) * 900
-        sd64 = np.random.random(length).astype(np.float64) * 0.01
-        temp64 = np.random.random(length).astype(np.float64)
+        # CRITICAL FIX: Use realistic array sizes (300-400 elements)
+        # This ensures parallel functions actually compile with prange
+        length_small = 100   # For serial functions
+        length_large = 350   # For parallel functions (matches real data)
+        
+        # Small arrays for serial functions
+        close_small = np.random.random(length_small).astype(np.float64) * 1000
+        
+        # Large arrays for parallel functions (CRITICAL!)
+        close_large = np.random.random(length_large).astype(np.float64) * 1000
+        high_large = close_large + np.random.random(length_large).astype(np.float64) * 10
+        low_large = close_large - np.random.random(length_large).astype(np.float64) * 10
+        volume_large = np.random.random(length_large).astype(np.float64) * 1000
+        timestamps = np.arange(length_large, dtype=np.int64) * 900
 
-        # OPTIMIZED: Compile critical path functions only
+        # OPTIMIZED: Compile critical serial functions first (fast)
         critical_funcs = [
-            lambda: _ema_loop(close64, 0.1),
-            lambda: _calculate_ppo_core(close64, 7, 16, 5),
-            lambda: _calculate_rsi_core(close64, 21),
-            lambda: _vwap_daily_loop(high64, low64, close64, volume64, timestamps),
+            lambda: _ema_loop(close_small, 0.1),
+            lambda: _calculate_ppo_core(close_small, 7, 16, 5),
+            lambda: _calculate_rsi_core(close_small, 21),
         ]
         
-        # Compile parallel functions if enabled
+        # Compile VWAP with realistic size
+        critical_funcs.append(
+            lambda: _vwap_daily_loop(high_large, low_large, close_large, volume_large, timestamps)
+        )
+        
+        # CRITICAL FIX: Compile parallel functions with LARGE arrays
+        # This forces Numba to actually use prange
         if cfg.NUMBA_PARALLEL:
             critical_funcs.extend([
-                lambda: _sanitize_array_numba_parallel(close64, 0.0),
-                lambda: _rolling_std_welford_parallel(close64, 50, 0.9),
-                lambda: _rolling_mean_numba_parallel(close64, 144),
-                lambda: _rolling_min_max_numba_parallel(close64, 144),
+                lambda: _sanitize_array_numba_parallel(close_large, 0.0),
+                lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
+                lambda: _rolling_mean_numba_parallel(close_large, 144),
+                lambda: _rolling_min_max_numba_parallel(close_large, 144),
+                lambda: _sma_loop_parallel(close_large, 20),
             ])
         
         # OPTIMIZED: Parallel compilation with ThreadPoolExecutor
@@ -1226,51 +1243,82 @@ def calculate_all_indicators_numpy(
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
 ) -> Dict[str, np.ndarray]:
-    results = {}    
-    close_15m = data_15m["close"]
-    close_5m = data_5m["close"]
+    """OPTIMIZED: Disable GC during all indicator calculations"""
     
-    ppo, ppo_signal = calculate_ppo_numpy(
-        close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
-    )
-    results['ppo'] = ppo
-    results['ppo_signal'] = ppo_signal
+    # CRITICAL FIX: Disable GC for entire indicator calculation
+    # This prevents GC checks during intermediate array allocations
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
     
-    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
-        close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
-    )
-    
-    if cfg.ENABLE_VWAP:
-        results['vwap'] = calculate_vwap_numpy(
-            data_15m["high"], data_15m["low"], data_15m["close"],
-            data_15m["volume"], data_15m["timestamp"]
+    try:
+        results = {}    
+        close_15m = data_15m["close"]
+        close_5m = data_5m["close"]
+        
+        ppo, ppo_signal = calculate_ppo_numpy(
+            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
-    else:
-        results['vwap'] = np.zeros_like(close_15m)
-    
-    mmh = calculate_magical_momentum_hist(close_15m)
-    results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    if cfg.CIRRUS_CLOUD_ENABLED:
-        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
-        results['upw'] = upw
-        results['dnw'] = dnw
-    else:
-        results['upw'] = np.zeros(len(close_15m), dtype=bool)
-        results['dnw'] = np.zeros(len(close_15m), dtype=bool)
-    
-    results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
-    results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-    
-    if cfg.ENABLE_PIVOT and data_daily is not None:
-        results['pivots'] = calculate_pivot_levels_numpy(
-            data_daily["high"], data_daily["low"],
-            data_daily["close"], data_daily["timestamp"]
+        results['ppo'] = ppo
+        results['ppo_signal'] = ppo_signal
+        
+        results['smooth_rsi'] = calculate_smooth_rsi_numpy(
+            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
-    else:
-        results['pivots'] = {}
-    
-    return results
+        
+        if cfg.ENABLE_VWAP:
+            results['vwap'] = calculate_vwap_numpy(
+                data_15m["high"], data_15m["low"], data_15m["close"],
+                data_15m["volume"], data_15m["timestamp"]
+            )
+        else:
+            results['vwap'] = np.zeros_like(close_15m)
+        
+        mmh = calculate_magical_momentum_hist(close_15m)
+        results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if cfg.CIRRUS_CLOUD_ENABLED:
+            upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
+            results['upw'] = upw
+            results['dnw'] = dnw
+        else:
+            results['upw'] = np.zeros(len(close_15m), dtype=bool)
+            results['dnw'] = np.zeros(len(close_15m), dtype=bool)
+        
+        results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
+        results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
+        
+        if cfg.ENABLE_PIVOT and data_daily is not None:
+            results['pivots'] = calculate_pivot_levels_numpy(
+                data_daily["high"], data_daily["low"],
+                data_daily["close"], data_daily["timestamp"]
+            )
+        else:
+            results['pivots'] = {}
+        
+        return results
+        
+    finally:
+        # CRITICAL: Re-enable GC only if it was enabled before
+        if gc_was_enabled:
+            gc.enable()
+
+
+# ALSO UPDATE evaluate_pair_and_alert (Line 4188):
+# OLD:
+gc.disable()
+try:
+    indicators = await asyncio.to_thread(
+        calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+    )
+finally:
+    gc.enable()
+
+# NEW (simpler):
+indicators = await asyncio.to_thread(
+    calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+)
+# GC management is now handled inside calculate_all_indicators_numpy
 
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
