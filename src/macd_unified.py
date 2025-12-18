@@ -1303,23 +1303,6 @@ def calculate_all_indicators_numpy(
         if gc_was_enabled:
             gc.enable()
 
-
-# ALSO UPDATE evaluate_pair_and_alert (Line 4188):
-# OLD:
-gc.disable()
-try:
-    indicators = await asyncio.to_thread(
-        calculate_all_indicators_numpy, data_15m, data_5m, data_daily
-    )
-finally:
-    gc.enable()
-
-# NEW (simpler):
-indicators = await asyncio.to_thread(
-    calculate_all_indicators_numpy, data_15m, data_5m, data_daily
-)
-# GC management is now handled inside calculate_all_indicators_numpy
-
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -2821,7 +2804,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "vwap_up","title": "🔵▲ Price cross above VWAP","check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and ctx["close_prev"] <= ctx["vwap_prev"] and ctx["close_curr"] > ctx["vwap_curr"] + 0.0002), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
     {"key": "vwap_down", "title": "🟣▼ Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and ctx["close_prev"] >= ctx["vwap_prev"] and ctx["close_curr"] < ctx["vwap_curr"] - 0.0002), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
     {"key": "mmh_buy", "title": "🔵⬆️ MMH Reversal BUY", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
-    {"key": "mmh_sell", "title": "🟣⬇️ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_sell", "title": "🟣⬇�� MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
 ]
 
 def _validate_pivot_cross(
@@ -3157,13 +3140,9 @@ async def evaluate_pair_and_alert(
             return None
 
         # 3. CALCULATE INDICATORS
-        gc.disable()
-        try:
-            indicators = await asyncio.to_thread(
-                calculate_all_indicators_numpy, data_15m, data_5m, data_daily
-            )
-        finally:
-            gc.enable()
+        indicators = await asyncio.to_thread(
+            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+        )
 
         ppo = indicators['ppo']
         ppo_signal = indicators['ppo_signal']
