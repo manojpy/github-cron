@@ -358,8 +358,6 @@ _VALIDATION_DONE = False
 PRODUCTS_CACHE: Dict[str, Any] = {"data": None, "until": 0.0}
 
 def validate_runtime_config() -> None:
-
-def validate_runtime_config() -> None:
     global _VALIDATION_DONE
     if _VALIDATION_DONE:
         logger.debug("Configuration validation skipped (cached)")
