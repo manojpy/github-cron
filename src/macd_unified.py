@@ -2710,12 +2710,12 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-    
+        
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
-    
+        
         try:
             async with self._redis.pipeline() as pipe:
                 # Phase 1: MGET for previous states
