@@ -34,6 +34,15 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
+# ⚡ Try to import AOT-compiled functions (fallback to JIT if not available)
+try:
+    import numba_compiled
+    USE_AOT = True
+    logger.info("⚡ Using AOT-compiled Numba functions (faster startup)")
+except ImportError:
+    USE_AOT = False
+    logger.info("ℹ️ AOT modules not found, using JIT compilation")
+
 try:
     import orjson
     
@@ -76,6 +85,32 @@ class Constants:
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
+
+# ============================================================================
+# STATIC PRODUCTS MAP (Eliminates API fetch overhead)
+# ============================================================================
+STATIC_PRODUCTS_MAP = {
+    "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
+    "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
+    "AVAXUSD": {"id": 262, "symbol": "AVAXUSDT", "contract_type": "perpetual_futures"},
+    "BCHUSD": {"id": 186, "symbol": "BCHUSDT", "contract_type": "perpetual_futures"},
+    "XRPUSD": {"id": 141, "symbol": "XRPUSDT", "contract_type": "perpetual_futures"},
+    "BNBUSD": {"id": 275, "symbol": "BNBUSDT", "contract_type": "perpetual_futures"},
+    "LTCUSD": {"id": 163, "symbol": "LTCUSDT", "contract_type": "perpetual_futures"},
+    "DOTUSD": {"id": 228, "symbol": "DOTUSDT", "contract_type": "perpetual_futures"},
+    "ADAUSD": {"id": 142, "symbol": "ADAUSDT", "contract_type": "perpetual_futures"},
+    "SUIUSD": {"id": 666, "symbol": "SUIUSDT", "contract_type": "perpetual_futures"},
+    "AAVEUSD": {"id": 227, "symbol": "AAVEUSDT", "contract_type": "perpetual_futures"},
+    "SOLUSD": {"id": 143, "symbol": "SOLUSDT", "contract_type": "perpetual_futures"},
+}
+
+# Validation: Ensure all configured pairs have mappings
+_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
+if _missing_products:
+    logger.warning(
+        f"⚠️ Missing product mappings for: {_missing_products}. "
+        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
+    )
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -319,6 +354,7 @@ def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], s
     if condition and logger_obj.isEnabledFor(logging.DEBUG):
         logger_obj.debug(msg_fn())
         
+
 def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) -> None:
     if is_important:
         logger_obj.info(msg)
@@ -495,17 +531,14 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
-    """OPTIMIZED: Choose parallel vs serial based on size and config"""
+    """OPTIMIZED: Uses smart wrapper with AOT support and adaptive thresholds"""
     try:
         if arr is None or len(arr) == 0:
             logger.warning(f"Indicator {name} is None or empty")
             return np.array([default], dtype=np.float64)
         
-        # Use parallel version for large arrays when enabled
-        if cfg.NUMBA_PARALLEL and len(arr) >= 200:
-            sanitized = _sanitize_array_numba_parallel(arr, default)
-        else:
-            sanitized = _sanitize_array_numba(arr, default)
+        # ⚡ Use smart wrapper (handles AOT + parallel threshold logic)
+        sanitized = sanitize_array_wrapper(arr, default)
         
         if np.all(sanitized == default):
             logger.warning(f"Indicator {name} is all {default} after sanitization")
@@ -515,7 +548,7 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
     except Exception as e:
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
-
+        
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """OPTIMIZED: Parallel SMA calculation"""
@@ -907,20 +940,16 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
     return rsi
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
-    """Wrapper for smooth RSI - minimal GIL time."""
     try:
         if close is None or len(close) < rsi_len:
-            logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
+            logger.warning(f"Smooth RSI: Insufficient data")
             return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
         
         rsi = _calculate_rsi_core(close, rsi_len)
         smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
-        # OPTIMIZED: Conditional parallel sanitization
-        if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
-            smooth_rsi = _sanitize_array_numba_parallel(smooth_rsi, 50.0)
-        else:
-            smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
+        # ⚡ Use smart wrapper (handles AOT + threshold 300)
+        smooth_rsi = sanitize_array_wrapper(smooth_rsi, 50.0)
         
         return smooth_rsi
         
@@ -937,13 +966,9 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         
         ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
         
-        # OPTIMIZED: Conditional parallel sanitization
-        if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
-            ppo = _sanitize_array_numba_parallel(ppo, 0.0)
-            ppo_sig = _sanitize_array_numba_parallel(ppo_sig, 0.0)
-        else:
-            ppo = _sanitize_array_numba(ppo, 0.0)
-            ppo_sig = _sanitize_array_numba(ppo_sig, 0.0)
+        # ⚡ Use smart wrapper (handles AOT + threshold 300)
+        ppo = sanitize_array_wrapper(ppo, 0.0)
+        ppo_sig = sanitize_array_wrapper(ppo_sig, 0.0)
         
         return ppo, ppo_sig
     except Exception as e:
@@ -1039,35 +1064,21 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # OPTIMIZED: Remove unnecessary type conversion
-        # Data is already float64 from parse_candles_to_numpy()
-        # OLD: close_f64 = close.astype(np.float64)
-        # NEW: Just ensure it's contiguous (zero-copy operation)
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
-        # OPTIMIZED: Use higher threshold for expensive rolling std
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
-        else:
-            sd = _rolling_std_welford(close_c, 50, resp_clamped)
-        
+        sd = rolling_std_wrapper(close_c, 50, resp_clamped)
+    
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+    
         
-        # OPTIMIZED: Higher threshold for rolling mean
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = _rolling_mean_numba_parallel(close_c, period)
-        else:
-            ma = _rolling_mean_numba(close_c, period)
-        
+        ma = rolling_mean_wrapper(close_c, period)
+
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
-        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # OPTIMIZED: Higher threshold for min/max
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
-        else:
-            min_med, max_med = _rolling_min_max_numba(raw, period)
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    
+        min_med, max_med = rolling_minmax_wrapper(raw, period)
         
         denom = max_med - min_med
         denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
@@ -1158,7 +1169,139 @@ def _vectorized_wick_check_sell(
     
     return result
 
+# ============================================================================
+# AOT/JIT SMART WRAPPERS with Adaptive Thresholds
+# ============================================================================
 
+def ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    Wrapper for EMA calculation.
+    EMA is inherently serial, so no parallel version exists.
+    """
+    if USE_AOT:
+        return numba_compiled.ema_loop(data, alpha)
+    else:
+        return _ema_loop(data, alpha)
+
+
+def sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    Wrapper for SMA calculation with smart threshold.
+    Threshold: 600 (moderate cost operation)
+    """
+    if USE_AOT:
+        return numba_compiled.sma_loop(data, period)
+    else:
+        # ⚡ OPTIMIZED: SMA is moderate cost - threshold 600
+        if cfg.NUMBA_PARALLEL and len(data) >= 600:
+            return _sma_loop_parallel(data, period)
+        else:
+            return _sma_loop(data, period)
+
+
+def sanitize_array_wrapper(arr: np.ndarray, default: float) -> np.ndarray:
+    """
+    Wrapper for array sanitization with smart threshold.
+    Threshold: 300 (cheap operation - just checks)
+    """
+    if USE_AOT:
+        return numba_compiled.sanitize_array(arr, default)
+    else:
+        # ⚡ OPTIMIZED: Sanitization is cheap - threshold 300
+        if cfg.NUMBA_PARALLEL and len(arr) >= 300:
+            return _sanitize_array_numba_parallel(arr, default)
+        else:
+            return _sanitize_array_numba(arr, default)
+
+
+def rolling_std_wrapper(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """
+    Wrapper for rolling standard deviation with smart threshold.
+    Threshold: 400 (expensive operation - sqrt, variance)
+    """
+    if USE_AOT:
+        # AOT doesn't have this function yet, fall back to JIT
+        if cfg.NUMBA_PARALLEL and len(close) >= 400:
+            return _rolling_std_welford_parallel(close, period, responsiveness)
+        else:
+            return _rolling_std_welford(close, period, responsiveness)
+    else:
+        # ⚡ OPTIMIZED: Rolling STD is expensive - threshold 400
+        if cfg.NUMBA_PARALLEL and len(close) >= 400:
+            return _rolling_std_welford_parallel(close, period, responsiveness)
+        else:
+            return _rolling_std_welford(close, period, responsiveness)
+
+
+def rolling_mean_wrapper(close: np.ndarray, period: int) -> np.ndarray:
+    """
+    Wrapper for rolling mean with smart threshold.
+    Threshold: 600 (moderate cost operation)
+    """
+    if USE_AOT:
+        # Use AOT SMA if available
+        return numba_compiled.sma_loop(close, period)
+    else:
+        # ⚡ OPTIMIZED: Rolling mean is moderate - threshold 600
+        if cfg.NUMBA_PARALLEL and len(close) >= 600:
+            return _rolling_mean_numba_parallel(close, period)
+        else:
+            return _rolling_mean_numba(close, period)
+
+
+def rolling_minmax_wrapper(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Wrapper for rolling min/max with smart threshold.
+    Threshold: 500 (moderate cost operation)
+    """
+    if USE_AOT:
+        # AOT doesn't have this function yet, fall back to JIT
+        if cfg.NUMBA_PARALLEL and len(arr) >= 500:
+            return _rolling_min_max_numba_parallel(arr, period)
+        else:
+            return _rolling_min_max_numba(arr, period)
+    else:
+        # ⚡ OPTIMIZED: Rolling min/max is moderate - threshold 500
+        if cfg.NUMBA_PARALLEL and len(arr) >= 500:
+            return _rolling_min_max_numba_parallel(arr, period)
+        else:
+            return _rolling_min_max_numba(arr, period)
+
+
+def vectorized_wick_check_buy_wrapper(
+    open_arr: np.ndarray,
+    high_arr: np.ndarray,
+    low_arr: np.ndarray,
+    close_arr: np.ndarray,
+    min_wick_ratio: float
+) -> np.ndarray:
+    """Wrapper for buy candle quality check - uses AOT if available"""
+    if USE_AOT:
+        return numba_compiled.vectorized_wick_buy(
+            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+        )
+    else:
+        return _vectorized_wick_check_buy(
+            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+        )
+
+
+def vectorized_wick_check_sell_wrapper(
+    open_arr: np.ndarray,
+    high_arr: np.ndarray,
+    low_arr: np.ndarray,
+    close_arr: np.ndarray,
+    min_wick_ratio: float
+) -> np.ndarray:
+    """Wrapper for sell candle quality check - uses AOT if available"""
+    if USE_AOT:
+        return numba_compiled.vectorized_wick_sell(
+            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+        )
+    else:
+        return _vectorized_wick_check_sell(
+            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+        )
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================
@@ -1379,7 +1522,8 @@ def calculate_all_indicators_numpy(
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray]:
-    buy_quality = _vectorized_wick_check_buy(
+    # ⚡ Use wrappers that select AOT/JIT automatically
+    buy_quality = vectorized_wick_check_buy_wrapper(
         data_15m["open"],
         data_15m["high"],
         data_15m["low"],
@@ -1387,7 +1531,7 @@ def precompute_candle_quality(
         Constants.MIN_WICK_RATIO
     )
     
-    sell_quality = _vectorized_wick_check_sell(
+    sell_quality = vectorized_wick_check_sell_wrapper(
         data_15m["open"],
         data_15m["high"],
         data_15m["low"],
@@ -1769,7 +1913,67 @@ class RateLimitedFetcher:
             "max_per_minute": self.max_per_minute
         }
 
+class APICircuitBreaker:
+    """Prevents cascading failures when API is degraded"""
+    
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.last_failure_time = 0.0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.success_count = 0
+        
+    def record_success(self) -> None:
+        """Record successful API call"""
+        if self.state == "HALF_OPEN":
+            self.success_count += 1
+            if self.success_count >= 2:
+                logger.info("🟢 Circuit breaker: Recovered, transitioning to CLOSED")
+                self.state = "CLOSED"
+                self.failures = 0
+                self.success_count = 0
+        elif self.state == "CLOSED":
+            # Reset failure count on success
+            if self.failures > 0:
+                self.failures = max(0, self.failures - 1)
+    
+    def record_failure(self) -> None:
+        """Record failed API call"""
+        self.failures += 1
+        self.last_failure_time = time.time()
+        
+        if self.failures >= self.failure_threshold and self.state == "CLOSED":
+            logger.warning(
+                f"🔴 Circuit breaker: OPENED after {self.failures} failures. "
+                f"Blocking requests for {self.recovery_timeout}s"
+            )
+            self.state = "OPEN"
+    
+    def can_attempt(self) -> Tuple[bool, Optional[str]]:
+        """Check if request should be allowed"""
+        if self.state == "CLOSED":
+            return True, None
+        
+        if self.state == "OPEN":
+            # Check if recovery timeout has passed
+            elapsed = time.time() - self.last_failure_time
+            if elapsed >= self.recovery_timeout:
+                logger.info("🟡 Circuit breaker: Transitioning to HALF_OPEN (testing recovery)")
+                self.state = "HALF_OPEN"
+                self.success_count = 0
+                return True, None
+            
+            return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
+        
+        # HALF_OPEN: Allow limited requests to test recovery
+        return True, None
+
+
 class DataFetcher:
+
+    class DataFetcher:
+
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
@@ -1781,14 +1985,19 @@ class DataFetcher:
             max_per_minute=60,
             concurrency=max_parallel
         )
+    
+        # ⚡ NEW: Circuit breaker
+        self.circuit_breaker = APICircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=60
+        )
 
         self.fetch_stats = {
             "products_success": 0,
             "products_failed": 0,
             "candles_success": 0,
             "candles_failed": 0,
-            "total_wait_time": 0.0,
-            "rate_limit_hits": 0
+            "circuit_breaker_blocks": 0,
         }
 
         logger.debug(
@@ -1824,6 +2033,13 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
+    
+        # ⚡ NEW: Check circuit breaker
+        can_proceed, reason = self.circuit_breaker.can_attempt()
+        if not can_proceed:
+            logger.warning(f"Circuit breaker blocked request for {symbol}: {reason}")
+            self.fetch_stats["circuit_breaker_blocks"] += 1
+            return None
         
         if reference_time is None:
             reference_time = get_trigger_timestamp()
@@ -1864,6 +2080,13 @@ class DataFetcher:
 
             if data:
                 self.fetch_stats["candles_success"] += 1
+                self.circuit_breaker.record_success()  # ⚡ NEW
+        
+                result = data.get("result", {})
+    else:
+        self.fetch_stats["candles_failed"] += 1
+        self.circuit_breaker.record_failure()  # ⚡ NEW
+        logger.warning(f"Candles fetch failed | Symbol: {symbol}")
 
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
@@ -2019,7 +2242,31 @@ def validate_candle_data(
     try:
         if data is None or not data:
             return False, "Data is None or empty"
-
+        
+        # ⚡ NEW: Data Freshness Check
+        close = data.get("close")
+        timestamp = data.get("timestamp")
+        
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
+        
+        # Check if data is stale (API frozen/cached)
+        current_time = get_trigger_timestamp()
+        last_candle_time = int(timestamp[-1])
+        staleness = current_time - last_candle_time
+        
+        # Allow 15min candle + 2min buffer for API lag
+        MAX_STALENESS = (15 * 60) + 120  # 17 minutes
+        
+        if staleness > MAX_STALENESS:
+            return False, (
+                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "
+                f"Last candle: {format_ist_time(last_candle_time)} | "
+                f"Current: {format_ist_time(current_time)}"
+            )
+        
+        if close is None or len(close) == 0:
+            return False, "Close array is empty"
         close = data.get("close")
         timestamp = data.get("timestamp")
 
@@ -2092,8 +2339,9 @@ def get_last_closed_index_from_array(
         return None
 
     last_closed_idx = int(valid_indices[-1])
-    logger.debug(
-        f"Selected fully closed candle | Index: {last_closed_idx} | "
+
+    debug_if(cfg.DEBUG_MODE, logger, 
+             lambda: f"Selected fully closed candle | Index: {last_closed_idx}")
         f"TS: {format_ist_time(timestamps[last_closed_idx])}"
     )
     return last_closed_idx
@@ -2563,6 +2811,88 @@ class RedisStateStore:
             logger.error(f"Batch state update failed (falling back to individual): {e}")
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
+
+    async def atomic_eval_batch(
+    self,
+    pair: str,
+    alert_keys: List[str],
+    state_updates: List[Tuple[str, Any, Optional[int]]],
+    dedup_checks: List[Tuple[str, str, int]]
+) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    """
+    ✅ NEW: Single atomic operation for entire evaluation:
+    1. Get previous states (MGET)
+    2. Set new states (pipeline)
+    3. Check dedup (pipeline)
+    
+    Returns: (previous_states_dict, dedup_results_dict)
+    """
+    if self.degraded:
+        empty_prev = {k: False for k in alert_keys}
+        empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+        return empty_prev, empty_dedup
+    
+    try:
+        async with self._redis.pipeline() as pipe:
+            # Phase 1: MGET for previous states
+            state_keys = [f"{pair}:{k}" for k in alert_keys]
+            pipe.mget(state_keys)
+            
+            # Phase 2: SET for state updates
+            now = int(time.time())
+            for key, state, custom_ts in state_updates:
+                ts = custom_ts if custom_ts is not None else now
+                data = json_dumps({"state": state, "ts": ts})
+                full_key = f"{self.state_prefix}{key}"
+                if self.expiry_seconds > 0:
+                    pipe.set(full_key, data, ex=self.expiry_seconds)
+                else:
+                    pipe.set(full_key, data)
+            
+            # Phase 3: SET NX for dedup
+            for pair_name, alert_key, ts in dedup_checks:
+                window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+            
+            # Execute all at once
+            results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
+        
+        # Parse results
+        num_state_keys = len(state_keys)
+        num_updates = len(state_updates)
+        
+        # Previous states (first N results from MGET)
+        prev_states = {}
+        mget_results = results[0] if results else []
+        for idx, key in enumerate(alert_keys):
+            val = mget_results[idx] if idx < len(mget_results) else None
+            if val:
+                try:
+                    parsed = json_loads(val)
+                    prev_states[key] = parsed.get("state") == "ACTIVE"
+                except:
+                    prev_states[key] = False
+            else:
+                prev_states[key] = False
+        
+        # Dedup results (results after MGET and SETs)
+        dedup_results = {}
+        dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
+        for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+            result_idx = dedup_start_idx + idx
+            should_send = bool(results[result_idx]) if result_idx < len(results) else True
+            dedup_results[f"{pair_name}:{alert_key}"] = should_send
+        
+        return prev_states, dedup_results
+        
+    except Exception as e:
+        logger.error(f"atomic_eval_batch failed: {e}")
+        # Fallback to individual operations
+        prev_states = await self.mget_states(state_keys)
+        await self.batch_set_states(state_updates)
+        dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+        return prev_states, dedup_results
 
     async def atomic_batch_update(
         self,
@@ -3160,12 +3490,37 @@ async def evaluate_pair_and_alert(
             logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
             return None
 
-        # ===================================================================
-        # STEP 2: ✅ CALCULATE INDICATORS FIRST (before accessing any arrays)
-        # ===================================================================
-        indicators = await asyncio.to_thread(
-            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
-        )
+# ===================================================================
+# STEP 2: ⚡ QUICK PRE-CHECK (Skip expensive calculations if possible)
+# ===================================================================
+close_15m = data_15m["close"]
+close_5m = data_5m["close"]
+timestamps_15m = data_15m["timestamp"]
+
+# Quick trend check without full indicator calculation
+i15_quick = get_last_closed_index_from_array(timestamps_15m, 15, reference_time)
+if i15_quick is None or i15_quick < 3:
+    logger_pair.debug(f"Insufficient data for {pair_name}")
+    return None
+
+close_curr_quick = close_15m[i15_quick]
+open_curr_quick = data_15m["open"][i15_quick]
+
+# Quick candle color check
+is_green = close_curr_quick > open_curr_quick
+is_red = close_curr_quick < open_curr_quick
+
+# If neither green nor red candle, skip expensive indicators
+if not is_green and not is_red:
+    logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
+    return None
+
+# ===================================================================
+# STEP 3: NOW calculate indicators (only if candle has direction)
+# ===================================================================
+indicators = await asyncio.to_thread(
+    calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+)
 
         # Extract indicator arrays from dictionary
         ppo = indicators['ppo']
@@ -3264,8 +3619,8 @@ async def evaluate_pair_and_alert(
         is_green_candle = close_curr > open_curr
         is_red_candle = close_curr < open_curr
 
-        if cfg.DEBUG_MODE:
-            logger_pair.debug(f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f} | Green={is_green_candle} Red={is_red_candle}")
+        debug_if(True, logger_pair,
+                 lambda: f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f}")
 
         # ===================================================================
         # STEP 7: TREND & QUALITY FILTERS
@@ -3486,14 +3841,14 @@ async def evaluate_pair_and_alert(
         # ===================================================================
         # STEP 13: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
         # ===================================================================
+        # ⚡ OPTIMIZED: Single atomic Redis operation
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-        
+
         if all_state_changes or dedup_checks:
-            # Use atomic batch - returns (prev_states, dedup_results)
-            # We already have prev_states, so we only need dedup_results
-            _, dedup_results = await sdb.atomic_eval_batch(
+            # Single Redis pipeline: get states + update + dedup
+            previous_states, dedup_results = await sdb.atomic_eval_batch(
                 pair_name,
-                [],  # Empty - we already got previous states above
+                redis_alert_keys,
                 all_state_changes,
                 dedup_checks
             )
@@ -3706,14 +4061,49 @@ async def run_once() -> bool:
             return False
 
         # OPTIMIZED: Use configurable cache TTL
-        PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
-        now = time.time()
+        # ⚡ OPTIMIZED: Use static map with API fallback
+products_map = None
+pairs_to_process = []
+
+# Try static map first
+USE_STATIC_MAP = True  # Set to False to force API fetch
+STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
+
+if USE_STATIC_MAP:
+    last_api_check_key = "last_products_api_check"
+    
+    try:
+        last_check_str = await (await RedisStateStore(cfg.REDIS_URL).connect()).get_metadata(last_api_check_key) if sdb else None
+        last_check = float(last_check_str) if last_check_str else 0.0
+    except:
+        last_check = 0.0
+    
+    days_since_check = (now - last_check) / 86400
+    
+    if days_since_check < STATIC_MAP_REFRESH_DAYS:
+        logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
+        products_map = STATIC_PRODUCTS_MAP.copy()
+    else:
+        logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+        USE_STATIC_MAP = False
+
+if not USE_STATIC_MAP or products_map is None:
+    # Fallback to API fetch
+    logger_run.info("📡 Fetching products list from Delta API...")
+    temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
+    prod_resp = await temp_fetcher.fetch_products()
+    
+    if not prod_resp:
+        logger_run.warning("⚠️ API fetch failed, falling back to static map")
+        products_map = STATIC_PRODUCTS_MAP.copy()
+    else:
+        products_map = build_products_map_from_api_result(prod_resp)
         
-        products_map = None
-        pairs_to_process = []
+        # Update last check timestamp
+        if sdb:
+            await sdb.set_metadata(last_api_check_key, str(now))
         
-        if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
-            logger_run.info("📡 Fetching fresh products list from Delta API...")
+        logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
             
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
@@ -3771,213 +4161,4 @@ async def run_once() -> bool:
         
         if not lock_acquired:
             logger_run.warning(
-                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
-            )
-            return False
-
-        logger_run.debug("🔒 Distributed lock acquired successfully")
-
-        if cfg.SEND_TEST_MESSAGE:
-            await telegram_queue.send(escape_markdown_v2(
-                f"🔥 {cfg.BOT_NAME} - Run Started\n"
-                f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
-                f"Correlation ID: {correlation_id}\n"
-                f"Pairs: {len(pairs_to_process)}"
-            ))
-
-        logger_run.debug(
-            f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
-        )
-
-        all_results = await process_pairs_with_workers(
-            fetcher, products_map, pairs_to_process,
-            sdb, telegram_queue, correlation_id,
-            lock, reference_time
-        )
-
-        for _, state in all_results:
-            if state.get("state") == "ALERT_SENT":
-                alerts_sent += state.get("summary", {}).get("alerts", 0)
-
-        fetcher_stats = fetcher.get_stats()
-        logger_run.info(
-            f"📡 Fetch statistics | "
-            f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
-            f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
-        )
-        
-        if "rate_limiter" in fetcher_stats:
-            rate_stats = fetcher_stats["rate_limiter"]
-            if rate_stats.get("total_waits", 0) > 0:
-                logger_run.info(
-                    f"🚦 Rate limiting stats | "
-                    f"Waits: {rate_stats['total_waits']} | "
-                    f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
-                )
-
-        final_memory_mb = process.memory_info().rss / 1024 / 1024
-        memory_delta = final_memory_mb - container_memory_mb
-        
-        run_duration = time.time() - start_time
-        redis_status = "OK" if not sdb.degraded else "DEGRADED"
-        
-        summary = (
-            f"✅ RUN COMPLETE | "
-            f"Duration: {run_duration:.1f}s | "
-            f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
-            f"Alerts: {alerts_sent} | "
-            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
-            f"Redis: {redis_status}"
-        )
-        logger_run.info(summary)
-
-        if alerts_sent > MAX_ALERTS_PER_RUN:
-            await telegram_queue.send(escape_markdown_v2(
-                f"⚠️ HIGH ALERT VOLUME\n"
-                f"Alerts sent: {alerts_sent}\n"
-                f"Pairs processed: {len(all_results)}\n"
-                f"Time: {format_ist_time()}"
-            ))
-
-        return True
-
-    except asyncio.TimeoutError:
-        logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
-        return False
-    
-    except asyncio.CancelledError:
-        logger_run.warning("🛑 Run cancelled (shutdown signal received)")
-        return False
-    
-    except Exception as e:
-        logger_run.exception(f"❌ Fatal error in run_once: {e}")
-        
-        if telegram_queue:
-            try:
-                await telegram_queue.send(escape_markdown_v2(
-                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
-                    f"Error: {str(e)[:200]}\n"
-                    f"Correlation ID: {correlation_id}\n"
-                    f"Time: {format_ist_time()}"
-                ))
-            except Exception:
-                logger_run.error("Failed to send error notification")
-        
-        return False
-    
-    finally:
-        logger_run.debug("🧹 Starting resource cleanup...")
-        
-        if lock_acquired and lock and lock.acquired_by_me:
-            try:
-                await lock.release(timeout=3.0)
-                logger_run.debug("🔓 Redis lock released")
-            except Exception as e:
-                logger_run.error(f"Error releasing lock: {e}")
-        
-        if sdb:
-            try:
-                await sdb.close()
-                logger_run.debug("✅ Redis connection closed")
-            except Exception as e:
-                logger_run.error(f"Error closing Redis: {e}")
-        
-        # ✅ REMOVED: Redis pool shutdown (keeping alive)
-        # ✅ REMOVED: HTTP session close (keeping alive)
-        
-        try:
-            if 'all_results' in locals():
-                del all_results
-            if 'products_map' in locals():
-                del products_map
-            if 'fetcher' in locals():
-                del fetcher
-            if 'telegram_queue' in locals():
-                del telegram_queue
-            
-            gc.collect()
-            
-            logger_run.debug("✅ Memory cleanup completed")
-        except Exception as e:
-            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
-        
-        TRACE_ID.set("")
-        PAIR_ID.set("")
-        
-        logger_run.debug("🏁 Resource cleanup finished")
-        
-        gc.enable()
-        
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
-except ImportError:
-    logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="macd_unified",
-        description="Unified MACD/alerts runner with NumPy optimization"
-    )
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
-    parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
-    parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
-    args = parser.parse_args()
-
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-        for h in logger.handlers:
-            h.setLevel(logging.DEBUG)
-        logger.info("Debug mode enabled via CLI flag")
-
-    try:
-        validate_runtime_config()
-    except ValueError as e:
-        logger.critical(f"Configuration validation failed: {e}")
-        sys.exit(1)
-    
-    if args.validate_only:
-        logger.info("Configuration validation passed - exiting (--validate-only mode)")
-        sys.exit(0)
-
-    # OPTIMIZED: Respect SKIP_WARMUP config option
-    if not args.skip_warmup and not cfg.SKIP_WARMUP:
-        warmup_numba()
-    else:
-        logger.info("Skipping Numba warmup (faster startup)")
-
-    async def main_with_cleanup():
-        """Run bot with proper cleanup on exit"""
-        try:
-            return await run_once()
-        finally:
-            # ✅ NEW: Cleanup persistent connections on shutdown
-            logger.info("🧹 Shutting down persistent connections...")
-            try:
-                await RedisStateStore.shutdown_global_pool()
-                logger.debug("✅ Redis pool closed")
-            except Exception as e:
-                logger.error(f"Error closing Redis pool: {e}")
-            
-            try:
-                await SessionManager.close_session()
-                logger.debug("✅ HTTP session closed")
-            except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
-    
-    try:
-        success = asyncio.run(main_with_cleanup())
-        if success:
-            logger.info("✅ Bot run completed successfully")
-            sys.exit(0)
-        else:
-            logger.error("❌ Bot run failed")
-            sys.exit(1)
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        logger.info("Bot stopped by timeout or user interrupt")
-        # Cleanup happens in finally block above
-        sys.exit(130)
-    except Exception as exc:
-        logger.critical(f"Fatal error: {exc}", exc_info=True)
-        sys.exit(1)
+                "⏸️ Another instance is running (Redis lo
