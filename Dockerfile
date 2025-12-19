@@ -18,10 +18,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Compile AOT module
-RUN python -u src/aot_build.py
+WORKDIR /app/src
+RUN python -u aot_build.py
 
-# ✅ Verify that the .so was produced
-RUN ls -l /app/indicators_aot*.so || (echo "❌ AOT .so not found in builder"; exit 1)
+# ✅ Verify that the .so was produced in /app/src
+RUN ls -l /app/src/indicators_aot*.so || (echo "❌ AOT .so not found in builder"; exit 1)
 
 # =========================
 # Runtime stage
@@ -35,7 +36,7 @@ COPY src/ ./src/
 COPY wrapper.py config_macd.json ./
 
 # Copy compiled AOT module from builder
-COPY --from=builder /app/indicators_aot.*.so /app/
+COPY --from=builder /app/src/indicators_aot.*.so /app/
 
 # ✅ Verify that the .so is present in runtime
 RUN ls -l /app/indicators_aot*.so || (echo "❌ AOT .so not found in runtime"; exit 1)
