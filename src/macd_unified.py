@@ -4315,7 +4315,7 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 
-if if __name__ == "__main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
