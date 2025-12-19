@@ -2703,81 +2703,6 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
-    async def atomic_eval_batch(
-        self,
-        pair: str,
-        alert_keys: List[str],
-        state_updates: List[Tuple[str, Any, Optional[int]]],
-        dedup_checks: List[Tuple[str, str, int]]
-    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        
-        if self.degraded:
-            empty_prev = {k: False for k in alert_keys}
-            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-            return empty_prev, empty_dedup
-        
-        try:
-            async with self._redis.pipeline() as pipe:
-                # Phase 1: MGET for previous states
-                state_keys = [f"{pair}:{k}" for k in alert_keys]
-                pipe.mget(state_keys)
-            
-                # Phase 2: SET for state updates
-                now = int(time.time())
-                for key, state, custom_ts in state_updates:
-                    ts = custom_ts if custom_ts is not None else now
-                    data = json_dumps({"state": state, "ts": ts})
-                    full_key = f"{self.state_prefix}{key}"
-                    if self.expiry_seconds > 0:
-                        pipe.set(full_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(full_key, data)
-            
-                # Phase 3: SET NX for dedup
-                for pair_name, alert_key, ts in dedup_checks:
-                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
-                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-            
-                # Execute all at once
-                results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
-        
-            # Parse results
-            num_state_keys = len(state_keys)
-            num_updates = len(state_updates)
-        
-            # Previous states (first N results from MGET)
-            prev_states = {}
-            mget_results = results[0] if results else []
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-                if val:
-                    try:
-                        parsed = json_loads(val)
-                        prev_states[key] = parsed.get("state") == "ACTIVE"
-                    except:
-                        prev_states[key] = False
-                else:
-                    prev_states[key] = False
-        
-            # Dedup results (results after MGET and SETs)
-            dedup_results = {}
-            dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
-            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
-                result_idx = dedup_start_idx + idx
-                should_send = bool(results[result_idx]) if result_idx < len(results) else True
-                dedup_results[f"{pair_name}:{alert_key}"] = should_send
-        
-            return prev_states, dedup_results
-        
-        except Exception as e:
-            logger.error(f"atomic_eval_batch failed: {e}")
-            # Fallback to individual operations
-            prev_states = await self.mget_states(state_keys)
-            await self.batch_set_states(state_updates)
-            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-            return prev_states, dedup_results 
-
     async def atomic_batch_update(
         self,
         updates: List[Tuple[str, Any, Optional[int]]],
@@ -2818,24 +2743,24 @@ class RedisStateStore:
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """
-        ✅ NEW: Single atomic operation for entire evaluation:
+        ✅ Single atomic operation for entire evaluation:
         1. Get previous states (MGET)
         2. Set new states (pipeline)
         3. Check dedup (pipeline)
-        
+
         Returns: (previous_states_dict, dedup_results_dict)
         """
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
-        
+
         try:
             async with self._redis.pipeline() as pipe:
                 # Phase 1: MGET for previous states
                 state_keys = [f"{pair}:{k}" for k in alert_keys]
                 pipe.mget(state_keys)
-                
+
                 # Phase 2: SET for state updates
                 now = int(time.time())
                 for key, state, custom_ts in state_updates:
@@ -2846,22 +2771,18 @@ class RedisStateStore:
                         pipe.set(full_key, data, ex=self.expiry_seconds)
                     else:
                         pipe.set(full_key, data)
-                
+
                 # Phase 3: SET NX for dedup
                 for pair_name, alert_key, ts in dedup_checks:
                     window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                     recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                     pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-                
+
                 # Execute all at once
                 results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
-            
+
             # Parse results
-            num_state_keys = len(state_keys)
-            num_updates = len(state_updates)
-            
-            # Previous states (first N results from MGET)
-            prev_states = {}
+            prev_states: Dict[str, bool] = {}
             mget_results = results[0] if results else []
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
@@ -2869,28 +2790,29 @@ class RedisStateStore:
                     try:
                         parsed = json_loads(val)
                         prev_states[key] = parsed.get("state") == "ACTIVE"
-                    except:
+                    except Exception:
                         prev_states[key] = False
                 else:
                     prev_states[key] = False
-            
-                # Dedup results (results after MGET and SETs)
-                dedup_results = {}
-                dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
-                for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
-                    result_idx = dedup_start_idx + idx
-                    should_send = bool(results[result_idx]) if result_idx < len(results) else True
-                    dedup_results[f"{pair_name}:{alert_key}"] = should_send
-            
-                return prev_states, dedup_results
-            
-            except Exception as e:
-                logger.error(f"atomic_eval_batch failed: {e}")
-                # Fallback to individual operations
-                prev_states = await self.mget_states(state_keys)
-                await self.batch_set_states(state_updates)
-                dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-                return prev_states, dedup_results
+
+            # Dedup results (results after MGET and SETs)
+            dedup_results: Dict[str, bool] = {}
+            dedup_start_idx = 1 + len(state_updates)  # Skip MGET result + SET results
+            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+                result_idx = dedup_start_idx + idx
+                should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                dedup_results[f"{pair_name}:{alert_key}"] = should_send
+
+            return prev_states, dedup_results
+
+        except Exception as e:
+            logger.error(f"atomic_eval_batch failed: {e}")
+            # Fallback to individual operations
+            state_keys = [f"{pair}:{k}" for k in alert_keys]
+            prev_states = await self.mget_states(state_keys)
+            await self.batch_set_states(state_updates)
+            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+            return prev_states, dedup_results
 
 class RedisLock:
     RELEASE_LUA = """
