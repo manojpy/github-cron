@@ -13,15 +13,10 @@ RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt .
-RUN uv pip install --no-cache --compile -r requirements.txt
-
-# ⚡ Build Numba AOT modules
-# We run the script directly because JIT/AOT tools changed in Numba 0.57+
-COPY src/numba_aot.py /tmp/
-RUN cd /tmp && \
-    python numba_aot.py && \
-    cp numba_compiled*.so /opt/venv/lib/python3.11/site-packages/ && \
-    echo "✅ Numba AOT modules compiled"
+RUN uv pip install --no-cache --compile \
+    pycares==4.4.0 \
+    aiodns==3.2.0 && \
+    uv pip install --no-cache --compile -r requirements.txt
 
 # Stage 2: Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -34,13 +29,27 @@ RUN apt-get update && \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
 
-COPY src/macd_unified.py ./src/
+# Setup cache directory with correct permissions
+RUN mkdir -p /app/numba_cache && chmod 777 /app/numba_cache
+
+# Copy source and wrapper
+COPY src/ ./src/
 COPY wrapper.py config_macd.json ./
 
-ENV PATH="/opt/venv/bin:$PATH"
-ENV PYTHONUNBUFFERED=1
-ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NUMBA_CACHE_DIR=/app/numba_cache \
+    NUMBA_NUM_THREADS=4 \
+    NUMBA_THREADING_LAYER=omp \
+    TZ=Asia/Kolkata
 
-ENTRYPOINT ["python", "wrapper.py"]
+RUN useradd -m -u 1000 botuser && \
+    chown -R botuser:botuser /app && \
+    chmod +x wrapper.py
+
+USER botuser
+
+ENTRYPOINT ["python", "-u", "wrapper.py"]
