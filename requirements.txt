@@ -23,3 +23,4 @@ orjson==3.10.12            # Fastest JSON library for Python
 psutil==6.1.0
 tzdata==2024.2
 typing-extensions==4.12.2
+setuptools>=70.0.0
