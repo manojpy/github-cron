@@ -3266,475 +3266,427 @@ def check_candle_quality_with_reason(
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-    async def evaluate_pair_and_alert(
-        pair_name: str,
-        data_15m: Dict[str, np.ndarray],
-        data_5m: Dict[str, np.ndarray],
-        data_daily: Optional[Dict[str, np.ndarray]],
-        sdb: RedisStateStore,
-        telegram_queue: TelegramQueue,
-        correlation_id: str,
-        reference_time: int
-    ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        
-        logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
-        PAIR_ID.set(pair_name)
-        pair_start_time = time.time()
+async def evaluate_pair_and_alert(
+    pair_name: str,
+    data_15m: Dict[str, np.ndarray],
+    data_5m: Dict[str, np.ndarray],
+    data_daily: Optional[Dict[str, np.ndarray]],
+    sdb: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str,
+    reference_time: int
+) -> Optional[Tuple[str, Dict[str, Any]]]:
 
-        try:
-            # ===================================================================
-            # STEP 1: IDENTIFY CLOSED CANDLE INDICES
-            # ===================================================================
-            i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-            i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
+    logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
+    PAIR_ID.set(pair_name)
+    pair_start_time = time.time()
 
-            if i15 is None or i15 < 3 or i5 is None:
-                logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
-                return None
+    try:  # -------------------------------------------------- OUTER TRY
+        # ===================================================================
+        # STEP 1: IDENTIFY CLOSED CANDLE INDICES
+        # ===================================================================
+        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
+        i5  = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
-            # ===================================================================
-            # STEP 2: ✅ CALCULATE INDICATORS FIRST (before accessing any arrays)
-            # ===================================================================
-            # ===================================================================
-    # STEP 2: ⚡ QUICK PRE-CHECK (Skip expensive calculations if possible)
-    # ===================================================================
-            close_15m = data_15m["close"]
-            close_5m = data_5m["close"]
-            timestamps_15m = data_15m["timestamp"]
+        if i15 is None or i15 < 3 or i5 is None:
+            logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
+            return None
 
-            # Quick trend check without full indicator calculation
-            i15_quick = get_last_closed_index_from_array(timestamps_15m, 15, reference_time)
-            if i15_quick is None or i15_quick < 3:
-                logger_pair.debug(f"Insufficient data for {pair_name}")
-                return None
+        # ===================================================================
+        # STEP 2: ⚡ QUICK PRE-CHECK (skip expensive calc if candle is doji)
+        # ===================================================================
+        close_15m    = data_15m["close"]
+        close_5m     = data_5m["close"]
+        timestamps_15m = data_15m["timestamp"]
 
-            close_curr_quick = close_15m[i15_quick]
-            open_curr_quick = data_15m["open"][i15_quick]
+        i15_quick = get_last_closed_index_from_array(timestamps_15m, 15, reference_time)
+        if i15_quick is None or i15_quick < 3:
+            logger_pair.debug(f"Insufficient data for {pair_name}")
+            return None
 
-            # Quick candle color check
-            is_green = close_curr_quick > open_curr_quick
-            is_red = close_curr_quick < open_curr_quick
+        close_curr_quick = close_15m[i15_quick]
+        open_curr_quick  = data_15m["open"][i15_quick]
 
-            # If neither green nor red candle, skip expensive indicators
-            if not is_green and not is_red:
-                logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
-                return None
+        is_green = close_curr_quick > open_curr_quick
+        is_red   = close_curr_quick < open_curr_quick
+        if not is_green and not is_red:
+            logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
+            return None
 
-    # ===================================================================
-    # STEP 3: NOW calculate indicators (only if candle has direction)
-    # ===================================================================
+        # ===================================================================
+        # STEP 3: CALCULATE INDICATORS (only if candle has direction)
+        # ===================================================================
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
         )
 
-            # Extract indicator arrays from dictionary
-            ppo = indicators['ppo']
-            ppo_signal = indicators['ppo_signal']
-            smooth_rsi = indicators['smooth_rsi']
-            vwap = indicators['vwap']
-            mmh = indicators['mmh']
-            upw = indicators['upw']
-            dnw = indicators['dnw']
-            rma50_15 = indicators['rma50_15']
-            rma200_5 = indicators['rma200_5']
-            piv = indicators['pivots']
+        # unpack indicators
+        ppo       = indicators["ppo"]
+        ppo_signal= indicators["ppo_signal"]
+        smooth_rsi= indicators["smooth_rsi"]
+        vwap      = indicators["vwap"]
+        mmh       = indicators["mmh"]
+        upw       = indicators["upw"]
+        dnw       = indicators["dnw"]
+        rma50_15  = indicators["rma50_15"]
+        rma200_5  = indicators["rma200_5"]
+        piv       = indicators["pivots"]
 
-            # Extract raw data arrays from input dictionaries
-            close_15m = data_15m["close"]
-            open_15m = data_15m["open"]
-            high_15m = data_15m["high"]
-            low_15m = data_15m["low"]
-            timestamps_15m = data_15m["timestamp"]
-            close_5m = data_5m["close"]
+        # raw arrays
+        close_15m = data_15m["close"]
+        open_15m  = data_15m["open"]
+        high_15m  = data_15m["high"]
+        low_15m   = data_15m["low"]
+        timestamps_15m = data_15m["timestamp"]
+        close_5m  = data_5m["close"]
 
-            # ===================================================================
-            # STEP 3: ✅ NOW extract values at target indices (after arrays exist)
-            # ===================================================================
-            close_curr   = close_15m[i15]       # already np.float64
-            close_prev   = close_15m[i15 - 1]   # already np.float64
-            close_5m_val = close_5m[i5]         # already np.float64
-            ts_curr      = int(timestamps_15m[i15])  # keep int() for timestamps
+        # ===================================================================
+        # STEP 4: EXTRACT VALUES AT TARGET INDICES
+        # ===================================================================
+        close_curr   = close_15m[i15]
+        close_prev   = close_15m[i15 - 1]
+        close_5m_val = close_5m[i5]
+        ts_curr      = int(timestamps_15m[i15])
 
-            # Extract indicator values at target indices
-            rma50_15_val = rma50_15[i15]        # already np.float64
-            rma200_5_val = rma200_5[i5]         # already np.float64
+        rma50_15_val = rma50_15[i15]
+        rma200_5_val = rma200_5[i5]
 
+        # ===================================================================
+        # STEP 5: TIMESTAMP VALIDATION (15 m strict)
+        # ===================================================================
+        latest_ts         = int(timestamps_15m[i15])
+        expected_open_ts  = calculate_expected_candle_timestamp(reference_time, 15)
 
-            # ===================================================================
-            # STEP 4: TIMESTAMP VALIDATION (STRICT ONLY FOR 15m)
-            # ===================================================================
-            latest_ts = int(timestamps_15m[i15])
-            expected_open_ts = calculate_expected_candle_timestamp(reference_time, 15)
+        if not validate_candle_timestamp(
+            candle_ts=latest_ts,
+            reference_time=reference_time,
+            interval_minutes=15,
+            tolerance_seconds=300
+        ):
+            logger_pair.info(
+                f"Skipping {pair_name} - latest 15m candle is not confirmed closed "
+                f"(got open {format_ist_time(latest_ts)}, expected ~{format_ist_time(expected_open_ts)})"
+            )
+            return None
 
-            if not validate_candle_timestamp(
-                candle_ts=latest_ts,
-                reference_time=reference_time,
-                interval_minutes=15,
-                tolerance_seconds=300
-            ):
-                logger_pair.info(
-                    f"Skipping {pair_name} - latest 15m candle is not confirmed closed "
-                    f"(got open {format_ist_time(latest_ts)}, expected ~{format_ist_time(expected_open_ts)})"
-                )
-                return None
+        # ===================================================================
+        # STEP 6: DAILY PIVOT RESET
+        # ===================================================================
+        if piv and cfg.ENABLE_PIVOT:
+            current_day    = int(ts_curr // 86400)
+            pivot_day_key  = f"{pair_name}:pivot_day"
+            last_pivot_day_str = await sdb.get_metadata(pivot_day_key)
+            last_pivot_day = int(last_pivot_day_str) if last_pivot_day_str else None
 
-            # ===================================================================
-            # STEP 5: DAILY PIVOT RESET (after validation passes)
-            # ===================================================================
-            if piv and cfg.ENABLE_PIVOT:
-                current_day = int(ts_curr // 86400)
-                pivot_day_key = f"{pair_name}:pivot_day"
-                last_pivot_day_str = await sdb.get_metadata(pivot_day_key)
-                last_pivot_day = int(last_pivot_day_str) if last_pivot_day_str else None
-                
-                if last_pivot_day != current_day:
-                    delete_keys = []
-                    for level in ["P", "S1", "S2", "S3", "R1", "R2", "R3"]:
-                        up_key = f"{pair_name}:{ALERT_KEYS[f'pivot_up_{level}']}"
-                        down_key = f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level}']}"
-                        delete_keys.extend([up_key, down_key])
-                    
-                    if delete_keys:
-                        success = await sdb.atomic_batch_update([], deletes=delete_keys)
-                        if not success and cfg.DEBUG_MODE:
-                            logger_pair.warning(f"Atomic delete failed for pivot reset, falling back")
-                            await asyncio.gather(*[sdb._redis.delete(k) for k in delete_keys], return_exceptions=True)
-                    await sdb.set_metadata(pivot_day_key, str(current_day))
+            if last_pivot_day != current_day:
+                delete_keys = []
+                for level in ["P", "S1", "S2", "S3", "R1", "R2", "R3"]:
+                    up_key   = f"{pair_name}:{ALERT_KEYS[f'pivot_up_{level}']}"
+                    down_key = f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level}']}"
+                    delete_keys.extend([up_key, down_key])
 
-            # ===================================================================
-            # STEP 6: EXTRACT REMAINING CANDLE & INDICATOR DATA
-            # ===================================================================
-            open_curr = open_15m[i15]
-            high_curr = high_15m[i15]
-            low_curr  = low_15m[i15]
-
-            # Extract indicator values for current and previous candles
-            ppo_curr, ppo_prev       = ppo[i15], ppo[i15 - 1]
-            ppo_sig_curr, ppo_sig_prev = ppo_signal[i15], ppo_signal[i15 - 1]
-            rsi_curr, rsi_prev       = smooth_rsi[i15], smooth_rsi[i15 - 1]
-            vwap_curr = vwap[i15] if len(vwap) > i15 else 0.0
-            vwap_prev = vwap[i15 - 1] if len(vwap) > (i15 - 1) else 0.0
-            mmh_curr, mmh_m1         = mmh[i15], mmh[i15 - 1]
-         
-            # Cloud indicators
-            cloud_up = bool(upw[i15]) and not bool(dnw[i15])
-            cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-            
-            # Candle color
-            is_green_candle = close_curr > open_curr
-            is_red_candle = close_curr < open_curr
-
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f} | Green={is_green_candle} Red={is_red_candle}")
-
-            # ===================================================================
-            # STEP 7: TREND & QUALITY FILTERS
-            # ===================================================================
-            base_buy_trend  = (rma50_15_val < close_curr and rma200_5_val < close_5m_val)
-            base_sell_trend = (rma50_15_val > close_curr and rma200_5_val > close_5m_val)
-
-            # Add MMH and cloud confirmation
-            if base_buy_trend: 
-                base_buy_trend = base_buy_trend and (mmh_curr > 0 and cloud_up)
-            if base_sell_trend: 
-                base_sell_trend = base_sell_trend and (mmh_curr < 0 and cloud_down)
-
-            # Candle quality checks
-            buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
-            buy_candle_passed = bool(buy_quality_arr[i15])
-            sell_candle_passed = bool(sell_quality_arr[i15])
-            buy_candle_reason, sell_candle_reason = None, None
-
-            if base_buy_trend:
-                if not is_green_candle:
-                    buy_candle_passed = False
-                    buy_candle_reason = f"NOT GREEN CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
-                    logger_pair.debug(f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}")
-                elif not buy_candle_passed:
-                    _, buy_candle_reason = check_candle_quality_with_reason(
-                        open_curr, high_curr, low_curr, close_curr, is_buy=True
-                    )
-
-            if base_sell_trend:
-                if not is_red_candle:
-                    sell_candle_passed = False
-                    sell_candle_reason = f"NOT RED CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
-                    logger_pair.debug(f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}")
-                elif not sell_candle_passed:
-                    _, sell_candle_reason = check_candle_quality_with_reason(
-                        open_curr, high_curr, low_curr, close_curr, is_buy=False
-                    )
-
-            buy_common = base_buy_trend and buy_candle_passed and is_green_candle
-            sell_common = base_sell_trend and sell_candle_passed and is_red_candle
-
-            # Log rejection reasons
-            if base_buy_trend and not buy_common:
-                logger_pair.debug(
-                    f"🚫 BUY rejected for {pair_name} | "
-                    f"Reason: {buy_candle_reason or 'Unknown'} | "
-                    f"Green={is_green_candle} Quality={buy_candle_passed}"
-                )
-            if base_sell_trend and not sell_common:
-                logger_pair.debug(
-                    f"🚫 SELL rejected for {pair_name} | "
-                    f"Reason: {sell_candle_reason or 'Unknown'} | "
-                    f"Red={is_red_candle} Quality={sell_candle_passed}"
-                )
-
-            # ===================================================================
-            # STEP 8: MMH REVERSAL LOGIC
-            # ===================================================================
-            mmh_reversal_buy = False
-            mmh_reversal_sell = False
-            if i15 >= 3:
-                mmh_m3, mmh_m2 = float(mmh[i15 - 3]), float(mmh[i15 - 2])
-                mmh_reversal_buy = (
-                    buy_common and 
-                    mmh_curr > 0 and 
-                    mmh_m3 > mmh_m2 > mmh_m1 and 
-                    mmh_curr > mmh_m1
-                )
-                mmh_reversal_sell = (
-                    sell_common and 
-                    mmh_curr < 0 and 
-                    mmh_m3 < mmh_m2 < mmh_m1 and 
-                    mmh_curr < mmh_m1
-                )
-
-            # ===================================================================
-            # STEP 9: BUILD CONTEXT FOR ALERT EVALUATION
-            # ===================================================================
-            context = {
-                "buy_common": buy_common,
-                "sell_common": sell_common,
-                "close_curr": close_curr,
-                "close_prev": close_prev,
-                "ts_curr": ts_curr,
-                "ppo_curr": ppo_curr,
-                "ppo_prev": ppo_prev,
-                "ppo_sig_curr": ppo_sig_curr,
-                "ppo_sig_prev": ppo_sig_prev,
-                "rsi_curr": rsi_curr,
-                "rsi_prev": rsi_prev,
-                "vwap_curr": vwap_curr,
-                "vwap_prev": vwap_prev,
-                "mmh_curr": mmh_curr,
-                "mmh_m1": mmh_m1,
-                "mmh_reversal_buy": mmh_reversal_buy,
-                "mmh_reversal_sell": mmh_reversal_sell,
-                "pivots": piv,
-                "vwap": cfg.ENABLE_VWAP,
-                "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
-                "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
-                "candle_rejection_reason_buy": buy_candle_reason,
-                "candle_rejection_reason_sell": sell_candle_reason,
-                "is_green_candle": is_green_candle,
-                "is_red_candle": is_red_candle,
-                "pivot_suppressions": []
-            }
-
-            ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
-            ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
-            rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
-            
-            # ===================================================================
-            # STEP 10: PREPARE FOR BATCHED REDIS OPERATION
-            # ===================================================================
-            raw_alerts = []
-            alert_keys_to_check = [
-                def_["key"] for def_ in ALERT_DEFINITIONS 
-                if not (
-                    ("pivots" in def_["requires"] and not context.get("pivots")) or 
-                    ("vwap" in def_["requires"] and not context.get("vwap"))
-                )
-            ]
-            redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
-            all_state_changes = []
-
-            # Get previous states FIRST (needed for trigger logic)
-            previous_states = await check_multiple_alert_states(sdb, pair_name, redis_alert_keys)
-
-            # ===================================================================
-            # STEP 11: TRIGGER LOGIC - CHECK ALL ALERTS
-            # ===================================================================
-            for alert_key in alert_keys_to_check:
-                def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-                if not def_: 
-                    continue
-                    
-                try:
-                    key = ALERT_KEYS[alert_key]
-                    trigger = False
-                    
-                    # Special handling for pivot alerts
-                    if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
-                        level = alert_key.split("_")[-1]
-                        is_buy = alert_key.startswith("pivot_up_")
-                        valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                        
-                        if not valid_cross and reason and context.get("pivots"):
-                            context["pivot_suppressions"].append(reason)
-                        
-                        trigger = (
-                            (is_buy and context["buy_common"]) or 
-                            (not is_buy and context["sell_common"])
-                        ) and valid_cross
-                    else:
-                        # Standard alert check
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-
-                    # Only add alert if triggered AND not previously active
-                    if trigger and not previous_states.get(key, False):
-                        extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
-                        raw_alerts.append((def_["title"], extra, def_["key"]))
-                        all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
-                        
-                        debug_if(True, logger_pair,
-                                 lambda: f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f}")
-               
-                except Exception as e:
-                    logger_pair.warning(
-                        f"Alert check failed for {pair_name}, key={alert_key}: {e}"
-                    )
-
-            # ===================================================================
-            # STEP 12: STATE RESETS (for crossover alerts that can re-trigger)
-            # ===================================================================
-            if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
-                all_state_changes.append(
-                    (f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None)
-                )
-            if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
-                all_state_changes.append(
-                    (f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None)
-                )
-                
-            if context["vwap"]:
-                if close_prev >= vwap_prev and close_curr < vwap_curr:
-                    all_state_changes.append(
-                        (f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None)
-                    )
-                if close_prev <= vwap_prev and close_curr > vwap_curr:
-                    all_state_changes.append(
-                        (f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None)
-                    )
-                    
-            if piv:
-                for lvl_n, lvl_v in piv.items():
-                    if close_prev > lvl_v and close_curr <= lvl_v:
-                        all_state_changes.append(
-                            (f"{pair_name}:{ALERT_KEYS[f'pivot_up_{lvl_n}']}", "INACTIVE", None)
+                if delete_keys:
+                    success = await sdb.atomic_batch_update([], deletes=delete_keys)
+                    if not success and cfg.DEBUG_MODE:
+                        logger_pair.warning("Atomic delete failed for pivot reset, falling back")
+                        await asyncio.gather(
+                            *[sdb._redis.delete(k) for k in delete_keys],
+                            return_exceptions=True
                         )
-                    if close_prev < lvl_v and close_curr >= lvl_v:
-                        all_state_changes.append(
-                            (f"{pair_name}:{ALERT_KEYS[f'pivot_down_{lvl_n}']}", "INACTIVE", None)
-                        )
+                await sdb.set_metadata(pivot_day_key, str(current_day))
 
-            # MMH reversal resets
-            if (mmh_curr > 0 and mmh_curr <= mmh_m1) and \
-               await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
-                all_state_changes.append(
-                    (f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None)
-                )
-            if (mmh_curr < 0 and mmh_curr >= mmh_m1) and \
-               await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
-                all_state_changes.append(
-                    (f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None)
+        # ===================================================================
+        # STEP 7: REMAINING CANDLE + INDICATOR DATA
+        # ===================================================================
+        open_curr = open_15m[i15]
+        high_curr = high_15m[i15]
+        low_curr  = low_15m[i15]
+
+        ppo_curr, ppo_prev     = ppo[i15], ppo[i15 - 1]
+        ppo_sig_curr, ppo_sig_prev = ppo_signal[i15], ppo_signal[i15 - 1]
+        rsi_curr, rsi_prev     = smooth_rsi[i15], smooth_rsi[i15 - 1]
+        vwap_curr = vwap[i15] if len(vwap) > i15 else 0.0
+        vwap_prev = vwap[i15 - 1] if len(vwap) > (i15 - 1) else 0.0
+        mmh_curr, mmh_m1       = mmh[i15], mmh[i15 - 1]
+
+        cloud_up   = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
+
+        is_green_candle = close_curr > open_curr
+        is_red_candle   = close_curr < open_curr
+
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f} | "
+                f"Green={is_green_candle} Red={is_red_candle}"
+            )
+
+        # ===================================================================
+        # STEP 8: TREND & QUALITY FILTERS
+        # ===================================================================
+        base_buy_trend  = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
+        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
+
+        if base_buy_trend:
+            base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
+        if base_sell_trend:
+            base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
+
+        buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
+        buy_candle_passed  = bool(buy_quality_arr[i15])
+        sell_candle_passed = bool(sell_quality_arr[i15])
+        buy_candle_reason  = None
+        sell_candle_reason = None
+
+        if base_buy_trend:
+            if not is_green_candle:
+                buy_candle_passed  = False
+                buy_candle_reason  = f"NOT GREEN CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
+                logger_pair.debug(f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}")
+            elif not buy_candle_passed:
+                _, buy_candle_reason = check_candle_quality_with_reason(
+                    open_curr, high_curr, low_curr, close_curr, is_buy=True
                 )
 
-            # ===================================================================
-            # STEP 13: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
-            # ===================================================================
-            # ⚡ OPTIMIZED: Single atomic Redis operation
-            dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-
-            if all_state_changes or dedup_checks:
-                # Single Redis pipeline: get states + update + dedup
-                previous_states, dedup_results = await sdb.atomic_eval_batch(
-                    pair_name,
-                    redis_alert_keys,
-                    all_state_changes,
-                    dedup_checks
+        if base_sell_trend:
+            if not is_red_candle:
+                sell_candle_passed  = False
+                sell_candle_reason  = f"NOT RED CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
+                logger_pair.debug(f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}")
+            elif not sell_candle_passed:
+                _, sell_candle_reason = check_candle_quality_with_reason(
+                    open_curr, high_curr, low_curr, close_curr, is_buy=False
                 )
-            else:
-                dedup_results = {}
-            
-            # ===================================================================
-            # STEP 14: DEDUP & SEND ALERTS
-            # ===================================================================
-            alerts_to_send = []
-            if raw_alerts:
-                for title, extra, ak in raw_alerts:
-                    # Check if we should send (not a duplicate)
-                    if dedup_results.get(f"{pair_name}:{ak}", True):
-                        alerts_to_send.append((title, extra, ak))
-            
-            if alerts_to_send:
-                # Limit alerts per pair
-                alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
-                
-                # Format message
-                if len(alerts_to_send) == 1:
-                    title, extra, _ = alerts_to_send[0]
-                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
+
+        buy_common  = base_buy_trend and buy_candle_passed and is_green_candle
+        sell_common = base_sell_trend and sell_candle_passed and is_red_candle
+
+        # rejection logging
+        if base_buy_trend and not buy_common:
+            logger_pair.debug(
+                f"🚫 BUY rejected for {pair_name} | "
+                f"Reason: {buy_candle_reason or 'Unknown'} | "
+                f"Green={is_green_candle} Quality={buy_candle_passed}"
+            )
+        if base_sell_trend and not sell_common:
+            logger_pair.debug(
+                f"🚫 SELL rejected for {pair_name} | "
+                f"Reason: {sell_candle_reason or 'Unknown'} | "
+                f"Red={is_red_candle} Quality={sell_candle_passed}"
+            )
+
+        # ===================================================================
+        # STEP 9: MMH REVERSAL LOGIC
+        # ===================================================================
+        mmh_reversal_buy  = False
+        mmh_reversal_sell = False
+        if i15 >= 3:
+            mmh_m3, mmh_m2 = float(mmh[i15 - 3]), float(mmh[i15 - 2])
+            mmh_reversal_buy = (
+                buy_common and
+                mmh_curr > 0 and
+                mmh_m3 > mmh_m2 > mmh_m1 and
+                mmh_curr > mmh_m1
+            )
+            mmh_reversal_sell = (
+                sell_common and
+                mmh_curr < 0 and
+                mmh_m3 < mmh_m2 < mmh_m1 and
+                mmh_curr < mmh_m1
+            )
+
+        # ===================================================================
+        # STEP 10: BUILD CONTEXT FOR ALERT EVALUATION
+        # ===================================================================
+        context = {
+            "buy_common": buy_common,
+            "sell_common": sell_common,
+            "close_curr": close_curr,
+            "close_prev": close_prev,
+            "ts_curr": ts_curr,
+            "ppo_curr": ppo_curr,
+            "ppo_prev": ppo_prev,
+            "ppo_sig_curr": ppo_sig_curr,
+            "ppo_sig_prev": ppo_sig_prev,
+            "rsi_curr": rsi_curr,
+            "rsi_prev": rsi_prev,
+            "vwap_curr": vwap_curr,
+            "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr,
+            "mmh_m1": mmh_m1,
+            "mmh_reversal_buy": mmh_reversal_buy,
+            "mmh_reversal_sell": mmh_reversal_sell,
+            "pivots": piv,
+            "vwap": cfg.ENABLE_VWAP,
+            "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
+            "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
+            "candle_rejection_reason_buy": buy_candle_reason,
+            "candle_rejection_reason_sell": sell_candle_reason,
+            "is_green_candle": is_green_candle,
+            "is_red_candle": is_red_candle,
+            "pivot_suppressions": []
+        }
+
+        ppo_ctx     = {"curr": ppo_curr, "prev": ppo_prev}
+        ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
+        rsi_ctx     = {"curr": rsi_curr, "prev": rsi_prev}
+
+        # ===================================================================
+        # STEP 11: PREPARE FOR BATCHED REDIS OPERATION
+        # ===================================================================
+        raw_alerts = []
+        alert_keys_to_check = [
+            def_["key"] for def_ in ALERT_DEFINITIONS
+            if not (
+                ("pivots" in def_["requires"] and not context.get("pivots")) or
+                ("vwap" in def_["requires"] and not context.get("vwap"))
+            )
+        ]
+        redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
+        all_state_changes = []
+
+        # get previous states
+        previous_states = await check_multiple_alert_states(sdb, pair_name, redis_alert_keys)
+
+        # ===================================================================
+        # STEP 12: TRIGGER LOGIC – CHECK ALL ALERTS
+        # ===================================================================
+        for alert_key in alert_keys_to_check:
+            def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
+            if not def_:
+                continue
+            try:
+                key = ALERT_KEYS[alert_key]
+                trigger = False
+
+                # pivot alerts
+                if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
+                    level = alert_key.split("_")[-1]
+                    is_buy = alert_key.startswith("pivot_up_")
+                    valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
+                    if not valid_cross and reason and context.get("pivots"):
+                        context["pivot_suppressions"].append(reason)
+                    trigger = (
+                        (is_buy and context["buy_common"]) or
+                        (not is_buy and context["sell_common"])
+                    ) and valid_cross
                 else:
-                    items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
-                
-                # Send to Telegram
-                if not cfg.DRY_RUN_MODE:
-                    await telegram_queue.send(msg)
-                
-                logger_pair.info(
-                    f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | "
-                    f"{[ak for _, _, ak in alerts_to_send]}"
-                )
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
 
-            # ===================================================================
-            # STEP 15: SUMMARY OUTPUT
-            # ===================================================================
-            reasons = []
-            if not buy_common and not sell_common:
-                reasons.append("Trend filter blocked")
-            if context.get("candle_quality_failed_buy"):
-                reasons.append(f"BUY quality: {buy_candle_reason}")
-            if context.get("candle_quality_failed_sell"):
-                reasons.append(f"SELL quality: {sell_candle_reason}")
-            if context.get("pivot_suppressions"):
-                reasons.extend(context["pivot_suppressions"])
-            
-            status_msg = (
+                if trigger and not previous_states.get(key, False):
+                    extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
+                    raw_alerts.append((def_["title"], extra, def_["key"]))
+                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
+
+            except Exception as e:
+                logger_pair.warning(f"Alert check failed for {pair_name}, key={alert_key}: {e}")
+
+        # ===================================================================
+        # STEP 13: STATE RESETS (crossover alerts that can re-trigger)
+        # ===================================================================
+        if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
+            all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
+        if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
+            all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+
+        if context["vwap"]:
+            if close_prev >= vwap_prev and close_curr < vwap_curr:
+                all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+            if close_prev <= vwap_prev and close_curr > vwap_curr:
+                all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+
+        if piv:
+            for lvl_n, lvl_v in piv.items():
+                if close_prev > lvl_v and close_curr <= lvl_v:
+                    all_state_changes.append((f"{pair_name}:{ALERT_KEYS[f'pivot_up_{lvl_n}']}", "INACTIVE", None))
+                if close_prev < lvl_v and close_curr >= lvl_v:
+                    all_state_changes.append((f"{pair_name}:{ALERT_KEYS[f'pivot_down_{lvl_n}']}", "INACTIVE", None))
+
+        # MMH reversal resets
+        if (mmh_curr > 0 and mmh_curr <= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
+            all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
+        if (mmh_curr < 0 and mmh_curr >= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
+            all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
+
+        # ===================================================================
+        # STEP 14: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
+        # ===================================================================
+        dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
+
+        if all_state_changes or dedup_checks:
+            previous_states, dedup_results = await sdb.atomic_eval_batch(
+                pair_name, redis_alert_keys, all_state_changes, dedup_checks
+            )
+        else:
+            dedup_results = {}
+
+        # ===================================================================
+        # STEP 15: DEDUP & SEND ALERTS
+        # ===================================================================
+        alerts_to_send = []
+        if raw_alerts:
+            for title, extra, ak in raw_alerts:
+                if dedup_results.get(f"{pair_name}:{ak}", True):
+                    alerts_to_send.append((title, extra, ak))
+
+        if alerts_to_send:
+            alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
+
+            if len(alerts_to_send) == 1:
+                title, extra, _ = alerts_to_send[0]
+                msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
+            else:
+                items = [(t, e) for t, e, _ in alerts_to_send[:25]]
+                msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
+
+            if not cfg.DRY_RUN_MODE:
+                await telegram_queue.send(msg)
+
+            logger_pair.info(
+                f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                f"{[ak for _, _, ak in alerts_to_send]}"
+            )
+
+        # ===================================================================
+        # STEP 16: SUMMARY OUTPUT
+        # ===================================================================
+        reasons = []
+        if not buy_common and not sell_common:
+            reasons.append("Trend filter blocked")
+        if context.get("candle_quality_failed_buy"):
+            reasons.append(f"BUY quality: {buy_candle_reason}")
+        if context.get("candle_quality_failed_sell"):
+            reasons.append(f"SELL quality: {sell_candle_reason}")
+        if context.get("pivot_suppressions"):
+            reasons.extend(context["pivot_suppressions"])
+
+        if not alerts_to_send:
+            logger_pair.debug(
                 f"✔ {pair_name} | "
                 f"cloud={'green' if cloud_up else 'red' if cloud_down else 'neutral'} "
-                f"mmh={mmh_curr:.2f}"
+                f"mmh={mmh_curr:.2f}" +
+                (" | No signals" if not (base_buy_trend or base_sell_trend) else "")
             )
-            
-            if not alerts_to_send:
-                logger_pair.debug(
-                    status_msg + 
-                    (" | No signals" if not (base_buy_trend or base_sell_trend) else "")
-                )
 
-            return pair_name, {
-                "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
-                "ts": int(time.time()),
-                "summary": {
-                    "alerts": len(alerts_to_send),
-                    "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                    "mmh_hist": round(mmh_curr, 4),
-                    "suppression": "; ".join(reasons) or "No conditions met"
-                }
+        return pair_name, {
+            "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": len(alerts_to_send),
+                "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                "mmh_hist": round(mmh_curr, 4),
+                "suppression": "; ".join(reasons) or "No conditions met"
             }
+        }
 
-        except Exception as e:
-            logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
-            return None
-            
-        finally:
-            PAIR_ID.set("")
+    except Exception as e:
+        logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
+        return None
 
+    finally:
+        PAIR_ID.set("")
 
+  
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
     products_map: Dict[str, dict],
