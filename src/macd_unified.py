@@ -2387,11 +2387,16 @@ def get_last_closed_index_from_array(
 
     last_closed_idx = int(valid_indices[-1])
 
-    debug_if(cfg.DEBUG_MODE, logger, 
-             lambda: f"Selected fully closed candle | Index: {last_closed_idx}")
-        f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+    debug_if(
+        cfg.DEBUG_MODE,
+        logger,
+        lambda: (
+            f"Selected fully closed candle | Index: {last_closed_idx}\n"
+            f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+        ),
     )
     return last_closed_idx
+
 
 def validate_candle_timestamp(
     candle_ts: int,
@@ -2417,28 +2422,36 @@ def validate_candle_timestamp(
     )
     return True
 
-def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+
+def build_products_map_from_api_result(
+    api_products: Optional[Dict[str, Any]]
+) -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
     if not api_products or not api_products.get("result"):
         return products_map
+
     valid_pattern = CompiledPatterns.VALID_SYMBOL
     for p in api_products["result"]:
         try:
             symbol = p.get("symbol", "")
             if not valid_pattern.match(symbol):
                 continue
+
             symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
+
             if p.get("contract_type") == "perpetual_futures":
                 for pair_name in cfg.PAIRS:
                     if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
                         products_map[pair_name] = {
                             "id": p.get("id"),
                             "symbol": p.get("symbol"),
-                            "contract_type": p.get("contract_type")
+                            "contract_type": p.get("contract_type"),
                         }
                         break
         except Exception:
+            # Silently skip malformed product entries
             pass
+
     return products_map
 
 class RedisStateStore:
