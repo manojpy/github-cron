@@ -3829,6 +3829,10 @@ async def run_once() -> bool:
         USE_STATIC_MAP = True  # Set to False to force API fetch
         STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
 
+        now = time.time()
+        last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
+
+
         if USE_STATIC_MAP:
             # If cache has been set in-memory, derive "days since check" from it.
             # Note: PRODUCTS_CACHE["until"] stores expiry; we back out last check as (until - TTL).
