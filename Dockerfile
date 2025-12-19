@@ -13,14 +13,13 @@ RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt .
-
-# Install dependencies
 RUN uv pip install --no-cache --compile -r requirements.txt
 
-# Build Numba AOT modules
+# ⚡ Build Numba AOT modules
+# We run the script directly because JIT/AOT tools changed in Numba 0.57+
 COPY src/numba_aot.py /tmp/
 RUN cd /tmp && \
-    python -m numba.pycc --python numba_aot.py && \
+    python numba_aot.py && \
     cp numba_compiled*.so /opt/venv/lib/python3.11/site-packages/ && \
     echo "✅ Numba AOT modules compiled"
 
@@ -35,7 +34,6 @@ RUN apt-get update && \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-
 RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
 
 COPY src/macd_unified.py ./src/
