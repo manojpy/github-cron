@@ -16,7 +16,8 @@ COPY requirements.txt .
 RUN uv pip install --no-cache --compile \
     pycares==4.4.0 \
     aiodns==3.2.0 && \
-    uv pip install --no-cache --compile -r requirements.txt
+    uv pip install --no-cache --compile -r requirements.txt && \
+    uv pip install --no-cache --compile setuptools
 
 WORKDIR /app
 # Copy source so we can build the AOT module
@@ -42,8 +43,8 @@ RUN mkdir -p /app/numba_cache && chmod 777 /app/numba_cache
 
 # Copy source and wrapper
 COPY src/ ./src/
-# Copy compiled AOT module from builder
-COPY --from=builder /app/indicators_aot.*.so /app/src/
+# Copy compiled AOT module from builder directly into /app
+COPY --from=builder /app/indicators_aot.*.so /app/
 COPY wrapper.py config_macd.json ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
