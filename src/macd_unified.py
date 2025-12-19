@@ -3783,9 +3783,9 @@ async def process_pairs_with_workers(
 
 async def run_once() -> bool:
     """OPTIMIZED: Smarter caching and parallel execution"""
-    
+
     gc.disable()
-    
+
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -3802,7 +3802,7 @@ async def run_once() -> bool:
     lock_acquired = False
     fetcher: Optional[DataFetcher] = None
     telegram_queue: Optional[TelegramQueue] = None
-    
+
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
 
@@ -3810,7 +3810,7 @@ async def run_once() -> bool:
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-        
+
         if container_memory_mb >= limit_mb:
             logger_run.critical(
                 f"🚨 Memory limit exceeded at startup "
@@ -3829,20 +3829,20 @@ async def run_once() -> bool:
 
         if USE_STATIC_MAP:
             last_api_check_key = "last_products_api_check"
-    
+
             try:
                 last_check_str = await (await RedisStateStore(cfg.REDIS_URL).connect()).get_metadata(last_api_check_key) if sdb else None
                 last_check = float(last_check_str) if last_check_str else 0.0
             except:
                 last_check = 0.0
-    
+
             days_since_check = (now - last_check) / 86400
-    
+
             if days_since_check < STATIC_MAP_REFRESH_DAYS:
                 logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
 
                 products_map = STATIC_PRODUCTS_MAP.copy()
-           else:
+            else:
                 logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
                 USE_STATIC_MAP = False
 
@@ -3851,46 +3851,46 @@ async def run_once() -> bool:
             logger_run.info("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
-    
+
             if not prod_resp:
                 logger_run.warning("⚠️ API fetch failed, falling back to static map")
                 products_map = STATIC_PRODUCTS_MAP.copy()
             else:
                 products_map = build_products_map_from_api_result(prod_resp)
-        
+
                 # Update last check timestamp
                 if sdb:
                     await sdb.set_metadata(last_api_check_key, str(now))
-        
-               , logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
-            
+
+                , logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
+
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
-            
+
             if not prod_resp:
                 logger_run.error("❌ Failed to fetch products map - aborting run")
                 return False
-            
+
             PRODUCTS_CACHE["data"] = prod_resp
             PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL  # OPTIMIZED: Configurable
             run_once._products_cache = PRODUCTS_CACHE
-            
+
             cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
             logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
-            
+
             products_map = build_products_map_from_api_result(prod_resp)
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
             logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
-        
+
         pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
         if len(pairs_to_process) < len(cfg.PAIRS):
             missing = set(cfg.PAIRS) - set(pairs_to_process)
             logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
-        
+
         if not pairs_to_process:
             logger_run.error("❌ No valid pairs to process - aborting run")
             return False
@@ -3898,7 +3898,7 @@ async def run_once() -> bool:
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
-        
+
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
                 "⚠️ Redis is in degraded mode – alert deduplication disabled!"
@@ -3917,7 +3917,7 @@ async def run_once() -> bool:
 
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
-        
+
         if not lock_acquired:
             logger_run.warning(
                 "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
@@ -3954,7 +3954,7 @@ async def run_once() -> bool:
             f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
             f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
         )
-        
+
         if "rate_limiter" in fetcher_stats:
             rate_stats = fetcher_stats["rate_limiter"]
             if rate_stats.get("total_waits", 0) > 0:
@@ -3966,10 +3966,10 @@ async def run_once() -> bool:
 
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
-        
+
         run_duration = time.time() - start_time
         redis_status = "OK" if not sdb.degraded else "DEGRADED"
-        
+
         summary = (
             f"✅ RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
@@ -3993,14 +3993,14 @@ async def run_once() -> bool:
     except asyncio.TimeoutError:
         logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
         return False
-    
+
     except asyncio.CancelledError:
         logger_run.warning("🛑 Run cancelled (shutdown signal received)")
         return False
-    
+
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
-        
+
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
@@ -4011,29 +4011,29 @@ async def run_once() -> bool:
                 ))
             except Exception:
                 logger_run.error("Failed to send error notification")
-        
+
         return False
-    
+
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
-        
+
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
                 logger_run.debug("🔓 Redis lock released")
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}")
-        
+
         if sdb:
             try:
                 await sdb.close()
                 logger_run.debug("✅ Redis connection closed")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
-        
+
         # ✅ REMOVED: Redis pool shutdown (keeping alive)
         # ✅ REMOVED: HTTP session close (keeping alive)
-        
+
         try:
             if 'all_results' in locals():
                 del all_results
@@ -4043,26 +4043,28 @@ async def run_once() -> bool:
                 del fetcher
             if 'telegram_queue' in locals():
                 del telegram_queue
-            
+
             gc.collect()
-            
+
             logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
             logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
-        
+
         TRACE_ID.set("")
         PAIR_ID.set("")
-        
+
         logger_run.debug("🏁 Resource cleanup finished")
-        
+
         gc.enable()
-        
+
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -4085,7 +4087,7 @@ if __name__ == "__main__":
     except ValueError as e:
         logger.critical(f"Configuration validation failed: {e}")
         sys.exit(1)
-    
+
     if args.validate_only:
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
@@ -4095,6 +4097,7 @@ if __name__ == "__main__":
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
+
 
     async def main_with_cleanup():
         """Run bot with proper cleanup on exit"""
@@ -4108,13 +4111,14 @@ if __name__ == "__main__":
                 logger.debug("✅ Redis pool closed")
             except Exception as e:
                 logger.error(f"Error closing Redis pool: {e}")
-            
+
             try:
                 await SessionManager.close_session()
                 logger.debug("✅ HTTP session closed")
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
-    
+
+
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
