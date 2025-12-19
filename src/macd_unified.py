@@ -2135,6 +2135,15 @@ class DataFetcher:
                         f"✅ Scanned {symbol} {resolution} | "
                         f"Latest: {format_ist_time(last_candle_open_ts)}"
                     )
+                # >>>>>>  QUICK TEST – DELETE AFTER CONFIRMING  <<<<<<
+                if resolution == "15" and symbol == "BTCUSDT":
+                    import time
+                    now = int(time.time())
+                    params["from"] = now - 48 * 3600   # 48 hours ago
+                    params["to"]   = now               # now
+                logger.debug(f"OVERRIDE BTC 15m | from={params['from']} to={params['to']}")
+# >>>>>>  END TEST  <<<<<<
+
 
         return data
 
