@@ -43,7 +43,7 @@ logger = logging.getLogger("MACD_BOT")
 try:
     import numba_compiled
     USE_AOT = True
-    logger.info
+    logger.info("✅ AOT modules loaded")
 except ImportError:
     USE_AOT = False
     logger.info("ℹ️ AOT modules not found, using JIT fallback")
@@ -109,13 +109,7 @@ STATIC_PRODUCTS_MAP = {
     "SOLUSD": {"id": 143, "symbol": "SOLUSDT", "contract_type": "perpetual_futures"},
 }
 
-# Validation: Ensure all configured pairs have mappings
-_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
-if _missing_products:
-    logger.warning(
-        f"⚠️ Missing product mappings for: {_missing_products}. "
-        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
-    )
+# Validation will happen after cfg is loaded
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -263,10 +257,6 @@ class BotConfig(BaseModel):
 
         return self
 
-# ============================================================================
-# PART 2: Optimized Numba Functions with Parallel Execution
-# ============================================================================
-
 
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
@@ -298,6 +288,14 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
+
+# Validate STATIC_PRODUCTS_MAP after cfg is loaded
+_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
+if _missing_products:
+    logger.warning(
+        f"⚠️ Missing product mappings for: {_missing_products}. "
+        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
+    )
 
 # Logging setup (same as original)
 class SecretFilter(logging.Filter):
