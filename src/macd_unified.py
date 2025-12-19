@@ -355,6 +355,10 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
 
 _VALIDATION_DONE = False
 
+PRODUCTS_CACHE: Dict[str, Any] = {"data": None, "until": 0.0}
+
+def validate_runtime_config() -> None:
+
 def validate_runtime_config() -> None:
     global _VALIDATION_DONE
     if _VALIDATION_DONE:
