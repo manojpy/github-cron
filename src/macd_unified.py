@@ -34,13 +34,10 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("MACD_AOT_BOOT")
 
-# ⚡ Try to import AOT-compiled functions (fallback to JIT if not available)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("MACD_BOT")
+
 try:
     import numba_compiled
     USE_AOT = True
