@@ -34,20 +34,6 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("MACD_BOT")
-
-try:
-    import numba_compiled
-    USE_AOT = True
-    logger.info("✅ AOT modules loaded")
-except ImportError:
-    USE_AOT = False
-    logger.info("ℹ️ AOT modules not found, using JIT fallback")
-
 try:
     import orjson
     
@@ -90,26 +76,6 @@ class Constants:
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
-
-# ============================================================================
-# STATIC PRODUCTS MAP (Eliminates API fetch overhead)
-# ============================================================================
-STATIC_PRODUCTS_MAP = {
-    "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
-    "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
-    "AVAXUSD": {"id": 262, "symbol": "AVAXUSDT", "contract_type": "perpetual_futures"},
-    "BCHUSD": {"id": 186, "symbol": "BCHUSDT", "contract_type": "perpetual_futures"},
-    "XRPUSD": {"id": 141, "symbol": "XRPUSDT", "contract_type": "perpetual_futures"},
-    "BNBUSD": {"id": 275, "symbol": "BNBUSDT", "contract_type": "perpetual_futures"},
-    "LTCUSD": {"id": 163, "symbol": "LTCUSDT", "contract_type": "perpetual_futures"},
-    "DOTUSD": {"id": 228, "symbol": "DOTUSDT", "contract_type": "perpetual_futures"},
-    "ADAUSD": {"id": 142, "symbol": "ADAUSDT", "contract_type": "perpetual_futures"},
-    "SUIUSD": {"id": 666, "symbol": "SUIUSDT", "contract_type": "perpetual_futures"},
-    "AAVEUSD": {"id": 227, "symbol": "AAVEUSDT", "contract_type": "perpetual_futures"},
-    "SOLUSD": {"id": 143, "symbol": "SOLUSDT", "contract_type": "perpetual_futures"},
-}
-
-# Validation will happen after cfg is loaded
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -257,6 +223,10 @@ class BotConfig(BaseModel):
 
         return self
 
+# ============================================================================
+# PART 2: Optimized Numba Functions with Parallel Execution
+# ============================================================================
+
 
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
@@ -288,14 +258,6 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
-
-# Validate STATIC_PRODUCTS_MAP after cfg is loaded
-_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
-if _missing_products:
-    logger.warning(
-        f"⚠️ Missing product mappings for: {_missing_products}. "
-        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
-    )
 
 # Logging setup (same as original)
 class SecretFilter(logging.Filter):
@@ -357,7 +319,6 @@ def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], s
     if condition and logger_obj.isEnabledFor(logging.DEBUG):
         logger_obj.debug(msg_fn())
         
-
 def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) -> None:
     if is_important:
         logger_obj.info(msg)
@@ -534,14 +495,17 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
-    """OPTIMIZED: Uses smart wrapper with AOT support and adaptive thresholds"""
+    """OPTIMIZED: Choose parallel vs serial based on size and config"""
     try:
         if arr is None or len(arr) == 0:
             logger.warning(f"Indicator {name} is None or empty")
             return np.array([default], dtype=np.float64)
         
-        # ⚡ Use smart wrapper (handles AOT + parallel threshold logic)
-        sanitized = sanitize_array_wrapper(arr, default)
+        # Use parallel version for large arrays when enabled
+        if cfg.NUMBA_PARALLEL and len(arr) >= 200:
+            sanitized = _sanitize_array_numba_parallel(arr, default)
+        else:
+            sanitized = _sanitize_array_numba(arr, default)
         
         if np.all(sanitized == default):
             logger.warning(f"Indicator {name} is all {default} after sanitization")
@@ -551,7 +515,7 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
     except Exception as e:
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
-        
+
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """OPTIMIZED: Parallel SMA calculation"""
@@ -943,16 +907,20 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
     return rsi
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
+    """Wrapper for smooth RSI - minimal GIL time."""
     try:
         if close is None or len(close) < rsi_len:
-            logger.warning(f"Smooth RSI: Insufficient data")
+            logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
             return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
         
         rsi = _calculate_rsi_core(close, rsi_len)
         smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
-        # ⚡ Use smart wrapper (handles AOT + threshold 300)
-        smooth_rsi = sanitize_array_wrapper(smooth_rsi, 50.0)
+        # OPTIMIZED: Conditional parallel sanitization
+        if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
+            smooth_rsi = _sanitize_array_numba_parallel(smooth_rsi, 50.0)
+        else:
+            smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
         
         return smooth_rsi
         
@@ -969,9 +937,13 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         
         ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
         
-        # ⚡ Use smart wrapper (handles AOT + threshold 300)
-        ppo = sanitize_array_wrapper(ppo, 0.0)
-        ppo_sig = sanitize_array_wrapper(ppo_sig, 0.0)
+        # OPTIMIZED: Conditional parallel sanitization
+        if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
+            ppo = _sanitize_array_numba_parallel(ppo, 0.0)
+            ppo_sig = _sanitize_array_numba_parallel(ppo_sig, 0.0)
+        else:
+            ppo = _sanitize_array_numba(ppo, 0.0)
+            ppo_sig = _sanitize_array_numba(ppo_sig, 0.0)
         
         return ppo, ppo_sig
     except Exception as e:
@@ -1067,21 +1039,35 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
+        # OPTIMIZED: Remove unnecessary type conversion
+        # Data is already float64 from parse_candles_to_numpy()
+        # OLD: close_f64 = close.astype(np.float64)
+        # NEW: Just ensure it's contiguous (zero-copy operation)
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
-        sd = rolling_std_wrapper(close_c, 50, resp_clamped)
-    
-        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
-    
+        # OPTIMIZED: Use higher threshold for expensive rolling std
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
+        else:
+            sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
-        ma = rolling_mean_wrapper(close_c, period)
-
+        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+        
+        # OPTIMIZED: Higher threshold for rolling mean
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            ma = _rolling_mean_numba_parallel(close_c, period)
+        else:
+            ma = _rolling_mean_numba(close_c, period)
+        
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
-        
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-    
-        min_med, max_med = rolling_minmax_wrapper(raw, period)
+        
+        # OPTIMIZED: Higher threshold for min/max
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
+        else:
+            min_med, max_med = _rolling_min_max_numba(raw, period)
         
         denom = max_med - min_med
         denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
@@ -1172,139 +1158,7 @@ def _vectorized_wick_check_sell(
     
     return result
 
-# ============================================================================
-# AOT/JIT SMART WRAPPERS with Adaptive Thresholds
-# ============================================================================
 
-def ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
-    """
-    Wrapper for EMA calculation.
-    EMA is inherently serial, so no parallel version exists.
-    """
-    if USE_AOT:
-        return numba_compiled.ema_loop(data, alpha)
-    else:
-        return _ema_loop(data, alpha)
-
-
-def sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """
-    Wrapper for SMA calculation with smart threshold.
-    Threshold: 600 (moderate cost operation)
-    """
-    if USE_AOT:
-        return numba_compiled.sma_loop(data, period)
-    else:
-        # ⚡ OPTIMIZED: SMA is moderate cost - threshold 600
-        if cfg.NUMBA_PARALLEL and len(data) >= 600:
-            return _sma_loop_parallel(data, period)
-        else:
-            return _sma_loop(data, period)
-
-
-def sanitize_array_wrapper(arr: np.ndarray, default: float) -> np.ndarray:
-    """
-    Wrapper for array sanitization with smart threshold.
-    Threshold: 300 (cheap operation - just checks)
-    """
-    if USE_AOT:
-        return numba_compiled.sanitize_array(arr, default)
-    else:
-        # ⚡ OPTIMIZED: Sanitization is cheap - threshold 300
-        if cfg.NUMBA_PARALLEL and len(arr) >= 300:
-            return _sanitize_array_numba_parallel(arr, default)
-        else:
-            return _sanitize_array_numba(arr, default)
-
-
-def rolling_std_wrapper(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """
-    Wrapper for rolling standard deviation with smart threshold.
-    Threshold: 400 (expensive operation - sqrt, variance)
-    """
-    if USE_AOT:
-        # AOT doesn't have this function yet, fall back to JIT
-        if cfg.NUMBA_PARALLEL and len(close) >= 400:
-            return _rolling_std_welford_parallel(close, period, responsiveness)
-        else:
-            return _rolling_std_welford(close, period, responsiveness)
-    else:
-        # ⚡ OPTIMIZED: Rolling STD is expensive - threshold 400
-        if cfg.NUMBA_PARALLEL and len(close) >= 400:
-            return _rolling_std_welford_parallel(close, period, responsiveness)
-        else:
-            return _rolling_std_welford(close, period, responsiveness)
-
-
-def rolling_mean_wrapper(close: np.ndarray, period: int) -> np.ndarray:
-    """
-    Wrapper for rolling mean with smart threshold.
-    Threshold: 600 (moderate cost operation)
-    """
-    if USE_AOT:
-        # Use AOT SMA if available
-        return numba_compiled.sma_loop(close, period)
-    else:
-        # ⚡ OPTIMIZED: Rolling mean is moderate - threshold 600
-        if cfg.NUMBA_PARALLEL and len(close) >= 600:
-            return _rolling_mean_numba_parallel(close, period)
-        else:
-            return _rolling_mean_numba(close, period)
-
-
-def rolling_minmax_wrapper(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Wrapper for rolling min/max with smart threshold.
-    Threshold: 500 (moderate cost operation)
-    """
-    if USE_AOT:
-        # AOT doesn't have this function yet, fall back to JIT
-        if cfg.NUMBA_PARALLEL and len(arr) >= 500:
-            return _rolling_min_max_numba_parallel(arr, period)
-        else:
-            return _rolling_min_max_numba(arr, period)
-    else:
-        # ⚡ OPTIMIZED: Rolling min/max is moderate - threshold 500
-        if cfg.NUMBA_PARALLEL and len(arr) >= 500:
-            return _rolling_min_max_numba_parallel(arr, period)
-        else:
-            return _rolling_min_max_numba(arr, period)
-
-
-def vectorized_wick_check_buy_wrapper(
-    open_arr: np.ndarray,
-    high_arr: np.ndarray,
-    low_arr: np.ndarray,
-    close_arr: np.ndarray,
-    min_wick_ratio: float
-) -> np.ndarray:
-    """Wrapper for buy candle quality check - uses AOT if available"""
-    if USE_AOT:
-        return numba_compiled.vectorized_wick_buy(
-            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
-        )
-    else:
-        return _vectorized_wick_check_buy(
-            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
-        )
-
-
-def vectorized_wick_check_sell_wrapper(
-    open_arr: np.ndarray,
-    high_arr: np.ndarray,
-    low_arr: np.ndarray,
-    close_arr: np.ndarray,
-    min_wick_ratio: float
-) -> np.ndarray:
-    """Wrapper for sell candle quality check - uses AOT if available"""
-    if USE_AOT:
-        return numba_compiled.vectorized_wick_sell(
-            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
-        )
-    else:
-        return _vectorized_wick_check_sell(
-            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
-        )
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================
@@ -1525,8 +1379,7 @@ def calculate_all_indicators_numpy(
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray]:
-    # ⚡ Use wrappers that select AOT/JIT automatically
-    buy_quality = vectorized_wick_check_buy_wrapper(
+    buy_quality = _vectorized_wick_check_buy(
         data_15m["open"],
         data_15m["high"],
         data_15m["low"],
@@ -1534,7 +1387,7 @@ def precompute_candle_quality(
         Constants.MIN_WICK_RATIO
     )
     
-    sell_quality = vectorized_wick_check_sell_wrapper(
+    sell_quality = _vectorized_wick_check_sell(
         data_15m["open"],
         data_15m["high"],
         data_15m["low"],
@@ -1762,21 +1615,6 @@ async def async_fetch_json(
         
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
-                # >>>>>>  DEBUG START  <<<<<<
-                if cfg.DEBUG_MODE and 'chart/history' in url:
-                    try:
-                        raw_body = await resp.text()          # get raw JSON once
-                        logger.debug(
-                            f"API RAW | URL: {resp.url} | "
-                            f"Status: {resp.status} | "
-                            f"Body (first 500 chars):\n{raw_body[:500]}"
-                        )
-                        # put the text back so resp.json() still works
-                        resp._body = raw_body.encode()
-                    except Exception as e:
-                        logger.debug(f"Debug log failed: {e}")
-# >>>>>>  DEBUG END  <<<<<
-
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
@@ -1931,104 +1769,32 @@ class RateLimitedFetcher:
             "max_per_minute": self.max_per_minute
         }
 
-class APICircuitBreaker:
-    """Prevents cascading failures when API is degraded"""
-    
-    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 60):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failures = 0
-        self.last_failure_time = 0.0
-        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
-        self.success_count = 0
-        
-    def record_success(self) -> None:
-        """Record successful API call"""
-        if self.state == "HALF_OPEN":
-            self.success_count += 1
-            if self.success_count >= 2:
-                logger.info("🟢 Circuit breaker: Recovered, transitioning to CLOSED")
-                self.state = "CLOSED"
-                self.failures = 0
-                self.success_count = 0
-        elif self.state == "CLOSED":
-            # Reset failure count on success
-            if self.failures > 0:
-                self.failures = max(0, self.failures - 1)
-    
-    def record_failure(self) -> None:
-        """Record failed API call"""
-        self.failures += 1
-        self.last_failure_time = time.time()
-        
-        if self.failures >= self.failure_threshold and self.state == "CLOSED":
-            logger.warning(
-                f"🔴 Circuit breaker: OPENED after {self.failures} failures. "
-                f"Blocking requests for {self.recovery_timeout}s"
-            )
-            self.state = "OPEN"
-    
-    def can_attempt(self) -> Tuple[bool, Optional[str]]:
-        """Check if request should be allowed"""
-        if self.state == "CLOSED":
-            return True, None
-        
-        if self.state == "OPEN":
-            # Check if recovery timeout has passed
-            elapsed = time.time() - self.last_failure_time
-            if elapsed >= self.recovery_timeout:
-                logger.info("🟡 Circuit breaker: Transitioning to HALF_OPEN (testing recovery)")
-                self.state = "HALF_OPEN"
-                self.success_count = 0
-                return True, None
-            
-            return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
-        
 class DataFetcher:
-    """
-    Asynchronous data fetcher with
-    - configurable concurrency
-    - rate-limiting
-    - circuit-breaker
-    - detailed statistics
-    """
-
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
-
-        # Fall back to global config if caller did not supply a limit
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
 
-        self.semaphore   = asyncio.Semaphore(max_parallel)
-        self.timeout     = cfg.HTTP_TIMEOUT
+        self.semaphore = asyncio.Semaphore(max_parallel)
+        self.timeout = cfg.HTTP_TIMEOUT
+
         self.rate_limiter = RateLimitedFetcher(
             max_per_minute=60,
             concurrency=max_parallel
         )
 
-        # Circuit-breaker hardening
-        self.circuit_breaker = APICircuitBreaker(
-            failure_threshold=3,
-            recovery_timeout=60
-        )
-
-        # Simple counters for observability
         self.fetch_stats = {
-            "products_success":        0,
-            "products_failed":         0,
-            "candles_success":         0,
-            "candles_failed":          0,
-            "circuit_breaker_blocks":  0,
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0,
+            "total_wait_time": 0.0,
+            "rate_limit_hits": 0
         }
 
         logger.debug(
-            f"DataFetcher initialised | max_parallel={max_parallel} | "
+            f"DataFetcher initialized | max_parallel={max_parallel} | "
             f"rate_limit=60/min | timeout={self.timeout}s"
         )
-
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
@@ -2042,16 +1808,14 @@ class DataFetcher:
                 timeout=self.timeout
             )
 
-        if result:
-            self.fetch_stats["products_success"] += 1
-            logger.debug(f"Products fetch successful | URL: {url}")
-        else:
-            self.fetch_stats["products_failed"] += 1
-            logger.warning(f"Products fetch failed | URL: {url}")
+            if result:
+                self.fetch_stats["products_success"] += 1
+                logger.debug(f"Products fetch successful | URL: {url}")
+            else:
+                self.fetch_stats["products_failed"] += 1
+                logger.warning(f"Products fetch failed | URL: {url}")
 
-        return result
-
-    # ------------------------------------------------------------------
+            return result
 
     async def fetch_candles(
         self,
@@ -2060,47 +1824,34 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """
-        Fetch OHLCV candles for a single symbol/resolution pair.
-        Returns the raw JSON dict from the API or None on failure.
-        """
-
-        # --- Circuit-breaker guard ------------------------------------
-        can_proceed, reason = self.circuit_breaker.can_attempt()
-        if not can_proceed:
-            logger.warning(
-                f"Circuit breaker blocked request for {symbol}: {reason}"
-            )
-            self.fetch_stats["circuit_breaker_blocks"] += 1
-            return None
-
-        # --- Time handling --------------------------------------------
+        
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
+        # Determine interval in minutes
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
+        
+        # 1. FIX: Calculate the strict expected open of the last closed candle
+        expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
 
-        # Expected open of the last *closed* candle
-        expected_open_ts = calculate_expected_candle_timestamp(
-            reference_time, minutes
-        )
-
-        # Ask for a few extra future periods to work around API lag
-        buffer_periods = 3
-        to_time   = reference_time + (interval_seconds * buffer_periods)
+        # 2. FIX: Request a wider window to handle API publication lag.
+        # We add extra buffer to the 'to' time so the API doesn't truncate the latest candle.
+        buffer_periods = 3 # Increased buffer
+        to_time = reference_time + (interval_seconds * buffer_periods)
+        
+        # Ensure we look back far enough to get 'limit' candles even with the buffer
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
             "resolution": resolution,
-            "symbol":     symbol,
-            "from":       int(from_time),
-            "to":         int(to_time),
+            "symbol": symbol,
+            "from": int(from_time),
+            "to": int(to_time)
         }
 
         url = f"{self.api_base}/v2/chart/history"
 
-        # --- Actual HTTP call -----------------------------------------
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -2111,114 +1862,88 @@ class DataFetcher:
                 timeout=self.timeout
             )
 
-        # --- Logging / sanity checks ----------------------------------
-        if data:
-            num_candles = len(data.get("t", []))
-            if num_candles:
-                last_candle_open_ts = data["t"][-1]
-                diff = abs(expected_open_ts - last_candle_open_ts)
+            if data:
+                self.fetch_stats["candles_success"] += 1
 
-                if diff > 300:          # > 5 min drift
-                    if last_candle_open_ts < expected_open_ts:
-                        logger.warning(
-                            f"⚠️  API DELAY | {symbol} {resolution} | "
-                            f"Expected: {format_ist_time(expected_open_ts)} | "
-                            f"Got: {format_ist_time(last_candle_open_ts)} "
-                            f"(Diff: {diff}s)"
-                        )
-                    else:
-                        logger.debug(
-                            f"API Ahead | {symbol} {resolution} | Diff: {diff}s"
-                        )
+                result = data.get("result", {})
+                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                    num_candles = len(result.get("t", []))
+
+                    if num_candles > 0:
+                        last_candle_open_ts = result["t"][-1]
+                        last_candle_close_ts = last_candle_open_ts + interval_seconds
+                        diff = abs(expected_open_ts - last_candle_open_ts)
+
+                        # LOGGING LOGIC
+                        if diff > 300: # Over 5 minutes difference
+                            if last_candle_open_ts < expected_open_ts:
+                                # This is the "API Lag" warning we want to monitor
+                                logger.warning(
+                                    f"⚠️ API DELAY | {symbol} {resolution} | "
+                                    f"Expected: {format_ist_time(expected_open_ts)} | "
+                                    f"Got: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
+                                )
+                            else:
+                                # Data is ahead (normal for lower timeframes like 5m vs 15m)
+                                logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
+                        else:
+                            logger.debug(
+                                f"✅ Scanned {symbol} {resolution} | "
+                                f"Latest: {format_ist_time(last_candle_open_ts)}"
+                            )
                 else:
-                    logger.debug(
-                        f"✅ Scanned {symbol} {resolution} | "
-                        f"Latest: {format_ist_time(last_candle_open_ts)}"
-                    )
-                # >>>>>>  QUICK TEST – DELETE AFTER CONFIRMING  <<<<<<
-                if resolution == "15" and symbol == "BTCUSDT":
-                    import time
-                    now = int(time.time())
-                    params["from"] = now - 48 * 3600   # 48 hours ago
-                    params["to"]   = now               # now
-                logger.debug(f"OVERRIDE BTC 15m | from={params['from']} to={params['to']}")
-# >>>>>>  END TEST  <<<<<<
+                    logger.warning(f"Candles response missing fields | Symbol: {symbol}")
+                    self.fetch_stats["candles_failed"] += 1
+                    return None
+            else:
+                self.fetch_stats["candles_failed"] += 1
+                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
 
-
-        return data
-
-    # ------------------------------------------------------------------
+            return data
 
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Return a snapshot of internal counters including success rates.
-        """
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
-
         total_products = stats["products_success"] + stats["products_failed"]
-        total_candles  = stats["candles_success"]  + stats["candles_failed"]
+        total_candles = stats["candles_success"] + stats["candles_failed"]
 
-        if total_products:
-            stats["products_success_rate"] = round(
-                stats["products_success"] / total_products * 100, 1
-            )
-        if total_candles:
-            stats["candles_success_rate"] = round(
-                stats["candles_success"] / total_candles * 100, 1
-            )
+        if total_products > 0:
+            stats["products_success_rate"] = round(stats["products_success"] / total_products * 100, 1)
+        if total_candles > 0:
+            stats["candles_success_rate"] = round(stats["candles_success"] / total_candles * 100, 1)
         return stats
-
-    # ------------------------------------------------------------------
-    # Batch helpers
-    # ------------------------------------------------------------------
 
     async def fetch_candles_batch(
         self,
         requests: List[Tuple[str, str, int]],
         reference_time: Optional[int] = None
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-        """
-        Fire off many `fetch_candles` calls concurrently.
-        Returns dict keyed by  "symbol_resolution".
-        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        tasks       = []
+        tasks = []
         request_keys = []
-
         for symbol, resolution, limit in requests:
             task = self.fetch_candles(symbol, resolution, limit, reference_time)
             tasks.append(task)
             request_keys.append(f"{symbol}_{resolution}")
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
         output = {}
         for key, result in zip(request_keys, results):
             output[key] = None if isinstance(result, Exception) else result
         return output
-
-    # ------------------------------------------------------------------
 
     async def fetch_all_candles_truly_parallel(
         self,
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
         reference_time: Optional[int] = None,
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-        """
-        Even higher-level batch helper:
-        [
-          ("BTC-USD", [("5", 200), ("15", 200)]),
-          ("ETH-USD", [("5", 200), ("60", 100)]),
-        ]
-        Returns nested dict:  symbol -> resolution -> data|None
-        """
+    
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        all_tasks     = []
+        all_tasks = []
         task_metadata = []
 
         for symbol, resolutions in pair_requests:
@@ -2228,22 +1953,19 @@ class DataFetcher:
                 task_metadata.append((symbol, resolution))
 
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
-
-        output        = {}
+        output = {}
         success_count = 0
 
         for (symbol, resolution), result in zip(task_metadata, results):
-            output.setdefault(symbol, {})[resolution] = (
-                None if isinstance(result, Exception) else result
-            )
-            if result and not isinstance(result, Exception):
-                success_count += 1
+            if symbol not in output: output[symbol] = {}
+            if isinstance(result, Exception):
+                output[symbol][resolution] = None
+            else:
+                output[symbol][resolution] = result
+                if result: success_count += 1
 
-        logger.info(
-            f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}"
-        )
+        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
-
 
 def parse_candles_to_numpy(
     result: Optional[Dict[str, Any]],
@@ -2297,31 +2019,7 @@ def validate_candle_data(
     try:
         if data is None or not data:
             return False, "Data is None or empty"
-        
-        # ⚡ NEW: Data Freshness Check
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-        
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
-        
-        # Check if data is stale (API frozen/cached)
-        current_time = get_trigger_timestamp()
-        last_candle_time = int(timestamp[-1])
-        staleness = current_time - last_candle_time
-        
-        # Allow 15min candle + 2min buffer for API lag
-        MAX_STALENESS = (15 * 60) + 120  # 17 minutes
-        
-        if staleness > MAX_STALENESS:
-            return False, (
-                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "
-                f"Last candle: {format_ist_time(last_candle_time)} | "
-                f"Current: {format_ist_time(current_time)}"
-            )
-        
-        if close is None or len(close) == 0:
-            return False, "Close array is empty"
+
         close = data.get("close")
         timestamp = data.get("timestamp")
 
@@ -2394,17 +2092,11 @@ def get_last_closed_index_from_array(
         return None
 
     last_closed_idx = int(valid_indices[-1])
-
-    debug_if(
-        cfg.DEBUG_MODE,
-        logger,
-        lambda: (
-            f"Selected fully closed candle | Index: {last_closed_idx}\n"
-            f"TS: {format_ist_time(timestamps[last_closed_idx])}"
-        ),
+    logger.debug(
+        f"Selected fully closed candle | Index: {last_closed_idx} | "
+        f"TS: {format_ist_time(timestamps[last_closed_idx])}"
     )
     return last_closed_idx
-
 
 def validate_candle_timestamp(
     candle_ts: int,
@@ -2430,36 +2122,28 @@ def validate_candle_timestamp(
     )
     return True
 
-
-def build_products_map_from_api_result(
-    api_products: Optional[Dict[str, Any]]
-) -> Dict[str, dict]:
+def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
     if not api_products or not api_products.get("result"):
         return products_map
-
     valid_pattern = CompiledPatterns.VALID_SYMBOL
     for p in api_products["result"]:
         try:
             symbol = p.get("symbol", "")
             if not valid_pattern.match(symbol):
                 continue
-
             symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
-
             if p.get("contract_type") == "perpetual_futures":
                 for pair_name in cfg.PAIRS:
                     if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
                         products_map[pair_name] = {
                             "id": p.get("id"),
                             "symbol": p.get("symbol"),
-                            "contract_type": p.get("contract_type"),
+                            "contract_type": p.get("contract_type")
                         }
                         break
         except Exception:
-            # Silently skip malformed product entries
             pass
-
     return products_map
 
 class RedisStateStore:
@@ -2751,6 +2435,7 @@ class RedisStateStore:
     async def check_recent_alert(
         self, pair: str, alert_key: str, ts: int
     ) -> bool:
+        
         if self.degraded:
             return True
 
@@ -2788,6 +2473,7 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
+        
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2878,82 +2564,6 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
-    async def atomic_eval_batch(
-        self,
-        pair: str,
-        alert_keys: List[str],
-        state_updates: List[Tuple[str, Any, Optional[int]]],
-        dedup_checks: List[Tuple[str, str, int]]
-    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        if self.degraded:
-            empty_prev = {k: False for k in alert_keys}
-            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-            return empty_prev, empty_dedup
-
-        try:
-            async with self._redis.pipeline() as pipe:
-                # Phase 1: MGET for previous states
-                state_keys = [f"{pair}:{k}" for k in alert_keys]
-                pipe.mget(state_keys)
-
-                # Phase 2: SET for state updates
-                now = int(time.time())
-                for key, state, custom_ts in state_updates:
-                    ts = custom_ts if custom_ts is not None else now
-                    data = json_dumps({"state": state, "ts": ts})
-                    full_key = f"{self.state_prefix}{key}"
-                    if self.expiry_seconds > 0:
-                        pipe.set(full_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(full_key, data)
-
-                # Phase 3: SET NX for dedup
-                for pair_name, alert_key, ts in dedup_checks:
-                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
-                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-
-            # Execute all at once
-            results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
-
-            # Parse results
-            num_state_keys = len(state_keys)
-            num_updates = len(state_updates)
-
-            # Previous states (first result from MGET)
-            prev_states = {}
-            mget_results = results[0] if results else []
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-                if val:
-                    try:
-                        parsed = json_loads(val)
-                        prev_states[key] = parsed.get("state") == "ACTIVE"
-                    except Exception:
-                        prev_states[key] = False
-                else:
-                    prev_states[key] = False
-
-            # Dedup results (results after MGET and SETs)
-            dedup_results = {}
-            dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
-            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
-                result_idx = dedup_start_idx + idx
-                should_send = bool(results[result_idx]) if result_idx < len(results) else True
-                dedup_results[f"{pair_name}:{alert_key}"] = should_send
-
-            return prev_states, dedup_results
-
-        except Exception as e:
-            logger.error(f"atomic_eval_batch failed: {e}")
-            # Fallback to individual operations
-            state_keys = [f"{pair}:{k}" for k in alert_keys]
-            prev_states_raw = await self.mget_states(state_keys)
-            prev_states = {k: (v.get("state") == "ACTIVE" if v else False) for k, v in prev_states_raw.items()}
-            await self.batch_set_states(state_updates)
-            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-            return prev_states, dedup_results
-
     async def atomic_batch_update(
         self,
         updates: List[Tuple[str, Any, Optional[int]]],
@@ -2985,6 +2595,88 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"Atomic batch update failed: {e}")
             return False
+
+    async def atomic_eval_batch(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        state_updates: List[Tuple[str, Any, Optional[int]]],
+        dedup_checks: List[Tuple[str, str, int]]
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """
+        ✅ NEW: Single atomic operation for entire evaluation:
+        1. Get previous states (MGET)
+        2. Set new states (pipeline)
+        3. Check dedup (pipeline)
+        
+        Returns: (previous_states_dict, dedup_results_dict)
+        """
+        if self.degraded:
+            empty_prev = {k: False for k in alert_keys}
+            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            return empty_prev, empty_dedup
+        
+        try:
+            async with self._redis.pipeline() as pipe:
+                # Phase 1: MGET for previous states
+                state_keys = [f"{pair}:{k}" for k in alert_keys]
+                pipe.mget(state_keys)
+                
+                # Phase 2: SET for state updates
+                now = int(time.time())
+                for key, state, custom_ts in state_updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    data = json_dumps({"state": state, "ts": ts})
+                    full_key = f"{self.state_prefix}{key}"
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
+                
+                # Phase 3: SET NX for dedup
+                for pair_name, alert_key, ts in dedup_checks:
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                
+                # Execute all at once
+                results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
+            
+            # Parse results
+            num_state_keys = len(state_keys)
+            num_updates = len(state_updates)
+            
+            # Previous states (first N results from MGET)
+            prev_states = {}
+            mget_results = results[0] if results else []
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                if val:
+                    try:
+                        parsed = json_loads(val)
+                        prev_states[key] = parsed.get("state") == "ACTIVE"
+                    except:
+                        prev_states[key] = False
+                else:
+                    prev_states[key] = False
+            
+            # Dedup results (results after MGET and SETs)
+            dedup_results = {}
+            dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
+            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+                result_idx = dedup_start_idx + idx
+                should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                dedup_results[f"{pair_name}:{alert_key}"] = should_send
+            
+            return prev_states, dedup_results
+            
+        except Exception as e:
+            logger.error(f"atomic_eval_batch failed: {e}")
+            # Fallback to individual operations
+            prev_states = await self.mget_states(state_keys)
+            await self.batch_set_states(state_updates)
+            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+            return prev_states, dedup_results
 
 class RedisLock:
     RELEASE_LUA = """
@@ -3452,7 +3144,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-
+    
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     pair_start_time = time.time()
@@ -3469,32 +3161,7 @@ async def evaluate_pair_and_alert(
             return None
 
         # ===================================================================
-        # STEP 2: ⚡ QUICK PRE-CHECK (Skip expensive calculations if possible)
-        # ===================================================================
-        close_15m = data_15m["close"]
-        close_5m = data_5m["close"]
-        timestamps_15m = data_15m["timestamp"]
-
-        # Quick trend check without full indicator calculation
-        i15_quick = get_last_closed_index_from_array(timestamps_15m, 15, reference_time)
-        if i15_quick is None or i15_quick < 3:
-            logger_pair.debug(f"Insufficient data for {pair_name}")
-            return None
-
-        close_curr_quick = close_15m[i15_quick]
-        open_curr_quick = data_15m["open"][i15_quick]
-
-        # Quick candle color check
-        is_green = close_curr_quick > open_curr_quick
-        is_red = close_curr_quick < open_curr_quick
-
-        # If neither green nor red candle, skip expensive indicators
-        if not is_green and not is_red:
-            logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
-            return None
-
-        # ===================================================================
-        # STEP 3: NOW calculate indicators (only if candle has direction)
+        # STEP 2: ✅ CALCULATE INDICATORS FIRST (before accessing any arrays)
         # ===================================================================
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
@@ -3523,14 +3190,15 @@ async def evaluate_pair_and_alert(
         # ===================================================================
         # STEP 3: ✅ NOW extract values at target indices (after arrays exist)
         # ===================================================================
-        close_curr = close_15m[i15]       # already np.float64
-        close_prev = close_15m[i15 - 1]   # already np.float64
-        close_5m_val = close_5m[i5]       # already np.float64
-        ts_curr = int(timestamps_15m[i15])  # keep int() for timestamps
+        close_curr   = close_15m[i15]       # already np.float64
+        close_prev   = close_15m[i15 - 1]   # already np.float64
+        close_5m_val = close_5m[i5]         # already np.float64
+        ts_curr      = int(timestamps_15m[i15])  # keep int() for timestamps
 
         # Extract indicator values at target indices
-        rma50_15_val = rma50_15[i15]      # already np.float64
-        rma200_5_val = rma200_5[i5]       # already np.float64
+        rma50_15_val = rma50_15[i15]        # already np.float64
+        rma200_5_val = rma200_5[i5]         # already np.float64
+
 
         # ===================================================================
         # STEP 4: TIMESTAMP VALIDATION (STRICT ONLY FOR 15m)
@@ -3558,24 +3226,19 @@ async def evaluate_pair_and_alert(
             pivot_day_key = f"{pair_name}:pivot_day"
             last_pivot_day_str = await sdb.get_metadata(pivot_day_key)
             last_pivot_day = int(last_pivot_day_str) if last_pivot_day_str else None
-
+            
             if last_pivot_day != current_day:
                 delete_keys = []
                 for level in ["P", "S1", "S2", "S3", "R1", "R2", "R3"]:
                     up_key = f"{pair_name}:{ALERT_KEYS[f'pivot_up_{level}']}"
                     down_key = f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level}']}"
                     delete_keys.extend([up_key, down_key])
-
+                
                 if delete_keys:
                     success = await sdb.atomic_batch_update([], deletes=delete_keys)
                     if not success and cfg.DEBUG_MODE:
-                        logger_pair.warning(
-                            f"Atomic delete failed for pivot reset, falling back"
-                        )
-                        await asyncio.gather(
-                            *[sdb._redis.delete(k) for k in delete_keys],
-                            return_exceptions=True
-                        )
+                        logger_pair.warning(f"Atomic delete failed for pivot reset, falling back")
+                        await asyncio.gather(*[sdb._redis.delete(k) for k in delete_keys], return_exceptions=True)
                 await sdb.set_metadata(pivot_day_key, str(current_day))
 
         # ===================================================================
@@ -3583,37 +3246,37 @@ async def evaluate_pair_and_alert(
         # ===================================================================
         open_curr = open_15m[i15]
         high_curr = high_15m[i15]
-        low_curr = low_15m[i15]
+        low_curr  = low_15m[i15]
 
         # Extract indicator values for current and previous candles
-        ppo_curr, ppo_prev = ppo[i15], ppo[i15 - 1]
+        ppo_curr, ppo_prev       = ppo[i15], ppo[i15 - 1]
         ppo_sig_curr, ppo_sig_prev = ppo_signal[i15], ppo_signal[i15 - 1]
-        rsi_curr, rsi_prev = smooth_rsi[i15], smooth_rsi[i15 - 1]
+        rsi_curr, rsi_prev       = smooth_rsi[i15], smooth_rsi[i15 - 1]
         vwap_curr = vwap[i15] if len(vwap) > i15 else 0.0
         vwap_prev = vwap[i15 - 1] if len(vwap) > (i15 - 1) else 0.0
-        mmh_curr, mmh_m1 = mmh[i15], mmh[i15 - 1]
-
+        mmh_curr, mmh_m1         = mmh[i15], mmh[i15 - 1]
+     
         # Cloud indicators
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-
+        
         # Candle color
         is_green_candle = close_curr > open_curr
         is_red_candle = close_curr < open_curr
 
-        debug_if(True, logger_pair,
-                 lambda: f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f}")
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f} | Green={is_green_candle} Red={is_red_candle}")
 
         # ===================================================================
         # STEP 7: TREND & QUALITY FILTERS
         # ===================================================================
-        base_buy_trend = (rma50_15_val < close_curr and rma200_5_val < close_5m_val)
+        base_buy_trend  = (rma50_15_val < close_curr and rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr and rma200_5_val > close_5m_val)
 
         # Add MMH and cloud confirmation
-        if base_buy_trend:
+        if base_buy_trend: 
             base_buy_trend = base_buy_trend and (mmh_curr > 0 and cloud_up)
-        if base_sell_trend:
+        if base_sell_trend: 
             base_sell_trend = base_sell_trend and (mmh_curr < 0 and cloud_down)
 
         # Candle quality checks
@@ -3625,12 +3288,8 @@ async def evaluate_pair_and_alert(
         if base_buy_trend:
             if not is_green_candle:
                 buy_candle_passed = False
-                buy_candle_reason = (
-                    f"NOT GREEN CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
-                )
-                logger_pair.debug(
-                    f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}"
-                )
+                buy_candle_reason = f"NOT GREEN CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
+                logger_pair.debug(f"❌ BUY alert blocked for {pair_name} | {buy_candle_reason}")
             elif not buy_candle_passed:
                 _, buy_candle_reason = check_candle_quality_with_reason(
                     open_curr, high_curr, low_curr, close_curr, is_buy=True
@@ -3639,12 +3298,8 @@ async def evaluate_pair_and_alert(
         if base_sell_trend:
             if not is_red_candle:
                 sell_candle_passed = False
-                sell_candle_reason = (
-                    f"NOT RED CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
-                )
-                logger_pair.debug(
-                    f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}"
-                )
+                sell_candle_reason = f"NOT RED CANDLE (O={open_curr:.4f} C={close_curr:.4f})"
+                logger_pair.debug(f"❌ SELL alert blocked for {pair_name} | {sell_candle_reason}")
             elif not sell_candle_passed:
                 _, sell_candle_reason = check_candle_quality_with_reason(
                     open_curr, high_curr, low_curr, close_curr, is_buy=False
@@ -3675,16 +3330,16 @@ async def evaluate_pair_and_alert(
         if i15 >= 3:
             mmh_m3, mmh_m2 = float(mmh[i15 - 3]), float(mmh[i15 - 2])
             mmh_reversal_buy = (
-                buy_common
-                and mmh_curr > 0
-                and mmh_m3 > mmh_m2 > mmh_m1
-                and mmh_curr > mmh_m1
+                buy_common and 
+                mmh_curr > 0 and 
+                mmh_m3 > mmh_m2 > mmh_m1 and 
+                mmh_curr > mmh_m1
             )
             mmh_reversal_sell = (
-                sell_common
-                and mmh_curr < 0
-                and mmh_m3 < mmh_m2 < mmh_m1
-                and mmh_curr < mmh_m1
+                sell_common and 
+                mmh_curr < 0 and 
+                mmh_m3 < mmh_m2 < mmh_m1 and 
+                mmh_curr < mmh_m1
             )
 
         # ===================================================================
@@ -3722,50 +3377,48 @@ async def evaluate_pair_and_alert(
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
-
+        
         # ===================================================================
         # STEP 10: PREPARE FOR BATCHED REDIS OPERATION
         # ===================================================================
         raw_alerts = []
         alert_keys_to_check = [
-            def_["key"] for def_ in ALERT_DEFINITIONS
+            def_["key"] for def_ in ALERT_DEFINITIONS 
             if not (
-                ("pivots" in def_["requires"] and not context.get("pivots"))
-                or ("vwap" in def_["requires"] and not context.get("vwap"))
+                ("pivots" in def_["requires"] and not context.get("pivots")) or 
+                ("vwap" in def_["requires"] and not context.get("vwap"))
             )
         ]
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
         all_state_changes = []
 
         # Get previous states FIRST (needed for trigger logic)
-        previous_states = await check_multiple_alert_states(
-            sdb, pair_name, redis_alert_keys
-        )
+        previous_states = await check_multiple_alert_states(sdb, pair_name, redis_alert_keys)
 
         # ===================================================================
         # STEP 11: TRIGGER LOGIC - CHECK ALL ALERTS
         # ===================================================================
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-            if not def_:
+            if not def_: 
                 continue
-
+                
             try:
                 key = ALERT_KEYS[alert_key]
                 trigger = False
-
+                
                 # Special handling for pivot alerts
                 if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                     level = alert_key.split("_")[-1]
                     is_buy = alert_key.startswith("pivot_up_")
                     valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-
+                    
                     if not valid_cross and reason and context.get("pivots"):
                         context["pivot_suppressions"].append(reason)
-
+                    
                     trigger = (
-                        (is_buy and context["buy_common"])
-                        or (not is_buy and context["sell_common"])
+                        (is_buy and context["buy_common"]) or 
+                        (not is_buy and context["sell_common"])
                     ) and valid_cross
                 else:
                     # Standard alert check
@@ -3776,10 +3429,10 @@ async def evaluate_pair_and_alert(
                     extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
                     raw_alerts.append((def_["title"], extra, def_["key"]))
                     all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
-
+                    
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"✅ NEW alert: {pair_name}:{alert_key}")
-
+                        
             except Exception as e:
                 logger_pair.warning(
                     f"Alert check failed for {pair_name}, key={alert_key}: {e}"
@@ -3796,7 +3449,7 @@ async def evaluate_pair_and_alert(
             all_state_changes.append(
                 (f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None)
             )
-
+            
         if context["vwap"]:
             if close_prev >= vwap_prev and close_curr < vwap_curr:
                 all_state_changes.append(
@@ -3806,7 +3459,7 @@ async def evaluate_pair_and_alert(
                 all_state_changes.append(
                     (f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None)
                 )
-
+                
         if piv:
             for lvl_n, lvl_v in piv.items():
                 if close_prev > lvl_v and close_curr <= lvl_v:
@@ -3833,20 +3486,20 @@ async def evaluate_pair_and_alert(
         # ===================================================================
         # STEP 13: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
         # ===================================================================
-        # ⚡ OPTIMIZED: Single atomic Redis operation
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-
+        
         if all_state_changes or dedup_checks:
-            # Single Redis pipeline: get states + update + dedup
-            previous_states, dedup_results = await sdb.atomic_eval_batch(
+            # Use atomic batch - returns (prev_states, dedup_results)
+            # We already have prev_states, so we only need dedup_results
+            _, dedup_results = await sdb.atomic_eval_batch(
                 pair_name,
-                redis_alert_keys,
+                [],  # Empty - we already got previous states above
                 all_state_changes,
                 dedup_checks
             )
         else:
             dedup_results = {}
-
+        
         # ===================================================================
         # STEP 14: DEDUP & SEND ALERTS
         # ===================================================================
@@ -3856,11 +3509,11 @@ async def evaluate_pair_and_alert(
                 # Check if we should send (not a duplicate)
                 if dedup_results.get(f"{pair_name}:{ak}", True):
                     alerts_to_send.append((title, extra, ak))
-
+        
         if alerts_to_send:
             # Limit alerts per pair
             alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
-
+            
             # Format message
             if len(alerts_to_send) == 1:
                 title, extra, _ = alerts_to_send[0]
@@ -3868,11 +3521,11 @@ async def evaluate_pair_and_alert(
             else:
                 items = [(t, e) for t, e, _ in alerts_to_send[:25]]
                 msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
-
+            
             # Send to Telegram
             if not cfg.DRY_RUN_MODE:
                 await telegram_queue.send(msg)
-
+            
             logger_pair.info(
                 f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                 f"{[ak for _, _, ak in alerts_to_send]}"
@@ -3890,16 +3543,16 @@ async def evaluate_pair_and_alert(
             reasons.append(f"SELL quality: {sell_candle_reason}")
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
-
+        
         status_msg = (
             f"✔ {pair_name} | "
             f"cloud={'green' if cloud_up else 'red' if cloud_down else 'neutral'} "
             f"mmh={mmh_curr:.2f}"
         )
-
+        
         if not alerts_to_send:
             logger_pair.debug(
-                status_msg +
+                status_msg + 
                 (" | No signals" if not (base_buy_trend or base_sell_trend) else "")
             )
 
@@ -3917,7 +3570,7 @@ async def evaluate_pair_and_alert(
     except Exception as e:
         logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
         return None
-
+        
     finally:
         PAIR_ID.set("")
 
@@ -3944,8 +3597,7 @@ async def process_pairs_with_workers(
     pair_requests = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
-        if not product_info:
-            continue
+        if not product_info: continue
         
         symbol = product_info["symbol"]
         resolutions = [("15", limit_15m), ("5", limit_5m)]
@@ -3954,86 +3606,62 @@ async def process_pairs_with_workers(
         
         pair_requests.append((symbol, resolutions))
     
-    # Fetch all candles in parallel
+    # Fetch all candles. We trust fetch_all_candles_truly_parallel to use 
+    # calculate_expected_candle_timestamp internally.
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
     
-    # 2. PHASE 2: PREPARE TASKS (Parsing & evaluation will happen in Phase 3)
-    logger_main.info(f"🧠 Phase 2: Preparing evaluation tasks for fetched pairs...")
+    # 2. PHASE 2: PARSE & VALIDATE
+    # ✅ OPTIMIZED: PHASE 2 REMOVED - Parsing happens in Phase 3 workers
+    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
+    valid_tasks = []
     
-    tasks = []
-    for pair_name, candles_by_res in all_candles.items():
-        if not candles_by_res:  # No data fetched at all
-            continue
-        # Only include if we at least have some candles
-        if any(candles_by_res.get(res) for res in ["15", "5", "D"] if res in candles_by_res):
-            tasks.append((pair_name, candles_by_res))
-    
-    if not tasks:
-        logger_main.info("No valid candle data received for any pair.")
-        return []
-    
-    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL
-    logger_main.info(f"🧠 Phase 3: Evaluating {len(tasks)} pairs...")
+    for pair_name in pairs_to_process:
+        product_info = products_map.get(pair_name)
+        if not product_info: continue
+        
+        symbol = product_info["symbol"]
+        candles = all_candles.get(symbol, {})
+        
+        # Just pass raw candles - parsing happens in worker
+        valid_tasks.append((pair_name, candles))
+
+
+    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
+    logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
-    # Limit concurrent heavy work (CPU + Redis I/O)
+    # Use MAX_PARALLEL_FETCH (e.g. 12) to limit concurrent Redis/CPU usage
     semaphore = asyncio.Semaphore(cfg.MAX_PARALLEL_FETCH)
     
     async def guarded_eval(task_data):
-        p_name, candles = task_data
         async with semaphore:
+            p_name, candles = task_data
             try:
-                if cfg.DEBUG_MODE:
-                    logger_main.debug(
-                        f"Processing {p_name} | Candle keys: {list(candles.keys())}"
-                    )
-                
-                # Parse candles
+                # ✅ Parse and validate inside worker (parallel execution)
                 data_15m = parse_candles_to_numpy(candles.get("15"))
                 data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = (
-                    parse_candles_to_numpy(candles.get("D"))
-                    if cfg.ENABLE_PIVOT else None
-                )
+                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
                 
-                # Quick validation on 15m (critical for strategy)
-                v15, r15 = validate_candle_data(
-                    data_15m, required_len=cfg.RMA_200_PERIOD
-                )
+                # Quick validation
+                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
                 if not v15:
                     logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
                     return None
                 
-                # Full evaluation + alerting
                 return await evaluate_pair_and_alert(
-                    p_name,
-                    data_15m,
-                    data_5m,
-                    data_daily,
-                    state_db,
-                    telegram_queue,
-                    correlation_id,
-                    reference_time
+                    p_name, data_15m, data_5m, data_daily, state_db, 
+                    telegram_queue, correlation_id, reference_time
                 )
             except Exception as e:
-                logger_main.error(f"Error evaluating {p_name}: {e}", exc_info=True)
+                logger_main.error(f"Error in {p_name} evaluation: {e}")
                 return None
-    
-    # Run all evaluations concurrently
-    results = await asyncio.gather(*[guarded_eval(task) for task in tasks])
-    
-    # Filter out failed/skipped pairs
+
+    results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
     valid_results = [r for r in results if r is not None]
     
-    total_time = time.time() - fetch_start
-    logger_main.info(
-        f"✅ Run complete | Successful: {len(valid_results)}/{len(pairs_to_process)} "
-        f"| Total time: {total_time:.2f}s "
-        f"(Fetch+Prep: {eval_start - fetch_start:.2f}s, Eval: {time.time() - eval_start:.2f}s)"
-    )
-    
+    logger_main.info(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
     return valid_results
 
 # ============================================================================
@@ -4077,54 +3705,36 @@ async def run_once() -> bool:
             )
             return False
 
-        # ===================================================================
-        # STEP 1: PRODUCTS MAP (Static-first with API fallback)
-        # ===================================================================
-        products_map = None
-        pairs_to_process = []
+        # OPTIMIZED: Use configurable cache TTL
+        PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
         now = time.time()
         
-        # Try static map first
-        USE_STATIC_MAP = True
-        STATIC_MAP_REFRESH_DAYS = 7
+        products_map = None
+        pairs_to_process = []
         
-        if USE_STATIC_MAP:
-            # Check if we need API refresh (connect to Redis temporarily)
-            last_api_check_key = "last_products_api_check"
-            last_check = 0.0
+        if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
+            logger_run.info("📡 Fetching fresh products list from Delta API...")
             
-            try:
-                temp_sdb = RedisStateStore(cfg.REDIS_URL)
-                await temp_sdb.connect()
-                last_check_str = await temp_sdb.get_metadata(last_api_check_key)
-                last_check = float(last_check_str) if last_check_str else 0.0
-                await temp_sdb.close()
-            except Exception:
-                last_check = 0.0
-            
-            days_since_check = (now - last_check) / 86400
-            
-            if days_since_check < STATIC_MAP_REFRESH_DAYS:
-                logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
-                products_map = STATIC_PRODUCTS_MAP.copy()
-            else:
-                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
-                USE_STATIC_MAP = False
-        
-        if not USE_STATIC_MAP or products_map is None:
-            # Fallback to API fetch
-            logger_run.info("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
             
             if not prod_resp:
-                logger_run.warning("⚠️ API fetch failed, falling back to static map")
-                products_map = STATIC_PRODUCTS_MAP.copy()
-            else:
-                products_map = build_products_map_from_api_result(prod_resp)
-                
-                # Update last check timestamp (will do this after Redis connects properly)
-                logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
+                logger_run.error("❌ Failed to fetch products map - aborting run")
+                return False
+            
+            PRODUCTS_CACHE["data"] = prod_resp
+            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL  # OPTIMIZED: Configurable
+            run_once._products_cache = PRODUCTS_CACHE
+            
+            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
+            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
+            
+            products_map = build_products_map_from_api_result(prod_resp)
+        else:
+            cache_ttl = PRODUCTS_CACHE["until"] - now
+            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
+            prod_resp = PRODUCTS_CACHE["data"]
+            products_map = build_products_map_from_api_result(prod_resp)
         
         pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
@@ -4136,19 +3746,9 @@ async def run_once() -> bool:
             logger_run.error("❌ No valid pairs to process - aborting run")
             return False
 
-        # ===================================================================
-        # STEP 2: CONNECT TO REDIS
-        # ===================================================================
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
-        
-        # Update API check timestamp if we fetched from API
-        if not USE_STATIC_MAP and products_map and not sdb.degraded:
-            try:
-                await sdb.set_metadata(last_api_check_key, str(now))
-            except Exception as e:
-                logger_run.debug(f"Failed to update API check timestamp: {e}")
         
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
@@ -4162,16 +3762,10 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
-        # ===================================================================
-        # STEP 3: INITIALIZE FETCHER & TELEGRAM
-        # ===================================================================
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
-        # ===================================================================
-        # STEP 4: ACQUIRE DISTRIBUTED LOCK
-        # ===================================================================
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
         
@@ -4183,9 +3777,6 @@ async def run_once() -> bool:
 
         logger_run.debug("🔒 Distributed lock acquired successfully")
 
-        # ===================================================================
-        # STEP 5: SEND TEST MESSAGE (if enabled)
-        # ===================================================================
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -4194,9 +3785,6 @@ async def run_once() -> bool:
                 f"Pairs: {len(pairs_to_process)}"
             ))
 
-        # ===================================================================
-        # STEP 6: PROCESS ALL PAIRS
-        # ===================================================================
         logger_run.debug(
             f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
@@ -4207,9 +3795,6 @@ async def run_once() -> bool:
             lock, reference_time
         )
 
-        # ===================================================================
-        # STEP 7: COLLECT STATISTICS
-        # ===================================================================
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
@@ -4230,9 +3815,6 @@ async def run_once() -> bool:
                     f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
                 )
 
-        # ===================================================================
-        # STEP 8: FINAL SUMMARY
-        # ===================================================================
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         
@@ -4286,7 +3868,6 @@ async def run_once() -> bool:
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
         
-        # Release distributed lock
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
@@ -4294,7 +3875,6 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}")
         
-        # Close Redis connection (but NOT the global pool)
         if sdb:
             try:
                 await sdb.close()
@@ -4302,7 +3882,9 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
         
-        # Memory cleanup
+        # ✅ REMOVED: Redis pool shutdown (keeping alive)
+        # ✅ REMOVED: HTTP session close (keeping alive)
+        
         try:
             if 'all_results' in locals():
                 del all_results
@@ -4325,19 +3907,13 @@ async def run_once() -> bool:
         logger_run.debug("🏁 Resource cleanup finished")
         
         gc.enable()
-
-
-# ============================================================================
-# UVLOOP SETUP & MAIN ENTRY POINT
-# ============================================================================
-
+        
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -4349,14 +3925,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     args = parser.parse_args()
 
-    # Enable debug logging if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
-    # Validate configuration early
     try:
         validate_runtime_config()
     except ValueError as e:
@@ -4367,19 +3941,19 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-    # Warmup Numba JIT unless explicitly skipped
+    # OPTIMIZED: Respect SKIP_WARMUP config option
     if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
-        """Run the bot with proper resource cleanup on exit"""
+        """Run bot with proper cleanup on exit"""
         try:
             return await run_once()
         finally:
-            # Cleanup persistent connections on shutdown
-            logger.info("���� Shutting down persistent connections...")
+            # ✅ NEW: Cleanup persistent connections on shutdown
+            logger.info("🧹 Shutting down persistent connections...")
             try:
                 await RedisStateStore.shutdown_global_pool()
                 logger.debug("✅ Redis pool closed")
@@ -4391,8 +3965,7 @@ if __name__ == "__main__":
                 logger.debug("✅ HTTP session closed")
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
-
-    # Run the async main function
+    
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
@@ -4403,6 +3976,7 @@ if __name__ == "__main__":
             sys.exit(1)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Bot stopped by timeout or user interrupt")
+        # Cleanup happens in finally block above
         sys.exit(130)
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
