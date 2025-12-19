@@ -1187,6 +1187,51 @@ def _vectorized_wick_check_sell(
     
     return result
 
+# ============================================================================
+# AOT integration: override serial kernels when precompiled module is available
+# ============================================================================
+try:
+    import indicators_aot as aot
+
+    # Sanitize
+    _sanitize_array_numba = aot._sanitize_array_numba
+
+    # EMA
+    _ema_loop = aot._ema_loop
+
+    # PPO: use AOT part1 + signal
+    def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+        ppo = aot._calculate_ppo_core_part1(close, fast, slow)
+        ppo_sig = aot._ppo_signal(ppo, signal)
+        return ppo, ppo_sig
+
+    # RSI core
+    _calculate_rsi_core = aot._calculate_rsi_core
+
+    # VWAP
+    _vwap_daily_loop = aot._vwap_daily_loop
+
+    # Rolling mean
+    _rolling_mean_numba = aot._rolling_mean_numba
+
+    # Rolling min/max
+    def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+        return aot._rolling_min_numba(arr, period), aot._rolling_max_numba(arr, period)
+
+    # Wick checks
+    _vectorized_wick_check_buy = aot._vectorized_wick_check_buy
+    _vectorized_wick_check_sell = aot._vectorized_wick_check_sell
+
+    # Skip warmup if AOT available
+    if hasattr(cfg, 'SKIP_WARMUP'):
+        cfg.SKIP_WARMUP = True
+
+    logger.info("✅ AOT module loaded: indicators_aot (serial kernels precompiled)")
+except Exception:
+    logger.info("ℹ️ AOT module not available, using JIT kernels")
+
+
+
 
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
@@ -3831,7 +3876,6 @@ async def run_once() -> bool:
 
         now = time.time()
         last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
-
 
         if USE_STATIC_MAP:
             # If cache has been set in-memory, derive "days since check" from it.
