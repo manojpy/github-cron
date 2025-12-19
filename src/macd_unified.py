@@ -1762,6 +1762,21 @@ async def async_fetch_json(
         
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
+                # >>>>>>  DEBUG START  <<<<<<
+                if cfg.DEBUG_MODE and 'chart/history' in url:
+                    try:
+                        raw_body = await resp.text()          # get raw JSON once
+                        logger.debug(
+                            f"API RAW | URL: {resp.url} | "
+                            f"Status: {resp.status} | "
+                            f"Body (first 500 chars):\n{raw_body[:500]}"
+                        )
+                        # put the text back so resp.json() still works
+                        resp._body = raw_body.encode()
+                    except Exception as e:
+                        logger.debug(f"Debug log failed: {e}")
+# >>>>>>  DEBUG END  <<<<<
+
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
                     wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
@@ -4355,7 +4370,7 @@ if __name__ == "__main__":
             return await run_once()
         finally:
             # Cleanup persistent connections on shutdown
-            logger.info("🧹 Shutting down persistent connections...")
+            logger.info("���� Shutting down persistent connections...")
             try:
                 await RedisStateStore.shutdown_global_pool()
                 logger.debug("✅ Redis pool closed")
