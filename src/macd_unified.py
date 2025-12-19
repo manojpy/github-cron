@@ -4044,36 +4044,54 @@ async def run_once() -> bool:
             )
             return False
 
-        # OPTIMIZED: Use configurable cache TTL
-        PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
-        now = time.time()
-        
+        # ===================================================================
+        # STEP 1: PRODUCTS MAP (Static-first with API fallback)
+        # ===================================================================
         products_map = None
         pairs_to_process = []
+        now = time.time()
         
-        if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
-            logger_run.info("📡 Fetching fresh products list from Delta API...")
+        # Try static map first
+        USE_STATIC_MAP = True
+        STATIC_MAP_REFRESH_DAYS = 7
+        
+        if USE_STATIC_MAP:
+            # Check if we need API refresh (connect to Redis temporarily)
+            last_api_check_key = "last_products_api_check"
+            last_check = 0.0
             
+            try:
+                temp_sdb = RedisStateStore(cfg.REDIS_URL)
+                await temp_sdb.connect()
+                last_check_str = await temp_sdb.get_metadata(last_api_check_key)
+                last_check = float(last_check_str) if last_check_str else 0.0
+                await temp_sdb.close()
+            except Exception:
+                last_check = 0.0
+            
+            days_since_check = (now - last_check) / 86400
+            
+            if days_since_check < STATIC_MAP_REFRESH_DAYS:
+                logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
+                products_map = STATIC_PRODUCTS_MAP.copy()
+            else:
+                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+                USE_STATIC_MAP = False
+        
+        if not USE_STATIC_MAP or products_map is None:
+            # Fallback to API fetch
+            logger_run.info("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
             
             if not prod_resp:
-                logger_run.error("❌ Failed to fetch products map - aborting run")
-                return False
-            
-            PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL  # OPTIMIZED: Configurable
-            run_once._products_cache = PRODUCTS_CACHE
-            
-            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
-            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
-            
-            products_map = build_products_map_from_api_result(prod_resp)
-        else:
-            cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
-            prod_resp = PRODUCTS_CACHE["data"]
-            products_map = build_products_map_from_api_result(prod_resp)
+                logger_run.warning("⚠️ API fetch failed, falling back to static map")
+                products_map = STATIC_PRODUCTS_MAP.copy()
+            else:
+                products_map = build_products_map_from_api_result(prod_resp)
+                
+                # Update last check timestamp (will do this after Redis connects properly)
+                logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
         
         pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
@@ -4085,9 +4103,19 @@ async def run_once() -> bool:
             logger_run.error("❌ No valid pairs to process - aborting run")
             return False
 
+        # ===================================================================
+        # STEP 2: CONNECT TO REDIS
+        # ===================================================================
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
+        
+        # Update API check timestamp if we fetched from API
+        if not USE_STATIC_MAP and products_map and not sdb.degraded:
+            try:
+                await sdb.set_metadata(last_api_check_key, str(now))
+            except Exception as e:
+                logger_run.debug(f"Failed to update API check timestamp: {e}")
         
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
@@ -4101,10 +4129,16 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
+        # ===================================================================
+        # STEP 3: INITIALIZE FETCHER & TELEGRAM
+        # ===================================================================
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
+        # ===================================================================
+        # STEP 4: ACQUIRE DISTRIBUTED LOCK
+        # ===================================================================
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
         
@@ -4116,6 +4150,9 @@ async def run_once() -> bool:
 
         logger_run.debug("🔒 Distributed lock acquired successfully")
 
+        # ===================================================================
+        # STEP 5: SEND TEST MESSAGE (if enabled)
+        # ===================================================================
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -4124,6 +4161,9 @@ async def run_once() -> bool:
                 f"Pairs: {len(pairs_to_process)}"
             ))
 
+        # ===================================================================
+        # STEP 6: PROCESS ALL PAIRS
+        # ===================================================================
         logger_run.debug(
             f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
@@ -4134,6 +4174,9 @@ async def run_once() -> bool:
             lock, reference_time
         )
 
+        # ===================================================================
+        # STEP 7: COLLECT STATISTICS
+        # ===================================================================
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
@@ -4154,6 +4197,9 @@ async def run_once() -> bool:
                     f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
                 )
 
+        # ===================================================================
+        # STEP 8: FINAL SUMMARY
+        # ===================================================================
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         
@@ -4207,6 +4253,7 @@ async def run_once() -> bool:
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
         
+        # Release distributed lock
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
@@ -4214,6 +4261,7 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}")
         
+        # Close Redis connection (but NOT the global pool)
         if sdb:
             try:
                 await sdb.close()
@@ -4221,9 +4269,7 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
         
-        # ✅ REMOVED: Redis pool shutdown (keeping alive)
-        # ✅ REMOVED: HTTP session close (keeping alive)
-        
+        # Memory cleanup
         try:
             if 'all_results' in locals():
                 del all_results
@@ -4246,13 +4292,19 @@ async def run_once() -> bool:
         logger_run.debug("🏁 Resource cleanup finished")
         
         gc.enable()
-        
+
+
+# ============================================================================
+# UVLOOP SETUP & MAIN ENTRY POINT
+# ============================================================================
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
