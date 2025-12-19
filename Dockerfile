@@ -1,11 +1,14 @@
 ============================================================================
 
-Stage 1: Builder
+Stage 1: Builder - Uses 'uv' for lightning-fast installs
 
 ============================================================================
 
 ARG BASE_DIGEST=python:3.11-slim-bookworm
 FROM ${BASE_DIGEST} AS builder
+
+Install build dependencies for orjson/uvloop/numba
+
 RUN apt-get update && apt-get install -y --no-install-recommends 
 gcc g++ libc6-dev 
 && rm -rf /var/lib/apt/lists/*
@@ -13,9 +16,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 ENV VIRTUAL_ENV=/opt/venv
 RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+Copy requirements first for better caching
+
 COPY requirements.txt .
 
-Install dependencies including setuptools for Numba AOT
+Install setuptools first (required for Numba AOT) then rest of requirements
 
 RUN uv pip install --no-cache --compile setuptools && 
 uv pip install --no-cache --compile -r requirements.txt
@@ -30,20 +36,32 @@ echo "✅ Numba AOT modules compiled"
 
 ============================================================================
 
-Stage 2: Runtime
+Stage 2: Runtime - Minimal & Optimized
 
 ============================================================================
 
 FROM ${BASE_DIGEST} AS runtime
+
+libgomp1 is required for Numba's parallel execution
+
 RUN apt-get update && 
 apt-get install -y --no-install-recommends 
 libgomp1 ca-certificates tzdata 
 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
+
+Ensure Numba has a writable cache directory
+
 RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
+
+Copy source code and config
+
 COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
+
+Environment configuration
+
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 ENV NUMBA_CACHE_DIR=/tmp/numba_cache
