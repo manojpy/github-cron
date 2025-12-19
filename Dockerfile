@@ -15,13 +15,12 @@ RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 COPY requirements.txt .
 
-Install dependencies including the newly added setuptools
+Install dependencies including setuptools for Numba AOT
 
-RUN uv pip install --no-cache --compile -r requirements.txt
+RUN uv pip install --no-cache --compile setuptools && 
+uv pip install --no-cache --compile -r requirements.txt
 
 ⚡ Build Numba AOT modules
-
-Ensure the source file is copied from the correct local path
 
 COPY src/numba_aot.py /tmp/
 RUN cd /tmp && 
@@ -42,9 +41,6 @@ libgomp1 ca-certificates tzdata
 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
-
-Ensure Numba has a writable cache directory for any remaining JIT needs
-
 RUN mkdir -p /tmp/numba_cache && chmod 777 /tmp/numba_cache
 COPY src/macd_unified.py ./src/
 COPY wrapper.py config_macd.json ./
