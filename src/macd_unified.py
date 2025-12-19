@@ -1974,11 +1974,7 @@ class APICircuitBreaker:
         # HALF_OPEN: Allow limited requests to test recovery
         return True, None
 
-
 class DataFetcher:
-
-    class DataFetcher:
-
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
