@@ -52,12 +52,7 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # ✅ Explicitly run the AOT build step so logs show .so creation
-      - name: Verify AOT build
-        run: |
-          python3 src/aot_build.py || { echo "❌ AOT build failed"; exit 1; }
-          ls -l indicators_aot*.so || echo "⚠️ No .so file found"
-
+    
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
