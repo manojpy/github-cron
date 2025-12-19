@@ -77,6 +77,25 @@ class Constants:
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
 
+# ============================================================================
+# STATIC PRODUCTS MAP (Eliminates API fetch overhead)
+# ============================================================================
+STATIC_PRODUCTS_MAP = {
+    "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
+    "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
+    "AVAXUSD": {"id": 262, "symbol": "AVAXUSDT", "contract_type": "perpetual_futures"},
+    "BCHUSD": {"id": 186, "symbol": "BCHUSDT", "contract_type": "perpetual_futures"},
+    "XRPUSD": {"id": 141, "symbol": "XRPUSDT", "contract_type": "perpetual_futures"},
+    "BNBUSD": {"id": 275, "symbol": "BNBUSDT", "contract_type": "perpetual_futures"},
+    "LTCUSD": {"id": 163, "symbol": "LTCUSDT", "contract_type": "perpetual_futures"},
+    "DOTUSD": {"id": 228, "symbol": "DOTUSDT", "contract_type": "perpetual_futures"},
+    "ADAUSD": {"id": 142, "symbol": "ADAUSDT", "contract_type": "perpetual_futures"},
+    "SUIUSD": {"id": 666, "symbol": "SUIUSDT", "contract_type": "perpetual_futures"},
+    "AAVEUSD": {"id": 227, "symbol": "AAVEUSDT", "contract_type": "perpetual_futures"},
+    "SOLUSD": {"id": 143, "symbol": "SOLUSDT", "contract_type": "perpetual_futures"},
+}
+
+
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 class CompiledPatterns:
@@ -258,6 +277,14 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
+
+# Validation: Ensure all configured pairs have mappings
+_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
+if _missing_products:
+    logger.warning(
+        f"⚠️ Missing product mappings for: {_missing_products}. "
+        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
+    )
 
 # Logging setup (same as original)
 class SecretFilter(logging.Filter):
@@ -1769,10 +1796,88 @@ class RateLimitedFetcher:
             "max_per_minute": self.max_per_minute
         }
 
+class APICircuitBreaker:
+    """Prevents cascading failures when API is degraded"""
+    
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.last_failure_time = 0.0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.success_count = 0
+        
+    def record_success(self) -> None:
+        """Record successful API call"""
+        if self.state == "HALF_OPEN":
+            self.success_count += 1
+            if self.success_count >= 2:
+                logger.info("🟢 Circuit breaker: Recovered, transitioning to CLOSED")
+                self.state = "CLOSED"
+                self.failures = 0
+                self.success_count = 0
+        elif self.state == "CLOSED":
+            # Reset failure count on success
+            if self.failures > 0:
+                self.failures = max(0, self.failures - 1)
+    
+    def record_failure(self) -> None:
+        """Record failed API call"""
+        self.failures += 1
+        self.last_failure_time = time.time()
+        
+        if self.failures >= self.failure_threshold and self.state == "CLOSED":
+            logger.warning(
+                f"🔴 Circuit breaker: OPENED after {self.failures} failures. "
+                f"Blocking requests for {self.recovery_timeout}s"
+            )
+            self.state = "OPEN"
+    
+    def can_attempt(self) -> Tuple[bool, Optional[str]]:
+        """Check if request should be allowed"""
+        if self.state == "CLOSED":
+            return True, None
+        
+        if self.state == "OPEN":
+            # Check if recovery timeout has passed
+            elapsed = time.time() - self.last_failure_time
+            if elapsed >= self.recovery_timeout:
+                logger.info("🟡 Circuit breaker: Transitioning to HALF_OPEN (testing recovery)")
+                self.state = "HALF_OPEN"
+                self.success_count = 0
+                return True, None
+            
+            return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
+        
+        # HALF_OPEN: Allow limited requests to test recovery
+        return True, None
+
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
+
+        self.semaphore = asyncio.Semaphore(max_parallel)
+        self.timeout = cfg.HTTP_TIMEOUT
+
+        self.rate_limiter = RateLimitedFetcher(
+            max_per_minute=60,
+            concurrency=max_parallel
+        )
+    
+        # ⚡ NEW: Circuit breaker
+        self.circuit_breaker = APICircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=60
+        )
+
+        self.fetch_stats = {
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0,
+            "circuit_breaker_blocks": 0,
+        }
 
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
@@ -1824,7 +1929,14 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        
+    
+        # ⚡ NEW: Check circuit breaker
+        can_proceed, reason = self.circuit_breaker.can_attempt()
+        if not can_proceed:
+            logger.warning(f"Circuit breaker blocked request for {symbol}: {reason}")
+            self.fetch_stats["circuit_breaker_blocks"] += 1
+            return None 
+  
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1861,9 +1973,10 @@ class DataFetcher:
                 backoff=cfg.CANDLE_FETCH_BACKOFF,
                 timeout=self.timeout
             )
-
+     
             if data:
                 self.fetch_stats["candles_success"] += 1
+                self.circuit_breaker.record_success()
 
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
@@ -1897,6 +2010,7 @@ class DataFetcher:
                     return None
             else:
                 self.fetch_stats["candles_failed"] += 1
+                self.circuit_breaker.record_failure()  # ⚡ NEW
                 logger.warning(f"Candles fetch failed | Symbol: {symbol}")
 
             return data
@@ -2019,10 +2133,29 @@ def validate_candle_data(
     try:
         if data is None or not data:
             return False, "Data is None or empty"
-
+        
+        # ⚡ NEW: Data Freshness Check
         close = data.get("close")
         timestamp = data.get("timestamp")
-
+        
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
+        
+        # Check if data is stale (API frozen/cached)
+        current_time = get_trigger_timestamp()
+        last_candle_time = int(timestamp[-1])
+        staleness = current_time - last_candle_time
+        
+        # Allow 15min candle + 2min buffer for API lag
+        MAX_STALENESS = (15 * 60) + 120  # 17 minutes
+        
+        if staleness > MAX_STALENESS:
+            return False, (
+                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "
+                f"Last candle: {format_ist_time(last_candle_time)} | "
+                f"Current: {format_ist_time(current_time)}"
+            )
+        
         if close is None or len(close) == 0:
             return False, "Close array is empty"
 
@@ -2092,8 +2225,11 @@ def get_last_closed_index_from_array(
         return None
 
     last_closed_idx = int(valid_indices[-1])
-    logger.debug(
-        f"Selected fully closed candle | Index: {last_closed_idx} | "
+
+
+
+    debug_if(cfg.DEBUG_MODE, logger, 
+             lambda: f"Selected fully closed candle | Index: {last_closed_idx}")
         f"TS: {format_ist_time(timestamps[last_closed_idx])}"
     )
     return last_closed_idx
@@ -2564,6 +2700,82 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
+
+    async def atomic_eval_batch(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        state_updates: List[Tuple[str, Any, Optional[int]]],
+        dedup_checks: List[Tuple[str, str, int]]
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    
+        if self.degraded:
+            empty_prev = {k: False for k in alert_keys}
+            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            return empty_prev, empty_dedup
+    
+        try:
+            async with self._redis.pipeline() as pipe:
+                # Phase 1: MGET for previous states
+                state_keys = [f"{pair}:{k}" for k in alert_keys]
+                pipe.mget(state_keys)
+            
+                # Phase 2: SET for state updates
+                now = int(time.time())
+                for key, state, custom_ts in state_updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    data = json_dumps({"state": state, "ts": ts})
+                    full_key = f"{self.state_prefix}{key}"
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
+            
+                # Phase 3: SET NX for dedup
+                for pair_name, alert_key, ts in dedup_checks:
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+            
+                # Execute all at once
+                results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
+        
+            # Parse results
+            num_state_keys = len(state_keys)
+            num_updates = len(state_updates)
+        
+            # Previous states (first N results from MGET)
+            prev_states = {}
+            mget_results = results[0] if results else []
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                if val:
+                    try:
+                        parsed = json_loads(val)
+                        prev_states[key] = parsed.get("state") == "ACTIVE"
+                    except:
+                        prev_states[key] = False
+                else:
+                    prev_states[key] = False
+        
+        # Dedup results (results after MGET and SETs)
+        dedup_results = {}
+        dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
+        for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+            result_idx = dedup_start_idx + idx
+            should_send = bool(results[result_idx]) if result_idx < len(results) else True
+            dedup_results[f"{pair_name}:{alert_key}"] = should_send
+        
+        return prev_states, dedup_results
+        
+    except Exception as e:
+        logger.error(f"atomic_eval_batch failed: {e}")
+        # Fallback to individual operations
+        prev_states = await self.mget_states(state_keys)
+        await self.batch_set_states(state_updates)
+        dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+        return prev_states, dedup_results 
+
     async def atomic_batch_update(
         self,
         updates: List[Tuple[str, Any, Optional[int]]],
@@ -2660,23 +2872,23 @@ class RedisStateStore:
                 else:
                     prev_states[key] = False
             
-            # Dedup results (results after MGET and SETs)
-            dedup_results = {}
-            dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
-            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
-                result_idx = dedup_start_idx + idx
-                should_send = bool(results[result_idx]) if result_idx < len(results) else True
-                dedup_results[f"{pair_name}:{alert_key}"] = should_send
+                # Dedup results (results after MGET and SETs)
+                dedup_results = {}
+                dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
+                for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+                    result_idx = dedup_start_idx + idx
+                    should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                    dedup_results[f"{pair_name}:{alert_key}"] = should_send
             
-            return prev_states, dedup_results
+                return prev_states, dedup_results
             
-        except Exception as e:
-            logger.error(f"atomic_eval_batch failed: {e}")
-            # Fallback to individual operations
-            prev_states = await self.mget_states(state_keys)
-            await self.batch_set_states(state_updates)
-            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-            return prev_states, dedup_results
+            except Exception as e:
+                logger.error(f"atomic_eval_batch failed: {e}")
+                # Fallback to individual operations
+                prev_states = await self.mget_states(state_keys)
+                await self.batch_set_states(state_updates)
+                dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+                return prev_states, dedup_results
 
 class RedisLock:
     RELEASE_LUA = """
@@ -3163,9 +3375,37 @@ async def evaluate_pair_and_alert(
         # ===================================================================
         # STEP 2: ✅ CALCULATE INDICATORS FIRST (before accessing any arrays)
         # ===================================================================
-        indicators = await asyncio.to_thread(
-            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
-        )
+        # ===================================================================
+# STEP 2: ⚡ QUICK PRE-CHECK (Skip expensive calculations if possible)
+# ===================================================================
+        close_15m = data_15m["close"]
+        close_5m = data_5m["close"]
+        timestamps_15m = data_15m["timestamp"]
+
+        # Quick trend check without full indicator calculation
+        i15_quick = get_last_closed_index_from_array(timestamps_15m, 15, reference_time)
+        if i15_quick is None or i15_quick < 3:
+            logger_pair.debug(f"Insufficient data for {pair_name}")
+            return None
+
+        close_curr_quick = close_15m[i15_quick]
+        open_curr_quick = data_15m["open"][i15_quick]
+
+        # Quick candle color check
+        is_green = close_curr_quick > open_curr_quick
+        is_red = close_curr_quick < open_curr_quick
+
+        # If neither green nor red candle, skip expensive indicators
+        if not is_green and not is_red:
+            logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
+            return None
+
+# ===================================================================
+# STEP 3: NOW calculate indicators (only if candle has direction)
+# ===================================================================
+indicators = await asyncio.to_thread(
+    calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+)
 
         # Extract indicator arrays from dictionary
         ppo = indicators['ppo']
@@ -3430,9 +3670,9 @@ async def evaluate_pair_and_alert(
                     raw_alerts.append((def_["title"], extra, def_["key"]))
                     all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
                     
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"✅ NEW alert: {pair_name}:{alert_key}")
-                        
+                    debug_if(True, logger_pair,
+                             lambda: f"Candle analysis | O={open_curr:.2f} C={close_curr:.2f}")
+           
             except Exception as e:
                 logger_pair.warning(
                     f"Alert check failed for {pair_name}, key={alert_key}: {e}"
@@ -3486,14 +3726,14 @@ async def evaluate_pair_and_alert(
         # ===================================================================
         # STEP 13: ATOMIC BATCH OPERATION (states + dedup in single Redis call)
         # ===================================================================
+        # ⚡ OPTIMIZED: Single atomic Redis operation
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-        
+
         if all_state_changes or dedup_checks:
-            # Use atomic batch - returns (prev_states, dedup_results)
-            # We already have prev_states, so we only need dedup_results
-            _, dedup_results = await sdb.atomic_eval_batch(
+            # Single Redis pipeline: get states + update + dedup
+            previous_states, dedup_results = await sdb.atomic_eval_batch(
                 pair_name,
-                [],  # Empty - we already got previous states above
+                redis_alert_keys,
                 all_state_changes,
                 dedup_checks
             )
@@ -3706,14 +3946,50 @@ async def run_once() -> bool:
             return False
 
         # OPTIMIZED: Use configurable cache TTL
-        PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
-        now = time.time()
-        
+        # ⚡ OPTIMIZED: Use static map with API fallback
         products_map = None
         pairs_to_process = []
+
+        # Try static map first
+        USE_STATIC_MAP = True  # Set to False to force API fetch
+        STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
+
+        if USE_STATIC_MAP:
+            last_api_check_key = "last_products_api_check"
+    
+            try:
+                last_check_str = await (await RedisStateStore(cfg.REDIS_URL).connect()).get_metadata(last_api_check_key) if sdb else None
+                last_check = float(last_check_str) if last_check_str else 0.0
+            except:
+                last_check = 0.0
+    
+            days_since_check = (now - last_check) / 86400
+    
+            if days_since_check < STATIC_MAP_REFRESH_DAYS:
+                logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
+
+                products_map = STATIC_PRODUCTS_MAP.copy()
+           else:
+                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+                USE_STATIC_MAP = False
+
+        if not USE_STATIC_MAP or products_map is None:
+            # Fallback to API fetch
+            logger_run.info("📡 Fetching products list from Delta API...")
+            temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
+            prod_resp = await temp_fetcher.fetch_products()
+    
+            if not prod_resp:
+                logger_run.warning("⚠️ API fetch failed, falling back to static map")
+                products_map = STATIC_PRODUCTS_MAP.copy()
+            else:
+                products_map = build_products_map_from_api_result(prod_resp)
         
-        if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
-            logger_run.info("📡 Fetching fresh products list from Delta API...")
+                # Update last check timestamp
+                if sdb:
+                    await sdb.set_metadata(last_api_check_key, str(now))
+        
+               , logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
             
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
