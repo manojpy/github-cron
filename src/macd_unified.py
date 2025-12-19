@@ -2884,13 +2884,13 @@ class RedisStateStore:
             
                 return prev_states, dedup_results
             
-            except Exception as e:
-                logger.error(f"atomic_eval_batch failed: {e}")
-                # Fallback to individual operations
-                prev_states = await self.mget_states(state_keys)
-                await self.batch_set_states(state_updates)
-                dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-                return prev_states, dedup_results
+                except Exception as e:
+                    logger.error(f"atomic_eval_batch failed: {e}")
+                    # Fallback to individual operations
+                    prev_states = await self.mget_states(state_keys)
+                    await self.batch_set_states(state_updates)
+                    dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+                    return prev_states, dedup_results
 
 class RedisLock:
     RELEASE_LUA = """
