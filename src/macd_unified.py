@@ -34,17 +34,18 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
-
+# --- INITIALIZE LOGGER FIRST ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MACD_BOT")
 
+# ⚡ Try to import AOT-compiled functions
 try:
     import numba_compiled
     USE_AOT = True
-    logger.info("⚡ Using AOT-compiled Numba functions (faster startup)")
+    logger.info("⚡ Using AOT-compiled Numba functions")
 except ImportError:
     USE_AOT = False
-    logger.info("ℹ️ AOT modules not found, using JIT compilation")
+    logger.info("ℹ️ AOT modules not found, using JIT fallback")
 
 try:
     import orjson
