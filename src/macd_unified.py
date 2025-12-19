@@ -2703,7 +2703,6 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
-
     async def atomic_eval_batch(
         self,
         pair: str,
@@ -2761,23 +2760,23 @@ class RedisStateStore:
                 else:
                     prev_states[key] = False
         
-        # Dedup results (results after MGET and SETs)
-        dedup_results = {}
-        dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
-        for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
-            result_idx = dedup_start_idx + idx
-            should_send = bool(results[result_idx]) if result_idx < len(results) else True
-            dedup_results[f"{pair_name}:{alert_key}"] = should_send
+            # Dedup results (results after MGET and SETs)
+            dedup_results = {}
+            dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
+            for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
+                result_idx = dedup_start_idx + idx
+                should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                dedup_results[f"{pair_name}:{alert_key}"] = should_send
         
-        return prev_states, dedup_results
+            return prev_states, dedup_results
         
-    except Exception as e:
-        logger.error(f"atomic_eval_batch failed: {e}")
-        # Fallback to individual operations
-        prev_states = await self.mget_states(state_keys)
-        await self.batch_set_states(state_updates)
-        dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-        return prev_states, dedup_results 
+        except Exception as e:
+            logger.error(f"atomic_eval_batch failed: {e}")
+            # Fallback to individual operations
+            prev_states = await self.mget_states(state_keys)
+            await self.batch_set_states(state_updates)
+            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+            return prev_states, dedup_results 
 
     async def atomic_batch_update(
         self,
