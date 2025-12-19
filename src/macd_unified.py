@@ -2098,23 +2098,23 @@ class DataFetcher:
 
         # --- Post-processing / statistics -----------------------------
         async def guarded_eval(task_data):
-        async with semaphore:
-            p_name, candles = task_data
-            try:
-                # 🔍 DEBUG: Log what we received
-                if cfg.DEBUG_MODE:
-                    logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
+            async with semaphore:
+                p_name, candles = task_data
+                try:
+                    # 🔍 DEBUG: Log what we received
+                    if cfg.DEBUG_MODE:
+                        logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
                 
-                # ✅ Parse and validate inside worker (parallel execution)
-                data_15m = parse_candles_to_numpy(candles.get("15"))
-                data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+                    # ✅ Parse and validate inside worker (parallel execution)
+                    data_15m = parse_candles_to_numpy(candles.get("15"))
+                    data_5m = parse_candles_to_numpy(candles.get("5"))
+                    data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
                 
-                # Quick validation
-                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-                if not v15:
-                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
-                    return None
+                    # Quick validation
+                    v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                    if not v15:
+                        logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                        return None
 
         # --- Logging / sanity checks ----------------------------------
         num_candles = len(result.get("t", []))
