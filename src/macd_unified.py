@@ -3862,7 +3862,7 @@ async def run_once() -> bool:
                 if sdb:
                     await sdb.set_metadata(last_api_check_key, str(now))
 
-                , logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
+                logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
