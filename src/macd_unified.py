@@ -1971,40 +1971,51 @@ class APICircuitBreaker:
             
             return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
         
-        # HALF_OPEN: Allow limited requests to test recovery
-        return True, None
-
 class DataFetcher:
+    """
+    Asynchronous data fetcher with
+    - configurable concurrency
+    - rate-limiting
+    - circuit-breaker
+    - detailed statistics
+    """
+
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
+
+        # Fall back to global config if caller did not supply a limit
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
 
-        self.semaphore = asyncio.Semaphore(max_parallel)
-        self.timeout = cfg.HTTP_TIMEOUT
-
+        self.semaphore   = asyncio.Semaphore(max_parallel)
+        self.timeout     = cfg.HTTP_TIMEOUT
         self.rate_limiter = RateLimitedFetcher(
             max_per_minute=60,
             concurrency=max_parallel
         )
-    
-        # ⚡ NEW: Circuit breaker
+
+        # Circuit-breaker hardening
         self.circuit_breaker = APICircuitBreaker(
             failure_threshold=3,
             recovery_timeout=60
         )
 
+        # Simple counters for observability
         self.fetch_stats = {
-            "products_success": 0,
-            "products_failed": 0,
-            "candles_success": 0,
-            "candles_failed": 0,
-            "circuit_breaker_blocks": 0,
+            "products_success":        0,
+            "products_failed":         0,
+            "candles_success":         0,
+            "candles_failed":          0,
+            "circuit_breaker_blocks":  0,
         }
 
         logger.debug(
-            f"DataFetcher initialized | max_parallel={max_parallel} | "
+            f"DataFetcher initialised | max_parallel={max_parallel} | "
             f"rate_limit=60/min | timeout={self.timeout}s"
         )
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
@@ -2018,14 +2029,16 @@ class DataFetcher:
                 timeout=self.timeout
             )
 
-            if result:
-                self.fetch_stats["products_success"] += 1
-                logger.debug(f"Products fetch successful | URL: {url}")
-            else:
-                self.fetch_stats["products_failed"] += 1
-                logger.warning(f"Products fetch failed | URL: {url}")
+        if result:
+            self.fetch_stats["products_success"] += 1
+            logger.debug(f"Products fetch successful | URL: {url}")
+        else:
+            self.fetch_stats["products_failed"] += 1
+            logger.warning(f"Products fetch failed | URL: {url}")
 
-            return result
+        return result
+
+    # ------------------------------------------------------------------
 
     async def fetch_candles(
         self,
@@ -2034,41 +2047,47 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-    
-        # ⚡ NEW: Check circuit breaker
+        """
+        Fetch OHLCV candles for a single symbol/resolution pair.
+        Returns the raw JSON dict from the API or None on failure.
+        """
+
+        # --- Circuit-breaker guard ------------------------------------
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
-            logger.warning(f"Circuit breaker blocked request for {symbol}: {reason}")
+            logger.warning(
+                f"Circuit breaker blocked request for {symbol}: {reason}"
+            )
             self.fetch_stats["circuit_breaker_blocks"] += 1
             return None
-        
+
+        # --- Time handling --------------------------------------------
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        # Determine interval in minutes
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
-        
-        # 1. FIX: Calculate the strict expected open of the last closed candle
-        expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
 
-        # 2. FIX: Request a wider window to handle API publication lag.
-        # We add extra buffer to the 'to' time so the API doesn't truncate the latest candle.
-        buffer_periods = 3 # Increased buffer
-        to_time = reference_time + (interval_seconds * buffer_periods)
-        
-        # Ensure we look back far enough to get 'limit' candles even with the buffer
+        # Expected open of the last *closed* candle
+        expected_open_ts = calculate_expected_candle_timestamp(
+            reference_time, minutes
+        )
+
+        # Ask for a few extra future periods to work around API lag
+        buffer_periods = 3
+        to_time   = reference_time + (interval_seconds * buffer_periods)
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
             "resolution": resolution,
-            "symbol": symbol,
-            "from": int(from_time),
-            "to": int(to_time)
+            "symbol":     symbol,
+            "from":       int(from_time),
+            "to":         int(to_time),
         }
 
         url = f"{self.api_base}/v2/chart/history"
 
+        # --- Actual HTTP call -----------------------------------------
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -2079,95 +2098,120 @@ class DataFetcher:
                 timeout=self.timeout
             )
 
-            if data:
-                self.fetch_stats["candles_success"] += 1
-                self.circuit_breaker.record_success()  # ⚡ NEW
-        
-                result = data.get("result", {})
-    else:
-        self.fetch_stats["candles_failed"] += 1
-        self.circuit_breaker.record_failure()  # ⚡ NEW
-        logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+        # --- Post-processing / statistics -----------------------------
+        if data:
+            self.fetch_stats["candles_success"] += 1
+            self.circuit_breaker.record_success()
+        else:
+            self.fetch_stats["candles_failed"] += 1
+            self.circuit_breaker.record_failure()
+            logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+            return None
 
-                result = data.get("result", {})
-                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                    num_candles = len(result.get("t", []))
+        result = data.get("result")
+        if not result or not all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+            logger.warning(f"Candles response missing fields | Symbol: {symbol}")
+            self.fetch_stats["candles_failed"] += 1
+            return None
 
-                    if num_candles > 0:
-                        last_candle_open_ts = result["t"][-1]
-                        last_candle_close_ts = last_candle_open_ts + interval_seconds
-                        diff = abs(expected_open_ts - last_candle_open_ts)
+        # --- Logging / sanity checks ----------------------------------
+        num_candles = len(result.get("t", []))
+        if num_candles:
+            last_candle_open_ts = result["t"][-1]
+            diff = abs(expected_open_ts - last_candle_open_ts)
 
-                        # LOGGING LOGIC
-                        if diff > 300: # Over 5 minutes difference
-                            if last_candle_open_ts < expected_open_ts:
-                                # This is the "API Lag" warning we want to monitor
-                                logger.warning(
-                                    f"⚠️ API DELAY | {symbol} {resolution} | "
-                                    f"Expected: {format_ist_time(expected_open_ts)} | "
-                                    f"Got: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
-                                )
-                            else:
-                                # Data is ahead (normal for lower timeframes like 5m vs 15m)
-                                logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
-                        else:
-                            logger.debug(
-                                f"✅ Scanned {symbol} {resolution} | "
-                                f"Latest: {format_ist_time(last_candle_open_ts)}"
-                            )
+            if diff > 300:          # > 5 min drift
+                if last_candle_open_ts < expected_open_ts:
+                    logger.warning(
+                        f"⚠️  API DELAY | {symbol} {resolution} | "
+                        f"Expected: {format_ist_time(expected_open_ts)} | "
+                        f"Got: {format_ist_time(last_candle_open_ts)} "
+                        f"(Diff: {diff}s)"
+                    )
                 else:
-                    logger.warning(f"Candles response missing fields | Symbol: {symbol}")
-                    self.fetch_stats["candles_failed"] += 1
-                    return None
+                    logger.debug(
+                        f"API Ahead | {symbol} {resolution} | Diff: {diff}s"
+                    )
             else:
-                self.fetch_stats["candles_failed"] += 1
-                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+                logger.debug(
+                    f"✅ Scanned {symbol} {resolution} | "
+                    f"Latest: {format_ist_time(last_candle_open_ts)}"
+                )
 
-            return data
+        return data
+
+    # ------------------------------------------------------------------
 
     def get_stats(self) -> Dict[str, Any]:
+        """
+        Return a snapshot of internal counters including success rates.
+        """
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
-        total_products = stats["products_success"] + stats["products_failed"]
-        total_candles = stats["candles_success"] + stats["candles_failed"]
 
-        if total_products > 0:
-            stats["products_success_rate"] = round(stats["products_success"] / total_products * 100, 1)
-        if total_candles > 0:
-            stats["candles_success_rate"] = round(stats["candles_success"] / total_candles * 100, 1)
+        total_products = stats["products_success"] + stats["products_failed"]
+        total_candles  = stats["candles_success"]  + stats["candles_failed"]
+
+        if total_products:
+            stats["products_success_rate"] = round(
+                stats["products_success"] / total_products * 100, 1
+            )
+        if total_candles:
+            stats["candles_success_rate"] = round(
+                stats["candles_success"] / total_candles * 100, 1
+            )
         return stats
+
+    # ------------------------------------------------------------------
+    # Batch helpers
+    # ------------------------------------------------------------------
 
     async def fetch_candles_batch(
         self,
         requests: List[Tuple[str, str, int]],
         reference_time: Optional[int] = None
     ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Fire off many `fetch_candles` calls concurrently.
+        Returns dict keyed by  "symbol_resolution".
+        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        tasks = []
+        tasks       = []
         request_keys = []
+
         for symbol, resolution, limit in requests:
             task = self.fetch_candles(symbol, resolution, limit, reference_time)
             tasks.append(task)
             request_keys.append(f"{symbol}_{resolution}")
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
         output = {}
         for key, result in zip(request_keys, results):
             output[key] = None if isinstance(result, Exception) else result
         return output
+
+    # ------------------------------------------------------------------
 
     async def fetch_all_candles_truly_parallel(
         self,
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
         reference_time: Optional[int] = None,
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-    
+        """
+        Even higher-level batch helper:
+        [
+          ("BTC-USD", [("5", 200), ("15", 200)]),
+          ("ETH-USD", [("5", 200), ("60", 100)]),
+        ]
+        Returns nested dict:  symbol -> resolution -> data|None
+        """
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        all_tasks = []
+        all_tasks     = []
         task_metadata = []
 
         for symbol, resolutions in pair_requests:
@@ -2177,18 +2221,20 @@ class DataFetcher:
                 task_metadata.append((symbol, resolution))
 
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
-        output = {}
+
+        output        = {}
         success_count = 0
 
         for (symbol, resolution), result in zip(task_metadata, results):
-            if symbol not in output: output[symbol] = {}
-            if isinstance(result, Exception):
-                output[symbol][resolution] = None
-            else:
-                output[symbol][resolution] = result
-                if result: success_count += 1
+            output.setdefault(symbol, {})[resolution] = (
+                None if isinstance(result, Exception) else result
+            )
+            if result and not isinstance(result, Exception):
+                success_count += 1
 
-        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
+        logger.info(
+            f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}"
+        )
         return output
 
 def parse_candles_to_numpy(
