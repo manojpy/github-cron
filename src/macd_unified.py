@@ -2226,13 +2226,16 @@ def get_last_closed_index_from_array(
 
     last_closed_idx = int(valid_indices[-1])
 
-
-
-    debug_if(cfg.DEBUG_MODE, logger, 
-             lambda: f"Selected fully closed candle | Index: {last_closed_idx}")
-        f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+    debug_if(
+        cfg.DEBUG_MODE,
+        logger,
+        lambda: (
+            f"Selected fully closed candle | Index: {last_closed_idx} | "
+            f"TS: {format_ist_time(timestamps[last_closed_idx])}"
+        ),
     )
     return last_closed_idx
+
 
 def validate_candle_timestamp(
     candle_ts: int,
