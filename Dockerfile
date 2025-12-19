@@ -18,6 +18,13 @@ RUN uv pip install --no-cache --compile \
     aiodns==3.2.0 && \
     uv pip install --no-cache --compile -r requirements.txt
 
+WORKDIR /app
+# Copy source so we can build the AOT module
+COPY src/ ./src/
+
+# Build the AOT module (produces indicators_aot.*.so)
+RUN python -u src/aot_build.py
+
 # Stage 2: Runtime
 FROM ${BASE_DIGEST} AS runtime
 
@@ -35,6 +42,8 @@ RUN mkdir -p /app/numba_cache && chmod 777 /app/numba_cache
 
 # Copy source and wrapper
 COPY src/ ./src/
+# Copy compiled AOT module from builder
+COPY --from=builder /app/indicators_aot.*.so /app/src/
 COPY wrapper.py config_macd.json ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
