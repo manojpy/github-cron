@@ -2097,20 +2097,24 @@ class DataFetcher:
             )
 
         # --- Post-processing / statistics -----------------------------
-        if data:
-            self.fetch_stats["candles_success"] += 1
-            self.circuit_breaker.record_success()
-        else:
-            self.fetch_stats["candles_failed"] += 1
-            self.circuit_breaker.record_failure()
-            logger.warning(f"Candles fetch failed | Symbol: {symbol}")
-            return None
-
-        result = data.get("result")
-        if not result or not all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-            logger.warning(f"Candles response missing fields | Symbol: {symbol}")
-            self.fetch_stats["candles_failed"] += 1
-            return None
+        async def guarded_eval(task_data):
+        async with semaphore:
+            p_name, candles = task_data
+            try:
+                # 🔍 DEBUG: Log what we received
+                if cfg.DEBUG_MODE:
+                    logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
+                
+                # ✅ Parse and validate inside worker (parallel execution)
+                data_15m = parse_candles_to_numpy(candles.get("15"))
+                data_5m = parse_candles_to_numpy(candles.get("5"))
+                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+                
+                # Quick validation
+                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                if not v15:
+                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                    return None
 
         # --- Logging / sanity checks ----------------------------------
         num_candles = len(result.get("t", []))
@@ -3951,19 +3955,24 @@ async def process_pairs_with_workers(
     
     # 2. PHASE 2: PARSE & VALIDATE
     # ✅ OPTIMIZED: PHASE 2 REMOVED - Parsing happens in Phase 3 workers
-    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
-    valid_tasks = []
-    
-    for pair_name in pairs_to_process:
-        product_info = products_map.get(pair_name)
-        if not product_info: continue
-        
-        symbol = product_info["symbol"]
-        candles = all_candles.get(symbol, {})
-        
-        # Just pass raw candles - parsing happens in worker
-        valid_tasks.append((pair_name, candles))
-
+    async def guarded_eval(task_data):
+        async with semaphore:
+            p_name, candles = task_data
+            try:
+                # 🔍 DEBUG: Log what we received
+                if cfg.DEBUG_MODE:
+                    logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
+                
+                # ✅ Parse and validate inside worker (parallel execution)
+                data_15m = parse_candles_to_numpy(candles.get("15"))
+                data_5m = parse_candles_to_numpy(candles.get("5"))
+                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+                
+                # Quick validation
+                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                if not v15:
+                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                    return None
 
     # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
     logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
@@ -4305,6 +4314,25 @@ except ImportError:
 
 
 if __name__ == "__main__":
+    async def guarded_eval(task_data):
+        async with semaphore:
+            p_name, candles = task_data
+            try:
+                # 🔍 DEBUG: Log what we received
+                if cfg.DEBUG_MODE:
+                    logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
+                
+                # ✅ Parse and validate inside worker (parallel execution)
+                data_15m = parse_candles_to_numpy(candles.get("15"))
+                data_5m = parse_candles_to_numpy(candles.get("5"))
+                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+                
+                # Quick validation
+                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                if not v15:
+                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                    return None
+
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
