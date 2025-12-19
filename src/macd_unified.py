@@ -3830,23 +3830,22 @@ async def run_once() -> bool:
         STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
 
         if USE_STATIC_MAP:
-            last_api_check_key = "last_products_api_check"
-
-            try:
-                last_check_str = await (await RedisStateStore(cfg.REDIS_URL).connect()).get_metadata(last_api_check_key) if sdb else None
-                last_check = float(last_check_str) if last_check_str else 0.0
-            except:
-                last_check = 0.0
-
-            now = time.time()
-            days_since_check = (now - last_check) / 86400
+            # If cache has been set in-memory, derive "days since check" from it.
+            # Note: PRODUCTS_CACHE["until"] stores expiry; we back out last check as (until - TTL).
+            if last_check_ts and last_check_ts > 0:
+                days_since_check = max(0.0, (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400)
+            else:
+                days_since_check = float("inf")
 
             if days_since_check < STATIC_MAP_REFRESH_DAYS:
                 logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
-
                 products_map = STATIC_PRODUCTS_MAP.copy()
             else:
-                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+                # Announce refresh with guard
+                if last_check_ts <= 0:
+                    logger_run.info("🔄 Refreshing products map from API (last check: never)")
+                else:
+                    logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
                 USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
@@ -3865,6 +3864,13 @@ async def run_once() -> bool:
                 if sdb:
                     await sdb.set_metadata(last_api_check_key, str(now))
                     logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
+
+            last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
+            if not last_check_ts or last_check_ts <= 0:
+                logger_run.info("🔄 Refreshing products map from API (last check: never)")
+            else:
+                days_ago = (now - last_check_ts) / 86400
+                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
