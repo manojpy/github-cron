@@ -17,7 +17,7 @@ COPY src/ ./src/
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Compile AOT module
+# Compile AOT module inside src
 WORKDIR /app/src
 RUN python -u aot_build.py
 
@@ -44,6 +44,13 @@ RUN ls -l /app/indicators_aot*.so || (echo "❌ AOT .so not found in runtime"; e
 # Install runtime dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 🔑 Fix: install OpenMP runtime and set safe threading layer
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV NUMBA_THREADING_LAYER=workqueue
+ENV NUMBA_NUM_THREADS=12
 
 # Environment
 ENV PYTHONPATH="/app"
