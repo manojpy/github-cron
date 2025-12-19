@@ -2096,49 +2096,30 @@ class DataFetcher:
                 timeout=self.timeout
             )
 
-        # --- Post-processing / statistics -----------------------------
-        async def guarded_eval(task_data):
-            async with semaphore:
-                p_name, candles = task_data
-                try:
-                    # 🔍 DEBUG: Log what we received
-                    if cfg.DEBUG_MODE:
-                        logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
-                
-                    # ✅ Parse and validate inside worker (parallel execution)
-                    data_15m = parse_candles_to_numpy(candles.get("15"))
-                    data_5m = parse_candles_to_numpy(candles.get("5"))
-                    data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-                
-                    # Quick validation
-                    v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-                    if not v15:
-                        logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
-                        return None
-
         # --- Logging / sanity checks ----------------------------------
-        num_candles = len(result.get("t", []))
-        if num_candles:
-            last_candle_open_ts = result["t"][-1]
-            diff = abs(expected_open_ts - last_candle_open_ts)
+        if data:
+            num_candles = len(data.get("t", []))
+            if num_candles:
+                last_candle_open_ts = data["t"][-1]
+                diff = abs(expected_open_ts - last_candle_open_ts)
 
-            if diff > 300:          # > 5 min drift
-                if last_candle_open_ts < expected_open_ts:
-                    logger.warning(
-                        f"⚠️  API DELAY | {symbol} {resolution} | "
-                        f"Expected: {format_ist_time(expected_open_ts)} | "
-                        f"Got: {format_ist_time(last_candle_open_ts)} "
-                        f"(Diff: {diff}s)"
-                    )
+                if diff > 300:          # > 5 min drift
+                    if last_candle_open_ts < expected_open_ts:
+                        logger.warning(
+                            f"⚠️  API DELAY | {symbol} {resolution} | "
+                            f"Expected: {format_ist_time(expected_open_ts)} | "
+                            f"Got: {format_ist_time(last_candle_open_ts)} "
+                            f"(Diff: {diff}s)"
+                        )
+                    else:
+                        logger.debug(
+                            f"API Ahead | {symbol} {resolution} | Diff: {diff}s"
+                        )
                 else:
                     logger.debug(
-                        f"API Ahead | {symbol} {resolution} | Diff: {diff}s"
+                        f"✅ Scanned {symbol} {resolution} | "
+                        f"Latest: {format_ist_time(last_candle_open_ts)}"
                     )
-            else:
-                logger.debug(
-                    f"✅ Scanned {symbol} {resolution} | "
-                    f"Latest: {format_ist_time(last_candle_open_ts)}"
-                )
 
         return data
 
@@ -2238,6 +2219,7 @@ class DataFetcher:
             f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}"
         )
         return output
+
 
 def parse_candles_to_numpy(
     result: Optional[Dict[str, Any]],
@@ -3938,7 +3920,8 @@ async def process_pairs_with_workers(
     pair_requests = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
-        if not product_info: continue
+        if not product_info:
+            continue
         
         symbol = product_info["symbol"]
         resolutions = [("15", limit_15m), ("5", limit_5m)]
@@ -3947,67 +3930,86 @@ async def process_pairs_with_workers(
         
         pair_requests.append((symbol, resolutions))
     
-    # Fetch all candles. We trust fetch_all_candles_truly_parallel to use 
-    # calculate_expected_candle_timestamp internally.
+    # Fetch all candles in parallel
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
     
-    # 2. PHASE 2: PARSE & VALIDATE
-    # ✅ OPTIMIZED: PHASE 2 REMOVED - Parsing happens in Phase 3 workers
-    async def guarded_eval(task_data):
-        async with semaphore:
-            p_name, candles = task_data
-            try:
-                # 🔍 DEBUG: Log what we received
-                if cfg.DEBUG_MODE:
-                    logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
-                
-                # ✅ Parse and validate inside worker (parallel execution)
-                data_15m = parse_candles_to_numpy(candles.get("15"))
-                data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-                
-                # Quick validation
-                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-                if not v15:
-                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
-                    return None
-
-    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
-    logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
+    # 2. PHASE 2: PREPARE TASKS (Parsing & evaluation will happen in Phase 3)
+    logger_main.info(f"🧠 Phase 2: Preparing evaluation tasks for fetched pairs...")
+    
+    tasks = []
+    for pair_name, candles_by_res in all_candles.items():
+        if not candles_by_res:  # No data fetched at all
+            continue
+        # Only include if we at least have some candles
+        if any(candles_by_res.get(res) for res in ["15", "5", "D"] if res in candles_by_res):
+            tasks.append((pair_name, candles_by_res))
+    
+    if not tasks:
+        logger_main.info("No valid candle data received for any pair.")
+        return []
+    
+    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL
+    logger_main.info(f"🧠 Phase 3: Evaluating {len(tasks)} pairs...")
     eval_start = time.time()
     
-    # Use MAX_PARALLEL_FETCH (e.g. 12) to limit concurrent Redis/CPU usage
+    # Limit concurrent heavy work (CPU + Redis I/O)
     semaphore = asyncio.Semaphore(cfg.MAX_PARALLEL_FETCH)
     
     async def guarded_eval(task_data):
+        p_name, candles = task_data
         async with semaphore:
-            p_name, candles = task_data
             try:
-                # ✅ Parse and validate inside worker (parallel execution)
+                if cfg.DEBUG_MODE:
+                    logger_main.debug(
+                        f"Processing {p_name} | Candle keys: {list(candles.keys())}"
+                    )
+                
+                # Parse candles
                 data_15m = parse_candles_to_numpy(candles.get("15"))
                 data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+                data_daily = (
+                    parse_candles_to_numpy(candles.get("D"))
+                    if cfg.ENABLE_PIVOT else None
+                )
                 
-                # Quick validation
-                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                # Quick validation on 15m (critical for strategy)
+                v15, r15 = validate_candle_data(
+                    data_15m, required_len=cfg.RMA_200_PERIOD
+                )
                 if not v15:
                     logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
                     return None
                 
+                # Full evaluation + alerting
                 return await evaluate_pair_and_alert(
-                    p_name, data_15m, data_5m, data_daily, state_db, 
-                    telegram_queue, correlation_id, reference_time
+                    p_name,
+                    data_15m,
+                    data_5m,
+                    data_daily,
+                    state_db,
+                    telegram_queue,
+                    correlation_id,
+                    reference_time
                 )
             except Exception as e:
-                logger_main.error(f"Error in {p_name} evaluation: {e}")
+                logger_main.error(f"Error evaluating {p_name}: {e}", exc_info=True)
                 return None
-
-    results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
+    
+    # Run all evaluations concurrently
+    results = await asyncio.gather(*[guarded_eval(task) for task in tasks])
+    
+    # Filter out failed/skipped pairs
     valid_results = [r for r in results if r is not None]
     
-    logger_main.info(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
+    total_time = time.time() - fetch_start
+    logger_main.info(
+        f"✅ Run complete | Successful: {len(valid_results)}/{len(pairs_to_process)} "
+        f"| Total time: {total_time:.2f}s "
+        f"(Fetch+Prep: {eval_start - fetch_start:.2f}s, Eval: {time.time() - eval_start:.2f}s)"
+    )
+    
     return valid_results
 
 # ============================================================================
@@ -4313,26 +4315,7 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 
-if __name__ == "__main__":
-    async def guarded_eval(task_data):
-        async with semaphore:
-            p_name, candles = task_data
-            try:
-                # 🔍 DEBUG: Log what we received
-                if cfg.DEBUG_MODE:
-                    logger_main.debug(f"Processing {p_name} | Candle keys: {list(candles.keys())}")
-                
-                # ✅ Parse and validate inside worker (parallel execution)
-                data_15m = parse_candles_to_numpy(candles.get("15"))
-                data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-                
-                # Quick validation
-                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-                if not v15:
-                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
-                    return None
-
+if if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
@@ -4342,12 +4325,14 @@ if __name__ == "__main__":
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     args = parser.parse_args()
 
+    # Enable debug logging if requested
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
             h.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled via CLI flag")
 
+    # Validate configuration early
     try:
         validate_runtime_config()
     except ValueError as e:
@@ -4358,18 +4343,18 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-    # OPTIMIZED: Respect SKIP_WARMUP config option
+    # Warmup Numba JIT unless explicitly skipped
     if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
-        """Run bot with proper cleanup on exit"""
+        """Run the bot with proper resource cleanup on exit"""
         try:
             return await run_once()
         finally:
-            # ✅ NEW: Cleanup persistent connections on shutdown
+            # Cleanup persistent connections on shutdown
             logger.info("🧹 Shutting down persistent connections...")
             try:
                 await RedisStateStore.shutdown_global_pool()
@@ -4382,7 +4367,8 @@ if __name__ == "__main__":
                 logger.debug("✅ HTTP session closed")
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
-    
+
+    # Run the async main function
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
@@ -4393,7 +4379,6 @@ if __name__ == "__main__":
             sys.exit(1)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Bot stopped by timeout or user interrupt")
-        # Cleanup happens in finally block above
         sys.exit(130)
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
