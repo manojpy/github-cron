@@ -3836,6 +3836,7 @@ async def run_once() -> bool:
             except:
                 last_check = 0.0
 
+            now = time.time()
             days_since_check = (now - last_check) / 86400
 
             if days_since_check < STATIC_MAP_REFRESH_DAYS:
@@ -4056,7 +4057,6 @@ async def run_once() -> bool:
 
         gc.enable()
 
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -4116,7 +4116,6 @@ if __name__ == "__main__":
                 logger.debug("✅ HTTP session closed")
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
-
 
     try:
         success = asyncio.run(main_with_cleanup())
