@@ -4045,49 +4045,14 @@ async def run_once() -> bool:
             return False
 
         # OPTIMIZED: Use configurable cache TTL
-        # ⚡ OPTIMIZED: Use static map with API fallback
-products_map = None
-pairs_to_process = []
-
-# Try static map first
-USE_STATIC_MAP = True  # Set to False to force API fetch
-STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
-
-if USE_STATIC_MAP:
-    last_api_check_key = "last_products_api_check"
-    
-    try:
-        last_check_str = await (await RedisStateStore(cfg.REDIS_URL).connect()).get_metadata(last_api_check_key) if sdb else None
-        last_check = float(last_check_str) if last_check_str else 0.0
-    except:
-        last_check = 0.0
-    
-    days_since_check = (now - last_check) / 86400
-    
-    if days_since_check < STATIC_MAP_REFRESH_DAYS:
-        logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
-        products_map = STATIC_PRODUCTS_MAP.copy()
-    else:
-        logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
-        USE_STATIC_MAP = False
-
-if not USE_STATIC_MAP or products_map is None:
-    # Fallback to API fetch
-    logger_run.info("📡 Fetching products list from Delta API...")
-    temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
-    prod_resp = await temp_fetcher.fetch_products()
-    
-    if not prod_resp:
-        logger_run.warning("⚠️ API fetch failed, falling back to static map")
-        products_map = STATIC_PRODUCTS_MAP.copy()
-    else:
-        products_map = build_products_map_from_api_result(prod_resp)
+        PRODUCTS_CACHE = getattr(run_once, '_products_cache', {"data": None, "until": 0.0})
+        now = time.time()
         
-        # Update last check timestamp
-        if sdb:
-            await sdb.set_metadata(last_api_check_key, str(now))
+        products_map = None
+        pairs_to_process = []
         
-        logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
+        if PRODUCTS_CACHE["data"] is None or now > PRODUCTS_CACHE["until"]:
+            logger_run.info("📡 Fetching fresh products list from Delta API...")
             
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
@@ -4145,4 +4110,213 @@ if not USE_STATIC_MAP or products_map is None:
         
         if not lock_acquired:
             logger_run.warning(
-                "⏸️ Another instance is running (Redis lo
+                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
+            )
+            return False
+
+        logger_run.debug("🔒 Distributed lock acquired successfully")
+
+        if cfg.SEND_TEST_MESSAGE:
+            await telegram_queue.send(escape_markdown_v2(
+                f"🔥 {cfg.BOT_NAME} - Run Started\n"
+                f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
+                f"Correlation ID: {correlation_id}\n"
+                f"Pairs: {len(pairs_to_process)}"
+            ))
+
+        logger_run.debug(
+            f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
+        )
+
+        all_results = await process_pairs_with_workers(
+            fetcher, products_map, pairs_to_process,
+            sdb, telegram_queue, correlation_id,
+            lock, reference_time
+        )
+
+        for _, state in all_results:
+            if state.get("state") == "ALERT_SENT":
+                alerts_sent += state.get("summary", {}).get("alerts", 0)
+
+        fetcher_stats = fetcher.get_stats()
+        logger_run.info(
+            f"📡 Fetch statistics | "
+            f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+            f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
+        )
+        
+        if "rate_limiter" in fetcher_stats:
+            rate_stats = fetcher_stats["rate_limiter"]
+            if rate_stats.get("total_waits", 0) > 0:
+                logger_run.info(
+                    f"🚦 Rate limiting stats | "
+                    f"Waits: {rate_stats['total_waits']} | "
+                    f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
+                )
+
+        final_memory_mb = process.memory_info().rss / 1024 / 1024
+        memory_delta = final_memory_mb - container_memory_mb
+        
+        run_duration = time.time() - start_time
+        redis_status = "OK" if not sdb.degraded else "DEGRADED"
+        
+        summary = (
+            f"✅ RUN COMPLETE | "
+            f"Duration: {run_duration:.1f}s | "
+            f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
+            f"Alerts: {alerts_sent} | "
+            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
+            f"Redis: {redis_status}"
+        )
+        logger_run.info(summary)
+
+        if alerts_sent > MAX_ALERTS_PER_RUN:
+            await telegram_queue.send(escape_markdown_v2(
+                f"⚠️ HIGH ALERT VOLUME\n"
+                f"Alerts sent: {alerts_sent}\n"
+                f"Pairs processed: {len(all_results)}\n"
+                f"Time: {format_ist_time()}"
+            ))
+
+        return True
+
+    except asyncio.TimeoutError:
+        logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
+        return False
+    
+    except asyncio.CancelledError:
+        logger_run.warning("🛑 Run cancelled (shutdown signal received)")
+        return False
+    
+    except Exception as e:
+        logger_run.exception(f"❌ Fatal error in run_once: {e}")
+        
+        if telegram_queue:
+            try:
+                await telegram_queue.send(escape_markdown_v2(
+                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
+                    f"Error: {str(e)[:200]}\n"
+                    f"Correlation ID: {correlation_id}\n"
+                    f"Time: {format_ist_time()}"
+                ))
+            except Exception:
+                logger_run.error("Failed to send error notification")
+        
+        return False
+    
+    finally:
+        logger_run.debug("🧹 Starting resource cleanup...")
+        
+        if lock_acquired and lock and lock.acquired_by_me:
+            try:
+                await lock.release(timeout=3.0)
+                logger_run.debug("🔓 Redis lock released")
+            except Exception as e:
+                logger_run.error(f"Error releasing lock: {e}")
+        
+        if sdb:
+            try:
+                await sdb.close()
+                logger_run.debug("✅ Redis connection closed")
+            except Exception as e:
+                logger_run.error(f"Error closing Redis: {e}")
+        
+        # ✅ REMOVED: Redis pool shutdown (keeping alive)
+        # ✅ REMOVED: HTTP session close (keeping alive)
+        
+        try:
+            if 'all_results' in locals():
+                del all_results
+            if 'products_map' in locals():
+                del products_map
+            if 'fetcher' in locals():
+                del fetcher
+            if 'telegram_queue' in locals():
+                del telegram_queue
+            
+            gc.collect()
+            
+            logger_run.debug("✅ Memory cleanup completed")
+        except Exception as e:
+            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
+        
+        TRACE_ID.set("")
+        PAIR_ID.set("")
+        
+        logger_run.debug("🏁 Resource cleanup finished")
+        
+        gc.enable()
+        
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
+except ImportError:
+    logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="macd_unified",
+        description="Unified MACD/alerts runner with NumPy optimization"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
+    parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
+    args = parser.parse_args()
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        for h in logger.handlers:
+            h.setLevel(logging.DEBUG)
+        logger.info("Debug mode enabled via CLI flag")
+
+    try:
+        validate_runtime_config()
+    except ValueError as e:
+        logger.critical(f"Configuration validation failed: {e}")
+        sys.exit(1)
+    
+    if args.validate_only:
+        logger.info("Configuration validation passed - exiting (--validate-only mode)")
+        sys.exit(0)
+
+    # OPTIMIZED: Respect SKIP_WARMUP config option
+    if not args.skip_warmup and not cfg.SKIP_WARMUP:
+        warmup_numba()
+    else:
+        logger.info("Skipping Numba warmup (faster startup)")
+
+    async def main_with_cleanup():
+        """Run bot with proper cleanup on exit"""
+        try:
+            return await run_once()
+        finally:
+            # ✅ NEW: Cleanup persistent connections on shutdown
+            logger.info("🧹 Shutting down persistent connections...")
+            try:
+                await RedisStateStore.shutdown_global_pool()
+                logger.debug("✅ Redis pool closed")
+            except Exception as e:
+                logger.error(f"Error closing Redis pool: {e}")
+            
+            try:
+                await SessionManager.close_session()
+                logger.debug("✅ HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing HTTP session: {e}")
+    
+    try:
+        success = asyncio.run(main_with_cleanup())
+        if success:
+            logger.info("✅ Bot run completed successfully")
+            sys.exit(0)
+        else:
+            logger.error("❌ Bot run failed")
+            sys.exit(1)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Bot stopped by timeout or user interrupt")
+        # Cleanup happens in finally block above
+        sys.exit(130)
+    except Exception as exc:
+        logger.critical(f"Fatal error: {exc}", exc_info=True)
+        sys.exit(1)
