@@ -1,29 +1,47 @@
-# Exclude Python and OS artifacts
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
-.env*
-
-# Exclude Numba Caches (Crucial for build speed)
-.numba_cache/
-.cache/
-
-# Exclude Git and CI/CD
-.git/
-.github/
+# Git and CI/CD
+.git
+.github
 .gitignore
-.dockerignore
 
-# Exclude documentation and logs
-README.md
+# Python cache
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Logs
 *.log
+logs/
+
+# Test files
+tests/
+*.test.py
+
+# Documentation
+README.md
+docs/
 *.md
 
-# Exclude local temporary files
-tmp/
-temp/
-*.tmp
+# Environment
+.env
+.env.local
+
+# But DON'T ignore these (required for build):
+!requirements.txt
+!Dockerfile
+!compile_numba_aot.py
+!src/
+!src/__pycache__
+!wrapper.py
+!config_macd.json
