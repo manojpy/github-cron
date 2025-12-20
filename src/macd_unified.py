@@ -3406,7 +3406,11 @@ async def evaluate_pair_and_alert(
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
 
-        # === STEP 10: VWAP HLC3 DEBUG (Optional) ===
+        # === FIX: ensure summary strings exist ===
+        if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
+        if 'sell_candle_reason' not in locals(): sell_candle_reason = None
+
+        # === STEP 10: VWAP-HLC3 DEBUG (optional) ===
         if cfg.DEBUG_MODE and cfg.ENABLE_VWAP:
             curr_ts = int(timestamps_15m[i15])
             curr_hour = (curr_ts % 86400) // 3600
