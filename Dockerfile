@@ -44,9 +44,12 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
 RUN python src/compile_numba_aot.py && \
     echo "✅ AOT compilation completed" && \
-    echo "📊 Verifying cache creation:" && \
-    ls -lah /app/src/__pycache__/ && \
-    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) -exec ls -lh {} \; | head -10
+    echo "🔍 Checking cache directories after AOT:" && \
+    ls -lah /app/src/__pycache__/ || true && \
+    ls -lah /app/__pycache__/ || true && \
+    echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40 && \
+    find /app/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
 
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -67,7 +70,6 @@ RUN mkdir -p /app/src/__pycache__
 COPY --from=aot-compiler /app/src/*.py ./src/
 
 # 🔥 EXPLICIT: Copy the Numba cache directory separately
-# This ensures __pycache__ is preserved even if COPY ignores it
 COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
 
 # Copy runtime files
@@ -85,7 +87,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # Verify cache was copied and set permissions
 RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
     ls -lah /app/src/__pycache__/ && \
-    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l) && \
+    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
     echo "📁 Found $CACHE_COUNT cache files" && \
     if [ "$CACHE_COUNT" -lt 15 ]; then \
         echo "⚠️  WARNING: Expected at least 15 cache files, found $CACHE_COUNT"; \
