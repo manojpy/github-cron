@@ -545,61 +545,96 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMIZED: Parallel SMA calculation"""
+@njit(nogil=True, fastmath=True, cache=True)
+def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    FIXED: Properly handles NaN initialization and calculates rolling SMA
+    The bug was in min_periods logic and NaN handling
+    """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
-    min_periods = max(2, period // 3)
     
-    for i in prange(n):  # PARALLEL LOOP
+    # Calculate cumulative sum approach for efficiency
+    for i in range(n):
+        start = max(0, i - period + 1)
         window_sum = 0.0
         count = 0
         
-        start = max(0, i - period + 1)
+        # Sum the window
         for j in range(start, i + 1):
             val = data[j]
             if not np.isnan(val):
                 window_sum += val
                 count += 1
         
-        if count >= min_periods:
+        # Output average if we have enough data
+        if count > 0:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
-            
+    
     return out
 
-@njit(nogil=True, fastmath=True, cache=True)
-def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Original serial SMA (fallback)"""
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    FIXED: Parallel version with proper NaN handling
+    """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
     
-    window_sum = 0.0
-    count = 0
+    for i in prange(n):  # PARALLEL LOOP
+        start = max(0, i - period + 1)
+        window_sum = 0.0
+        count = 0
+        
+        # Sum the window
+        for j in range(start, i + 1):
+            val = data[j]
+            if not np.isnan(val):
+                window_sum += val
+                count += 1
+        
+        # Output average if we have enough data
+        if count > 0:
+            out[i] = window_sum / count
+        else:
+            out[i] = np.nan
+    
+    return out
+
+
+# ============================================================================
+# ALTERNATIVE: If you want to keep min_periods logic from original
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _sma_loop_with_min_periods(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    Version with min_periods - requires at least 1/3 of period
+    """
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    min_periods = max(1, period // 3)  # Changed from max(2, ...) to max(1, ...)
     
     for i in range(n):
-        val = data[i]
+        start = max(0, i - period + 1)
+        window_sum = 0.0
+        count = 0
         
-        if not np.isnan(val):
-            window_sum += val
-            count += 1
-            
-        if i >= period:
-            old_val = data[i - period]
-            if not np.isnan(old_val):
-                window_sum -= old_val
-                count -= 1
-
-        min_periods = max(2, period // 3)
+        for j in range(start, i + 1):
+            val = data[j]
+            if not np.isnan(val):
+                window_sum += val
+                count += 1
+        
+        # Check if we meet minimum periods requirement
         if count >= min_periods:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
-            
+    
     return out
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -1120,7 +1155,15 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
             ma = _sma_loop_parallel(close_c, period)
         else:
             ma = _sma_loop(close_c, period)
-        
+        # After calculating MA, add this check:
+        if np.isnan(ma).any():
+            nan_count = np.isnan(ma).sum()
+            logger.error(f"❌ MA contains {nan_count}/{len(ma)} NaN values!")
+            logger.error(f"   MA[0:10] = {ma[:10]}")
+            logger.error(f"   MA[-10:] = {ma[-10:]}")
+            logger.error(f"   Close[0:10] = {close_c[:10]}")
+            logger.error(f"   Period = {period}, Data length = {len(close_c)}")
+
         logger.info(f"  MA result: min={ma.min():.2f}, max={ma.max():.2f}, mean={ma.mean():.2f}, last={ma[-1]:.2f}")
         
         # === STEP 4: Raw Momentum ===
