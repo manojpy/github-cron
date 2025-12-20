@@ -665,7 +665,7 @@ def _vwap_daily_loop(
         h, l, c, v = high[i], low[i], close[i], volume[i]
 
         # session-start timestamp for this day: 00:15 UTC
-        session_start_ts = day * 86400 + 15 * 60   # 00:15
+        session_start_ts = day * 86400
 
         # ── 1.  daily reset exactly at 00:15 -----------------------------
         if ts >= session_start_ts and day != current_session_day:
