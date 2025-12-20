@@ -752,16 +752,24 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    value_arr = np.zeros(rows, dtype=np.float64)
+    value_arr = np.empty(rows, dtype=np.float64)
     value_arr[0] = 1.0
     
     for i in range(1, rows):
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = t - 0.5 + 0.5 * prev_v
-        value_arr[i] = max(-0.9999, min(0.9999, v))
+        prev_v = value_arr[i - 1]
+        t = temp_arr[i]
+        if np.isnan(t):
+            t = 0.5
+        
+        # FIXED: Compound multiplication like PineScript
+        v = prev_v * (t - 0.5 + 0.5 * prev_v)
+        
+        # Clamp to [-0.9999, 0.9999]
+        v = min(0.9999, max(-0.9999, v))
+        value_arr[i] = v
     
     return value_arr
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
@@ -776,15 +784,10 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """
-    OPTIMIZED: Parallel rolling standard deviation using Welford's algorithm.
-    Uses prange for independent window calculations.
-    """
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
     
-    # Parallel loop - each window is independent
     for i in prange(n):
         mean = 0.0
         m2 = 0.0
@@ -800,8 +803,9 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                 delta2 = val - mean
                 m2 += delta * delta2
         
+        # FIXED: Sample standard deviation (n-1)
         if count > 1:
-            variance = m2 / count
+            variance = m2 / (count - 1)
             sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
@@ -810,7 +814,6 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -830,8 +833,9 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                 delta2 = val - mean
                 m2 += delta * delta2
         
+        # FIXED: Sample standard deviation (n-1)
         if count > 1:
-            variance = m2 / count
+            variance = m2 / (count - 1)
             sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
@@ -1065,71 +1069,69 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # ============================================================================
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """OPTIMIZED: MMH with conditional parallel execution"""
     try:
         if close is None or len(close) < period:
-            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        
-        # OPTIMIZED: Remove unnecessary type conversion
-        # Data is already float64 from parse_candles_to_numpy()
-        # OLD: close_f64 = close.astype(np.float64)
-        # NEW: Just ensure it's contiguous (zero-copy operation)
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-        
-        # OPTIMIZED: Use higher threshold for expensive rolling std
+
+        # Standard deviation (FIXED: now uses sample stdev)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
+        # Worm calculation
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # OPTIMIZED: Higher threshold for rolling mean
+        # Moving average
         if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = _rolling_mean_numba_parallel(close_c, period)
+            ma = _sma_loop_parallel(close_c, period)
         else:
             ma = _rolling_mean_numba(close_c, period)
         
+        # Raw momentum
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # OPTIMIZED: Higher threshold for min/max
+        # Rolling min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
         
+        # FIXED: Temp calculation matching PineScript behavior
         denom = max_med - min_med
-        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
-        temp = (raw - min_med) / denom
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
+        # FIXED: Value recursion with compound multiplication
         value_arr = _calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
+        # temp2 calculation
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
+        temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
         
-        momentum = 0.25 * np.log(temp2)
-        momentum = np.nan_to_num(momentum, nan=0.0)
+        # FIXED: Log calculation (direct log, handle NaN after)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            momentum = 0.25 * np.log(temp2)
+        momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # Final smoothing
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
-        
-        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
         
         return momentum_arr
         
     except Exception as e:
-        logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
@@ -3405,6 +3407,11 @@ async def evaluate_pair_and_alert(
                 sell_common and mmh_curr < 0 and
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
+        logger_pair.info(
+            f"{pair_name} | MMH: {mmh_curr:+.2f} | "
+            f"{'🟢' if mmh_curr > 0 else '🔴'} | "
+            f"Price: ${close_curr:.2f}"
+        )
 
         # === FIX: ensure summary strings exist ===
         if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
