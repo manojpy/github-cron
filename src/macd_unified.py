@@ -753,22 +753,21 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    Diagnostic MMH value recursion with logging.
-    Replicates PineScript: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
+    Corrected MMH value recursion with proper nz() fallback.
+    PineScript: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
     value_arr = np.zeros(rows, dtype=np.float64)
-    value_arr[0] = 1.0  # PineScript initializes value = 1.0
+    value_arr[0] = 1.0  # initial seed
 
-    # For debugging: capture first 20 values
     debug_limit = min(rows, 20)
     debug_temp = []
     debug_value = []
 
     for i in range(1, rows):
+        # PineScript nz(value[1]) = 0 if no prior value
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
 
-        # PineScript semantics
         v = prev_v * (t - 0.5 + 0.5 * prev_v)
 
         # Clipping
@@ -779,12 +778,10 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
 
         value_arr[i] = v
 
-        # Collect debug info
         if i < debug_limit:
             debug_temp.append(t)
             debug_value.append(v)
 
-    # Print debug info (first 20 values)
     print("MMH Debug - temp[0:20]:", debug_temp)
     print("MMH Debug - value[0:20]:", debug_value)
 
