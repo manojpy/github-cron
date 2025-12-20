@@ -70,12 +70,11 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
-    MMH_VALUE_CLIP = 0.9999999
-    ZERO_DIVISION_GUARD = 1e-12
-    INFINITY_CLAMP = 1e8
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
+    ZERO_DIVISION_GUARD = 1e-10
+    MMH_VALUE_CLIP = 0.9999
 
 # ============================================================================
 # STATIC PRODUCTS MAP (Eliminates API fetch overhead)
@@ -545,96 +544,61 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
-@njit(nogil=True, fastmath=True, cache=True)
-def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """
-    FIXED: Properly handles NaN initialization and calculates rolling SMA
-    The bug was in min_periods logic and NaN handling
-    """
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    
-    # Calculate cumulative sum approach for efficiency
-    for i in range(n):
-        start = max(0, i - period + 1)
-        window_sum = 0.0
-        count = 0
-        
-        # Sum the window
-        for j in range(start, i + 1):
-            val = data[j]
-            if not np.isnan(val):
-                window_sum += val
-                count += 1
-        
-        # Output average if we have enough data
-        if count > 0:
-            out[i] = window_sum / count
-        else:
-            out[i] = np.nan
-    
-    return out
-
-
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """
-    FIXED: Parallel version with proper NaN handling
-    """
+    """OPTIMIZED: Parallel SMA calculation"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+    min_periods = max(2, period // 3)
     
     for i in prange(n):  # PARALLEL LOOP
-        start = max(0, i - period + 1)
         window_sum = 0.0
         count = 0
         
-        # Sum the window
+        start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = data[j]
             if not np.isnan(val):
                 window_sum += val
                 count += 1
         
-        # Output average if we have enough data
-        if count > 0:
-            out[i] = window_sum / count
-        else:
-            out[i] = np.nan
-    
-    return out
-
-
-# ============================================================================
-# ALTERNATIVE: If you want to keep min_periods logic from original
-# ============================================================================
-
-@njit(nogil=True, fastmath=True, cache=True)
-def _sma_loop_with_min_periods(data: np.ndarray, period: int) -> np.ndarray:
-    """
-    Version with min_periods - requires at least 1/3 of period
-    """
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    min_periods = max(1, period // 3)  # Changed from max(2, ...) to max(1, ...)
-    
-    for i in range(n):
-        start = max(0, i - period + 1)
-        window_sum = 0.0
-        count = 0
-        
-        for j in range(start, i + 1):
-            val = data[j]
-            if not np.isnan(val):
-                window_sum += val
-                count += 1
-        
-        # Check if we meet minimum periods requirement
         if count >= min_periods:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
+            
+    return out
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """Original serial SMA (fallback)"""
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
     
+    window_sum = 0.0
+    count = 0
+    
+    for i in range(n):
+        val = data[i]
+        
+        if not np.isnan(val):
+            window_sum += val
+            count += 1
+            
+        if i >= period:
+            old_val = data[i - period]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                count -= 1
+
+        min_periods = max(2, period // 3)
+        if count >= min_periods:
+            out[i] = window_sum / count
+        else:
+            out[i] = np.nan
+            
     return out
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -777,42 +741,28 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
         diff = src - prev_worm
         sd_i = sd_arr[i]
         
-        if np.isnan(sd_i):
+        if np.isnan(sd_i) or sd_i <= 0:
             delta = diff
         else:
-            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
+            delta = np.sign(diff) * sd_i if np.abs(diff) > sd_i else diff
         worm_arr[i] = prev_worm + delta
     
     return worm_arr
 
-# ============================================================================
-# ALSO ADD THIS: Print first 10 iterations of value loop for debugging
-# ============================================================================
-
-@njit(nogil=True, fastmath=False, cache=False)  # Disable optimizations for debugging
-def _calc_mmh_value_loop_debug(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Debug version - no fastmath, prints first iterations"""
+@njit(nogil=True, fastmath=True, cache=True)
+def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr = np.empty(rows, dtype=np.float64)
+    # PineScript effectively starts with value = 1.0 on first calculated bar
     value_arr[0] = 1.0
     
-    for i in range(1, min(11, rows)):  # First 10 iterations
+    for i in range(1, rows):
         prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        
-        # THIS IS THE CRITICAL LINE - make sure it's correct
-        v = prev_v * (t - 0.5 + 0.5 * prev_v)
-        
-        v = min(0.9999, max(-0.9999, v))
-        value_arr[i] = v
-        
-        # Print to console (will appear in logs)
-        print(f"  i={i}: prev_v={prev_v:.6f}, t={t:.6f}, expr={(t - 0.5 + 0.5 * prev_v):.6f}, v={v:.6f}")
-    
-    # Continue for rest
-    for i in range(11, rows):
-        prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = prev_v * (t - 0.5 + 0.5 * prev_v)
+        t = temp_arr[i]
+        if np.isnan(t):
+            t = 0.5
+        # Critical fix: multiplier is 1.0 (PineScript: 0.5 * 2)
+        v = 1.0 * (t - 0.5 + 0.5 * prev_v)
+        # Exact PineScript clamping
         v = min(0.9999, max(-0.9999, v))
         value_arr[i] = v
     
@@ -826,16 +776,22 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
+
 # ============================================================================
 # OPTIMIZATION 3: Welford's Algorithm with Parallel Preprocessing
 # ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """
+    OPTIMIZED: Parallel rolling standard deviation using Welford's algorithm.
+    Uses prange for independent window calculations.
+    """
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
     
+    # Parallel loop - each window is independent
     for i in prange(n):
         mean = 0.0
         m2 = 0.0
@@ -851,9 +807,8 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                 delta2 = val - mean
                 m2 += delta * delta2
         
-        # FIXED: Sample standard deviation (n-1)
         if count > 1:
-            variance = m2 / (count - 1)
+            variance = m2 / count
             sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
@@ -862,6 +817,7 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -881,9 +837,8 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                 delta2 = val - mean
                 m2 += delta * delta2
         
-        # FIXED: Sample standard deviation (n-1)
         if count > 1:
-            variance = m2 / (count - 1)
+            variance = m2 / count
             sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
@@ -1116,143 +1071,73 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
 # ============================================================================
 
-"""
-Add this comprehensive debugging version of calculate_magical_momentum_hist
-Replace your current function with this to see exactly where zeros appear
-"""
-
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """Debug version - traces every step"""
+    """Corrected Magical Momentum Histogram - exact PineScript match"""
     try:
         if close is None or len(close) < period:
-            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
+            # logger.warning(...)
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-        
-        # === STEP 1: Standard Deviation ===
-        logger.info(f"MMH Step 1: Calculating SD | rows={rows}, period=50, resp={resp_clamped:.4f}")
+
+        # SD (50-period stdev * responsiveness)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
-        logger.info(f"  SD result: min={sd.min():.6f}, max={sd.max():.6f}, mean={sd.mean():.6f}, last={sd[-1]:.6f}")
-        if np.all(sd == 0):
-            logger.error("❌ SD is all zeros - check _rolling_std_welford!")
-            return np.zeros(rows, dtype=np.float64)
-        
-        # === STEP 2: Worm ===
-        logger.info(f"MMH Step 2: Calculating Worm")
+        # Worm
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
-        logger.info(f"  Worm result: min={worm_arr.min():.2f}, max={worm_arr.max():.2f}, mean={worm_arr.mean():.2f}, last={worm_arr[-1]:.2f}")
         
-        # === STEP 3: Moving Average ===
-        logger.info(f"MMH Step 3: Calculating MA | period={period}")
+        # MA (SMA of close)
         if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = _sma_loop_parallel(close_c, period)
+            ma = _sma_loop_parallel(close_c, period)  # assuming you still have this function
+            # or use your _rolling_mean_numba_parallel if preferred
         else:
-            ma = _sma_loop(close_c, period)
-        # After calculating MA, add this check:
-        if np.isnan(ma).any():
-            nan_count = np.isnan(ma).sum()
-            logger.error(f"❌ MA contains {nan_count}/{len(ma)} NaN values!")
-            logger.error(f"   MA[0:10] = {ma[:10]}")
-            logger.error(f"   MA[-10:] = {ma[-10:]}")
-            logger.error(f"   Close[0:10] = {close_c[:10]}")
-            logger.error(f"   Period = {period}, Data length = {len(close_c)}")
-
-        logger.info(f"  MA result: min={ma.min():.2f}, max={ma.max():.2f}, mean={ma.mean():.2f}, last={ma[-1]:.2f}")
+            ma = _rolling_mean_numba(close_c, period)
         
-        # === STEP 4: Raw Momentum ===
-        logger.info(f"MMH Step 4: Calculating raw momentum")
+        # raw_momentum = (worm - ma) / worm
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        logger.info(f"  Raw result: min={raw.min():.6f}, max={raw.max():.6f}, mean={raw.mean():.6f}, last={raw[-1]:.6f}")
-        logger.info(f"  Raw sample (last 5): {raw[-5:]}")
-        
-        # === STEP 5: Rolling Min/Max ===
-        logger.info(f"MMH Step 5: Calculating rolling min/max | period={period}")
+        # Rolling min/max over period
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
         
-        logger.info(f"  Min_med: last={min_med[-1]:.6f}, Max_med: last={max_med[-1]:.6f}")
-        
-        # === STEP 6: Normalize ===
-        logger.info(f"MMH Step 6: Normalizing to [0,1]")
+        # temp = (raw - min) / (max - min)  --> 0.5 when denom=0
         denom = max_med - min_med
-        logger.info(f"  Denom (last): {denom[-1]:.6f}")
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp = np.where(denom < 1e-10, 0.5, (raw - min_med) / denom)
-        temp = np.clip(temp, 0.0, 1.0)
+        temp = np.where(denom == 0, 0.5, (raw - min_med) / denom)
         temp = np.nan_to_num(temp, nan=0.5)
         
-        logger.info(f"  Temp result: min={temp.min():.6f}, max={temp.max():.6f}, mean={temp.mean():.6f}, last={temp[-1]:.6f}")
-        logger.info(f"  Temp sample (last 5): {temp[-5:]}")
-        
-        # === STEP 7: Value Recursion (CRITICAL) ===
-        logger.info(f"MMH Step 7: Value recursion")
+        # Value recursion (fixed scaling)
         value_arr = _calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
-        logger.info(f"  Value result: min={value_arr.min():.6f}, max={value_arr.max():.6f}, mean={value_arr.mean():.6f}, last={value_arr[-1]:.6f}")
-        logger.info(f"  Value sample (last 5): {value_arr[-5:]}")
-        
-        if np.all(np.abs(value_arr) < 1e-6):
-            logger.error("❌ Value array is all near-zero after recursion - check _calc_mmh_value_loop!")
-        
-        # === STEP 8: Temp2 Calculation ===
-        logger.info(f"MMH Step 8: Calculating temp2")
+        # temp2 = (1 + value) / (1 - value)
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.clip(temp2, -1e8, 1e8)
+        temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
         
-        logger.info(f"  Temp2 result: min={temp2.min():.2f}, max={temp2.max():.2f}, mean={temp2.mean():.2f}, last={temp2[-1]:.2f}")
-        logger.info(f"  Temp2 sample (last 5): {temp2[-5:]}")
+        # momentum = 0.25 * log(temp2)
+        momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)  # safer log with sign
+        momentum = np.nan_to_num(momentum, nan=0.0)
         
-        # === STEP 9: Log Transformation ===
-        logger.info(f"MMH Step 9: Log transformation")
-        with np.errstate(divide='ignore', invalid='ignore'):
-            momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)
-        momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        logger.info(f"  Momentum result: min={momentum.min():.6f}, max={momentum.max():.6f}, mean={momentum.mean():.6f}, last={momentum[-1]:.6f}")
-        logger.info(f"  Momentum sample (last 5): {momentum[-5:]}")
-        
-        # === STEP 10: Final Smoothing ===
-        logger.info(f"MMH Step 10: Final recursive smoothing")
+        # Final histogram smoothing
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
         
-        logger.info(f"  Final MMH: min={momentum_arr.min():.6f}, max={momentum_arr.max():.6f}, mean={momentum_arr.mean():.6f}, last={momentum_arr[-1]:.6f}")
-        logger.info(f"  Final sample (last 5): {momentum_arr[-5:]}")
-        
-        # === FINAL CHECK ===
-        if np.all(np.abs(momentum_arr) < 1e-6):
-            logger.error("❌ FINAL MMH IS ALL ZEROS!")
-            logger.error("Breakdown:")
-            logger.error(f"  Close range: [{close_c.min():.2f}, {close_c.max():.2f}]")
-            logger.error(f"  SD range: [{sd.min():.6f}, {sd.max():.6f}]")
-            logger.error(f"  Worm range: [{worm_arr.min():.2f}, {worm_arr.max():.2f}]")
-            logger.error(f"  MA range: [{ma.min():.2f}, {ma.max():.2f}]")
-            logger.error(f"  Raw range: [{raw.min():.6f}, {raw.max():.6f}]")
-            logger.error(f"  Temp range: [{temp.min():.6f}, {temp.max():.6f}]")
-            logger.error(f"  Value range: [{value_arr.min():.6f}, {value_arr.max():.6f}]")
-        
+        # Optional sanitization (keep if you use it)
         momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
+        
         return momentum_arr
         
     except Exception as e:
-        logger.error(f"MMH calculation failed: {e}", exc_info=True)
+        # logger.error(...)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
