@@ -1072,72 +1072,68 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # ============================================================================
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """Corrected Magical Momentum Histogram - exact PineScript match"""
     try:
-        if close is None or len(close) < period:
-            # logger.warning(...)
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-        
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
+        if close is None or len(close) == 0:
+            return np.array([0.0])
 
-        # SD (50-period stdev * responsiveness)
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
-        else:
-            sd = _rolling_std_welford(close_c, 50, resp_clamped)
-        
-        # Worm
+        rows = len(close)
+        if rows < period:
+            return np.zeros(rows)
+
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        close_c = np.ascontiguousarray(close, dtype=np.float64)
+
+        # === Standard deviation (50-period) ===
+        sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped) if cfg.NUMBA_PARALLEL and rows >= 250 else _rolling_std_welford(close_c, 50, resp_clamped)
+
+        # === Worm ===
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
-        
-        # MA (SMA of close)
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = _sma_loop_parallel(close_c, period)  # assuming you still have this function
-            # or use your _rolling_mean_numba_parallel if preferred
-        else:
-            ma = _rolling_mean_numba(close_c, period)
-        
-        # raw_momentum = (worm - ma) / worm
-        with np.errstate(divide='ignore', invalid='ignore'):
-            raw = (worm_arr - ma) / worm_arr
-        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # Rolling min/max over period
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
-        else:
-            min_med, max_med = _rolling_min_max_numba(raw, period)
-        
-        # temp = (raw - min) / (max - min)  --> 0.5 when denom=0
+
+        # Prevent worm from being zero (defensive)
+        worm_arr = np.where(worm_arr == 0, 1e-10, worm_arr)
+
+        # === SMA ===
+        ma = _sma_loop_parallel(close_c, period) if hasattr(_sma_loop_parallel, '__call__') and cfg.NUMBA_PARALLEL and rows >= 250 else _rolling_mean_numba(close_c, period)
+        ma = np.nan_to_num(ma, nan=close_c[-1])  # fallback
+
+        # === Raw momentum ===
+        raw = (worm_arr - ma) / worm_arr
+        raw = np.nan_to_num(raw, nan=0.0)
+
+        # === Rolling min/max ===
+        min_med, max_med = _rolling_min_max_numba_parallel(raw, period) if cfg.NUMBA_PARALLEL and rows >= 250 else _rolling_min_max_numba(raw, period)
+
+        # === Temp (normalized) - exact Pine behavior ===
         denom = max_med - min_med
         temp = np.where(denom == 0, 0.5, (raw - min_med) / denom)
         temp = np.nan_to_num(temp, nan=0.5)
-        
-        # Value recursion (fixed scaling)
-        value_arr = _calc_mmh_value_loop(temp, rows)
-        
-        # temp2 = (1 + value) / (1 - value)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-        temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
-        
-        # momentum = 0.25 * log(temp2)
-        momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)  # safer log with sign
+
+        # === Value recursion (fixed scaling) ===
+        value_arr = _calc_mmh_value_loop(temp, rows)  # now correct with 1.0 multiplier
+
+        # === Temp2 and base momentum ===
+        # Prevent division by zero or extreme values
+        value_clamped = np.clip(value_arr, -0.9999, 0.9999)
+        temp2 = (1.0 + value_clamped) / (1.0 - value_clamped + 1e-12)  # small guard
+        temp2 = np.clip(temp2, -1e8, 1e8)  # prevent log explosion
+
+        momentum = 0.25 * np.log(np.abs(temp2) + 1e-12) * np.sign(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
-        
-        # Final histogram smoothing
-        momentum_arr = momentum.copy()
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
-        
-        # Optional sanitization (keep if you use it)
-        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
-        
-        return momentum_arr
-        
+
+        # === Final histogram smoothing ===
+        hist = momentum.copy()
+        hist = _calc_mmh_momentum_loop(hist, rows)
+
+        # === Critical: Do NOT sanitize to zero aggressively ===
+        # If you must sanitize, preserve small values
+        # Replace any sanitize_indicator_array call with minimal protection:
+        hist = np.nan_to_num(hist, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return hist
+
     except Exception as e:
-        # logger.error(...)
-        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+        print(f"MMH error: {e}")
+        return np.zeros(len(close))
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
