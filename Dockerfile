@@ -30,25 +30,21 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Setup Numba cache directory
-RUN mkdir -p /app/numba_cache && chmod 777 /app/numba_cache
-
-# Copy source code for compilation
+# Copy source code (which includes compile_numba_aot.py)
 COPY src/ ./src/
-COPY compile_numba_aot.py ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app" \
     PYTHONDONTWRITEBYTECODE=1 \
-    NUMBA_CACHE_DIR=/app/numba_cache \
+    NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_NUM_THREADS=4 \
     NUMBA_THREADING_LAYER=omp
 
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
-RUN python compile_numba_aot.py && \
+RUN python src/compile_numba_aot.py && \
     echo "✅ AOT compilation completed successfully" && \
-    ls -lah /app/numba_cache
+    find /app/src/__pycache__ -name "*.nbi" -o -name "*.nbc" | head -10
 
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -59,20 +55,20 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
-# 🔥 Copy pre-compiled Numba cache from AOT stage
-COPY --from=aot-compiler /app/numba_cache /app/numba_cache
 
 WORKDIR /app
 
-# Copy source and wrapper
-COPY src/ ./src/
+# 🔥 Copy source WITH pre-compiled Numba cache
+COPY --from=aot-compiler /app/src/ ./src/
+
+# Copy runtime files
 COPY wrapper.py config_macd.json ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app" \
     PYTHONDONTWRITEBYTECODE=1 \
-    NUMBA_CACHE_DIR=/app/numba_cache \
+    NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_NUM_THREADS=4 \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
