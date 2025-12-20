@@ -752,47 +752,23 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """
-    Correct MMH value recursion to match PineScript.
-    PineScript: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    """
     value_arr = np.zeros(rows, dtype=np.float64)
-    value_arr[0] = 1.0  # initial seed
-
+    value_arr[0] = 1.0
+    
     for i in range(1, rows):
-        # PineScript nz(value[1]) = 0 if no prior value
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-
-        # Correct recursion
-        v = value_arr[i - 1] * (t - 0.5 + 0.5 * prev_v)
-
-        # Clipping
-        if v > 0.9999:
-            v = 0.9999
-        elif v < -0.9999:
-            v = -0.9999
-
-        value_arr[i] = v
-
+        v = t - 0.5 + 0.5 * prev_v
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    
     return value_arr
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    debug_limit = min(rows, 20)
-    debug_momentum = []
-
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
-        if i < debug_limit:
-            debug_momentum.append(momentum_arr[i])
-
-    print("MMH Debug - momentum[0:20]:", debug_momentum)
     return momentum_arr
-
 
 # ============================================================================
 # OPTIMIZATION 3: Welford's Algorithm with Parallel Preprocessing
