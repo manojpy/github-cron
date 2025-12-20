@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 
 # Set cache directory before importing numba
-os.environ['NUMBA_CACHE_DIR'] = '/app/numba_cache'
+os.environ['NUMBA_CACHE_DIR'] = '/app/src/__pycache__'
 os.environ['NUMBA_NUM_THREADS'] = '4'
 
 print("🔧 Starting Numba AOT compilation...")
@@ -124,10 +124,15 @@ print(f"💾 Cache location: {os.environ.get('NUMBA_CACHE_DIR', 'default')}")
 print(f"{'='*70}\n")
 
 # Verify cache directory
-cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/numba_cache'))
+cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
 if cache_dir.exists():
     cache_files = list(cache_dir.rglob('*.nbi'))
     print(f"📁 Cache contains {len(cache_files)} compiled files")
+    print(f"📂 Cache structure:")
+    for f in sorted(cache_files)[:5]:  # Show first 5 files
+        print(f"   {f.relative_to(cache_dir)}")
+    if len(cache_files) > 5:
+        print(f"   ... and {len(cache_files) - 5} more files")
 else:
     print("⚠️  Warning: Cache directory not found!")
 
@@ -136,4 +141,4 @@ if failed_count > 0:
     sys.exit(0)  # Don't fail the build
 else:
     print("\n🎉 All functions compiled successfully!")
-    sys.exit(0) 
+    sys.exit(0)
