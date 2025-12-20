@@ -750,21 +750,34 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     
     return worm_arr
 
-@njit(nogil=True, fastmath=True, cache=True)
-def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
+# ============================================================================
+# ALSO ADD THIS: Print first 10 iterations of value loop for debugging
+# ============================================================================
+
+@njit(nogil=True, fastmath=False, cache=False)  # Disable optimizations for debugging
+def _calc_mmh_value_loop_debug(temp_arr: np.ndarray, rows: int) -> np.ndarray:
+    """Debug version - no fastmath, prints first iterations"""
     value_arr = np.empty(rows, dtype=np.float64)
     value_arr[0] = 1.0
     
-    for i in range(1, rows):
+    for i in range(1, min(11, rows)):  # First 10 iterations
         prev_v = value_arr[i - 1]
-        t = temp_arr[i]
-        if np.isnan(t):
-            t = 0.5
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        # FIXED: Compound multiplication like PineScript
+        # THIS IS THE CRITICAL LINE - make sure it's correct
         v = prev_v * (t - 0.5 + 0.5 * prev_v)
         
-        # Clamp to [-0.9999, 0.9999]
+        v = min(0.9999, max(-0.9999, v))
+        value_arr[i] = v
+        
+        # Print to console (will appear in logs)
+        print(f"  i={i}: prev_v={prev_v:.6f}, t={t:.6f}, expr={(t - 0.5 + 0.5 * prev_v):.6f}, v={v:.6f}")
+    
+    # Continue for rest
+    for i in range(11, rows):
+        prev_v = value_arr[i - 1]
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        v = prev_v * (t - 0.5 + 0.5 * prev_v)
         v = min(0.9999, max(-0.9999, v))
         value_arr[i] = v
     
@@ -1068,68 +1081,133 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
 # ============================================================================
 
+"""
+Add this comprehensive debugging version of calculate_magical_momentum_hist
+Replace your current function with this to see exactly where zeros appear
+"""
+
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
+    """Debug version - traces every step"""
     try:
         if close is None or len(close) < period:
+            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-
-        # Standard deviation (FIXED: now uses sample stdev)
+        
+        # === STEP 1: Standard Deviation ===
+        logger.info(f"MMH Step 1: Calculating SD | rows={rows}, period=50, resp={resp_clamped:.4f}")
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
-        # Worm calculation
-        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+        logger.info(f"  SD result: min={sd.min():.6f}, max={sd.max():.6f}, mean={sd.mean():.6f}, last={sd[-1]:.6f}")
+        if np.all(sd == 0):
+            logger.error("❌ SD is all zeros - check _rolling_std_welford!")
+            return np.zeros(rows, dtype=np.float64)
         
-        # Moving average
+        # === STEP 2: Worm ===
+        logger.info(f"MMH Step 2: Calculating Worm")
+        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+        logger.info(f"  Worm result: min={worm_arr.min():.2f}, max={worm_arr.max():.2f}, mean={worm_arr.mean():.2f}, last={worm_arr[-1]:.2f}")
+        
+        # === STEP 3: Moving Average ===
+        logger.info(f"MMH Step 3: Calculating MA | period={period}")
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _sma_loop_parallel(close_c, period)
         else:
-            ma = _rolling_mean_numba(close_c, period)
+            ma = _sma_loop(close_c, period)
         
-        # Raw momentum
+        logger.info(f"  MA result: min={ma.min():.2f}, max={ma.max():.2f}, mean={ma.mean():.2f}, last={ma[-1]:.2f}")
+        
+        # === STEP 4: Raw Momentum ===
+        logger.info(f"MMH Step 4: Calculating raw momentum")
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Rolling min/max
+        logger.info(f"  Raw result: min={raw.min():.6f}, max={raw.max():.6f}, mean={raw.mean():.6f}, last={raw[-1]:.6f}")
+        logger.info(f"  Raw sample (last 5): {raw[-5:]}")
+        
+        # === STEP 5: Rolling Min/Max ===
+        logger.info(f"MMH Step 5: Calculating rolling min/max | period={period}")
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
         
-        # FIXED: Temp calculation matching PineScript behavior
+        logger.info(f"  Min_med: last={min_med[-1]:.6f}, Max_med: last={max_med[-1]:.6f}")
+        
+        # === STEP 6: Normalize ===
+        logger.info(f"MMH Step 6: Normalizing to [0,1]")
         denom = max_med - min_med
+        logger.info(f"  Denom (last): {denom[-1]:.6f}")
+        
         with np.errstate(divide='ignore', invalid='ignore'):
-            temp = (raw - min_med) / denom
+            temp = np.where(denom < 1e-10, 0.5, (raw - min_med) / denom)
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
-        # FIXED: Value recursion with compound multiplication
-        value_arr = _calc_mmh_value_loop(temp, rows)
+        logger.info(f"  Temp result: min={temp.min():.6f}, max={temp.max():.6f}, mean={temp.mean():.6f}, last={temp[-1]:.6f}")
+        logger.info(f"  Temp sample (last 5): {temp[-5:]}")
         
-        # temp2 calculation
+        # === STEP 7: Value Recursion (CRITICAL) ===
+        logger.info(f"MMH Step 7: Value recursion")
+        value_arr = _calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+        
+        logger.info(f"  Value result: min={value_arr.min():.6f}, max={value_arr.max():.6f}, mean={value_arr.mean():.6f}, last={value_arr[-1]:.6f}")
+        logger.info(f"  Value sample (last 5): {value_arr[-5:]}")
+        
+        if np.all(np.abs(value_arr) < 1e-6):
+            logger.error("❌ Value array is all near-zero after recursion - check _calc_mmh_value_loop!")
+        
+        # === STEP 8: Temp2 Calculation ===
+        logger.info(f"MMH Step 8: Calculating temp2")
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-        temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
+            temp2 = np.clip(temp2, -1e8, 1e8)
         
-        # FIXED: Log calculation (direct log, handle NaN after)
+        logger.info(f"  Temp2 result: min={temp2.min():.2f}, max={temp2.max():.2f}, mean={temp2.mean():.2f}, last={temp2[-1]:.2f}")
+        logger.info(f"  Temp2 sample (last 5): {temp2[-5:]}")
+        
+        # === STEP 9: Log Transformation ===
+        logger.info(f"MMH Step 9: Log transformation")
         with np.errstate(divide='ignore', invalid='ignore'):
-            momentum = 0.25 * np.log(temp2)
+            momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Final smoothing
+        logger.info(f"  Momentum result: min={momentum.min():.6f}, max={momentum.max():.6f}, mean={momentum.mean():.6f}, last={momentum[-1]:.6f}")
+        logger.info(f"  Momentum sample (last 5): {momentum[-5:]}")
+        
+        # === STEP 10: Final Smoothing ===
+        logger.info(f"MMH Step 10: Final recursive smoothing")
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
         
+        logger.info(f"  Final MMH: min={momentum_arr.min():.6f}, max={momentum_arr.max():.6f}, mean={momentum_arr.mean():.6f}, last={momentum_arr[-1]:.6f}")
+        logger.info(f"  Final sample (last 5): {momentum_arr[-5:]}")
+        
+        # === FINAL CHECK ===
+        if np.all(np.abs(momentum_arr) < 1e-6):
+            logger.error("❌ FINAL MMH IS ALL ZEROS!")
+            logger.error("Breakdown:")
+            logger.error(f"  Close range: [{close_c.min():.2f}, {close_c.max():.2f}]")
+            logger.error(f"  SD range: [{sd.min():.6f}, {sd.max():.6f}]")
+            logger.error(f"  Worm range: [{worm_arr.min():.2f}, {worm_arr.max():.2f}]")
+            logger.error(f"  MA range: [{ma.min():.2f}, {ma.max():.2f}]")
+            logger.error(f"  Raw range: [{raw.min():.6f}, {raw.max():.6f}]")
+            logger.error(f"  Temp range: [{temp.min():.6f}, {temp.max():.6f}]")
+            logger.error(f"  Value range: [{value_arr.min():.6f}, {value_arr.max():.6f}]")
+        
+        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
         return momentum_arr
         
     except Exception as e:
+        logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 
