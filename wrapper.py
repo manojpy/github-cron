@@ -41,8 +41,8 @@ def _handle_signal(signum: int, frame) -> NoReturn:
 
 def check_aot_cache() -> None:
     """
-    Check for AOT-compiled Numba cache in both /app/src/__pycache__ and /app/__pycache__.
-    Skip JIT warmup if cache is found. Otherwise, fall back to warmup logic.
+    Check for AOT-compiled Numba cache in both /app/src/__pycache__ and /app/__pycache__,
+    including nested directories. Skip JIT warmup if cache is found.
     """
     cache_dirs = [
         Path(os.environ.get("NUMBA_CACHE_DIR", "/app/src/__pycache__")),
@@ -52,6 +52,7 @@ def check_aot_cache() -> None:
     cache_files = []
     for d in cache_dirs:
         if d.exists():
+            # Recursively search for both .nbi and .nbc files
             cache_files.extend(list(d.rglob("*.nbi")) + list(d.rglob("*.nbc")))
 
     if len(cache_files) > 15:  # Expect at least 15 compiled functions
@@ -60,7 +61,6 @@ def check_aot_cache() -> None:
         )
         return
 
-    # If no AOT cache, check if we should do JIT warmup
     if getattr(cfg, "SKIP_WARMUP", False):
         logger.warning(
             "⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)"
@@ -68,7 +68,6 @@ def check_aot_cache() -> None:
         return
 
     logger.info("⚠️  AOT cache not found - performing JIT warmup...")
-
     try:
         from src.macd_unified import warmup_numba
         warmup_numba()
