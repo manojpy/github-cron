@@ -1187,70 +1187,30 @@ def _vectorized_wick_check_sell(
     
     return result
 
-# ============================================================================
-# AOT integration: override serial kernels when precompiled module is available
-# ============================================================================
-try:
-    import indicators_aot as aot
-
-    # Sanitize
-    _sanitize_array_numba = aot._sanitize_array_numba
-
-    # EMA
-    _ema_loop = aot._ema_loop
-
-    # PPO: use AOT part1 + signal
-    def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
-        ppo = aot._calculate_ppo_core_part1(close, fast, slow)
-        ppo_sig = aot._ppo_signal(ppo, signal)
-        return ppo, ppo_sig
-
-    # RSI core
-    _calculate_rsi_core = aot._calculate_rsi_core
-
-    # VWAP
-    _vwap_daily_loop = aot._vwap_daily_loop
-
-    # Rolling mean
-    _rolling_mean_numba = aot._rolling_mean_numba
-
-    # Rolling min/max
-    def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-        return aot._rolling_min_numba(arr, period), aot._rolling_max_numba(arr, period)
-
-    # Wick checks
-    _vectorized_wick_check_buy = aot._vectorized_wick_check_buy
-    _vectorized_wick_check_sell = aot._vectorized_wick_check_sell
-
-    # Skip warmup if AOT available
-    if hasattr(cfg, 'SKIP_WARMUP'):
-        cfg.SKIP_WARMUP = True
-
-    logger.info("✅ AOT module loaded: indicators_aot (serial kernels precompiled)")
-except Exception:
-    logger.info("ℹ️ AOT module not available, using JIT kernels")
-
-
-
 
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================
 
 def warmup_numba() -> None:
-    """OPTIMIZED: Proper warmup with realistic array sizes for parallel compilation.
-    Corrected to include wick checks and rolling stats to prevent first-run lag spikes.
-    """
-    logger.info("Warming up Numba JIT compiler (optimized parallel)...")        
+    """OPTIMIZED: Skip warmup if AOT cache exists"""
+    cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/numba_cache'))
+    
+    # Check if AOT-compiled cache exists
+    if cache_dir.exists():
+        cache_files = list(cache_dir.rglob('*.nbi'))
+        if len(cache_files) > 15:  # Expect at least 15 compiled functions
+            logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - skipping warmup")
+            return
+    
+    logger.info("⚠️  AOT cache not found - performing JIT warmup...")
+    
+    # Original warmup code continues below...
     try:
-        # CRITICAL FIX: Use realistic array sizes (300-400 elements)
-        # This ensures parallel functions actually compile with prange
-        length_small = 100   # For serial functions
-        length_large = 400   # For parallel functions (matches real 15m/5m data)
+        length_small = 100
+        length_large = 400
         
-        # Data preparation
         close_small = np.random.random(length_small).astype(np.float64) * 1000
-        
         close_large = np.random.random(length_large).astype(np.float64) * 1000
         open_large = close_large + np.random.random(length_large).astype(np.float64) * 2
         high_large = np.maximum(open_large, close_large) + 1.0
@@ -1258,42 +1218,30 @@ def warmup_numba() -> None:
         volume_large = np.random.random(length_large).astype(np.float64) * 1000
         timestamps = np.arange(length_large, dtype=np.int64) * 900
 
-        # 1. CORE SERIAL FUNCTIONS
         critical_funcs = [
             lambda: _ema_loop(close_small, 0.1),
             lambda: _calculate_ppo_core(close_small, 7, 16, 5),
             lambda: _calculate_rsi_core(close_small, 21),
         ]
         
-        # 2. VWAP & VOLUME LOGIC
         critical_funcs.append(
             lambda: _vwap_daily_loop(high_large, low_large, close_large, volume_large, timestamps)
         )
         
-        # 3. CRITICAL PARALLEL FUNCTIONS (Forces prange compilation)
         if cfg.NUMBA_PARALLEL:
             critical_funcs.extend([
-                # Array handling
                 lambda: _sanitize_array_numba_parallel(close_large, 0.0),
-                
-                # Rolling Statistics (Essential for indicators)
                 lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
                 lambda: _rolling_mean_numba_parallel(close_large, 144),
                 lambda: _rolling_min_max_numba_parallel(close_large, 144),
                 lambda: _sma_loop_parallel(close_large, 20),
-                
-                # FIX: Vectorized Candle Quality Checks
-                # These must be warmed up or the first 15m evaluation will be delayed
-                lambda: _vectorized_wick_check_buy(open_large, high_large, low_large, close_large, 0.1, 0.4),
-                lambda: _vectorized_wick_check_sell(open_large, high_large, low_large, close_large, 0.1, 0.4)
+                lambda: _vectorized_wick_check_buy(open_large, high_large, low_large, close_large, 0.2),
+                lambda: _vectorized_wick_check_sell(open_large, high_large, low_large, close_large, 0.2)
             ])
         
-        # 4. EXECUTE COMPILATION IN PARALLEL
         import concurrent.futures
-        # Using a ThreadPool to trigger Numba compilation across multiple functions simultaneously
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(func) for func in critical_funcs]
-            # 10 second timeout is usually sufficient for full JIT compilation
             completed, _ = concurrent.futures.wait(futures, timeout=10.0)
             
         warmup_mode = "parallel" if cfg.NUMBA_PARALLEL else "serial"
@@ -3877,6 +3825,7 @@ async def run_once() -> bool:
         now = time.time()
         last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
 
+
         if USE_STATIC_MAP:
             # If cache has been set in-memory, derive "days since check" from it.
             # Note: PRODUCTS_CACHE["until"] stores expiry; we back out last check as (until - TTL).
@@ -4147,12 +4096,11 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-    # OPTIMIZED: Respect SKIP_WARMUP config option
+        # AOT-aware warmup: skips if cache exists, otherwise JIT compiles
     if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
-
 
     async def main_with_cleanup():
         """Run bot with proper cleanup on exit"""
