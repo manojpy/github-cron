@@ -1199,15 +1199,20 @@ def _vectorized_wick_check_sell(
 # ============================================================================
 
 def warmup_numba() -> None:
-    """OPTIMIZED: Skip warmup if AOT cache exists"""
+    """OPTIMIZED: Always check for AOT cache, skip JIT warmup if SKIP_WARMUP=true"""
     cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
     
-    # Check if AOT-compiled cache exists
+    # ALWAYS check if AOT-compiled cache exists (regardless of SKIP_WARMUP)
     if cache_dir.exists():
         cache_files = list(cache_dir.rglob('*.nbi'))
         if len(cache_files) > 15:  # Expect at least 15 compiled functions
-            logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - skipping warmup")
+            logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
             return
+    
+    # If no AOT cache, check if we should do JIT warmup
+    if cfg.SKIP_WARMUP:
+        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
+        return
     
     logger.info("⚠️  AOT cache not found - performing JIT warmup...")
     
