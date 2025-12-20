@@ -1194,7 +1194,7 @@ def _vectorized_wick_check_sell(
 
 def warmup_numba() -> None:
     """OPTIMIZED: Skip warmup if AOT cache exists"""
-    cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/numba_cache'))
+    cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
     
     # Check if AOT-compiled cache exists
     if cache_dir.exists():
@@ -4096,13 +4096,13 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-        # AOT-aware warmup: skips if cache exists, otherwise JIT compiles
+            # AOT-aware warmup: skips if cache exists, otherwise JIT compiles
     if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
-
     async def main_with_cleanup():
+
         """Run bot with proper cleanup on exit"""
         try:
             return await run_once()

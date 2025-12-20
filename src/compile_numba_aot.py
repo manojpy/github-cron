@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AOT (Ahead-of-Time) Compilation Script for Numba Functions
-Compiles all Numba-decorated functions during Docker build
+Standalone script that compiles Numba functions without loading full config
 """
 import os
 import sys
@@ -9,40 +9,52 @@ import time
 import numpy as np
 from pathlib import Path
 
-# Set cache directory before importing numba
+# Set cache directory and Numba settings
 os.environ['NUMBA_CACHE_DIR'] = '/app/src/__pycache__'
 os.environ['NUMBA_NUM_THREADS'] = '4'
+os.environ['NUMBA_THREADING_LAYER'] = 'omp'
+
+# Mock minimal config to bypass validation
+os.environ['TELEGRAM_BOT_TOKEN'] = '000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+os.environ['TELEGRAM_CHAT_ID'] = '000000000'
+os.environ['REDIS_URL'] = 'redis://localhost:6379'
+os.environ['DELTA_API_BASE'] = 'https://api.delta.exchange'
 
 print("🔧 Starting Numba AOT compilation...")
 start_time = time.time()
 
-# Import the main module to trigger compilation
+# Import only the Numba functions we need to compile
 sys.path.insert(0, '/app')
-from src.macd_unified import (
-    _sanitize_array_numba,
-    _sanitize_array_numba_parallel,
-    _sma_loop,
-    _sma_loop_parallel,
-    _ema_loop,
-    _kalman_loop,
-    _vwap_daily_loop,
-    _rng_filter_loop,
-    _calc_mmh_worm_loop,
-    _calc_mmh_value_loop,
-    _calc_mmh_momentum_loop,
-    _rolling_std_welford,
-    _rolling_std_welford_parallel,
-    _rolling_mean_numba,
-    _rolling_mean_numba_parallel,
-    _rolling_min_max_numba,
-    _rolling_min_max_numba_parallel,
-    _calculate_ppo_core,
-    _calculate_rsi_core,
-    _vectorized_wick_check_buy,
-    _vectorized_wick_check_sell
-)
 
-print("✅ Module imported successfully")
+print("📦 Importing Numba functions...")
+try:
+    from src.macd_unified import (
+        _sanitize_array_numba,
+        _sanitize_array_numba_parallel,
+        _sma_loop,
+        _sma_loop_parallel,
+        _ema_loop,
+        _kalman_loop,
+        _vwap_daily_loop,
+        _rng_filter_loop,
+        _calc_mmh_worm_loop,
+        _calc_mmh_value_loop,
+        _calc_mmh_momentum_loop,
+        _rolling_std_welford,
+        _rolling_std_welford_parallel,
+        _rolling_mean_numba,
+        _rolling_mean_numba_parallel,
+        _rolling_min_max_numba,
+        _rolling_min_max_numba_parallel,
+        _calculate_ppo_core,
+        _calculate_rsi_core,
+        _vectorized_wick_check_buy,
+        _vectorized_wick_check_sell
+    )
+    print("✅ Module imported successfully")
+except Exception as e:
+    print(f"❌ Failed to import functions: {e}")
+    sys.exit(1)
 
 # Realistic data sizes for 15m/5m candles
 SIZE_SMALL = 200   # For 15m data
@@ -128,11 +140,14 @@ cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
 if cache_dir.exists():
     cache_files = list(cache_dir.rglob('*.nbi'))
     print(f"📁 Cache contains {len(cache_files)} compiled files")
-    print(f"📂 Cache structure:")
-    for f in sorted(cache_files)[:5]:  # Show first 5 files
-        print(f"   {f.relative_to(cache_dir)}")
-    if len(cache_files) > 5:
-        print(f"   ... and {len(cache_files) - 5} more files")
+    if len(cache_files) > 0:
+        print(f"📂 Sample cache files:")
+        for f in sorted(cache_files)[:5]:
+            rel_path = f.relative_to(cache_dir)
+            file_size = f.stat().st_size / 1024
+            print(f"   {rel_path} ({file_size:.1f} KB)")
+        if len(cache_files) > 5:
+            print(f"   ... and {len(cache_files) - 5} more files")
 else:
     print("⚠️  Warning: Cache directory not found!")
 
