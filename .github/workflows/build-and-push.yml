@@ -16,7 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax Check
         run: |
-          python3 -m py_compile wrapper.py src/*.py &
+          # Check all Python files except the AOT compilation script (needs special env)
+          find . -name "*.py" ! -path "./src/compile_numba_aot.py" -exec python3 -m py_compile {} + &
           python3 -c "import json; json.load(open('config_macd.json'))" &
           wait
           echo "✅ All files validated"
@@ -52,7 +53,6 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
 
-    
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
