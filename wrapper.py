@@ -48,7 +48,7 @@ def check_aot_cache() -> None:
     
     # ALWAYS check if AOT-compiled cache exists (regardless of SKIP_WARMUP)
     if cache_dir.exists():
-        cache_files = list(cache_dir.rglob('*.nbi'))
+        cache_files = list(cache_dir.rglob('*.nbi')) + list(cache_dir.rglob('*.nbc'))
         if len(cache_files) > 15:  # Expect at least 15 compiled functions
             logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
             return
