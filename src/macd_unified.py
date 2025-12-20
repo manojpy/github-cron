@@ -1201,26 +1201,31 @@ def _vectorized_wick_check_sell(
 def warmup_numba() -> None:
     """OPTIMIZED: Always check for AOT cache, skip JIT warmup if SKIP_WARMUP=true"""
     cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
-    
+
     # ALWAYS check if AOT-compiled cache exists (regardless of SKIP_WARMUP)
     if cache_dir.exists():
-        cache_files = list(cache_dir.rglob('*.nbi'))
+        # ✅ Look for both .nbi and .nbc files
+        cache_files = list(cache_dir.rglob('*.nbi')) + list(cache_dir.rglob('*.nbc'))
         if len(cache_files) > 15:  # Expect at least 15 compiled functions
-            logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
+            logger.info(
+                f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed"
+            )
             return
-    
+
     # If no AOT cache, check if we should do JIT warmup
-    if cfg.SKIP_WARMUP:
-        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
+    if getattr(cfg, "SKIP_WARMUP", False):
+        logger.warning(
+            "⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)"
+        )
         return
-    
+
     logger.info("⚠️  AOT cache not found - performing JIT warmup...")
-    
+
     # Original warmup code continues below...
     try:
         length_small = 100
         length_large = 400
-        
+
         close_small = np.random.random(length_small).astype(np.float64) * 1000
         close_large = np.random.random(length_large).astype(np.float64) * 1000
         open_large = close_large + np.random.random(length_large).astype(np.float64) * 2
@@ -1234,35 +1239,43 @@ def warmup_numba() -> None:
             lambda: _calculate_ppo_core(close_small, 7, 16, 5),
             lambda: _calculate_rsi_core(close_small, 21),
         ]
-        
+
         critical_funcs.append(
             lambda: _vwap_daily_loop(high_large, low_large, close_large, volume_large, timestamps)
         )
-        
+
         if cfg.NUMBA_PARALLEL:
-            critical_funcs.extend([
-                lambda: _sanitize_array_numba_parallel(close_large, 0.0),
-                lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
-                lambda: _rolling_min_max_numba_parallel(close_large, 144),
-                lambda: _sma_loop_parallel(close_large, 20),
-                lambda: _vectorized_wick_check_buy(open_large, high_large, low_large, close_large, 0.2),
-                lambda: _vectorized_wick_check_sell(open_large, high_large, low_large, close_large, 0.2)
-            ])
-        
+            critical_funcs.extend(
+                [
+                    lambda: _sanitize_array_numba_parallel(close_large, 0.0),
+                    lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
+                    lambda: _rolling_min_max_numba_parallel(close_large, 144),
+                    lambda: _sma_loop_parallel(close_large, 20),
+                    lambda: _vectorized_wick_check_buy(
+                        open_large, high_large, low_large, close_large, 0.2
+                    ),
+                    lambda: _vectorized_wick_check_sell(
+                        open_large, high_large, low_large, close_large, 0.2
+                    ),
+                ]
+            )
+
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(func) for func in critical_funcs]
             completed, _ = concurrent.futures.wait(futures, timeout=10.0)
-            
+
         warmup_mode = "parallel" if cfg.NUMBA_PARALLEL else "serial"
-        logger.info(f"Numba warm-up complete ({warmup_mode} mode, {len(critical_funcs)} functions compiled)")
-            
+        logger.info(
+            f"Numba warm-up complete ({warmup_mode} mode, {len(critical_funcs)} functions compiled)"
+        )
+
     except Exception as e:
         logger.warning(f"Numba warm-up failed (non-fatal): {e}")
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
-
 
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
