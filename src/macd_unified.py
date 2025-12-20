@@ -1232,7 +1232,6 @@ def warmup_numba() -> None:
             critical_funcs.extend([
                 lambda: _sanitize_array_numba_parallel(close_large, 0.0),
                 lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
-                lambda: _rolling_mean_numba_parallel(close_large, 144),
                 lambda: _rolling_min_max_numba_parallel(close_large, 144),
                 lambda: _sma_loop_parallel(close_large, 20),
                 lambda: _vectorized_wick_check_buy(open_large, high_large, low_large, close_large, 0.2),

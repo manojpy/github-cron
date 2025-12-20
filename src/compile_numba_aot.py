@@ -43,7 +43,6 @@ try:
         _rolling_std_welford,
         _rolling_std_welford_parallel,
         _rolling_mean_numba,
-        _rolling_mean_numba_parallel,
         _rolling_min_max_numba,
         _rolling_min_max_numba_parallel,
         _calculate_ppo_core,
@@ -94,7 +93,6 @@ functions_to_compile = [
     ("_rolling_std_welford", lambda: _rolling_std_welford(close_small, 50, 0.9)),
     ("_rolling_std_welford_parallel", lambda: _rolling_std_welford_parallel(close_large, 50, 0.9)),
     ("_rolling_mean_numba", lambda: _rolling_mean_numba(close_small, 144)),
-    ("_rolling_mean_numba_parallel", lambda: _rolling_mean_numba_parallel(close_large, 144)),
     ("_rolling_min_max_numba", lambda: _rolling_min_max_numba(close_small, 144)),
     ("_rolling_min_max_numba_parallel", lambda: _rolling_min_max_numba_parallel(close_large, 144)),
     
