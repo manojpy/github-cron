@@ -30,7 +30,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy source code (which includes compile_numba_aot.py)
+# Copy source code
 COPY src/ ./src/
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -43,11 +43,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
 RUN python src/compile_numba_aot.py && \
-    echo "✅ AOT compilation completed successfully" && \
-    echo "📂 Cache contents:" && \
-    find /app/src/__pycache__ -type f -name "*.nbi" -o -name "*.nbc" | head -20 && \
-    echo "📊 Cache statistics:" && \
-    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l
+    echo "✅ AOT compilation completed" && \
+    echo "📊 Verifying cache creation:" && \
+    ls -lah /app/src/__pycache__/ && \
+    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) -exec ls -lh {} \; | head -10
 
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -61,9 +60,15 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# 🔥 CRITICAL: Copy entire src/ directory WITH __pycache__ subdirectory
-# This preserves the AOT-compiled Numba cache
-COPY --from=aot-compiler /app/src/ ./src/
+# Create directory structure first
+RUN mkdir -p /app/src/__pycache__
+
+# Copy Python source files (excluding __pycache__ initially)
+COPY --from=aot-compiler /app/src/*.py ./src/
+
+# 🔥 EXPLICIT: Copy the Numba cache directory separately
+# This ensures __pycache__ is preserved even if COPY ignores it
+COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
 
 # Copy runtime files
 COPY wrapper.py config_macd.json ./
@@ -77,12 +82,19 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
 
-RUN useradd -m -u 1000 botuser && \
+# Verify cache was copied and set permissions
+RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
+    ls -lah /app/src/__pycache__/ && \
+    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l) && \
+    echo "📁 Found $CACHE_COUNT cache files" && \
+    if [ "$CACHE_COUNT" -lt 15 ]; then \
+        echo "⚠️  WARNING: Expected at least 15 cache files, found $CACHE_COUNT"; \
+    else \
+        echo "✅ AOT cache verified successfully"; \
+    fi && \
+    useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app && \
-    chmod +x wrapper.py && \
-    echo "🔍 Verifying AOT cache in runtime:" && \
-    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l && \
-    ls -lah /app/src/__pycache__/ || echo "⚠️  __pycache__ directory not found"
+    chmod +x wrapper.py
 
 USER botuser
 
