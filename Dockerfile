@@ -44,7 +44,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
 RUN python src/compile_numba_aot.py && \
     echo "✅ AOT compilation completed successfully" && \
-    find /app/src/__pycache__ -name "*.nbi" -o -name "*.nbc" | head -10
+    echo "📂 Cache contents:" && \
+    find /app/src/__pycache__ -type f -name "*.nbi" -o -name "*.nbc" | head -20 && \
+    echo "📊 Cache statistics:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l
 
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -58,7 +61,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# 🔥 Copy source WITH pre-compiled Numba cache
+# 🔥 CRITICAL: Copy entire src/ directory WITH __pycache__ subdirectory
+# This preserves the AOT-compiled Numba cache
 COPY --from=aot-compiler /app/src/ ./src/
 
 # Copy runtime files
@@ -75,7 +79,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 RUN useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app && \
-    chmod +x wrapper.py
+    chmod +x wrapper.py && \
+    echo "🔍 Verifying AOT cache in runtime:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l && \
+    ls -lah /app/src/__pycache__/ || echo "⚠️  __pycache__ directory not found"
 
 USER botuser
 
