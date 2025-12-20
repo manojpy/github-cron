@@ -40,31 +40,16 @@ def _handle_signal(signum: int, frame) -> NoReturn:
     raise KeyboardInterrupt
 
 def check_aot_cache() -> None:
-    """
-    Check for AOT-compiled Numba cache in both /app/src/__pycache__ and /app/__pycache__,
-    including nested directories. Skip JIT warmup if cache is found.
-    """
-    cache_dirs = [
-        Path(os.environ.get("NUMBA_CACHE_DIR", "/app/src/__pycache__")),
-        Path("/app/__pycache__"),
-    ]
+    cache_dir = Path("/app/src/__pycache__")
 
-    cache_files = []
-    for d in cache_dirs:
-        if d.exists():
-            # Recursively search for both .nbi and .nbc files
-            cache_files.extend(list(d.rglob("*.nbi")) + list(d.rglob("*.nbc")))
+    cache_files = list(cache_dir.rglob("*.nbi"))
 
-    if len(cache_files) > 15:  # Expect at least 15 compiled functions
-        logger.info(
-            f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed"
-        )
+    if len(cache_files) >= 15:  # Expect at least 15 compiled functions
+        logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
         return
 
     if getattr(cfg, "SKIP_WARMUP", False):
-        logger.warning(
-            "⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)"
-        )
+        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
         return
 
     logger.info("⚠️  AOT cache not found - performing JIT warmup...")
