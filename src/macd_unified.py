@@ -753,7 +753,7 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    Stable MMH value recursion with correct nz() fallback.
+    Correct MMH value recursion to match PineScript.
     PineScript: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
     value_arr = np.zeros(rows, dtype=np.float64)
@@ -764,7 +764,7 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
 
-        # Correct recursion: use previous value AND nz fallback
+        # Correct recursion
         v = value_arr[i - 1] * (t - 0.5 + 0.5 * prev_v)
 
         # Clipping
