@@ -10,6 +10,7 @@ import sys
 import logging
 import psutil
 import time
+from pathlib import Path
 from typing import NoReturn
 
 # OPTIMIZED: Try uvloop first for 2-4x faster event loop
@@ -27,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("wrapper")
 
 try:
-    from src.macd_unified import run_once, __version__, cfg
+    from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
     sys.exit(1)
@@ -37,6 +38,34 @@ def _handle_signal(signum: int, frame) -> NoReturn:
     sig_name = signal.strsignal(signum) if hasattr(signal, 'strsignal') else str(signum)
     logger.warning(f"⚠️  Received signal {sig_name} ({signum}) – shutting down")
     raise KeyboardInterrupt
+
+def check_aot_cache() -> None:
+    """
+    Check for AOT-compiled Numba cache and perform JIT warmup if needed.
+    This runs BEFORE the main bot logic to ensure functions are compiled.
+    """
+    cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
+    
+    # ALWAYS check if AOT-compiled cache exists (regardless of SKIP_WARMUP)
+    if cache_dir.exists():
+        cache_files = list(cache_dir.rglob('*.nbi'))
+        if len(cache_files) > 15:  # Expect at least 15 compiled functions
+            logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
+            return
+    
+    # If no AOT cache, check if we should do JIT warmup
+    if getattr(cfg, 'SKIP_WARMUP', False):
+        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
+        return
+    
+    logger.info("⚠️  AOT cache not found - performing JIT warmup...")
+    
+    # Import and run warmup
+    try:
+        from src.macd_unified import warmup_numba
+        warmup_numba()
+    except Exception as e:
+        logger.warning(f"Warmup failed (non-fatal): {e}")
 
 # OPTIMIZED: Resource monitoring function
 def log_resource_usage(stage: str = "final") -> None:
@@ -86,6 +115,9 @@ async def main() -> int:
             f"Numba parallel: {numba_parallel}"
         )
         
+        # 🔥 CHECK AOT CACHE BEFORE RUNNING BOT
+        check_aot_cache()
+        
         # Log initial resource usage
         log_resource_usage("startup")
         
@@ -115,6 +147,16 @@ async def main() -> int:
         duration = time.time() - start_time
         logger.exception(f"❌ UNHANDLED EXCEPTION after {duration:.1f}s: {exc}")
         return 3
+    
+    finally:
+        # 🔥 CLEANUP: Shutdown persistent connections
+        try:
+            logger.info("🧹 Shutting down persistent connections...")
+            await RedisStateStore.shutdown_global_pool()
+            await SessionManager.close_session()
+            logger.debug("✅ Cleanup complete")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
 if __name__ == "__main__":
     # Install signal handlers
