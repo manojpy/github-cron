@@ -1,33 +1,66 @@
-# =========================
-# Builder stage
-# =========================
-FROM python:3.11-slim-bookworm AS builder
+# Stage 1: Builder
+ARG BASE_DIGEST=python:3.11-slim-bookworm
+FROM ${BASE_DIGEST} AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+COPY requirements.txt .
+RUN uv pip install --no-cache --compile \
+    pycares==4.4.0 \
+    aiodns==3.2.0 && \
+    uv pip install --no-cache --compile -r requirements.txt
+
+# Stage 2: AOT Compilation Stage
+FROM ${BASE_DIGEST} AS aot-compiler
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc g++ \
-    && rm -rf /var/lib/apt/lists/*
+# Setup Numba cache directory
+RUN mkdir -p /app/numba_cache && chmod 777 /app/numba_cache
 
-# Copy source
+# Copy source code for compilation
 COPY src/ ./src/
+COPY compile_numba_aot.py ./
 
-# Install requirements (numba must be here)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NUMBA_CACHE_DIR=/app/numba_cache \
+    NUMBA_NUM_THREADS=4 \
+    NUMBA_THREADING_LAYER=omp
 
-# Compile AOT module inside src
-WORKDIR /app/src
-RUN python -u aot_build.py
+# 🔥 AOT COMPILATION - Pre-compile all Numba functions
+RUN python compile_numba_aot.py && \
+    echo "✅ AOT compilation completed successfully" && \
+    ls -lah /app/numba_cache
 
-# ✅ Verify that the .so was produced in /app/src
-RUN ls -l /app/src/indicators_aot*.so || (echo "❌ AOT .so not found in builder"; exit 1)
+# Stage 3: Final Runtime
+FROM ${BASE_DIGEST} AS runtime
 
-# =========================
-# Runtime stage
-# =========================
-FROM python:3.11-slim-bookworm AS runtime
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+# 🔥 Copy pre-compiled Numba cache from AOT stage
+COPY --from=aot-compiler /app/numba_cache /app/numba_cache
 
 WORKDIR /app
 
@@ -35,25 +68,19 @@ WORKDIR /app
 COPY src/ ./src/
 COPY wrapper.py config_macd.json ./
 
-# Copy compiled AOT module from builder
-COPY --from=builder /app/src/indicators_aot.*.so /app/
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NUMBA_CACHE_DIR=/app/numba_cache \
+    NUMBA_NUM_THREADS=4 \
+    NUMBA_THREADING_LAYER=omp \
+    TZ=Asia/Kolkata
 
-# ✅ Verify that the .so is present in runtime
-RUN ls -l /app/indicators_aot*.so || (echo "❌ AOT .so not found in runtime"; exit 1)
+RUN useradd -m -u 1000 botuser && \
+    chown -R botuser:botuser /app && \
+    chmod +x wrapper.py
 
-# Install runtime dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+USER botuser
 
-# 🔑 Fix: install OpenMP runtime and set safe threading layer
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV NUMBA_THREADING_LAYER=workqueue
-ENV NUMBA_NUM_THREADS=12
-
-# Environment
-ENV PYTHONPATH="/app"
-
-# Entrypoint
-CMD ["python", "-u", "wrapper.py"]
+ENTRYPOINT ["python", "-u", "wrapper.py"]
