@@ -754,7 +754,10 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Already correct - no changes needed"""
+    """
+    CORRECTED: PineScript's value := value * (...) 
+    means multiply by the ORIGINAL value (1.0), not the previous iteration
+    """
     value_arr = np.empty(rows, dtype=np.float64)
     value_arr[0] = 1.0
     
@@ -762,10 +765,11 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        # Compound multiplication (matches PineScript)
-        v = prev_v * (t - 0.5 + 0.5 * prev_v)
+        # CRITICAL FIX: Multiply by 1.0 (the original value), not prev_v
+        # This matches PineScript's behavior where 'value' on RHS = original value
+        v = 1.0 * (t - 0.5 + 0.5 * prev_v)
         
-        # Clamp to prevent explosion
+        # Clamp
         v = min(0.9999, max(-0.9999, v))
         value_arr[i] = v
     
