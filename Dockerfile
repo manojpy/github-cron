@@ -44,10 +44,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
 RUN python src/compile_numba_aot.py && \
     echo "✅ AOT compilation completed" && \
-    echo "🔍 Checking cache directories after AOT:" && \
+    echo "📂 Checking cache directories after AOT:" && \
     ls -lah /app/src/__pycache__/ || true && \
     ls -lah /app/__pycache__/ || true && \
-    echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
+    echo "📂 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
     find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40 && \
     find /app/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
 
@@ -85,12 +85,14 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TZ=Asia/Kolkata
 
 # Verify cache was copied and set permissions
-RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
+# UPDATED: Increased minimum expected cache files from 15 to 17
+# (Added 2 new functions: _rolling_mean_numba_parallel and fixed _sma_loop)
+RUN echo "📂 Verifying AOT cache in runtime stage:" && \
     ls -lah /app/src/__pycache__/ && \
     CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
-    echo "📁 Found $CACHE_COUNT cache files" && \
-    if [ "$CACHE_COUNT" -lt 15 ]; then \
-        echo "⚠️  WARNING: Expected at least 15 cache files, found $CACHE_COUNT"; \
+    echo "📂 Found $CACHE_COUNT cache files" && \
+    if [ "$CACHE_COUNT" -lt 17 ]; then \
+        echo "⚠️  WARNING: Expected at least 17 cache files (updated for new parallel functions), found $CACHE_COUNT"; \
     else \
         echo "✅ AOT cache verified successfully"; \
     fi && \
