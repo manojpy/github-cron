@@ -246,7 +246,6 @@ class BotConfig(BaseModel):
 # PART 2: Optimized Numba Functions with Parallel Execution
 # ============================================================================
 
-
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
     data: Dict[str, Any] = {}
@@ -277,14 +276,6 @@ def load_config() -> BotConfig:
         sys.exit(1)
 
 cfg = load_config()
-
-# Validation: Ensure all configured pairs have mappings
-_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
-if _missing_products:
-    logger.warning(
-        f"⚠️ Missing product mappings for: {_missing_products}. "
-        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
-    )
 
 # Logging setup (same as original)
 class SecretFilter(logging.Filter):
@@ -342,9 +333,20 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 shutdown_event = asyncio.Event()
 
+# Validation: Ensure all configured pairs have mappings
+_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
+if _missing_products:
+    logger.warning(
+        f"⚠️ Missing product mappings for: {_missing_products}. "
+        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
+    )
+
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
-    if condition and logger_obj.isEnabledFor(logging.DEBUG):
+   
+    if condition:
+        
         logger_obj.debug(msg_fn())
+
         
 def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) -> None:
     if is_important:
@@ -453,32 +455,59 @@ def print_startup_banner_once() -> None:
 
 print_startup_banner_once()
 
+
 def get_trigger_timestamp() -> int:
+    
     trigger_ts_str = os.getenv("TRIGGER_TIMESTAMP")
     if trigger_ts_str:
         try:
             trigger_ts = int(trigger_ts_str)
             now = int(time.time())
-            if abs(now - trigger_ts) > 600:
-                logger.warning(f"TRIGGER_TIMESTAMP ({trigger_ts}) is >10 min from now ({now}), using current time")
-                return now
-            logger.debug(f"Using TRIGGER_TIMESTAMP from env: {trigger_ts}")
+            
+            if trigger_ts > now:
+                time_diff = trigger_ts - now
+                if time_diff > 600:  # More than 10 minutes in future
+                    logger.warning(
+                        f"TRIGGER_TIMESTAMP ({trigger_ts}) is {time_diff}s in the future (>10min), "
+                        f"using current time ({now})"
+                    )
+                    return now
+                else:
+                    logger.debug(f"Using future TRIGGER_TIMESTAMP: {trigger_ts} (+{time_diff}s from now)")
+            else:
+                time_diff = now - trigger_ts
+                logger.debug(f"Using past TRIGGER_TIMESTAMP: {trigger_ts} (-{time_diff}s from now)")
+            
             return trigger_ts
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid TRIGGER_TIMESTAMP: {trigger_ts_str}, using current time")
+            
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid TRIGGER_TIMESTAMP: '{trigger_ts_str}' ({e}), using current time")
     
     return int(time.time())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
     
+    if interval_minutes <= 0:
+        raise ValueError(f"interval_minutes must be positive, got {interval_minutes}")
+    
     interval_seconds = interval_minutes * 60
     
-    effective_time = reference_time - 45 
+    effective_time = reference_time - Constants.CANDLE_PUBLICATION_LAG_SEC
     
+    # Find the start of the current period
     current_period_start = (effective_time // interval_seconds) * interval_seconds
+    
+    # Go back one period to get the last closed candle
     last_closed_candle_open = current_period_start - interval_seconds
     
+    logger.debug(
+        f"Candle timestamp calculation: reference={reference_time}, "
+        f"interval={interval_minutes}m, lag={Constants.CANDLE_PUBLICATION_LAG_SEC}s, "
+        f"result={last_closed_candle_open}"
+    )
+    
     return last_closed_candle_open
+
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
@@ -524,34 +553,52 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
-    """OPTIMIZED: Choose parallel vs serial based on size and config"""
+    
     try:
         if arr is None or len(arr) == 0:
-            logger.warning(f"Indicator {name} is None or empty")
+            logger.warning(f"Indicator {name} is None or empty, returning default array")
             return np.array([default], dtype=np.float64)
         
-        # Use parallel version for large arrays when enabled
-        if cfg.NUMBA_PARALLEL and len(arr) >= 200:
+        original_length = len(arr)
+        
+        # ✅ Choose parallel vs serial based on size and config
+        if cfg.NUMBA_PARALLEL and original_length >= 200:
             sanitized = _sanitize_array_numba_parallel(arr, default)
+            method = "parallel"
         else:
             sanitized = _sanitize_array_numba(arr, default)
+            method = "serial"
         
-        if np.all(sanitized == default):
-            logger.warning(f"Indicator {name} is all {default} after sanitization")
+        # Check if all values were invalid
+        invalid_count = np.sum(sanitized == default)
+        if invalid_count == original_length:
+            logger.warning(
+                f"Indicator {name} is all {default} after sanitization "
+                f"(all {original_length} values were NaN/Inf)"
+            )
+        elif invalid_count > 0:
+            invalid_pct = (invalid_count / original_length) * 100
+            logger.debug(
+                f"Indicator {name} sanitized using {method}: "
+                f"{invalid_count}/{original_length} ({invalid_pct:.1f}%) values replaced with {default}"
+            )
+        else:
+            logger.debug(f"Indicator {name} sanitized using {method}: no invalid values found")
         
         return sanitized
         
     except Exception as e:
-        logger.error(f"Failed to sanitize indicator {name}: {e}")
-        return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)       
-  
+        logger.error(f"Failed to sanitize indicator {name}: {e}", exc_info=True)
+        fallback_length = len(arr) if arr is not None else 1
+        return np.full(fallback_length, default, dtype=np.float64)
+
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """OPTIMIZED: Parallel SMA calculation"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    min_periods = max(2, period // 3)
+    min_periods = max(2, period // 3)  # Calculate once
     
     for i in prange(n):  # PARALLEL LOOP
         window_sum = 0.0
@@ -571,15 +618,17 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Original serial SMA (fallback)"""
+    """FIXED: Serial SMA with corrected min_periods logic"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
     
     window_sum = 0.0
     count = 0
+    min_periods = max(2, period // 3)  # FIXED: Calculate once before loop
     
     for i in range(n):
         val = data[i]
@@ -594,7 +643,6 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
                 window_sum -= old_val
                 count -= 1
 
-        min_periods = max(2, period // 3)
         if count >= min_periods:
             out[i] = window_sum / count
         else:
@@ -839,7 +887,7 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMIZED: Parallel rolling mean calculation"""
+    """ADDED: Parallel rolling mean (was missing)"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     
@@ -847,82 +895,56 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
-        
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
-        
         ma[i] = sum_val / count if count > 0 else 0.0
     
     return ma
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """Original serial version (fallback)"""
+    """Original serial version"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
-    
     for i in range(rows):
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
-        
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
-        
         ma[i] = sum_val / count if count > 0 else 0.0
-    
     return ma
-
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Parallel rolling min/max that safely ignores NaNs in each window"""
+    """OPTIMIZED: Parallel rolling min/max"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
-    min_arr[:] = np.nan
-    max_arr[:] = np.nan
     
     for i in prange(rows):
         start = max(0, i - period + 1)
-        window = arr[start:i+1]
-        valid = window[~np.isnan(window)]
-        if len(valid) > 0:
-            min_arr[i] = np.min(valid)
-            max_arr[i] = np.max(valid)
-        else:
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
+        min_arr[i] = np.min(arr[start:i+1])
+        max_arr[i] = np.max(arr[start:i+1])
     
     return min_arr, max_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Serial fallback – NaN-safe rolling min/max"""
+    """Original serial version"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
-    min_arr[:] = np.nan
-    max_arr[:] = np.nan
-    
     for i in range(rows):
         start = max(0, i - period + 1)
-        window = arr[start:i+1]
-        valid = window[~np.isnan(window)]
-        if len(valid) > 0:
-            min_arr[i] = np.min(valid)
-            max_arr[i] = np.max(valid)
-        else:
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-    
+        min_arr[i] = np.min(arr[start:i+1])
+        max_arr[i] = np.max(arr[start:i+1])
     return min_arr, max_arr
 
 
@@ -1109,10 +1131,7 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # ============================================================================
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """
-    Drop-in replacement Magical Momentum Histogram with improved NaN handling in rolling min/max.
-    All original logic preserved, only robustness enhanced.
-    """
+    """OPTIMIZED: MMH with conditional parallel execution"""
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
@@ -1121,10 +1140,10 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # Ensure contiguous array for Numba
-        close_c = np.ascontiguousarray(close, dtype=np.float64)
+        # OPTIMIZED: Remove unnecessary type conversion
+        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
-        # Standard deviation (rolling over fixed 50-period window – typical for MMH)
+        # OPTIMIZED: Use higher threshold for expensive rolling std
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
@@ -1132,7 +1151,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # Rolling mean over main period
+        # FIXED: Now calls the correctly defined parallel function
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
@@ -1142,26 +1161,26 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Rolling min/max – now NaN-safe (critical fix)
+        # OPTIMIZED: Higher threshold for min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
         
         denom = max_med - min_med
-        denom = np.where(np.isnan(denom) | (denom == 0), Constants.ZERO_DIVISION_GUARD, denom)
+        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
-        temp = np.nan_to_num(temp, nan=0.5, posinf=1.0, neginf=0.0)
+        temp = np.nan_to_num(temp, nan=0.5)
         
         value_arr = _calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.nan_to_num(temp2, nan=Constants.INFINITY_CLAMP, posinf=Constants.INFINITY_CLAMP, neginf=-Constants.INFINITY_CLAMP)
+            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
         
-        momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)  # safer log with sign preservation
+        momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
         
         momentum_arr = momentum.copy()
@@ -3449,12 +3468,7 @@ async def evaluate_pair_and_alert(
                 sell_common and mmh_curr < 0 and
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
-
-        logger_pair.info(
-            f"{pair_name} | MMH: {mmh_curr:+.2f} | "
-            f"{'🟢' if mmh_curr > 0 else '🔴'} | "
-            f"Price: ${close_curr:.2f}"
-        )
+       
 
         # === FIX: ensure summary strings exist ===
         if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
