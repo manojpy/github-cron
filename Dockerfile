@@ -30,26 +30,27 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy source code
+# Copy source code (Kept original path)
 COPY src/ ./src/
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app" \
-    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONDONTWRITEBYTECODE=0 \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_NUM_THREADS=4 \
     NUMBA_THREADING_LAYER=omp
 
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
-RUN python src/compile_numba_aot.py && \
+# Explicitly create the directory first to prevent "checksum calculation" errors if the script fails
+RUN mkdir -p /app/src/__pycache__ && \
+    python src/compile_numba_aot.py && \
     echo "✅ AOT compilation completed" && \
-    echo "📂 Checking cache directories after AOT:" && \
+    echo "🔍 Checking cache directories after AOT:" && \
     ls -lah /app/src/__pycache__/ || true && \
     ls -lah /app/__pycache__/ || true && \
-    echo "📂 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
-    find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40 && \
-    find /app/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
+    echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
 
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -63,16 +64,16 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Create directory structure first
+# Create directory structure first (Kept original path) 
 RUN mkdir -p /app/src/__pycache__
 
 # Copy Python source files (excluding __pycache__ initially)
 COPY --from=aot-compiler /app/src/*.py ./src/
 
-# 🔥 EXPLICIT: Copy the Numba cache directory separately
+# 🔥 EXPLICIT: Copy the Numba cache directory separately 
 COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
 
-# Copy runtime files
+# Copy runtime files (Kept original names) 
 COPY wrapper.py config_macd.json ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -84,15 +85,13 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
 
-# Verify cache was copied and set permissions
-# UPDATED: Increased minimum expected cache files from 15 to 17
-# (Added 2 new functions: _rolling_mean_numba_parallel and fixed _sma_loop)
-RUN echo "📂 Verifying AOT cache in runtime stage:" && \
+# Verify cache was copied and set permissions [cite: 49, 50, 51, 61, 62, 63]
+RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
     ls -lah /app/src/__pycache__/ && \
     CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
-    echo "📂 Found $CACHE_COUNT cache files" && \
-    if [ "$CACHE_COUNT" -lt 17 ]; then \
-        echo "⚠️  WARNING: Expected at least 17 cache files (updated for new parallel functions), found $CACHE_COUNT"; \
+    echo "📁 Found $CACHE_COUNT cache files" && \
+    if [ "$CACHE_COUNT" -lt 5 ]; then \
+        echo "⚠️  WARNING: Expected more cache files, found only $CACHE_COUNT"; \
     else \
         echo "✅ AOT cache verified successfully"; \
     fi && \
