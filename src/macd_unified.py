@@ -3421,28 +3421,13 @@ async def evaluate_pair_and_alert(
                 sell_common and mmh_curr < 0 and
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
-        logger_pair.info(
-            f"{pair_name} | MMH: {mmh_curr:+.2f} | "
-            f"{'🟢' if mmh_curr > 0 else '🔴'} | "
-            f"Price: ${close_curr:.2f}"
-        )
+       
 
         # === FIX: ensure summary strings exist ===
         if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
         if 'sell_candle_reason' not in locals(): sell_candle_reason = None
 
-        # === STEP 10: VWAP-HLC3 DEBUG (optional) ===
-        if cfg.DEBUG_MODE and cfg.ENABLE_VWAP:
-            curr_ts = int(timestamps_15m[i15])
-            curr_hour = (curr_ts % 86400) // 3600
-            curr_minute = (curr_ts % 3600) // 60
-            hlc3_curr = (high_curr + low_curr + close_curr) / 3.0
-            logger_pair.debug(
-                f"VWAP HLC3 | {curr_hour:02d}:{curr_minute:02d} UTC | "
-                f"H:{high_curr:.4f} L:{low_curr:.4f} C:{close_curr:.4f} "
-                f"HLC3:{hlc3_curr:.4f} VWAP:{vwap_curr:.4f}"
-            )
-
+        
         # === STEP 11: CONTEXT BUILD ===
         context = {
             "buy_common": buy_common, "sell_common": sell_common,
@@ -3623,7 +3608,7 @@ async def process_pairs_with_workers(
 
 
     # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
-    logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
+    logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
     # Use MAX_PARALLEL_FETCH (e.g. 12) to limit concurrent Redis/CPU usage
@@ -3655,7 +3640,7 @@ async def process_pairs_with_workers(
     results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
     valid_results = [r for r in results if r is not None]
     
-    logger_main.info(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
+    logger_main.debug(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
     return valid_results
 
 # ============================================================================
@@ -3726,14 +3711,14 @@ async def run_once() -> bool:
             else:
                 # Announce refresh with guard
                 if last_check_ts <= 0:
-                    logger_run.info("🔄 Refreshing products map from API (last check: never)")
+                    logger_run.debug("🔄 Refreshing products map from API (last check: never)")
                 else:
-                    logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+                    logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
                 USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
             # Fallback to API fetch
-            logger_run.info("📡 Fetching products list from Delta API...")
+            logger_run.debug("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
 
@@ -3750,10 +3735,10 @@ async def run_once() -> bool:
 
             last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
             if not last_check_ts or last_check_ts <= 0:
-                logger_run.info("🔄 Refreshing products map from API (last check: never)")
+                logger_run.debug("🔄 Refreshing products map from API (last check: never)")
             else:
                 days_ago = (now - last_check_ts) / 86400
-                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
+                logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
