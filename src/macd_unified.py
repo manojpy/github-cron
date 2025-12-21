@@ -724,6 +724,7 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 
     return filt
 
+
 # ============================================================================
 # PART 3: Optimized MMH and Indicator Calculations
 # ============================================================================
@@ -757,20 +758,16 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        
-        # Stable interpretation: value = temp - 0.5 + 0.5 * prev_value
-        raw_v = t - 0.5 + 0.5 * prev_v
-        value_arr[i] = max(-0.9999, min(0.9999, raw_v))
+        v = t - 0.5 + 0.5 * prev_v
+        value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    if rows > 0:
-        momentum_arr[0] = 0.0
-        for i in range(1, rows):
-            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-            momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+    for i in range(1, rows):
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
 # ============================================================================
@@ -813,6 +810,7 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -840,8 +838,10 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     
     return sd
 
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    """Original serial version"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     for i in range(rows):
@@ -870,9 +870,9 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nd
     
     return min_arr, max_arr
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Original serial version"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -881,7 +881,6 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         min_arr[i] = np.min(arr[start:i+1])
         max_arr[i] = np.max(arr[start:i+1])
     return min_arr, max_arr
-
 
 # ============================================================================
 # OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
@@ -1066,79 +1065,70 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # ============================================================================
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """Magical Momentum Histogram - Python implementation matching PineScript"""
+    """OPTIMIZED: MMH with conditional parallel execution"""
     try:
         if close is None or len(close) < period:
+            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # Ensure contiguous array
+        # OPTIMIZED: Remove unnecessary type conversion
+        # Data is already float64 from parse_candles_to_numpy()
+        # OLD: close_f64 = close.astype(np.float64)
+        # NEW: Just ensure it's contiguous (zero-copy operation)
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
-        # Calculate rolling standard deviation
-        sd = _rolling_std_welford(close_c, 50, resp_clamped)
+        # OPTIMIZED: Use higher threshold for expensive rolling std
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
+        else:
+            sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
-        # Calculate worm array
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # Calculate moving average
-        ma = _rolling_mean_numba(close_c, period)
+        # OPTIMIZED: Higher threshold for rolling mean
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            ma = _rolling_mean_numba_parallel(close_c, period)
+        else:
+            ma = _rolling_mean_numba(close_c, period)
         
-        # Calculate raw momentum
-        raw = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            if worm_arr[i] != 0.0 and not np.isnan(worm_arr[i]):
-                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
-            else:
-                raw[i] = 0.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw = (worm_arr - ma) / worm_arr
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Calculate min/max over period
-        min_med, max_med = _rolling_min_max_numba(raw, period)
+        # OPTIMIZED: Higher threshold for min/max
+        if cfg.NUMBA_PARALLEL and rows >= 250:
+            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
+        else:
+            min_med, max_med = _rolling_min_max_numba(raw, period)
         
-        # Normalize temp array
-        temp = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            denom = max_med[i] - min_med[i]
-            if abs(denom) < 1e-10:
-                temp[i] = 0.5
-            else:
-                temp[i] = (raw[i] - min_med[i]) / denom
-            temp[i] = max(0.0, min(1.0, temp[i]))
+        denom = max_med - min_med
+        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
+        temp = (raw - min_med) / denom
+        temp = np.clip(temp, 0.0, 1.0)
+        temp = np.nan_to_num(temp, nan=0.5)
         
-        # Calculate value array (recursive)
         value_arr = _calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
-        # Calculate temp2 with safeguards
-        temp2 = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            val = value_arr[i]
-            if abs(1.0 - val) < 1e-10:
-                temp2[i] = 1000.0  # Avoid division by zero
-            else:
-                temp2[i] = (1.0 + val) / (1.0 - val)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
         
-        # Calculate momentum
-        momentum = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            t2 = temp2[i]
-            if t2 <= 0.0:
-                momentum[i] = 0.0
-            else:
-                momentum[i] = 0.25 * np.log(t2)
+        momentum = 0.25 * np.log(temp2)
+        momentum = np.nan_to_num(momentum, nan=0.0)
         
-        # Apply recursive momentum filter
-        momentum = _calc_mmh_momentum_loop(momentum, rows)
+        momentum_arr = momentum.copy()
+        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
         
-        # Sanitize final output
-        momentum = sanitize_indicator_array(momentum, "MMH_Hist", 0.0)
+        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
         
-        return momentum
+        return momentum_arr
         
     except Exception as e:
-        # Log the actual error for debugging
-        print(f"MMH calculation failed: {type(e).__name__}: {str(e)}")
+        logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 @njit(nogil=True, fastmath=True, cache=True)
