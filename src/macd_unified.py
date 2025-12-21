@@ -861,7 +861,8 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         start = max(0, i - period + 1)
         min_arr[i] = np.nanmin(arr[start:i + 1])
         max_arr[i] = np.nanmax(arr[start:i + 1])
-    return min_arr
+  
+    return min_arr, max_arr
 
 # ============================================================================
 # OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
