@@ -603,10 +603,22 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     return out
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
-    """EMA is inherently serial (each value depends on previous)"""
+def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    Calculate EMA matching Pine Script's ta.ema() behavior
+    
+    Args:
+        data: Input array
+        period: EMA period
+        
+    Returns:
+        EMA values as numpy array
+    """
     n = len(data)
+    alpha = 2.0 / (period + 1)
     out = np.empty(n, dtype=np.float64)
+    
+    # Initialize with first valid value
     out[0] = data[0] if not np.isnan(data[0]) else 0.0
     
     for i in range(1, n):
@@ -615,6 +627,7 @@ def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = out[i-1]
         else:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
+    
     return out
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -689,8 +702,22 @@ def _vwap_daily_loop(
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """
+    Apply range filter matching Pine Script's rngfilt logic
+    
+    Logic:
+    - If price > previous filter: new filter = max(prev_filter, price - range)
+    - If price < previous filter: new filter = min(prev_filter, price + range)
+    
+    Args:
+        x: Price data (typically close)
+        r: Range values
+        
+    Returns:
+        Filtered values
+    """
     n = len(x)
-    filt = np.zeros(n, dtype=np.float64)
+    filt = np.empty(n, dtype=np.float64)
     filt[0] = x[0] if not np.isnan(x[0]) else 0.0
     
     for i in range(1, n):
@@ -698,25 +725,53 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
         curr_x = x[i]
         curr_r = r[i]
         
+        # Handle NaN values
         if np.isnan(curr_r) or np.isnan(curr_x):
             filt[i] = prev_filt
             continue
-            
+        
+        # Apply range filter logic
         if curr_x > prev_filt:
+            # Price above filter: move up but not below previous
             target = curr_x - curr_r
-            if target < prev_filt:
-                filt[i] = prev_filt
-            else:
-                filt[i] = target
+            filt[i] = max(prev_filt, target)
         else:
+            # Price below filter: move down but not above previous
             target = curr_x + curr_r
-            if target > prev_filt:
-                filt[i] = prev_filt
-            else:
-                filt[i] = target
-                
+            filt[i] = min(prev_filt, target)
+    
     return filt
 
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
+    """
+    Calculate smoothed range matching Pine Script's smoothrngX1 function
+    
+    Args:
+        close: Close prices
+        t: First smoothing period (X1 or X3)
+        m: Multiplier (X2 or X4)
+        
+    Returns:
+        Smoothed range values
+    """
+    n = len(close)
+    
+    # Calculate absolute price changes
+    diff = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        diff[i] = abs(close[i] - close[i-1])
+    
+    # First EMA: average range
+    avrng = _ema_loop(diff, t)
+    
+    # Second EMA: smooth the average range
+    wper = t * 2 - 1
+    smoothrng = _ema_loop(avrng, wper)
+    
+    # Apply multiplier
+    return smoothrng * m
 
 # ============================================================================
 # PART 3: Optimized MMH and Indicator Calculations
@@ -1034,48 +1089,60 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
 def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate Cirrus Cloud trend indicator using global config
+    (Original function name preserved)
+    
+    Args:
+        close: Close price array
+        
+    Returns:
+        Tuple of (upw, dnw, filt_x1, filt_x12)
+        - upw: Boolean array indicating uptrend
+        - dnw: Boolean array indicating downtrend
+        - filt_x1: First filtered values
+        - filt_x12: Second filtered values
+    """
     try:
+        # Validate input
         if close is None or len(close) < max(cfg.X1, cfg.X3):
-            logger.warning(f"Cirrus Cloud: Insufficient data (len={len(close) if close is not None else 0})")
+            logger.warning(
+                f"Cirrus Cloud: Insufficient data (len={len(close) if close is not None else 0})"
+            )
             default_len = len(close) if close is not None else 1
-            return (np.zeros(default_len, dtype=bool), 
-                    np.zeros(default_len, dtype=bool),
-                    np.zeros(default_len, dtype=np.float64),
-                    np.zeros(default_len, dtype=np.float64))
+            return (
+                np.zeros(default_len, dtype=bool),
+                np.zeros(default_len, dtype=bool),
+                np.zeros(default_len, dtype=np.float64),
+                np.zeros(default_len, dtype=np.float64)
+            )
         
-        diff = np.zeros_like(close)
-        diff[1:] = np.abs(close[1:] - close[:-1])
+        # Ensure float64
+        close = np.asarray(close, dtype=np.float64)
         
-        alpha_t = 2.0 / (cfg.X1 + 1)
-        avrng = _ema_loop(diff, alpha_t)
+        # Calculate smoothed ranges
+        smrng_x1 = _smooth_range(close, cfg.X1, cfg.X2)
+        smrng_x2 = _smooth_range(close, cfg.X3, cfg.X4)
         
-        wper = cfg.X1 * 2 - 1
-        alpha_w = 2.0 / (wper + 1)
-        smooth_rng_x1 = _ema_loop(avrng, alpha_w) * cfg.X2
+        # Apply range filters
+        filt_x1 = _rng_filter_loop(close, smrng_x1)
+        filt_x12 = _rng_filter_loop(close, smrng_x2)
         
-        filt_x1 = _rng_filter_loop(close, smooth_rng_x1)
-        
-        alpha_t2 = 2.0 / (cfg.X3 + 1)
-        avrng2 = _ema_loop(diff, alpha_t2)
-        
-        wper2 = cfg.X3 * 2 - 1
-        alpha_w2 = 2.0 / (wper2 + 1)
-        smooth_rng_x2 = _ema_loop(avrng2, alpha_w2) * cfg.X4
-        
-        filt_x12 = _rng_filter_loop(close, smooth_rng_x2)
-        
+        # Determine trends (using original variable names)
         upw = filt_x1 < filt_x12
         dnw = filt_x1 > filt_x12
         
         return upw, dnw, filt_x1, filt_x12
         
     except Exception as e:
-        logger.error(f"Cirrus Cloud calculation failed: {e}")
+        logger.error(f"Cirrus Cloud calculation failed: {e}", exc_info=True)
         default_len = len(close) if close is not None else 1
-        return (np.zeros(default_len, dtype=bool), 
-                np.zeros(default_len, dtype=bool),
-                np.zeros(default_len, dtype=np.float64),
-                np.zeros(default_len, dtype=np.float64))
+        return (
+            np.zeros(default_len, dtype=bool),
+            np.zeros(default_len, dtype=bool),
+            np.zeros(default_len, dtype=np.float64),
+            np.zeros(default_len, dtype=np.float64)
+        )
 
 # ============================================================================
 # OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
