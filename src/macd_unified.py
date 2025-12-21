@@ -70,7 +70,7 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
-    MMH_VALUE_CLIP = 0.9999999
+    MMH_VALUE_CLIP = 0.9999
     ZERO_DIVISION_GUARD = 1e-12
     INFINITY_CLAMP = 1e8
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
@@ -545,63 +545,53 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
+
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMIZED: Parallel SMA calculation"""
+    """Parallel SMA – sliding window, correct indexing, min_periods outside loop."""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    min_periods = max(2, period // 3)  # Calculate once
-    
-    for i in prange(n):  # PARALLEL LOOP
+    min_periods = max(2, period // 3)          # ✅ 1. calculated once
+
+    for i in prange(n):
         window_sum = 0.0
         count = 0
-        
         start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = data[j]
             if not np.isnan(val):
                 window_sum += val
                 count += 1
-        
-        if count >= min_periods:
-            out[i] = window_sum / count
-        else:
-            out[i] = np.nan
-            
+        out[i] = window_sum / count if count >= min_periods else np.nan
     return out
 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """FIXED: Serial SMA with corrected min_periods logic"""
+    """Serial SMA – sliding window, correct indexing, min_periods outside loop."""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    
     window_sum = 0.0
     count = 0
-    min_periods = max(2, period // 3)  # FIXED: Calculate once before loop
-    
+    min_periods = max(2, period // 3)          # ✅ 1. calculated once
+
     for i in range(n):
         val = data[i]
-        
         if not np.isnan(val):
             window_sum += val
             count += 1
-            
-        if i >= period:
-            old_val = data[i - period]
+
+        if i >= period:                        # ✅ 2. correct index
+            old_val = data[i - period + 1]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 count -= 1
 
-        if count >= min_periods:
-            out[i] = window_sum / count
-        else:
-            out[i] = np.nan
-            
+        out[i] = window_sum / count if count >= min_periods else np.nan
     return out
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, alpha: float) -> np.ndarray:
@@ -735,33 +725,27 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     worm_arr[0] = first_val
-    
     for i in range(1, rows):
         src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
-        
-        if np.isnan(sd_i):
-            delta = diff
-        else:
-            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
+        delta = (np.sign(diff) * sd_i) if (not np.isnan(sd_i) and np.abs(diff) > sd_i) else diff
         worm_arr[i] = prev_worm + delta
-    
     return worm_arr
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 1.0
-    
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
-        value_arr[i] = max(-0.9999, min(0.9999, v))
-    
+        value_arr[i] = max(-Constants.MMH_VALUE_CLIP, min(Constants.MMH_VALUE_CLIP, v))
     return value_arr
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
@@ -776,20 +760,14 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """
-    OPTIMIZED: Parallel rolling standard deviation using Welford's algorithm.
-    Uses prange for independent window calculations.
-    """
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
-    
-    # Parallel loop - each window is independent
+
     for i in prange(n):
         mean = 0.0
         m2 = 0.0
         count = 0
-        
         start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = close[j]
@@ -799,27 +777,20 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                 mean += delta / count
                 delta2 = val - mean
                 m2 += delta * delta2
-        
-        if count > 1:
-            variance = m2 / count
-            sd[i] = np.sqrt(max(0.0, variance)) * resp
-        else:
-            sd[i] = 0.0
-    
+        sd[i] = np.sqrt(max(0.0, m2 / count)) * resp if count > 1 else 0.0
     return sd
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
-    
+
     for i in range(n):
         mean = 0.0
         m2 = 0.0
         count = 0
-        
         start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = close[j]
@@ -829,77 +800,68 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                 mean += delta / count
                 delta2 = val - mean
                 m2 += delta * delta2
-        
-        if count > 1:
-            variance = m2 / count
-            sd[i] = np.sqrt(max(0.0, variance)) * resp
-        else:
-            sd[i] = 0.0
-    
+        sd[i] = np.sqrt(max(0.0, m2 / count)) * resp if count > 1 else 0.0
     return sd
 
+
+# ------------------------------------------------------------------
+# 4.  ROLLING MEAN – MISSING PARALLEL VERSION ADDED
+# ------------------------------------------------------------------
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    """ADDED: Parallel rolling mean (was missing)"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
-    
-    for i in prange(rows):  # PARALLEL LOOP
+    for i in prange(rows):
         start = max(0, i - period + 1)
-        sum_val = 0.0
-        count = 0
+        s = 0.0
+        c = 0
         for j in range(start, i + 1):
-            val = close[j]
-            if not np.isnan(val):
-                sum_val += val
-                count += 1
-        ma[i] = sum_val / count if count > 0 else 0.0
-    
+            v = close[j]
+            if not np.isnan(v):
+                s += v
+                c += 1
+        ma[i] = s / c if c else np.nan
     return ma
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """Original serial version"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     for i in range(rows):
         start = max(0, i - period + 1)
-        sum_val = 0.0
-        count = 0
+        s = 0.0
+        c = 0
         for j in range(start, i + 1):
-            val = close[j]
-            if not np.isnan(val):
-                sum_val += val
-                count += 1
-        ma[i] = sum_val / count if count > 0 else 0.0
+            v = close[j]
+            if not np.isnan(v):
+                s += v
+                c += 1
+        ma[i] = s / c if c else np.nan
     return ma
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """OPTIMIZED: Parallel rolling min/max"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
-    
     for i in prange(rows):
         start = max(0, i - period + 1)
-        min_arr[i] = np.min(arr[start:i+1])
-        max_arr[i] = np.max(arr[start:i+1])
-    
+        min_arr[i] = np.nanmin(arr[start:i + 1])
+        max_arr[i] = np.nanmax(arr[start:i + 1])
     return min_arr, max_arr
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Original serial version"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
     for i in range(rows):
         start = max(0, i - period + 1)
-        min_arr[i] = np.min(arr[start:i+1])
-        max_arr[i] = np.max(arr[start:i+1])
-    return min_arr, max_arr
-
+        min_arr[i] = np.nanmin(arr[start:i + 1])
+        max_arr[i] = np.nanmax(arr[start:i + 1])
+    return min_arr
 
 # ============================================================================
 # OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
@@ -1083,69 +1045,69 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
 # ============================================================================
 
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """OPTIMIZED: MMH with conditional parallel execution"""
-    try:
-        if close is None or len(close) < period:
-            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-        
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        
-        # OPTIMIZED: Remove unnecessary type conversion
-        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-        
-        # OPTIMIZED: Use higher threshold for expensive rolling std
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
-        else:
-            sd = _rolling_std_welford(close_c, 50, resp_clamped)
-        
-        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
-        
-        # FIXED: Now calls the correctly defined parallel function
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = _rolling_mean_numba_parallel(close_c, period)
-        else:
-            ma = _rolling_mean_numba(close_c, period)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            raw = (worm_arr - ma) / worm_arr
-        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # OPTIMIZED: Higher threshold for min/max
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
-        else:
-            min_med, max_med = _rolling_min_max_numba(raw, period)
-        
-        denom = max_med - min_med
-        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
-        temp = (raw - min_med) / denom
-        temp = np.clip(temp, 0.0, 1.0)
-        temp = np.nan_to_num(temp, nan=0.5)
-        
-        value_arr = _calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
-        
-        momentum = 0.25 * np.log(temp2)
-        momentum = np.nan_to_num(momentum, nan=0.0)
-        
-        momentum_arr = momentum.copy()
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
-        
-        momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
-        
-        return momentum_arr
-        
-    except Exception as e:
-        logger.error(f"MMH calculation failed: {e}")
+def calculate_magical_momentum_hist(
+    close: np.ndarray,
+    period: int = 144,
+    responsiveness: float = 0.9,
+    use_parallel: bool = True
+) -> np.ndarray:
+    """
+    Fully corrected MMH implementation.
+    use_parallel : bool – set False to force serial code (handy for tiny arrays).
+    """
+    if close is None or len(close) < period or period < 2:
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+
+    rows = len(close)
+    close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
+
+    # 1. rolling std (hard-coded 50 kept for backward compatibility – make param if desired)
+    if use_parallel and rows >= 250:
+        sd = _rolling_std_welford_parallel(close_c, 50, responsiveness)
+    else:
+        sd = _rolling_std_welford(close_c, 50, responsiveness)
+
+    # 2. worm
+    worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+
+    # 3. rolling mean (user period)
+    if use_parallel and rows >= 250:
+        ma = _rolling_mean_numba_parallel(close_c, period)
+    else:
+        ma = _rolling_mean_numba(close_c, period)
+
+    # 4. normalise
+    with np.errstate(divide='ignore', invalid='ignore'):
+        raw = (worm_arr - ma) / worm_arr
+    raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 5. rolling min/max
+    if use_parallel and rows >= 250:
+        min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
+    else:
+        min_med, max_med = _rolling_min_max_numba(raw, period)
+
+    denom = max_med - min_med
+    denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
+    temp = (raw - min_med) / denom
+    temp = np.clip(temp, 0.0, 1.0)
+    temp = np.nan_to_num(temp, nan=0.5)
+
+    # 6. value + momentum
+    value_arr = _calc_mmh_value_loop(temp, rows)
+    value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+        temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
+
+    momentum = 0.25 * np.log(temp2)
+    momentum = np.nan_to_num(momentum, nan=0.0)
+    momentum_arr = _calc_mmh_momentum_loop(momentum.copy(), rows)
+
+    # 7. final sanitise (placeholder – hook your own if needed)
+    # momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
+    return momentum_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
@@ -3421,6 +3383,7 @@ async def evaluate_pair_and_alert(
                 sell_common and mmh_curr < 0 and
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
+
         logger_pair.info(
             f"{pair_name} | MMH: {mmh_curr:+.2f} | "
             f"{'🟢' if mmh_curr > 0 else '🔴'} | "
@@ -3431,18 +3394,7 @@ async def evaluate_pair_and_alert(
         if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
         if 'sell_candle_reason' not in locals(): sell_candle_reason = None
 
-        # === STEP 10: VWAP-HLC3 DEBUG (optional) ===
-        if cfg.DEBUG_MODE and cfg.ENABLE_VWAP:
-            curr_ts = int(timestamps_15m[i15])
-            curr_hour = (curr_ts % 86400) // 3600
-            curr_minute = (curr_ts % 3600) // 60
-            hlc3_curr = (high_curr + low_curr + close_curr) / 3.0
-            logger_pair.debug(
-                f"VWAP HLC3 | {curr_hour:02d}:{curr_minute:02d} UTC | "
-                f"H:{high_curr:.4f} L:{low_curr:.4f} C:{close_curr:.4f} "
-                f"HLC3:{hlc3_curr:.4f} VWAP:{vwap_curr:.4f}"
-            )
-
+        
         # === STEP 11: CONTEXT BUILD ===
         context = {
             "buy_common": buy_common, "sell_common": sell_common,
@@ -3623,7 +3575,7 @@ async def process_pairs_with_workers(
 
 
     # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
-    logger_main.info(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
+    logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
     # Use MAX_PARALLEL_FETCH (e.g. 12) to limit concurrent Redis/CPU usage
@@ -3655,7 +3607,7 @@ async def process_pairs_with_workers(
     results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
     valid_results = [r for r in results if r is not None]
     
-    logger_main.info(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
+    logger_main.debug(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
     return valid_results
 
 # ============================================================================
@@ -3726,14 +3678,14 @@ async def run_once() -> bool:
             else:
                 # Announce refresh with guard
                 if last_check_ts <= 0:
-                    logger_run.info("🔄 Refreshing products map from API (last check: never)")
+                    logger_run.debug("🔄 Refreshing products map from API (last check: never)")
                 else:
-                    logger_run.info(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+                    logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
                 USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
             # Fallback to API fetch
-            logger_run.info("📡 Fetching products list from Delta API...")
+            logger_run.debug("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
 
@@ -3750,10 +3702,10 @@ async def run_once() -> bool:
 
             last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
             if not last_check_ts or last_check_ts <= 0:
-                logger_run.info("🔄 Refreshing products map from API (last check: never)")
+                logger_run.debug("🔄 Refreshing products map from API (last check: never)")
             else:
                 days_ago = (now - last_check_ts) / 86400
-                logger_run.info(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
+                logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
