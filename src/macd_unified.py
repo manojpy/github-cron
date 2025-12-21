@@ -591,14 +591,15 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}", exc_info=True)
         fallback_length = len(arr) if arr is not None else 1
         return np.full(fallback_length, default, dtype=np.float64)
-
+       
+  
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """OPTIMIZED: Parallel SMA calculation"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    min_periods = max(2, period // 3)  # Calculate once
+    min_periods = max(2, period // 3)
     
     for i in prange(n):  # PARALLEL LOOP
         window_sum = 0.0
@@ -618,17 +619,15 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """FIXED: Serial SMA with corrected min_periods logic"""
+    """Original serial SMA (fallback)"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
     
     window_sum = 0.0
     count = 0
-    min_periods = max(2, period // 3)  # FIXED: Calculate once before loop
     
     for i in range(n):
         val = data[i]
@@ -643,6 +642,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
                 window_sum -= old_val
                 count -= 1
 
+        min_periods = max(2, period // 3)
         if count >= min_periods:
             out[i] = window_sum / count
         else:
@@ -885,9 +885,10 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     
     return sd
 
+
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    """ADDED: Parallel rolling mean (was missing)"""
+    """OPTIMIZED: Parallel rolling mean calculation"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     
@@ -895,31 +896,39 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
+        
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
+        
         ma[i] = sum_val / count if count > 0 else 0.0
     
     return ma
 
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """Original serial version"""
+    """Original serial version (fallback)"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
+    
     for i in range(rows):
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
+        
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
+        
         ma[i] = sum_val / count if count > 0 else 0.0
+    
     return ma
+
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -1140,10 +1149,10 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # OPTIMIZED: Remove unnecessary type conversion
+        # Ensure contiguous array
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
-        # OPTIMIZED: Use higher threshold for expensive rolling std
+        # Standard deviation calculation
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
@@ -1151,7 +1160,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # FIXED: Now calls the correctly defined parallel function
+        # ROLLING MEAN - Now with parallel support
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
@@ -1161,7 +1170,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # OPTIMIZED: Higher threshold for min/max
+        # Rolling min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
@@ -1189,7 +1198,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
         
         return momentum_arr
-        
+      
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
@@ -3468,7 +3477,12 @@ async def evaluate_pair_and_alert(
                 sell_common and mmh_curr < 0 and
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
-       
+
+        logger_pair.info(
+            f"{pair_name} | MMH: {mmh_curr:+.2f} | "
+            f"{'🟢' if mmh_curr > 0 else '🔴'} | "
+            f"Price: ${close_curr:.2f}"
+        )
 
         # === FIX: ensure summary strings exist ===
         if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
