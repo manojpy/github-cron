@@ -551,7 +551,7 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    min_periods = max(2, period // 3)
+    min_periods = max(2, period // 3)  # Calculate once
     
     for i in prange(n):  # PARALLEL LOOP
         window_sum = 0.0
@@ -571,15 +571,17 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
             
     return out
 
+
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Original serial SMA (fallback)"""
+    """FIXED: Serial SMA with corrected min_periods logic"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
     
     window_sum = 0.0
     count = 0
+    min_periods = max(2, period // 3)  # FIXED: Calculate once before loop
     
     for i in range(n):
         val = data[i]
@@ -594,7 +596,6 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
                 window_sum -= old_val
                 count -= 1
 
-        min_periods = max(2, period // 3)
         if count >= min_periods:
             out[i] = window_sum / count
         else:
@@ -729,7 +730,6 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
 # PART 3: Optimized MMH and Indicator Calculations
 # ============================================================================
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -838,6 +838,24 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     
     return sd
 
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
+    """ADDED: Parallel rolling mean (was missing)"""
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+    
+    for i in prange(rows):  # PARALLEL LOOP
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        count = 0
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+        ma[i] = sum_val / count if count > 0 else 0.0
+    
+    return ma
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
@@ -881,6 +899,7 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         min_arr[i] = np.min(arr[start:i+1])
         max_arr[i] = np.max(arr[start:i+1])
     return min_arr, max_arr
+
 
 # ============================================================================
 # OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
@@ -1075,9 +1094,6 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
         # OPTIMIZED: Remove unnecessary type conversion
-        # Data is already float64 from parse_candles_to_numpy()
-        # OLD: close_f64 = close.astype(np.float64)
-        # NEW: Just ensure it's contiguous (zero-copy operation)
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
         # OPTIMIZED: Use higher threshold for expensive rolling std
@@ -1088,7 +1104,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # OPTIMIZED: Higher threshold for rolling mean
+        # FIXED: Now calls the correctly defined parallel function
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
