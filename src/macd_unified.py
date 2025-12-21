@@ -70,7 +70,7 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
-    MMH_VALUE_CLIP = 0.9999
+    MMH_VALUE_CLIP = 0.9999999
     ZERO_DIVISION_GUARD = 1e-12
     INFINITY_CLAMP = 1e8
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
@@ -246,6 +246,7 @@ class BotConfig(BaseModel):
 # PART 2: Optimized Numba Functions with Parallel Execution
 # ============================================================================
 
+
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
     data: Dict[str, Any] = {}
@@ -342,11 +343,8 @@ if _missing_products:
     )
 
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
-   
-    if condition:
-        
+    if condition and logger_obj.isEnabledFor(logging.DEBUG):
         logger_obj.debug(msg_fn())
-
         
 def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) -> None:
     if is_important:
@@ -455,59 +453,32 @@ def print_startup_banner_once() -> None:
 
 print_startup_banner_once()
 
-
 def get_trigger_timestamp() -> int:
-    
     trigger_ts_str = os.getenv("TRIGGER_TIMESTAMP")
     if trigger_ts_str:
         try:
             trigger_ts = int(trigger_ts_str)
             now = int(time.time())
-            
-            if trigger_ts > now:
-                time_diff = trigger_ts - now
-                if time_diff > 600:  # More than 10 minutes in future
-                    logger.warning(
-                        f"TRIGGER_TIMESTAMP ({trigger_ts}) is {time_diff}s in the future (>10min), "
-                        f"using current time ({now})"
-                    )
-                    return now
-                else:
-                    logger.debug(f"Using future TRIGGER_TIMESTAMP: {trigger_ts} (+{time_diff}s from now)")
-            else:
-                time_diff = now - trigger_ts
-                logger.debug(f"Using past TRIGGER_TIMESTAMP: {trigger_ts} (-{time_diff}s from now)")
-            
+            if abs(now - trigger_ts) > 600:
+                logger.warning(f"TRIGGER_TIMESTAMP ({trigger_ts}) is >10 min from now ({now}), using current time")
+                return now
+            logger.debug(f"Using TRIGGER_TIMESTAMP from env: {trigger_ts}")
             return trigger_ts
-            
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid TRIGGER_TIMESTAMP: '{trigger_ts_str}' ({e}), using current time")
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid TRIGGER_TIMESTAMP: {trigger_ts_str}, using current time")
     
     return int(time.time())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
     
-    if interval_minutes <= 0:
-        raise ValueError(f"interval_minutes must be positive, got {interval_minutes}")
-    
     interval_seconds = interval_minutes * 60
     
-    effective_time = reference_time - Constants.CANDLE_PUBLICATION_LAG_SEC
+    effective_time = reference_time - 45 
     
-    # Find the start of the current period
     current_period_start = (effective_time // interval_seconds) * interval_seconds
-    
-    # Go back one period to get the last closed candle
     last_closed_candle_open = current_period_start - interval_seconds
     
-    logger.debug(
-        f"Candle timestamp calculation: reference={reference_time}, "
-        f"interval={interval_minutes}m, lag={Constants.CANDLE_PUBLICATION_LAG_SEC}s, "
-        f"result={last_closed_candle_open}"
-    )
-    
     return last_closed_candle_open
-
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
@@ -553,97 +524,82 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
-    
+    """OPTIMIZED: Choose parallel vs serial based on size and config"""
     try:
         if arr is None or len(arr) == 0:
-            logger.warning(f"Indicator {name} is None or empty, returning default array")
+            logger.warning(f"Indicator {name} is None or empty")
             return np.array([default], dtype=np.float64)
         
-        original_length = len(arr)
-        
-        # ✅ Choose parallel vs serial based on size and config
-        if cfg.NUMBA_PARALLEL and original_length >= 200:
+        # Use parallel version for large arrays when enabled
+        if cfg.NUMBA_PARALLEL and len(arr) >= 200:
             sanitized = _sanitize_array_numba_parallel(arr, default)
-            method = "parallel"
         else:
             sanitized = _sanitize_array_numba(arr, default)
-            method = "serial"
         
-        # Check if all values were invalid
-        invalid_count = np.sum(sanitized == default)
-        if invalid_count == original_length:
-            logger.warning(
-                f"Indicator {name} is all {default} after sanitization "
-                f"(all {original_length} values were NaN/Inf)"
-            )
-        elif invalid_count > 0:
-            invalid_pct = (invalid_count / original_length) * 100
-            logger.debug(
-                f"Indicator {name} sanitized using {method}: "
-                f"{invalid_count}/{original_length} ({invalid_pct:.1f}%) values replaced with {default}"
-            )
-        else:
-            logger.debug(f"Indicator {name} sanitized using {method}: no invalid values found")
+        if np.all(sanitized == default):
+            logger.warning(f"Indicator {name} is all {default} after sanitization")
         
         return sanitized
         
     except Exception as e:
-        logger.error(f"Failed to sanitize indicator {name}: {e}", exc_info=True)
-        fallback_length = len(arr) if arr is not None else 1
-        return np.full(fallback_length, default, dtype=np.float64)
+        logger.error(f"Failed to sanitize indicator {name}: {e}")
+        return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
+    """OPTIMIZED: Parallel SMA calculation"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
     min_periods = max(2, period // 3)
-
-    for i in prange(n):
+    
+    for i in prange(n):  # PARALLEL LOOP
         window_sum = 0.0
         count = 0
+        
         start = max(0, i - period + 1)
-
         for j in range(start, i + 1):
             val = data[j]
             if not np.isnan(val):
                 window_sum += val
                 count += 1
-
+        
         if count >= min_periods:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
-
+            
     return out
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    """Original serial SMA (fallback)"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
+    
     window_sum = 0.0
     count = 0
-    min_periods = max(2, period // 3)
-
+    
     for i in range(n):
         val = data[i]
+        
         if not np.isnan(val):
             window_sum += val
             count += 1
-
+            
         if i >= period:
             old_val = data[i - period]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 count -= 1
 
+        min_periods = max(2, period // 3)
         if count >= min_periods:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
-
+            
     return out
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -769,180 +725,182 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     worm_arr = np.empty(rows, dtype=np.float64)
-    # Fixed: Find first valid price for initialization instead of defaulting to 0.0
-    initial_val = 0.0
-    for val in close_arr:
-        if not np.isnan(val):
-            initial_val = val
-            break
-    worm_arr[0] = initial_val
-
+    first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+    worm_arr[0] = first_val
+    
     for i in range(1, rows):
         src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
-
+        
         if np.isnan(sd_i):
             delta = diff
         else:
             delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
         worm_arr[i] = prev_worm + delta
-
+    
     return worm_arr
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
-    value_arr[0] = 0.0  # Standard Fisher start
-
+    value_arr[0] = 1.0
+    
     for i in range(1, rows):
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
         value_arr[i] = max(-0.9999, min(0.9999, v))
-
+    
     return value_arr
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
     return momentum_arr
 
+# ============================================================================
+# OPTIMIZATION 3: Welford's Algorithm with Parallel Preprocessing
+# ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """
+    OPTIMIZED: Parallel rolling standard deviation using Welford's algorithm.
+    Uses prange for independent window calculations.
+    """
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
-
+    
+    # Parallel loop - each window is independent
     for i in prange(n):
         mean = 0.0
         m2 = 0.0
         count = 0
+        
         start = max(0, i - period + 1)
-
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 count += 1
                 delta = val - mean
                 mean += delta / count
-                m2 += delta * (val - mean)
-
-        # Fixed: Sample Variance (count - 1) is standard for TA
+                delta2 = val - mean
+                m2 += delta * delta2
+        
         if count > 1:
-            variance = m2 / (count - 1)
+            variance = m2 / count
             sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
-
+    
     return sd
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
-
+    
     for i in range(n):
         mean = 0.0
         m2 = 0.0
         count = 0
+        
         start = max(0, i - period + 1)
-
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 count += 1
                 delta = val - mean
                 mean += delta / count
-                m2 += delta * (val - mean)
-
-        # Fixed: Sample Variance
+                delta2 = val - mean
+                m2 += delta * delta2
+        
         if count > 1:
-            variance = m2 / (count - 1)
+            variance = m2 / count
             sd[i] = np.sqrt(max(0.0, variance)) * resp
         else:
             sd[i] = 0.0
-
+    
     return sd
 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
+    """OPTIMIZED: Parallel rolling mean calculation"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
-
-    for i in prange(rows):
+    
+    for i in prange(rows):  # PARALLEL LOOP
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
-
+        
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
-
+        
         ma[i] = sum_val / count if count > 0 else 0.0
-
+    
     return ma
 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    """Original serial version (fallback)"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
-
+    
     for i in range(rows):
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
-
+        
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
-
+        
         ma[i] = sum_val / count if count > 0 else 0.0
-
+    
     return ma
 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    """OPTIMIZED: Parallel rolling min/max"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
-
+    
     for i in prange(rows):
         start = max(0, i - period + 1)
         min_arr[i] = np.min(arr[start:i+1])
         max_arr[i] = np.max(arr[start:i+1])
-
+    
     return min_arr, max_arr
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Original serial version"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
-
     for i in range(rows):
         start = max(0, i - period + 1)
         min_arr[i] = np.min(arr[start:i+1])
         max_arr[i] = np.max(arr[start:i+1])
-
     return min_arr, max_arr
+
 
 # ============================================================================
 # OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
@@ -1060,7 +1018,6 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     except Exception as e:
         return np.zeros_like(close) if close is not None else np.array([0.0])
 
-
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
         if data is None or len(data) < period:
@@ -1125,60 +1082,67 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # ============================================================================
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
+    """OPTIMIZED: MMH with conditional parallel execution"""
     try:
         if close is None or len(close) < period:
+            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
+        
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        
+        # Ensure contiguous array
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-
-        # Fixed: Use 'period' instead of hardcoded '50' to match input
+        
+        # Standard deviation calculation
         if cfg.NUMBA_PARALLEL and rows >= 250:
-            sd = _rolling_std_welford_parallel(close_c, period, resp_clamped)
+            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
-            sd = _rolling_std_welford(close_c, period, resp_clamped)
-
+            sd = _rolling_std_welford(close_c, 50, resp_clamped)
+        
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
-
+        
+        # ROLLING MEAN - Now with parallel support
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
             ma = _rolling_mean_numba(close_c, period)
-
+        
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-
+        
+        # Rolling min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
-
+        
         denom = max_med - min_med
         denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
-
+        
         value_arr = _calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
-
+        
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
             temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
-
-        # Correction: Fisher Transform standard uses 0.5, current code uses 0.25
+        
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
-
+        
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        
         momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
-
+        
         return momentum_arr
-
+      
     except Exception as e:
+        logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 @njit(nogil=True, fastmath=True, cache=True)
