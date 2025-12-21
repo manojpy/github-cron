@@ -837,7 +837,6 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     
     return sd
 
-
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     """OPTIMIZED: Parallel rolling mean calculation"""
@@ -884,28 +883,46 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """OPTIMIZED: Parallel rolling min/max"""
+    """Parallel rolling min/max that safely ignores NaNs in each window"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
+    min_arr[:] = np.nan
+    max_arr[:] = np.nan
     
     for i in prange(rows):
         start = max(0, i - period + 1)
-        min_arr[i] = np.min(arr[start:i+1])
-        max_arr[i] = np.max(arr[start:i+1])
+        window = arr[start:i+1]
+        valid = window[~np.isnan(window)]
+        if len(valid) > 0:
+            min_arr[i] = np.min(valid)
+            max_arr[i] = np.max(valid)
+        else:
+            min_arr[i] = np.nan
+            max_arr[i] = np.nan
     
     return min_arr, max_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Original serial version"""
+    """Serial fallback – NaN-safe rolling min/max"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
+    min_arr[:] = np.nan
+    max_arr[:] = np.nan
+    
     for i in range(rows):
         start = max(0, i - period + 1)
-        min_arr[i] = np.min(arr[start:i+1])
-        max_arr[i] = np.max(arr[start:i+1])
+        window = arr[start:i+1]
+        valid = window[~np.isnan(window)]
+        if len(valid) > 0:
+            min_arr[i] = np.min(valid)
+            max_arr[i] = np.max(valid)
+        else:
+            min_arr[i] = np.nan
+            max_arr[i] = np.nan
+    
     return min_arr, max_arr
 
 
@@ -1092,7 +1109,10 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # ============================================================================
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """OPTIMIZED: MMH with conditional parallel execution"""
+    """
+    Drop-in replacement Magical Momentum Histogram with improved NaN handling in rolling min/max.
+    All original logic preserved, only robustness enhanced.
+    """
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
@@ -1101,10 +1121,10 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         
-        # Ensure contiguous array
-        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
+        # Ensure contiguous array for Numba
+        close_c = np.ascontiguousarray(close, dtype=np.float64)
         
-        # Standard deviation calculation
+        # Standard deviation (rolling over fixed 50-period window – typical for MMH)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
@@ -1112,7 +1132,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # ROLLING MEAN - Now with parallel support
+        # Rolling mean over main period
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
@@ -1122,26 +1142,26 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Rolling min/max
+        # Rolling min/max – now NaN-safe (critical fix)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
         
         denom = max_med - min_med
-        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
+        denom = np.where(np.isnan(denom) | (denom == 0), Constants.ZERO_DIVISION_GUARD, denom)
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
-        temp = np.nan_to_num(temp, nan=0.5)
+        temp = np.nan_to_num(temp, nan=0.5, posinf=1.0, neginf=0.0)
         
         value_arr = _calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.nan_to_num(temp2, nan=1e8, posinf=1e8, neginf=-1e8)
+            temp2 = np.nan_to_num(temp2, nan=Constants.INFINITY_CLAMP, posinf=Constants.INFINITY_CLAMP, neginf=-Constants.INFINITY_CLAMP)
         
-        momentum = 0.25 * np.log(temp2)
+        momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)  # safer log with sign preservation
         momentum = np.nan_to_num(momentum, nan=0.0)
         
         momentum_arr = momentum.copy()
@@ -1150,7 +1170,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         momentum_arr = sanitize_indicator_array(momentum_arr, "MMH_Hist", default=0.0)
         
         return momentum_arr
-      
+        
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
