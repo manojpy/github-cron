@@ -37,6 +37,7 @@ try:
         _kalman_loop,
         _vwap_daily_loop,
         _rng_filter_loop,
+        _smooth_range,
         _calc_mmh_worm_loop,
         _calc_mmh_value_loop,
         _calc_mmh_momentum_loop,
@@ -84,7 +85,7 @@ functions_to_compile = [
     ("_kalman_loop", lambda: _kalman_loop(close_small, 5, 0.01, 0.1)),
     ("_vwap_daily_loop", lambda: _vwap_daily_loop(high_arr, low_arr, close_large, volume, timestamps)),
     ("_rng_filter_loop", lambda: _rng_filter_loop(close_small, np.random.random(SIZE_SMALL) * 10)),
-    
+    ("_smooth_range", lambda: _smooth_range(close_small, 22, 9)),
     # MMH components
     ("_calc_mmh_worm_loop", lambda: _calc_mmh_worm_loop(close_small, np.random.random(SIZE_SMALL) * 5, SIZE_SMALL)),
     ("_calc_mmh_value_loop", lambda: _calc_mmh_value_loop(np.random.random(SIZE_SMALL), SIZE_SMALL)),
