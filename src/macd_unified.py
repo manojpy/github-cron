@@ -1175,7 +1175,7 @@ def warmup_numba() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
-ddef calculate_pivot_levels_numpy(
+def calculate_pivot_levels_numpy(
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
