@@ -626,10 +626,9 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        # Correct smoothing: use previous smoothed value only
-        momentum_arr[i] = prev + 0.5 * prev  # equivalent to 1.5 * prev
+        # Correct: Add the raw momentum[i] + 50% of previous smoothed value
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
-
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
