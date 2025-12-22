@@ -67,10 +67,9 @@ functions_to_compile = [
     ("_sma_loop", lambda: _sma_loop(close_data, 50)),
     ("_sma_loop_parallel", lambda: _sma_loop_parallel(close_data, 50)),
     ("_ema_loop", lambda: _ema_loop(close_data, 14)),
-    ("_kalman_loop", lambda: _kalman_loop(close_data, 10)),
+    ("_kalman_loop", lambda: _kalman_loop(close_large, 0.5, 0.5, 0.5)),
     ("_vwap_daily_loop", lambda: _vwap_daily_loop(high_data, low_data, close_data, vol_data, ts_data)),
-    # FIXED: Only passing 2 arguments to _rng_filter_loop
-    ("_rng_filter_loop", lambda: _rng_filter_loop(1.0, 1.0)), 
+    ("_rng_filter_loop", lambda: _rng_filter_loop(close_large, 1.0)),
     ("_smooth_range", lambda: _smooth_range(close_data, 14, 2)),
     ("_calc_mmh_worm_loop", lambda: _calc_mmh_worm_loop(close_data, close_data, size)),
     ("_calc_mmh_value_loop", lambda: _calc_mmh_value_loop(close_data, size)),
