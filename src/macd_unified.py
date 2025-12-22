@@ -841,22 +841,23 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+    
+    # Pass integer periods directly
+    fast_ma = _ema_loop(close, fast)
+    slow_ma = _ema_loop(close, slow)
+
     n = len(close)
-    
-    alpha_fast = 2.0 / (fast + 1)
-    fast_ma = _ema_loop(close, alpha_fast)
-    
-    alpha_slow = 2.0 / (slow + 1)
-    slow_ma = _ema_loop(close, alpha_slow)
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
-        if abs(slow_ma[i]) < 1e-12:
+        # Safety: Check for NaN or near-zero to prevent division by zero
+        if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
             ppo[i] = 0.0
         else:
             ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-    alpha_signal = 2.0 / (signal + 1)
-    ppo_sig = _ema_loop(ppo, alpha_signal)
-    
+
+    # Signal line calculation (expects integer period)
+    ppo_sig = _ema_loop(ppo, signal)
+
     return ppo, ppo_sig
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -1174,59 +1175,63 @@ def warmup_numba() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
-def calculate_pivot_levels_numpy(
+ddef calculate_pivot_levels_numpy(
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
     timestamps: np.ndarray
 ) -> Dict[str, float]:
-    piv: Dict[str, float] = {}
-    
+    # Pre-fill with zeros to avoid KeyErrors downstream
+    piv: Dict[str, float] = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
+
     try:
         if len(timestamps) < 2:
             logger.warning("Pivot calc: insufficient data")
             return piv
-        
+
+        # Daily bins (timestamps in seconds)
         days = timestamps // 86400
         now_utc = datetime.now(timezone.utc)
         yesterday = (now_utc - timedelta(days=1)).date()
+
+        # Yesterday UTC day number
         yesterday_ts = datetime(
-            yesterday.year, 
-            yesterday.month, 
-            yesterday.day, 
-            tzinfo=timezone.utc
+            yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc
         ).timestamp()
-        yesterday_day_number = int(yesterday_ts) // 86400        
-        yesterday_mask = days == yesterday_day_number
-        
+        yesterday_day_number = int(yesterday_ts) // 86400
+
+        yesterday_mask = (days == yesterday_day_number)
+
         if not np.any(yesterday_mask):
-            logger.warning(
-                f"No data for yesterday (day #{yesterday_day_number}). "
-                f"Available days: {np.unique(days)}"
-            )
-            return piv
+            # Fallback: use second-to-last unique day if yesterday missing
+            unique_days = np.unique(days)
+            if len(unique_days) > 1:
+                yesterday_day_number = unique_days[-2]
+                yesterday_mask = (days == yesterday_day_number)
+                logger.info(f"Fallback pivot day: {yesterday_day_number}")
+            else:
+                logger.warning("Pivot calc: No daily transition found in data.")
+                return piv
+
         yesterday_high = high[yesterday_mask]
         yesterday_low = low[yesterday_mask]
         yesterday_close = close[yesterday_mask]
-        
-        num_candles = len(yesterday_high)
-        if num_candles == 0:
-            logger.warning("No candles found for yesterday")
+
+        if len(yesterday_high) == 0:
+            logger.warning("No candles found for pivot day")
             return piv
-        
+
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
         C_prev = float(yesterday_close[-1])
-        
+
         rng_prev = H_prev - L_prev
-        
         if rng_prev < 1e-8:
             logger.warning(f"Invalid pivot range: {rng_prev}")
             return piv
-        
+
         P = (H_prev + L_prev + C_prev) / 3.0
-        
-        piv = {
+        piv.update({
             "P": P,
             "R1": P + rng_prev * 0.382,
             "R2": P + rng_prev * 0.618,
@@ -1234,11 +1239,11 @@ def calculate_pivot_levels_numpy(
             "S1": P - rng_prev * 0.382,
             "S2": P - rng_prev * 0.618,
             "S3": P - rng_prev,
-        }
-                
+        })
+
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
-    
+
     return piv
 
 def calculate_all_indicators_numpy(
@@ -2921,42 +2926,45 @@ def _validate_pivot_cross(
     level: str,
     is_buy: bool
 ) -> Tuple[bool, Optional[str]]:
-    """Return (crossed?, None) or (False, reason)."""
-    if not ctx.get("pivots") or level not in ctx["pivots"]:
-        return False, "Pivot level missing"
+    """Check for crossover and return (crossed?, reason if suppressed)."""
+    pivots = ctx.get("pivots")
+    if not pivots or level not in pivots or pivots[level] == 0:
+        return False, "Pivot data missing"
 
-    level_value = ctx["pivots"][level]
+    level_value = pivots[level]
     close_curr = ctx["close_curr"]
+    close_prev = ctx["close_prev"]
 
+    # Distance check (normalize by current price for intuitive % diff)
     price_diff_pct = abs(level_value - close_curr) / close_curr * 100
     if price_diff_pct > cfg.PIVOT_MAX_DISTANCE_PCT:
-        reason = (
-            f"Pivot {level} too far: ${level_value:.2f} "
-            f"(diff {price_diff_pct:.1f}% > {cfg.PIVOT_MAX_DISTANCE_PCT}%)"
+        return False, (
+            f"Pivot {level} too far: {price_diff_pct:.1f}% > {cfg.PIVOT_MAX_DISTANCE_PCT}%"
         )
-        return False, reason
 
     if is_buy:
-        crossed = (ctx["close_prev"] <= level_value) and (close_curr > level_value)
+        crossed = (close_prev <= level_value) and (close_curr > level_value)
     else:
-        crossed = (ctx["close_prev"] >= level_value) and (close_curr < level_value)
+        crossed = (close_prev >= level_value) and (close_curr < level_value)
 
     return crossed, None
 
+
+# Unified lambda signatures for consistency
 BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}",
         "title": f"🟢⬆️ Cross above {level}",
-        "check_fn": lambda ctx, lvl=level: (
+        "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
             ctx["buy_common"]
             and _validate_pivot_cross(ctx, lvl, is_buy=True)[0]
         ),
-        "extra_fn": lambda ctx, lvl=level: (
+        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
             f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
             + (
                 f" [Suppressed: {_validate_pivot_cross(ctx, lvl, True)[1]}]"
                 if not _validate_pivot_cross(ctx, lvl, True)[0] and ctx.get("pivots")
-                else ""
+                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             )
         ),
         "requires": ["pivots"],
@@ -2968,7 +2976,7 @@ SELL_PIVOT_DEFS = [
     {
         "key": f"pivot_down_{level}",
         "title": f"🔴⬇️ Cross below {level}",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi, lvl=level: (
+        "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
             ctx["sell_common"]
             and _validate_pivot_cross(ctx, lvl, is_buy=False)[0]
         ),
@@ -2977,14 +2985,13 @@ SELL_PIVOT_DEFS = [
             + (
                 f" [Suppressed: {_validate_pivot_cross(ctx, lvl, False)[1]}]"
                 if not _validate_pivot_cross(ctx, lvl, False)[0] and ctx.get("pivots")
-                else ""
+                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             )
         ),
         "requires": ["pivots"],
     }
     for level in ("P", "S1", "S2", "R1", "R2", "R3")
 ]
-
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
