@@ -20,7 +20,6 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 from urllib.parse import urlparse, parse_qs
-
 import aiohttp
 from aiohttp import web
 import numpy as np
@@ -50,7 +49,7 @@ except ImportError:
     json_loads = json.loads
     JSON_BACKEND = "stdlib"
 
-__version__ = "1.4.0-performance-optimized"
+__version__ = "1.8.0-stable"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -132,9 +131,7 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         except Exception:
             return str(dt_or_ts)
 
-# ============================================================================
-# OPTIMIZATION 1: Enhanced BotConfig with performance tuning
-# ============================================================================
+
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
@@ -158,8 +155,6 @@ class BotConfig(BaseModel):
     SRSI_RSI_LEN: int = 21
     SRSI_KALMAN_LEN: int = 5
     LOG_FILE: str = "macd_bot.log"
-    
-    # OPTIMIZED: Increased parallel fetch for better throughput
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
@@ -168,11 +163,8 @@ class BotConfig(BaseModel):
     JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
     BATCH_SIZE: int = 4
-    
-    # OPTIMIZED: Increased connection limits for parallel operations
     TCP_CONN_LIMIT: int = 16
     TCP_CONN_LIMIT_PER_HOST: int = 12
-    
     TELEGRAM_RETRIES: int = 3
     TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000
@@ -191,8 +183,6 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
-    
-    # NEW: Performance tuning options
     NUMBA_PARALLEL: bool = Field(default=True, description="Enable Numba parallel execution")
     SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
     PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
@@ -242,11 +232,6 @@ class BotConfig(BaseModel):
 
         return self
 
-# ============================================================================
-# PART 2: Optimized Numba Functions with Parallel Execution
-# ============================================================================
-
-
 def load_config() -> BotConfig:
     config_file = os.getenv("CONFIG_FILE", "config_macd.json")
     data: Dict[str, Any] = {}
@@ -278,7 +263,6 @@ def load_config() -> BotConfig:
 
 cfg = load_config()
 
-# Logging setup (same as original)
 class SecretFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -334,7 +318,6 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 shutdown_event = asyncio.Event()
 
-# Validation: Ensure all configured pairs have mappings
 _missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
 if _missing_products:
     logger.warning(
@@ -496,12 +479,11 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 # ============================================================================
-# OPTIMIZATION 2: Parallel Numba Functions with prange
+# PART 2: Numba/Numpy based Helpers
 # ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
-    """OPTIMIZED: Parallel sanitization with prange"""
     out = np.empty_like(arr)
     for i in prange(len(arr)):  # PARALLEL LOOP
         val = arr[i]
@@ -513,7 +495,6 @@ def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarra
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
-    """Original serial version for small arrays"""
     out = np.empty_like(arr)
     for i in range(len(arr)):
         val = arr[i]
@@ -524,13 +505,11 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
-    """OPTIMIZED: Choose parallel vs serial based on size and config"""
     try:
         if arr is None or len(arr) == 0:
             logger.warning(f"Indicator {name} is None or empty")
             return np.array([default], dtype=np.float64)
         
-        # Use parallel version for large arrays when enabled
         if cfg.NUMBA_PARALLEL and len(arr) >= 200:
             sanitized = _sanitize_array_numba_parallel(arr, default)
         else:
@@ -545,20 +524,13 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
-# =============================================================================
-# PARALLEL IMPLEMENTATIONS
-# =============================================================================
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Original serial SMA (fallback)"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-
     window_sum = 0.0
     count = 0
-
     for i in range(n):
         val = data[i]
         if not np.isnan(val):
@@ -570,14 +542,11 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
             if not np.isnan(old_val):
                 window_sum -= old_val
                 count -= 1
-
-        # Calculate from first bar onwards (no min_periods requirement to match Pine)
         if count > 0:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
     return out
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
@@ -601,15 +570,9 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
         worm_arr[i] = prev_worm + delta
     return worm_arr
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
-    # Pine initializes with: value = 0.5 * 2 = 1.0, then applies formula
-    # But the formula is: value := value * (temp - .5 + .5 * nz(value[1]))
-    # On first bar (i=0): value[1] doesn't exist, so nz(value[1]) = 0
-    # value := 1.0 * (temp[0] - 0.5 + 0.5 * 0) = temp[0] - 0.5
-    # For consistency with Pine's var initialization behavior:
     value_arr[0] = 0.0
 
     for i in range(1, rows):
@@ -619,7 +582,6 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
         value_arr[i] = max(-0.9999, min(0.9999, v))
     return value_arr
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     for i in range(1, rows):
@@ -627,10 +589,8 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Original serial version (fallback)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.0001, min(1.0, responsiveness))
@@ -657,10 +617,8 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
             sd[i] = 0.0
     return sd
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """Original serial version (fallback)"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
 
@@ -683,7 +641,6 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int):
-    """Original serial version"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -694,45 +651,35 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int):
         max_arr[i] = np.nanmax(arr[start:i + 1])
     return min_arr, max_arr
 
-
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMISED: Parallel SMA calculation"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-
     for i in prange(n):
         window_sum = 0.0
         count = 0
-
         start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = data[j]
             if not np.isnan(val):
                 window_sum += val
                 count += 1
-
-        # Calculate from first bar onwards (no min_periods to match Pine)
         if count > 0:
             out[i] = window_sum / count
         else:
             out[i] = np.nan
     return out
 
-
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float):
-    """OPTIMISED: Parallel rolling standard deviation using Welford's algorithm."""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.0001, min(1.0, responsiveness))
-
     for i in prange(n):
         mean = 0.0
         m2 = 0.0
         count = 0
-
         start = max(0, i - period + 1)
         for j in range(start, i + 1):
             val = close[j]
@@ -742,7 +689,6 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                 mean += delta / count
                 delta2 = val - mean
                 m2 += delta * delta2
-
         if count > 1:
             variance = m2 / count          # population
             sd[i] = np.sqrt(max(0.0, variance)) * resp
@@ -750,10 +696,8 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
             sd[i] = 0.0
     return sd
 
-
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMISED: Parallel rolling mean calculation"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
 
@@ -761,23 +705,19 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
         start = max(0, i - period + 1)
         sum_val = 0.0
         count = 0
-
         for j in range(start, i + 1):
             val = close[j]
             if not np.isnan(val):
                 sum_val += val
                 count += 1
-
         if count > 0:
             ma[i] = sum_val / count
         else:
             ma[i] = np.nan
     return ma
 
-
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
-    """OPTIMISED: Parallel rolling min/max"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -790,23 +730,10 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """
-    Calculate EMA matching Pine Script's ta.ema() behavior
-    
-    Args:
-        data: Input array
-        period: EMA period
-        
-    Returns:
-        EMA values as numpy array
-    """
     n = len(data)
     alpha = 2.0 / (period + 1)
     out = np.empty(n, dtype=np.float64)
-    
-    # Initialize with first valid value
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-    
+    out[0] = data[0] if not np.isnan(data[0]) else 0.0 
     for i in range(1, n):
         curr = data[i]
         if np.isnan(curr):
@@ -819,27 +746,22 @@ def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
 @njit(nogil=True, fastmath=True, cache=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     n = len(src)
-    result = np.empty(n, dtype=np.float64)
-    
+    result = np.empty(n, dtype=np.float64)    
     estimate = src[0] if not np.isnan(src[0]) else 0.0
     error_est = 1.0
     error_meas = R * max(1.0, float(length))
-    Q_div_length = Q / max(1.0, float(length))
-    
+    Q_div_length = Q / max(1.0, float(length))    
     for i in range(n):
         current = src[i]
         if np.isnan(current):
             result[i] = estimate
-            continue
-            
+            continue          
         if np.isnan(estimate):
-            estimate = current
-            
+            estimate = current           
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
         estimate = prediction + kalman_gain * (current - prediction)
-        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
-        
+        error_est = (1.0 - kalman_gain) * error_est + Q_div_length      
         result[i] = estimate        
     return result
 
@@ -862,46 +784,23 @@ def _vwap_daily_loop(
         ts = timestamps[i]
         day = ts // 86400  # Resets exactly at 00:00:00 UTC
         h, l, c, v = high[i], low[i], close[i], volume[i]
-
-        # 1. Daily Reset Logic
         if day != current_session_day:
             current_session_day = day
             cum_vol = 0.0
             cum_pv  = 0.0
 
-        # 2. Handle Invalid Data
         if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
             vwap[i] = vwap[i-1] if i > 0 else c
             continue
-
-        # 3. HLC3 Typical Price Calculation
-        typical_price = (h + l + c) / 3.0
-        
-        # 4. Accumulate (Includes the first candle of the day)
+        typical_price = (h + l + c) / 3.0  
         cum_vol += v
         cum_pv  += typical_price * v
-        
-        # 5. Output VWAP
         vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical_price
 
     return vwap
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """
-    Apply range filter matching Pine Script's rngfilt logic
-    
-    Logic:
-    - If price > previous filter: new filter = max(prev_filter, price - range)
-    - If price < previous filter: new filter = min(prev_filter, price + range)
-    
-    Args:
-        x: Price data (typically close)
-        r: Range values
-        
-    Returns:
-        Filtered values
-    """
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
     filt[0] = x[0] if not np.isnan(x[0]) else 0.0
@@ -910,62 +809,36 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
         prev_filt = filt[i - 1]
         curr_x = x[i]
         curr_r = r[i]
-        
-        # Handle NaN values
         if np.isnan(curr_r) or np.isnan(curr_x):
             filt[i] = prev_filt
-            continue
-        
-        # Apply range filter logic
+            continue 
         if curr_x > prev_filt:
-            # Price above filter: move up but not below previous
             target = curr_x - curr_r
             filt[i] = max(prev_filt, target)
         else:
-            # Price below filter: move down but not above previous
             target = curr_x + curr_r
             filt[i] = min(prev_filt, target)
     
     return filt
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
-    """
-    Calculate smoothed range matching Pine Script's smoothrngX1 function
-    
-    Args:
-        close: Close prices
-        t: First smoothing period (X1 or X3)
-        m: Multiplier (X2 or X4)
-        
-    Returns:
-        Smoothed range values
-    """
     n = len(close)
-    
-    # Calculate absolute price changes
     diff = np.zeros(n, dtype=np.float64)
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i-1])
-    
-    # First EMA: average range
     avrng = _ema_loop(diff, t)
-    
-    # Second EMA: smooth the average range
     wper = t * 2 - 1
     smoothrng = _ema_loop(avrng, wper)
     
-    # Apply multiplier
     return smoothrng * m
 
 # ============================================================================
-# OPTIMIZATION 4: Streamlined PPO/RSI with Reduced Allocations
+# PART 3: Indicator Functions
 # ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Core PPO calculation - fully compiled with GIL released."""
     n = len(close)
     
     alpha_fast = 2.0 / (fast + 1)
@@ -973,15 +846,12 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) ->
     
     alpha_slow = 2.0 / (slow + 1)
     slow_ma = _ema_loop(close, alpha_slow)
-    
-    # OPTIMIZED: Pre-allocate and fill in one pass
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
         if abs(slow_ma[i]) < 1e-12:
             ppo[i] = 0.0
         else:
             ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-    
     alpha_signal = 2.0 / (signal + 1)
     ppo_sig = _ema_loop(ppo, alpha_signal)
     
@@ -989,10 +859,7 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) ->
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
-    """Core RSI calculation with GIL released."""
     n = len(close)
-    
-    # OPTIMIZED: Combined delta calculation and gain/loss separation
     delta = np.zeros(n, dtype=np.float64)
     gain = np.zeros(n, dtype=np.float64)
     loss = np.zeros(n, dtype=np.float64)
@@ -1002,12 +869,10 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
         if delta[i] > 0:
             gain[i] = delta[i]
         elif delta[i] < 0:
-            loss[i] = -delta[i]
-    
+            loss[i] = -delta[i]   
     alpha = 1.0 / rsi_len
     avg_gain = _ema_loop(gain, alpha)
-    avg_loss = _ema_loop(loss, alpha)
-    
+    avg_loss = _ema_loop(loss, alpha)   
     rsi = np.empty(n, dtype=np.float64)
     for i in range(n):
         if avg_loss[i] < 1e-10:
@@ -1019,7 +884,6 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
     return rsi
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
-    """Wrapper for smooth RSI - minimal GIL time."""
     try:
         if close is None or len(close) < rsi_len:
             logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
@@ -1028,7 +892,6 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
         rsi = _calculate_rsi_core(close, rsi_len)
         smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
-        # OPTIMIZED: Conditional parallel sanitization
         if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
             smooth_rsi = _sanitize_array_numba_parallel(smooth_rsi, 50.0)
         else:
@@ -1049,7 +912,6 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         
         ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
         
-        # OPTIMIZED: Conditional parallel sanitization
         if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
             ppo = _sanitize_array_numba_parallel(ppo, 0.0)
             ppo_sig = _sanitize_array_numba_parallel(ppo_sig, 0.0)
@@ -1079,34 +941,17 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
         if data is None or len(data) < period:
             logger.warning(f"RMA: Insufficient data (len={len(data) if data is not None else 0})")
-            return np.zeros_like(data) if data is not None else np.array([0.0])
-        
+            return np.zeros_like(data) if data is not None else np.array([0.0])       
         alpha = 1.0 / period
         rma = _ema_loop(data, alpha)
         rma = sanitize_indicator_array(rma, f"RMA_{period}", default=0.0)
-        return rma
-        
+        return rma       
     except Exception as e:
         logger.error(f"RMA calculation failed: {e}")
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
 def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Calculate Cirrus Cloud trend indicator using global config
-    (Original function name preserved)
-    
-    Args:
-        close: Close price array
-        
-    Returns:
-        Tuple of (upw, dnw, filt_x1, filt_x12)
-        - upw: Boolean array indicating uptrend
-        - dnw: Boolean array indicating downtrend
-        - filt_x1: First filtered values
-        - filt_x12: Second filtered values
-    """
     try:
-        # Validate input
         if close is None or len(close) < max(cfg.X1, cfg.X3):
             logger.warning(
                 f"Cirrus Cloud: Insufficient data (len={len(close) if close is not None else 0})"
@@ -1119,18 +964,14 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
                 np.zeros(default_len, dtype=np.float64)
             )
         
-        # Ensure float64
         close = np.asarray(close, dtype=np.float64)
         
-        # Calculate smoothed ranges
         smrng_x1 = _smooth_range(close, cfg.X1, cfg.X2)
         smrng_x2 = _smooth_range(close, cfg.X3, cfg.X4)
         
-        # Apply range filters
         filt_x1 = _rng_filter_loop(close, smrng_x1)
         filt_x12 = _rng_filter_loop(close, smrng_x2)
         
-        # Determine trends (using original variable names)
         upw = filt_x1 < filt_x12
         dnw = filt_x1 > filt_x12
         
@@ -1146,24 +987,14 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
 
-# ============================================================================
-# OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
-# ============================================================================
-
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """OPTIMISED: MMH with conditional parallel execution - Corrected to match PineScript exactly"""
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-
-        # ensure contiguous array
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-
-        # --- standard deviation (FIXED at 50 periods to match Pine) ---
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
@@ -1171,18 +1002,15 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
 
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
 
-        # --- rolling mean (uses input period parameter) ---
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
             ma = _rolling_mean_numba(close_c, period)
 
-        # --- CORRECTED: raw momentum uses worm as denominator (not ma) ---
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # --- rolling min / max ---
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
@@ -1197,7 +1025,6 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         value_arr = _calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
-        # --- CORRECTED: log transform as per Pine (no abs/sign manipulation) ---
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
             temp2 = np.clip(temp2, 1e-9, 1e9)
@@ -1224,26 +1051,20 @@ def _vectorized_wick_check_buy(
     low_arr: np.ndarray, 
     close_arr: np.ndarray,
     min_wick_ratio: float
-) -> np.ndarray:
-    
+) -> np.ndarray:   
     n = len(close_arr)
-    result = np.zeros(n, dtype=np.bool_)
-    
+    result = np.zeros(n, dtype=np.bool_)   
     for i in range(n):
-        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
-        
+        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]     
         if c <= o:
             result[i] = False
-            continue
-        
+            continue      
         candle_range = h - l
         if candle_range < 1e-8:
             result[i] = False
-            continue
-        
+            continue    
         upper_wick = h - c
-        wick_ratio = upper_wick / candle_range
-        
+        wick_ratio = upper_wick / candle_range    
         result[i] = wick_ratio < min_wick_ratio
     
     return result
@@ -1256,25 +1077,19 @@ def _vectorized_wick_check_sell(
     close_arr: np.ndarray,
     min_wick_ratio: float
 ) -> np.ndarray:
-   
     n = len(close_arr)
-    result = np.zeros(n, dtype=np.bool_)
-    
+    result = np.zeros(n, dtype=np.bool_)  
     for i in range(n):
-        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
-        
+        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]     
         if c >= o:
             result[i] = False
-            continue
-        
+            continue    
         candle_range = h - l
         if candle_range < 1e-8:
             result[i] = False
-            continue
-        
+            continue  
         lower_wick = c - l
-        wick_ratio = lower_wick / candle_range
-        
+        wick_ratio = lower_wick / candle_range     
         result[i] = wick_ratio < min_wick_ratio
     
     return result
@@ -1285,12 +1100,8 @@ def _vectorized_wick_check_sell(
 # ============================================================================
 
 def warmup_numba() -> None:
-    """OPTIMIZED: Always check for AOT cache, skip JIT warmup if SKIP_WARMUP=true"""
     cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
-
-    # ALWAYS check if AOT-compiled cache exists (regardless of SKIP_WARMUP)
     if cache_dir.exists():
-        # ✅ Look for both .nbi and .nbc files
         cache_files = list(cache_dir.rglob('*.nbi')) + list(cache_dir.rglob('*.nbc'))
         if len(cache_files) > 15:  # Expect at least 15 compiled functions
             logger.info(
@@ -1298,7 +1109,6 @@ def warmup_numba() -> None:
             )
             return
 
-    # If no AOT cache, check if we should do JIT warmup
     if getattr(cfg, "SKIP_WARMUP", False):
         logger.warning(
             "⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)"
@@ -1307,7 +1117,6 @@ def warmup_numba() -> None:
 
     logger.info("⚠️  AOT cache not found - performing JIT warmup...")
 
-    # Original warmup code continues below...
     try:
         length_small = 100
         length_large = 400
@@ -1435,10 +1244,6 @@ def calculate_all_indicators_numpy(
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
 ) -> Dict[str, np.ndarray]:
-    """OPTIMIZED: Disable GC during all indicator calculations"""
-    
-    # CRITICAL FIX: Disable GC for entire indicator calculation
-    # This prevents GC checks during intermediate array allocations
     gc_was_enabled = gc.isenabled()
     if gc_was_enabled:
         gc.disable()
@@ -1481,13 +1286,11 @@ def calculate_all_indicators_numpy(
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
         
         if cfg.ENABLE_PIVOT and data_daily is not None:
-            # Quick check: is price within 5% of yesterday's high/low range?
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
             daily_low = float(data_daily["low"][-1])
             daily_range = daily_high - daily_low
             
-            # If price is far from yesterday's range, skip pivot calculation
             if abs(last_close - daily_high) < daily_range * 0.5 or \
                abs(last_close - daily_low) < daily_range * 0.5:
                 results['pivots'] = calculate_pivot_levels_numpy(
@@ -1499,10 +1302,8 @@ def calculate_all_indicators_numpy(
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Skipped pivot calc (price {last_close:.2f} far from range {daily_low:.2f}-{daily_high:.2f})")
         else:
-            results['pivots'] = {}
-        
-        return results
-        
+            results['pivots'] = {}    
+        return results        
     finally:
         if gc_was_enabled:
             gc.enable()
@@ -1900,9 +1701,7 @@ class RateLimitedFetcher:
             "max_per_minute": self.max_per_minute
         }
 
-class APICircuitBreaker:
-    """Prevents cascading failures when API is degraded"""
-    
+class APICircuitBreaker:  
     def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 60):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
@@ -1912,7 +1711,6 @@ class APICircuitBreaker:
         self.success_count = 0
         
     def record_success(self) -> None:
-        """Record successful API call"""
         if self.state == "HALF_OPEN":
             self.success_count += 1
             if self.success_count >= 2:
@@ -1921,12 +1719,10 @@ class APICircuitBreaker:
                 self.failures = 0
                 self.success_count = 0
         elif self.state == "CLOSED":
-            # Reset failure count on success
             if self.failures > 0:
                 self.failures = max(0, self.failures - 1)
     
     def record_failure(self) -> None:
-        """Record failed API call"""
         self.failures += 1
         self.last_failure_time = time.time()
         
@@ -1938,12 +1734,10 @@ class APICircuitBreaker:
             self.state = "OPEN"
     
     def can_attempt(self) -> Tuple[bool, Optional[str]]:
-        """Check if request should be allowed"""
         if self.state == "CLOSED":
             return True, None
         
         if self.state == "OPEN":
-            # Check if recovery timeout has passed
             elapsed = time.time() - self.last_failure_time
             if elapsed >= self.recovery_timeout:
                 logger.info("🟡 Circuit breaker: Transitioning to HALF_OPEN (testing recovery)")
@@ -1953,7 +1747,6 @@ class APICircuitBreaker:
             
             return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
         
-        # HALF_OPEN: Allow limited requests to test recovery
         return True, None
 
 class DataFetcher:
@@ -2033,8 +1826,6 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-    
-        # ⚡ NEW: Check circuit breaker
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked request for {symbol}: {reason}")
@@ -2044,19 +1835,14 @@ class DataFetcher:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
-        # Determine interval in minutes
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
         
-        # 1. FIX: Calculate the strict expected open of the last closed candle
         expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
 
-        # 2. FIX: Request a wider window to handle API publication lag.
-        # We add extra buffer to the 'to' time so the API doesn't truncate the latest candle.
         buffer_periods = 3 # Increased buffer
         to_time = reference_time + (interval_seconds * buffer_periods)
         
-        # Ensure we look back far enough to get 'limit' candles even with the buffer
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
@@ -2091,7 +1877,6 @@ class DataFetcher:
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
                         diff = abs(expected_open_ts - last_candle_open_ts)
 
-                        # LOGGING LOGIC
                         if diff > 300: # Over 5 minutes difference
                             if last_candle_open_ts < expected_open_ts:
                                 # This is the "API Lag" warning we want to monitor
@@ -2238,19 +2023,16 @@ def validate_candle_data(
         if data is None or not data:
             return False, "Data is None or empty"
         
-        # ⚡ NEW: Data Freshness Check
         close = data.get("close")
         timestamp = data.get("timestamp")
         
         if timestamp is None or len(timestamp) == 0:
             return False, "Timestamp array is empty"
         
-        # Check if data is stale (API frozen/cached)
         current_time = get_trigger_timestamp()
         last_candle_time = int(timestamp[-1])
         staleness = current_time - last_candle_time
         
-        # Allow 15min candle + 2min buffer for API lag
         MAX_STALENESS = (15 * 60) + 120  # 17 minutes
         
         if staleness > MAX_STALENESS:
@@ -2339,7 +2121,6 @@ def get_last_closed_index_from_array(
         ),
     )
     return last_closed_idx
-
 
 def validate_candle_timestamp(
     candle_ts: int,
@@ -2822,11 +2603,9 @@ class RedisStateStore:
     
         try:
             async with self._redis.pipeline() as pipe:
-                # Phase 1: MGET for previous states
                 state_keys = [f"{pair}:{k}" for k in alert_keys]
                 pipe.mget(state_keys)
             
-                # Phase 2: SET for state updates
                 now = int(time.time())
                 for key, state, custom_ts in state_updates:
                     ts = custom_ts if custom_ts is not None else now
@@ -2837,20 +2616,16 @@ class RedisStateStore:
                     else:
                         pipe.set(full_key, data)
             
-                # Phase 3: SET NX for dedup
                 for pair_name, alert_key, ts in dedup_checks:
                     window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                     recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                     pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
             
-                # Execute all at once
                 results = await asyncio.wait_for(pipe.execute(), timeout=4.0)
         
-            # Parse results
             num_state_keys = len(state_keys)
             num_updates = len(state_updates)
         
-            # Previous states (first N results from MGET)
             prev_states = {}
             mget_results = results[0] if results else []
             for idx, key in enumerate(alert_keys):
@@ -2864,7 +2639,6 @@ class RedisStateStore:
                 else:
                     prev_states[key] = False
         
-            # Dedup results (results after MGET and SETs)
             dedup_results = {}
             dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
             for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
@@ -2876,7 +2650,6 @@ class RedisStateStore:
         
         except Exception as e:
             logger.error(f"atomic_eval_batch failed: {e}")
-            # Fallback to individual operations
             prev_states = await self.mget_states(state_keys)
             await self.batch_set_states(state_updates)
             dedup_results = await self.batch_check_recent_alerts(dedup_checks)
@@ -3145,9 +2918,6 @@ def _validate_pivot_cross(
     level: str, 
     is_buy: bool
 ) -> Tuple[bool, Optional[str]]:
-    """
-    Returns (is_valid_cross, suppression_reason_or_None)
-    """
     if not ctx.get("pivots") or level not in ctx["pivots"]:
         return False, "Pivot level missing"
 
@@ -3385,14 +3155,12 @@ async def evaluate_pair_and_alert(
     PAIR_ID.set(pair_name)
 
     try:
-        # === STEP 1: CLOSED CANDLE INDICES ===
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5  = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
             return None
 
-        # === STEP 2: DOJI PRE-CHECK ===
         close_15m    = data_15m["close"]
         open_15m     = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
@@ -3404,7 +3172,6 @@ async def evaluate_pair_and_alert(
             logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
             return None
 
-        # === STEP 3: CALCULATE INDICATORS ===
         indicators = await asyncio.to_thread(calculate_all_indicators_numpy, data_15m, data_5m, data_daily)
         ppo        = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
@@ -3417,7 +3184,6 @@ async def evaluate_pair_and_alert(
         rma200_5   = indicators["rma200_5"]
         piv        = indicators["pivots"]
 
-        # === STEP 4: EXTRACT VALUES ===
         close_curr   = close_15m[i15]
         close_prev   = close_15m[i15 - 1]
         close_5m_val = data_5m["close"][i5]
@@ -3429,12 +3195,10 @@ async def evaluate_pair_and_alert(
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
-        # === STEP 5: TIMESTAMP VALIDATION ===
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             logger_pair.info(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
 
-        # === STEP 6: PIVOT DAY RESET ===
         if piv and cfg.ENABLE_PIVOT:
             current_day = int(ts_curr // 86400)
             pivot_day_key = f"{pair_name}:pivot_day"
@@ -3451,7 +3215,6 @@ async def evaluate_pair_and_alert(
                     await sdb.atomic_batch_update([], deletes=delete_keys)
                 await sdb.set_metadata(pivot_day_key, str(current_day))
 
-        # === STEP 7: INDICATOR VALUES ===
         ppo_curr, ppo_prev         = ppo[i15], ppo[i15 - 1]
         ppo_sig_curr, ppo_sig_prev = ppo_signal[i15], ppo_signal[i15 - 1]
         rsi_curr, rsi_prev         = smooth_rsi[i15], smooth_rsi[i15 - 1]
@@ -3461,7 +3224,6 @@ async def evaluate_pair_and_alert(
         cloud_up   = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
-        # === STEP 8: TREND & CANDLE QUALITY ===
         base_buy_trend  = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
         if base_buy_trend:
@@ -3478,7 +3240,6 @@ async def evaluate_pair_and_alert(
         buy_common  = base_buy_trend and buy_candle_passed and is_green_candle
         sell_common = base_sell_trend and sell_candle_passed and is_red_candle
 
-        # === STEP 9: MMH REVERSAL ===
         mmh_reversal_buy  = False
         mmh_reversal_sell = False
         if i15 >= 3:
@@ -3492,18 +3253,9 @@ async def evaluate_pair_and_alert(
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
 
-        logger_pair.info(
-            f"{pair_name} | MMH: {mmh_curr:+.2f} | "
-            f"{'🟢' if mmh_curr > 0 else '🔴'} | "
-            f"Price: ${close_curr:.2f}"
-        )
-
-        # === FIX: ensure summary strings exist ===
         if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
         if 'sell_candle_reason' not in locals(): sell_candle_reason = None
 
-        
-        # === STEP 11: CONTEXT BUILD ===
         context = {
             "buy_common": buy_common, "sell_common": sell_common,
             "close_curr": close_curr, "close_prev": close_prev,
@@ -3523,7 +3275,6 @@ async def evaluate_pair_and_alert(
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
-        # === STEP 12: ALERT EVALUATION ===
         raw_alerts = []
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
@@ -3552,7 +3303,6 @@ async def evaluate_pair_and_alert(
                 raw_alerts.append((def_["title"], extra, def_["key"]))
                 all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
 
-        # === STEP 13: STATE RESETS ===
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
@@ -3573,7 +3323,6 @@ async def evaluate_pair_and_alert(
         if (mmh_curr < 0 and mmh_curr >= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        # === STEP 14: ATOMIC BATCH UPDATE ===
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
         if all_state_changes or dedup_checks:
             previous_states, dedup_results = await sdb.atomic_eval_batch(
@@ -3582,7 +3331,6 @@ async def evaluate_pair_and_alert(
         else:
             dedup_results = {}
 
-        # === STEP 15: SEND ALERTS ===
         alerts_to_send = []
         if raw_alerts:
             for title, extra, ak in raw_alerts:
@@ -3601,7 +3349,6 @@ async def evaluate_pair_and_alert(
                 await telegram_queue.send(msg)
             logger_pair.info(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _, _, ak in alerts_to_send]}")
 
-        # === STEP 16: SUMMARY ===
         reasons = []
         if not buy_common and not sell_common: reasons.append("Trend filter blocked")
         if context.get("candle_quality_failed_buy"): reasons.append(f"BUY quality: {buy_candle_reason}")
@@ -3640,7 +3387,6 @@ async def process_pairs_with_workers(
 ) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
     
-    # 1. PHASE 1: PARALLEL DATA FETCH
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
     
@@ -3660,14 +3406,10 @@ async def process_pairs_with_workers(
         
         pair_requests.append((symbol, resolutions))
     
-    # Fetch all candles. We trust fetch_all_candles_truly_parallel to use 
-    # calculate_expected_candle_timestamp internally.
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
     
-    # 2. PHASE 2: PARSE & VALIDATE
-    # ✅ OPTIMIZED: PHASE 2 REMOVED - Parsing happens in Phase 3 workers
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     valid_tasks = []
     
@@ -3677,28 +3419,22 @@ async def process_pairs_with_workers(
         
         symbol = product_info["symbol"]
         candles = all_candles.get(symbol, {})
-        
-        # Just pass raw candles - parsing happens in worker
+       
         valid_tasks.append((pair_name, candles))
 
-
-    # 3. PHASE 3: EVALUATE WITH CONCURRENCY CONTROL (Semaphore)
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
-    # Use MAX_PARALLEL_FETCH (e.g. 12) to limit concurrent Redis/CPU usage
     semaphore = asyncio.Semaphore(cfg.MAX_PARALLEL_FETCH)
     
     async def guarded_eval(task_data):
         async with semaphore:
             p_name, candles = task_data
             try:
-                # ✅ Parse and validate inside worker (parallel execution)
                 data_15m = parse_candles_to_numpy(candles.get("15"))
                 data_5m = parse_candles_to_numpy(candles.get("5"))
                 data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
                 
-                # Quick validation
                 v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
                 if not v15:
                     logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
@@ -3723,8 +3459,6 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once() -> bool:
-    """OPTIMIZED: Smarter caching and parallel execution"""
-
     gc.disable()
 
     correlation_id = uuid.uuid4().hex[:8]
@@ -3759,12 +3493,9 @@ async def run_once() -> bool:
             )
             return False
 
-        # OPTIMIZED: Use configurable cache TTL
-        # ⚡ OPTIMIZED: Use static map with API fallback
         products_map = None
         pairs_to_process = []
 
-        # Try static map first
         USE_STATIC_MAP = True  # Set to False to force API fetch
         STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
 
@@ -3773,8 +3504,6 @@ async def run_once() -> bool:
 
 
         if USE_STATIC_MAP:
-            # If cache has been set in-memory, derive "days since check" from it.
-            # Note: PRODUCTS_CACHE["until"] stores expiry; we back out last check as (until - TTL).
             if last_check_ts and last_check_ts > 0:
                 days_since_check = max(0.0, (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400)
             else:
@@ -3784,7 +3513,6 @@ async def run_once() -> bool:
                 logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
                 products_map = STATIC_PRODUCTS_MAP.copy()
             else:
-                # Announce refresh with guard
                 if last_check_ts <= 0:
                     logger_run.debug("🔄 Refreshing products map from API (last check: never)")
                 else:
@@ -3792,7 +3520,6 @@ async def run_once() -> bool:
                 USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
-            # Fallback to API fetch
             logger_run.debug("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
@@ -3803,7 +3530,6 @@ async def run_once() -> bool:
             else:
                 products_map = build_products_map_from_api_result(prod_resp)
 
-                # Update last check timestamp
                 if sdb:
                     await sdb.set_metadata(last_api_check_key, str(now))
                     logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
@@ -3982,9 +3708,6 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
 
-        # ✅ REMOVED: Redis pool shutdown (keeping alive)
-        # ✅ REMOVED: HTTP session close (keeping alive)
-
         try:
             if 'all_results' in locals():
                 del all_results
@@ -4042,18 +3765,14 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-            # AOT-aware warmup: skips if cache exists, otherwise JIT compiles
     if not args.skip_warmup and not cfg.SKIP_WARMUP:
         warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
     async def main_with_cleanup():
-
-        """Run bot with proper cleanup on exit"""
         try:
             return await run_once()
         finally:
-            # ✅ NEW: Cleanup persistent connections on shutdown
             logger.info("🧹 Shutting down persistent connections...")
             try:
                 await RedisStateStore.shutdown_global_pool()
@@ -4077,7 +3796,6 @@ if __name__ == "__main__":
             sys.exit(1)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Bot stopped by timeout or user interrupt")
-        # Cleanup happens in finally block above
         sys.exit(130)
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
