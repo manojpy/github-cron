@@ -52,6 +52,10 @@ except ImportError:
 
 __version__ = "1.4.0-performance-optimized"
 
+MMH_VALUE_CLIP = 0.9999
+ZERO_DIVISION_GUARD = 1e-12
+INFINITY_CLAMP = 1e8
+
 class Constants:
     MIN_WICK_RATIO = 0.2
     PPO_THRESHOLD_BUY = 0.20
