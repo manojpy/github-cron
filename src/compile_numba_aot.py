@@ -53,24 +53,19 @@ open_data = (close_data - 0.01).astype(np.float64)
 vol_data = np.random.random(size).astype(np.float64)
 ts_data = np.linspace(1600000000, 1600086400, size).astype(np.int64)
 
-# Define variables that were missing in your previous version
-close_small = close_data[:size] # Ensure we have data for 'close_small'
-close_large = close_data
-open_arr = open_data
-high_arr = high_data
-low_arr = low_data
+
+r_array = np.ones(size, dtype=np.float64) * 1.0
 
 # 4. Compilation Registry
-
 functions_to_compile = [
     ("_sanitize_array_numba", lambda: _sanitize_array_numba(close_data, 0.0)),
     ("_sanitize_array_numba_parallel", lambda: _sanitize_array_numba_parallel(close_data, 0.0)),
     ("_sma_loop", lambda: _sma_loop(close_data, 50)),
     ("_sma_loop_parallel", lambda: _sma_loop_parallel(close_data, 50)),
     ("_ema_loop", lambda: _ema_loop(close_data, 14)),
-    ("_kalman_loop", lambda: _kalman_loop(close_data, 14)), 
+    ("_kalman_loop", lambda: _kalman_loop(close_data, 14, 0.01, 0.1)),  # ðŸ"¥ FIXED: Added R and Q params
     ("_vwap_daily_loop", lambda: _vwap_daily_loop(high_data, low_data, close_data, vol_data, ts_data)),
-    ("_rng_filter_loop", lambda: _rng_filter_loop(close_data, 1.0)), 
+    ("_rng_filter_loop", lambda: _rng_filter_loop(close_data, r_array)),  # ðŸ"¥ FIXED: Pass array instead of float
     ("_smooth_range", lambda: _smooth_range(close_data, 14, 2)),
     ("_calc_mmh_worm_loop", lambda: _calc_mmh_worm_loop(close_data, close_data, size)),
     ("_calc_mmh_value_loop", lambda: _calc_mmh_value_loop(close_data, size)),
@@ -86,11 +81,6 @@ functions_to_compile = [
     ("_vectorized_wick_check_buy", lambda: _vectorized_wick_check_buy(open_data, high_data, low_data, close_data, 0.2)),
     ("_vectorized_wick_check_sell", lambda: _vectorized_wick_check_sell(open_data, high_data, low_data, close_data, 0.2))
 ]
-
-
-
-
-
 
 # 5. Execution Loop
 compiled_count = 0
