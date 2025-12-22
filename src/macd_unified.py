@@ -3518,27 +3518,33 @@ async def run_once() -> bool:
         STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
 
         now = time.time()
+
         def should_refresh_products(cache_dict, static_enabled, days_threshold):
             if not static_enabled:
                 return True
-    
             last_check = cache_dict.get("until", 0.0)
             if not last_check or last_check <= 0:
                 return True
-    
             days_since = (time.time() - (last_check - cfg.PRODUCTS_CACHE_TTL)) / 86400
             return days_since >= days_threshold
 
+        # Track last check timestamp
+        last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
+        days_since_check = (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400 if last_check_ts else 9999
+
         if should_refresh_products(PRODUCTS_CACHE, USE_STATIC_MAP, STATIC_MAP_REFRESH_DAYS):
-   
             if days_since_check < STATIC_MAP_REFRESH_DAYS:
-                logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
+                logger_run.info(
+                    f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)"
+                )
                 products_map = STATIC_PRODUCTS_MAP.copy()
             else:
                 if last_check_ts <= 0:
                     logger_run.debug("🔄 Refreshing products map from API (last check: never)")
                 else:
-                    logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)")
+                    logger_run.debug(
+                        f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)"
+                    )
                 USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
@@ -3547,28 +3553,11 @@ async def run_once() -> bool:
             prod_resp = await temp_fetcher.fetch_products()
 
             if not prod_resp:
-                logger_run.warning("⚠️ API fetch failed, falling back to static map")
-                products_map = STATIC_PRODUCTS_MAP.copy()
-            else:
-                products_map = build_products_map_from_api_result(prod_resp)
-
-                if sdb:
-                    last_api_check_key = "products:last_api_check"
-                    await sdb.set_metadata(last_api_check_key, str(now))
-                    logger_run.info(f"�� Products list fetched from API ({len(products_map)} pairs)")
-            else:
-                days_ago = (now - last_check_ts) / 86400
-                logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
-
-            temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
-            prod_resp = await temp_fetcher.fetch_products()
-
-            if not prod_resp:
                 logger_run.error("❌ Failed to fetch products map - aborting run")
                 return False
 
             PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL  # OPTIMIZED: Configurable
+            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
             run_once._products_cache = PRODUCTS_CACHE
 
             cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
@@ -3756,7 +3745,6 @@ try:
     logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
