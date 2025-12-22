@@ -2953,7 +2953,7 @@ BUY_PIVOT_DEFS = [
         check_fn: lambda ctx, level=level: (
             ctx["buy_common"] and ctx.get(f'pivot_valid_{level}', (False, None))[0]
                if not _validate_pivot_cross(ctx, level, True)[0] and ctx.get("pivots") else "")
-        ),
+        )
         "requires": ["pivots"]
     }
     for level in ["P", "S1", "S2", "S3", "R1", "R2"]
