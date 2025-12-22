@@ -16,7 +16,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax Check
         run: |
-          # Check all Python files except the AOT compilation script (needs special env)
           find . -name "*.py" ! -path "./src/compile_numba_aot.py" -exec python3 -m py_compile {} + &
           python3 -c "import json; json.load(open('config_macd.json'))" &
           wait
@@ -41,9 +40,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Warm up base image
-        run: docker pull python:3.11-slim-bookworm
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -62,11 +58,3 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
-          provenance: true
-          sbom: true
-
-      - name: Verify image
-        run: |
-          docker pull ${{ env.IMAGE_NAME }}:latest
-          SIZE_MB=$(docker inspect ${{ env.IMAGE_NAME }}:latest --format='{{.Size}}' | awk '{print $1/1024/1024}')
-          echo "📦 Image size: ${SIZE_MB} MB"
