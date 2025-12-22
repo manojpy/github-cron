@@ -2915,66 +2915,76 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "mmh_sell", "title": "🟣⬇ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
 ]
 
+
 def _validate_pivot_cross(
-    ctx: Dict[str, Any], 
-    level: str, 
+    ctx: Dict[str, Any],
+    level: str,
     is_buy: bool
 ) -> Tuple[bool, Optional[str]]:
+    """Return (crossed?, None) or (False, reason)."""
     if not ctx.get("pivots") or level not in ctx["pivots"]:
         return False, "Pivot level missing"
 
     level_value = ctx["pivots"][level]
     close_curr = ctx["close_curr"]
-    
+
     price_diff_pct = abs(level_value - close_curr) / close_curr * 100
-    
     if price_diff_pct > cfg.PIVOT_MAX_DISTANCE_PCT:
         reason = (
             f"Pivot {level} too far: ${level_value:.2f} "
             f"(diff {price_diff_pct:.1f}% > {cfg.PIVOT_MAX_DISTANCE_PCT}%)"
         )
         return False, reason
-    
+
     if is_buy:
-        cross = (ctx["close_prev"] <= level_value) and (close_curr > level_value)
+        crossed = (ctx["close_prev"] <= level_value) and (close_curr > level_value)
     else:
-        cross = (ctx["close_prev"] >= level_value) and (close_curr < level_value)
-    
-    return cross, None
+        crossed = (ctx["close_prev"] >= level_value) and (close_curr < level_value)
+
+    return crossed, None
 
 BUY_PIVOT_DEFS = [
     {
-        "key": f"pivot_up_{level}", 
+        "key": f"pivot_up_{level}",
         "title": f"🟢⬆️ Cross above {level}",
-
-        pivot_result = _validate_pivot_cross(ctx, level, is_buy)
-        ctx[f'pivot_valid_{level}'] = pivot_result
-
-        check_fn: lambda ctx, level=level: (
-            ctx["buy_common"] and ctx.get(f'pivot_valid_{level}', (False, None))[0]
-               if not _validate_pivot_cross(ctx, level, True)[0] and ctx.get("pivots") else "")
-        )
-        "requires": ["pivots"]
+        "check_fn": lambda ctx, lvl=level: (
+            ctx["buy_common"]
+            and _validate_pivot_cross(ctx, lvl, is_buy=True)[0]
+        ),
+        "extra_fn": lambda ctx, lvl=level: (
+            f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
+            + (
+                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, True)[1]}]"
+                if not _validate_pivot_cross(ctx, lvl, True)[0] and ctx.get("pivots")
+                else ""
+            )
+        ),
+        "requires": ["pivots"],
     }
-    for level in ["P", "S1", "S2", "S3", "R1", "R2"]
+    for level in ("P", "S1", "S2", "S3", "R1", "R2")
 ]
 
 SELL_PIVOT_DEFS = [
     {
         "key": f"pivot_down_{level}",
         "title": f"🔴⬇️ Cross below {level}",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
-            ctx["sell_common"] and _validate_pivot_cross(ctx, level, is_buy=False)[0]
+        "check_fn": lambda ctx, ppo, ppo_sig, rsi, lvl=level: (
+            ctx["sell_common"]
+            and _validate_pivot_cross(ctx, lvl, is_buy=False)[0]
         ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, level=level: (
-            f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
-            + (f" [Suppressed: {_validate_pivot_cross(ctx, level, False)[1]}]" 
-               if not _validate_pivot_cross(ctx, level, False)[0] and ctx.get("pivots") else "")
+        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
+            f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
+            + (
+                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, False)[1]}]"
+                if not _validate_pivot_cross(ctx, lvl, False)[0] and ctx.get("pivots")
+                else ""
+            )
         ),
-        "requires": ["pivots"]
+        "requires": ["pivots"],
     }
-    for level in ["P", "S1", "S2", "R1", "R2", "R3"]
+    for level in ("P", "S1", "S2", "R1", "R2", "R3")
 ]
+
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
@@ -2982,15 +2992,14 @@ ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
 ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
 
 ALERT_KEYS: Dict[str, str] = {
-    d["key"]: f"ALERT:{d['key'].upper()}" 
-    for d in ALERT_DEFINITIONS
+    d["key"]: f"ALERT:{d['key'].upper()}" for d in ALERT_DEFINITIONS
 }
 
-for level in PIVOT_LEVELS:
-    ALERT_KEYS[f"pivot_up_{level}"] = f"ALERT:PIVOT_UP_{level}"
-    ALERT_KEYS[f"pivot_down_{level}"] = f"ALERT:PIVOT_DOWN_{level}"
+for lvl in PIVOT_LEVELS:
+    ALERT_KEYS[f"pivot_up_{lvl}"] = f"ALERT:PIVOT_UP_{lvl}"
+    ALERT_KEYS[f"pivot_down_{lvl}"] = f"ALERT:PIVOT_DOWN_{lvl}"
 
-logger.debug(f"Alert keys initialized: {len(ALERT_KEYS)} mappings")
+logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
 def validate_alert_definitions() -> None:
     errors = []
