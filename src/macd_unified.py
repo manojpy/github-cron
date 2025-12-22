@@ -52,10 +52,6 @@ except ImportError:
 
 __version__ = "1.4.0-performance-optimized"
 
-MMH_VALUE_CLIP = 0.9999
-ZERO_DIVISION_GUARD = 1e-12
-INFINITY_CLAMP = 1e8
-
 class Constants:
     MIN_WICK_RATIO = 0.2
     PPO_THRESHOLD_BUY = 0.20
@@ -549,6 +545,10 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         logger.error(f"Failed to sanitize indicator {name}: {e}")
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
+# =============================================================================
+# PARALLEL IMPLEMENTATIONS
+# =============================================================================
+
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """OPTIMIZED: Parallel SMA calculation with consistent logic"""
@@ -841,8 +841,8 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
-        # Use module-level constant instead of class constant
-        value_arr[i] = max(-MMH_VALUE_CLIP, min(MMH_VALUE_CLIP, v))
+        # Use literal values instead of Constants
+        value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
 
@@ -855,10 +855,6 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
         curr = momentum_arr[i] if not np.isnan(momentum_arr[i]) else 0.0
         momentum_arr[i] = curr + 0.5 * prev
     return momentum_arr
-
-# =============================================================================
-# MAIN CALCULATION FUNCTION
-# =============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
@@ -1271,24 +1267,24 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
         
-        # Normalize to 0-1 range (using module-level constant)
+        # Normalize to 0-1 range (using Constants class)
         denom = max_med - min_med
-        denom = np.where(np.abs(denom) < ZERO_DIVISION_GUARD, ZERO_DIVISION_GUARD, denom)
+        denom = np.where(np.abs(denom) < Constants.ZERO_DIVISION_GUARD, Constants.ZERO_DIVISION_GUARD, denom)
         temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
         # Calculate value array (always serial - sequential dependency)
         value_arr = _calc_mmh_value_loop(temp, rows)
-        # Clip using module-level constant
-        value_arr = np.clip(value_arr, -MMH_VALUE_CLIP, MMH_VALUE_CLIP)
+        # Clip using Constants class
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
         # Transform to momentum space
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            # Use module-level constant
-            temp2 = np.clip(temp2, -INFINITY_CLAMP, INFINITY_CLAMP)
-            temp2 = np.nan_to_num(temp2, nan=1.0, posinf=INFINITY_CLAMP, neginf=-INFINITY_CLAMP)
+            # Use Constants class
+            temp2 = np.clip(temp2, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
+            temp2 = np.nan_to_num(temp2, nan=1.0, posinf=Constants.INFINITY_CLAMP, neginf=-Constants.INFINITY_CLAMP)
         
         momentum = 0.25 * np.log(np.abs(temp2)) * np.sign(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
