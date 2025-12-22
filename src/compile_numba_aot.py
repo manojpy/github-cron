@@ -61,15 +61,16 @@ high_arr = high_data
 low_arr = low_data
 
 # 4. Compilation Registry
+
 functions_to_compile = [
     ("_sanitize_array_numba", lambda: _sanitize_array_numba(close_data, 0.0)),
     ("_sanitize_array_numba_parallel", lambda: _sanitize_array_numba_parallel(close_data, 0.0)),
     ("_sma_loop", lambda: _sma_loop(close_data, 50)),
     ("_sma_loop_parallel", lambda: _sma_loop_parallel(close_data, 50)),
     ("_ema_loop", lambda: _ema_loop(close_data, 14)),
-    ("_kalman_loop", lambda: _kalman_loop(close_large, 0.5, 0.5, 0.5)),
+    ("_kalman_loop", lambda: _kalman_loop(close_data, 14)), 
     ("_vwap_daily_loop", lambda: _vwap_daily_loop(high_data, low_data, close_data, vol_data, ts_data)),
-    ("_rng_filter_loop", lambda: _rng_filter_loop(close_large, 1.0)),
+    ("_rng_filter_loop", lambda: _rng_filter_loop(close_data, 1.0)), 
     ("_smooth_range", lambda: _smooth_range(close_data, 14, 2)),
     ("_calc_mmh_worm_loop", lambda: _calc_mmh_worm_loop(close_data, close_data, size)),
     ("_calc_mmh_value_loop", lambda: _calc_mmh_value_loop(close_data, size)),
@@ -81,10 +82,15 @@ functions_to_compile = [
     ("_rolling_min_max_numba", lambda: _rolling_min_max_numba(close_data, 20)),
     ("_rolling_min_max_numba_parallel", lambda: _rolling_min_max_numba_parallel(close_data, 20)),
     ("_calculate_ppo_core", lambda: _calculate_ppo_core(close_data, 7, 16, 5)),
-    ("_calculate_rsi_core", lambda: _calculate_rsi_core(close_small, 14)),
-    ("_vectorized_wick_check_buy", lambda: _vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_small, 0.2)),
-    ("_vectorized_wick_check_sell", lambda: _vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_large, 0.2))
+    ("_calculate_rsi_core", lambda: _calculate_rsi_core(close_data, 14)),
+    ("_vectorized_wick_check_buy", lambda: _vectorized_wick_check_buy(open_data, high_data, low_data, close_data, 0.2)),
+    ("_vectorized_wick_check_sell", lambda: _vectorized_wick_check_sell(open_data, high_data, low_data, close_data, 0.2))
 ]
+
+
+
+
+
 
 # 5. Execution Loop
 compiled_count = 0
