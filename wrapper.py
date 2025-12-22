@@ -20,6 +20,7 @@ try:
     UVLOOP_ENABLED = True
 except ImportError:
     UVLOOP_ENABLED = False
+    logger.info("uvloop not available, using default event loop")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
@@ -28,7 +29,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("wrapper")
 
 try:
-    from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
+    from src.macd_unified import run_once, __version__, cfg, RedisStateStore
+
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
     sys.exit(1)
