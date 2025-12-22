@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("wrapper")
 
 try:
-    from src.macd_unified import run_once, __version__, cfg, RedisStateStore
+    from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
 
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
