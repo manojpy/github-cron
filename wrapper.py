@@ -13,28 +13,22 @@ import time
 from pathlib import Path
 from typing import NoReturn
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("wrapper")
-
-
 # OPTIMIZED: Try uvloop first for 2-4x faster event loop
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     UVLOOP_ENABLED = True
-    logger.info("✅ uvloop enabled for 2-4x faster event loop")
 except ImportError:
     UVLOOP_ENABLED = False
-    logger.info("ℹ️ uvloop not available, using default event loop")
-
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("wrapper")
 
 try:
     from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
-
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
     sys.exit(1)

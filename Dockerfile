@@ -30,7 +30,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy source code
+# Copy source code (Kept original path)
 COPY src/ ./src/
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -41,10 +41,16 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_NUM_THREADS=4 \
     NUMBA_THREADING_LAYER=omp
 
-# 🔥 AOT COMPILATION
+# 🔥 AOT COMPILATION - Pre-compile all Numba functions
+# Explicitly create the directory first to prevent "checksum calculation" errors if the script fails
 RUN mkdir -p /app/src/__pycache__ && \
     python src/compile_numba_aot.py && \
-    echo "✅ AOT compilation completed"
+    echo "✅ AOT compilation completed" && \
+    echo "🔍 Checking cache directories after AOT:" && \
+    ls -lah /app/src/__pycache__/ || true && \
+    ls -lah /app/__pycache__/ || true && \
+    echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
 
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
@@ -58,12 +64,16 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Setup directory structure
+# Create directory structure first (Kept original path) 
 RUN mkdir -p /app/src/__pycache__
 
-# Copy source files and the PRE-COMPILED cache
+# Copy Python source files (excluding __pycache__ initially)
 COPY --from=aot-compiler /app/src/*.py ./src/
+
+# 🔥 EXPLICIT: Copy the Numba cache directory separately 
 COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
+
+# Copy runtime files (Kept original names) 
 COPY wrapper.py config_macd.json ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -75,12 +85,20 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
 
-# Verify and set permissions
-RUN CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
-    echo "📁 Found $CACHE_COUNT AOT cache files" && \
+# Verify cache was copied and set permissions [cite: 49, 50, 51, 61, 62, 63]
+RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
+    ls -lah /app/src/__pycache__/ && \
+    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
+    echo "📁 Found $CACHE_COUNT cache files" && \
+    if [ "$CACHE_COUNT" -lt 5 ]; then \
+        echo "⚠️  WARNING: Expected more cache files, found only $CACHE_COUNT"; \
+    else \
+        echo "✅ AOT cache verified successfully"; \
+    fi && \
     useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app && \
     chmod +x wrapper.py
 
 USER botuser
+
 ENTRYPOINT ["python", "-u", "wrapper.py"]
