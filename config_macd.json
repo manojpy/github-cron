@@ -49,4 +49,4 @@
   "MAX_ALERTS_PER_PAIR": 8,
   "SKIP_WARMUP": true,
   "NUMBA_PARALLEL": true
-} 
+}
