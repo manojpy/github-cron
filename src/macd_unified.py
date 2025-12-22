@@ -546,16 +546,11 @@ def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -
         return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
 
 
-# ---------------------------------------
-# SMA (kept, aligned to full-window SMA)
-# ---------------------------------------
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMIZED: Parallel SMA calculation with full-window requirement"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-
     for i in prange(n):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
@@ -571,49 +566,34 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Original serial SMA (fallback) with full-window requirement"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-
     window_sum = 0.0
     count = 0
-
     for i in range(n):
         val = data[i]
         if not np.isnan(val):
             window_sum += val
             count += 1
-
-        # drop value falling out of the window
         if i >= period:
             old_val = data[i - period]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 count -= 1
-
-        # emit only when full window available
         if i >= period - 1:
             out[i] = window_sum / count if count > 0 else np.nan
-        else:
-            out[i] = np.nan
-
     return out
 
-# ---------------------------------------------------
-# Rolling Std Dev (Welford) - parallel and serial
-# ---------------------------------------------------
+# -------------------------------------------
+# Rolling Std Dev (parallel + serial) — full-window semantics
+# -------------------------------------------
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """
-    OPTIMIZED: Parallel rolling standard deviation using Welford's algorithm,
-    full-window requirement to align with Pine-like semantics.
-    """
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     sd[:] = np.nan
-    resp = max(0.00001, min(1.0, responsiveness))
-
+    resp = 1.0 if responsiveness >= 1.0 else (0.00001 if responsiveness <= 0.0 else responsiveness)
     for i in prange(n):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
@@ -635,12 +615,10 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Serial rolling standard deviation with full-window requirement"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     sd[:] = np.nan
-    resp = max(0.00001, min(1.0, responsiveness))
-
+    resp = 1.0 if responsiveness >= 1.0 else (0.00001 if responsiveness <= 0.0 else responsiveness)
     for i in range(n):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
@@ -661,15 +639,13 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     return sd
 
 # -------------------------------------------
-# Rolling Mean - parallel and serial
+# Rolling Mean (parallel + serial) — full-window semantics
 # -------------------------------------------
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    """OPTIMIZED: Parallel rolling mean with full-window requirement"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     ma[:] = np.nan
-
     for i in prange(rows):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
@@ -681,16 +657,13 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
                     sum_val += val
                     count += 1
             ma[i] = sum_val / count if count > 0 else np.nan
-
     return ma
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """Original serial version (fallback) with full-window requirement"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     ma[:] = np.nan
-
     for i in range(rows):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
@@ -702,46 +675,40 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
                     sum_val += val
                     count += 1
             ma[i] = sum_val / count if count > 0 else np.nan
-
     return ma
 
 # -------------------------------------------
-# Rolling Min/Max - parallel and serial
+# Rolling Min/Max (parallel + serial) — full-window semantics
 # -------------------------------------------
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """OPTIMIZED: Parallel rolling min/max with full-window requirement"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
     min_arr[:] = np.nan
     max_arr[:] = np.nan
-
     for i in prange(rows):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
             window = arr[start:i+1]
+            # NaNs in window will propagate; upstream should decide handling
             min_arr[i] = np.min(window)
             max_arr[i] = np.max(window)
-
     return min_arr, max_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Original serial version with full-window requirement"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
     min_arr[:] = np.nan
     max_arr[:] = np.nan
-
     for i in range(rows):
         start = max(0, i - period + 1)
         if (i - start + 1) == period:
             window = arr[start:i+1]
             min_arr[i] = np.min(window)
             max_arr[i] = np.max(window)
-
     return min_arr, max_arr
 
 # -------------------------------------------
@@ -752,34 +719,28 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     worm_arr[0] = first_val
-
     for i in range(1, rows):
         src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
-
         if np.isnan(sd_i):
             delta = diff
         else:
             delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
-
         worm_arr[i] = prev_worm + delta
-
     return worm_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
+def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int, clip: float) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 0.0  # neutral start
-
     for i in range(1, rows):
         prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = t - 0.5 + 0.5 * prev_v
-        # consistent clamp with Constants
-        value_arr[i] = max(-Constants.MMH_VALUE_CLIP, min(Constants.MMH_VALUE_CLIP, v))
-
+        # clamp using passed-in clip (sourced from Constants in Python)
+        value_arr[i] = max(-clip, min(clip, v))
     return value_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -788,6 +749,7 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
     return momentum_arr
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
@@ -1161,10 +1123,10 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
 
-        # ensure contiguous
+        # Ensure contiguous
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
-        # Std dev using period (aligns with Pine-like usage)
+        # Std dev using the given period (align Pine-like semantics)
         sd_period = period
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, sd_period, resp_clamped)
@@ -1180,12 +1142,10 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         else:
             ma = _rolling_mean_numba(close_c, period)
 
-        # Raw deviation normalization:
-        # Option A (deviation over mean) — more Pine-like than dividing by worm
+        # Raw deviation normalization: use mean as denominator (closer to Pine behavior)
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / ma
-        raw = np.where(np.isnan(raw), 0.0, raw)
-        raw = np.where(np.isinf(raw), 0.0, raw)
+        raw = np.where(np.isnan(raw) | np.isinf(raw), 0.0, raw)
 
         # Rolling min/max (full-window requirement)
         if cfg.NUMBA_PARALLEL and rows >= 250:
@@ -1201,8 +1161,8 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.where(np.isnan(temp), 0.5, temp)
 
-        # Recursive value and clamp
-        value_arr = _calc_mmh_value_loop(temp, rows)
+        # Recursive value with clamp sourced from Constants (passed into JIT)
+        value_arr = _calc_mmh_value_loop(temp, rows, float(Constants.MMH_VALUE_CLIP))
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
         # Log transform with consistent clamp constant
