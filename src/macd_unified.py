@@ -239,10 +239,12 @@ def load_config() -> BotConfig:
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 data = json_loads(f.read())
+
         except Exception as exc:
-            print(f"❌ ERROR: Config file {config_file} is not valid JSON", file=sys.stderr)
-            print(f"❌ Details: {exc}", file=sys.stderr)
+            error_msg = f"❌ ERROR: Config file {config_file} is not valid JSON: {exc}"
+            print(error_msg, file=sys.stderr)
             sys.exit(1)
+        
     else:
         print(f"⚠️ WARNING: Config file {config_file} not found, using environment variables only", file=sys.stderr)
 
@@ -2944,12 +2946,12 @@ BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}", 
         "title": f"🟢⬆️ Cross above {level}",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi, level=level: (
-            ctx["buy_common"] and _validate_pivot_cross(ctx, level, is_buy=True)[0]
-        ), 
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, level=level: (
-            f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
-            + (f" [Suppressed: {_validate_pivot_cross(ctx, level, True)[1]}]" 
+
+        pivot_result = _validate_pivot_cross(ctx, level, is_buy)
+        ctx[f'pivot_valid_{level}'] = pivot_result
+
+        check_fn: lambda ctx, level=level: (
+            ctx["buy_common"] and ctx.get(f'pivot_valid_{level}', (False, None))[0]
                if not _validate_pivot_cross(ctx, level, True)[0] and ctx.get("pivots") else "")
         ),
         "requires": ["pivots"]
@@ -3369,12 +3371,15 @@ async def evaluate_pair_and_alert(
         }
 
     except Exception as e:
-        logger_pair.exception(f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e}")
+        logger_pair.exception(
+            f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e} | "
+            f"i15={locals().get('i15', 'N/A')} i5={locals().get('i5', 'N/A')} | "
+            f"Correlation: {correlation_id}"
+        )
         return None
     finally:
         PAIR_ID.set("")
 
-  
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
     products_map: Dict[str, dict],
@@ -3406,10 +3411,10 @@ async def process_pairs_with_workers(
         
         pair_requests.append((symbol, resolutions))
     
-    all_candles = await fetcher.fetch_all_candles_truly_parallel(
-        pair_requests, reference_time
+
+    all_candles = await fetcher.fetch_all_candles_truly_parallel( 
+        pair_requests, reference_time 
     )
-    
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     valid_tasks = []
     
@@ -3449,9 +3454,13 @@ async def process_pairs_with_workers(
                 return None
 
     results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
-    valid_results = [r for r in results if r is not None]
-    
-    logger_main.debug(f"✅ Run complete | Pairs: {len(valid_results)}/{len(pairs_to_process)} in {time.time()-fetch_start:.2f}s")
+    valid_results = [r for r in results if r is not None] 
+    # Cleanup large intermediate structures 
+    del all_candles 
+    del results 
+    import gc 
+    gc.collect()
+
     return valid_results
 
 # ============================================================================
@@ -3500,15 +3509,19 @@ async def run_once() -> bool:
         STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
 
         now = time.time()
-        last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
+        def should_refresh_products(cache_dict, static_enabled, days_threshold):
+            if not static_enabled:
+                return True
+    
+            last_check = cache_dict.get("until", 0.0)
+            if not last_check or last_check <= 0:
+                return True
+    
+            days_since = (time.time() - (last_check - cfg.PRODUCTS_CACHE_TTL)) / 86400
+            return days_since >= days_threshold
 
-
-        if USE_STATIC_MAP:
-            if last_check_ts and last_check_ts > 0:
-                days_since_check = max(0.0, (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400)
-            else:
-                days_since_check = float("inf")
-
+        if should_refresh_products(PRODUCTS_CACHE, USE_STATIC_MAP, STATIC_MAP_REFRESH_DAYS):
+   
             if days_since_check < STATIC_MAP_REFRESH_DAYS:
                 logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
                 products_map = STATIC_PRODUCTS_MAP.copy()
@@ -3531,12 +3544,9 @@ async def run_once() -> bool:
                 products_map = build_products_map_from_api_result(prod_resp)
 
                 if sdb:
+                    last_api_check_key = "products:last_api_check"
                     await sdb.set_metadata(last_api_check_key, str(now))
-                    logger_run.info(f"✅ Products list fetched from API ({len(products_map)} pairs)")
-
-            last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
-            if not last_check_ts or last_check_ts <= 0:
-                logger_run.debug("🔄 Refreshing products map from API (last check: never)")
+                    logger_run.info(f"�� Products list fetched from API ({len(products_map)} pairs)")
             else:
                 days_ago = (now - last_check_ts) / 86400
                 logger_run.debug(f"🔄 Refreshing products map from API (last check: {days_ago:.1f} days ago)")
