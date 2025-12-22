@@ -28,15 +28,28 @@ except ImportError:
     logger.info("ℹ️ uvloop not available, using default event loop")
 
 
+# 🔥 FIX: Set PYTHONPATH and import correctly
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
+SRC_DIR = os.path.join(SCRIPT_DIR, "src")
 
+# Add src to path BEFORE importing
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+# Also ensure the app directory is in the path
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 try:
-    from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
+    # 🔥 CRITICAL: Import directly from macd_unified, not src.macd_unified
+    import macd_unified
+    from macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
 
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
+    logger.critical(f"sys.path: {sys.path}")
+    logger.critical(f"SRC_DIR: {SRC_DIR}")
+    logger.critical(f"Files in SRC_DIR: {os.listdir(SRC_DIR) if os.path.exists(SRC_DIR) else 'DIR NOT FOUND'}")
     sys.exit(1)
 
 def _handle_signal(signum: int, frame) -> NoReturn:
@@ -109,7 +122,7 @@ def _handle_missing_cache() -> None:
     warmup_start = time.time()
     
     try:
-        from src.macd_unified import warmup_numba
+        from macd_unified import warmup_numba
         warmup_numba()
         warmup_duration = time.time() - warmup_start
         logger.info(f"✅ JIT warmup completed in {warmup_duration:.1f}s")
