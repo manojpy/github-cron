@@ -599,15 +599,14 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 def _calc_mmh_value_loop(temp: np.ndarray, rows: int, clip_val: float) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
     for i in range(1, rows):
-        # Pine: value := value * (temp - .5 + .5 * nz(value[1])) where value = 0.5 * 2
-        # This simplifies to: value := 1.0 * (temp - 0.5 + 0.5 * value[i-1])
+        # Pine: value := 1.0 * (temp - 0.5 + 0.5 * nz(value[1]))
         val = 1.0 * (temp[i] - 0.5 + 0.5 * value_arr[i-1])
         value_arr[i] = val
     return value_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    # Always serial due to recursive dependency: momentum := momentum + .5 * nz(momentum[1])
+    # Always serial due to recursive dependency
     for i in range(1, rows):
         momentum_arr[i] = momentum_arr[i] + 0.5 * momentum_arr[i-1]
     return momentum_arr
@@ -638,7 +637,7 @@ def _rolling_min_max_numba(data: np.ndarray, period: int):
         maxs[i] = np.max(window)
     return mins, maxs
 
-# --- Calculation Function (Preserving all Script C parameter names) ---
+# --- Calculation Function (Exact name from your log and Script C) ---
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
@@ -1002,60 +1001,60 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # OPTIMIZATION 5: Streamlined MMH with Smart Parallel Execution
 # ============================================================================
 
-def calculate_mmh_momentum(close_arr: np.ndarray, responsiveness: float, period: int, cfg):
+def calculate_magical_momentum_hist(close_arr: np.ndarray, responsiveness: float = 0.9, period: int = 144, cfg = None):
     rows = len(close_arr)
     
-    # --- Rolling Std Logic ---
-    # Using pandas as in some versions or a custom helper; assuming input/prep matches Script C context
+    # Check cfg provided in your bot context
+    use_parallel = cfg.NUMBA_PARALLEL if cfg is not None else False
+
+    # --- 1. SD (ta.stdev * responsiveness) ---
     import pandas as pd
-    sd_series = pd.Series(close_arr).rolling(50).std()
-    sd_arr = sd_series.values * responsiveness
+    sd_arr = pd.Series(close_arr).rolling(50).std().values * responsiveness
     sd_arr = np.nan_to_num(sd_arr, nan=0.0)
 
-    # --- 1. Worm ---
+    # --- 2. Worm ---
     worm_arr = _calc_mmh_worm_loop(close_arr, sd_arr, rows)
 
-    # --- 2. MA ---
-    if cfg.NUMBA_PARALLEL and rows >= 250:
+    # --- 3. MA ---
+    if use_parallel and rows >= 250:
         ma = _sma_loop_parallel(close_arr, period)
     else:
         ma = _sma_loop(close_arr, period)
 
-    # --- 3. Raw Momentum ---
+    # --- 4. Raw Momentum ---
     with np.errstate(divide='ignore', invalid='ignore'):
         raw = (worm_arr - ma) / worm_arr
     raw = np.nan_to_num(raw, nan=0.0)
 
-    # --- 4. Rolling Min/Max ---
-    if cfg.NUMBA_PARALLEL and rows >= 250:
+    # --- 5. Min/Max med ---
+    if use_parallel and rows >= 250:
         min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
     else:
         min_med, max_med = _rolling_min_max_numba(raw, period)
 
-    # --- 5. Normalization (Temp) ---
+    # --- 6. Normalization ---
     denom = max_med - min_med
     denom = np.where(np.isnan(denom) | (denom == 0.0), Constants.ZERO_DIVISION_GUARD, denom)
     temp = (raw - min_med) / denom
     temp = np.clip(temp, 0.0, 1.0)
     temp = np.where(np.isnan(temp), 0.5, temp)
 
-    # --- 6. Recursive Value ---
+    # --- 7. Value ---
     value_arr = _calc_mmh_value_loop(temp, rows, float(Constants.MMH_VALUE_CLIP))
     value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
-    # --- 7. Log Transform (Corrected to math.log(temp2)) ---
+    # --- 8. Log Transform ---
     with np.errstate(divide='ignore', invalid='ignore'):
         temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-        # Ensure values stay within safe bounds for the log
         temp2 = np.where(np.isnan(temp2), Constants.INFINITY_CLAMP, temp2)
         temp2 = np.where(np.isposinf(temp2), Constants.INFINITY_CLAMP, temp2)
         temp2 = np.where(np.isneginf(temp2), 1e-9, temp2)
 
-    # 10/10 Logic: Direct log(temp2) per Pine Script
+    # Correct 10/10 Logic: math.log(temp2)
     momentum = 0.25 * np.log(temp2)
     momentum = np.where(np.isnan(momentum), 0.0, momentum)
 
-    # --- 8. Momentum Bleed (Recursive Accumulation) ---
+    # --- 9. Momentum Bleed ---
     momentum_arr = momentum.copy()
     momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
