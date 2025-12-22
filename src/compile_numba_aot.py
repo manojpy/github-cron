@@ -11,13 +11,12 @@ from pathlib import Path
 
 # Set cache directory and Numba settings
 os.environ['NUMBA_CACHE_DIR'] = '/app/src/__pycache__'
-cpu_count = os.cpu_count() or 2
-os.environ['NUMBA_NUM_THREADS'] = str(min(cpu_count, 4))
+os.environ['NUMBA_NUM_THREADS'] = '4'
 os.environ['NUMBA_THREADING_LAYER'] = 'omp'
 
 # Mock minimal config to bypass validation
-os.environ['TELEGRAM_BOT_TOKEN'] = 'MOCK_TOKEN_FOR_AOT_COMPILATION'
-os.environ['TELEGRAM_CHAT_ID'] = 'MOCK_CHAT_ID'
+os.environ['TELEGRAM_BOT_TOKEN'] = '000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+os.environ['TELEGRAM_CHAT_ID'] = '000000000'
 os.environ['REDIS_URL'] = 'redis://localhost:6379'
 os.environ['DELTA_API_BASE'] = 'https://api.delta.exchange'
 
