@@ -762,13 +762,30 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp: np.ndarray, rows: int, clip: float) -> np.ndarray:
     value = np.zeros(rows, dtype=np.float64)
-    value[0] = 1.0
+
+    # Pine-faithful initialization (never allow exactly ±1)
+    value[0] = min(clip, 0.9999)
 
     for i in range(1, rows):
         prev = value[i - 1] if not np.isnan(value[i - 1]) else 0.0
         t = temp[i] if not np.isnan(temp[i]) else 0.5
+
+        # Pine recursion
         v = prev * (t - 0.5 + 0.5 * prev)
-        value[i] = max(-clip, min(clip, v))
+
+        # HARD clamp before it can ever reach ±1.0
+        if v > clip:
+            v = clip
+        elif v < -clip:
+            v = -clip
+
+        # Extra numerical guard (Python-only necessity)
+        if v >= 1.0:
+            v = clip
+        elif v <= -1.0:
+            v = -clip
+
+        value[i] = v
 
     return value
 
