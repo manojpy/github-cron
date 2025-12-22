@@ -31,7 +31,7 @@ print("📦 Importing Numba functions from macd_unified...")
 try:
     from src.macd_unified import (
         _sanitize_array_numba, _sanitize_array_numba_parallel,
-        _sma_loop, _sma_loop_parallel, _ema_loop, _kalman_loop,
+        _sma_loop, _sma_loop_parallel, _ema_loop, _ema_loop_alpha, _kalman_loop,
         _vwap_daily_loop, _rng_filter_loop, _smooth_range,
         _calc_mmh_worm_loop, _calc_mmh_value_loop, _calc_mmh_momentum_loop,
         _rolling_std_welford, _rolling_std_welford_parallel,
@@ -56,6 +56,7 @@ ts_data = np.linspace(1600000000, 1600086400, size).astype(np.int64)
 
 r_array = np.ones(size, dtype=np.float64) * 1.0
 
+
 # 4. Compilation Registry
 functions_to_compile = [
     ("_sanitize_array_numba", lambda: _sanitize_array_numba(close_data, 0.0)),
@@ -63,6 +64,7 @@ functions_to_compile = [
     ("_sma_loop", lambda: _sma_loop(close_data, 50)),
     ("_sma_loop_parallel", lambda: _sma_loop_parallel(close_data, 50)),
     ("_ema_loop", lambda: _ema_loop(close_data, 14)),
+    ("_ema_loop_alpha", lambda: _ema_loop_alpha(close_data, 0.05)),
     ("_kalman_loop", lambda: _kalman_loop(close_data, 14, 0.01, 0.1)),  # ðŸ"¥ FIXED: Added R and Q params
     ("_vwap_daily_loop", lambda: _vwap_daily_loop(high_data, low_data, close_data, vol_data, ts_data)),
     ("_rng_filter_loop", lambda: _rng_filter_loop(close_data, r_array)),  # ðŸ"¥ FIXED: Pass array instead of float

@@ -731,11 +731,21 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
     return min_arr, max_arr
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
+def _ema_loop(data: np.ndarray, alpha_or_period) -> np.ndarray:
+    
     n = len(data)
-    alpha = 2.0 / (period + 1)
+    
+    # Determine if input is period or alpha
+    if alpha_or_period > 1.0:
+        # It's a period, convert to alpha
+        alpha = 2.0 / (alpha_or_period + 1.0)
+    else:
+        # It's already alpha
+        alpha = alpha_or_period
+    
     out = np.empty(n, dtype=np.float64)
     out[0] = data[0] if not np.isnan(data[0]) else 0.0 
+    
     for i in range(1, n):
         curr = data[i]
         if np.isnan(curr):
@@ -744,6 +754,23 @@ def _ema_loop(data: np.ndarray, period: int) -> np.ndarray:
             out[i] = alpha * curr + (1 - alpha) * out[i-1]
     
     return out
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
+    """EMA with direct alpha parameter."""
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[0] = data[0] if not np.isnan(data[0]) else 0.0 
+    
+    for i in range(1, n):
+        curr = data[i]
+        if np.isnan(curr):
+            out[i] = out[i-1]
+        else:
+            out[i] = alpha * curr + (1 - alpha) * out[i-1]
+    
+    return out
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
@@ -873,9 +900,19 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
             gain[i] = delta[i]
         elif delta[i] < 0:
             loss[i] = -delta[i]   
+    
     alpha = 1.0 / rsi_len
-    avg_gain = _ema_loop(gain, alpha)
-    avg_loss = _ema_loop(loss, alpha)   
+    
+    avg_gain = np.empty(n, dtype=np.float64)
+    avg_loss = np.empty(n, dtype=np.float64)
+    
+    avg_gain[0] = gain[0]
+    avg_loss[0] = loss[0]
+    
+    for i in range(1, n):
+        avg_gain[i] = alpha * gain[i] + (1 - alpha) * avg_gain[i-1]
+        avg_loss[i] = alpha * loss[i] + (1 - alpha) * avg_loss[i-1]
+    
     rsi = np.empty(n, dtype=np.float64)
     for i in range(n):
         if avg_loss[i] < 1e-10:
@@ -946,7 +983,7 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
             logger.warning(f"RMA: Insufficient data (len={len(data) if data is not None else 0})")
             return np.zeros_like(data) if data is not None else np.array([0.0])       
         alpha = 1.0 / period
-        rma = _ema_loop(data, alpha)
+        rma = _ema_loop_alpha(data, alpha)
         rma = sanitize_indicator_array(rma, f"RMA_{period}", default=0.0)
         return rma       
     except Exception as e:
