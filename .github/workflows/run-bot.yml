@@ -59,6 +59,7 @@ jobs:
         id: run
         env:
           IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
+          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
         run: |
           docker pull --quiet "$IMAGE"
           
@@ -73,9 +74,8 @@ jobs:
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
+            -e DEBUG_MODE="$DEBUG_MODE" \
             -e NUMBA_CACHE_DIR=/tmp/numba_cache \
-            -e NUMBA_NUM_THREADS=4 \
-            -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             "$IMAGE" | tee bot.log
 
@@ -95,6 +95,8 @@ jobs:
         run: |
           echo "📊 Status: ${{ job.status }} | Exit Code: ${{ steps.run.outputs.exit_code }}"
 
+
+      
 
           
 
