@@ -3,7 +3,12 @@ name: Build & Push GHCR
 on:
   push:
     branches: [main]
-    paths: ['requirements.txt', 'Dockerfile', 'src/**', 'wrapper.py', 'config_macd.json']
+    paths:
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'src/**'
+      - 'wrapper.py'
+      - 'config_macd.json'
   workflow_dispatch:
 
 env:
@@ -26,7 +31,9 @@ jobs:
   build:
     needs: validate
     runs-on: ubuntu-24.04
-    permissions: { contents: read, packages: write }
+    permissions:
+      contents: read
+      packages: write
     concurrency:
       group: trading-bot-build
       cancel-in-progress: true
@@ -54,8 +61,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=${{ github.ref_name }}-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and Push
         uses: docker/build-push-action@v5
