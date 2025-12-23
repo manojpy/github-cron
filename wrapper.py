@@ -27,11 +27,6 @@ except ImportError:
     UVLOOP_ENABLED = False
     logger.info("ℹ️ uvloop not available, using default event loop")
 
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
-
-
 try:
     from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
 except ImportError as e:
