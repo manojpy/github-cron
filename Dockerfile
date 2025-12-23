@@ -29,9 +29,8 @@ RUN apt-get update && \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-
-# Copy full source tree (must include src/__init__.py)
 COPY src/ ./src/
+
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
@@ -46,7 +45,7 @@ RUN pip install --no-cache-dir -e /app/src
 
 # 🔥 AOT COMPILATION
 RUN mkdir -p /app/numba_cache && \
-    python src/compile_numba_aot.py && \
+    python src/compile_numba_aot.py
     echo "✅ AOT compilation completed" && \
     echo "🔍 Listing cache files:" && \
     find /app/numba_cache -type f -name "*.nbi" | head -40
@@ -62,6 +61,10 @@ RUN apt-get update && \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
+COPY --from=aot-compiler /app/src/ ./src/
+COPY --from=aot-compiler /app/numba_cache/ ./numba_cache/
+COPY wrapper.py config_macd.json ./
+
 
 # Create directory structure
 RUN mkdir -p /app/numba_cache
