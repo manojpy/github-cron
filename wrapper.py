@@ -49,7 +49,7 @@ def check_aot_cache() -> None:
 
     cache_files = list(cache_dir.rglob("*.nbi"))
 
-    if len(cache_files) >= 15:  # Expect at least 15 compiled functions
+    if len(cache_files) >= 10:
         logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
         return
 

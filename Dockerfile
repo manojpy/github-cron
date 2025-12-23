@@ -90,7 +90,7 @@ RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
     ls -lah /app/src/__pycache__/ && \
     CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
     echo "📁 Found $CACHE_COUNT cache files" && \
-    if [ "$CACHE_COUNT" -lt 5 ]; then \
+    if [ "$CACHE_COUNT" -lt 10 ]; then \
         echo "⚠️  WARNING: Expected more cache files, found only $CACHE_COUNT"; \
     else \
         echo "✅ AOT cache verified successfully"; \
