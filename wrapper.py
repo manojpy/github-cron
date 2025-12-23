@@ -41,86 +41,26 @@ except ImportError as e:
 def _handle_signal(signum: int, frame) -> NoReturn:
     """Unified signal handler for graceful shutdown."""
     sig_name = signal.strsignal(signum) if hasattr(signal, 'strsignal') else str(signum)
-    logger.warning(f"⚠️ Received signal {sig_name} ({signum}) – shutting down")
+    logger.warning(f"⚠️  Received signal {sig_name} ({signum}) – shutting down")
     raise KeyboardInterrupt
 
 def check_aot_cache() -> None:
-    """
-    Verify AOT-compiled Numba cache exists and log detailed statistics.
-    If cache is missing or insufficient, trigger JIT warmup.
-    """
     cache_dir = Path("/app/src/__pycache__")
-    
-    if not cache_dir.exists():
-        logger.warning(f"⚠️ Cache directory not found: {cache_dir}")
-        if not getattr(cfg, "SKIP_WARMUP", False):
-            logger.info("🔥 Performing JIT warmup...")
-            try:
-                from src.macd_unified import warmup_numba
-                warmup_numba()
-            except Exception as e:
-                logger.warning(f"Warmup failed (non-fatal): {e}")
+
+    cache_files = list(cache_dir.rglob("*.nbi"))
+
+    if len(cache_files) >= 15:  # Expect at least 15 compiled functions
+        logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
         return
-    
-    # Look for both .nbi (compiled functions) and .nbc (cached bytecode)
-    cache_files_nbi = list(cache_dir.rglob("*.nbi"))
-    cache_files_nbc = list(cache_dir.rglob("*.nbc"))
-    cache_files = cache_files_nbi + cache_files_nbc
-    
-    total_cache_files = len(cache_files)
-    
-    # Calculate total cache size
-    total_size_kb = sum(f.stat().st_size for f in cache_files) / 1024 if cache_files else 0
-    
-    # Expected minimum: ~15 core functions + parallel variants + helpers = ~20-25 files
-    MIN_EXPECTED_CACHE_FILES = 15
-    
-    if total_cache_files >= MIN_EXPECTED_CACHE_FILES:
-        logger.info(
-            f"✅ Using AOT-compiled Numba cache | "
-            f"Files: {total_cache_files} ({len(cache_files_nbi)} .nbi, {len(cache_files_nbc)} .nbc) | "
-            f"Size: {total_size_kb:.1f} KB | "
-            f"Location: {cache_dir}"
-        )
-        
-        # Log sample files for verification (first 5)
-        if cfg.DEBUG_MODE and cache_files:
-            sample_files = [f.name for f in sorted(cache_files)[:5]]
-            logger.debug(f"📂 Sample cache files: {', '.join(sample_files)}")
-            if total_cache_files > 5:
-                logger.debug(f"   ... and {total_cache_files - 5} more files")
-        
-        return
-    
-    # Cache exists but insufficient files
-    if total_cache_files > 0:
-        logger.warning(
-            f"⚠️ AOT cache incomplete | "
-            f"Found: {total_cache_files} files | "
-            f"Expected: >={MIN_EXPECTED_CACHE_FILES} | "
-            f"Some functions will JIT compile on first use"
-        )
-        
-        # List what we found for debugging
-        if cfg.DEBUG_MODE:
-            for f in cache_files[:10]:
-                logger.debug(f"   - {f.name} ({f.stat().st_size / 1024:.1f} KB)")
-    
-    # No cache or insufficient - check if warmup is needed
+
     if getattr(cfg, "SKIP_WARMUP", False):
-        logger.warning(
-            "⚠️ AOT cache missing/incomplete and SKIP_WARMUP=true | "
-            "Functions will JIT compile on first use (slower first run)"
-        )
+        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
         return
-    
-    logger.info("🔥 AOT cache not found - performing JIT warmup...")
+
+    logger.info("⚠️  AOT cache not found - performing JIT warmup...")
     try:
         from src.macd_unified import warmup_numba
-        warmup_start = time.time()
         warmup_numba()
-        warmup_duration = time.time() - warmup_start
-        logger.info(f"✅ JIT warmup completed in {warmup_duration:.2f}s")
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
 
@@ -143,7 +83,7 @@ def log_resource_usage(stage: str = "final") -> None:
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             if mem_mb > (limit_mb * 0.9):
                 logger.warning(
-                    f"⚠️ Memory usage at {mem_mb:.1f}MB "
+                    f"⚠️  Memory usage at {mem_mb:.1f}MB "
                     f"(90% of {limit_mb:.0f}MB limit)"
                 )
     except Exception as e:
@@ -163,7 +103,7 @@ async def main() -> int:
     
     try:
         # Log startup info
-        uvloop_status = "✅ enabled" if UVLOOP_ENABLED else "⚠️ disabled"
+        uvloop_status = "✅ enabled" if UVLOOP_ENABLED else "⚠️  disabled"
         numba_parallel = getattr(cfg, 'NUMBA_PARALLEL', False)
         
         logger.info(
@@ -183,7 +123,7 @@ async def main() -> int:
         
         # Calculate execution time
         duration = time.time() - start_time
-        logger.info(f"⏱️ Execution time: {duration:.2f}s")
+        logger.info(f"⏱️  Execution time: {duration:.2f}s")
         
         # Log final resource usage
         log_resource_usage("complete")
@@ -192,12 +132,12 @@ async def main() -> int:
         
     except KeyboardInterrupt:
         duration = time.time() - start_time
-        logger.warning(f"⚠️ Interrupted after {duration:.1f}s (SIGINT/SIGTERM)")
+        logger.warning(f"⚠️  Interrupted after {duration:.1f}s (SIGINT/SIGTERM)")
         return 130
         
     except asyncio.CancelledError:
         duration = time.time() - start_time
-        logger.warning(f"⚠️ Cancelled after {duration:.1f}s (timeout)")
+        logger.warning(f"⚠️  Cancelled after {duration:.1f}s (timeout)")
         return 130
         
     except Exception as exc:
