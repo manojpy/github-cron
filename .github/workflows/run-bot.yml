@@ -50,7 +50,7 @@ jobs:
       - name: Create local cache dir
         run: |
           mkdir -p numba_cache
-          # CRITICAL: Grant full permissions so 'botuser' (UID 1000) can write to this host-mounted dir
+          # Grant full permissions so 'botuser' (UID 1000) can write to this host-mounted dir
           chmod 777 numba_cache 
 
       - name: Login to GHCR
@@ -87,7 +87,7 @@ jobs:
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DEBUG_MODE="$DEBUG_MODE" \
             -e NUMBA_CACHE_DIR=/app/numba_cache \
-            -e NUMBA_NUM_THREADS=2 \
+            -e NUMBA_NUM_THREADS=4 \
             -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             -v "$(pwd)/numba_cache:/app/numba_cache:rw" \
