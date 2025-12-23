@@ -65,6 +65,18 @@ jobs:
           provenance: true
           sbom: true
 
+        - name: Verify AOT Cache in Image
+          run: |
+            echo "🔍 Inspecting built image for AOT cache..."
+            docker run --rm ${{ env.IMAGE_NAME }}:latest sh -c \
+              "ls -lah /app/src/__pycache__/ 2>/dev/null || echo '❌ Cache directory missing'; \
+               echo ''; \
+               echo '📦 Cache file count:'; \
+               find /app/src/__pycache__ -name '*.nbi' -o -name '*.nbc' 2>/dev/null | wc -l; \
+               echo ''; \
+               echo '📂 Sample files:'; \
+               find /app/src/__pycache__ -name '*.nbi' -o -name '*.nbc' 2>/dev/null | head -5"
+
       - name: Verify image
         run: |
           docker pull ${{ env.IMAGE_NAME }}:latest
