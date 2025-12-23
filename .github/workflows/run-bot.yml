@@ -74,7 +74,7 @@ jobs:
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e NUMBA_CACHE_DIR=/tmp/numba_cache \
-            -e NUMBA_NUM_THREADS=2 \
+            -e NUMBA_NUM_THREADS=4 \
             -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             "$IMAGE" | tee bot.log
@@ -95,6 +95,8 @@ jobs:
         run: |
           echo "📊 Status: ${{ job.status }} | Exit Code: ${{ steps.run.outputs.exit_code }}"
 
+
+          
 
       
       
