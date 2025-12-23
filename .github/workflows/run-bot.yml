@@ -81,15 +81,16 @@ jobs:
             --read-only \
             --security-opt=no-new-privileges:true \
             --tmpfs /tmp:size=150m,rw,noexec,nosuid \
-            --tmpfs /app/src/__pycache__:size=50m,rw,mode=1777 \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DEBUG_MODE="$DEBUG_MODE" \
+            -e NUMBA_CACHE_DIR=/app/numba_cache \
             -e NUMBA_NUM_THREADS=2 \
             -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
+            -v "$(pwd)/numba_cache:/app/numba_cache:rw" \
             "$IMAGE" | tee bot.log
 
           EXIT_CODE=${PIPESTATUS[0]}
