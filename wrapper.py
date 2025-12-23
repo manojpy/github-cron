@@ -44,25 +44,32 @@ def _handle_signal(signum: int, frame) -> NoReturn:
     logger.warning(f"⚠️  Received signal {sig_name} ({signum}) – shutting down")
     raise KeyboardInterrupt
 
-def check_aot_cache() -> None:
-    cache_dir = Path("/app/src/__pycache__")
-
+def check_aot_cache() -> bool:
+    """Check if AOT-compiled Numba cache is available and valid."""
+    cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/numba_cache'))
+    
+    if not cache_dir.exists():
+        logger.warning(f"⚠️  Cache directory does not exist: {cache_dir}")
+        return False
+    
     cache_files = list(cache_dir.rglob("*.nbi"))
-
+    
+    logger.info(f"Looking for Numba cache in: {cache_dir}")
+    logger.info(f"Found {len(cache_files)} cache files")
+    
     if len(cache_files) >= 15:  # Expect at least 15 compiled functions
         logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
-        return
-
-    if getattr(cfg, "SKIP_WARMUP", False):
-        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
-        return
-
-    logger.info("⚠️  AOT cache not found - performing JIT warmup...")
-    try:
-        from src.macd_unified import warmup_numba
-        warmup_numba()
-    except Exception as e:
-        logger.warning(f"Warmup failed (non-fatal): {e}")
+        
+        # Show some sample cache files for verification
+        if cache_files:
+            logger.info("📂 Sample cache files:")
+            for f in sorted(cache_files)[:3]:
+                file_size = f.stat().st_size / 1024
+                logger.info(f"   {f.name} ({file_size:.1f} KB)")
+        return True
+    else:
+        logger.warning(f"⚠️  AOT cache incomplete or not found ({len(cache_files)} files)")
+        return False
 
 # OPTIMIZED: Resource monitoring function
 def log_resource_usage(stage: str = "final") -> None:
@@ -112,8 +119,8 @@ async def main() -> int:
             f"Numba parallel: {numba_parallel}"
         )
         
-        # 🔥 CHECK AOT CACHE BEFORE RUNNING BOT
-        check_aot_cache()
+        # CHECK AOT CACHE BEFORE RUNNING BOT
+        cache_available = check_aot_cache()
         
         # Log initial resource usage
         log_resource_usage("startup")
@@ -146,7 +153,7 @@ async def main() -> int:
         return 3
     
     finally:
-        # 🔥 CLEANUP: Shutdown persistent connections
+        # CLEANUP: Shutdown persistent connections
         try:
             logger.info("🧹 Shutting down persistent connections...")
             await RedisStateStore.shutdown_global_pool()
