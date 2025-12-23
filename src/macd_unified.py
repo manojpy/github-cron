@@ -30,6 +30,30 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, Cli
 from numba import njit, prange
 import warnings
 
+# Import AOT bridge aliases
+from aot_bridge import (
+    use_aot,
+    AOT_SANITIZE,
+    AOT_EMA_PERIOD,
+    AOT_EMA_ALPHA,
+    AOT_SMA,
+    AOT_ROLLING_MEAN_NUMBA,
+    AOT_ROLLING_STD,
+    AOT_ROLLING_MIN_MAX,
+    AOT_KALMAN,
+    AOT_VWAP_DAILY,
+    AOT_RNG_FILTER,
+    AOT_SMOOTH_RANGE,
+    AOT_MMH_WORM,
+    AOT_MMH_VALUE,
+    AOT_MMH_MOMENTUM_ACCUM,
+    AOT_RSI_CORE,
+    AOT_PPO_CORE,
+    AOT_WICK_CHECK_BUY,
+    AOT_WICK_CHECK_SELL,
+)
+
+
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
