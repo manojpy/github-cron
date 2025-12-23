@@ -30,7 +30,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy full source tree (package marker included)
+# Copy full source tree (must include src/__init__.py)
 COPY src/ ./src/
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -40,6 +40,9 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_CACHE_DIR=/app/numba_cache \
     NUMBA_NUM_THREADS=4 \
     NUMBA_THREADING_LAYER=omp
+
+# Install the project as an editable package so Numba has a locator
+RUN pip install --no-cache-dir -e /app/src
 
 # 🔥 AOT COMPILATION
 RUN mkdir -p /app/numba_cache && \
@@ -63,7 +66,7 @@ WORKDIR /app
 # Create directory structure
 RUN mkdir -p /app/numba_cache
 
-# Copy full source tree (not just *.py)
+# Copy full source tree
 COPY --from=aot-compiler /app/src/ ./src/
 
 # Copy AOT cache artifacts
@@ -81,8 +84,9 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
 
-# Verify cache and user setup
-RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
+# Install as editable package in runtime too to guarantee locator
+RUN pip install --no-cache-dir -e /app/src && \
+    echo "🔍 Verifying AOT cache in runtime stage:" && \
     ls -lah /app/numba_cache && \
     CACHE_COUNT=$(find /app/numba_cache -type f -name "*.nbi" | wc -l) && \
     echo "📁 Found $CACHE_COUNT cache files" && \
