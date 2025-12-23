@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Set cache directory and Numba settings
 os.environ['NUMBA_CACHE_DIR'] = '/app/src/__pycache__'
-os.environ['NUMBA_NUM_THREADS'] = '4'
+os.environ['NUMBA_NUM_THREADS'] = '2'
 os.environ['NUMBA_THREADING_LAYER'] = 'omp'
 
 # Mock minimal config to bypass validation
