@@ -84,11 +84,6 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
           DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
         run: |
-          set +x
-          echo "::group::📥 Pulling latest bot image"
-          docker pull --quiet "$IMAGE"
-          echo "::endgroup::"
-          
           docker run --rm \
             --name bot-${{ github.run_id }} \
             --memory=700m \
@@ -104,11 +99,9 @@ jobs:
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DEBUG_MODE="$DEBUG_MODE" \
-            -e NUMBA_CACHE_DIR=/app/numba_cache \
             -e NUMBA_NUM_THREADS=2 \
             -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
-            -v "$(pwd)/numba_cache:/app/numba_cache:rw" \
             "$IMAGE" | tee bot.log
 
           EXIT_CODE=${PIPESTATUS[0]}
