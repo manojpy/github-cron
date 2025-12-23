@@ -36,7 +36,7 @@ setup_runtime_cache()
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info("✅ uvloop enabled")
+    logger.debug("✅ uvloop enabled")
 except ImportError:
     pass
 
@@ -56,14 +56,14 @@ def log_resource_usage(stage: str = "final") -> None:
     try:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / 1024 / 1024
-        logger.info(f"📊 Resource Usage [{stage}] | Memory: {mem_mb:.1f}MB")
+        logger.debug(f"📊 Resource Usage [{stage}] | Memory: {mem_mb:.1f}MB")
     except Exception:
         pass
 
 async def main() -> int:
     start_time = time.time()
     try:
-        logger.info(f"🚀 Bot v{__version__} starting")
+        logger.debug(f"🚀 Bot v{__version__} starting")
         log_resource_usage("startup")
         
         success = await run_once()
