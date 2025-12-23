@@ -55,7 +55,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
 
-- name: Run Bot Container
+      - name: Run Bot Container
         id: run
         env:
           IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
