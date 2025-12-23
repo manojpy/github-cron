@@ -82,7 +82,7 @@ functions_to_compile = [
     ("_sma_loop", lambda: _sma_loop(close_small, 50)),
     ("_sma_loop_parallel", lambda: _sma_loop_parallel(close_large, 50)),
     ("_ema_loop", lambda: _ema_loop(close_small, 0.1)),
-    ("ema_loop_alpha", lambda: _ema_loop_alpha(close_small, 0.1)),
+    ("_ema_loop_alpha", lambda: _ema_loop_alpha(close_small, 0.1)),
 
     
     # Advanced indicators
