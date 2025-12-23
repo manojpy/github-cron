@@ -75,7 +75,7 @@ jobs:
             --read-only \
             --security-opt=no-new-privileges:true \
             --tmpfs /tmp:size=150m,rw,noexec,nosuid \
-            --tmpfs /app/src/__pycache__:size=50m,rw,noexec,nosuid \
+            --tmpfs /app/src/__pycache__:size=100m,rw,nosuid \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
@@ -83,6 +83,8 @@ jobs:
             -e DEBUG_MODE="$DEBUG_MODE" \
             -e NUMBA_NUM_THREADS=2 \
             -e NUMBA_THREADING_LAYER=omp \
+            -e NUMBA_CACHE_DIR=/app/src/__pycache__ \
+            -e NUMBA_DISABLE_PERFORMANCE_WARNINGS=1 \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             "$IMAGE" | tee bot.log
 
