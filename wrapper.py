@@ -2,7 +2,6 @@
 """
 wrapper.py - Entry Point for Unified MACD Trading Bot
 Handles initialization, configuration validation, execution, and resource monitoring.
-Respects NUMBA_CACHE_DIR for AOT cache detection and warmup fallback.
 """
 import asyncio
 import os
@@ -17,92 +16,70 @@ from typing import NoReturn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("wrapper")
 
-# Try uvloop for faster event loop
+
+# OPTIMIZED: Try uvloop first for 2-4x faster event loop
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     UVLOOP_ENABLED = True
-    logger.info("✅ uvloop enabled for faster event loop")
+    logger.info("✅ uvloop enabled for 2-4x faster event loop")
 except ImportError:
     UVLOOP_ENABLED = False
     logger.info("ℹ️ uvloop not available, using default event loop")
 
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
 
+
 try:
-    from src.macd_unified import (
-        run_once,
-        __version__,
-        cfg,
-        RedisStateStore,
-        SessionManager,
-    )
+    from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")
     sys.exit(1)
 
-
 def _handle_signal(signum: int, frame) -> NoReturn:
     """Unified signal handler for graceful shutdown."""
-    sig_name = signal.strsignal(signum) if hasattr(signal, "strsignal") else str(signum)
+    sig_name = signal.strsignal(signum) if hasattr(signal, 'strsignal') else str(signum)
     logger.warning(f"⚠️  Received signal {sig_name} ({signum}) – shutting down")
     raise KeyboardInterrupt
 
-
 def check_aot_cache() -> None:
-    """
-    Verify presence of Numba AOT cache and optionally perform warmup.
-    Respects NUMBA_CACHE_DIR env. Defaults to /app/src/__pycache__.
-    """
-    cache_dir = Path(os.environ.get("NUMBA_CACHE_DIR", "/app/src/__pycache__"))
-    if not cache_dir.exists():
-        logger.warning(f"⚠️  NUMBA cache directory not found: {cache_dir}")
+    cache_dir = Path("/app/src/__pycache__")
+
     cache_files = list(cache_dir.rglob("*.nbi"))
 
-    # Expect at least a minimal number of compiled artifacts
-    if len(cache_files) >= 15:
-        logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) in {cache_dir}")
+    if len(cache_files) >= 15:  # Expect at least 15 compiled functions
+        logger.info(f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed")
         return
 
-    # Respect SKIP_WARMUP to avoid JIT warmup
     if getattr(cfg, "SKIP_WARMUP", False):
-        logger.warning(
-            f"⚠️  AOT cache missing or incomplete in {cache_dir} "
-            f"({len(cache_files)} files) and SKIP_WARMUP=true — first use will JIT compile (slower)"
-        )
+        logger.warning("⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)")
         return
 
-    # Attempt warmup if cache not present and SKIP_WARMUP is false
-    logger.info(
-        f"⚠️  AOT cache missing or incomplete in {cache_dir} "
-        f"({len(cache_files)} files) — performing JIT warmup..."
-    )
+    logger.info("⚠️  AOT cache not found - performing JIT warmup...")
     try:
         from src.macd_unified import warmup_numba
         warmup_numba()
-        # Re-check after warmup
-        post_files = list(cache_dir.rglob("*.nbi"))
-        logger.info(f"✅ Warmup completed — cache now has {len(post_files)} files in {cache_dir}")
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
 
-
+# OPTIMIZED: Resource monitoring function
 def log_resource_usage(stage: str = "final") -> None:
     """Log memory and CPU usage for performance monitoring."""
     try:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / 1024 / 1024
         cpu_percent = process.cpu_percent(interval=0.1)
-
+        
         logger.info(
             f"📊 Resource Usage [{stage}] | "
             f"Memory: {mem_mb:.1f}MB | "
             f"CPU: {cpu_percent:.1f}%"
         )
-
+        
         # Warn if memory usage is high
-        if hasattr(cfg, "MEMORY_LIMIT_BYTES"):
+        if hasattr(cfg, 'MEMORY_LIMIT_BYTES'):
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             if mem_mb > (limit_mb * 0.9):
                 logger.warning(
@@ -111,7 +88,6 @@ def log_resource_usage(stage: str = "final") -> None:
                 )
     except Exception as e:
         logger.debug(f"Could not log resource usage: {e}")
-
 
 async def main() -> int:
     """
@@ -124,54 +100,53 @@ async def main() -> int:
         130: Interrupted (SIGINT/SIGTERM)
     """
     start_time = time.time()
-
+    
     try:
         # Log startup info
         uvloop_status = "✅ enabled" if UVLOOP_ENABLED else "⚠️  disabled"
-        numba_parallel = getattr(cfg, "NUMBA_PARALLEL", False)
-
+        numba_parallel = getattr(cfg, 'NUMBA_PARALLEL', False)
+        
         logger.info(
             f"🚀 Bot v{__version__} starting | "
             f"uvloop: {uvloop_status} | "
-            f"Numba parallel: {numba_parallel} | "
-            f"NUMBA_CACHE_DIR: {os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__')}"
+            f"Numba parallel: {numba_parallel}"
         )
-
-        # Check AOT cache before running bot
+        
+        # 🔥 CHECK AOT CACHE BEFORE RUNNING BOT
         check_aot_cache()
-
+        
         # Log initial resource usage
         log_resource_usage("startup")
-
+        
         # Execute main bot logic
         success = await run_once()
-
+        
         # Calculate execution time
         duration = time.time() - start_time
         logger.info(f"⏱️  Execution time: {duration:.2f}s")
-
+        
         # Log final resource usage
         log_resource_usage("complete")
-
+        
         return 0 if success else 2
-
+        
     except KeyboardInterrupt:
         duration = time.time() - start_time
         logger.warning(f"⚠️  Interrupted after {duration:.1f}s (SIGINT/SIGTERM)")
         return 130
-
+        
     except asyncio.CancelledError:
         duration = time.time() - start_time
         logger.warning(f"⚠️  Cancelled after {duration:.1f}s (timeout)")
         return 130
-
+        
     except Exception as exc:
         duration = time.time() - start_time
         logger.exception(f"❌ UNHANDLED EXCEPTION after {duration:.1f}s: {exc}")
         return 3
-
+    
     finally:
-        # Cleanup: Shutdown persistent connections
+        # 🔥 CLEANUP: Shutdown persistent connections
         try:
             logger.info("🧹 Shutting down persistent connections...")
             await RedisStateStore.shutdown_global_pool()
@@ -180,12 +155,11 @@ async def main() -> int:
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 
-
 if __name__ == "__main__":
     # Install signal handlers
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-
+    
     try:
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
