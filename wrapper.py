@@ -15,33 +15,37 @@ logger = logging.getLogger("wrapper")
 
 def setup_runtime_cache():
     """Populate the writable RAM cache with pre-compiled AOT files."""
+    # This is where the Dockerfile put the files
     source = Path("/app/src/__pycache__")
+    # This is the tmpfs RAM disk we will use at runtime
     target = Path(os.environ.get("NUMBA_CACHE_DIR", "/tmp/numba_cache"))
     
     try:
         if source.exists():
             target.mkdir(parents=True, exist_ok=True)
-            count = 0
-            for f in source.glob("*.nb*"):
-                shutil.copy(f, target)
-                count += 1
-            logger.info(f"🚀 Loaded {count} AOT files into RAM cache")
+            # Use rglob to find files in any nested Numba subdirectories
+            cache_files = list(source.rglob("*.nb*"))
+            for f in cache_files:
+                shutil.copy(f, target / f.name)
+            
+            logger.info(f"🚀 Loaded {len(cache_files)} AOT files into RAM cache at {target}")
     except Exception as e:
         logger.warning(f"Failed to populate RAM cache: {e}")
 
-# CRITICAL: Populate cache BEFORE importing logic
+# 1. Setup cache first
 setup_runtime_cache()
 
-# OPTIMIZED: Try uvloop first
+# 2. Setup uvloop
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     logger.info("✅ uvloop enabled")
 except ImportError:
-    logger.info("ℹ️ uvloop not available")
+    pass
 
-# IMPORT LOGIC (Path is handled by Docker's PYTHONPATH="/app")
+# 3. Import logic (DO NOT use sys.path.insert)
 try:
+    # PYTHONPATH="/app" in Dockerfile handles this correctly
     from src.macd_unified import run_once, __version__, cfg, RedisStateStore, SessionManager
 except ImportError as e:
     logger.critical(f"Failed to import core logic: {e}")

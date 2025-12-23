@@ -49,12 +49,12 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
+# Inside Stage 3: runtime
 WORKDIR /app
-
 RUN mkdir -p /app/src/__pycache__
 COPY --from=aot-compiler /app/src/*.py ./src/
-# Ensure __init__.py exists for package recognition
-RUN touch ./src/__init__.py
+# ADD THIS LINE:
+RUN touch ./src/__init__.py 
 COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
 COPY wrapper.py config_macd.json ./
 
