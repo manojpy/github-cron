@@ -52,6 +52,15 @@ RUN mkdir -p /app/src/__pycache__ && \
     echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
     find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
 
+RUN echo "🔍 AOT Cache Verification:" && \
+    find /app/src/__pycache__ -type f -name "*.nbi" -o -name "*.nbc" | head -20 && \
+    CACHE_FILE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l) && \
+    echo "📦 Found $CACHE_FILE_COUNT compiled cache files" && \
+    if [ "$CACHE_FILE_COUNT" -lt 15 ]; then \
+        echo "❌ ERROR: Expected at least 15 cache files, found only $CACHE_FILE_COUNT"; \
+        exit 1; \
+    fi
+
 # Stage 3: Final Runtime
 FROM ${BASE_DIGEST} AS runtime
 
