@@ -30,7 +30,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy source code
+# Copy full source tree (package marker included)
 COPY src/ ./src/
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -63,7 +63,7 @@ WORKDIR /app
 # Create directory structure
 RUN mkdir -p /app/numba_cache
 
-# Copy full source tree, not just .py files
+# Copy full source tree (not just *.py)
 COPY --from=aot-compiler /app/src/ ./src/
 
 # Copy AOT cache artifacts
@@ -81,7 +81,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
 
-# Verify cache
+# Verify cache and user setup
 RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
     ls -lah /app/numba_cache && \
     CACHE_COUNT=$(find /app/numba_cache -type f -name "*.nbi" | wc -l) && \
