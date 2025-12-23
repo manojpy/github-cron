@@ -60,24 +60,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify Numba Cache
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
-        run: |
-          echo "::group::🔍 Verifying Numba AOT cache in image"
-          docker pull --quiet "$IMAGE"
-          
-          # Check cache in the image before running
-          CACHE_COUNT=$(docker run --rm "$IMAGE" find /app/numba_cache -name "*.nbi" 2>/dev/null | wc -l)
-          echo "📁 Found $CACHE_COUNT Numba cache files in image"
-          
-          if [ "$CACHE_COUNT" -lt 5 ]; then
-            echo "⚠️  WARNING: Low number of cache files detected"
-          else
-            echo "✅ AOT cache verification passed"
-          fi
-          echo "::endgroup::"
-
       - name: Run Bot Container
         id: run
         env:
@@ -96,6 +78,7 @@ jobs:
             --cpus=2.0 \
             --cpu-shares=1024 \
             --pids-limit=100 \
+            --read-only \
             --security-opt=no-new-privileges:true \
             --tmpfs /tmp:size=150m,rw,noexec,nosuid \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
