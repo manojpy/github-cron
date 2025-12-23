@@ -30,7 +30,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# Copy source code (Kept original path)
+# Copy source code
 COPY src/ ./src/
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -42,22 +42,16 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp
 
 # 🔥 AOT COMPILATION - Pre-compile all Numba functions
-# Explicitly create the directory first to prevent "checksum calculation" errors if the script fails
 RUN mkdir -p /app/src/__pycache__ && \
+    chmod 755 /app/src/__pycache__ && \
     python src/compile_numba_aot.py && \
     echo "✅ AOT compilation completed" && \
-    echo "🔍 Checking cache directories after AOT:" && \
-    ls -lah /app/src/__pycache__/ || true && \
-    ls -lah /app/__pycache__/ || true && \
-    echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
-    find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
-
-RUN echo "🔍 AOT Cache Verification:" && \
-    find /app/src/__pycache__ -type f -name "*.nbi" -o -name "*.nbc" | head -20 && \
-    CACHE_FILE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l) && \
-    echo "📦 Found $CACHE_FILE_COUNT compiled cache files" && \
-    if [ "$CACHE_FILE_COUNT" -lt 15 ]; then \
-        echo "❌ ERROR: Expected at least 15 cache files, found only $CACHE_FILE_COUNT"; \
+    echo "🔍 Verifying cache files:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) && \
+    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l) && \
+    echo "📦 Total cache files: $CACHE_COUNT" && \
+    if [ "$CACHE_COUNT" -lt 15 ]; then \
+        echo "❌ ERROR: Expected at least 15 cache files, found only $CACHE_COUNT"; \
         exit 1; \
     fi
 
@@ -73,7 +67,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# 🔥 CRITICAL FIX: Copy source AND cache together atomically
+# 🔥 CRITICAL: Copy entire src directory with cache in one operation
 COPY --from=aot-compiler /app/src/ ./src/
 
 # Copy runtime files
@@ -88,15 +82,17 @@ ENV PATH="/opt/venv/bin:$PATH" \
     NUMBA_THREADING_LAYER=omp \
     TZ=Asia/Kolkata
 
-# Verify cache was copied and set permissions
+# Verify cache and set permissions
 RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
+    ls -lah /app/src/ && \
     ls -lah /app/src/__pycache__/ && \
-    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | wc -l) && \
+    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) 2>/dev/null | wc -l) && \
     echo "📦 Found $CACHE_COUNT cache files" && \
     if [ "$CACHE_COUNT" -lt 5 ]; then \
         echo "⚠️ WARNING: Expected more cache files, found only $CACHE_COUNT"; \
     else \
         echo "✅ AOT cache verified successfully"; \
+        find /app/src/__pycache__ -type f \( -name "*.nbi" -o -name "*.nbc" \) | head -5; \
     fi && \
     useradd -m -u 1000 botuser && \
     chown -R botuser:botuser /app && \
