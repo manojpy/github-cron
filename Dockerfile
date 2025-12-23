@@ -63,8 +63,8 @@ WORKDIR /app
 # Create directory structure
 RUN mkdir -p /app/numba_cache
 
-# Copy Python source files
-COPY --from=aot-compiler /app/src/*.py ./src/
+# Copy full source tree, not just .py files
+COPY --from=aot-compiler /app/src/ ./src/
 
 # Copy AOT cache artifacts
 COPY --from=aot-compiler /app/numba_cache/ ./numba_cache/
