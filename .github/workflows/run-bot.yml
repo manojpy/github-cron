@@ -54,7 +54,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run Bot Container
+
+- name: Run Bot Container
         id: run
         env:
           IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
@@ -64,10 +65,6 @@ jobs:
           echo "::group::📥 Pulling latest bot image"
           docker pull --quiet "$IMAGE"
           echo "::endgroup::"
-          
-          # Logic: We remove the external NUMBA_CACHE_DIR volume and env var 
-          # to allow the bot to use the internal /app/src/__pycache__ directory 
-          # where the AOT files were generated during the build stage.
           
           docker run --rm \
             --name bot-${{ github.run_id }} \
@@ -84,8 +81,7 @@ jobs:
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DEBUG_MODE="$DEBUG_MODE" \
-            -e NUMBA_CACHE_DIR=/app/src/__pycache__ \
-            -e NUMBA_NUM_THREADS=2 \
+            -e NUMBA_NUM_THREADS=4 \
             -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
             "$IMAGE" | tee bot.log
@@ -93,7 +89,7 @@ jobs:
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
           exit $EXIT_CODE
-
+      
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
