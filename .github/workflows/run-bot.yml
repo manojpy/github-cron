@@ -47,12 +47,6 @@ jobs:
             echo "✅ config_macd.json is valid JSON" || \
             { echo "❌ Invalid JSON"; exit 1; }
 
-      - name: Create local cache dir
-        run: |
-          mkdir -p numba_cache
-          # CRITICAL: Grant full permissions so 'botuser' (UID 1000) can write to this host-mounted dir
-          chmod 777 numba_cache 
-
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -71,6 +65,10 @@ jobs:
           docker pull --quiet "$IMAGE"
           echo "::endgroup::"
           
+          # Logic: We remove the external NUMBA_CACHE_DIR volume and env var 
+          # to allow the bot to use the internal /app/src/__pycache__ directory 
+          # where the AOT files were generated during the build stage.
+          
           docker run --rm \
             --name bot-${{ github.run_id }} \
             --memory=700m \
@@ -86,11 +84,10 @@ jobs:
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DEBUG_MODE="$DEBUG_MODE" \
-            -e NUMBA_CACHE_DIR=/app/numba_cache \
+            -e NUMBA_CACHE_DIR=/app/src/__pycache__ \
             -e NUMBA_NUM_THREADS=2 \
             -e NUMBA_THREADING_LAYER=omp \
             -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
-            -v "$(pwd)/numba_cache:/app/numba_cache:rw" \
             "$IMAGE" | tee bot.log
 
           EXIT_CODE=${PIPESTATUS[0]}
