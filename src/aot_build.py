@@ -97,17 +97,25 @@ def _rolling_std_welford(close, period, responsiveness):
         sd[i] = (np.sqrt(max(0.0, m2 / count)) * resp) if count > 1 else 0.0
     return sd
 
-# --- Rolling min/max ---
-@cc.export('_rolling_min_max_numba', '(float64[:], float64[:])(float64[:], int32)')
-def _rolling_min_max_numba(arr, period):
+# --- Rolling min ---
+@cc.export('_rolling_min_numba', 'float64[:](float64[:], int32)')
+def _rolling_min_numba(arr, period):
     rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
+    out = np.empty(rows, dtype=np.float64)
     for i in range(rows):
         start = max(0, i - period + 1)
-        min_arr[i] = np.nanmin(arr[start:i + 1])
-        max_arr[i] = np.nanmax(arr[start:i + 1])
-    return min_arr, max_arr
+        out[i] = np.nanmin(arr[start:i + 1])
+    return out
+
+# --- Rolling max ---
+@cc.export('_rolling_max_numba', 'float64[:](float64[:], int32)')
+def _rolling_max_numba(arr, period):
+    rows = len(arr)
+    out = np.empty(rows, dtype=np.float64)
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        out[i] = np.nanmax(arr[start:i + 1])
+    return out
 
 # --- Kalman filter ---
 @cc.export('_kalman_loop', 'float64[:](float64[:], int32, float64, float64)')

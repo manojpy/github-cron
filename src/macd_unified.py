@@ -39,7 +39,8 @@ from aot_bridge import (
     AOT_SMA,
     AOT_ROLLING_MEAN_NUMBA,
     AOT_ROLLING_STD,
-    AOT_ROLLING_MIN_MAX,
+    AOT_ROLLING_MIN,
+    AOT_ROLLING_MAX,
     AOT_KALMAN,
     AOT_VWAP_DAILY,
     AOT_RNG_FILTER,
@@ -52,6 +53,7 @@ from aot_bridge import (
     AOT_WICK_CHECK_BUY,
     AOT_WICK_CHECK_SELL,
 )
+
 
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
@@ -675,7 +677,8 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int):
         start = max(0, i - period + 1)
         min_arr[i] = np.nanmin(arr[start:i + 1])
         max_arr[i] = np.nanmax(arr[start:i + 1])
-    return min_arr, max_arr
+        min_arr = AOT_ROLLING_MIN(arr, period)
+        max_arr = AOT_ROLLING_MAX(arr, period)
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:

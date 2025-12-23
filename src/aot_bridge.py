@@ -20,7 +20,8 @@ from macd_unified import (
     _sma_loop,
     _rolling_mean_numba,
     _rolling_std_welford,
-    _rolling_min_max_numba,
+    _rolling_min_numba,
+    _rolling_max_numba,
     _kalman_loop,
     _vwap_daily_loop,
     _rng_filter_loop,
@@ -53,8 +54,11 @@ def AOT_ROLLING_MEAN_NUMBA(close: np.ndarray, period: int) -> np.ndarray:
 def AOT_ROLLING_STD(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     return AOT._rolling_std_welford(close, period, responsiveness) if HAVE_AOT else _rolling_std_welford(close, period, responsiveness)
 
-def AOT_ROLLING_MIN_MAX(arr: np.ndarray, period: int):
-    return AOT._rolling_min_max_numba(arr, period) if HAVE_AOT else _rolling_min_max_numba(arr, period)
+def AOT_ROLLING_MIN(arr, period):
+    return AOT._rolling_min_numba(arr, period) if HAVE_AOT else _rolling_min_numba(arr, period)
+
+def AOT_ROLLING_MAX(arr, period):
+    return AOT._rolling_max_numba(arr, period) if HAVE_AOT else _rolling_max_numba(arr, period)
 
 def AOT_KALMAN(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     return AOT._kalman_loop(src, length, R, Q) if HAVE_AOT else _kalman_loop(src, length, R, Q)
