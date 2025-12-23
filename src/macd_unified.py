@@ -2987,21 +2987,25 @@ def _validate_pivot_cross(
     return crossed, None
 
 
-# Unified lambda signatures for consistency
+
 BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}",
         "title": f"🟢⬆️ Cross above {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            ctx["buy_common"]
-            and _validate_pivot_cross(ctx, lvl, is_buy=True)[0]
+            ctx["buy_common"] and (
+                (crossed := _validate_pivot_cross(ctx, lvl, is_buy=True)[0])  # Run once
+                and crossed  # Use the cached bool
+            )
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
+            # Run once and cache both values
+            crossed, reason = _validate_pivot_cross(ctx, lvl, is_buy=True)
+        
             f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
             + (
-                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, True)[1]}]"
-                if not _validate_pivot_cross(ctx, lvl, True)[0] and ctx.get("pivots")
-                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+                f" [Suppressed: {reason}]" if reason else
+                f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             )
         ),
         "requires": ["pivots"],
@@ -3009,20 +3013,25 @@ BUY_PIVOT_DEFS = [
     for level in ("P", "S1", "S2", "S3", "R1", "R2")
 ]
 
+
 SELL_PIVOT_DEFS = [
     {
         "key": f"pivot_down_{level}",
         "title": f"🔴⬇️ Cross below {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            ctx["sell_common"]
-            and _validate_pivot_cross(ctx, lvl, is_buy=False)[0]
+            ctx["sell_common"] and (
+                (crossed := _validate_pivot_cross(ctx, lvl, is_buy=False)[0])
+                and crossed
+            )
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
+            # Run only once here and cache both values
+            crossed, reason = _validate_pivot_cross(ctx, lvl, is_buy=False)
+            
             f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
             + (
-                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, False)[1]}]"
-                if not _validate_pivot_cross(ctx, lvl, False)[0] and ctx.get("pivots")
-                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+                f" [Suppressed: {reason}]" if reason else
+                f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr']) / ctx['close_curr'] * 100:.2f}%]"
             )
         ),
         "requires": ["pivots"],
@@ -3289,11 +3298,9 @@ async def evaluate_pair_and_alert(
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed  = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-        is_green_candle = close_curr > open_curr
-        is_red_candle   = close_curr < open_curr
 
-        buy_common  = base_buy_trend and buy_candle_passed and is_green_candle
-        sell_common = base_sell_trend and sell_candle_passed and is_red_candle
+        buy_common  = base_buy_trend and buy_candle_passed and is_green
+        sell_common = base_sell_trend and sell_candle_passed and is_red
 
         mmh_reversal_buy  = False
         mmh_reversal_sell = False
@@ -3323,7 +3330,7 @@ async def evaluate_pair_and_alert(
             "pivots": piv, "vwap": cfg.ENABLE_VWAP,
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
-            "is_green_candle": is_green_candle, "is_red_candle": is_red_candle,
+            "is_green": is_green, "is_red": is_red,
             "pivot_suppressions": []
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
