@@ -1,57 +1,104 @@
-# ------------------------------------------------------------------
-# Stage-1  –  Build environment (g++, Python headers, Numba with pycc)
-# ------------------------------------------------------------------
-ARG PYTHON_VERSION=3.11
-ARG DEBIAN_TAG=bookworm
+# Stage 1: Builder
+ARG BASE_DIGEST=python:3.11-slim-bookworm
+FROM ${BASE_DIGEST} AS builder
 
-FROM python:${PYTHON_VERSION}-slim-${DEBIAN_TAG} AS builder
-
-# system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
+    gcc g++ libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Python deps (incl. Numba w/ AOT support)
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install --no-cache --compile \
+    pycares==4.4.0 \
+    aiodns==3.2.0 && \
+    uv pip install --no-cache --compile -r requirements.txt
 
-# source code
-COPY src/ ./src/
+# Stage 2: AOT Compilation Stage
+FROM ${BASE_DIGEST} AS aot-compiler
 
-# Produce shared object  (aot_build.py auto-discovers every @njit)
-RUN python src/aot_build.py
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# ------------------------------------------------------------------
-# Stage-2  –  Lean runtime (no compiler, only .so + source)
-# ------------------------------------------------------------------
-FROM python:${PYTHON_VERSION}-slim-${DEBIAN_TAG} AS runtime
-
-# runtime-only native libs
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# copy Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# copy source
+# Copy source code (Kept original path)
 COPY src/ ./src/
-RUN python -m pip install --editable ./src
 
-# copy AOT artefact built in previous stage
-COPY --from=builder /build/build/aot/aot_compiled*.so \
-     /app/build/aot/
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=0 \
+    NUMBA_CACHE_DIR=/app/src/__pycache__ \
+    NUMBA_NUM_THREADS=4 \
+    NUMBA_THREADING_LAYER=omp
 
-# non-root user
-RUN groupadd -g 1000 appuser && \
-    useradd -r -u 1000 -g appuser -d /app -s /bin/bash appuser && \
-    chown -R appuser:appuser /app
-USER appuser
+# 🔥 AOT COMPILATION - Pre-compile all Numba functions
+# Explicitly create the directory first to prevent "checksum calculation" errors if the script fails
+RUN mkdir -p /app/src/__pycache__ && \
+    python src/compile_numba_aot.py && \
+    echo "✅ AOT compilation completed" && \
+    echo "🔍 Checking cache directories after AOT:" && \
+    ls -lah /app/src/__pycache__/ || true && \
+    ls -lah /app/__pycache__/ || true && \
+    echo "🔍 Recursive file listing for *.nb* / *.npz / *.pkl:" && \
+    find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | head -40
 
-# entry-point uses wrapper.py (AOT-aware)
-CMD ["python", "-m", "src.wrapper"]
+# Stage 3: Final Runtime
+FROM ${BASE_DIGEST} AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+
+# Create directory structure first (Kept original path) 
+RUN mkdir -p /app/src/__pycache__
+
+# Copy Python source files (excluding __pycache__ initially)
+COPY --from=aot-compiler /app/src/*.py ./src/
+
+# 🔥 EXPLICIT: Copy the Numba cache directory separately 
+COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
+
+# Copy runtime files (Kept original names) 
+COPY wrapper.py config_macd.json ./
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NUMBA_CACHE_DIR=/app/src/__pycache__ \
+    NUMBA_NUM_THREADS=4 \
+    NUMBA_THREADING_LAYER=omp \
+    TZ=Asia/Kolkata
+
+# Verify cache was copied and set permissions [cite: 49, 50, 51, 61, 62, 63]
+RUN echo "🔍 Verifying AOT cache in runtime stage:" && \
+    ls -lah /app/src/__pycache__/ && \
+    CACHE_COUNT=$(find /app/src/__pycache__ -type f \( -name "*.nb*" -o -name "*.npz" -o -name "*.pkl" \) | wc -l) && \
+    echo "📁 Found $CACHE_COUNT cache files" && \
+    if [ "$CACHE_COUNT" -lt 5 ]; then \
+        echo "⚠️  WARNING: Expected more cache files, found only $CACHE_COUNT"; \
+    else \
+        echo "✅ AOT cache verified successfully"; \
+    fi && \
+    useradd -m -u 1000 botuser && \
+    chown -R botuser:botuser /app && \
+    chmod +x wrapper.py
+
+USER botuser
+
+ENTRYPOINT ["python", "-u", "wrapper.py"]
