@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  macd-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: macd-unified:latest
+    container_name: macd-unified
+    restart: unless-stopped
+    environment:
+      # Required – provide real values in .env or CI/CD
+      TELEGRAM_BOT_TOKEN:  ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID:    ${TELEGRAM_CHAT_ID}
+      REDIS_URL:           ${REDIS_URL}
+      DELTA_API_BASE:      ${DELTA_API_BASE:-https://api.delta.exchange}
+      DEBUG_MODE:          ${DEBUG_MODE:-false}
+      # Optional tuning
+      MAX_PARALLEL_FETCH:  ${MAX_PARALLEL_FETCH:-12}
+      RUN_TIMEOUT_SECONDS: ${RUN_TIMEOUT_SECONDS:-600}
+    volumes:
+      - ./logs:/app/logs
+      - ./config_macd.json:/app/config_macd.json:ro
+    depends_on:
+      - redis
+    networks:
+      - botnet
+
+  redis:
+    image: redis:7-alpine
+    container_name: macd-unified-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]  # ephemeral
+    networks:
+      - botnet
+
+networks:
+  botnet:
+    driver: bridge
