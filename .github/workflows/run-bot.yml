@@ -1,0 +1,110 @@
+name: Run Trading Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug logging'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [cron_trigger]
+
+concurrency:
+  group: trading-bot-execution
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: read
+      contents: read
+
+    steps:
+      - name: Log execution context
+        run: |
+          set +x
+          echo "🚀 Trading Bot Execution"
+          echo "Trigger     : ${{ github.event_name }}"
+          echo "Time (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
+
+      - name: Checkout config
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            config_macd.json
+          sparse-checkout-cone-mode: false
+
+      - name: Validate config
+        run: |
+          if [[ ! -f config_macd.json ]]; then
+            echo "❌ Missing config_macd.json"
+            exit 1
+          fi
+          python3 -c "import json; json.load(open('config_macd.json'))" && \
+            echo "✅ config_macd.json is valid JSON" || \
+            { echo "❌ Invalid JSON"; exit 1; }
+
+      - name: Create local cache dir
+        run: |
+          mkdir -p numba_cache
+          # CRITICAL: Grant full permissions so 'botuser' (UID 1000) can write to this host-mounted dir
+          chmod 777 numba_cache 
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Bot Container
+        id: run
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/trading-bot:latest
+          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
+        run: |
+          set +x
+          echo "::group::📥 Pulling latest bot image"
+          docker pull --quiet "$IMAGE"
+          echo "::endgroup::"
+          
+          docker run --rm \
+            --name bot-${{ github.run_id }} \
+            --memory=700m \
+            --memory-swap=700m \
+            --cpus=2.0 \
+            --cpu-shares=1024 \
+            --pids-limit=100 \
+            --read-only \
+            --security-opt=no-new-privileges:true \
+            --tmpfs /tmp:size=150m,rw,noexec,nosuid \
+            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
+            -e DEBUG_MODE="$DEBUG_MODE" \
+            -e NUMBA_CACHE_DIR=/app/numba_cache \
+            -e NUMBA_NUM_THREADS=2 \
+            -e NUMBA_THREADING_LAYER=omp \
+            -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
+            -v "$(pwd)/numba_cache:/app/numba_cache:rw" \
+            "$IMAGE" | tee bot.log
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs
+          path: bot.log
+
+      - name: Execution summary
+        if: always()
+        run: |
+          echo "📊 Status: ${{ job.status }} | Exit Code: ${{ steps.run.outputs.exit_code }}"
