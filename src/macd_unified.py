@@ -2986,58 +2986,48 @@ def _validate_pivot_cross(
 
     return crossed, None
 
-
-
 BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}",
         "title": f"🟢⬆️ Cross above {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            ctx["buy_common"] and (
-                (crossed := _validate_pivot_cross(ctx, lvl, is_buy=True)[0])  # Run once
-                and crossed  # Use the cached bool
-            )
+            ctx["buy_common"]
+            and _validate_pivot_cross(ctx, lvl, is_buy=True)[0]
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            # Run once and cache both values
-            crossed, reason = _validate_pivot_cross(ctx, lvl, is_buy=True)
-        
             f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
             + (
-                f" [Suppressed: {reason}]" if reason else
-                f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, True)[1]}]"
+                if not _validate_pivot_cross(ctx, lvl, True)[0] and ctx.get("pivots")
+                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             )
         ),
         "requires": ["pivots"],
     }
-    for level in ("P", "S1", "S2", "S3", "R1", "R2")
+    for level in ("P", "S1", "S2", "S3", "R1", "R2")     # R3 intentionally omitted
 ]
-
 
 SELL_PIVOT_DEFS = [
     {
         "key": f"pivot_down_{level}",
         "title": f"🔴⬇️ Cross below {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            ctx["sell_common"] and (
-                (crossed := _validate_pivot_cross(ctx, lvl, is_buy=False)[0])
-                and crossed
-            )
+            ctx["sell_common"]
+            and _validate_pivot_cross(ctx, lvl, is_buy=False)[0]
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            # Run only once here and cache both values
-            crossed, reason = _validate_pivot_cross(ctx, lvl, is_buy=False)
-            
             f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
             + (
-                f" [Suppressed: {reason}]" if reason else
-                f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr']) / ctx['close_curr'] * 100:.2f}%]"
+                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, False)[1]}]"
+                if not _validate_pivot_cross(ctx, lvl, False)[0] and ctx.get("pivots")
+                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             )
         ),
         "requires": ["pivots"],
     }
-    for level in ("P", "S1", "S2", "R1", "R2", "R3")
+    for level in ("P", "S1", "S2", "R1", "R2", "R3")     # S3 intentionally omitted
 ]
+
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
