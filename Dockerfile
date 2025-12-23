@@ -49,16 +49,16 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
-# Inside Stage 3: runtime
 WORKDIR /app
+
+# Create directory structure and package markers
 RUN mkdir -p /app/src/__pycache__
 COPY --from=aot-compiler /app/src/*.py ./src/
-# ADD THIS LINE:
-RUN touch ./src/__init__.py 
+RUN touch ./src/__init__.py
 COPY --from=aot-compiler /app/src/__pycache__/ ./src/__pycache__/
 COPY wrapper.py config_macd.json ./
 
-# CRITICAL: PYTHONDONTWRITEBYTECODE=0 is required for Numba's locator to work
+# CRITICAL: PYTHONDONTWRITEBYTECODE must be 0 for Numba's locator
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app" \
