@@ -1,9 +1,7 @@
-# syntax=docker/dockerfile:1
-# builder stage – python 3.11 slim
 FROM python:3.11-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git && \
+    build-essential git curl && \
     rm -rf /var/lib/apt/lists/*
 
 ADD https://astral.sh/uv/install.sh /tmp/uv.sh
