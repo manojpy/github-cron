@@ -40,10 +40,13 @@ from numba_helpers import (          # noqa  (we need them in globals)
     _rolling_std_welford_parallel,
     _rolling_mean_numba,
     _rolling_mean_numba_parallel,
+    _rolling_min_max_numba,
+    _rolling_min_max_numba_parallel,
     _vectorized_wick_check_buy,
     _vectorized_wick_check_sell,
     _calculate_rsi_core,
 )
+
 
 
 # ------------------------------------------------------------------
