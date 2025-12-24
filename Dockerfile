@@ -20,9 +20,10 @@ RUN uv pip install --python python3.11 --system -r requirements.txt
 COPY src/ /build/src/
 RUN cd /build/src && python3.11 aot_build.py
 
+# ✅ check for any ABI-suffixed .so file
 RUN cd /build/src && python3.11 aot_build.py && \
-    test -f /build/src/_macd_aot.so || (echo "❌ AOT .so missing" && exit 1)
-
+    ls -l /build/src && \
+    test -e /build/src/_macd_aot*.so || (echo "❌ AOT .so missing" && exit 1)
 
 # ----------------------------------------------------------
 # final stage – ubuntu 24.04 + python 3.11 runtime
@@ -42,7 +43,9 @@ COPY --from=builder /usr/local/bin/python3       /usr/local/bin/python3
 RUN ln -sf python3.11 /usr/local/bin/python
 
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /build/src/_macd_aot.so /app/src/
+
+# ✅ copy any matching .so file
+COPY --from=builder /build/src/_macd_aot*.so /app/src/
 
 COPY src/ /app/src/
 WORKDIR /app
