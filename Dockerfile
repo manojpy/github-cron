@@ -1,5 +1,7 @@
+# ---------- BUILDER STAGE ----------
 FROM python:3.11-slim AS builder
 
+# Install compilers and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git curl \
     && rm -rf /var/lib/apt/lists/*
@@ -19,7 +21,10 @@ RUN uv pip install --system --no-cache-dir -r requirements.txt
 COPY src ./src
 
 WORKDIR /build/src
-RUN python -m aot_bridge --compile
+
+# Run AOT compile step and fail hard if artifact is missing
+RUN python -m aot_bridge --compile && \
+    test -f /build/src/_macd_aot.so || (echo "❌ AOT artifact missing" && exit 1)
 
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
