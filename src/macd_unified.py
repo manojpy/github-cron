@@ -55,9 +55,6 @@ from aot_bridge import (
     _vectorized_wick_check_sell,
 )
 
-import aot_bridge
-aot_bridge.summary()
-
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
