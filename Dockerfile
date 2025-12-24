@@ -52,5 +52,6 @@ COPY --from=builder /build/src/_macd_aot*.so /app/src/
 COPY src/ /app/src/
 WORKDIR /app
 
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app/src
 CMD ["python", "-m", "wrapper"]
+
