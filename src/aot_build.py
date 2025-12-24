@@ -44,10 +44,10 @@ from numba_helpers import (          # noqa  (we need them in globals)
     _rolling_min_max_numba_parallel,
     _vectorized_wick_check_buy,
     _vectorized_wick_check_sell,
-    _calculate_rsi_core,
-    _calculate_ppo_core,
-)
+    _calculate_rsi_core, 
+    _calculate_ppo_core, 
 
+)
 
 
 # ------------------------------------------------------------------

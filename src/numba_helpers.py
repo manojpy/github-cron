@@ -438,3 +438,26 @@ def _vectorized_wick_check_sell(
         wick_ratio = lower_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
     return result
+
+# ------------------------------------------------------------------
+# 10.  AOT-build: re-decorate callees so Numba can type them
+# ------------------------------------------------------------------
+if _AOT_BUILD:
+    from numba import njit          # local import to avoid runtime cost
+    # list every function that is **called** by another function
+    _callees = (
+
+
+        _sanitize_array_numba, _sanitize_array_numba_parallel,
+        _sma_loop, _sma_loop_parallel, _calculate_rsi_core, _calculate_ppo_core,
+        _ema_loop, _ema_loop_alpha, _kalman_loop, _vwap_daily_loop,
+        _rng_filter_loop, _smooth_range, _calc_mmh_worm_loop,
+        _calc_mmh_value_loop, _calc_mmh_momentum_loop,
+        _rolling_std_welford, _rolling_std_welford_parallel,
+        _rolling_mean_numba, _rolling_mean_numba_parallel,
+        _rolling_min_max_numba, _rolling_min_max_numba_parallel,
+        _vectorized_wick_check_buy, _vectorized_wick_check_sell,
+    )
+    # decorate with empty signature – Numba will infer it
+    for f in _callees:
+        globals()[f.__name__] = njit(f)
