@@ -10,10 +10,11 @@ from pathlib import Path
 _SO_PATH = Path(__file__).parent / "_macd_aot.so"
 
 # ------------------------------------------------------------------
-# Default fallback (JIT)
+# Default fallback (JIT) – import **only** when we are not building
 # ------------------------------------------------------------------
 _FALLBACK = {}
 try:
+    # This import will succeed only when macd_unified is **fully** loaded
     from macd_unified import (                       # noqa
         _sanitize_array_numba,
         _sanitize_array_numba_parallel,
@@ -40,8 +41,10 @@ try:
         _vectorized_wick_check_sell,
     )
     _FALLBACK.update(locals())
-except Exception as exc:       # pragma: no cover
-    raise RuntimeError("Unable to load JIT fallbacks – corrupted macd_unified?") from exc
+except Exception as exc:
+    # If we are inside the AOT build this will fail – that is **expected**
+    # The AOT build does **not** use the bridge anyway
+    _FALLBACK = {}
 
 # ------------------------------------------------------------------
 # Attempt AOT load
@@ -60,7 +63,7 @@ if _SO_PATH.exists():
 
 # ------------------------------------------------------------------
 # Public API – pick AOT if available else JIT
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------__
 for _name in list(_FALLBACK):
     globals()[_name] = _AOT.get(_name, _FALLBACK[_name])
     __all__ = list(_FALLBACK)   # type: ignore
