@@ -1,0 +1,10 @@
+services:
+  macd-bot:
+    build: .
+    image: macd-unified-aot:latest
+    container_name: macd-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./config_macd.json:/app/config_macd.json:ro
