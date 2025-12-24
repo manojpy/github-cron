@@ -39,13 +39,17 @@ jobs:
         run: |
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
           
-          echo "Pulling $IMAGE_ID..."
+          echo "::debug::Pulling $IMAGE_ID..."
           docker pull --quiet $IMAGE_ID
           
-          echo "Starting Bot..."
+          echo "::debug::Starting Bot..."
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=2 \
             -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
             $IMAGE_ID
+
+
+
+
