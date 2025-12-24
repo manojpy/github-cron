@@ -37,6 +37,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot
+          # FIX: Explicitly generate 'latest' tag on default branch
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=schedule
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
