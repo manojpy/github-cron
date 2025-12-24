@@ -1,13 +1,11 @@
 name: Run MACD Bot
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:   # allows manual trigger and external API trigger
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -16,9 +14,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image
-        run: |
-          docker build -t macd-unified-aot:latest .
+      # Load cached image instead of rebuilding from scratch
+      - name: Load cached image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: macd-unified-aot:latest
+          cache-from: type=gha
 
       - name: Inject secrets into config_macd.json
         run: |
