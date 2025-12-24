@@ -1,8 +1,8 @@
 """
-Numba helpers with AOT-safe design.
-- During AOT build (AOT_BUILD=1), functions are plain Python (no @njit).
-- At runtime, they are decorated with @njit for JIT acceleration.
-- Tuple-return functions are split into single-return helpers for AOT export.
+Numba helpers – safe for both AOT build and runtime.
+During AOT build (AOT_BUILD=1), functions are plain Python.
+At runtime, they are decorated with @njit for JIT acceleration.
+Tuple-return functions remain intact (they will be JIT-only).
 """
 
 from __future__ import annotations
@@ -260,7 +260,7 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
     return sd
 
 @_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float):
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.0001, min(1.0, responsiveness))
@@ -316,7 +316,6 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else np.nan
     return ma
 
-# Original tuple-return functions (kept for runtime API compatibility)
 @_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int):
     rows = len(arr)
@@ -339,27 +338,6 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
         max_arr[i] = np.nanmax(arr[start:i + 1])
     return min_arr, max_arr
 
-# AOT-safe split helpers
-@_maybe_njit(nogil=True, fastmath=True, cache=True)
-def _rolling_min_numba(arr: np.ndarray, period: int) -> np.ndarray:
-    mins, _ = _rolling_min_max_numba(arr, period)
-    return mins
-
-@_maybe_njit(nogil=True, fastmath=True, cache=True)
-def _rolling_max_numba(arr: np.ndarray, period: int) -> np.ndarray:
-    _, maxs = _rolling_min_max_numba(arr, period)
-    return maxs
-
-@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def _rolling_min_numba_parallel(arr: np.ndarray, period: int) -> np.ndarray:
-    mins, _ = _rolling_min_max_numba_parallel(arr, period)
-    return mins
-
-@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def _rolling_max_numba_parallel(arr: np.ndarray, period: int) -> np.ndarray:
-    _, maxs = _rolling_min_max_numba_parallel(arr, period)
-    return maxs
-
 # ------------------------------------------------------------------
 # 8. Indicators
 # ------------------------------------------------------------------
@@ -377,26 +355,8 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int):
     ppo_sig = _ema_loop(ppo, signal)
     return ppo, ppo_sig
 
-# AOT-safe split helpers
 @_maybe_njit(nogil=True, fastmath=True, cache=True)
-def _ppo_values(close: np.ndarray, fast: int, slow: int) -> np.ndarray:
-    fast_ma = _ema_loop(close, fast)
-    slow_ma = _ema_loop(close, slow)
-    n = len(close)
-    ppo = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
-            ppo[i] = 0.0
-        else:
-            ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-    return ppo
-
-@_maybe_njit(nogil=True, fastmath=True, cache=True)
-def _ppo_signal(ppo: np.ndarray, signal: int) -> np.ndarray:
-    return _ema_loop(ppo, signal)
-
-@_maybe_njit(nogil=True, fastmath=True, cache=True)
-def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
+def _calculate_rsi_core(close: np.ndarray, rsi_len: int):
     n = len(close)
     delta = np.zeros(n, dtype=np.float64)
     gain = np.zeros(n, dtype=np.float64)
@@ -476,7 +436,7 @@ def _vectorized_wick_check_sell(
     return result
 
 # ------------------------------------------------------------------
-# 10. AOT-build hint: (optional) light redecorate to help type inference
+# 10. AOT-build hint: re-decorate callees (optional)
 # ------------------------------------------------------------------
 if _AOT_BUILD:
     # Optionally redecorate frequently called functions so pycc infers types reliably.

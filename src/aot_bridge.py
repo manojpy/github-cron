@@ -1,7 +1,8 @@
 """
 Loader bridge:
-1. Try to import the AOT compiled .so
+1. Try to import the AOT compiled _macd_aot.so
 2. On failure -> re-export the JIT versions from numba_helpers
+Provides diagnostics via summary().
 """
 from __future__ import annotations
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 _SO_PATH = Path(__file__).parent / "_macd_aot.so"
 
 # ------------------------------------------------------------------
-# List of names we will expose
+# Names exposed by this bridge (runtime API)
 # ------------------------------------------------------------------
 __all__ = [
     "_sanitize_array_numba",
@@ -39,9 +40,6 @@ __all__ = [
     "_vectorized_wick_check_sell",
 ]
 
-# ------------------------------------------------------------------
-# Lazy module loader with diagnostics
-# ------------------------------------------------------------------
 class _LazyModule:
     """Load AOT or JIT implementations on first attribute access, with diagnostics."""
     def __init__(self):

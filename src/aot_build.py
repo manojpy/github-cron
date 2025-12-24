@@ -3,8 +3,10 @@
 Compile Numba helpers into a true AOT shared object (_macd_aot.so).
 - Ensures helpers are plain (AOT_BUILD=1).
 - Exports only single-return functions (AOT-compatible).
+- Leaves tuple-return functions JIT-only.
 - Normalizes ABI-suffixed filename to _macd_aot.so.
 """
+
 from __future__ import annotations
 import os
 import sys
@@ -38,16 +40,11 @@ from numba_helpers import (  # noqa
     _rolling_std_welford_parallel,
     _rolling_mean_numba,
     _rolling_mean_numba_parallel,
-    # tuple originals (not exported): _rolling_min_max_numba, _rolling_min_max_numba_parallel,
-    _rolling_min_numba,
-    _rolling_max_numba,
-    _rolling_min_numba_parallel,
-    _rolling_max_numba_parallel,
-    # PPO split
-    _ppo_values,
-    _ppo_signal,
+    # tuple-return originals (kept for runtime; not exported)
+    _rolling_min_max_numba,
+    _rolling_min_max_numba_parallel,
+    _calculate_ppo_core,
     _calculate_rsi_core,
-    # candle checks
     _vectorized_wick_check_buy,
     _vectorized_wick_check_sell,
 )
@@ -58,6 +55,7 @@ cc.verbose = True
 def _sig(ret, *args):
     return f"{ret}({','.join(args)})"
 
+# Export only single-return functions
 SIGS = {
     # sanitise
     "_sanitize_array_numba":           _sig("float64[:]", "float64[:]", "float64"),
@@ -89,16 +87,6 @@ SIGS = {
     "_rolling_std_welford_parallel":   _sig("float64[:]", "float64[:]", "int32", "float64"),
     "_rolling_mean_numba":             _sig("float64[:]", "float64[:]", "int32"),
     "_rolling_mean_numba_parallel":    _sig("float64[:]", "float64[:]", "int32"),
-
-    # AOT-safe min/max splits
-    "_rolling_min_numba":              _sig("float64[:]", "float64[:]", "int32"),
-    "_rolling_max_numba":              _sig("float64[:]", "float64[:]", "int32"),
-    "_rolling_min_numba_parallel":     _sig("float64[:]", "float64[:]", "int32"),
-    "_rolling_max_numba_parallel":     _sig("float64[:]", "float64[:]", "int32"),
-
-    # PPO splits
-    "_ppo_values":                     _sig("float64[:]", "float64[:]", "int32", "int32"),
-    "_ppo_signal":                     _sig("float64[:]", "float64[:]", "int32"),
 
     # RSI
     "_calculate_rsi_core":             _sig("float64[:]", "float64[:]", "int32"),
