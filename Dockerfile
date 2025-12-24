@@ -38,9 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # copy python 3.11 runtime + packages from builder
 COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=builder /usr/local/lib/libpython3.11.so.1.0 /usr/local/lib/   # <-- add this line
 COPY --from=builder /usr/local/bin/python3.11 /usr/local/bin/python3.11
 COPY --from=builder /usr/local/bin/python3       /usr/local/bin/python3
 RUN ln -sf python3.11 /usr/local/bin/python
+
 
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
