@@ -31,6 +31,11 @@ RUN python3.11 aot_build.py && \
 # ----------------------------------------------------------
 FROM python:3.11-slim AS final
 
+# runtime libraries including TBB for Numba
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libtbb2 \
+    && rm -rf /var/lib/apt/lists/*
+
 # copy python runtime, site-packages, and compiled artifact
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
