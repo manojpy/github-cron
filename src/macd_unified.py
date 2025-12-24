@@ -1410,14 +1410,15 @@ class SessionManager:
     _request_count: ClassVar[int] = 0
     _session_reuse_limit: ClassVar[int] = 2000  # OPTIMIZED: Increased from 1000
 
+    
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
         if cls._ssl_context is None:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
+            # Modern way: enforce TLS >= 1.2
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
             cls._ssl_context = ctx
             logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
