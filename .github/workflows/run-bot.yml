@@ -40,7 +40,7 @@ jobs:
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
           
           echo "Pulling $IMAGE_ID..."
-          docker pull $IMAGE_ID
+          docker pull --quiet $IMAGE_ID
           
           echo "Starting Bot..."
           docker run --rm \
