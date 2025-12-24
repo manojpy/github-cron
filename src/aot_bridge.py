@@ -40,13 +40,15 @@ __all__ = [
 ]
 
 # ------------------------------------------------------------------
-# Lazy module loader
+# Lazy module loader with diagnostics
 # ------------------------------------------------------------------
 class _LazyModule:
-    """Load AOT or JIT implementations on first attribute access."""
+    """Load AOT or JIT implementations on first attribute access, with diagnostics."""
     def __init__(self):
         self._loaded = False
         self._impl = {}
+        self._aot_funcs: list[str] = []
+        self._jit_funcs: list[str] = []
 
     def __getattr__(self, name: str):
         if not self._loaded:
@@ -66,6 +68,7 @@ class _LazyModule:
                 for name in __all__:
                     if hasattr(mod, name):
                         self._impl[name] = getattr(mod, name)
+                        self._aot_funcs.append(name)
                 if self._impl:
                     warnings.warn("✅ Using AOT compiled _macd_aot.so", stacklevel=2)
                     self._loaded = True
@@ -126,11 +129,18 @@ class _LazyModule:
                 "_vectorized_wick_check_sell": _vectorized_wick_check_sell,
             }
             for name in __all__:
-                self._impl[name] = local_map[name]
+                if name in local_map:
+                    self._impl[name] = local_map[name]
+                    self._jit_funcs.append(name)
             warnings.warn("✅ Using JIT fallbacks from numba_helpers", stacklevel=2)
         except Exception as exc:
             raise RuntimeError("Unable to load either AOT or JIT implementations") from exc
         self._loaded = True
+
+    def summary(self) -> None:
+        print("📊 AOT vs JIT summary")
+        print(f"AOT functions: {self._aot_funcs}")
+        print(f"JIT fallbacks: {self._jit_funcs}")
 
 # install the lazy loader into sys.modules so `from aot_bridge import X` works
 sys.modules[__name__] = _LazyModule()  # type: ignore
