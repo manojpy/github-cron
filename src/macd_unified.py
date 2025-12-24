@@ -29,6 +29,19 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
+# AOT bridge – provides compiled or JIT fallbacks for heavy helpers
+from aot_bridge import (
+    _sanitize_array_numba, _sanitize_array_numba_parallel,
+    _sma_loop, _sma_loop_parallel, _ema_loop, _ema_loop_alpha,
+    _kalman_loop, _vwap_daily_loop, _rng_filter_loop, _smooth_range,
+    _calc_mmh_worm_loop, _calc_mmh_value_loop, _calc_mmh_momentum_loop,
+    _rolling_std_welford, _rolling_std_welford_parallel,
+    _rolling_mean_numba, _rolling_mean_numba_parallel,
+    _rolling_min_max_numba, _rolling_min_max_numba_parallel,
+    _calculate_ppo_core, _calculate_rsi_core,
+    _vectorized_wick_check_buy, _vectorized_wick_check_sell,
+)
+
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
