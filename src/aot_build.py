@@ -65,29 +65,47 @@ def _sig(ret, *args):
 
 # ------------------------------------------------------------------
 # 2.  Register every function with an **explicit** signature
+#    Match actual definitions in numba_helpers.py
 # ------------------------------------------------------------------
 SIGS = {
+    # sanitise
     "_sanitize_array_numba":           _sig("float64[:]", "float64[:]", "float64"),
     "_sanitize_array_numba_parallel":  _sig("float64[:]", "float64[:]", "float64"),
+
+    # moving averages
     "_sma_loop":                       _sig("float64[:]", "float64[:]", "int32"),
     "_sma_loop_parallel":              _sig("float64[:]", "float64[:]", "int32"),
     "_ema_loop":                       _sig("float64[:]", "float64[:]", "float64"),
     "_ema_loop_alpha":                 _sig("float64[:]", "float64[:]", "float64"),
+
+    # Kalman
     "_kalman_loop":                    _sig("float64[:]", "float64[:]", "int32", "float64", "float64"),
-    "_vwap_daily_loop":                _sig("float64[:]", "float64[:]", "float64[:]", "float64[:]", "float64[:]", "int64[:]"),
+
+    # VWAP
+    "_vwap_daily_loop":                _sig("float64[:]", "float64[:]", "float64[:]", "float64[:]", "int64[:]"),
+
+    # RNG
     "_rng_filter_loop":                _sig("float64[:]", "float64[:]", "float64[:]"),
     "_smooth_range":                   _sig("float64[:]", "float64[:]", "int32", "int32"),
+
+    # MMH
     "_calc_mmh_worm_loop":             _sig("float64[:]", "float64[:]", "float64[:]", "int32"),
     "_calc_mmh_value_loop":            _sig("float64[:]", "float64[:]", "int32"),
     "_calc_mmh_momentum_loop":         _sig("float64[:]", "float64[:]", "int32"),
+
+    # rolling stats
     "_rolling_std_welford":            _sig("float64[:]", "float64[:]", "int32", "float64"),
     "_rolling_std_welford_parallel":   _sig("float64[:]", "float64[:]", "int32", "float64"),
     "_rolling_mean_numba":             _sig("float64[:]", "float64[:]", "int32"),
     "_rolling_mean_numba_parallel":    _sig("float64[:]", "float64[:]", "int32"),
     "_rolling_min_max_numba":          "Tuple((float64[:], float64[:]))(float64[:], int32)",
     "_rolling_min_max_numba_parallel": "Tuple((float64[:], float64[:]))(float64[:], int32)",
+
+    # indicators
     "_calculate_ppo_core":             "Tuple((float64[:], float64[:]))(float64[:], int32, int32, int32)",
     "_calculate_rsi_core":             _sig("float64[:]", "float64[:]", "int32"),
+
+    # candle quality
     "_vectorized_wick_check_buy":      _sig("bool[:]", "float64[:]", "float64[:]", "float64[:]", "float64[:]", "float64"),
     "_vectorized_wick_check_sell":     _sig("bool[:]", "float64[:]", "float64[:]", "float64[:]", "float64[:]", "float64"),
 }
@@ -96,17 +114,17 @@ for name, sig in SIGS.items():
     cc.export(name, sig)(globals()[name])
 
 # ------------------------------------------------------------------
-# Compile
+# Compile and normalize filename
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     out_dir = _SRC_DIR
     cc.output_dir = str(out_dir)
     cc.compile()
-
-    # ✅ normalize filename to _macd_aot.so
+    # Normalize ABI-suffixed filename to _macd_aot.so
     built = list(out_dir.glob("_macd_aot*.so"))
     if not built:
         raise RuntimeError("❌ No AOT .so produced")
     target = out_dir / "_macd_aot.so"
-    shutil.move(str(built[0]), target)
+    if built[0].name != target.name:
+        shutil.move(str(built[0]), target)
     print("✅ AOT compilation finished ->", target)

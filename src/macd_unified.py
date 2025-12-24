@@ -29,8 +29,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
-# Numba helpers – AOT when available, else JIT
-from numba_helpers import (
+from aot_bridge import (
     _sanitize_array_numba,
     _sanitize_array_numba_parallel,
     _sma_loop,
@@ -55,8 +54,6 @@ from numba_helpers import (
     _vectorized_wick_check_buy,
     _vectorized_wick_check_sell,
 )
-
-
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
