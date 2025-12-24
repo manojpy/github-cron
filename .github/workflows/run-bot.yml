@@ -37,8 +37,8 @@ jobs:
       # We lowercase the image name because Docker registries require lowercase.
       - name: Run container
         run: |
-          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-          
+          set +x
+          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')    
           echo "::debug::Pulling $IMAGE_ID..."
           docker pull --quiet $IMAGE_ID
           
@@ -49,7 +49,3 @@ jobs:
             -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
             $IMAGE_ID
-
-
-
-
