@@ -82,7 +82,8 @@ SIGS = {
     "_kalman_loop":                    _sig("float64[:]", "float64[:]", "int32", "float64", "float64"),
 
     # VWAP
-    "_vwap_daily_loop":                _sig("float64[:]", "float64[:]", "float64[:]", "float64[:]", "int64[:]"),
+    "_vwap_daily_loop":                _sig("float64[:]", "float64[:]", "float64[:]", "float64[:]", "float64[:]", "int64[:]"),
+
 
     # RNG
     "_rng_filter_loop":                _sig("float64[:]", "float64[:]", "float64[:]"),
