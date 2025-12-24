@@ -22,8 +22,8 @@ COPY src ./src
 
 WORKDIR /build/src
 
-# Run AOT compile step and fail hard if artifact is missing
-RUN python -m aot_bridge --compile && \
+# Run AOT compile step via aot_build.py and fail hard if artifact is missing
+RUN python aot_build.py && \
     test -f /build/src/_macd_aot.so || (echo "❌ AOT artifact missing" && exit 1)
 
 # ---------- FINAL STAGE ----------
