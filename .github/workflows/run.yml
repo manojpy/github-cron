@@ -1,7 +1,7 @@
 name: Run MACD Bot
 
 on:
-  workflow_dispatch:   # allows manual or external trigger (Cron-jobs.org will use this)
+  workflow_dispatch:   # Cron-jobs.org will trigger this
 
 jobs:
   run:
@@ -18,7 +18,9 @@ jobs:
       - name: Run container
         run: |
           docker run --rm \
-            --env-file .env \
+            -e TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }} \
+            -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -e OTHER_ENV=${{ vars.OTHER_ENV }} \
             -v ${{ github.workspace }}/logs:/app/logs \
             -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
             macd-unified-aot:latest
