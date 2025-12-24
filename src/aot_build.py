@@ -2,8 +2,7 @@
 """
 Compile Numba helpers into a true AOT shared object (_macd_aot.so).
 - Ensures helpers are plain (AOT_BUILD=1).
-- Exports only single-return functions (AOT-compatible).
-- Leaves tuple-return functions JIT-only.
+- Exports all functions, including tuple-return ones.
 - Normalizes ABI-suffixed filename to _macd_aot.so.
 """
 
@@ -40,7 +39,6 @@ from numba_helpers import (  # noqa
     _rolling_std_welford_parallel,
     _rolling_mean_numba,
     _rolling_mean_numba_parallel,
-    # tuple-return originals (kept for runtime; not exported)
     _rolling_min_max_numba,
     _rolling_min_max_numba_parallel,
     _calculate_ppo_core,
@@ -55,7 +53,6 @@ cc.verbose = True
 def _sig(ret, *args):
     return f"{ret}({','.join(args)})"
 
-# Export only single-return functions
 SIGS = {
     # sanitise
     "_sanitize_array_numba":           _sig("float64[:]", "float64[:]", "float64"),
@@ -87,8 +84,11 @@ SIGS = {
     "_rolling_std_welford_parallel":   _sig("float64[:]", "float64[:]", "int32", "float64"),
     "_rolling_mean_numba":             _sig("float64[:]", "float64[:]", "int32"),
     "_rolling_mean_numba_parallel":    _sig("float64[:]", "float64[:]", "int32"),
+    "_rolling_min_max_numba":          "Tuple((float64[:], float64[:]))(float64[:], int32)",
+    "_rolling_min_max_numba_parallel": "Tuple((float64[:], float64[:]))(float64[:], int32)",
 
-    # RSI
+    # indicators
+    "_calculate_ppo_core":             "Tuple((float64[:], float64[:]))(float64[:], int32, int32, int32)",
     "_calculate_rsi_core":             _sig("float64[:]", "float64[:]", "int32"),
 
     # candle quality
