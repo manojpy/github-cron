@@ -1,26 +1,37 @@
 name: Run MACD Bot
 
 on:
-  workflow_dispatch:   # Cron-jobs.org will trigger this
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
 
 jobs:
-  run:
-    runs-on: ubuntu-24.04
+  run-bot:
+    runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build image
-        run: docker build -t macd-unified-aot:latest .  
-        
+        run: |
+          docker build -t macd-unified-aot:latest .
+
+      - name: Inject secrets into config_macd.json
+        run: |
+          jq '.TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" |
+              .TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" |
+              .REDIS_URL="${{ secrets.REDIS_URL }}" |
+              .DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}"' \
+              config_macd.json > config_macd.json.tmp && mv config_macd.json.tmp config_macd.json
+
       - name: Run container
         run: |
           docker run --rm \
-            -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
-            -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            -e REDIS_URL=${{ secrets.REDIS_URL }} \
-            -e DELTA_API_BASE=${{ secrets.DELTA_API_BASE }} \
+            -e NUMBA_THREADING_LAYER=tbb \
+            -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
             macd-unified-aot:latest
