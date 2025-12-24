@@ -1,27 +1,25 @@
-# ---------- BUILDER STAGE ----------
 FROM python:3.11-slim AS builder
 
-# Install build tools needed for compiling AOT artifacts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
+# Install uv first
+RUN pip install uv
+
 # Copy only requirements first to maximize cache hits
 COPY requirements.txt .
 
-# Use uv (Astral’s ultra-fast installer) for dependencies
-# --system installs into the image’s Python environment
+# Use uv for dependencies
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# Copy source code last (so dependency layer is cached unless requirements change)
+# Copy source code last
 COPY src ./src
 
-# Compile AOT artifacts (Numba .so files)
 WORKDIR /build/src
 RUN python -m aot_bridge --compile
-
 
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
