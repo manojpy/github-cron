@@ -13,13 +13,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build image
-        run: docker build -t macd-unified-aot:latest .
+        run: docker build -t macd-unified-aot:latest .  
         
       - name: Run container
         run: |
           docker run --rm \
             -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -e REDIS_URL=${{ secrets.REDIS_URL }} \
+            -e DELTA_API_BASE=${{ secrets.DELTA_API_BASE }} \
             -v ${{ github.workspace }}/logs:/app/logs \
-            -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
             macd-unified-aot:latest
