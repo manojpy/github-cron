@@ -4,8 +4,14 @@ Compile the heavy Numba helpers into a true AOT shared object.
 Executed once per architecture (or in CI) – produces _macd_aot.so
 """
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
+
+# ------------------------------------------------------------------
+# Signal that helpers must stay **plain** (no @njit)
+# ------------------------------------------------------------------
+os.environ["AOT_BUILD"] = "1"
 
 # ------------------------------------------------------------------
 # Add the folder that contains numba_helpers.py to Python path
@@ -26,20 +32,20 @@ from numba_helpers import (          # noqa  (we need them in globals)
     _kalman_loop,
     _vwap_daily_loop,
     _rng_filter_loop,
-    _smooth_range,
-    _calc_mmh_worm_loop,
-    _calc_mmh_value_loop,
-    _calc_mmh_momentum_loop,
-    _rolling_std_welford,
-    _rolling_std_welford_parallel,
-    _rolling_mean_numba,
-    _rolling_mean_numba_parallel,
-    _rolling_min_max_numba,
-    _rolling_min_max_numba_parallel,
-    _calculate_ppo_core,
-    _calculate_rsi_core,
-    _vectorized_wick_check_buy,
-    _vectorized_wick_check_sell,
+    _smooth_range",
+    _calc_mmh_worm_loop",
+    _calc_mmh_value_loop",
+    _calc_mmh_momentum_loop",
+    _rolling_std_welford",
+    _rolling_std_welford_parallel",
+    _rolling_mean_numba",
+    _rolling_mean_numba_parallel",
+    _rolling_min_max_numba",
+    _rolling_min_max_numba_parallel",
+    _calculate_ppo_core",
+    _calculate_rsi_core",
+    _vectorized_wick_check_buy",
+    _vectorized_wick_check_sell",
 )
 
 # ------------------------------------------------------------------
@@ -79,8 +85,8 @@ AOT_FUNCTIONS = [
     "_kalman_loop",
     "_vwap_daily_loop",
     "_rng_filter_loop",
-    "_smooth_range",
-    _calc_mmh_worm_loop,
+    _smooth_range,
+    "_calc_mmh_worm_loop",
     "_calc_mmh_value_loop",
     "_calc_mmh_momentum_loop",
     "_rolling_std_welford",

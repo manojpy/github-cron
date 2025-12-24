@@ -1,15 +1,28 @@
 """
 Pure Numba helpers – no imports of aot_bridge or anything else.
-This file is safe to import during AOT compilation **and** at runtime.
+During AOT compilation the functions are **plain**; at runtime they
+are auto-decorated with @njit so the rest of the code never notices.
 """
 from __future__ import annotations
+import os
 import numpy as np
 from numba import njit, prange
 
 # ------------------------------------------------------------------
+# Are we inside the AOT build?
+# ------------------------------------------------------------------
+_AOT_BUILD = os.getenv("AOT_BUILD") == "1"
+
+def _maybe_njit(*dec_args, **dec_kwargs):
+    """Return identity (no-op) when AOT_BUILD=1, else @njit."""
+    if _AOT_BUILD:
+        return lambda f: f          # plain function
+    return njit(*dec_args, **dec_kwargs)    # real decorator
+
+# ------------------------------------------------------------------
 # 1.  sanitisation
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
     out = np.empty_like(arr)
     for i in prange(len(arr)):
@@ -17,7 +30,7 @@ def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarra
         out[i] = default if np.isnan(val) or np.isinf(val) else val
     return out
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     out = np.empty_like(arr)
     for i in range(len(arr)):
@@ -28,7 +41,7 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
 # ------------------------------------------------------------------
 # 2.  moving averages
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -48,7 +61,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
         out[i] = window_sum / count if count > 0 else np.nan
     return out
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -65,7 +78,7 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
         out[i] = window_sum / count if count > 0 else np.nan
     return out
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop(data: np.ndarray, alpha_or_period) -> np.ndarray:
     n = len(data)
     if alpha_or_period > 1.0:
@@ -79,7 +92,7 @@ def _ema_loop(data: np.ndarray, alpha_or_period) -> np.ndarray:
         out[i] = out[i-1] if np.isnan(curr) else alpha * curr + (1 - alpha) * out[i-1]
     return out
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -92,7 +105,7 @@ def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 # ------------------------------------------------------------------
 # 3.  Kalman
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     n = len(src)
     result = np.empty(n, dtype=np.float64)
@@ -117,7 +130,7 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
 # ------------------------------------------------------------------
 # 4.  VWAP
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _vwap_daily_loop(
     high: np.ndarray,
     low: np.ndarray,
@@ -150,7 +163,7 @@ def _vwap_daily_loop(
 # ------------------------------------------------------------------
 # 5.  RNG filter & smooth range
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
@@ -170,7 +183,7 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
             filt[i] = min(prev_filt, target)
     return filt
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
     n = len(close)
     diff = np.zeros(n, dtype=np.float64)
@@ -184,7 +197,7 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
 # ------------------------------------------------------------------
 # 6.  MMH internals
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     worm_arr = np.empty(rows, dtype=np.float64)
     first_val = close_arr[0]
@@ -204,7 +217,7 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
         worm_arr[i] = prev_worm + delta
     return worm_arr
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr = np.zeros(rows, dtype=np.float64)
     value_arr[0] = 0.0
@@ -215,7 +228,7 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
         value_arr[i] = max(-0.9999, min(0.9999, v))
     return value_arr
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
@@ -225,7 +238,7 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 # ------------------------------------------------------------------
 # 7.  rolling statistics
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
@@ -250,7 +263,7 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
             sd[i] = 0.0
     return sd
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float):
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
@@ -275,7 +288,7 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
             sd[i] = 0.0
     return sd
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -291,7 +304,7 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else np.nan
     return ma
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -307,7 +320,7 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
         ma[i] = sum_val / count if count > 0 else np.nan
     return ma
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _rolling_min_max_numba(arr: np.ndarray, period: int):
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
@@ -318,7 +331,7 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int):
         max_arr[i] = np.nanmax(arr[start:i + 1])
     return min_arr, max_arr
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
@@ -332,7 +345,7 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
 # ------------------------------------------------------------------
 # 8.  indicators
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int):
     fast_ma = _ema_loop(close, fast)
     slow_ma = _ema_loop(close, slow)
@@ -346,7 +359,7 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int):
     ppo_sig = _ema_loop(ppo, signal)
     return ppo, ppo_sig
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _calculate_rsi_core(close: np.ndarray, rsi_len: int):
     n = len(close)
     delta = np.zeros(n, dtype=np.float64)
@@ -378,7 +391,7 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int):
 # ------------------------------------------------------------------
 # 9.  candle quality
 # ------------------------------------------------------------------
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_buy(
     open_arr: np.ndarray,
     high_arr: np.ndarray,
@@ -402,7 +415,7 @@ def _vectorized_wick_check_buy(
         result[i] = wick_ratio < min_wick_ratio
     return result
 
-@njit(nogil=True, fastmath=True, cache=True)
+@_maybe_njit(nogil=True, fastmath=True, cache=True)
 def _vectorized_wick_check_sell(
     open_arr: np.ndarray,
     high_arr: np.ndarray,
