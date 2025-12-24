@@ -30,8 +30,8 @@ from numba_helpers import (          # noqa  (we need them in globals)
     _ema_loop,
     _ema_loop_alpha,
     _kalman_loop,
-    _vwap_daily_loop",
-    _rng_filter_loop",
+    _vwap_daily_loop,
+    _rng_filter_loop,
     _smooth_range",
     _calc_mmh_worm_loop",
     _calc_mmh_value_loop",
@@ -44,6 +44,7 @@ from numba_helpers import (          # noqa  (we need them in globals)
     _vectorized_wick_check_sell",
     _calculate_rsi_core",
 )
+
 
 # ------------------------------------------------------------------
 # Numba C compiler instance
