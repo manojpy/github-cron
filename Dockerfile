@@ -20,6 +20,10 @@ RUN uv pip install --python python3.11 --system -r requirements.txt
 COPY src/ /build/src/
 RUN cd /build/src && python3.11 aot_build.py
 
+RUN cd /build/src && python3.11 aot_build.py && \
+    test -f /build/src/_macd_aot.so || (echo "❌ AOT .so missing" && exit 1)
+
+
 # ----------------------------------------------------------
 # final stage – ubuntu 24.04 + python 3.11 runtime
 # ----------------------------------------------------------
