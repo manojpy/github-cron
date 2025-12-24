@@ -1,49 +1,44 @@
-# syntax=docker/dockerfile:1
-# ----------------------------------------------------------
-# builder stage – python 3.11 slim
-# ----------------------------------------------------------
+# ---------- BUILDER STAGE ----------
 FROM python:3.11-slim AS builder
 
+# Install build tools needed for compiling AOT artifacts
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl && \
-    rm -rf /var/lib/apt/lists/*
-
-# install uv
-ADD https://astral.sh/uv/install.sh /tmp/uv.sh
-RUN sh /tmp/uv.sh && mv "$HOME/.local/bin/uv" /usr/local/bin/
+    build-essential git curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+
+# Copy only requirements first to maximize cache hits
 COPY requirements.txt .
-RUN uv pip install --python python3.11 --system -r requirements.txt
 
-# compile AOT
-COPY src/ /build/src/
+# Use uv (Astral’s ultra-fast installer) for dependencies
+# --system installs into the image’s Python environment
+RUN uv pip install --system --no-cache-dir -r requirements.txt
+
+# Copy source code last (so dependency layer is cached unless requirements change)
+COPY src ./src
+
+# Compile AOT artifacts (Numba .so files)
 WORKDIR /build/src
-RUN python3.11 aot_build.py
+RUN python -m aot_bridge --compile
 
-# ✅ check for any ABI-suffixed .so file
-RUN python3.11 aot_build.py && \
-    ls -l /build/src && \
-    test -e /build/src/_macd_aot*.so || (echo "❌ AOT .so missing" && exit 1)
 
-# ----------------------------------------------------------
-# final stage – python 3.11 slim runtime
-# ----------------------------------------------------------
+# ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
 
-# runtime libraries including TBB for Numba
+# Install runtime libraries only (no compilers here)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libtbb12 \
     && rm -rf /var/lib/apt/lists/*
 
-# copy python runtime, site-packages, and compiled artifact
+# Copy Python runtime, site-packages, and compiled artifacts from builder
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
 
 WORKDIR /app
 
-# ensure Python can find src/ modules
+# Ensure Python can find src/ modules
 ENV PYTHONPATH=/app/src
 
-# default command: run macd_unified directly
+# Default command: run macd_unified directly
 CMD ["python", "-m", "macd_unified"]
