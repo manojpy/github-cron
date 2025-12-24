@@ -1,0 +1,26 @@
+name: Run MACD Bot
+
+on:
+  workflow_dispatch:   # Cron-jobs.org will trigger this
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: docker build -t macd-unified-aot:latest .
+
+      - name: Run container
+        run: |
+          docker run --rm \
+            -e TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }} \
+            -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -e OTHER_ENV=${{ vars.OTHER_ENV }} \
+            -v ${{ github.workspace }}/logs:/app/logs \
+            -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
+            macd-unified-aot:latest
