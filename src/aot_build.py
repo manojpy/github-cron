@@ -8,15 +8,15 @@ import sys
 from pathlib import Path
 
 # ------------------------------------------------------------------
-# Add the folder that **contains** macd_unified.py to Python path
+# Add the folder that contains numba_helpers.py to Python path
 # ------------------------------------------------------------------
 _SRC_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SRC_DIR))
 
 # ------------------------------------------------------------------
-# Import the **raw** Numba functions **before** any bridge is loaded
+# Import the **raw** Numba functions – **no** bridge, **no** macd_unified
 # ------------------------------------------------------------------
-from macd_unified import (          # noqa  (we need them in globals)
+from numba_helpers import (          # noqa  (we need them in globals)
     _sanitize_array_numba,
     _sanitize_array_numba_parallel,
     _sma_loop,
@@ -80,7 +80,7 @@ AOT_FUNCTIONS = [
     "_vwap_daily_loop",
     "_rng_filter_loop",
     "_smooth_range",
-    "_calc_mmh_worm_loop",
+    _calc_mmh_worm_loop,
     "_calc_mmh_value_loop",
     "_calc_mmh_momentum_loop",
     "_rolling_std_welford",

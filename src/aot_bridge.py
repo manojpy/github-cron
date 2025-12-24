@@ -1,7 +1,7 @@
 """
 Loader bridge:
 1. Try to import the AOT compiled .so
-2. On failure -> re-export the JIT versions from macd_unified
+2. On failure -> re-export the JIT versions from numba_helpers
 """
 from __future__ import annotations
 import sys
@@ -75,7 +75,7 @@ class _LazyModule:
 
         # 2. fallback to JIT
         try:
-            from macd_unified import (  # noqa
+            from numba_helpers import (  # noqa
                 _sanitize_array_numba,
                 _sanitize_array_numba_parallel,
                 _sma_loop,
@@ -85,24 +85,24 @@ class _LazyModule:
                 _kalman_loop,
                 _vwap_daily_loop,
                 _rng_filter_loop,
-                _smooth_range,
+                _smooth_range",
                 _calc_mmh_worm_loop,
-                _calc_mmh_value_loop,
-                _calc_mmh_momentum_loop,
+                _calc_mmh_value_loop",
+                _calc_mmh_momentum_loop",
                 _rolling_std_welford,
                 _rolling_std_welford_parallel,
                 _rolling_mean_numba,
                 _rolling_mean_numba_parallel,
                 _rolling_min_max_numba,
                 _rolling_min_max_numba_parallel,
-                _calculate_ppo_core,
-                _calculate_rsi_core,
-                _vectorized_wick_check_buy,
-                _vectorized_wick_check_sell,
+                _calculate_ppo_core",
+                _calculate_rsi_core",
+                _vectorized_wick_check_buy",
+                _vectorized_wick_check_sell",
             )
             for name in __all__:
                 self._impl[name] = locals()[name]
-            warnings.warn("✅ Using JIT fallbacks from macd_unified", stacklevel=2)
+            warnings.warn("✅ Using JIT fallbacks from numba_helpers", stacklevel=2)
         except Exception as exc:
             raise RuntimeError("Unable to load either AOT or JIT implementations") from exc
         self._loaded = True
