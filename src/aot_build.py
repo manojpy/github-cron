@@ -32,21 +32,19 @@ from numba_helpers import (          # noqa  (we need them in globals)
     _kalman_loop,
     _vwap_daily_loop,
     _rng_filter_loop,
-    _smooth_range",
-    _calc_mmh_worm_loop",
-    _calc_mmh_value_loop",
-    _calc_mmh_momentum_loop",
-    _rolling_std_welford",
-    _rolling_std_welford_parallel",
-    _rolling_mean_numba",
-    _rolling_mean_numba_parallel",
-    _rolling_min_max_numba",
-    _rolling_min_max_numba_parallel",
-    _calculate_ppo_core",
-    _calculate_rsi_core",
-    _vectorized_wick_check_buy",
-    _vectorized_wick_check_sell",
+    _smooth_range,
+    _calc_mmh_worm_loop,
+    _calc_mmh_value_loop,
+    _calc_mmh_momentum_loop,
+    _rolling_std_welford,
+    _rolling_std_welford_parallel,
+    _rolling_mean_numba,
+    _rolling_mean_numba_parallel,
+    _vectorized_wick_check_buy,
+    _vectorized_wick_check_sell,
+    _calculate_rsi_core,
 )
+
 
 # ------------------------------------------------------------------
 # Numba C compiler instance
