@@ -40,5 +40,5 @@ WORKDIR /app
 # ensure Python can find src/ modules
 ENV PYTHONPATH=/app/src
 
-# default command: run wrapper
-CMD ["python", "-m", "wrapper"]
+# default command: run macd_unified directly
+CMD ["python", "-m", "macd_unified"]
