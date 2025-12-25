@@ -30,10 +30,6 @@ RUN python aot_build.py || \
         echo "JIT fallback allowed (dev build)"; \
     fi
 
-# Diagnostic: Show what was created (now in /build/src)
-RUN echo "=== AOT Build Results ===" && \
-    ls -lh macd_aot_compiled*.so && \
-    echo "========================"
 
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
@@ -52,12 +48,6 @@ COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
 COPY --from=builder /build/config_macd.json /app/src/config_macd.json
 
-# Verify .so file is present in final image
-RUN echo "=== Verifying AOT artifact in final image ===" && \
-    ls -lh /app/src/macd_aot_compiled*.so && \
-    echo "Config file location:" && \
-    ls -lh /app/src/config_macd.json && \
-    echo "============================================="
 
 # Runtime environment
 ENV PYTHONPATH=/app/src \
