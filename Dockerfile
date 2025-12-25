@@ -32,7 +32,7 @@ RUN python aot_build.py || \
 
 # Diagnostic: Show what was created
 RUN echo "=== AOT Build Results ===" && \
-    ls -lh __pycache__/macd_aot_compiled*.so 2>/dev/null || echo "No .so files found" && \
+    ls -lh __pycache__/macd_aot_compiled*.so && \
     echo "========================"
 
 # ---------- FINAL STAGE ----------
@@ -43,28 +43,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libtbb12 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /app/src
 
 # Copy Python runtime
 COPY --from=builder /usr/local /usr/local
 
 # Copy all source code (including __pycache__ with .so files)
 COPY --from=builder /build/src /app/src
-COPY --from=builder /build/config_macd.json /app/config_macd.json
+COPY --from=builder /build/config_macd.json /app/src/config_macd.json
 
 # Verify .so file is present
 RUN echo "=== Verifying AOT artifact in final image ===" && \
-    ls -lh /app/src/__pycache__/macd_aot_compiled*.so 2>/dev/null || echo "WARNING: No .so files in final image" && \
+    ls -lh /app/src/__pycache__/macd_aot_compiled*.so && \
+    echo "Config file location:" && \
+    ls -lh /app/src/config_macd.json && \
     echo "============================================="
 
-# Runtime environment - CRITICAL: Set PYTHONPATH so Python can find the modules
+# Runtime environment
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2
 
-# Set working directory to /app/src so imports work correctly
-WORKDIR /app/src
-
+# Run from /app/src where everything is located
 CMD ["python", "-m", "macd_unified"]
