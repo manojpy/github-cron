@@ -1,13 +1,17 @@
 from __future__ import annotations         
 
-import logging                          
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s %(name)s: %(message)s"
-)
+import logging
+logging.basicConfig(...)
 
+# AOT diagnostics
+import sys, pathlib
 import aot_bridge
+ok = aot_bridge.ensure_initialized()
+print("AOT init success?", ok)
 print("AOT active?", aot_bridge.is_using_aot())
+print("Fallback reason:", aot_bridge.get_fallback_reason())
+print("Startup sys.path:", sys.path)
+print("Looking for macd_aot_compiled in:", list(pathlib.Path("/app/src").glob("macd_aot_compiled*.so")))
 
 import os
 import sys
