@@ -401,6 +401,10 @@ def validate_runtime_config() -> None:
     
     _VALIDATION_DONE = True
 
+print("Python version:", sys.version)
+print("sys.path:", sys.path)
+print("Contents of /app/src:", os.listdir("/app/src"))
+
 import aot_bridge
 aot_bridge.ensure_initialized()
 
