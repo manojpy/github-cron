@@ -7,8 +7,7 @@ import numpy as np
 os.environ['NUMBA_OPT'] = '3'
 
 def compile_module():
-    output_dir = Path(__file__).parent / '__pycache__'
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(__file__).parent
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
 
