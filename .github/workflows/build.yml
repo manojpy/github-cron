@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: "0 0 * * *"   # daily build at midnight UTC
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 env:
@@ -40,8 +40,9 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=schedule
+            type=schedule,pattern={{date 'YYYYMMDD'}}
 
+      # ✅ ADD: Layer caching for faster builds
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -51,3 +52,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=macd-aot
           cache-to: type=gha,scope=macd-aot,mode=max
+          # ✅ ADD: Build optimizations
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+          provenance: false
