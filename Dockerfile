@@ -18,6 +18,7 @@ RUN uv pip install --system --no-cache-dir -r requirements.txt
 
 # Copy source code last
 COPY src ./src
+COPY config_macd.json ./config_macd.json
 
 WORKDIR /build/src
 
@@ -45,7 +46,7 @@ WORKDIR /app
 # Copy Python runtime and compiled artifacts
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
-
+COPY --from=builder /build/config_macd.json /app/config_macd.json
 # Ensure Python can find src/ modules
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
