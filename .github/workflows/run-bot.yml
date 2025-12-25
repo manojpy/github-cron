@@ -37,8 +37,7 @@ jobs:
       - name: Run container
         run: |
           set +x
-          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')    
-         
+          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')   
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=2 \
