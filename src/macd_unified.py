@@ -1,22 +1,15 @@
 from __future__ import annotations         
-
 import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s %(name)s: %(message)s"
-)
-
-
-# AOT diagnostics
-import sys, pathlib
 import aot_bridge
-ok = aot_bridge.ensure_initialized()
-print("AOT init success?", ok)
-print("AOT active?", aot_bridge.is_using_aot())
-print("Fallback reason:", aot_bridge.get_fallback_reason())
-print("Startup sys.path:", sys.path)
-print("Looking for macd_aot_compiled in:", list(pathlib.Path("/app/src").glob("macd_aot_compiled*.so")))
 
+aot_bridge.ensure_initialized()
+
+if aot_bridge.is_using_aot():
+    # ✅ AOT is active
+    ...
+else:
+    # ⚠️ JIT fallback, inspect reason
+    reason = aot_bridge.get_fallback_reason()
 import os
 import sys
 import time

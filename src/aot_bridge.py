@@ -6,8 +6,6 @@ import logging
 import numpy as np
 from typing import Tuple, Optional
 
-logger = logging.getLogger(__name__)
-
 _USING_AOT = False
 _AOT_MODULE = None
 _FALLBACK_REASON = None
@@ -420,8 +418,6 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
         return ma
     return _jit(close, period)
 
-# 18-19: ROLLING MIN/MAX (Tuple return)
-# Replace lines 358-382 in aot_bridge.py with this:
 
 # 18-19: ROLLING MIN/MAX (Tuple return) - FIXED to match AOT
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:

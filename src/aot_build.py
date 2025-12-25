@@ -11,8 +11,6 @@ def compile_module():
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
 
-    print("Compiling 23 functions...")
-    print(f"Output directory: {output_dir}")
 
     # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
@@ -411,33 +409,21 @@ def compile_module():
         return result
 
     try:
-        print("Starting cc.compile()...")
         cc.compile()
-        print("cc.compile() completed")
         
-        # Check for output file with platform-specific extension
         so_files = list(output_dir.glob(f"{cc.name}*.so"))
-        print(f"Found .so files: {so_files}")
-        
+        return bool(so_files)
+
         if so_files:
             output = so_files[0]
             size_kb = output.stat().st_size / 1024
-            print(f"✅ Compiled: {output.name} ({size_kb:.1f} KB)")
             return True
         else:
-            print(f"❌ No .so files found after compilation")
             all_files = list(output_dir.glob("*"))
-            print(f"All files in __pycache__: {all_files}")
             return False
             
     except Exception as e:
-        print(f"❌ Error during compilation: {e}")
-        print(f"Error type: {type(e).__name__}")
-        import traceback
-        traceback.print_exc()
         return False
 
 if __name__ == '__main__':
-    success = compile_module()
-    print(f"\nFinal result: {'SUCCESS' if success else 'FAILED'}")
-    sys.exit(0 if success else 1)
+    sys.exit(0 if compile_module() else 1)
