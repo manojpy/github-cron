@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Install uv for faster pip installs
+# Install uv via pip (simpler than curl script)
 RUN pip install uv
 
 # Copy requirements first for cache efficiency
@@ -16,16 +16,13 @@ COPY requirements.txt .
 
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# Copy source code and config
+# Copy source code last
 COPY src ./src
-COPY config_macd.json ./   # ensure config file is copied into build context
 
 WORKDIR /build/src
 
-# Hybrid AOT build step:
-# - In CI/CD (AOT_STRICT=1), fail hard if artifact missing
-# - In local/dev, allow JIT fallback
-ARG AOT_STRICT=0
+
+ARG AOT_STRICT=1
 RUN python aot_build.py || \
     if [ "$AOT_STRICT" = "1" ]; then \
         echo "❌ AOT artifact missing" && exit 1; \
@@ -46,15 +43,15 @@ WORKDIR /app
 # Copy Python runtime and compiled artifacts
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
-COPY --from=builder /build/config_macd.json /app/config_macd.json   
-COPY --from=builder /build/build/aot/aot_compiled*.so /app/src/
+COPY --from=builder /build/config_macd.json /app/config_macd.json
+COPY --from=builder /build/src/__pycache__/macd_aot_compiled*.so /app/src/
 
-# Ensure Python can find src/ modules
+# Runtime environment
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2
 
-# Default command: run macd_unified
 CMD ["python", "-m", "macd_unified"]
+
