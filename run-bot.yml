@@ -1,0 +1,46 @@
+name: Run MACD Bot
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inject secrets into config_macd.json
+        run: |
+          jq '.TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" |
+              .TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" |
+              .REDIS_URL="${{ secrets.REDIS_URL }}" |
+              .DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}"' \
+              config_macd.json > config_macd.json.tmp && mv config_macd.json.tmp config_macd.json
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Run container with correct paths
+      - name: Run container
+        run: |
+          set +x
+          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')   
+          docker run --rm \
+            -e NUMBA_THREADING_LAYER=tbb \
+            -e NUMBA_NUM_THREADS=2 \
+            -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro \
+            -v ${{ github.workspace }}/logs:/app/logs \
+            $IMAGE_ID
