@@ -35,7 +35,7 @@ jobs:
 
       - name: Run MACD Bot
         run: |
-          set +x  # 🔥 Launching "Macd Unified" 🔥
+          set +x  # 🔥 Launch "Macd Unified" 🚀
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
           
           echo "Pulling image..."
