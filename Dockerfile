@@ -49,8 +49,8 @@ COPY --from=builder /build/src /app/src
 # Ensure Python can find src/ modules
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
-    NUMBA_CACHE_DIR=/app/src/__pycache__
-    ENV NUMBA_THREADING_LAYER=tbb \
+    NUMBA_CACHE_DIR=/app/src/__pycache__ \
+    NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2
 
 
