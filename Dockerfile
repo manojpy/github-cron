@@ -50,6 +50,9 @@ COPY --from=builder /build/src /app/src
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     NUMBA_CACHE_DIR=/app/src/__pycache__
+    ENV NUMBA_THREADING_LAYER=tbb \
+    NUMBA_NUM_THREADS=2
+
 
 # Default command: run macd_unified
 CMD ["python", "-m", "macd_unified"]
