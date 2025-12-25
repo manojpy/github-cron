@@ -13,23 +13,29 @@ _AOT_MODULE = None
 _FALLBACK_REASON = None
 
 def initialize_aot() -> Tuple[bool, Optional[str]]:
-    """
-    Initialize AOT module if available
-    Returns: (success: bool, reason: Optional[str])
-    """
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
     
     try:
         import macd_aot_compiled
         _AOT_MODULE = macd_aot_compiled
-        
+
         # Verify it works with a simple test
         test_data = np.array([1.0, 2.0, 3.0], dtype=np.float64)
         _ = _AOT_MODULE.ema_loop(test_data, 3.0)
-        
+
+        # Extra diagnostic: confirm .so presence
+        import os
+        so_path = os.path.join(os.path.dirname(__file__),
+                               "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so")
+        if os.path.exists(so_path):
+            logger.info(f"✅ AOT artifact loaded: {so_path}")
+        else:
+            logger.warning("⚠️ No AOT artifact found in expected path, but module import succeeded")
+
         _USING_AOT = True
         logger.info("✅ Using AOT-compiled functions (.so) - 23 functions loaded")
         return True, None
+
         
     except ImportError as e:
         _FALLBACK_REASON = f"AOT module not found: {e}"
