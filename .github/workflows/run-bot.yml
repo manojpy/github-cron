@@ -38,18 +38,7 @@ jobs:
         run: |
           set +x
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')    
-          echo "$IMAGE_ID"
-          
-          # Show AOT status before running
-          docker run --rm $IMAGE_ID python -c "
-          import sys
-          sys.path.insert(0, '/app/src')
-          from aot_bridge import initialize_aot, is_using_aot
-          initialize_aot()
-          print('AOT active?', is_using_aot())
-          "
-          
-          echo "Starting Bot..."
+         
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=2 \
