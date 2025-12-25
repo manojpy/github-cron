@@ -7,8 +7,6 @@ import numpy as np
 from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
 
 _USING_AOT = False
 _AOT_MODULE = None
@@ -16,43 +14,40 @@ _FALLBACK_REASON = None
 
 def initialize_aot() -> Tuple[bool, Optional[str]]:
     """
-    Initialize AOT module if available.
+    Initialize AOT module if available
     Returns: (success: bool, reason: Optional[str])
     """
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
-
+    
     try:
         import macd_aot_compiled
         _AOT_MODULE = macd_aot_compiled
-
+        
         # Verify it works with a simple test
         test_data = np.array([1.0, 2.0, 3.0], dtype=np.float64)
         _ = _AOT_MODULE.ema_loop(test_data, 3.0)
-
-        # Extra diagnostic: confirm .so presence
-        import os
-        so_path = os.path.join(
-            os.path.dirname(__file__),
-            "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so"
-        )
-        if os.path.exists(so_path):
-            logger.info(f"✅ AOT artifact loaded: {so_path}")
-        else:
-            logger.warning("⚠️ No AOT artifact found in expected path, but module import succeeded")
-
+        
         _USING_AOT = True
         logger.info("✅ Using AOT-compiled functions (.so) - 23 functions loaded")
         return True, None
-
+        
     except ImportError as e:
         _FALLBACK_REASON = f"AOT module not found: {e}"
-        logger.warning(f"⚠️ {_FALLBACK_REASON} - using JIT fallback")
+        logger.warning(f"⚠️  {_FALLBACK_REASON} - using JIT fallback")
         return False, _FALLBACK_REASON
-
+        
     except Exception as e:
         _FALLBACK_REASON = f"AOT verification failed: {e}"
         logger.error(f"❌ {_FALLBACK_REASON} - using JIT fallback")
         return False, _FALLBACK_REASON
+
+def is_using_aot() -> bool:
+    """Check if AOT is active"""
+    return _USING_AOT
+
+def get_fallback_reason() -> Optional[str]:
+    """Get reason for AOT fallback"""
+    return _FALLBACK_REASON
 
 # ============================================================================
 # UNIFIED API - All 23 Functions with AOT/JIT Auto-Selection
@@ -426,9 +421,6 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     return _jit(close, period)
 
 # 18-19: ROLLING MIN/MAX (Tuple return)
-# Replace lines 358-382 in aot_bridge.py with this:
-
-# 18-19: ROLLING MIN/MAX (Tuple return) - FIXED to match AOT
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     if _USING_AOT and _AOT_MODULE:
         return _AOT_MODULE.rolling_min_max_numba(arr, period)
@@ -440,18 +432,8 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             start = max(0, i - period + 1)
-            # Manual min/max calculation (matches AOT)
-            min_val = np.inf
-            max_val = -np.inf
-            for j in range(start, i + 1):
-                val = arr[j]
-                if not np.isnan(val):
-                    if val < min_val:
-                        min_val = val
-                    if val > max_val:
-                        max_val = val
-            min_arr[i] = min_val if min_val != np.inf else np.nan
-            max_arr[i] = max_val if max_val != -np.inf else np.nan
+            min_arr[i] = np.nanmin(arr[start:i + 1])
+            max_arr[i] = np.nanmax(arr[start:i + 1])
         return min_arr, max_arr
     return _jit(arr, period)
 
@@ -466,20 +448,11 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nd
         max_arr = np.empty(rows, dtype=np.float64)
         for i in prange(rows):
             start = max(0, i - period + 1)
-            # Manual min/max calculation (matches AOT)
-            min_val = np.inf
-            max_val = -np.inf
-            for j in range(start, i + 1):
-                val = arr[j]
-                if not np.isnan(val):
-                    if val < min_val:
-                        min_val = val
-                    if val > max_val:
-                        max_val = val
-            min_arr[i] = min_val if min_val != np.inf else np.nan
-            max_arr[i] = max_val if max_val != -np.inf else np.nan
+            min_arr[i] = np.nanmin(arr[start:i + 1])
+            max_arr[i] = np.nanmax(arr[start:i + 1])
         return min_arr, max_arr
     return _jit(arr, period)
+
 # 20: PPO (Tuple return)
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     if _USING_AOT and _AOT_MODULE:
@@ -618,14 +591,7 @@ def ensure_initialized() -> bool:
         return _USING_AOT
     ok, _ = initialize_aot()
     _INITIALIZED = True
-
-    if _USING_AOT:
-        logger.info("✅ AOT active: macd_aot_compiled loaded")
-    else:
-        logger.warning(f"⚠️ JIT fallback active | Reason: {_FALLBACK_REASON}")
-
     return ok
-
 
 def summary_silent() -> dict:
     """Return AOT/JIT coverage summary without printing."""
