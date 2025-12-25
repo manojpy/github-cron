@@ -24,7 +24,6 @@ import argparse
 import psutil
 import math
 import gc
-import json
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
 from datetime import datetime, timezone, timedelta
@@ -43,29 +42,6 @@ import warnings
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
-
-
-def get_config():
-    # 1. Load the static values from the JSON file inside the container
-    config_path = '/app/src/config_macd.json'
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    
-    # 2. Override placeholders with real Secrets from Environment Variables
-    # This replaces the need for the "jq" step in GitHub Actions
-    keys_to_override = [
-        'TELEGRAM_BOT_TOKEN', 
-        'TELEGRAM_CHAT_ID', 
-        'REDIS_URL', 
-        'DELTA_API_BASE'
-    ]
-    
-    for key in keys_to_override:
-        env_val = os.getenv(key)
-        if env_val:
-            config[key] = env_val
-            
-    return config
 
 try:
     import orjson
