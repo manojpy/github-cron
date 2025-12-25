@@ -1,10 +1,19 @@
-from __future__ import annotations
+from __future__ import annotations         
+
+import logging                          
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s"
+)
+
+import aot_bridge
+print("AOT active?", aot_bridge.is_using_aot())
+
 import os
 import sys
 import time
 import asyncio
 import random
-import logging
 from pathlib import Path
 import ssl
 import signal
