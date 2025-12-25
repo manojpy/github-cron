@@ -30,9 +30,9 @@ RUN python aot_build.py || \
         echo "JIT fallback allowed (dev build)"; \
     fi
 
-# Diagnostic: Show what was created
+# Diagnostic: Show what was created (now in /build/src)
 RUN echo "=== AOT Build Results ===" && \
-    ls -lh __pycache__/macd_aot_compiled*.so && \
+    ls -lh macd_aot_compiled*.so && \
     echo "========================"
 
 # ---------- FINAL STAGE ----------
@@ -48,13 +48,13 @@ WORKDIR /app/src
 # Copy Python runtime
 COPY --from=builder /usr/local /usr/local
 
-# Copy all source code (including __pycache__ with .so files)
+# Copy all source code (including .so file)
 COPY --from=builder /build/src /app/src
 COPY --from=builder /build/config_macd.json /app/src/config_macd.json
 
-# Verify .so file is present
+# Verify .so file is present in final image
 RUN echo "=== Verifying AOT artifact in final image ===" && \
-    ls -lh /app/src/__pycache__/macd_aot_compiled*.so && \
+    ls -lh /app/src/macd_aot_compiled*.so && \
     echo "Config file location:" && \
     ls -lh /app/src/config_macd.json && \
     echo "============================================="
