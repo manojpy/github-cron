@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Install uv via pip (simpler than curl script)
+# Install uv for faster pip installs
 RUN pip install uv
 
 # Copy requirements first for cache efficiency
@@ -16,8 +16,9 @@ COPY requirements.txt .
 
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# Copy source code last
+# Copy source code and config
 COPY src ./src
+COPY config_macd.json ./   # ensure config file is copied into build context
 
 WORKDIR /build/src
 
@@ -45,6 +46,8 @@ WORKDIR /app
 # Copy Python runtime and compiled artifacts
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
+COPY --from=builder /build/config_macd.json /app/config_macd.json   
+COPY --from=builder /build/build/aot/aot_compiled*.so /app/src/
 
 # Ensure Python can find src/ modules
 ENV PYTHONPATH=/app/src \
@@ -52,7 +55,6 @@ ENV PYTHONPATH=/app/src \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2
-
 
 # Default command: run macd_unified
 CMD ["python", "-m", "macd_unified"]
