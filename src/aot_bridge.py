@@ -13,8 +13,12 @@ _AOT_MODULE = None
 _FALLBACK_REASON = None
 
 def initialize_aot() -> Tuple[bool, Optional[str]]:
+    """
+    Initialize AOT module if available.
+    Returns: (success: bool, reason: Optional[str])
+    """
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
-    
+
     try:
         import macd_aot_compiled
         _AOT_MODULE = macd_aot_compiled
@@ -25,8 +29,10 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
 
         # Extra diagnostic: confirm .so presence
         import os
-        so_path = os.path.join(os.path.dirname(__file__),
-                               "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so")
+        so_path = os.path.join(
+            os.path.dirname(__file__),
+            "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so"
+        )
         if os.path.exists(so_path):
             logger.info(f"✅ AOT artifact loaded: {so_path}")
         else:
@@ -36,24 +42,15 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
         logger.info("✅ Using AOT-compiled functions (.so) - 23 functions loaded")
         return True, None
 
-        
     except ImportError as e:
         _FALLBACK_REASON = f"AOT module not found: {e}"
-        logger.warning(f"⚠️  {_FALLBACK_REASON} - using JIT fallback")
+        logger.warning(f"⚠️ {_FALLBACK_REASON} - using JIT fallback")
         return False, _FALLBACK_REASON
-        
+
     except Exception as e:
         _FALLBACK_REASON = f"AOT verification failed: {e}"
         logger.error(f"❌ {_FALLBACK_REASON} - using JIT fallback")
         return False, _FALLBACK_REASON
-
-def is_using_aot() -> bool:
-    """Check if AOT is active"""
-    return _USING_AOT
-
-def get_fallback_reason() -> Optional[str]:
-    """Get reason for AOT fallback"""
-    return _FALLBACK_REASON
 
 # ============================================================================
 # UNIFIED API - All 23 Functions with AOT/JIT Auto-Selection
