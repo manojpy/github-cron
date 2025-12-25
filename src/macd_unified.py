@@ -401,6 +401,10 @@ def validate_runtime_config() -> None:
     
     _VALIDATION_DONE = True
 
+import aot_bridge
+aot_bridge.ensure_initialized()
+
+
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
     try:

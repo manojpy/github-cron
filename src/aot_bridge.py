@@ -7,6 +7,8 @@ import numpy as np
 from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 
 _USING_AOT = False
 _AOT_MODULE = None
