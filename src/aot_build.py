@@ -4,7 +4,7 @@ from pathlib import Path
 from numba.pycc import CC
 import numpy as np
 
-# ✅ Suppress warnings
+# Suppress warnings
 os.environ['NUMBA_OPT'] = '3'
 os.environ['NUMBA_WARNINGS'] = '0'
 os.environ['PYTHONWARNINGS'] = 'ignore'
@@ -13,8 +13,7 @@ def compile_module():
     output_dir = Path(__file__).parent
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
-    
-    cc.verbose = False
+    cc.verbose = False  # Quieter compilation
 
     # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
@@ -274,7 +273,7 @@ def compile_module():
             ma[i] = sum_val / count if count > 0 else np.nan
         return ma
 
-    # 18-19: Rolling Min/Max (FIXED)
+    # 18-19: Rolling Min/Max
     @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba(arr, period):
         rows = len(arr)
@@ -413,6 +412,7 @@ def compile_module():
         return result
 
     try:
+        print("Compiling AOT module...")
         cc.compile()
         
         so_files = list(output_dir.glob(f"{cc.name}*.so"))
@@ -420,14 +420,14 @@ def compile_module():
         if so_files:
             output = so_files[0]
             size_kb = output.stat().st_size / 1024
-            print(f"✓ AOT compiled successfully: {output.name} ({size_kb:.1f} KB)")  # ✅ Single success line
+            print(f"SUCCESS: AOT compiled {output.name} ({size_kb:.1f} KB)")
             return True
         else:
-            print("✗ AOT compilation failed: no .so file generated")
+            print("ERROR: No .so file generated")
             return False
             
     except Exception as e:
-        print(f"✗ AOT compilation error: {e}")
+        print(f"ERROR: Compilation failed: {e}")
         return False
 
 if __name__ == '__main__':
