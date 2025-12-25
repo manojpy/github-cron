@@ -5,11 +5,11 @@ import aot_bridge
 aot_bridge.ensure_initialized()
 
 if aot_bridge.is_using_aot():
-    # ✅ AOT is active
-    ...
+    print("✅ AOT is active")
 else:
-    # ⚠️ JIT fallback, inspect reason
     reason = aot_bridge.get_fallback_reason()
+    print(f"⚠️ JIT fallback, reason: {reason}")
+
 import os
 import sys
 import time
