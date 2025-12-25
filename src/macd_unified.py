@@ -1,7 +1,11 @@
 from __future__ import annotations         
 
 import logging
-logging.basicConfig(...)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s"
+)
+
 
 # AOT diagnostics
 import sys, pathlib
