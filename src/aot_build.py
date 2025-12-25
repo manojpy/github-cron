@@ -13,6 +13,7 @@ def compile_module():
     cc.output_dir = str(output_dir)
 
     print("Compiling 23 functions...")
+    print(f"Output directory: {output_dir}")
 
     # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
@@ -156,7 +157,6 @@ def compile_module():
         for i in range(1, n):
             diff[i] = abs(close[i] - close[i-1])
 
-        # Inline EMA for avrng (alpha from t)
         alpha_t = 2.0 / (t + 1.0)
         avrng = np.empty(n, dtype=np.float64)
         avrng[0] = diff[0] if not np.isnan(diff[0]) else 0.0
@@ -164,7 +164,6 @@ def compile_module():
             curr = diff[i]
             avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
 
-        # Inline EMA for smoothrng (alpha from wper)
         wper = t * 2 - 1
         alpha_w = 2.0 / (wper + 1.0)
         smoothrng = np.empty(n, dtype=np.float64)
@@ -274,7 +273,7 @@ def compile_module():
             ma[i] = sum_val / count if count > 0 else np.nan
         return ma
 
-    # 18-19: Rolling Min/Max
+    # 18-19: Rolling Min/Max (FIXED)
     @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba(arr, period):
         rows = len(arr)
@@ -282,8 +281,17 @@ def compile_module():
         max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             start = max(0, i - period + 1)
-            min_arr[i] = np.nanmin(arr[start:i + 1])
-            max_arr[i] = np.nanmax(arr[start:i + 1])
+            min_val = np.inf
+            max_val = -np.inf
+            for j in range(start, i + 1):
+                val = arr[j]
+                if not np.isnan(val):
+                    if val < min_val:
+                        min_val = val
+                    if val > max_val:
+                        max_val = val
+            min_arr[i] = min_val if min_val != np.inf else np.nan
+            max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
 
     @cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
@@ -293,8 +301,17 @@ def compile_module():
         max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             start = max(0, i - period + 1)
-            min_arr[i] = np.nanmin(arr[start:i + 1])
-            max_arr[i] = np.nanmax(arr[start:i + 1])
+            min_val = np.inf
+            max_val = -np.inf
+            for j in range(start, i + 1):
+                val = arr[j]
+                if not np.isnan(val):
+                    if val < min_val:
+                        min_val = val
+                    if val > max_val:
+                        max_val = val
+            min_arr[i] = min_val if min_val != np.inf else np.nan
+            max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
 
     # 20: PPO
@@ -302,7 +319,6 @@ def compile_module():
     def calculate_ppo_core(close, fast, slow, signal):
         n = len(close)
 
-        # Inline EMA for fast and slow
         fast_alpha = 2.0 / (fast + 1.0)
         slow_alpha = 2.0 / (slow + 1.0)
 
@@ -320,7 +336,6 @@ def compile_module():
                 fast_ma[i] = fast_alpha * curr + (1 - fast_alpha) * fast_ma[i - 1]
                 slow_ma[i] = slow_alpha * curr + (1 - slow_alpha) * slow_ma[i - 1]
 
-        # PPO calculation
         ppo = np.empty(n, dtype=np.float64)
         for i in range(n):
             if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
@@ -328,7 +343,6 @@ def compile_module():
             else:
                 ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
 
-        # Signal line EMA (inline alpha)
         sig_alpha = 2.0 / (signal + 1.0)
         ppo_sig = np.empty(n, dtype=np.float64)
         ppo_sig[0] = ppo[0]
@@ -353,7 +367,6 @@ def compile_module():
             elif delta < 0:
                 loss[i] = -delta
 
-        # Inline EMA with alpha = 1/rsi_len
         alpha = 1.0 / rsi_len
         avg_gain = np.empty(n, dtype=np.float64)
         avg_loss = np.empty(n, dtype=np.float64)
@@ -399,15 +412,33 @@ def compile_module():
         return result
 
     try:
+        print("Starting cc.compile()...")
         cc.compile()
-        output = Path(cc.output_dir) / f"{cc.name}.so"
-        if output.exists():
-            print(f"✅ Compiled: {output.stat().st_size/1024:.1f} KB")
+        print("cc.compile() completed")
+        
+        # Check for output file with platform-specific extension
+        so_files = list(output_dir.glob(f"{cc.name}*.so"))
+        print(f"Found .so files: {so_files}")
+        
+        if so_files:
+            output = so_files[0]
+            size_kb = output.stat().st_size / 1024
+            print(f"✅ Compiled: {output.name} ({size_kb:.1f} KB)")
             return True
-        return False
+        else:
+            print(f"❌ No .so files found after compilation")
+            all_files = list(output_dir.glob("*"))
+            print(f"All files in __pycache__: {all_files}")
+            return False
+            
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error during compilation: {e}")
+        print(f"Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
         return False
 
 if __name__ == '__main__':
-    sys.exit(0 if compile_module() else 1)
+    success = compile_module()
+    print(f"\nFinal result: {'SUCCESS' if success else 'FAILED'}")
+    sys.exit(0 if success else 1)

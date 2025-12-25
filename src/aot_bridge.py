@@ -421,6 +421,9 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     return _jit(close, period)
 
 # 18-19: ROLLING MIN/MAX (Tuple return)
+# Replace lines 358-382 in aot_bridge.py with this:
+
+# 18-19: ROLLING MIN/MAX (Tuple return) - FIXED to match AOT
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     if _USING_AOT and _AOT_MODULE:
         return _AOT_MODULE.rolling_min_max_numba(arr, period)
@@ -432,8 +435,18 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
         max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             start = max(0, i - period + 1)
-            min_arr[i] = np.nanmin(arr[start:i + 1])
-            max_arr[i] = np.nanmax(arr[start:i + 1])
+            # Manual min/max calculation (matches AOT)
+            min_val = np.inf
+            max_val = -np.inf
+            for j in range(start, i + 1):
+                val = arr[j]
+                if not np.isnan(val):
+                    if val < min_val:
+                        min_val = val
+                    if val > max_val:
+                        max_val = val
+            min_arr[i] = min_val if min_val != np.inf else np.nan
+            max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
     return _jit(arr, period)
 
@@ -448,11 +461,20 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nd
         max_arr = np.empty(rows, dtype=np.float64)
         for i in prange(rows):
             start = max(0, i - period + 1)
-            min_arr[i] = np.nanmin(arr[start:i + 1])
-            max_arr[i] = np.nanmax(arr[start:i + 1])
+            # Manual min/max calculation (matches AOT)
+            min_val = np.inf
+            max_val = -np.inf
+            for j in range(start, i + 1):
+                val = arr[j]
+                if not np.isnan(val):
+                    if val < min_val:
+                        min_val = val
+                    if val > max_val:
+                        max_val = val
+            min_arr[i] = min_val if min_val != np.inf else np.nan
+            max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
     return _jit(arr, period)
-
 # 20: PPO (Tuple return)
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     if _USING_AOT and _AOT_MODULE:
