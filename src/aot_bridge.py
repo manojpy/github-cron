@@ -618,7 +618,14 @@ def ensure_initialized() -> bool:
         return _USING_AOT
     ok, _ = initialize_aot()
     _INITIALIZED = True
+
+    if _USING_AOT:
+        logger.info("✅ AOT active: macd_aot_compiled loaded")
+    else:
+        logger.warning(f"⚠️ JIT fallback active | Reason: {_FALLBACK_REASON}")
+
     return ok
+
 
 def summary_silent() -> dict:
     """Return AOT/JIT coverage summary without printing."""
