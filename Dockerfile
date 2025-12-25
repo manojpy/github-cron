@@ -47,6 +47,9 @@ WORKDIR /app
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /build/src /app/src
 COPY --from=builder /build/config_macd.json /app/config_macd.json
+COPY --from=builder /build/src/__pycache__/macd_aot_compiled*.so /app/src/__pycache__/
+
+
 # Ensure Python can find src/ modules
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
