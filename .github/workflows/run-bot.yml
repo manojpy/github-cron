@@ -33,19 +33,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Optimization: Directly pull the specific tag.
-      # We lowercase the image name because Docker registries require lowercase.
+      # Run container with correct paths
       - name: Run container
         run: |
           set +x
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')    
-          echo "::debug::Pulling $IMAGE_ID..."
-          docker pull --quiet $IMAGE_ID
+          echo "$IMAGE_ID"
           
-          echo "::debug::Starting Bot..."
+          # Show AOT status before running
+          docker run --rm $IMAGE_ID python -c "
+          import sys
+          sys.path.insert(0, '/app/src')
+          from aot_bridge import initialize_aot, is_using_aot
+          initialize_aot()
+          print('AOT active?', is_using_aot())
+          "
+          
+          echo "Starting Bot..."
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=2 \
-            -v ${{ github.workspace }}/config_macd.json:/app/config_macd.json:ro \
+            -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
             $IMAGE_ID
