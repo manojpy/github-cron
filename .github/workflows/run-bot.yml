@@ -1,4 +1,3 @@
-
 name: Run MACD Bot
 
 on:
@@ -34,19 +33,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ FIX: Pull image quietly before running
-      - name: Pull Docker image
+      # ✅ Pull and run in single step with suppressed output
+      - name: Run MACD Bot
         run: |
+          set +x  # Disable command echoing
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-          docker pull -q $IMAGE_ID
-
-      # ✅ FIX: Run container with quieter output
-      - name: Run container
-        run: |
-          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')   
+          
+          echo "Pulling image..."
+          docker pull -q "$IMAGE_ID" > /dev/null 2>&1
+          
+          echo "Running bot..."
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=2 \
             -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
-            $IMAGE_ID 2>&1 | grep -v "^$" || true
+            "$IMAGE_ID"
