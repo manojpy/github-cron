@@ -21,7 +21,7 @@ COPY config_macd.json ./config_macd.json
 
 WORKDIR /build/src
 
-# OPTION 1: Try AOT with fallback to JIT (current)
+# Build AOT with detailed output
 ARG AOT_STRICT=1
 RUN python aot_build.py || \
     if [ "$AOT_STRICT" = "1" ]; then \
@@ -30,12 +30,10 @@ RUN python aot_build.py || \
         echo "JIT fallback allowed (dev build)"; \
     fi
 
-# OPTION 2: Disable AOT completely (uncomment to use)
-# Just comment out the entire RUN python aot_build.py block above
-# and the bot will use JIT automatically
-
-# Diagnostic: list everything under /build/src so logs show artifact location
-RUN ls -R /build/src
+# Diagnostic: Show what was created
+RUN echo "=== AOT Build Results ===" && \
+    ls -lh __pycache__/macd_aot_compiled*.so 2>/dev/null || echo "No .so files found" && \
+    echo "========================"
 
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
@@ -47,19 +45,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy Python runtime and compiled artifacts
+# Copy Python runtime
 COPY --from=builder /usr/local /usr/local
+
+# Copy all source code (including __pycache__ with .so files)
 COPY --from=builder /build/src /app/src
 COPY --from=builder /build/config_macd.json /app/config_macd.json
 
-# Copy .so file with platform-specific name (e.g., macd_aot_compiled.cpython-311-x86_64-linux-gnu.so)
-COPY --from=builder /build/src/__pycache__/macd_aot_compiled*.so /app/src/__pycache__/
+# Verify .so file is present
+RUN echo "=== Verifying AOT artifact in final image ===" && \
+    ls -lh /app/src/__pycache__/macd_aot_compiled*.so 2>/dev/null || echo "WARNING: No .so files in final image" && \
+    echo "============================================="
 
-# Runtime environment
+# Runtime environment - CRITICAL: Set PYTHONPATH so Python can find the modules
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2
+
+# Set working directory to /app/src so imports work correctly
+WORKDIR /app/src
 
 CMD ["python", "-m", "macd_unified"]
