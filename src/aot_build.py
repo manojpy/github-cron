@@ -4,13 +4,17 @@ from pathlib import Path
 from numba.pycc import CC
 import numpy as np
 
+# ✅ Suppress warnings
 os.environ['NUMBA_OPT'] = '3'
+os.environ['NUMBA_WARNINGS'] = '0'
+os.environ['PYTHONWARNINGS'] = 'ignore'
 
 def compile_module():
     output_dir = Path(__file__).parent
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
-
+    
+    cc.verbose = False
 
     # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
@@ -412,17 +416,18 @@ def compile_module():
         cc.compile()
         
         so_files = list(output_dir.glob(f"{cc.name}*.so"))
-        return bool(so_files)
-
+        
         if so_files:
             output = so_files[0]
             size_kb = output.stat().st_size / 1024
+            print(f"✓ AOT compiled successfully: {output.name} ({size_kb:.1f} KB)")  # ✅ Single success line
             return True
         else:
-            all_files = list(output_dir.glob("*"))
+            print("✗ AOT compilation failed: no .so file generated")
             return False
             
     except Exception as e:
+        print(f"✗ AOT compilation error: {e}")
         return False
 
 if __name__ == '__main__':

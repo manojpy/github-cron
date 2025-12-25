@@ -24,6 +24,7 @@ import argparse
 import psutil
 import math
 import gc
+import json
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
 from datetime import datetime, timezone, timedelta

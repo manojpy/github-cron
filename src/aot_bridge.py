@@ -5,6 +5,10 @@ Provides unified API that automatically uses AOT (.so) when available, falls bac
 import logging
 import numpy as np
 from typing import Tuple, Optional
+import os
+
+# ✅ Suppress Numba warnings at import time
+os.environ['NUMBA_WARNINGS'] = '0'
 
 _USING_AOT = False
 _AOT_MODULE = None
@@ -12,32 +16,37 @@ _FALLBACK_REASON = None
 
 def initialize_aot() -> Tuple[bool, Optional[str]]:
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
-    try:
-        import macd_aot_compiled
-        _AOT_MODULE = macd_aot_compiled
-    except ImportError:
-        import importlib.util, pathlib, sys
-        so_path = pathlib.Path(__file__).parent / "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so"
-        if so_path.exists():
-            spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["macd_aot_compiled"] = mod
-            spec.loader.exec_module(mod)
-            _AOT_MODULE = mod
-        else:
-            _FALLBACK_REASON = "AOT module not found"
+    
+    # ✅ Suppress warnings during import
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        
+        try:
+            import macd_aot_compiled
+            _AOT_MODULE = macd_aot_compiled
+        except ImportError:
+            import importlib.util, pathlib, sys
+            so_path = pathlib.Path(__file__).parent / "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so"
+            if so_path.exists():
+                spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["macd_aot_compiled"] = mod
+                spec.loader.exec_module(mod)
+                _AOT_MODULE = mod
+            else:
+                _FALLBACK_REASON = "AOT module not found"
+                return False, _FALLBACK_REASON
+
+        # Verify with a simple test
+        try:
+            test_data = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+            _ = _AOT_MODULE.ema_loop(test_data, 3.0)
+            _USING_AOT = True
+            return True, None
+        except Exception as e:
+            _FALLBACK_REASON = f"AOT verification failed: {e}"
             return False, _FALLBACK_REASON
-
-    # Verify with a simple test
-    try:
-        test_data = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-        _ = _AOT_MODULE.ema_loop(test_data, 3.0)
-        _USING_AOT = True
-        return True, None
-    except Exception as e:
-        _FALLBACK_REASON = f"AOT verification failed: {e}"
-        return False, _FALLBACK_REASON
-
 
 def is_using_aot() -> bool:
     """Check if AOT is active"""
