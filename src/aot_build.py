@@ -11,9 +11,9 @@ def compile_module():
     output_dir.mkdir(exist_ok=True)
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
-    
+
     print("Compiling 23 functions...")
-    
+
     # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
     def sanitize_array_numba(arr, default):
@@ -22,11 +22,16 @@ def compile_module():
             val = arr[i]
             out[i] = default if (np.isnan(val) or np.isinf(val)) else val
         return out
-    
+
     @cc.export('sanitize_array_numba_parallel', 'f8[:](f8[:], f8)')
     def sanitize_array_numba_parallel(arr, default):
-        return sanitize_array_numba(arr, default)
-    
+        n = len(arr)
+        out = np.empty_like(arr)
+        for i in range(n):
+            val = arr[i]
+            out[i] = default if (np.isnan(val) or np.isinf(val)) else val
+        return out
+
     # 3-4: SMA
     @cc.export('sma_loop', 'f8[:](f8[:], i4)')
     def sma_loop(data, period):
@@ -46,37 +51,45 @@ def compile_module():
                     count -= 1
             out[i] = window_sum / count if count > 0 else np.nan
         return out
-    
+
     @cc.export('sma_loop_parallel', 'f8[:](f8[:], i4)')
     def sma_loop_parallel(data, period):
         n = len(data)
         out = np.empty(n, dtype=np.float64)
+        out[:] = np.nan
         for i in range(n):
             window_sum, count = 0.0, 0
             start = max(0, i - period + 1)
             for j in range(start, i + 1):
-                if not np.isnan(data[j]):
-                    window_sum += data[j]
+                val = data[j]
+                if not np.isnan(val):
+                    window_sum += val
                     count += 1
             out[i] = window_sum / count if count > 0 else np.nan
         return out
-    
+
     # 5-6: EMA
     @cc.export('ema_loop', 'f8[:](f8[:], f8)')
     def ema_loop(data, alpha_or_period):
         n = len(data)
-        alpha = 2.0/(alpha_or_period+1.0) if alpha_or_period>1.0 else alpha_or_period
+        alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
         out = np.empty(n, dtype=np.float64)
         out[0] = data[0] if not np.isnan(data[0]) else 0.0
         for i in range(1, n):
             curr = data[i]
-            out[i] = out[i-1] if np.isnan(curr) else alpha*curr + (1-alpha)*out[i-1]
+            out[i] = out[i-1] if np.isnan(curr) else alpha * curr + (1 - alpha) * out[i-1]
         return out
-    
+
     @cc.export('ema_loop_alpha', 'f8[:](f8[:], f8)')
     def ema_loop_alpha(data, alpha):
-        return ema_loop(data, alpha)
-    
+        n = len(data)
+        out = np.empty(n, dtype=np.float64)
+        out[0] = data[0] if not np.isnan(data[0]) else 0.0
+        for i in range(1, n):
+            curr = data[i]
+            out[i] = out[i-1] if np.isnan(curr) else alpha * curr + (1 - alpha) * out[i-1]
+        return out
+
     # 7: Kalman
     @cc.export('kalman_loop', 'f8[:](f8[:], i4, f8, f8)')
     def kalman_loop(src, length, R, Q):
@@ -97,7 +110,7 @@ def compile_module():
             error_est = (1.0 - kalman_gain) * error_est + Q_div_length
             result[i] = estimate
         return result
-    
+
     # 8: VWAP
     @cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])')
     def vwap_daily_loop(high, low, close, volume, timestamps):
@@ -109,15 +122,15 @@ def compile_module():
             if day != current_day:
                 current_day, cum_vol, cum_pv = day, 0.0, 0.0
             h, l, c, v = high[i], low[i], close[i], volume[i]
-            if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v<=0:
-                vwap[i] = vwap[i-1] if i>0 else c
+            if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
+                vwap[i] = vwap[i-1] if i > 0 else c
                 continue
-            typical = (h+l+c)/3.0
+            typical = (h + l + c) / 3.0
             cum_vol += v
             cum_pv += typical * v
-            vwap[i] = cum_pv/cum_vol if cum_vol>0 else typical
+            vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical
         return vwap
-    
+
     # 9-10: Filters
     @cc.export('rng_filter_loop', 'f8[:](f8[:], f8[:])')
     def rng_filter_loop(x, r):
@@ -125,7 +138,7 @@ def compile_module():
         filt = np.empty(n, dtype=np.float64)
         filt[0] = x[0] if not np.isnan(x[0]) else 0.0
         for i in range(1, n):
-            prev_filt = filt[i-1]
+            prev_filt = filt[i - 1]
             curr_x, curr_r = x[i], r[i]
             if np.isnan(curr_r) or np.isnan(curr_x):
                 filt[i] = prev_filt
@@ -135,49 +148,64 @@ def compile_module():
             else:
                 filt[i] = min(prev_filt, curr_x + curr_r)
         return filt
-    
+
     @cc.export('smooth_range', 'f8[:](f8[:], i4, i4)')
     def smooth_range(close, t, m):
         n = len(close)
         diff = np.zeros(n, dtype=np.float64)
         for i in range(1, n):
             diff[i] = abs(close[i] - close[i-1])
-        avrng = ema_loop(diff, float(t))
+
+        # Inline EMA for avrng (alpha from t)
+        alpha_t = 2.0 / (t + 1.0)
+        avrng = np.empty(n, dtype=np.float64)
+        avrng[0] = diff[0] if not np.isnan(diff[0]) else 0.0
+        for i in range(1, n):
+            curr = diff[i]
+            avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
+
+        # Inline EMA for smoothrng (alpha from wper)
         wper = t * 2 - 1
-        smoothrng = ema_loop(avrng, float(wper))
+        alpha_w = 2.0 / (wper + 1.0)
+        smoothrng = np.empty(n, dtype=np.float64)
+        smoothrng[0] = avrng[0]
+        for i in range(1, n):
+            curr = avrng[i]
+            smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
+
         return smoothrng * m
-    
+
     # 11-13: MMH
     @cc.export('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i4)')
     def calc_mmh_worm_loop(close_arr, sd_arr, rows):
         worm_arr = np.empty(rows, dtype=np.float64)
         worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
         for i in range(1, rows):
-            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i-1]
-            prev_worm = worm_arr[i-1]
+            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
+            prev_worm = worm_arr[i - 1]
             diff = src - prev_worm
             sd_i = sd_arr[i]
-            delta = diff if np.isnan(sd_i) else ((np.sign(diff)*sd_i) if abs(diff)>sd_i else diff)
+            delta = diff if np.isnan(sd_i) else ((np.sign(diff) * sd_i) if abs(diff) > sd_i else diff)
             worm_arr[i] = prev_worm + delta
         return worm_arr
-    
+
     @cc.export('calc_mmh_value_loop', 'f8[:](f8[:], i4)')
     def calc_mmh_value_loop(temp_arr, rows):
         value_arr = np.zeros(rows, dtype=np.float64)
         for i in range(1, rows):
-            prev_v = value_arr[i-1] if not np.isnan(value_arr[i-1]) else 0.0
+            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
             v = t - 0.5 + 0.5 * prev_v
             value_arr[i] = max(-0.9999, min(0.9999, v))
         return value_arr
-    
+
     @cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i4)')
     def calc_mmh_momentum_loop(momentum_arr, rows):
         for i in range(1, rows):
-            prev = momentum_arr[i-1] if not np.isnan(momentum_arr[i-1]) else 0.0
+            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
             momentum_arr[i] = momentum_arr[i] + 0.5 * prev
         return momentum_arr
-    
+
     # 14-15: Rolling Std
     @cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')
     def rolling_std_welford(close, period, responsiveness):
@@ -186,107 +214,190 @@ def compile_module():
         resp = max(0.0001, min(1.0, responsiveness))
         for i in range(n):
             mean, m2, count = 0.0, 0.0, 0
-            start = max(0, i-period+1)
-            for j in range(start, i+1):
+            start = max(0, i - period + 1)
+            for j in range(start, i + 1):
                 val = close[j]
                 if not np.isnan(val):
                     count += 1
                     delta = val - mean
                     mean += delta / count
                     m2 += delta * (val - mean)
-            sd[i] = 0.0 if count<=1 else np.sqrt(max(0.0, m2/count)) * resp
+            sd[i] = 0.0 if count <= 1 else np.sqrt(max(0.0, m2 / count)) * resp
         return sd
-    
+
     @cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')
     def rolling_std_welford_parallel(close, period, responsiveness):
-        return rolling_std_welford(close, period, responsiveness)
-    
+        n = len(close)
+        sd = np.empty(n, dtype=np.float64)
+        resp = max(0.0001, min(1.0, responsiveness))
+        for i in range(n):
+            mean, m2, count = 0.0, 0.0, 0
+            start = max(0, i - period + 1)
+            for j in range(start, i + 1):
+                val = close[j]
+                if not np.isnan(val):
+                    count += 1
+                    delta = val - mean
+                    mean += delta / count
+                    m2 += delta * (val - mean)
+            sd[i] = 0.0 if count <= 1 else np.sqrt(max(0.0, m2 / count)) * resp
+        return sd
+
     # 16-17: Rolling Mean
     @cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')
     def rolling_mean_numba(close, period):
         rows = len(close)
         ma = np.empty(rows, dtype=np.float64)
         for i in range(rows):
-            start = max(0, i-period+1)
+            start = max(0, i - period + 1)
             sum_val, count = 0.0, 0
-            for j in range(start, i+1):
-                if not np.isnan(close[j]):
-                    sum_val += close[j]
+            for j in range(start, i + 1):
+                val = close[j]
+                if not np.isnan(val):
+                    sum_val += val
                     count += 1
-            ma[i] = sum_val/count if count>0 else np.nan
+            ma[i] = sum_val / count if count > 0 else np.nan
         return ma
-    
+
     @cc.export('rolling_mean_numba_parallel', 'f8[:](f8[:], i4)')
     def rolling_mean_numba_parallel(close, period):
-        return rolling_mean_numba(close, period)
-    
+        rows = len(close)
+        ma = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            start = max(0, i - period + 1)
+            sum_val, count = 0.0, 0
+            for j in range(start, i + 1):
+                val = close[j]
+                if not np.isnan(val):
+                    sum_val += val
+                    count += 1
+            ma[i] = sum_val / count if count > 0 else np.nan
+        return ma
+
     # 18-19: Rolling Min/Max
     @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba(arr, period):
         rows = len(arr)
-        min_arr, max_arr = np.empty(rows, dtype=np.float64), np.empty(rows, dtype=np.float64)
+        min_arr = np.empty(rows, dtype=np.float64)
+        max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
-            start = max(0, i-period+1)
-            min_arr[i] = np.nanmin(arr[start:i+1])
-            max_arr[i] = np.nanmax(arr[start:i+1])
+            start = max(0, i - period + 1)
+            min_arr[i] = np.nanmin(arr[start:i + 1])
+            max_arr[i] = np.nanmax(arr[start:i + 1])
         return min_arr, max_arr
-    
+
     @cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba_parallel(arr, period):
-        return rolling_min_max_numba(arr, period)
-    
+        rows = len(arr)
+        min_arr = np.empty(rows, dtype=np.float64)
+        max_arr = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            start = max(0, i - period + 1)
+            min_arr[i] = np.nanmin(arr[start:i + 1])
+            max_arr[i] = np.nanmax(arr[start:i + 1])
+        return min_arr, max_arr
+
     # 20: PPO
     @cc.export('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)')
     def calculate_ppo_core(close, fast, slow, signal):
         n = len(close)
-        fast_ma = ema_loop(close, float(fast))
-        slow_ma = ema_loop(close, float(slow))
+
+        # Inline EMA for fast and slow
+        fast_alpha = 2.0 / (fast + 1.0)
+        slow_alpha = 2.0 / (slow + 1.0)
+
+        fast_ma = np.empty(n, dtype=np.float64)
+        slow_ma = np.empty(n, dtype=np.float64)
+        fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
+        slow_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
+
+        for i in range(1, n):
+            curr = close[i]
+            if np.isnan(curr):
+                fast_ma[i] = fast_ma[i - 1]
+                slow_ma[i] = slow_ma[i - 1]
+            else:
+                fast_ma[i] = fast_alpha * curr + (1 - fast_alpha) * fast_ma[i - 1]
+                slow_ma[i] = slow_alpha * curr + (1 - slow_alpha) * slow_ma[i - 1]
+
+        # PPO calculation
         ppo = np.empty(n, dtype=np.float64)
         for i in range(n):
-            ppo[i] = 0.0 if abs(slow_ma[i])<1e-12 else ((fast_ma[i]-slow_ma[i])/slow_ma[i])*100.0
-        ppo_sig = ema_loop(ppo, float(signal))
+            if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
+                ppo[i] = 0.0
+            else:
+                ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
+
+        # Signal line EMA (inline alpha)
+        sig_alpha = 2.0 / (signal + 1.0)
+        ppo_sig = np.empty(n, dtype=np.float64)
+        ppo_sig[0] = ppo[0]
+        for i in range(1, n):
+            if np.isnan(ppo[i]):
+                ppo_sig[i] = ppo_sig[i - 1]
+            else:
+                ppo_sig[i] = sig_alpha * ppo[i] + (1 - sig_alpha) * ppo_sig[i - 1]
+
         return ppo, ppo_sig
-    
+
     # 21: RSI
     @cc.export('calculate_rsi_core', 'f8[:](f8[:], i4)')
     def calculate_rsi_core(close, rsi_len):
         n = len(close)
-        gain, loss = np.zeros(n, dtype=np.float64), np.zeros(n, dtype=np.float64)
+        gain = np.zeros(n, dtype=np.float64)
+        loss = np.zeros(n, dtype=np.float64)
         for i in range(1, n):
-            delta = close[i] - close[i-1]
-            if delta > 0: gain[i] = delta
-            elif delta < 0: loss[i] = -delta
-        alpha = 1.0/rsi_len
-        avg_gain = ema_loop_alpha(gain, alpha)
-        avg_loss = ema_loop_alpha(loss, alpha)
+            delta = close[i] - close[i - 1]
+            if delta > 0:
+                gain[i] = delta
+            elif delta < 0:
+                loss[i] = -delta
+
+        # Inline EMA with alpha = 1/rsi_len
+        alpha = 1.0 / rsi_len
+        avg_gain = np.empty(n, dtype=np.float64)
+        avg_loss = np.empty(n, dtype=np.float64)
+        avg_gain[0] = gain[0]
+        avg_loss[0] = loss[0]
+        for i in range(1, n):
+            avg_gain[i] = alpha * gain[i] + (1 - alpha) * avg_gain[i - 1]
+            avg_loss[i] = alpha * loss[i] + (1 - alpha) * avg_loss[i - 1]
+
         rsi = np.empty(n, dtype=np.float64)
         for i in range(n):
-            rsi[i] = 100.0 if avg_loss[i]<1e-10 else 100.0 - (100.0/(1.0+avg_gain[i]/avg_loss[i]))
+            if avg_loss[i] < 1e-10:
+                rsi[i] = 100.0
+            else:
+                rsi[i] = 100.0 - (100.0 / (1.0 + (avg_gain[i] / avg_loss[i])))
         return rsi
-    
+
     # 22-23: Wick Checks
     @cc.export('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')
     def vectorized_wick_check_buy(o, h, l, c, ratio):
         n = len(c)
         result = np.zeros(n, dtype=np.bool_)
         for i in range(n):
-            if c[i]<=o[i]: continue
-            rng = h[i]-l[i]
-            if rng<1e-8: continue
-            result[i] = (h[i]-c[i])/rng < ratio
+            if c[i] <= o[i]:
+                continue
+            rng = h[i] - l[i]
+            if rng < 1e-8:
+                continue
+            result[i] = ((h[i] - c[i]) / rng) < ratio
         return result
-    
+
     @cc.export('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')
     def vectorized_wick_check_sell(o, h, l, c, ratio):
         n = len(c)
         result = np.zeros(n, dtype=np.bool_)
         for i in range(n):
-            if c[i]>=o[i]: continue
-            rng = h[i]-l[i]
-            if rng<1e-8: continue
-            result[i] = (c[i]-l[i])/rng < ratio
+            if c[i] >= o[i]:
+                continue
+            rng = h[i] - l[i]
+            if rng < 1e-8:
+                continue
+            result[i] = ((c[i] - l[i]) / rng) < ratio
         return result
-    
+
     try:
         cc.compile()
         output = Path(cc.output_dir) / f"{cc.name}.so"
