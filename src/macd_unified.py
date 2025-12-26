@@ -786,63 +786,63 @@ def calculate_all_indicators_numpy(
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
 ) -> Dict[str, np.ndarray]:
+    results = {}    
+    close_15m = data_15m["close"]
+    close_5m = data_5m["close"]
     
-    try:
-        results = {}    
-        close_15m = data_15m["close"]
-        close_5m = data_5m["close"]
-        
-        ppo, ppo_signal = calculate_ppo_numpy(
-            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+    ppo, ppo_signal = calculate_ppo_numpy(
+        close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+    )
+    results['ppo'] = ppo
+    results['ppo_signal'] = ppo_signal
+    
+    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
+        close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
+    )
+    
+    if cfg.ENABLE_VWAP:
+        results['vwap'] = calculate_vwap_numpy(
+            data_15m["high"], data_15m["low"], data_15m["close"],
+            data_15m["volume"], data_15m["timestamp"]
         )
-        results['ppo'] = ppo
-        results['ppo_signal'] = ppo_signal
+    else:
+        results['vwap'] = np.zeros_like(close_15m)
+    
+    mmh = calculate_magical_momentum_hist(close_15m)
+    results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if cfg.CIRRUS_CLOUD_ENABLED:
+        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
+        results['upw'] = upw
+        results['dnw'] = dnw
+    else:
+        results['upw'] = np.zeros(len(close_15m), dtype=bool)
+        results['dnw'] = np.zeros(len(close_15m), dtype=bool)
+    
+    results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
+    results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
+    
+    if cfg.ENABLE_PIVOT and data_daily is not None:
+        last_close = float(close_15m[-1])
+        daily_high = float(data_daily["high"][-1])
+        daily_low = float(data_daily["low"][-1])
+        daily_range = daily_high - daily_low
         
-        results['smooth_rsi'] = calculate_smooth_rsi_numpy(
-            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
-        )
-        
-        if cfg.ENABLE_VWAP:
-            results['vwap'] = calculate_vwap_numpy(
-                data_15m["high"], data_15m["low"], data_15m["close"],
-                data_15m["volume"], data_15m["timestamp"]
+        if abs(last_close - daily_high) < daily_range * 0.5 or \
+           abs(last_close - daily_low) < daily_range * 0.5:
+            results['pivots'] = calculate_pivot_levels_numpy(
+                data_daily["high"], data_daily["low"],
+                data_daily["close"], data_daily["timestamp"]
             )
         else:
-            results['vwap'] = np.zeros_like(close_15m)
-        
-        mmh = calculate_magical_momentum_hist(close_15m)
-        results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        if cfg.CIRRUS_CLOUD_ENABLED:
-            upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
-            results['upw'] = upw
-            results['dnw'] = dnw
-        else:
-            results['upw'] = np.zeros(len(close_15m), dtype=bool)
-            results['dnw'] = np.zeros(len(close_15m), dtype=bool)
-        
-        results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
-        results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-        
-        if cfg.ENABLE_PIVOT and data_daily is not None:
-            last_close = float(close_15m[-1])
-            daily_high = float(data_daily["high"][-1])
-            daily_low = float(data_daily["low"][-1])
-            daily_range = daily_high - daily_low
-            
-            if abs(last_close - daily_high) < daily_range * 0.5 or \
-               abs(last_close - daily_low) < daily_range * 0.5:
-                results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"], data_daily["low"],
-                    data_daily["close"], data_daily["timestamp"]
+            results['pivots'] = {}
+            if cfg.DEBUG_MODE:
+                logger.debug(
+                    f"Skipped pivot calc (price {last_close:.2f} far from range {daily_low:.2f}-{daily_high:.2f})"
                 )
-            else:
-                results['pivots'] = {}
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"Skipped pivot calc (price {last_close:.2f} far from range {daily_low:.2f}-{daily_high:.2f})")
-        else:
-            results['pivots'] = {}    
-        return results
+    else:
+        results['pivots'] = {}    
+    return results
 
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
