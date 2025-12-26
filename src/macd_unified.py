@@ -1,15 +1,6 @@
 from __future__ import annotations         
 import logging
 import aot_bridge
-
-aot_bridge.ensure_initialized()
-
-if aot_bridge.is_using_aot():
-    print("✅ AOT is active")
-else:
-    reason = aot_bridge.get_fallback_reason()
-    print(f"⚠️ JIT fallback, reason: {reason}")
-
 import os
 import sys
 import time
@@ -3799,7 +3790,16 @@ try:
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
+
 if __name__ == "__main__":
+    aot_bridge.ensure_initialized()
+    if not aot_bridge.is_using_aot():
+        reason = aot_bridge.get_fallback_reason() or "Unknown"
+        logger.critical("❌ AOT not active — JIT fallback. Reason: %s", reason)
+        sys.exit(1)
+    else:
+        logger.info("✅ Verified: AOT artifacts loaded successfully")
+
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
