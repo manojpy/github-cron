@@ -955,13 +955,11 @@ class SessionManager:
         if old_session and not old_session.closed:
             asyncio.create_task(cls._graceful_close(old_session))
 
-    # REPLACE _graceful_close method (lines 738-746)
-
     @classmethod
     async def _graceful_close(cls, session: aiohttp.ClientSession):
         try:
             await asyncio.sleep(5.0)
-            if not session.closed:  # âœ… FIX: Check before closing
+            if not session.closed:  # ✅ FIX: Check before closing
                 await session.close()
                 logger.debug("🗑️ Old HTTP session closed gracefully")
         except asyncio.CancelledError:
@@ -1003,6 +1001,15 @@ class SessionManager:
                     cls._creation_time = 0.0
             else:
                 logger.debug("Session already closed or not created")
+
+    @classmethod
+    def track_request(cls) -> None:
+        """Increment request counter for the active session."""
+        cls._request_count += 1
+        logger.debug(
+            f"Tracked request | Count: {cls._request_count} | "
+            f"Reuse limit: {cls._session_reuse_limit}"
+        )
 
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
@@ -1096,12 +1103,18 @@ async def async_fetch_json(
 ) -> Optional[Dict[str, Any]]:
     session = await SessionManager.get_session()
     last_error = None
-    retry_stats = {"network": 0, "rate_limit": 0, "api_error": 0, "timeout": 0, "unknown": 0}
+    retry_stats = {
+        "network": 0,
+        "rate_limit": 0,
+        "api_error": 0,
+        "timeout": 0,
+        "unknown": 0,
+    }
 
     for attempt in range(1, retries + 1):
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
-                # Track request immediately after acquiring response
+                # ✅ Track request immediately after acquiring response
                 SessionManager.track_request()
 
                 if resp.status == 429:
@@ -1110,7 +1123,9 @@ async def async_fetch_json(
                     jitter = random.uniform(0.1, 0.5)
                     total_wait = wait_sec + jitter
                     retry_stats["rate_limit"] += 1
-                    logger.warning(f"Rate limited (429) | Waiting {total_wait:.2f}s | Attempt {attempt}/{retries}")
+                    logger.warning(
+                        f"Rate limited (429) | Waiting {total_wait:.2f}s | Attempt {attempt}/{retries}"
+                    )
                     await asyncio.sleep(total_wait)
                     continue
 
@@ -1120,17 +1135,28 @@ async def async_fetch_json(
                     if attempt < retries:
                         base_delay = min(10, backoff * (2 ** (attempt - 1)))
                         jitter = base_delay * random.uniform(0.1, 0.5)
-                        await asyncio.sleep(base_delay + jitter)
+                        delay = base_delay + jitter
+                        logger.debug(f"Applied backoff {delay:.2f}s | Attempt {attempt}")
+                        await asyncio.sleep(delay)
                     continue
 
                 if resp.status >= 400:
                     logger.error(f"Client error {resp.status} | Not retrying")
                     return None
 
-                data = await resp.json(loads=json_loads)
+                try:
+                    data = await resp.json(loads=json_loads)
+                except Exception as e:
+                    last_error = e
+                    retry_stats["unknown"] += 1
+                    snippet = (await resp.text())[:200]
+                    logger.error(f"JSON decode failed | Error: {e} | Snippet: {snippet}")
+                    continue
 
                 if any(retry_stats.values()):
-                    logger.info(f"Fetch succeeded after retries | Attempts: {attempt} | Stats: {retry_stats}")
+                    logger.info(
+                        f"Fetch succeeded after retries | Attempts: {attempt} | Stats: {retry_stats}"
+                    )
 
                 return data
 
@@ -1141,16 +1167,22 @@ async def async_fetch_json(
             if attempt < retries:
                 base_delay = min(10, backoff * (2 ** (attempt - 1)))
                 jitter = base_delay * random.uniform(0.1, 0.5)
-                await asyncio.sleep(base_delay + jitter)
+                delay = base_delay + jitter
+                logger.debug(f"Applied backoff {delay:.2f}s | Attempt {attempt}")
+                await asyncio.sleep(delay)
 
         except aiohttp.ClientError as e:
             last_error = e
             retry_stats["network"] += 1
-            logger.warning(f"Network error (attempt {attempt}/{retries}) | Error: {str(e)[:100]}")
+            logger.warning(
+                f"Network error (attempt {attempt}/{retries}) | Error: {str(e)[:100]}"
+            )
             if attempt < retries:
                 base_delay = min(10, backoff * (2 ** (attempt - 1)))
                 jitter = base_delay * random.uniform(0.1, 0.5)
-                await asyncio.sleep(base_delay + jitter)
+                delay = base_delay + jitter
+                logger.debug(f"Applied backoff {delay:.2f}s | Attempt {attempt}")
+                await asyncio.sleep(delay)
 
         except Exception as e:
             last_error = e
@@ -1158,11 +1190,13 @@ async def async_fetch_json(
             logger.exception(f"Unexpected fetch error: {e}")
             break
 
-    # Force session recreation if repeated API errors
+    # 🔄 Force session recreation if repeated API/network errors
     if retry_stats["api_error"] >= 2 or retry_stats["network"] >= 3:
         await SessionManager.force_recreate()
 
-    logger.error(f"Failed to fetch after {retries} attempts | Stats: {retry_stats} | Last error: {last_error}")
+    logger.error(
+        f"Failed to fetch after {retries} attempts | Stats: {retry_stats} | Last error: {last_error}"
+    )
     return None
 
 class RateLimitedFetcher:
