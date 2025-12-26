@@ -2211,7 +2211,7 @@ class RedisStateStore:
         
         # Log deduplication stats if debug enabled
                 if cfg.DEBUG_MODE:
-                duplicates = sum(1 for v in dedup_results.values() if not v)
+                    duplicates = sum(1 for v in dedup_results.values() if not v)
                 if duplicates > 0:
                     logger.debug(f"Atomic batch for {pair}: {duplicates}/{len(dedup_checks)} duplicates filtered")
         
