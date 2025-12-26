@@ -1896,27 +1896,27 @@ class RedisStateStore:
                     if hasattr(cls._global_pool, 'connection_pool') and cls._global_pool.connection_pool:
                         pool_age = time.time() - cls._pool_created_at
                         reuse_count = cls._pool_reuse_count
-                        
+
                         logger.info(
                             f"Shutting down global Redis pool | "
                             f"Age: {pool_age:.1f}s | "
                             f"Reuses: {reuse_count}"
                         )
-                        
+
                         await cls._global_pool.aclose()
                         await asyncio.sleep(0.25)  # Allow cleanup
-                        
+
                         cls._global_pool = None
                         cls._pool_healthy = False
                         cls._pool_created_at = 0.0
                         cls._pool_reuse_count = 0
-                        
+
                         logger.debug("✅ Global Redis pool shutdown complete")
                     else:
                         logger.debug("Redis pool already closed")
                         cls._global_pool = None
                         cls._pool_healthy = False
-                        
+
                 except Exception as e:
                     logger.error(f"Error shutting down global Redis pool: {e}")
                     cls._global_pool = None
@@ -2005,7 +2005,7 @@ class RedisStateStore:
     async def check_recent_alert(
         self, pair: str, alert_key: str, ts: int
     ) -> bool:
-        
+
         if self.degraded:
             return True
 
@@ -2043,7 +2043,7 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
-        
+
         if self.degraded or not checks:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2141,7 +2141,7 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-    
+
         if self.degraded:
             # Redis unavailable - return safe defaults
             empty_prev = {k: False for k in alert_keys}
@@ -2151,21 +2151,21 @@ class RedisStateStore:
         try:
             async with asyncio.timeout(5.0):
                 async with self._redis.pipeline() as pipe:
-                
+
                     state_keys = [f"{pair}:{k}" for k in alert_keys]
                     pipe.mget(state_keys)
-                
+
                     now = int(time.time())
                     for key, state, custom_ts in state_updates:
                         ts = custom_ts if custom_ts is not None else now
                         data = json_dumps({"state": state, "ts": ts})
                         full_key = f"{self.state_prefix}{key}"
-                    
+
                         if self.expiry_seconds > 0:
                             pipe.set(full_key, data, ex=self.expiry_seconds)
                         else:
                             pipe.set(full_key, data)
-                
+
                 # ================================================================
                 # OPERATION 3: Deduplication checks (SET NX)
                 # ================================================================
@@ -2173,20 +2173,20 @@ class RedisStateStore:
                         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                         recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                         pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-                
+
                 # Execute all operations atomically
                     results = await pipe.execute()
-        
+
         # ====================================================================
         # Parse Results
         # ====================================================================
             num_state_keys = len(state_keys)
             num_updates = len(state_updates)
-        
+
         # Parse Operation 1: Previous states (MGET result)
             prev_states = {}
             mget_results = results[0] if results else []
-        
+
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
                 if val:
@@ -2198,36 +2198,36 @@ class RedisStateStore:
                         prev_states[key] = False
                 else:
                     prev_states[key] = False
-        
+
         # Parse Operation 3: Deduplication results (SET NX results)
             dedup_results = {}
             dedup_start_idx = 1 + num_updates  # Skip MGET result + SET results
-        
+
             for idx, (pair_name, alert_key, _) in enumerate(dedup_checks):
                 result_idx = dedup_start_idx + idx
             # SET NX returns True if key was set (new alert), False if already exists (duplicate)
                 should_send = bool(results[result_idx]) if result_idx < len(results) else True
                 dedup_results[f"{pair_name}:{alert_key}"] = should_send
-        
+
         # Log deduplication stats if debug enabled
                 if cfg.DEBUG_MODE:
                     duplicates = sum(1 for v in dedup_results.values() if not v)
                 if duplicates > 0:
                     logger.debug(f"Atomic batch for {pair}: {duplicates}/{len(dedup_checks)} duplicates filtered")
-        
+
             return prev_states, dedup_results
-    
+
         except asyncio.TimeoutError:
         # ✅ FIX: Graceful degradation on timeout
             logger.error(
                 f"atomic_eval_batch timeout after 5s for {pair} | "
                 f"Operations: MGET({len(alert_keys)}) + SET({len(state_updates)}) + DEDUP({len(dedup_checks)})"
             )
-        
+
         # Fallback to individual operations (slower but reliable)
             try:
                 logger.warning(f"Falling back to individual Redis operations for {pair}")
-            
+
             # Fetch previous states individually
                 prev_states = {}
                 for key in alert_keys:
@@ -2237,14 +2237,14 @@ class RedisStateStore:
                         prev_states[key] = st is not None and st.get("state") == "ACTIVE"
                     except asyncio.TimeoutError:
                         prev_states[key] = False
-            
+
             # Update states individually
                 for key, state, custom_ts in state_updates:
                     try:
                         await asyncio.wait_for(self.set(key, state, custom_ts), timeout=2.0)
                     except asyncio.TimeoutError:
                         logger.warning(f"Timeout setting state for {key}")
-            
+
             # Deduplication checks individually
                 dedup_results = {}
                 for pair_name, alert_key, ts in dedup_checks:
@@ -2257,10 +2257,10 @@ class RedisStateStore:
                     except asyncio.TimeoutError:
                     # On timeout, allow the alert (fail-open)
                         dedup_results[f"{pair_name}:{alert_key}"] = True
-            
+
                 logger.info(f"Fallback operations completed for {pair}")
                 return prev_states, dedup_results
-            
+
             except Exception as fallback_err:
                 logger.error(f"Fallback operations also failed for {pair}: {fallback_err}")
             # Ultimate fallback: allow all alerts
@@ -2274,22 +2274,22 @@ class RedisStateStore:
                 f"atomic_eval_batch failed for {pair}: {e} | "
                 f"Operations: MGET({len(alert_keys)}) + SET({len(state_updates)}) + DEDUP({len(dedup_checks)})"
             )
-        
+
         # Try fallback to individual operations
             try:
                 prev_states = await self.mget_states([f"{pair}:{k}" for k in alert_keys])
                 await self.batch_set_states(state_updates)
                 dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-            
+
                 # Convert prev_states format
                 prev_states_bool = {}
                 for key in alert_keys:
                     state_key = f"{pair}:{key}"
                     st = prev_states.get(state_key)
                     prev_states_bool[key] = st is not None and st.get("state") == "ACTIVE"
-            
+
                 return prev_states_bool, dedup_results
-            
+
             except Exception as fallback_err:
                 logger.error(f"Fallback operations also failed: {fallback_err}")
             # Ultimate fallback: allow all alerts to prevent missed signals
