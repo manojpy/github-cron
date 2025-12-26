@@ -13,7 +13,6 @@ import re
 import uuid
 import argparse
 import psutil
-import math
 import gc
 import json
 from collections import deque, defaultdict
@@ -23,7 +22,6 @@ from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 from urllib.parse import urlparse, parse_qs
 import aiohttp
-from aiohttp import web
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
@@ -78,6 +76,25 @@ except ImportError:
     JSON_BACKEND = "stdlib"
 
 __version__ = "1.8.0-stable"
+
+# --- Define SUCCESS log level ---
+SUCCESS = 25  # between INFO (20) and WARNING (30)
+logging.addLevelName(SUCCESS, "SUCCESS")
+
+def success(self, message, *args, **kwargs):
+    if self.isEnabledFor(SUCCESS):
+        self._log(SUCCESS, message, args, **kwargs)
+
+logging.Logger.success = success
+
+# --- Filter: allow SUCCESS + ERROR/CRITICAL ---
+class SuccessFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno in (SUCCESS, logging.ERROR, logging.CRITICAL)
+
+# Attach filter to all handlers
+for h in logging.getLogger().handlers:
+    h.addFilter(SuccessFilter())
 
 class Constants:
     MIN_WICK_RATIO = 0.2
@@ -483,14 +500,13 @@ def get_trigger_timestamp() -> int:
     return int(time.time())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
-    
+   
     interval_seconds = interval_minutes * 60
-    
-    effective_time = reference_time - 45 
-    
-    current_period_start = (effective_time // interval_seconds) * interval_seconds
-    last_closed_candle_open = current_period_start - interval_seconds
-    
+
+    current_interval_open = (reference_time // interval_seconds) * interval_seconds
+
+    last_closed_candle_open = current_interval_open - interval_seconds
+
     return last_closed_candle_open
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
@@ -679,14 +695,14 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
 def warmup_if_needed() -> None:
     
     if aot_bridge.is_using_aot():
-        logger.info("✅ AOT active - no warmup needed")
+        logger.success("✅ AOT active - no warmup needed")
         return
     
     if cfg.SKIP_WARMUP:
         logger.warning("⚠️ JIT mode + SKIP_WARMUP=true - first run will be slower")
         return
     
-    logger.info("🔥 AOT not available, warming up JIT compilation...")
+    logger.success("🔥 AOT not available, warming up JIT compilation...")
     
     try:
         test_data = np.random.random(200).astype(np.float64) * 1000
@@ -705,7 +721,7 @@ def warmup_if_needed() -> None:
         _ = _calculate_rsi_core(test_data, 21)
         _ = _sanitize_array_numba(test_data, 0.0)
         
-        logger.info("✅ JIT warmup complete (4 critical functions)")
+        logger.success("✅ JIT warmup complete (4 critical functions)")
         
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
@@ -717,58 +733,51 @@ def calculate_pivot_levels_numpy(
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
-    timestamps: np.ndarray
+    timestamps: np.ndarray,
 ) -> Dict[str, float]:
-    # Pre-fill with zeros to avoid KeyErrors downstream
+
     piv: Dict[str, float] = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
 
     try:
         if len(timestamps) < 2:
-            logger.warning("Pivot calc: insufficient data")
             return piv
 
-        # Daily bins (timestamps in seconds)
-        days = timestamps // 86400
-        now_utc = datetime.now(timezone.utc)
-        yesterday = (now_utc - timedelta(days=1)).date()
+        # Use the LAST available timestamp in the data as "Current Time" reference
+        last_ts = timestamps[-1]
+        last_dt = datetime.fromtimestamp(last_ts, tz=timezone.utc)
 
-        # Yesterday UTC day number
-        yesterday_ts = datetime(
-            yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc
-        ).timestamp()
-        yesterday_day_number = int(yesterday_ts) // 86400
+        # We want the day strictly BEFORE the last candle's day
+        # If last candle is 00:00 (new day start), we want the full previous day.
+        # If last candle is 23:45, we are still in same day, so we want yesterday relative to that.
 
-        yesterday_mask = (days == yesterday_day_number)
+        # Calculate day numbers
+        day_seconds = 86400
+        days = timestamps // day_seconds
+        last_day_num = days[-1]
 
-        if not np.any(yesterday_mask):
-            # Fallback: use second-to-last unique day if yesterday missing
+        # Look for data belonging to (last_day_num - 1)
+        prev_day_mask = (days == (last_day_num - 1))
+
+        if not np.any(prev_day_mask):
+            # Fallback: Just take the unique day before the last one found in data
             unique_days = np.unique(days)
             if len(unique_days) > 1:
-                yesterday_day_number = unique_days[-2]
-                yesterday_mask = (days == yesterday_day_number)
-                logger.info(f"Fallback pivot day: {yesterday_day_number}")
+                target_day = unique_days[-2]
+                prev_day_mask = (days == target_day)
             else:
-                logger.warning("Pivot calc: No daily transition found in data.")
                 return piv
 
-        yesterday_high = high[yesterday_mask]
-        yesterday_low = low[yesterday_mask]
-        yesterday_close = close[yesterday_mask]
-
-        if len(yesterday_high) == 0:
-            logger.warning("No candles found for pivot day")
-            return piv
+        yesterday_high = high[prev_day_mask]
+        yesterday_low = low[prev_day_mask]
+        yesterday_close = close[prev_day_mask]
 
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
         C_prev = float(yesterday_close[-1])
-
         rng_prev = H_prev - L_prev
-        if rng_prev < 1e-8:
-            logger.warning(f"Invalid pivot range: {rng_prev}")
-            return piv
 
         P = (H_prev + L_prev + C_prev) / 3.0
+
         piv.update({
             "P": P,
             "R1": P + rng_prev * 0.382,
@@ -780,9 +789,10 @@ def calculate_pivot_levels_numpy(
         })
 
     except Exception as e:
-        logger.error(f"Pivot calculation failed: {e}", exc_info=True)
+        logger.error(f"Pivot calculation failed: {e}")
 
     return piv
+
 
 def calculate_all_indicators_numpy(
     data_15m: Dict[str, np.ndarray],
@@ -878,86 +888,74 @@ class SessionManager:
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 2000  # OPTIMIZED: Increased from 1000
+    _session_reuse_limit: ClassVar[int] = 2000
 
-    
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
         if cls._ssl_context is None:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
-            # Modern way: enforce TLS >= 1.2
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             cls._ssl_context = ctx
-            logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
-
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         async with cls._lock:
-            should_recreate = False
-
             if cls._session is None or cls._session.closed:
-                should_recreate = True
-                reason = "no session" if cls._session is None else "session closed"
+                await cls._create_new_session()
             elif cls._request_count >= cls._session_reuse_limit:
-                should_recreate = True
-                reason = f"request limit reached ({cls._request_count})"
-                logger.info(f"Session recreation triggered: {reason}")
-
-            if should_recreate:
-                # Detach old session inside lock
-                old_session = cls._session
-                cls._session = None
-
-                # Close outside lock
-                if old_session and not old_session.closed:
-                    try:
-                        await old_session.close()
-                        await asyncio.sleep(0.1)
-                    except Exception as e:
-                        logger.warning(f"Error closing old session: {e}")
-
-                connector = aiohttp.TCPConnector(
-                    limit=cfg.TCP_CONN_LIMIT,
-                    limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
-                    ssl=cls._get_ssl_context(),
-                    force_close=False,
-                    enable_cleanup_closed=True,
-                    ttl_dns_cache=3600,
-                    keepalive_timeout=90,
-                    family=0,
-                )
-
-                timeout = aiohttp.ClientTimeout(
-                    total=cfg.HTTP_TIMEOUT,
-                    connect=8,
-                    sock_read=cfg.HTTP_TIMEOUT,
-                )
-
-                cls._session = aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout,
-                    headers={
-                        "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
-                        "Accept": "application/json",
-                        "Accept-Encoding": "gzip, deflate",
-                        "Connection": "keep-alive",
-                    },
-                    raise_for_status=False,
-                    trust_env=False,  # keep Patch1’s safety
-                )
-
-                cls._creation_time = time.time()
-                cls._request_count = 0
-
-                logger.info(
-                    f"HTTP session created | Pool: {cfg.TCP_CONN_LIMIT} total, "
-                    f"{cfg.TCP_CONN_LIMIT_PER_HOST} per host | Timeout: {cfg.HTTP_TIMEOUT}s | Keepalive: 90s"
-                )
+                logger.info(f"Session limit ({cls._request_count}) reached, rotating...")
+                await cls._rotate_session()
             return cls._session
+
+    @classmethod
+    async def _create_new_session(cls):
+        """Internal helper to create a session."""
+        connector = aiohttp.TCPConnector(
+            limit=cfg.TCP_CONN_LIMIT,
+            limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
+            ssl=cls._get_ssl_context(),
+            ttl_dns_cache=3600,
+            keepalive_timeout=90,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=cfg.HTTP_TIMEOUT, connect=8, sock_read=cfg.HTTP_TIMEOUT
+        )
+        cls._session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={
+                "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+            },
+        )
+        cls._creation_time = time.time()
+        cls._request_count = 0
+        logger.info("🆕 HTTP session created")
+
+    @classmethod
+    async def _rotate_session(cls):
+        """Creates a new session and schedules the old one for graceful closure."""
+        old_session = cls._session
+        # Create new session immediately
+        await cls._create_new_session()
+        # Close old session in background after delay to allow in-flight reqs to finish
+        if old_session and not old_session.closed:
+            asyncio.create_task(cls._graceful_close(old_session))
+
+    @classmethod
+    async def _graceful_close(cls, session: aiohttp.ClientSession):
+        """Waits 5 seconds then closes the session."""
+        try:
+            await asyncio.sleep(5.0)
+            await session.close()
+            logger.debug("🗑️ Old HTTP session closed gracefully")
+        except Exception as e:
+            logger.warning(f"Error closing old session: {e}")
 
     @classmethod
     def track_request(cls):
@@ -965,17 +963,9 @@ class SessionManager:
 
     @classmethod
     async def force_recreate(cls):
-        """Force session recreation immediately."""
         async with cls._lock:
-            old_session = cls._session
-            cls._session = None
-        if old_session and not old_session.closed:
-            try:
-                await old_session.close()
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                logger.warning(f"Error closing old session: {e}")
-        logger.info("HTTP session forcibly recreated")
+            logger.info("🔄 Force recreating HTTP session")
+            await cls._rotate_session()
 
     @classmethod
     async def close_session(cls) -> None:
@@ -1474,7 +1464,7 @@ class DataFetcher:
                 output[symbol][resolution] = result
                 if result: success_count += 1
 
-        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
+        logger.success(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
 def parse_candles_to_numpy(
@@ -1806,7 +1796,7 @@ class RedisStateStore:
                 if set_ok and get_ok:
                     await self._safe_redis_op(lambda: self._redis.delete(test_key), 1.0, "smoke_cleanup")
                     expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
-                    logger.info(
+                    logger.success(
                         f"✅ Redis connected ({self._redis.connection_pool.max_connections} connections, {expiry_mode} expiry)"
                     )
                     info = await self._safe_redis_op(lambda: self._redis.info("memory"), 3.0, "info_memory")
@@ -2230,7 +2220,7 @@ class RedisLock:
                 self.token = token
                 self.acquired_by_me = True
                 self.last_extend_time = time.time()
-                logger.info(f"🔒 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)")
+                logger.success(f"🔒 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)")
                 return True
 
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
@@ -2290,7 +2280,7 @@ class RedisLock:
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
                 timeout=timeout,
             )
-            logger.info(f"🔓 Lock released")
+            logger.success(f"🔓 Lock released")
         except Exception as e:
             logger.error(f"Error releasing Redis lock: {e}")
         finally:
@@ -2891,7 +2881,7 @@ async def evaluate_pair_and_alert(
                 msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
             if not cfg.DRY_RUN_MODE:
                 await telegram_queue.send(msg)
-            logger_pair.info(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _, _, ak in alerts_to_send]}")
+            logger_pair.success(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _, _, ak in alerts_to_send]}")
 
         # Suppression / summary
         reasons = []
@@ -3021,7 +3011,6 @@ async def process_pairs_with_workers(
 # ============================================================================
 
 async def run_once(dry_run: bool = False) -> Dict[str, Any]:
-    gc.disable()
 
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
@@ -3144,9 +3133,9 @@ async def run_once(dry_run: bool = False) -> Dict[str, Any]:
         summary = {
             "Processed": len(all_results),
             "Alerts": alerts_sent,
-            "Duration": round(run_duration, 1)
+            "Duration": f"{round(run_duration, 1)}s"
         }
-        logger.info(f"✅ RUN COMPLETE | {summary}")
+        logger.success(f"✅ RUN COMPLETE | {summary}")
 
         if alerts_sent > MAX_ALERTS_PER_RUN and not dry_run:
             await telegram_queue.send(escape_markdown_v2(
@@ -3193,12 +3182,11 @@ async def run_once(dry_run: bool = False) -> Dict[str, Any]:
             logger_run.warning(f"Memory cleanup warning: {e}")
         TRACE_ID.set("")
         PAIR_ID.set("")
-        gc.enable()
 
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
+    logger.success(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
@@ -3210,7 +3198,7 @@ if __name__ == "__main__":
         logger.critical("❌ AOT not active — JIT fallback. Reason: %s", reason)
         sys.exit(1)
     else:
-        logger.info("✅ Verified: AOT artifacts loaded successfully")
+        logger.success("✅ Verified: AOT artifacts loaded successfully")
 
     parser = argparse.ArgumentParser(
         prog="macd_unified",
@@ -3239,30 +3227,24 @@ if __name__ == "__main__":
 
     if not args.skip_warmup:
         warmup_if_needed()
-    else:
-        logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
         try:
             return await run_once()
         finally:
-            logger.info("🧹 Shutting down persistent connections...")
             try:
                 await RedisStateStore.shutdown_global_pool()
-                logger.debug("✅ Redis pool closed")
             except Exception as e:
                 logger.error(f"Error closing Redis pool: {e}")
-
             try:
                 await SessionManager.close_session()
-                logger.debug("✅ HTTP session closed")
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
 
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
-            logger.info("✅ Bot run completed successfully")
+            logger.success("✅ Bot run completed successfully")
             sys.exit(0)
         else:
             logger.error("❌ Bot run failed")
