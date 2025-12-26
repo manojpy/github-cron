@@ -3140,18 +3140,13 @@ async def run_once(dry_run: bool = False) -> Dict[str, Any]:
         run_duration = time.time() - start_time
         redis_status = "OK" if not sdb.degraded else "DEGRADED"
 
+
         summary = {
-            "success": True,
-            "alerts_sent": alerts_sent,
-            "pairs_processed": len(all_results),
-            "pairs_requested": len(pairs_to_process),
-            "duration_seconds": round(run_duration, 1),
-            "memory_mb": int(final_memory_mb),
-            "memory_delta_mb": int(memory_delta),
-            "redis_status": redis_status,
-            "fetcher_stats": fetcher_stats,
+            "Processed": len(all_results),
+            "Alerts": alerts_sent,
+            "Duration": round(run_duration, 1)
         }
-        logger_run.info(f"✅ RUN COMPLETE | {summary}")
+        logger.info(f"✅ RUN COMPLETE | {summary}")
 
         if alerts_sent > MAX_ALERTS_PER_RUN and not dry_run:
             await telegram_queue.send(escape_markdown_v2(
