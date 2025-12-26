@@ -3281,7 +3281,7 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 
-if if __name__ == "__main__":
+if __name__ == "__main__":
     aot_bridge.ensure_initialized()
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
