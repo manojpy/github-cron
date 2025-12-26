@@ -11,17 +11,18 @@ WORKDIR /build
 # Install uv for faster pip installs
 RUN pip install --quiet --no-cache-dir uv
 
-# Copy requirements first for cache efficiency
+# Copy requirements from ROOT
 COPY requirements.txt .
 RUN uv pip install --system --no-cache-dir --quiet -r requirements.txt
 
-# Copy source code and config
+# Copy source code: ROOT/src -> /build/src
 COPY src ./src
+# Copy config: ROOT/config_macd.json -> /build/config_macd.json
 COPY config_macd.json ./config_macd.json
 
 WORKDIR /build/src
 
-# ✅ FIXED: Build AOT without grep filtering that breaks the logic
+# Build AOT - Script is in src/ so this works
 ARG AOT_STRICT=1
 RUN python aot_build.py && \
     ls -lh macd_aot_compiled*.so 2>/dev/null || \
@@ -35,7 +36,7 @@ RUN python aot_build.py && \
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
 
-# Install runtime libraries quietly
+# Install runtime libraries
 RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
     libtbb12 \
     && rm -rf /var/lib/apt/lists/*
@@ -45,11 +46,12 @@ WORKDIR /app/src
 # Copy Python runtime
 COPY --from=builder /usr/local /usr/local
 
-# Copy all source code (including .so file)
+# Copy application code and compiled artifacts
 COPY --from=builder /build/src /app/src
+# Copy config to the same directory as scripts for easy access
 COPY --from=builder /build/config_macd.json /app/src/config_macd.json
 
-# Runtime environment with optimizations
+# Runtime config
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -58,5 +60,5 @@ ENV PYTHONPATH=/app/src \
     NUMBA_NUM_THREADS=2 \
     NUMBA_WARNINGS=0
 
-# Run from /app/src where everything is located
-CMD ["python", "-u", "-m", "macd_unified"]
+# Execute file directly from src directory
+CMD ["python", "-u", "macd_unified.py"]
