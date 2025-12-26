@@ -200,7 +200,7 @@ class BotConfig(BaseModel):
     LOG_LEVEL: str = "INFO"
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
-    PIVOT_LOOKBACK_PERIOD: int = 15
+    PIVOT_LOOKBACK_PERIOD: int = 2
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
     TELEGRAM_RATE_LIMIT_PER_MINUTE: int = 20
@@ -1477,33 +1477,49 @@ class DataFetcher:
         logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
-def parse_candles_to_numpy(res: dict) -> Optional[Dict[str, np.ndarray]]:
+def parse_candles_to_numpy(
+    result: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, np.ndarray]]:
+    if not result or not isinstance(result, dict):
+        return None
+
+    res = result.get("result", {}) or {}
+    required = ("t", "o", "h", "l", "c", "v")
+    if not all(k in res for k in required):
+        return None
+
     try:
+        n = len(res["t"])
+        if n == 0:
+            return None
+
         data = {
-            "timestamp": np.asarray(res["t"], dtype=np.int64),
-            "open": np.asarray(res["o"], dtype=np.float64),
-            "high": np.asarray(res["h"], dtype=np.float64),
-            "low": np.asarray(res["l"], dtype=np.float64),
-            "close": np.asarray(res["c"], dtype=np.float64),
-            "volume": np.asarray(res["v"], dtype=np.float64),
+            "timestamp": np.empty(n, dtype=np.int64),
+            "open": np.empty(n, dtype=np.float64),
+            "high": np.empty(n, dtype=np.float64),
+            "low": np.empty(n, dtype=np.float64),
+            "close": np.empty(n, dtype=np.float64),
+            "volume": np.empty(n, dtype=np.float64),
         }
-    except (KeyError, TypeError, ValueError):
-        logger.error("Malformed candle response: %s", res)
+
+        data["timestamp"][:] = res["t"]
+        data["open"][:] = res["o"]
+        data["high"][:] = res["h"]
+        data["low"][:] = res["l"]
+        data["close"][:] = res["c"]
+        data["volume"][:] = res["v"]
+
+        if data["timestamp"][-1] > 1_000_000_000_000:
+            data["timestamp"] //= 1000
+
+        if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
+            return None
+
+        return data
+
+    except Exception as e:
+        logger.error(f"Failed to parse candles: {e}")
         return None
-
-    if len(data["close"]) == 0:
-        return None
-
-    # Normalize timestamps: ms → s if needed
-    if data["timestamp"].max() > 3_000_000_000:  # ~2065 in seconds
-        data["timestamp"] //= 1000
-
-    # Basic sanity checks
-    if not np.isfinite(data["close"][-1]) or data["close"][-1] <= 0:
-        return None
-
-    return data
-
 def validate_candle_data(
     data: Optional[Dict[str, np.ndarray]],
     required_len: int = 0,
