@@ -18,13 +18,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Inject secrets into config_macd.json
+      # ✅ SECURITY: Inject secrets into a temp file, not the main config
+      - name: Inject secrets into secure config
         run: |
           jq '.TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" |
               .TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" |
               .REDIS_URL="${{ secrets.REDIS_URL }}" |
               .DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}"' \
-              config_macd.json > config_macd.json.tmp && mv config_macd.json.tmp config_macd.json
+              config_macd.json > config_macd.secure.json
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -34,17 +35,26 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run MACD Bot
+        id: run_container
         run: |
-          set +x  # 🔥 Launch "Macd Unified" 🚀
+          set +x
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
           
           echo "Pulling image..."
           docker pull -q "$IMAGE_ID" > /dev/null 2>&1
           
           echo "Running bot..."
+          # Mount the SECURE config file to the container's expected path
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=2 \
-            -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro \
+            -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
             "$IMAGE_ID"
+
+      # ✅ SECURITY: Always cleanup secrets, even if bot crashes
+      - name: Cleanup Secrets
+        if: always()
+        run: |
+          rm -f config_macd.secure.json
+          echo "🔒 Secrets wiped from runner."
