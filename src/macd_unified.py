@@ -118,6 +118,7 @@ class Constants:
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
+    PIVOT_MIDNIGHT_BUFFER_SEC = 300
 
 # ============================================================================
 # STATIC PRODUCTS MAP (Eliminates API fetch overhead)
