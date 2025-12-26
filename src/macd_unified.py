@@ -1,6 +1,15 @@
 from __future__ import annotations         
 import logging
 import aot_bridge
+
+aot_bridge.ensure_initialized()
+
+if aot_bridge.is_using_aot():
+    print("✅ AOT is active")
+else:
+    reason = aot_bridge.get_fallback_reason()
+    print(f"⚠️ JIT fallback, reason: {reason}")
+
 import os
 import sys
 import time
@@ -34,32 +43,6 @@ import warnings
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
-
-from aot_bridge import (
-    _sanitize_array_numba,
-    _sanitize_array_numba_parallel,
-    _sma_loop,
-    _sma_loop_parallel,
-    _ema_loop,
-    _ema_loop_alpha,
-    _kalman_loop,
-    _vwap_daily_loop,
-    _rng_filter_loop,
-    _smooth_range,
-    _calc_mmh_worm_loop,
-    _calc_mmh_value_loop,
-    _calc_mmh_momentum_loop,
-    _rolling_std_welford,
-    _rolling_std_welford_parallel,
-    _rolling_mean_numba,
-    _rolling_mean_numba_parallel,
-    _rolling_min_max_numba,
-    _rolling_min_max_numba_parallel,
-    _calculate_ppo_core,
-    _calculate_rsi_core,
-    _vectorized_wick_check_buy,
-    _vectorized_wick_check_sell
-)
 
 try:
     import orjson
@@ -508,6 +491,449 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError, OverflowError):
         return default
 
+# ============================================================================
+# PART 2: Numba/Numpy based Helpers
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
+    out = np.empty_like(arr)
+    for i in prange(len(arr)):  # PARALLEL LOOP
+        val = arr[i]
+        if np.isnan(val) or np.isinf(val):
+            out[i] = default
+        else:
+            out[i] = val
+    return out
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
+    out = np.empty_like(arr)
+    for i in range(len(arr)):
+        val = arr[i]
+        if np.isnan(val) or np.isinf(val):
+            out[i] = default
+        else:
+            out[i] = val
+    return out
+
+def sanitize_indicator_array(arr: np.ndarray, name: str, default: float = 0.0) -> np.ndarray:
+    try:
+        if arr is None or len(arr) == 0:
+            logger.warning(f"Indicator {name} is None or empty")
+            return np.array([default], dtype=np.float64)
+        
+        if cfg.NUMBA_PARALLEL and len(arr) >= 200:
+            sanitized = _sanitize_array_numba_parallel(arr, default)
+        else:
+            sanitized = _sanitize_array_numba(arr, default)
+        
+        if np.all(sanitized == default):
+            logger.warning(f"Indicator {name} is all {default} after sanitization")
+        
+        return sanitized
+        
+    except Exception as e:
+        logger.error(f"Failed to sanitize indicator {name}: {e}")
+        return np.full(len(arr) if arr is not None else 1, default, dtype=np.float64)
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+    window_sum = 0.0
+    count = 0
+    for i in range(n):
+        val = data[i]
+        if not np.isnan(val):
+            window_sum += val
+            count += 1
+
+        if i >= period:
+            old_val = data[i - period]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                count -= 1
+        if count > 0:
+            out[i] = window_sum / count
+        else:
+            out[i] = np.nan
+    return out
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
+    worm_arr = np.empty(rows, dtype=np.float64)
+    first_val = close_arr[0]
+    if np.isnan(first_val):
+        worm_arr[0] = 0.0
+    else:
+        worm_arr[0] = first_val
+
+    for i in range(1, rows):
+        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
+        prev_worm = worm_arr[i - 1]
+        diff = src - prev_worm
+        sd_i = sd_arr[i]
+
+        if np.isnan(sd_i):
+            delta = diff
+        else:
+            delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
+        worm_arr[i] = prev_worm + delta
+    return worm_arr
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
+    value_arr = np.zeros(rows, dtype=np.float64)
+    value_arr[0] = 0.0
+
+    for i in range(1, rows):
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        v = t - 0.5 + 0.5 * prev_v
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    return value_arr
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
+    for i in range(1, rows):
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+    return momentum_arr
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    n = len(close)
+    sd = np.empty(n, dtype=np.float64)
+    resp = max(0.0001, min(1.0, responsiveness))
+
+    for i in range(n):
+        mean = 0.0
+        m2 = 0.0
+        count = 0
+
+        start = max(0, i - period + 1)
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                count += 1
+                delta = val - mean
+                mean += delta / count
+                delta2 = val - mean
+                m2 += delta * delta2
+
+        if count > 1:
+            variance = m2 / count          # population std-dev (n not n-1)
+            sd[i] = np.sqrt(max(0.0, variance)) * resp
+        else:
+            sd[i] = 0.0
+    return sd
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        count = 0
+
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+
+        if count > 0:
+            ma[i] = sum_val / count
+        else:
+            ma[i] = np.nan
+    return ma
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _rolling_min_max_numba(arr: np.ndarray, period: int):
+    rows = len(arr)
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        min_arr[i] = np.nanmin(arr[start:i + 1])
+        max_arr[i] = np.nanmax(arr[start:i + 1])
+    return min_arr, max_arr
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+    for i in prange(n):
+        window_sum = 0.0
+        count = 0
+        start = max(0, i - period + 1)
+        for j in range(start, i + 1):
+            val = data[j]
+            if not np.isnan(val):
+                window_sum += val
+                count += 1
+        if count > 0:
+            out[i] = window_sum / count
+        else:
+            out[i] = np.nan
+    return out
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float):
+    n = len(close)
+    sd = np.empty(n, dtype=np.float64)
+    resp = max(0.0001, min(1.0, responsiveness))
+    for i in prange(n):
+        mean = 0.0
+        m2 = 0.0
+        count = 0
+        start = max(0, i - period + 1)
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                count += 1
+                delta = val - mean
+                mean += delta / count
+                delta2 = val - mean
+                m2 += delta * delta2
+        if count > 1:
+            variance = m2 / count          # population
+            sd[i] = np.sqrt(max(0.0, variance)) * resp
+        else:
+            sd[i] = 0.0
+    return sd
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+
+    for i in prange(rows):
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        count = 0
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+        if count > 0:
+            ma[i] = sum_val / count
+        else:
+            ma[i] = np.nan
+    return ma
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
+    rows = len(arr)
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+
+    for i in prange(rows):
+        start = max(0, i - period + 1)
+        min_arr[i] = np.nanmin(arr[start:i + 1])
+        max_arr[i] = np.nanmax(arr[start:i + 1])
+    return min_arr, max_arr
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _ema_loop(data: np.ndarray, alpha_or_period) -> np.ndarray:
+    
+    n = len(data)
+    
+    # Determine if input is period or alpha
+    if alpha_or_period > 1.0:
+        # It's a period, convert to alpha
+        alpha = 2.0 / (alpha_or_period + 1.0)
+    else:
+        # It's already alpha
+        alpha = alpha_or_period
+    
+    out = np.empty(n, dtype=np.float64)
+    out[0] = data[0] if not np.isnan(data[0]) else 0.0 
+    
+    for i in range(1, n):
+        curr = data[i]
+        if np.isnan(curr):
+            out[i] = out[i-1]
+        else:
+            out[i] = alpha * curr + (1 - alpha) * out[i-1]
+    
+    return out
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
+    """EMA with direct alpha parameter."""
+    n = len(data)
+    out = np.empty(n, dtype=np.float64)
+    out[0] = data[0] if not np.isnan(data[0]) else 0.0 
+    
+    for i in range(1, n):
+        curr = data[i]
+        if np.isnan(curr):
+            out[i] = out[i-1]
+        else:
+            out[i] = alpha * curr + (1 - alpha) * out[i-1]
+    
+    return out
+
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
+    n = len(src)
+    result = np.empty(n, dtype=np.float64)    
+    estimate = src[0] if not np.isnan(src[0]) else 0.0
+    error_est = 1.0
+    error_meas = R * max(1.0, float(length))
+    Q_div_length = Q / max(1.0, float(length))    
+    for i in range(n):
+        current = src[i]
+        if np.isnan(current):
+            result[i] = estimate
+            continue          
+        if np.isnan(estimate):
+            estimate = current           
+        prediction = estimate
+        kalman_gain = error_est / (error_est + error_meas)
+        estimate = prediction + kalman_gain * (current - prediction)
+        error_est = (1.0 - kalman_gain) * error_est + Q_div_length      
+        result[i] = estimate        
+    return result
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _vwap_daily_loop(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    timestamps: np.ndarray
+) -> np.ndarray:
+    n = len(close)
+    vwap = np.empty(n, dtype=np.float64)
+
+    cum_vol = 0.0
+    cum_pv  = 0.0
+    current_session_day = -1
+
+    for i in range(n):
+        ts = timestamps[i]
+        day = ts // 86400  # Resets exactly at 00:00:00 UTC
+        h, l, c, v = high[i], low[i], close[i], volume[i]
+        if day != current_session_day:
+            current_session_day = day
+            cum_vol = 0.0
+            cum_pv  = 0.0
+
+        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
+            vwap[i] = vwap[i-1] if i > 0 else c
+            continue
+        typical_price = (h + l + c) / 3.0  
+        cum_vol += v
+        cum_pv  += typical_price * v
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical_price
+
+    return vwap
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    n = len(x)
+    filt = np.empty(n, dtype=np.float64)
+    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
+    
+    for i in range(1, n):
+        prev_filt = filt[i - 1]
+        curr_x = x[i]
+        curr_r = r[i]
+        if np.isnan(curr_r) or np.isnan(curr_x):
+            filt[i] = prev_filt
+            continue 
+        if curr_x > prev_filt:
+            target = curr_x - curr_r
+            filt[i] = max(prev_filt, target)
+        else:
+            target = curr_x + curr_r
+            filt[i] = min(prev_filt, target)
+    
+    return filt
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
+    n = len(close)
+    diff = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        diff[i] = abs(close[i] - close[i-1])
+    avrng = _ema_loop(diff, t)
+    wper = t * 2 - 1
+    smoothrng = _ema_loop(avrng, wper)
+    
+    return smoothrng * m
+
+# ============================================================================
+# PART 3: Indicator Functions
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
+    
+    # Pass integer periods directly
+    fast_ma = _ema_loop(close, fast)
+    slow_ma = _ema_loop(close, slow)
+
+    n = len(close)
+    ppo = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        # Safety: Check for NaN or near-zero to prevent division by zero
+        if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
+            ppo[i] = 0.0
+        else:
+            ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
+
+    # Signal line calculation (expects integer period)
+    ppo_sig = _ema_loop(ppo, signal)
+
+    return ppo, ppo_sig
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
+    n = len(close)
+    delta = np.zeros(n, dtype=np.float64)
+    gain = np.zeros(n, dtype=np.float64)
+    loss = np.zeros(n, dtype=np.float64)
+    
+    for i in range(1, n):
+        delta[i] = close[i] - close[i-1]
+        if delta[i] > 0:
+            gain[i] = delta[i]
+        elif delta[i] < 0:
+            loss[i] = -delta[i]   
+    
+    alpha = 1.0 / rsi_len
+    
+    avg_gain = np.empty(n, dtype=np.float64)
+    avg_loss = np.empty(n, dtype=np.float64)
+    
+    avg_gain[0] = gain[0]
+    avg_loss[0] = loss[0]
+    
+    for i in range(1, n):
+        avg_gain[i] = alpha * gain[i] + (1 - alpha) * avg_gain[i-1]
+        avg_loss[i] = alpha * loss[i] + (1 - alpha) * avg_loss[i-1]
+    
+    rsi = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        if avg_loss[i] < 1e-10:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+    
+    return rsi
+
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
     try:
         if close is None or len(close) < rsi_len:
@@ -669,43 +1095,130 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         logger.error(f"MMH calculation failed: {e}")
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
+@njit(nogil=True, fastmath=True, cache=True)
+def _vectorized_wick_check_buy(
+    open_arr: np.ndarray, 
+    high_arr: np.ndarray, 
+    low_arr: np.ndarray, 
+    close_arr: np.ndarray,
+    min_wick_ratio: float
+) -> np.ndarray:   
+    n = len(close_arr)
+    result = np.zeros(n, dtype=np.bool_)   
+    for i in range(n):
+        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]     
+        if c <= o:
+            result[i] = False
+            continue      
+        candle_range = h - l
+        if candle_range < 1e-8:
+            result[i] = False
+            continue    
+        upper_wick = h - c
+        wick_ratio = upper_wick / candle_range    
+        result[i] = wick_ratio < min_wick_ratio
+    
+    return result
+
+@njit(nogil=True, fastmath=True, cache=True)
+def _vectorized_wick_check_sell(
+    open_arr: np.ndarray, 
+    high_arr: np.ndarray, 
+    low_arr: np.ndarray, 
+    close_arr: np.ndarray,
+    min_wick_ratio: float
+) -> np.ndarray:
+    n = len(close_arr)
+    result = np.zeros(n, dtype=np.bool_)  
+    for i in range(n):
+        o, h, l, c = open_arr[i], high_arr[i], low_arr[i], close_arr[i]     
+        if c >= o:
+            result[i] = False
+            continue    
+        candle_range = h - l
+        if candle_range < 1e-8:
+            result[i] = False
+            continue  
+        lower_wick = c - l
+        wick_ratio = lower_wick / candle_range     
+        result[i] = wick_ratio < min_wick_ratio
+    
+    return result
+
+
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================
 
-def warmup_if_needed() -> None:
-    
-    if aot_bridge.is_using_aot():
-        logger.info("✅ AOT active - no warmup needed")
-        return
-    
-    if cfg.SKIP_WARMUP:
-        logger.warning("⚠️ JIT mode + SKIP_WARMUP=true - first run will be slower")
-        return
-    
-    logger.info("🔥 AOT not available, warming up JIT compilation...")
-    
-    try:
-        test_data = np.random.random(200).astype(np.float64) * 1000
-        
-        # Warm up the most-used functions
-        from aot_bridge import (
-            _ema_loop,
-            _calculate_ppo_core,
-            _calculate_rsi_core,
-            _sanitize_array_numba
+def warmup_numba() -> None:
+    cache_dir = Path(os.environ.get('NUMBA_CACHE_DIR', '/app/src/__pycache__'))
+    if cache_dir.exists():
+        cache_files = list(cache_dir.rglob('*.nbi')) + list(cache_dir.rglob('*.nbc'))
+        if len(cache_files) > 15:  # Expect at least 15 compiled functions
+            logger.info(
+                f"✅ Using AOT-compiled Numba cache ({len(cache_files)} files) - no warmup needed"
+            )
+            return
+
+    if getattr(cfg, "SKIP_WARMUP", False):
+        logger.warning(
+            "⚠️  No AOT cache found and SKIP_WARMUP=true - functions will JIT compile on first use (slower)"
         )
-        
-        # These will JIT compile on first call
-        _ = _ema_loop(test_data, 7.0)
-        _ = _calculate_ppo_core(test_data, 7, 16, 5)
-        _ = _calculate_rsi_core(test_data, 21)
-        _ = _sanitize_array_numba(test_data, 0.0)
-        
-        logger.info("✅ JIT warmup complete (4 critical functions)")
-        
+        return
+
+    logger.info("⚠️  AOT cache not found - performing JIT warmup...")
+
+    try:
+        length_small = 100
+        length_large = 400
+
+        close_small = np.random.random(length_small).astype(np.float64) * 1000
+        close_large = np.random.random(length_large).astype(np.float64) * 1000
+        open_large = close_large + np.random.random(length_large).astype(np.float64) * 2
+        high_large = np.maximum(open_large, close_large) + 1.0
+        low_large = np.minimum(open_large, close_large) - 1.0
+        volume_large = np.random.random(length_large).astype(np.float64) * 1000
+        timestamps = np.arange(length_large, dtype=np.int64) * 900
+
+        critical_funcs = [
+            lambda: _ema_loop(close_small, 0.1),
+            lambda: _calculate_ppo_core(close_small, 7, 16, 5),
+            lambda: _calculate_rsi_core(close_small, 21),
+        ]
+
+        critical_funcs.append(
+            lambda: _vwap_daily_loop(high_large, low_large, close_large, volume_large, timestamps)
+        )
+
+        if cfg.NUMBA_PARALLEL:
+            critical_funcs.extend(
+                [
+                    lambda: _sanitize_array_numba_parallel(close_large, 0.0),
+                    lambda: _rolling_std_welford_parallel(close_large, 50, 0.9),
+                    lambda: _rolling_min_max_numba_parallel(close_large, 144),
+                    lambda: _sma_loop_parallel(close_large, 20),
+                    lambda: _vectorized_wick_check_buy(
+                        open_large, high_large, low_large, close_large, 0.2
+                    ),
+                    lambda: _vectorized_wick_check_sell(
+                        open_large, high_large, low_large, close_large, 0.2
+                    ),
+                ]
+            )
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(func) for func in critical_funcs]
+            completed, _ = concurrent.futures.wait(futures, timeout=10.0)
+
+        warmup_mode = "parallel" if cfg.NUMBA_PARALLEL else "serial"
+        logger.info(
+            f"Numba warm-up complete ({warmup_mode} mode, {len(critical_funcs)} functions compiled)"
+        )
+
     except Exception as e:
-        logger.warning(f"Warmup failed (non-fatal): {e}")
+        logger.warning(f"Numba warm-up failed (non-fatal): {e}")
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -786,63 +1299,69 @@ def calculate_all_indicators_numpy(
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
 ) -> Dict[str, np.ndarray]:
-    results = {}    
-    close_15m = data_15m["close"]
-    close_5m = data_5m["close"]
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
     
-    ppo, ppo_signal = calculate_ppo_numpy(
-        close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
-    )
-    results['ppo'] = ppo
-    results['ppo_signal'] = ppo_signal
-    
-    results['smooth_rsi'] = calculate_smooth_rsi_numpy(
-        close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
-    )
-    
-    if cfg.ENABLE_VWAP:
-        results['vwap'] = calculate_vwap_numpy(
-            data_15m["high"], data_15m["low"], data_15m["close"],
-            data_15m["volume"], data_15m["timestamp"]
-        )
-    else:
-        results['vwap'] = np.zeros_like(close_15m)
-    
-    mmh = calculate_magical_momentum_hist(close_15m)
-    results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    if cfg.CIRRUS_CLOUD_ENABLED:
-        upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
-        results['upw'] = upw
-        results['dnw'] = dnw
-    else:
-        results['upw'] = np.zeros(len(close_15m), dtype=bool)
-        results['dnw'] = np.zeros(len(close_15m), dtype=bool)
-    
-    results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
-    results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-    
-    if cfg.ENABLE_PIVOT and data_daily is not None:
-        last_close = float(close_15m[-1])
-        daily_high = float(data_daily["high"][-1])
-        daily_low = float(data_daily["low"][-1])
-        daily_range = daily_high - daily_low
+    try:
+        results = {}    
+        close_15m = data_15m["close"]
+        close_5m = data_5m["close"]
         
-        if abs(last_close - daily_high) < daily_range * 0.5 or \
-           abs(last_close - daily_low) < daily_range * 0.5:
-            results['pivots'] = calculate_pivot_levels_numpy(
-                data_daily["high"], data_daily["low"],
-                data_daily["close"], data_daily["timestamp"]
+        ppo, ppo_signal = calculate_ppo_numpy(
+            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+        )
+        results['ppo'] = ppo
+        results['ppo_signal'] = ppo_signal
+        
+        results['smooth_rsi'] = calculate_smooth_rsi_numpy(
+            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
+        )
+        
+        if cfg.ENABLE_VWAP:
+            results['vwap'] = calculate_vwap_numpy(
+                data_15m["high"], data_15m["low"], data_15m["close"],
+                data_15m["volume"], data_15m["timestamp"]
             )
         else:
-            results['pivots'] = {}
-            if cfg.DEBUG_MODE:
-                logger.debug(
-                    f"Skipped pivot calc (price {last_close:.2f} far from range {daily_low:.2f}-{daily_high:.2f})"
+            results['vwap'] = np.zeros_like(close_15m)
+        
+        mmh = calculate_magical_momentum_hist(close_15m)
+        results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if cfg.CIRRUS_CLOUD_ENABLED:
+            upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
+            results['upw'] = upw
+            results['dnw'] = dnw
+        else:
+            results['upw'] = np.zeros(len(close_15m), dtype=bool)
+            results['dnw'] = np.zeros(len(close_15m), dtype=bool)
+        
+        results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
+        results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
+        
+        if cfg.ENABLE_PIVOT and data_daily is not None:
+            last_close = float(close_15m[-1])
+            daily_high = float(data_daily["high"][-1])
+            daily_low = float(data_daily["low"][-1])
+            daily_range = daily_high - daily_low
+            
+            if abs(last_close - daily_high) < daily_range * 0.5 or \
+               abs(last_close - daily_low) < daily_range * 0.5:
+                results['pivots'] = calculate_pivot_levels_numpy(
+                    data_daily["high"], data_daily["low"],
+                    data_daily["close"], data_daily["timestamp"]
                 )
-    else:
-        results['pivots'] = {}    
-    return results
+            else:
+                results['pivots'] = {}
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"Skipped pivot calc (price {last_close:.2f} far from range {daily_low:.2f}-{daily_high:.2f})")
+        else:
+            results['pivots'] = {}    
+        return results        
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
@@ -3280,16 +3799,7 @@ try:
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
-
 if __name__ == "__main__":
-    aot_bridge.ensure_initialized()
-    if not aot_bridge.is_using_aot():
-        reason = aot_bridge.get_fallback_reason() or "Unknown"
-        logger.critical("❌ AOT not active — JIT fallback. Reason: %s", reason)
-        sys.exit(1)
-    else:
-        logger.info("✅ Verified: AOT artifacts loaded successfully")
-
     parser = argparse.ArgumentParser(
         prog="macd_unified",
         description="Unified MACD/alerts runner with NumPy optimization"
@@ -3315,11 +3825,10 @@ if __name__ == "__main__":
         logger.info("Configuration validation passed - exiting (--validate-only mode)")
         sys.exit(0)
 
-    if not args.skip_warmup:
-        warmup_if_needed()
+    if not args.skip_warmup and not cfg.SKIP_WARMUP:
+        warmup_numba()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
-
     async def main_with_cleanup():
         try:
             return await run_once()
