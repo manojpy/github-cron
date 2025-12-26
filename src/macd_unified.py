@@ -200,6 +200,7 @@ class BotConfig(BaseModel):
     LOG_LEVEL: str = "INFO"
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
+    PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
     TELEGRAM_RATE_LIMIT_PER_MINUTE: int = 20
