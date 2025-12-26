@@ -20,22 +20,19 @@ _INITIALIZED = False
 
 
 def aot_guard(func_name: str):
-    """
-    Decorator factory for bridge functions.
-    - Calls AOT module if available.
-    - Falls back to JIT implementation otherwise, logging a warning once.
-    """
     def decorator(jit_func):
+        warned = [False]
         @functools.wraps(jit_func)
         def wrapper(*args, **kwargs):
             if _USING_AOT and _AOT_MODULE:
                 return getattr(_AOT_MODULE, func_name)(*args, **kwargs)
             else:
-                logger.warning(f"⚠️ Fallback to JIT: {func_name} not using AOT")
+                if not warned[0]:
+                    logger.warning(f"⚠️ Fallback to JIT: {func_name}")
+                    warned[0] = True
                 return jit_func(*args, **kwargs)
         return wrapper
     return decorator
-
 
 def initialize_aot() -> Tuple[bool, Optional[str]]:
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
