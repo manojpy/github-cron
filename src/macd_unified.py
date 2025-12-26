@@ -77,7 +77,7 @@ except ImportError:
 
 __version__ = "1.8.0-stable"
 
-# --- Define SUCCESS log level ---
+
 SUCCESS = 25  # between INFO (20) and WARNING (30)
 logging.addLevelName(SUCCESS, "SUCCESS")
 
@@ -87,14 +87,12 @@ def success(self, message, *args, **kwargs):
 
 logging.Logger.success = success
 
-# --- Filter: allow SUCCESS + ERROR/CRITICAL ---
 class SuccessFilter(logging.Filter):
     def filter(self, record):
         return record.levelno in (SUCCESS, logging.ERROR, logging.CRITICAL)
 
-# Attach filter to all handlers
-for h in logging.getLogger().handlers:
-    h.addFilter(SuccessFilter())
+logging.getLogger().addFilter(SuccessFilter())
+
 
 class Constants:
     MIN_WICK_RATIO = 0.2
