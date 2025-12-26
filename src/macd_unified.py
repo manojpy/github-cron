@@ -200,7 +200,6 @@ class BotConfig(BaseModel):
     LOG_LEVEL: str = "INFO"
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
-    PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
     TELEGRAM_RATE_LIMIT_PER_MINUTE: int = 20
@@ -893,6 +892,7 @@ class SessionManager:
             logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
 
+
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         async with cls._lock:
@@ -907,27 +907,32 @@ class SessionManager:
                 logger.info(f"Session recreation triggered: {reason}")
 
             if should_recreate:
-                if cls._session and not cls._session.closed:
+                # Detach old session inside lock
+                old_session = cls._session
+                cls._session = None
+
+                # Close outside lock
+                if old_session and not old_session.closed:
                     try:
-                        await cls._session.close()
-                        await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
+                        await old_session.close()
+                        await asyncio.sleep(0.1)
                     except Exception as e:
                         logger.warning(f"Error closing old session: {e}")
 
-                connector = TCPConnector(
+                connector = aiohttp.TCPConnector(
                     limit=cfg.TCP_CONN_LIMIT,
                     limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
                     ssl=cls._get_ssl_context(),
                     force_close=False,
                     enable_cleanup_closed=True,
                     ttl_dns_cache=3600,
-                    keepalive_timeout=90,  # OPTIMIZED: Increased from 60s
+                    keepalive_timeout=90,
                     family=0,
                 )
 
                 timeout = aiohttp.ClientTimeout(
                     total=cfg.HTTP_TIMEOUT,
-                    connect=8,  # OPTIMIZED: Reduced from 10s
+                    connect=8,
                     sock_read=cfg.HTTP_TIMEOUT,
                 )
 
@@ -935,27 +940,41 @@ class SessionManager:
                     connector=connector,
                     timeout=timeout,
                     headers={
-                        'User-Agent': f'{cfg.BOT_NAME}/{__version__}',
-                        'Accept': 'application/json',
-                        'Accept-Encoding': 'gzip, deflate',
-                        'Connection': 'keep-alive',  # OPTIMIZED: Added explicit keep-alive
+                        "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip, deflate",
+                        "Connection": "keep-alive",
                     },
                     raise_for_status=False,
+                    trust_env=False,  # keep Patch1’s safety
                 )
 
                 cls._creation_time = time.time()
                 cls._request_count = 0
 
                 logger.info(
-                    f"HTTP session created | "
-                    f"Pool: {cfg.TCP_CONN_LIMIT} total, {cfg.TCP_CONN_LIMIT_PER_HOST} per host | "
-                    f"Timeout: {cfg.HTTP_TIMEOUT}s | Keepalive: 90s"
+                    f"HTTP session created | Pool: {cfg.TCP_CONN_LIMIT} total, "
+                    f"{cfg.TCP_CONN_LIMIT_PER_HOST} per host | Timeout: {cfg.HTTP_TIMEOUT}s | Keepalive: 90s"
                 )
             return cls._session
 
     @classmethod
-    def track_request(cls) -> None:
+    def track_request(cls):
         cls._request_count += 1
+
+    @classmethod
+    async def force_recreate(cls):
+        """Force session recreation immediately."""
+        async with cls._lock:
+            old_session = cls._session
+            cls._session = None
+        if old_session and not old_session.closed:
+            try:
+                await old_session.close()
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.warning(f"Error closing old session: {e}")
+        logger.info("HTTP session forcibly recreated")
 
     @classmethod
     async def close_session(cls) -> None:
@@ -1069,128 +1088,75 @@ async def async_fetch_json(
     backoff: float = 1.5,
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
-    
     session = await SessionManager.get_session()
     last_error = None
-    retry_stats = {
-        RetryCategory.NETWORK: 0,
-        RetryCategory.RATE_LIMIT: 0,
-        RetryCategory.API_ERROR: 0,
-        RetryCategory.TIMEOUT: 0,
-        RetryCategory.UNKNOWN: 0
-    }
-    
+    retry_stats = {"network": 0, "rate_limit": 0, "api_error": 0, "timeout": 0, "unknown": 0}
+
     for attempt in range(1, retries + 1):
-        if shutdown_event.is_set():
-            logger.debug(f"Shutdown requested, aborting fetch: {url[:80]}")
-            return None
-        
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
+                # Track request immediately after acquiring response
+                SessionManager.track_request()
+
                 if resp.status == 429:
-                    retry_after = resp.headers.get('Retry-After')
-                    wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                    retry_after = resp.headers.get("Retry-After")
+                    wait_sec = min(int(retry_after) if retry_after else 2, 10)
                     jitter = random.uniform(0.1, 0.5)
                     total_wait = wait_sec + jitter
-                    
-                    retry_stats[RetryCategory.RATE_LIMIT] += 1
-                    logger.warning(
-                        f"Rate limited (429) | URL: {url[:80]} | "
-                        f"Retry-After: {retry_after}s | Waiting: {total_wait:.2f}s | "
-                        f"Attempt: {attempt}/{retries}"
-                    )
-                    
+                    retry_stats["rate_limit"] += 1
+                    logger.warning(f"Rate limited (429) | Waiting {total_wait:.2f}s | Attempt {attempt}/{retries}")
                     await asyncio.sleep(total_wait)
                     continue
-                
+
                 if resp.status >= 500:
-                    retry_stats[RetryCategory.API_ERROR] += 1
-                    logger.warning(
-                        f"Server error {resp.status} | URL: {url[:80]} | "
-                        f"Attempt: {attempt}/{retries}"
-                    )
-                    
+                    retry_stats["api_error"] += 1
+                    logger.warning(f"Server error {resp.status} | Attempt {attempt}/{retries}")
                     if attempt < retries:
-                        base_delay = min(
-                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                            backoff * (2 ** (attempt - 1))
-                        )
+                        base_delay = min(10, backoff * (2 ** (attempt - 1)))
                         jitter = base_delay * random.uniform(0.1, 0.5)
-                        total_delay = base_delay + jitter
-                        
-                        logger.debug(f"Retrying after {total_delay:.2f}s...")
-                        await asyncio.sleep(total_delay)
+                        await asyncio.sleep(base_delay + jitter)
                     continue
-                
+
                 if resp.status >= 400:
-                    logger.error(
-                        f"Client error {resp.status} for {url[:80]} | "
-                        f"This usually indicates invalid request - not retrying"
-                    )
+                    logger.error(f"Client error {resp.status} | Not retrying")
                     return None
+
                 data = await resp.json(loads=json_loads)
-                
-                SessionManager.track_request()
-                
+
                 if any(retry_stats.values()):
-                    logger.info(
-                        f"Fetch succeeded after retries | URL: {url[:80]} | "
-                        f"Attempts: {attempt} | Stats: {retry_stats}"
-                    )
-                
+                    logger.info(f"Fetch succeeded after retries | Attempts: {attempt} | Stats: {retry_stats}")
+
                 return data
-                
+
         except asyncio.TimeoutError as e:
             last_error = e
-            retry_stats[RetryCategory.TIMEOUT] += 1
-            
-            logger.warning(
-                f"Timeout (attempt {attempt}/{retries}) | "
-                f"URL: {url[:80]} | Timeout: {timeout}s"
-            )
-            
+            retry_stats["timeout"] += 1
+            logger.warning(f"Timeout (attempt {attempt}/{retries}) | URL: {url[:80]}")
             if attempt < retries:
-                base_delay = min(
-                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                    backoff * (2 ** (attempt - 1))
-                )
+                base_delay = min(10, backoff * (2 ** (attempt - 1)))
                 jitter = base_delay * random.uniform(0.1, 0.5)
-                total_delay = base_delay + jitter
-                
-                logger.debug(f"Retrying after {total_delay:.2f}s...")
-                await asyncio.sleep(total_delay)
-        
-        except (ClientConnectorError, ClientError, ClientResponseError) as e:
+                await asyncio.sleep(base_delay + jitter)
+
+        except aiohttp.ClientError as e:
             last_error = e
-            category = categorize_exception(e)
-            retry_stats[category] = retry_stats.get(category, 0) + 1
-            
-            logger.warning(
-                f"Network error (attempt {attempt}/{retries}) | "
-                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
-            )
-            
+            retry_stats["network"] += 1
+            logger.warning(f"Network error (attempt {attempt}/{retries}) | Error: {str(e)[:100]}")
             if attempt < retries:
-                base_delay = min(
-                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                    backoff * (2 ** (attempt - 1))
-                )
+                base_delay = min(10, backoff * (2 ** (attempt - 1)))
                 jitter = base_delay * random.uniform(0.1, 0.5)
-                total_delay = base_delay + jitter
-                
-                logger.debug(f"Retrying after {total_delay:.2f}s...")
-                await asyncio.sleep(total_delay)
-        
+                await asyncio.sleep(base_delay + jitter)
+
         except Exception as e:
             last_error = e
-            retry_stats[RetryCategory.UNKNOWN] += 1
-            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
+            retry_stats["unknown"] += 1
+            logger.exception(f"Unexpected fetch error: {e}")
             break
-    
-    logger.error(
-        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
-        f"Stats: {retry_stats} | Last error: {last_error}"
-    )
+
+    # Force session recreation if repeated API errors
+    if retry_stats["api_error"] >= 2 or retry_stats["network"] >= 3:
+        await SessionManager.force_recreate()
+
+    logger.error(f"Failed to fetch after {retries} attempts | Stats: {retry_stats} | Last error: {last_error}")
     return None
 
 class RateLimitedFetcher:
@@ -1510,49 +1476,32 @@ class DataFetcher:
         logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
-def parse_candles_to_numpy(
-    result: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, np.ndarray]]:
-    if not result or not isinstance(result, dict):
-        return None
-
-    res = result.get("result", {}) or {}
-    required = ("t", "o", "h", "l", "c", "v")
-    if not all(k in res for k in required):
-        return None
-
+def parse_candles_to_numpy(res: dict) -> Optional[Dict[str, np.ndarray]]:
     try:
-        n = len(res["t"])
-        if n == 0:
-            return None
-
         data = {
-            "timestamp": np.empty(n, dtype=np.int64),
-            "open": np.empty(n, dtype=np.float64),
-            "high": np.empty(n, dtype=np.float64),
-            "low": np.empty(n, dtype=np.float64),
-            "close": np.empty(n, dtype=np.float64),
-            "volume": np.empty(n, dtype=np.float64),
+            "timestamp": np.asarray(res["t"], dtype=np.int64),
+            "open": np.asarray(res["o"], dtype=np.float64),
+            "high": np.asarray(res["h"], dtype=np.float64),
+            "low": np.asarray(res["l"], dtype=np.float64),
+            "close": np.asarray(res["c"], dtype=np.float64),
+            "volume": np.asarray(res["v"], dtype=np.float64),
         }
-
-        data["timestamp"][:] = res["t"]
-        data["open"][:] = res["o"]
-        data["high"][:] = res["h"]
-        data["low"][:] = res["l"]
-        data["close"][:] = res["c"]
-        data["volume"][:] = res["v"]
-
-        if data["timestamp"][-1] > 1_000_000_000_000:
-            data["timestamp"] //= 1000
-
-        if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
-            return None
-
-        return data
-
-    except Exception as e:
-        logger.error(f"Failed to parse candles: {e}")
+    except (KeyError, TypeError, ValueError):
+        logger.error("Malformed candle response: %s", res)
         return None
+
+    if len(data["close"]) == 0:
+        return None
+
+    # Normalize timestamps: ms → s if needed
+    if data["timestamp"].max() > 3_000_000_000:  # ~2065 in seconds
+        data["timestamp"] //= 1000
+
+    # Basic sanity checks
+    if not np.isfinite(data["close"][-1]) or data["close"][-1] <= 0:
+        return None
+
+    return data
 
 def validate_candle_data(
     data: Optional[Dict[str, np.ndarray]],
@@ -2698,31 +2647,45 @@ async def evaluate_pair_and_alert(
     sdb: RedisStateStore,
     telegram_queue: TelegramQueue,
     correlation_id: str,
-    reference_time: int
+    reference_time: int,
+    buy_quality_arr: np.ndarray,
+    sell_quality_arr: np.ndarray,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
+    buy_candle_reason = None
+    sell_candle_reason = None
+
     try:
+        # Indexing and minimal data checks
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5  = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
         if i15 is None or i15 < 3 or i5 is None:
             logger_pair.warning(f"Insufficient data for {pair_name}: i15={i15}, i5={i5}")
             return None
 
-        close_15m    = data_15m["close"]
-        open_15m     = data_15m["open"]
-        timestamps_15m = data_15m["timestamp"]
-        close_curr_quick = close_15m[i15]
-        open_curr_quick  = open_15m[i15]
-        is_green = close_curr_quick > open_curr_quick
-        is_red   = close_curr_quick < open_curr_quick
+        # Quick candle color check to skip work on neutral candles
+        close_15m = data_15m["close"]
+        open_15m  = data_15m["open"]
+        ts_15m    = data_15m["timestamp"]
+
+        close_curr = float(close_15m[i15])
+        open_curr  = float(open_15m[i15])
+        is_green = close_curr > open_curr
+        is_red   = close_curr < open_curr
         if not is_green and not is_red:
             logger_pair.debug(f"Doji/neutral candle for {pair_name}, skipping indicators")
             return None
 
-        indicators = await asyncio.to_thread(calculate_all_indicators_numpy, data_15m, data_5m, data_daily)
+        # Compute indicators (off-thread)
+        indicators = await asyncio.to_thread(
+            calculate_all_indicators_numpy,
+            data_15m, data_5m, data_daily
+        )
+
+        # Extract indicator arrays
         ppo        = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
         smooth_rsi = indicators["smooth_rsi"]
@@ -2734,21 +2697,13 @@ async def evaluate_pair_and_alert(
         rma200_5   = indicators["rma200_5"]
         piv        = indicators["pivots"]
 
-        close_curr   = close_15m[i15]
-        close_prev   = close_15m[i15 - 1]
-        close_5m_val = data_5m["close"][i5]
-        ts_curr      = int(timestamps_15m[i15])
-        open_curr    = open_15m[i15]
-        high_curr    = data_15m["high"][i15]
-        low_curr     = data_15m["low"][i15]
-
-        rma50_15_val = rma50_15[i15]
-        rma200_5_val = rma200_5[i5]
-
+        # Confirm candle timing
+        ts_curr = int(ts_15m[i15])
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             logger_pair.info(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
 
+        # Pivot day reset (once per UTC day)
         if piv and cfg.ENABLE_PIVOT:
             current_day = int(ts_curr // 86400)
             pivot_day_key = f"{pair_name}:pivot_day"
@@ -2765,12 +2720,15 @@ async def evaluate_pair_and_alert(
                     await sdb.atomic_batch_update([], deletes=delete_keys)
                 await sdb.set_metadata(pivot_day_key, str(current_day))
 
-        ppo_curr, ppo_prev         = ppo[i15], ppo[i15 - 1]
-        ppo_sig_curr, ppo_sig_prev = ppo_signal[i15], ppo_signal[i15 - 1]
-        rsi_curr, rsi_prev         = smooth_rsi[i15], smooth_rsi[i15 - 1]
-        vwap_curr                  = vwap[i15] if len(vwap) > i15 else close_curr
-        vwap_prev                  = vwap[i15 - 1] if len(vwap) > (i15 - 1) else close_prev
-        mmh_curr, mmh_m1           = mmh[i15], mmh[i15 - 1]
+        # Trend filters and context prep
+        rma50_15_val = float(rma50_15[i15])
+        rma200_5_val = float(rma200_5[i5])
+        close_prev   = float(close_15m[i15 - 1])
+        close_5m_val = float(data_5m["close"][i5])
+
+        mmh_curr = float(mmh[i15])
+        mmh_m1   = float(mmh[i15 - 1])
+
         cloud_up   = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
@@ -2781,13 +2739,14 @@ async def evaluate_pair_and_alert(
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
-        buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
+        # Use precomputed quality arrays (efficiency tweak)
         buy_candle_passed  = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
 
         buy_common  = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
 
+        # MMH reversal detection
         mmh_reversal_buy  = False
         mmh_reversal_sell = False
         if i15 >= 3:
@@ -2801,15 +2760,17 @@ async def evaluate_pair_and_alert(
                 mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
             )
 
-        if 'buy_candle_reason' not in locals():  buy_candle_reason  = None
-        if 'sell_candle_reason' not in locals(): sell_candle_reason = None
+        # Build full context for alert checks
+        vwap_curr = float(vwap[i15]) if len(vwap) > i15 else close_curr
+        vwap_prev = float(vwap[i15 - 1]) if len(vwap) > (i15 - 1) else close_prev
 
         context = {
             "buy_common": buy_common, "sell_common": sell_common,
             "close_curr": close_curr, "close_prev": close_prev,
-            "ts_curr": ts_curr, "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
-            "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
+            "ts_curr": ts_curr,
+            "ppo_curr": float(ppo[i15]), "ppo_prev": float(ppo[i15 - 1]),
+            "ppo_sig_curr": float(ppo_signal[i15]), "ppo_sig_prev": float(ppo_signal[i15 - 1]),
+            "rsi_curr": float(smooth_rsi[i15]), "rsi_prev": float(smooth_rsi[i15 - 1]),
             "vwap_curr": vwap_curr, "vwap_prev": vwap_prev,
             "mmh_curr": mmh_curr, "mmh_m1": mmh_m1,
             "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell,
@@ -2819,29 +2780,37 @@ async def evaluate_pair_and_alert(
             "is_green": is_green, "is_red": is_red,
             "pivot_suppressions": []
         }
-        ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
-        ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
-        rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
+        ppo_ctx     = {"curr": context["ppo_curr"], "prev": context["ppo_prev"]}
+        ppo_sig_ctx = {"curr": context["ppo_sig_curr"], "prev": context["ppo_sig_prev"]}
+        rsi_ctx     = {"curr": context["rsi_curr"], "prev": context["rsi_prev"]}
+
+        # Select applicable alerts (respecting requires: pivots, vwap)
         raw_alerts = []
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (("pivots" in d["requires"] and not piv) or ("vwap" in d["requires"] and not cfg.ENABLE_VWAP))
         ]
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
+
+        # Fetch previous states for dedup
         all_state_changes = []
         previous_states = await check_multiple_alert_states(sdb, pair_name, redis_alert_keys)
 
+        # Evaluate triggers
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-            if not def_: continue
+            if not def_:
+                continue
             key = ALERT_KEYS[alert_key]
             trigger = False
+
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
-                level = alert_key.split("_")[-1]
+                level = alert_key.split("_")[-1]  # e.g., "P", "R1", "S2"
                 is_buy = alert_key.startswith("pivot_up_")
                 valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                if not valid_cross and reason and piv: context["pivot_suppressions"].append(reason)
+                if not valid_cross and reason and piv:
+                    context["pivot_suppressions"].append(reason)
                 trigger = ((is_buy and buy_common) or (not is_buy and sell_common)) and valid_cross
             else:
                 trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
@@ -2851,26 +2820,35 @@ async def evaluate_pair_and_alert(
                 raw_alerts.append((def_["title"], extra, def_["key"]))
                 all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
 
-        if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
+        # Deactivation checks (mirrors Patch2)
+        # PPO signal crosses end
+        if context["ppo_prev"] > context["ppo_sig_prev"] and context["ppo_curr"] <= context["ppo_sig_curr"]:
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-        if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
+        if context["ppo_prev"] < context["ppo_sig_prev"] and context["ppo_curr"] >= context["ppo_sig_curr"]:
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+
+        # VWAP crosses end (when enabled)
         if cfg.ENABLE_VWAP:
-            if close_prev >= vwap_prev and close_curr < vwap_curr:
+            if context["close_prev"] >= context["vwap_prev"] and context["close_curr"] < context["vwap_curr"]:
                 all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-            if close_prev <= vwap_prev and close_curr > vwap_curr:
+            if context["close_prev"] <= context["vwap_prev"] and context["close_curr"] > context["vwap_curr"]:
                 all_state_changes.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+
+        # Pivot crosses end (if pivots present)
         if piv:
             for lvl_n, lvl_v in piv.items():
-                if close_prev > lvl_v and close_curr <= lvl_v:
+                if context["close_prev"] > lvl_v and context["close_curr"] <= lvl_v:
                     all_state_changes.append((f"{pair_name}:{ALERT_KEYS[f'pivot_up_{lvl_n}']}", "INACTIVE", None))
-                if close_prev < lvl_v and close_curr >= lvl_v:
+                if context["close_prev"] < lvl_v and context["close_curr"] >= lvl_v:
                     all_state_changes.append((f"{pair_name}:{ALERT_KEYS[f'pivot_down_{lvl_n}']}", "INACTIVE", None))
+
+        # MMH reversal end
         if (mmh_curr > 0 and mmh_curr <= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
         if (mmh_curr < 0 and mmh_curr >= mmh_m1) and await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
+        # Atomic batch: apply state changes, dedup alerts
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
         if all_state_changes or dedup_checks:
             previous_states, dedup_results = await sdb.atomic_eval_batch(
@@ -2886,6 +2864,7 @@ async def evaluate_pair_and_alert(
                     alerts_to_send.append((title, extra, ak))
         alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
 
+        # Build and send messages
         if alerts_to_send:
             if len(alerts_to_send) == 1:
                 title, extra, _ = alerts_to_send[0]
@@ -2897,11 +2876,16 @@ async def evaluate_pair_and_alert(
                 await telegram_queue.send(msg)
             logger_pair.info(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _, _, ak in alerts_to_send]}")
 
+        # Suppression / summary
         reasons = []
-        if not buy_common and not sell_common: reasons.append("Trend filter blocked")
-        if context.get("candle_quality_failed_buy"): reasons.append(f"BUY quality: {buy_candle_reason}")
-        if context.get("candle_quality_failed_sell"): reasons.append(f"SELL quality: {sell_candle_reason}")
-        if context.get("pivot_suppressions"): reasons.extend(context["pivot_suppressions"])
+        if not buy_common and not sell_common:
+            reasons.append("Trend filter blocked")
+        if context.get("candle_quality_failed_buy"):
+            reasons.append(f"BUY quality: {buy_candle_reason}")
+        if context.get("candle_quality_failed_sell"):
+            reasons.append(f"SELL quality: {sell_candle_reason}")
+        if context.get("pivot_suppressions"):
+            reasons.extend(context["pivot_suppressions"])
         if not alerts_to_send:
             logger_pair.debug(f"✔ {pair_name} | cloud={'green' if cloud_up else 'red' if cloud_down else 'neutral'} mmh={mmh_curr:.2f}")
 
@@ -2926,6 +2910,13 @@ async def evaluate_pair_and_alert(
     finally:
         PAIR_ID.set("")
 
+
+import asyncio
+import logging
+import gc
+import numpy as np
+from typing import Dict, List, Tuple, Any
+
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
     products_map: Dict[str, dict],
@@ -2937,74 +2928,73 @@ async def process_pairs_with_workers(
     reference_time: int
 ) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
-    
-    logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
-    fetch_start = time.time()
-    
+
+    logger_main.info(f"📡 Fetching candles for {len(pairs_to_process)} pairs...")
     limit_15m = max(200, cfg.RMA_200_PERIOD + 25)
     limit_5m = max(300, cfg.RMA_200_PERIOD + 50)
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 5 if cfg.ENABLE_PIVOT else 0
-    
+
+    # Build requests for all pairs
     pair_requests = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
-        if not product_info: continue
-        
+        if not product_info:
+            continue
         symbol = product_info["symbol"]
         resolutions = [("15", limit_15m), ("5", limit_5m)]
         if cfg.ENABLE_PIVOT:
             resolutions.append(("D", daily_limit))
-        
         pair_requests.append((symbol, resolutions))
-    
 
-    all_candles = await fetcher.fetch_all_candles_truly_parallel( 
-        pair_requests, reference_time 
-    )
-    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
-    valid_tasks = []
-    
-    for pair_name in pairs_to_process:
-        product_info = products_map.get(pair_name)
-        if not product_info: continue
-        
-        symbol = product_info["symbol"]
-        candles = all_candles.get(symbol, {})
-       
-        valid_tasks.append((pair_name, candles))
+    # Fetch all candles in parallel
+    all_candles = await fetcher.fetch_all_candles_truly_parallel(pair_requests, reference_time)
 
-    logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
-    eval_start = time.time()
-    
+    logger_main.debug("⚙️ Preparing evaluation tasks...")
     semaphore = asyncio.Semaphore(cfg.MAX_PARALLEL_FETCH)
-    
-    async def guarded_eval(task_data):
+
+    async def guarded_eval(pair_name: str, candles: dict):
         async with semaphore:
-            p_name, candles = task_data
             try:
                 data_15m = parse_candles_to_numpy(candles.get("15"))
-                data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-                
-                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-                if not v15:
-                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                data_5m  = parse_candles_to_numpy(candles.get("5"))
+                data_d   = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+
+                valid, reason = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+                if not valid:
+                    logger_main.warning(f"Skipping {pair_name}: 15m invalid ({reason})")
                     return None
-                
+
+                # ✅ Precompute candle quality arrays once per pair
+                buy_q, sell_q = precompute_candle_quality(data_15m)
+
                 return await evaluate_pair_and_alert(
-                    p_name, data_15m, data_5m, data_daily, state_db, 
-                    telegram_queue, correlation_id, reference_time
+                    pair_name,
+                    data_15m,
+                    data_5m,
+                    data_d,
+                    state_db,
+                    telegram_queue,
+                    correlation_id,
+                    reference_time,
+                    buy_q,
+                    sell_q,
                 )
             except Exception as e:
-                logger_main.error(f"Error in {p_name} evaluation: {e}")
+                logger_main.error(f"Error in {pair_name} evaluation: {e}")
                 return None
 
-    results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
-    valid_results = [r for r in results if r is not None] 
-    # Cleanup large intermediate structures 
-    del all_candles 
-    del results 
-    import gc 
+    # Launch tasks for all pairs
+    tasks = [
+        guarded_eval(p, all_candles.get(products_map[p]["symbol"], {}))
+        for p in pairs_to_process if products_map.get(p)
+    ]
+    results = await asyncio.gather(*tasks)
+
+    # Filter valid results
+    valid_results = [r for r in results if r is not None]
+
+    # Cleanup large structures
+    del all_candles, results
     gc.collect()
 
     return valid_results
@@ -3013,7 +3003,7 @@ async def process_pairs_with_workers(
 # OPTIMIZATION 9: Enhanced run_once with Smart Product Caching
 # ============================================================================
 
-async def run_once() -> bool:
+async def run_once(dry_run: bool = False) -> Dict[str, Any]:
     gc.disable()
 
     correlation_id = uuid.uuid4().hex[:8]
@@ -3037,23 +3027,22 @@ async def run_once() -> bool:
     MAX_ALERTS_PER_RUN = 50
 
     try:
+        # --- Memory guard ---
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-
         if container_memory_mb >= limit_mb:
             logger_run.critical(
                 f"🚨 Memory limit exceeded at startup "
                 f"({container_memory_mb:.1f}MB / {limit_mb:.1f}MB)"
             )
-            return False
+            return {"success": False, "reason": "memory_limit"}
 
+        # --- Products map refresh logic ---
         products_map = None
         pairs_to_process = []
-
-        USE_STATIC_MAP = True  # Set to False to force API fetch
-        STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
-
+        USE_STATIC_MAP = True
+        STATIC_MAP_REFRESH_DAYS = 7
         now = time.time()
 
         def should_refresh_products(cache_dict, static_enabled, days_threshold):
@@ -3065,90 +3054,51 @@ async def run_once() -> bool:
             days_since = (time.time() - (last_check - cfg.PRODUCTS_CACHE_TTL)) / 86400
             return days_since >= days_threshold
 
-        # Track last check timestamp
         last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
         days_since_check = (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400 if last_check_ts else 9999
 
         if should_refresh_products(PRODUCTS_CACHE, USE_STATIC_MAP, STATIC_MAP_REFRESH_DAYS):
             if days_since_check < STATIC_MAP_REFRESH_DAYS:
-                logger_run.info(
-                    f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)"
-                )
+                logger_run.info(f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)")
                 products_map = STATIC_PRODUCTS_MAP.copy()
             else:
-                if last_check_ts <= 0:
-                    logger_run.debug("🔄 Refreshing products map from API (last check: never)")
-                else:
-                    logger_run.debug(
-                        f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)"
-                    )
+                logger_run.debug("🔄 Refreshing products map from API")
                 USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
-            logger_run.debug("📡 Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
-
             if not prod_resp:
                 logger_run.error("❌ Failed to fetch products map - aborting run")
-                return False
-
+                return {"success": False, "reason": "products_fetch_failed"}
             PRODUCTS_CACHE["data"] = prod_resp
             PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
-            run_once._products_cache = PRODUCTS_CACHE
-
-            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
-            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
-
             products_map = build_products_map_from_api_result(prod_resp)
         else:
-            cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
 
         pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
-
-        if len(pairs_to_process) < len(cfg.PAIRS):
-            missing = set(cfg.PAIRS) - set(pairs_to_process)
-            logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
-
         if not pairs_to_process:
             logger_run.error("❌ No valid pairs to process - aborting run")
-            return False
+            return {"success": False, "reason": "no_pairs"}
 
-        logger_run.debug("Connecting to Redis...")
+        # --- Redis and lock ---
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
-
-        if sdb.degraded and not sdb.degraded_alerted:
-            logger_run.critical(
-                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
-            )
-            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-            await telegram_queue.send(escape_markdown_v2(
-                f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
-                f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
-                f"Time: {format_ist_time()}"
-            ))
-            sdb.degraded_alerted = True
-
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        if telegram_queue is None:
-            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
-
         if not lock_acquired:
-            logger_run.warning(
-                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
-            )
-            return False
+            logger_run.warning("⏸️ Another instance is running (Redis lock held)")
+            return {"success": False, "reason": "lock_not_acquired"}
 
         logger_run.debug("🔒 Distributed lock acquired successfully")
 
-        if cfg.SEND_TEST_MESSAGE:
+        # --- Optional dry-run mode ---
+        if cfg.SEND_TEST_MESSAGE and not dry_run:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
                 f"Date: {format_ist_time(datetime.now(timezone.utc))}\n"
@@ -3156,53 +3106,37 @@ async def run_once() -> bool:
                 f"Pairs: {len(pairs_to_process)}"
             ))
 
-        logger_run.debug(
-            f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
-        )
-
+        # --- Process pairs ---
         all_results = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process,
             sdb, telegram_queue, correlation_id,
             lock, reference_time
         )
-
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
 
+        # --- Stats and summary ---
         fetcher_stats = fetcher.get_stats()
-        logger_run.info(
-            f"📡 Fetch statistics | "
-            f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
-            f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
-        )
-
-        if "rate_limiter" in fetcher_stats:
-            rate_stats = fetcher_stats["rate_limiter"]
-            if rate_stats.get("total_waits", 0) > 0:
-                logger_run.info(
-                    f"🚦 Rate limiting stats | "
-                    f"Waits: {rate_stats['total_waits']} | "
-                    f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
-                )
-
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
-
         run_duration = time.time() - start_time
         redis_status = "OK" if not sdb.degraded else "DEGRADED"
 
-        summary = (
-            f"✅ RUN COMPLETE | "
-            f"Duration: {run_duration:.1f}s | "
-            f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
-            f"Alerts: {alerts_sent} | "
-            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
-            f"Redis: {redis_status}"
-        )
-        logger_run.info(summary)
+        summary = {
+            "success": True,
+            "alerts_sent": alerts_sent,
+            "pairs_processed": len(all_results),
+            "pairs_requested": len(pairs_to_process),
+            "duration_seconds": round(run_duration, 1),
+            "memory_mb": int(final_memory_mb),
+            "memory_delta_mb": int(memory_delta),
+            "redis_status": redis_status,
+            "fetcher_stats": fetcher_stats,
+        }
+        logger_run.info(f"✅ RUN COMPLETE | {summary}")
 
-        if alerts_sent > MAX_ALERTS_PER_RUN:
+        if alerts_sent > MAX_ALERTS_PER_RUN and not dry_run:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"
                 f"Alerts sent: {alerts_sent}\n"
@@ -3210,20 +3144,11 @@ async def run_once() -> bool:
                 f"Time: {format_ist_time()}"
             ))
 
-        return True
-
-    except asyncio.TimeoutError:
-        logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
-        return False
-
-    except asyncio.CancelledError:
-        logger_run.warning("🛑 Run cancelled (shutdown signal received)")
-        return False
+        return summary
 
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
-
-        if telegram_queue:
+        if telegram_queue and not dry_run:
             try:
                 await telegram_queue.send(escape_markdown_v2(
                     f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
@@ -3233,47 +3158,29 @@ async def run_once() -> bool:
                 ))
             except Exception:
                 logger_run.error("Failed to send error notification")
-
-        return False
+        return {"success": False, "reason": "exception", "error": str(e)}
 
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
-
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await lock.release(timeout=3.0)
                 logger_run.debug("🔓 Redis lock released")
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}")
-
         if sdb:
             try:
                 await sdb.close()
                 logger_run.debug("✅ Redis connection closed")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}")
-
         try:
-            if 'all_results' in locals():
-                del all_results
-            if 'products_map' in locals():
-                del products_map
-            if 'fetcher' in locals():
-                del fetcher
-            if 'telegram_queue' in locals():
-                del telegram_queue
-
             gc.collect()
-
             logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
-            logger_run.warning(f"Memory cleanup warning (non-critical): {e}")
-
+            logger_run.warning(f"Memory cleanup warning: {e}")
         TRACE_ID.set("")
         PAIR_ID.set("")
-
-        logger_run.debug("🏁 Resource cleanup finished")
-
         gc.enable()
 
 try:
