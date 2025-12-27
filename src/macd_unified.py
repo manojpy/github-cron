@@ -48,6 +48,7 @@ from aot_bridge import (
     _smooth_range,
     _calc_mmh_worm_loop,
     _calc_mmh_value_loop,
+    _calc_mmh_momentum_loop,
     _rolling_std_welford,
     _rolling_std_welford_parallel,
     _rolling_mean_numba,
@@ -708,8 +709,31 @@ def calculate_magical_momentum_hist(
         if debug:
             logger.info(f"MMH Debug - Temp: [0]={temp[0]:.6f}, [50]={temp[50]:.6f}, [143]={temp[143]:.6f}, [-1]={temp[-1]:.6f}")
 
-        # Step 7: Combined value recursion + momentum smoothing (optimized single-pass)
-        momentum_arr = _calc_mmh_value_loop(temp, rows)
+        # Step 7: LINEAR recursive value
+        value_arr = _calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+
+        if debug:
+            logger.info(f"MMH Debug - Value: [0]={value_arr[0]:.6f}, [50]={value_arr[50]:.6f}, [143]={value_arr[143]:.6f}, [-1]={value_arr[-1]:.6f}")
+
+        # Step 8: Log transform
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.clip(temp2, 1e-9, 1e9)
+            temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
+
+        if debug:
+            logger.info(f"MMH Debug - Temp2: [143]={temp2[143]:.6f}, [-1]={temp2[-1]:.6f}")
+
+        momentum = 0.25 * np.log(temp2)
+        momentum = np.nan_to_num(momentum, nan=0.0)
+
+        if debug:
+            logger.info(f"MMH Debug - PreSmooth: [0]={momentum[0]:.6f}, [50]={momentum[50]:.6f}, [143]={momentum[143]:.6f}, [-1]={momentum[-1]:.6f}")
+
+        # Step 9: Smooth
+        momentum_arr = momentum.copy()
+        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
         if debug:
             logger.info(f"MMH Debug - Final: [0]={momentum_arr[0]:.6f}, [50]={momentum_arr[50]:.6f}, [143]={momentum_arr[143]:.6f}, [-1]={momentum_arr[-1]:.6f}")
@@ -723,6 +747,7 @@ def calculate_magical_momentum_hist(
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+
 
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
