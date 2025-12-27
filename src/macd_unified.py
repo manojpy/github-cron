@@ -634,14 +634,14 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         debug = rows <= 226
         
         # YOUR EXACT FUNCTION NAMES
-        if cfg.NUMBAPARALLEL and rows >= 250:
+        if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
         wormarr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        if cfg.NUMBAPARALLEL and rows >= 250:
+        if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
             ma = _rolling_mean_numba(close_c, period)
@@ -649,18 +649,18 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         raw = wormarr - ma
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        if cfg.NUMBAPARALLEL and rows >= 250:
+        if cfg.NUMBA_PARALLEL and rows >= 250:
             minmed, maxmed = _rolling_min_max_numba_parallel(raw, period)
         else:
             minmed, maxmed = _rolling_min_max_numba(raw, period)
         
         denom = maxmed - minmed
-        temp = np.where(np.abs(denom) < Constants.ZERODIVISIONGUARD, 0.5, (raw - minmed) / denom)
+        temp = np.where(np.abs(denom) < Constants.ZERO_DIVISION_GUARD, 0.5, (raw - minmed) / denom)
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
         valuearr = _calc_mmh_value_loop(temp, rows)
-        valuearr = np.clip(valuearr, -Constants.MMHVALUECLIP, Constants.MMHVALUECLIP)
+        valuearr = np.clip(valuearr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
         
         temp2 = 1.0 / (1.0 - valuearr)
         temp2 = np.clip(temp2, 1e-9, 1e9)
