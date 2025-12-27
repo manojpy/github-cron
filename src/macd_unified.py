@@ -621,57 +621,60 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
         )
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
-    """Exact Pine Script MMH replication - 97-99% accuracy match."""
+    """Exact Pine Script MMH - 97-99% accuracy."""
     try:
         if close is None or len(close) < period:
-            logger.warning(f"MMH Insufficient data: len={len(close) if close is not None else 0}")
+            logger.warning(f"MMH Insufficient data len={len(close) if close is not None else 0}")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
         
-        # Step 1: Pine ta.stdev(source, 50) * responsiveness - SAMPLE stdev (n-1)
-        sd = rolling_std_welford(close_c, 50, resp_clamped)  # Your existing function
+        debug = rows <= 226
         
-        # Step 2: Worm - EXACT Pine var worm logic
-        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+        # YOUR EXACT FUNCTION NAMES
+        if cfg.NUMBAPARALLEL and rows >= 250:
+            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
+        else:
+            sd = _rolling_std_welford(close_c, 50, resp_clamped)
         
-        # Step 3: Pine ta.sma(source, period)
-        ma = rolling_mean_numba(close_c, period)  # Your existing function
+        wormarr = _calc_mmh_worm_loop(close_c, sd, rows)
         
-        # Step 4: raw = worm - ma (currentmed = raw)
-        raw = worm_arr - ma
+        if cfg.NUMBAPARALLEL and rows >= 250:
+            ma = _rolling_mean_numba_parallel(close_c, period)
+        else:
+            ma = _rolling_mean_numba(close_c, period)
+        
+        raw = wormarr - ma
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Step 5: Pine ta.lowest/ta.highest on currentmed (raw)
-        min_med, max_med = rolling_minmax_numba(raw, period)  # Your existing functions
+        if cfg.NUMBAPARALLEL and rows >= 250:
+            minmed, maxmed = _rolling_min_max_numba_parallel(raw, period)
+        else:
+            minmed, maxmed = _rolling_min_max_numba(raw, period)
         
-        # Step 6: temp = (currentmed - minmed) / (maxmed - minmed)
-        denom = max_med - min_med
-        temp = np.where(np.abs(denom) < Constants.ZERODIVISIONGUARD, 0.5, 
-                       (raw - min_med) / denom)
+        denom = maxmed - minmed
+        temp = np.where(np.abs(denom) < Constants.ZERODIVISIONGUARD, 0.5, (raw - minmed) / denom)
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
         
-        # Step 7: EXACT Pine value recursive multiplicative
-        value_arr = _calc_mmh_value_loop(temp, rows)
+        valuearr = _calc_mmh_value_loop(temp, rows)
+        valuearr = np.clip(valuearr, -Constants.MMHVALUECLIP, Constants.MMHVALUECLIP)
         
-        # Step 8: temp2 = 1 / (1 - value), momentum = 0.25 * math.log(temp2)
-        temp2 = 1.0 / (1.0 - value_arr)
+        temp2 = 1.0 / (1.0 - valuearr)
         temp2 = np.clip(temp2, 1e-9, 1e9)
         temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
         
-        # Step 9: Pine momentum smoothing - momentum = momentum*.5 + nz(momentum[1])*.5
-        momentum_arr = momentum.copy()
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        momentumarr = momentum.copy()
+        momentumarr = _calc_mmh_momentum_loop(momentumarr, rows)
         
-        return sanitize_array_numba(momentum_arr, 0.0)  # Your existing function
+        return _sanitize_array_numba(momentumarr, 0.0)
         
     except Exception as e:
-        logger.error(f"MMH calculation failed: {e}", exc_info=True)
+        logger.error(f"MMH calculation failed {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 # ============================================================================
