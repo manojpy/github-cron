@@ -13,6 +13,7 @@ import re
 import uuid
 import argparse
 import psutil
+import math
 import gc
 import json
 from collections import deque, defaultdict
@@ -22,6 +23,7 @@ from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 from urllib.parse import urlparse, parse_qs
 import aiohttp
+from aiohttp import web
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
@@ -77,23 +79,6 @@ except ImportError:
 
 __version__ = "1.8.0-stable"
 
-
-SUCCESS = 25  # between INFO (20) and WARNING (30)
-logging.addLevelName(SUCCESS, "SUCCESS")
-
-def success(self, message, *args, **kwargs):
-    if self.isEnabledFor(SUCCESS):
-        self._log(SUCCESS, message, args, **kwargs)
-
-logging.Logger.success = success
-
-class SuccessFilter(logging.Filter):
-    def filter(self, record):
-        return record.levelno in (SUCCESS, logging.ERROR, logging.CRITICAL)
-
-logging.getLogger().addFilter(SuccessFilter())
-
-
 class Constants:
     MIN_WICK_RATIO = 0.2
     PPO_THRESHOLD_BUY = 0.20
@@ -118,7 +103,6 @@ class Constants:
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
-    PIVOT_MIDNIGHT_BUFFER_SEC = 300
 
 # ============================================================================
 # STATIC PRODUCTS MAP (Eliminates API fetch overhead)
@@ -694,14 +678,14 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
 def warmup_if_needed() -> None:
     
     if aot_bridge.is_using_aot():
-        logger.success("✅ AOT active - no warmup needed")
+        logger.info("✅ AOT active - no warmup needed")
         return
     
     if cfg.SKIP_WARMUP:
         logger.warning("⚠️ JIT mode + SKIP_WARMUP=true - first run will be slower")
         return
     
-    logger.success("🔥 AOT not available, warming up JIT compilation...")
+    logger.info("🔥 AOT not available, warming up JIT compilation...")
     
     try:
         test_data = np.random.random(200).astype(np.float64) * 1000
@@ -720,7 +704,7 @@ def warmup_if_needed() -> None:
         _ = _calculate_rsi_core(test_data, 21)
         _ = _sanitize_array_numba(test_data, 0.0)
         
-        logger.success("✅ JIT warmup complete (4 critical functions)")
+        logger.info("✅ JIT warmup complete (4 critical functions)")
         
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
@@ -728,66 +712,62 @@ def warmup_if_needed() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
-
-
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
-    timestamps: np.ndarray,
+    timestamps: np.ndarray
 ) -> Dict[str, float]:
-
+    # Pre-fill with zeros to avoid KeyErrors downstream
     piv: Dict[str, float] = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
 
     try:
         if len(timestamps) < 2:
+            logger.warning("Pivot calc: insufficient data")
             return piv
 
-        # Use the LAST available timestamp in the data as "Current Time" reference
-        last_ts = int(timestamps[-1])  # ensure integer
-        last_dt = datetime.fromtimestamp(last_ts, tz=timezone.utc)
+        # Daily bins (timestamps in seconds)
+        days = timestamps // 86400
+        now_utc = datetime.now(timezone.utc)
+        yesterday = (now_utc - timedelta(days=1)).date()
 
-        # Detect unit (seconds vs ms)
-        if last_ts > 1e12:  # heuristic: ms epoch
-            day_seconds = 86400000
-        else:
-            day_seconds = 86400
+        # Yesterday UTC day number
+        yesterday_ts = datetime(
+            yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc
+        ).timestamp()
+        yesterday_day_number = int(yesterday_ts) // 86400
 
-        # Calculate UTC market day
-        market_day = last_ts // day_seconds
-        seconds_since_midnight = last_ts % day_seconds
+        yesterday_mask = (days == yesterday_day_number)
 
-        # Buffer: skip pivot reset if too close to midnight
-        if seconds_since_midnight < (5 * 60 * (1000 if day_seconds == 86400000 else 1)):
-            logger.debug(f"Skipping pivot calc (too close to midnight: {seconds_since_midnight} units)")
-            return piv
-
-        # Select previous day’s data
-        days = timestamps // day_seconds
-        prev_day_mask = (days == (market_day - 1))
-
-        if not np.any(prev_day_mask):
+        if not np.any(yesterday_mask):
+            # Fallback: use second-to-last unique day if yesterday missing
             unique_days = np.unique(days)
             if len(unique_days) > 1:
-                target_day = unique_days[-2]
-                prev_day_mask = (days == target_day)
+                yesterday_day_number = unique_days[-2]
+                yesterday_mask = (days == yesterday_day_number)
+                logger.info(f"Fallback pivot day: {yesterday_day_number}")
             else:
+                logger.warning("Pivot calc: No daily transition found in data.")
                 return piv
 
-        yesterday_high = high[prev_day_mask]
-        yesterday_low = low[prev_day_mask]
-        yesterday_close = close[prev_day_mask]
+        yesterday_high = high[yesterday_mask]
+        yesterday_low = low[yesterday_mask]
+        yesterday_close = close[yesterday_mask]
 
-        if len(yesterday_high) == 0 or len(yesterday_low) == 0 or len(yesterday_close) == 0:
+        if len(yesterday_high) == 0:
+            logger.warning("No candles found for pivot day")
             return piv
 
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
         C_prev = float(yesterday_close[-1])
+
         rng_prev = H_prev - L_prev
+        if rng_prev < 1e-8:
+            logger.warning(f"Invalid pivot range: {rng_prev}")
+            return piv
 
         P = (H_prev + L_prev + C_prev) / 3.0
-
         piv.update({
             "P": P,
             "R1": P + rng_prev * 0.382,
@@ -799,7 +779,7 @@ def calculate_pivot_levels_numpy(
         })
 
     except Exception as e:
-        logger.error(f"Pivot calculation failed: {e}")
+        logger.error(f"Pivot calculation failed: {e}", exc_info=True)
 
     return piv
 
@@ -897,89 +877,84 @@ class SessionManager:
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 2000
+    _session_reuse_limit: ClassVar[int] = 2000  # OPTIMIZED: Increased from 1000
 
+    
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
         if cls._ssl_context is None:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
+            # Modern way: enforce TLS >= 1.2
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             cls._ssl_context = ctx
+            logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         async with cls._lock:
+            should_recreate = False
+
             if cls._session is None or cls._session.closed:
-                await cls._create_new_session()
+                should_recreate = True
+                reason = "no session" if cls._session is None else "session closed"
             elif cls._request_count >= cls._session_reuse_limit:
-                logger.info(f"Session limit ({cls._request_count}) reached, rotating...")
-                await cls._rotate_session()
+                should_recreate = True
+                reason = f"request limit reached ({cls._request_count})"
+                logger.info(f"Session recreation triggered: {reason}")
+
+            if should_recreate:
+                if cls._session and not cls._session.closed:
+                    try:
+                        await cls._session.close()
+                        await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
+                    except Exception as e:
+                        logger.warning(f"Error closing old session: {e}")
+
+                connector = TCPConnector(
+                    limit=cfg.TCP_CONN_LIMIT,
+                    limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
+                    ssl=cls._get_ssl_context(),
+                    force_close=False,
+                    enable_cleanup_closed=True,
+                    ttl_dns_cache=3600,
+                    keepalive_timeout=90,  # OPTIMIZED: Increased from 60s
+                    family=0,
+                )
+
+                timeout = aiohttp.ClientTimeout(
+                    total=cfg.HTTP_TIMEOUT,
+                    connect=8,  # OPTIMIZED: Reduced from 10s
+                    sock_read=cfg.HTTP_TIMEOUT,
+                )
+
+                cls._session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    headers={
+                        'User-Agent': f'{cfg.BOT_NAME}/{__version__}',
+                        'Accept': 'application/json',
+                        'Accept-Encoding': 'gzip, deflate',
+                        'Connection': 'keep-alive',  # OPTIMIZED: Added explicit keep-alive
+                    },
+                    raise_for_status=False,
+                )
+
+                cls._creation_time = time.time()
+                cls._request_count = 0
+
+                logger.info(
+                    f"HTTP session created | "
+                    f"Pool: {cfg.TCP_CONN_LIMIT} total, {cfg.TCP_CONN_LIMIT_PER_HOST} per host | "
+                    f"Timeout: {cfg.HTTP_TIMEOUT}s | Keepalive: 90s"
+                )
             return cls._session
 
     @classmethod
-    async def _create_new_session(cls):
-        """Internal helper to create a session."""
-        connector = aiohttp.TCPConnector(
-            limit=cfg.TCP_CONN_LIMIT,
-            limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
-            ssl=cls._get_ssl_context(),
-            ttl_dns_cache=3600,
-            keepalive_timeout=90,
-            enable_cleanup_closed=True,
-        )
-        timeout = aiohttp.ClientTimeout(
-            total=cfg.HTTP_TIMEOUT, connect=8, sock_read=cfg.HTTP_TIMEOUT
-        )
-        cls._session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            headers={
-                "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
-                "Accept": "application/json",
-                "Connection": "keep-alive",
-            },
-        )
-        cls._creation_time = time.time()
-        cls._request_count = 0
-        logger.info("🆕 HTTP session created")
-
-    @classmethod
-    async def _rotate_session(cls):
-        """Creates a new session and schedules the old one for graceful closure."""
-        old_session = cls._session
-        # Create new session immediately
-        await cls._create_new_session()
-        # Close old session in background after delay to allow in-flight reqs to finish
-        if old_session and not old_session.closed:
-            asyncio.create_task(cls._graceful_close(old_session))
-
-    @classmethod
-    async def _graceful_close(cls, session: aiohttp.ClientSession):
-        try:
-            await asyncio.sleep(5.0)
-            if not session.closed:  # ✅ FIX: Check before closing
-                await session.close()
-                logger.debug("🗑️ Old HTTP session closed gracefully")
-        except asyncio.CancelledError:
-            if not session.closed:
-                await session.close()
-            raise
-        except Exception as e:
-            logger.warning(f"Error closing old session: {e}")
-            try:
-                if not session.closed:
-                    await session.close()
-            except:
-                pass
-
-    @classmethod
-    async def force_recreate(cls):
-        async with cls._lock:
-            logger.info("🔄 Force recreating HTTP session")
-            await cls._rotate_session()
+    def track_request(cls) -> None:
+        cls._request_count += 1
 
     @classmethod
     async def close_session(cls) -> None:
@@ -1002,15 +977,6 @@ class SessionManager:
                     cls._creation_time = 0.0
             else:
                 logger.debug("Session already closed or not created")
-
-    @classmethod
-    def track_request(cls) -> None:
-        """Increment request counter for the active session."""
-        cls._request_count += 1
-        logger.debug(
-            f"Tracked request | Count: {cls._request_count} | "
-            f"Reuse limit: {cls._session_reuse_limit}"
-        )
 
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
@@ -1102,101 +1068,127 @@ async def async_fetch_json(
     backoff: float = 1.5,
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
+    
     session = await SessionManager.get_session()
     last_error = None
     retry_stats = {
-        "network": 0,
-        "rate_limit": 0,
-        "api_error": 0,
-        "timeout": 0,
-        "unknown": 0,
+        RetryCategory.NETWORK: 0,
+        RetryCategory.RATE_LIMIT: 0,
+        RetryCategory.API_ERROR: 0,
+        RetryCategory.TIMEOUT: 0,
+        RetryCategory.UNKNOWN: 0
     }
-
+    
     for attempt in range(1, retries + 1):
+        if shutdown_event.is_set():
+            logger.debug(f"Shutdown requested, aborting fetch: {url[:80]}")
+            return None
+        
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
-                # ✅ Track request immediately after acquiring response
-                SessionManager.track_request()
-
                 if resp.status == 429:
-                    retry_after = resp.headers.get("Retry-After")
-                    wait_sec = min(int(retry_after) if retry_after else 2, 10)
+                    retry_after = resp.headers.get('Retry-After')
+                    wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
                     jitter = random.uniform(0.1, 0.5)
                     total_wait = wait_sec + jitter
-                    retry_stats["rate_limit"] += 1
+                    
+                    retry_stats[RetryCategory.RATE_LIMIT] += 1
                     logger.warning(
-                        f"Rate limited (429) | Waiting {total_wait:.2f}s | Attempt {attempt}/{retries}"
+                        f"Rate limited (429) | URL: {url[:80]} | "
+                        f"Retry-After: {retry_after}s | Waiting: {total_wait:.2f}s | "
+                        f"Attempt: {attempt}/{retries}"
                     )
+                    
                     await asyncio.sleep(total_wait)
                     continue
-
+                
                 if resp.status >= 500:
-                    retry_stats["api_error"] += 1
-                    logger.warning(f"Server error {resp.status} | Attempt {attempt}/{retries}")
+                    retry_stats[RetryCategory.API_ERROR] += 1
+                    logger.warning(
+                        f"Server error {resp.status} | URL: {url[:80]} | "
+                        f"Attempt: {attempt}/{retries}"
+                    )
+                    
                     if attempt < retries:
-                        base_delay = min(10, backoff * (2 ** (attempt - 1)))
+                        base_delay = min(
+                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                            backoff * (2 ** (attempt - 1))
+                        )
                         jitter = base_delay * random.uniform(0.1, 0.5)
-                        delay = base_delay + jitter
-                        logger.debug(f"Applied backoff {delay:.2f}s | Attempt {attempt}")
-                        await asyncio.sleep(delay)
+                        total_delay = base_delay + jitter
+                        
+                        logger.debug(f"Retrying after {total_delay:.2f}s...")
+                        await asyncio.sleep(total_delay)
                     continue
-
+                
                 if resp.status >= 400:
-                    logger.error(f"Client error {resp.status} | Not retrying")
+                    logger.error(
+                        f"Client error {resp.status} for {url[:80]} | "
+                        f"This usually indicates invalid request - not retrying"
+                    )
                     return None
-
-                try:
-                    data = await resp.json(loads=json_loads)
-                except Exception as e:
-                    last_error = e
-                    retry_stats["unknown"] += 1
-                    snippet = (await resp.text())[:200]
-                    logger.error(f"JSON decode failed | Error: {e} | Snippet: {snippet}")
-                    continue
-
+                data = await resp.json(loads=json_loads)
+                
+                SessionManager.track_request()
+                
                 if any(retry_stats.values()):
                     logger.info(
-                        f"Fetch succeeded after retries | Attempts: {attempt} | Stats: {retry_stats}"
+                        f"Fetch succeeded after retries | URL: {url[:80]} | "
+                        f"Attempts: {attempt} | Stats: {retry_stats}"
                     )
-
+                
                 return data
-
+                
         except asyncio.TimeoutError as e:
             last_error = e
-            retry_stats["timeout"] += 1
-            logger.warning(f"Timeout (attempt {attempt}/{retries}) | URL: {url[:80]}")
-            if attempt < retries:
-                base_delay = min(10, backoff * (2 ** (attempt - 1)))
-                jitter = base_delay * random.uniform(0.1, 0.5)
-                delay = base_delay + jitter
-                logger.debug(f"Applied backoff {delay:.2f}s | Attempt {attempt}")
-                await asyncio.sleep(delay)
-
-        except aiohttp.ClientError as e:
-            last_error = e
-            retry_stats["network"] += 1
+            retry_stats[RetryCategory.TIMEOUT] += 1
+            
             logger.warning(
-                f"Network error (attempt {attempt}/{retries}) | Error: {str(e)[:100]}"
+                f"Timeout (attempt {attempt}/{retries}) | "
+                f"URL: {url[:80]} | Timeout: {timeout}s"
             )
+            
             if attempt < retries:
-                base_delay = min(10, backoff * (2 ** (attempt - 1)))
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
                 jitter = base_delay * random.uniform(0.1, 0.5)
-                delay = base_delay + jitter
-                logger.debug(f"Applied backoff {delay:.2f}s | Attempt {attempt}")
-                await asyncio.sleep(delay)
-
+                total_delay = base_delay + jitter
+                
+                logger.debug(f"Retrying after {total_delay:.2f}s...")
+                await asyncio.sleep(total_delay)
+        
+        except (ClientConnectorError, ClientError, ClientResponseError) as e:
+            last_error = e
+            category = categorize_exception(e)
+            retry_stats[category] = retry_stats.get(category, 0) + 1
+            
+            logger.warning(
+                f"Network error (attempt {attempt}/{retries}) | "
+                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+            )
+            
+            if attempt < retries:
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                total_delay = base_delay + jitter
+                
+                logger.debug(f"Retrying after {total_delay:.2f}s...")
+                await asyncio.sleep(total_delay)
+        
         except Exception as e:
             last_error = e
-            retry_stats["unknown"] += 1
-            logger.exception(f"Unexpected fetch error: {e}")
+            retry_stats[RetryCategory.UNKNOWN] += 1
+            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
-
-    # 🔄 Force session recreation if repeated API/network errors
-    if retry_stats["api_error"] >= 2 or retry_stats["network"] >= 3:
-        await SessionManager.force_recreate()
-
+    
     logger.error(
-        f"Failed to fetch after {retries} attempts | Stats: {retry_stats} | Last error: {last_error}"
+        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
+        f"Stats: {retry_stats} | Last error: {last_error}"
     )
     return None
 
@@ -1514,7 +1506,7 @@ class DataFetcher:
                 output[symbol][resolution] = result
                 if result: success_count += 1
 
-        logger.success(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
+        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
 def parse_candles_to_numpy(
@@ -1560,6 +1552,7 @@ def parse_candles_to_numpy(
     except Exception as e:
         logger.error(f"Failed to parse candles: {e}")
         return None
+
 def validate_candle_data(
     data: Optional[Dict[str, np.ndarray]],
     required_len: int = 0,
@@ -2901,7 +2894,7 @@ async def evaluate_pair_and_alert(
                 msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
             if not cfg.DRY_RUN_MODE:
                 await telegram_queue.send(msg)
-            logger_pair.success(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _, _, ak in alerts_to_send]}")
+            logger_pair.info(f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | {[ak for _, _, ak in alerts_to_send]}")
 
         reasons = []
         if not buy_common and not sell_common: reasons.append("Trend filter blocked")
@@ -2949,7 +2942,7 @@ async def process_pairs_with_workers(
     
     limit_15m = max(200, cfg.RMA_200_PERIOD + 25)
     limit_5m = max(300, cfg.RMA_200_PERIOD + 50)
-    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD + 5 if cfg.ENABLE_PIVOT else 0
+    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
     
     pair_requests = []
     for pair_name in pairs_to_process:
@@ -3285,7 +3278,7 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.success(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
+    logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
@@ -3297,7 +3290,7 @@ if __name__ == "__main__":
         logger.critical("❌ AOT not active — JIT fallback. Reason: %s", reason)
         sys.exit(1)
     else:
-        logger.success("✅ Verified: AOT artifacts loaded successfully")
+        logger.info("✅ Verified: AOT artifacts loaded successfully")
 
     parser = argparse.ArgumentParser(
         prog="macd_unified",
@@ -3349,7 +3342,7 @@ if __name__ == "__main__":
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
-            logger.success("✅ Bot run completed successfully")
+            logger.info("✅ Bot run completed successfully")
             sys.exit(0)
         else:
             logger.error("❌ Bot run failed")
