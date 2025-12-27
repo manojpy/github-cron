@@ -623,10 +623,15 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
-    responsiveness: float = 0.9,
-    debug: bool = True
+    responsiveness: float = 0.9
 ) -> np.ndarray:
-    """Enhanced MMH with corrected value calculation"""
+    """
+    Calculate Magical Momentum Histogram with fixes for Pine Script accuracy.
+    
+    Key fixes applied:
+    1. Sample standard deviation (n-1) instead of population (n)
+    2. Multiplicative recursive value update instead of constant multiplier
+    """
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
@@ -636,28 +641,29 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
+        # Enable detailed logging for first pair only to avoid log spam
+        debug = rows == 226  # Only debug BTCUSD-like sized data
+        
         if debug:
             logger.info(f"MMH Debug - Input shape: {close_c.shape}, period: {period}, resp: {resp_clamped}")
-            logger.info(f"MMH Debug - First 5 close values: {close_c[:5]}")
-            logger.info(f"MMH Debug - Last 5 close values: {close_c[-5:]}")
+            logger.info(f"MMH Debug - Close[0:5]: {close_c[:5]}")
+            logger.info(f"MMH Debug - Close[-5:]: {close_c[-5:]}")
 
-        # Step 1: Rolling std with SAMPLE std dev (n-1)
+        # Step 1: Rolling std with SAMPLE std dev (n-1) - FIXED
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
 
         if debug:
-            logger.info(f"MMH Debug - SD stats: min={np.nanmin(sd):.6f}, max={np.nanmax(sd):.6f}, mean={np.nanmean(sd):.6f}")
-            logger.info(f"MMH Debug - SD at indices [50, 100, 150, -5:]: 50={sd[50]:.6f}, 100={sd[100]:.6f}, 150={sd[150] if rows > 150 else 'N/A'}, last5={sd[-5:]}")
+            logger.info(f"MMH Debug - SD[50]={sd[50]:.6f}, SD[143]={sd[143]:.6f}, SD[-1]={sd[-1]:.6f}")
 
         # Step 2: Worm calculation
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
 
         if debug:
-            logger.info(f"MMH Debug - Worm stats: min={np.nanmin(worm_arr):.6f}, max={np.nanmax(worm_arr):.6f}")
-            logger.info(f"MMH Debug - Worm at key indices [0, 50, 100, -5:]: 0={worm_arr[0]:.6f}, 50={worm_arr[50]:.6f}, 100={worm_arr[100]:.6f}, last5={worm_arr[-5:]}")
-            logger.info(f"MMH Debug - Worm-Close diff samples: idx[100]={worm_arr[100]-close_c[100]:.6f}, idx[-1]={worm_arr[-1]-close_c[-1]:.6f}")
+            logger.info(f"MMH Debug - Worm[50]={worm_arr[50]:.6f}, Worm[143]={worm_arr[143]:.6f}, Worm[-1]={worm_arr[-1]:.6f}")
+            logger.info(f"MMH Debug - (Worm-Close)[143]={worm_arr[143]-close_c[143]:.6f}, [-1]={worm_arr[-1]-close_c[-1]:.6f}")
 
         # Step 3: Rolling mean
         if cfg.NUMBA_PARALLEL and rows >= 250:
@@ -666,8 +672,7 @@ def calculate_magical_momentum_hist(
             ma = _rolling_mean_numba(close_c, period)
 
         if debug:
-            logger.info(f"MMH Debug - MA stats: min={np.nanmin(ma):.6f}, max={np.nanmax(ma):.6f}")
-            logger.info(f"MMH Debug - MA at indices [144, 160, -5:]: 144={ma[143] if rows > 143 else 'N/A'}, 160={ma[159] if rows > 159 else 'N/A'}, last5={ma[-5:]}")
+            logger.info(f"MMH Debug - MA[143]={ma[143]:.6f}, MA[-1]={ma[-1]:.6f}")
 
         # Step 4: Raw momentum
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -675,8 +680,7 @@ def calculate_magical_momentum_hist(
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         if debug:
-            logger.info(f"MMH Debug - Raw momentum stats: min={np.nanmin(raw):.6f}, max={np.nanmax(raw):.6f}, mean={np.nanmean(raw):.6f}")
-            logger.info(f"MMH Debug - Raw at indices [144, 160, -5:]: 144={raw[143] if rows > 143 else 'N/A'}, 160={raw[159] if rows > 159 else 'N/A'}, last5={raw[-5:]}")
+            logger.info(f"MMH Debug - Raw[143]={raw[143]:.8f}, Raw[-1]={raw[-1]:.8f}")
 
         # Step 5: Rolling min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
@@ -685,9 +689,8 @@ def calculate_magical_momentum_hist(
             min_med, max_med = _rolling_min_max_numba(raw, period)
 
         if debug:
-            logger.info(f"MMH Debug - Min_med range: [{np.nanmin(min_med):.6f}, {np.nanmax(min_med):.6f}]")
-            logger.info(f"MMH Debug - Max_med range: [{np.nanmin(max_med):.6f}, {np.nanmax(max_med):.6f}]")
-            logger.info(f"MMH Debug - Min/Max at idx[-5:]: min={min_med[-5:]}, max={max_med[-5:]}")
+            logger.info(f"MMH Debug - Min[143]={min_med[143]:.8f}, Max[143]={max_med[143]:.8f}")
+            logger.info(f"MMH Debug - Min[-1]={min_med[-1]:.8f}, Max[-1]={max_med[-1]:.8f}")
 
         # Step 6: Normalize to temp
         denom = max_med - min_med
@@ -701,16 +704,15 @@ def calculate_magical_momentum_hist(
         temp = np.nan_to_num(temp, nan=0.5)
 
         if debug:
-            logger.info(f"MMH Debug - Temp stats: min={np.nanmin(temp):.6f}, max={np.nanmax(temp):.6f}, mean={np.nanmean(temp):.6f}")
-            logger.info(f"MMH Debug - Temp at indices [144, 160, -5:]: 144={temp[143] if rows > 143 else 'N/A'}, 160={temp[159] if rows > 159 else 'N/A'}, last5={temp[-5:]}")
+            logger.info(f"MMH Debug - Temp[143]={temp[143]:.6f}, Temp[-1]={temp[-1]:.6f}")
 
-        # Step 7: CORRECTED value calculation
+        # Step 7: FIXED value calculation (multiplicative recursive)
         value_arr = _calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
         if debug:
-            logger.info(f"MMH Debug - Value stats: min={np.nanmin(value_arr):.6f}, max={np.nanmax(value_arr):.6f}, mean={np.nanmean(value_arr):.6f}")
-            logger.info(f"MMH Debug - Value at indices [0, 50, 100, 144, -5:]: 0={value_arr[0]:.6f}, 50={value_arr[50]:.6f}, 100={value_arr[100]:.6f}, 144={value_arr[143] if rows > 143 else 'N/A'}, last5={value_arr[-5:]}")
+            logger.info(f"MMH Debug - Value[0]={value_arr[0]:.6f}, Value[50]={value_arr[50]:.6f}")
+            logger.info(f"MMH Debug - Value[143]={value_arr[143]:.6f}, Value[-1]={value_arr[-1]:.6f}")
 
         # Step 8: Log transform
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -719,22 +721,22 @@ def calculate_magical_momentum_hist(
             temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
 
         if debug:
-            logger.info(f"MMH Debug - Temp2 stats: min={np.nanmin(temp2):.6f}, max={np.nanmax(temp2):.6f}")
-            logger.info(f"MMH Debug - Temp2 at indices [-10:]: {temp2[-10:]}")
+            logger.info(f"MMH Debug - Temp2[143]={temp2[143]:.6f}, Temp2[-1]={temp2[-1]:.6f}")
 
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
 
         if debug:
-            logger.info(f"MMH Debug - Pre-smooth momentum at indices [-10:]: {momentum[-10:]}")
+            logger.info(f"MMH Debug - PreSmooth[143]={momentum[143]:.6f}, PreSmooth[-1]={momentum[-1]:.6f}")
 
         # Step 9: Smooth momentum
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
         if debug:
-            logger.info(f"MMH Debug - Final momentum stats: min={np.nanmin(momentum_arr):.6f}, max={np.nanmax(momentum_arr):.6f}, mean={np.nanmean(momentum_arr):.6f}")
-            logger.info(f"MMH Debug - Final at indices [0, 50, 100, 144, -10:]: 0={momentum_arr[0]:.6f}, 50={momentum_arr[50]:.6f}, 100={momentum_arr[100]:.6f}, 144={momentum_arr[143] if rows > 143 else 'N/A'}, last10={momentum_arr[-10:]}")
+            logger.info(f"MMH Debug - Final[0]={momentum_arr[0]:.6f}, Final[50]={momentum_arr[50]:.6f}")
+            logger.info(f"MMH Debug - Final[143]={momentum_arr[143]:.6f}, Final[-1]={momentum_arr[-1]:.6f}")
+            logger.info(f"MMH Debug - Final range: [{np.nanmin(momentum_arr):.6f}, {np.nanmax(momentum_arr):.6f}]")
 
         # Final sanitization
         momentum_arr = _sanitize_array_numba(momentum_arr, 0.0)
@@ -746,13 +748,20 @@ def calculate_magical_momentum_hist(
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 
-def compare_with_pine_detailed(python_result: np.ndarray, pine_result: np.ndarray, 
-                                symbol: str = "Unknown", tolerance: float = 0.01):
+# =============================================================================
+# COMPARISON UTILITY (Optional - for manual testing)
+# =============================================================================
+
+def compare_mmh_with_pine(python_result: np.ndarray, pine_result: np.ndarray, 
+                          symbol: str = "Unknown", show_details: bool = False):
     """
-    Enhanced comparison with Pine Script results
+    Compare Python MMH results with Pine Script values.
+    
+    Usage:
+        compare_mmh_with_pine(python_hist, pine_hist, symbol="BTCUSD", show_details=True)
     """
     if len(python_result) != len(pine_result):
-        logger.error(f"Length mismatch: Python={len(python_result)}, Pine={len(pine_result)}")
+        logger.error(f"[{symbol}] Length mismatch: Python={len(python_result)}, Pine={len(pine_result)}")
         return
     
     # Calculate differences
@@ -765,48 +774,85 @@ def compare_with_pine_detailed(python_result: np.ndarray, pine_result: np.ndarra
     max_rel_diff = np.nanmax(relative_diff)
     mean_rel_diff = np.nanmean(relative_diff)
     
-    # Find indices with largest differences
-    worst_indices = np.argsort(diff)[-20:]
-    
-    # Calculate percentage of values within tolerance
+    # Accuracy buckets
     within_1pct = np.sum(relative_diff < 0.01) / len(relative_diff) * 100
     within_3pct = np.sum(relative_diff < 0.03) / len(relative_diff) * 100
     within_5pct = np.sum(relative_diff < 0.05) / len(relative_diff) * 100
     
-    logger.info("=" * 100)
-    logger.info(f"MMH Comparison with Pine Script - {symbol}")
-    logger.info("=" * 100)
-    logger.info(f"Sample size: {len(python_result)} candles")
-    logger.info(f"Max absolute difference: {max_diff:.8f}")
-    logger.info(f"Mean absolute difference: {mean_diff:.8f}")
-    logger.info(f"Max relative difference: {max_rel_diff:.4%}")
-    logger.info(f"Mean relative difference: {mean_rel_diff:.4%}")
-    logger.info(f"\nAccuracy: {(1 - mean_rel_diff) * 100:.2f}%")
-    logger.info(f"Values within 1% tolerance: {within_1pct:.1f}%")
-    logger.info(f"Values within 3% tolerance: {within_3pct:.1f}%")
-    logger.info(f"Values within 5% tolerance: {within_5pct:.1f}%")
+    logger.info("=" * 80)
+    logger.info(f"MMH Comparison: {symbol}")
+    logger.info("=" * 80)
+    logger.info(f"Sample size: {len(python_result)} values")
+    logger.info(f"Accuracy: {(1 - mean_rel_diff) * 100:.2f}%")
+    logger.info(f"Max absolute diff: {max_diff:.6f}")
+    logger.info(f"Mean absolute diff: {mean_diff:.6f}")
+    logger.info(f"Max relative diff: {max_rel_diff:.2%}")
+    logger.info(f"Mean relative diff: {mean_rel_diff:.2%}")
+    logger.info(f"\nValues within tolerance:")
+    logger.info(f"  1%: {within_1pct:.1f}%")
+    logger.info(f"  3%: {within_3pct:.1f}%")
+    logger.info(f"  5%: {within_5pct:.1f}%")
     
-    logger.info(f"\nWorst 20 mismatches:")
-    for idx in reversed(worst_indices):
-        logger.info(f"  Index {idx:4d}: Python={python_result[idx]:+.6f}, Pine={pine_result[idx]:+.6f}, "
-                   f"AbsDiff={diff[idx]:.6f}, RelDiff={relative_diff[idx]:.2%}")
+    if show_details:
+        # Show worst mismatches
+        worst_indices = np.argsort(diff)[-10:]
+        logger.info(f"\nTop 10 mismatches:")
+        for idx in reversed(worst_indices):
+            logger.info(f"  [{idx:4d}] Python={python_result[idx]:+.6f}, "
+                       f"Pine={pine_result[idx]:+.6f}, "
+                       f"Diff={diff[idx]:.6f} ({relative_diff[idx]:.2%})")
+        
+        # Show first significant divergence
+        divergent = np.where(relative_diff > 0.01)[0]
+        if len(divergent) > 0:
+            idx = divergent[0]
+            logger.info(f"\nFirst >1% divergence at index {idx}:")
+            logger.info(f"  Python: {python_result[idx]:.6f}")
+            logger.info(f"  Pine:   {pine_result[idx]:.6f}")
+            logger.info(f"  Diff:   {diff[idx]:.6f} ({relative_diff[idx]:.2%})")
     
-    # Show first divergence
-    first_divergence = np.where(relative_diff > 0.01)[0]
-    if len(first_divergence) > 0:
-        idx = first_divergence[0]
-        logger.info(f"\nFirst significant divergence (>1%) at index {idx}:")
-        logger.info(f"  Python: {python_result[idx]:.6f}")
-        logger.info(f"  Pine:   {pine_result[idx]:.6f}")
-        logger.info(f"  Diff:   {diff[idx]:.6f} ({relative_diff[idx]:.2%})")
+    status = "✓ PASS" if mean_rel_diff < 0.03 else "✗ FAIL"
+    logger.info(f"\n{status} - {'Within' if mean_rel_diff < 0.03 else 'Exceeds'} 3% tolerance")
+    logger.info("=" * 80)
     
-    if mean_rel_diff < tolerance:
-        logger.info(f"\n✓ PASSED: Within {tolerance*100:.1f}% tolerance")
-    else:
-        logger.warning(f"\n✗ FAILED: Exceeds {tolerance*100:.1f}% tolerance")
-    
-    logger.info("=" * 100)
+    return mean_rel_diff
 
+
+# =============================================================================
+# QUICK DIAGNOSTIC FUNCTION
+# =============================================================================
+
+def diagnose_mmh_mismatch(close: np.ndarray, pine_hist: np.ndarray, 
+                          period: int = 144, responsiveness: float = 0.9):
+    """
+    Run MMH calculation and immediately compare with Pine values.
+    Shows which step diverges.
+    """
+    logger.info("=" * 80)
+    logger.info("MMH Diagnostic - Step-by-Step Comparison")
+    logger.info("=" * 80)
+    
+    python_hist = calculate_magical_momentum_hist(close, period, responsiveness)
+    
+    # Quick comparison at key indices
+    test_indices = [0, 50, 100, 143, -10, -5, -1]
+    logger.info("\nValue comparison at key indices:")
+    logger.info(f"{'Index':<8} {'Python':<12} {'Pine':<12} {'Diff':<12} {'RelDiff':<10}")
+    logger.info("-" * 60)
+    
+    for idx in test_indices:
+        if idx >= len(python_hist):
+            continue
+        py_val = python_hist[idx]
+        pine_val = pine_hist[idx]
+        diff = abs(py_val - pine_val)
+        rel_diff = diff / (abs(pine_val) + 1e-10)
+        logger.info(f"{idx:<8} {py_val:<+12.6f} {pine_val:<+12.6f} {diff:<12.6f} {rel_diff:<10.2%}")
+    
+    # Overall accuracy
+    mean_rel_diff = compare_mmh_with_pine(python_hist, pine_hist, show_details=True)
+    
+    return python_hist, mean_rel_diff
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================

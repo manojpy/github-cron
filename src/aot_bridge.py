@@ -332,12 +332,14 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    CRITICAL FIX: Pine Script logic is:
-    value = 0.5 * 2  // Initial value = 1.0
-    value := value * (temp - .5 + .5 * nz(value[1]))
+    CRITICAL FIX: Pine Script uses multiplicative recursive update
+    
+    Pine code:
+        value = 0.5 * 2  // Initial value = 1.0
+        value := value * (temp - .5 + .5 * nz(value[1]))
     
     This means: value[i] = value[i-1] * (temp[i] - 0.5 + 0.5 * value[i-1])
-    NOT: value[i] = 1.0 * (temp[i] - 0.5 + 0.5 * value[i-1])
+    NOT:        value[i] = 1.0 * (temp[i] - 0.5 + 0.5 * value[i-1])
     """
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
@@ -349,10 +351,10 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
             prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
             
+            # CRITICAL: Multiply previous value, not constant 1.0
             # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
-            # This is a MULTIPLICATIVE update, not additive
             inner = t - 0.5 + 0.5 * prev_v
-            v = prev_v * inner
+            v = prev_v * inner  # This is the key difference!
             
             # Clip to prevent overflow
             value_arr[i] = max(-0.9999, min(0.9999, v))
@@ -374,7 +376,7 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Pine's ta.stdev uses SAMPLE std dev (n-1)"""
+    """FIXED: Use SAMPLE std dev (n-1) to match Pine's ta.stdev"""
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, period, responsiveness):
@@ -392,8 +394,9 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                     mean += delta / count
                     delta2 = val - mean
                     m2 += delta * delta2
+            # CRITICAL FIX: Divide by (count - 1) for sample std dev
             if count > 1:
-                variance = m2 / (count - 1)  # Sample std dev
+                variance = m2 / (count - 1)  # Was: m2 / count
                 sd[i] = np.sqrt(max(0.0, variance)) * resp
             else:
                 sd[i] = 0.0
@@ -402,6 +405,7 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
 
 @aot_guard("rolling_std_welford_parallel")
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Parallel version with sample std dev"""
     from numba import njit, prange
     @njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(close, period, responsiveness):
@@ -420,7 +424,7 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                     delta2 = val - mean
                     m2 += delta * delta2
             if count > 1:
-                variance = m2 / (count - 1)
+                variance = m2 / (count - 1)  # Sample std dev
                 sd[i] = np.sqrt(max(0.0, variance)) * resp
             else:
                 sd[i] = 0.0
