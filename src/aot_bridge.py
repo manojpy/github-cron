@@ -436,6 +436,26 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                 sd[i] = 0.0
         return sd
     return _jit(close, period, responsiveness)
+
+@aot_guard("rolling_mean_numba")
+def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    from numba import njit
+    @njit(nogil=True, fastmath=True, cache=True)
+    def _jit(close, period):
+        rows = len(close)
+        ma = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            start = max(0, i - period + 1)
+            sum_val, count = 0.0, 0
+            for j in range(start, i + 1):
+                val = close[j]
+                if not np.isnan(val):
+                    sum_val += val
+                    count += 1
+            ma[i] = sum_val / count if count > 0 else np.nan
+        return ma
+    return _jit(close, period)
+
 @aot_guard("rolling_mean_numba_parallel")
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     from numba import njit, prange
