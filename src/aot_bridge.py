@@ -313,19 +313,19 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def jit(close_arr, sd_arr, rows):
-        worm_arr = np.empty(rows, dtype=np.float64)
-        worm_arr[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+        wormarr = np.empty(rows, dtype=np.float64)
+        wormarr[0] = close_arr[0]
         for i in range(1, rows):
-            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i-1]
-            prev_worm = worm_arr[i-1]
-            diff = src - prev_worm
+            src = close_arr[i]
+            prevworm = wormarr[i-1]
+            diff = src - prevworm
             sdi = sd_arr[i]
             if np.isnan(sdi) or sdi == 0.0:
                 delta = diff
             else:
                 delta = np.sign(diff) * sdi if abs(diff) > sdi else diff
-            worm_arr[i] = prev_worm + delta
-        return worm_arr
+            wormarr[i] = prevworm + delta
+        return wormarr
     return jit(close_arr, sd_arr, rows)
 
 @aot_guard("calc_mmh_value_loop")
@@ -333,23 +333,18 @@ def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def jit(temp_arr, rows):
-        value_arr = np.empty(rows, dtype=np.float64)
-        # Pine: value = math.pow(0.5, 2) = 0.25 initial
-        value_arr[0] = 0.25
+        valuearr = np.empty(rows, dtype=np.float64)
+        # Pine bar 0: value = 0.5^2 = 0.25, then value = value * (temp-.5)*.5 + .5
         t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-        # First bar: value = 1.0 * (t0 - 0.5)*0.5 + 0.5
-        inner = t0 - 0.5
-        inner = 0.5 + inner * 0.5
-        value_arr[0] = max(-0.9999, min(0.9999, inner))
+        valuearr[0] = 0.25  # Pine initial pow(0.5, 2)
         
         for i in range(1, rows):
-            prev_v = value_arr[i-1]
+            prev_value = valuearr[i-1]
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-            inner = t - 0.5
-            inner = 0.5 + inner * 0.5  # EXACT Pine: value * (temp-.5)*.5 + .5
-            v = prev_v * inner
-            value_arr[i] = max(-0.9999, min(0.9999, v))
-        return value_arr
+            # EXACT Pine: value = value[1] * (temp - .5)*.5 + .5
+            multiplier = (t - 0.5) * 0.5 + 0.5
+            valuearr[i] = np.clip(prev_value * multiplier, -0.9999, 0.9999)
+        return valuearr
     return jit(temp_arr, rows)
 
 @aot_guard("calc_mmh_momentum_loop")
@@ -358,8 +353,9 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     @njit(nogil=True, fastmath=True, cache=True)
     def jit(momentum_arr, rows):
         for i in range(1, rows):
-            prev = momentum_arr[i-1] if not np.isnan(momentum_arr[i-1]) else 0.0
-            momentum_arr[i] = momentum_arr[i] * 0.5 + prev * 0.5  # Pine: momentum = momentum*.5 + nz(momentum[1])*.5
+            prev_momentum = momentum_arr[i-1] if not np.isnan(momentum_arr[i-1]) else 0.0
+            # EXACT Pine: momentum = momentum*.5 + nz(momentum[1])*.5
+            momentum_arr[i] = momentum_arr[i] * 0.5 + prev_momentum * 0.5
         return momentum_arr
     return jit(momentum_arr, rows)
 
