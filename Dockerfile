@@ -36,9 +36,11 @@ RUN python aot_build.py && \
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
 
-# Install runtime libraries
+
+# 1. Install tzdata and set the timezone
 RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
     libtbb12 \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/src
@@ -59,6 +61,9 @@ ENV PYTHONPATH=/app/src \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
     NUMBA_WARNINGS=0
+    ENV TZ=Asia/Kolkata
+    RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 
 # Execute file directly from src directory
 CMD ["python", "-u", "macd_unified.py"]
