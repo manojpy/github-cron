@@ -2,10 +2,15 @@
 AOT Bridge Module - Complete wrapper coverage for all 23 Numba functions
 Provides unified API that automatically uses AOT (.so) when available, falls back to JIT
 """
+import importlib.util
+import warnings
+import pathlib
 import os
+import sys
 import logging
 import functools
 import numpy as np
+from numba import njit, prange
 from typing import Tuple, Optional
 
 # ✅ Suppress Numba warnings at import time
@@ -20,42 +25,48 @@ _INITIALIZED = False
 
 
 def aot_guard(func_name: str):
-    """
-    Decorator factory for bridge functions.
-    - Calls AOT module if available.
-    - Falls back to JIT implementation otherwise, logging a warning once.
-    """
     def decorator(jit_func):
         @functools.wraps(jit_func)
         def wrapper(*args, **kwargs):
-            if _USING_AOT and _AOT_MODULE:
-                return getattr(_AOT_MODULE, func_name)(*args, **kwargs)
-            else:
-                logger.warning(f"⚠️ Fallback to JIT: {func_name} not using AOT")
-                return jit_func(*args, **kwargs)
+            if _USING_AOT and _AOT_MODULE is not None:
+                try:
+                    return getattr(_AOT_MODULE, func_name)(*args, **kwargs)
+                except AttributeError:
+                    logger.warning(f"⚠️ AOT module missing function {func_name}, falling back to JIT")
+            # Fallback path
+            logger.warning(f"⚠️ Fallback to JIT: {func_name} not using AOT")
+            return jit_func(*args, **kwargs)
         return wrapper
     return decorator
 
 
 def initialize_aot() -> Tuple[bool, Optional[str]]:
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
-    import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             import macd_aot_compiled
             _AOT_MODULE = macd_aot_compiled
         except ImportError:
-            import importlib.util, pathlib, sys
             so_path = pathlib.Path(__file__).parent / "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so"
             if so_path.exists():
-                spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules["macd_aot_compiled"] = mod
-                spec.loader.exec_module(mod)
-                _AOT_MODULE = mod
+                try:
+                    spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
+                    if spec is None or spec.loader is None:
+                        _FALLBACK_REASON = "Failed to create module spec"
+                        logger.warning(f"AOT init failed: {_FALLBACK_REASON}")   # <-- add here
+                        return False, _FALLBACK_REASON
+                    mod = importlib.util.module_from_spec(spec)
+                    sys.modules["macd_aot_compiled"] = mod
+                    spec.loader.exec_module(mod)
+                    _AOT_MODULE = mod
+                except Exception as e:
+                    _FALLBACK_REASON = f"Failed to load .so file: {e}"
+                    logger.warning(f"AOT init failed: {_FALLBACK_REASON}")       # <-- add here
+                    return False, _FALLBACK_REASON
             else:
                 _FALLBACK_REASON = "AOT module not found"
+                logger.warning(f"AOT init failed: {_FALLBACK_REASON}")           # <-- add here
                 return False, _FALLBACK_REASON
 
         # Verify with a simple test
@@ -66,8 +77,9 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
             return True, None
         except Exception as e:
             _FALLBACK_REASON = f"AOT verification failed: {e}"
+            _AOT_MODULE = None
+            logger.warning(f"AOT init failed: {_FALLBACK_REASON}")               # <-- add here
             return False, _FALLBACK_REASON
-
 
 def ensure_initialized() -> bool:
     global _INITIALIZED
