@@ -332,34 +332,39 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    FIXED: Matches Pine Script's linear recursive logic.
-    Pine: value = 0.5 * 2  // Resets to 1.0
-          value := value * (temp - .5 + .5 * nz(value[1]))
-    
-    This simplifies to: value_new = 1.0 * (temp - 0.5 + 0.5 * value_old)
+    Corrected Value & Momentum logic to match Pine Script.
+    Implements double-recursion: 
+    1. value := (temp - .5 + .5 * value[1])
+    2. momentum := raw_mom + .5 * momentum[1]
     """
     from numba import njit
+    import numpy as np
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(temp_arr, rows):
         value_arr = np.zeros(rows, dtype=np.float64)
+        mom_arr = np.zeros(rows, dtype=np.float64)
         
-        # Bar 0: Initial calculation
-        t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-        value_arr[0] = t0 - 0.5
-        value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
-        
-        # Subsequent bars
-        for i in range(1, rows):
-            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        for i in range(rows):
+            # STEP 1: Fisher Value Recursion
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+            prev_v = value_arr[i - 1] if i > 0 else 0.0
             
-            # FIXED: Removed the extra 'prev_v *' multiplier
-            v = t - 0.5 + 0.5 * prev_v
+            v = (t - 0.5 + 0.5 * prev_v)
+            v = max(-0.9999, min(0.9999, v))
+            value_arr[i] = v
             
-            value_arr[i] = max(-0.9999, min(0.9999, v))
-        
-        return value_arr
+            # STEP 2: Log Transform
+            temp2 = (1.0 + v) / (1.0 - v)
+            # Standard log transform for Fisher
+            raw_mom = 0.25 * np.log(temp2)
+            
+            # STEP 3: Momentum Recursion (The Histogram Smoothing)
+            prev_mom = mom_arr[i - 1] if i > 0 else 0.0
+            mom_arr[i] = raw_mom + 0.5 * prev_mom
+            
+        return mom_arr # This is the final Hist value
     return _jit(temp_arr, rows)
+
 @aot_guard("calc_mmh_momentum_loop")
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     from numba import njit
@@ -373,17 +378,22 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """FIXED: Use POPULATION std dev (divide by N) to match Pine's ta.stdev"""
+    """
+    Standard deviation using Welford's algorithm.
+    FIXED: Uses Population SD (divide by N) to match Pine ta.stdev.
+    """
     from numba import njit
+    import numpy as np
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, period, responsiveness):
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
-        # Match Pine's floor of 0.00001 (Python was 0.0001)
+        # Match Pine's math.max(0.00001, ...)
         resp = max(0.00001, min(1.0, responsiveness))
         
         for i in range(n):
             mean, m2, count = 0.0, 0.0, 0
+            # Pine ta.stdev uses the window of 50 in your script
             start = max(0, i - period + 1)
             for j in range(start, i + 1):
                 val = close[j]
@@ -391,13 +401,11 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                     count += 1
                     delta = val - mean
                     mean += delta / count
-                    delta2 = val - mean
-                    m2 += delta * delta2
+                    m2 += delta * (val - mean)
             
-            # FIXED: Divide by 'count' (Population), not 'count - 1'
             if count > 0:
-                variance = m2 / count
-                sd[i] = np.sqrt(variance) * resp
+                # Population Variance (m2 / count)
+                sd[i] = np.sqrt(m2 / count) * resp
             else:
                 sd[i] = 0.0
         return sd
@@ -406,50 +414,36 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
 @aot_guard("rolling_std_welford_parallel")
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """
-    Parallel version of rolling standard deviation using Welford's algorithm.
-    FIXED: Uses Population Standard Deviation (divide by N) to achieve 
-    99%+ parity with Pine Script's ta.stdev.
+    Parallel version of rolling standard deviation.
+    FIXED: Uses Population SD (divide by N) to match Pine ta.stdev.
     """
     from numba import njit, prange
     import numpy as np
-    
     @njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(close, period, responsiveness):
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
-        
-        # Pine Script uses a floor of 0.00001 for the responsiveness multiplier
         resp = max(0.00001, min(1.0, responsiveness))
         
         for i in prange(n):
-            mean = 0.0
-            m2 = 0.0
-            count = 0
-            
-            # Define window bounds
+            mean, m2, count = 0.0, 0.0, 0
             start = max(0, i - period + 1)
-            
-            # Welford's algorithm for numerical stability
             for j in range(start, i + 1):
                 val = close[j]
                 if not np.isnan(val):
                     count += 1
                     delta = val - mean
                     mean += delta / count
-                    delta2 = val - mean
-                    m2 += delta * delta2
+                    m2 += delta * (val - mean)
             
             if count > 0:
-                # FIXED: Pine Script ta.stdev uses Population Variance (m2 / count)
-                # Previous version used Sample Variance (m2 / (count - 1))
-                variance = m2 / count
-                sd[i] = np.sqrt(variance) * resp
+                sd[i] = np.sqrt(m2 / count) * resp
             else:
                 sd[i] = 0.0
-                
         return sd
-        
     return _jit(close, period, responsiveness)
+        
+
 @aot_guard("rolling_mean_numba")
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     from numba import njit
