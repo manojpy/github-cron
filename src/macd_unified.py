@@ -623,67 +623,77 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
-    responsiveness: float = 0.9
+    responsiveness: float = 0.9,
 ) -> np.ndarray:
     try:
         if close is None or len(close) < period:
-            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
+            logger.warning(
+                f"MMH: Insufficient data (len={len(close) if close is not None else 0})"
+            )
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
         rows = len(close)
+        # Clamp responsiveness like Pine
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
-        # Rolling std
+        # Ensure contiguous float64 array
+        close_c = (
+            np.ascontiguousarray(close)
+            if not close.flags["C_CONTIGUOUS"]
+            else close.astype(np.float64)
+        )
+
+        # 1) Rolling std (Pine: ta.stdev(source, 50) * responsiveness)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
 
+        # 2) Worm series (Pine: var worm; worm := worm + delta)
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
 
-        # Rolling mean
+        # 3) SMA over source (Pine: ma = ta.sma(source, period))
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
             ma = _rolling_mean_numba(close_c, period)
 
-        with np.errstate(divide='ignore', invalid='ignore'):
+        # 4) Raw momentum (Pine: raw_momentum = (worm - ma) / worm)
+        with np.errstate(divide="ignore", invalid="ignore"):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Rolling min/max
+        # 5) Rolling min/max over raw_momentum (Pine: lowest/highest over `period`)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
 
+        # 6) Normalize to [0, 1] (Pine: temp = (current_med - min_med) / (max_med - min_med))
         denom = max_med - min_med
-        # Explicit zero division handling: default to 0.5 when denom ~ 0
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp = np.where(
-                np.abs(denom) < Constants.ZERO_DIVISION_GUARD,
-                0.5,  # Neutral midpoint when normalization is undefined
-                (raw - min_med) / denom
-            )
+        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
 
+        # 7) Value recursion (Python helper matches Pine logic)
         value_arr = _calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
-        with np.errstate(divide='ignore', invalid='ignore'):
+        # 8) Transform and log (Pine: temp2 = (1 + value) / (1 - value); momentum = .25 * log(temp2))
+        with np.errstate(divide="ignore", invalid="ignore"):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.clip(temp2, 1e-9, 1e9)
-            temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
+        temp2 = np.clip(temp2, 1e-9, 1e9)
+        temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
 
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
 
+        # 9) Recursive smoothing (Pine: momentum := momentum + .5 * nz(momentum[1]))
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
-        # Final sanitization
+        # 10) Final sanitize with your bridge helper
         momentum_arr = _sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
