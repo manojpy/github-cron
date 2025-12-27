@@ -641,13 +641,12 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
-        # Enable detailed logging for first pair only to avoid log spam
-        debug = rows == 226  # Only debug BTCUSD-like sized data
+        # Enable detailed logging for debugging
+        debug = rows == 226  # Only debug standard-sized data
         
         if debug:
             logger.info(f"MMH Debug - Input shape: {close_c.shape}, period: {period}, resp: {resp_clamped}")
-            logger.info(f"MMH Debug - Close[0:5]: {close_c[:5]}")
-            logger.info(f"MMH Debug - Close[-5:]: {close_c[-5:]}")
+            logger.info(f"MMH Debug - Close[0]={close_c[0]:.2f}, Close[50]={close_c[50]:.2f}, Close[143]={close_c[143]:.2f}, Close[-1]={close_c[-1]:.2f}")
 
         # Step 1: Rolling std with SAMPLE std dev (n-1) - FIXED
         if cfg.NUMBA_PARALLEL and rows >= 250:
@@ -656,14 +655,13 @@ def calculate_magical_momentum_hist(
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
 
         if debug:
-            logger.info(f"MMH Debug - SD[50]={sd[50]:.6f}, SD[143]={sd[143]:.6f}, SD[-1]={sd[-1]:.6f}")
+            logger.info(f"MMH Debug - SD[0]={sd[0]:.6f}, SD[50]={sd[50]:.6f}, SD[143]={sd[143]:.6f}, SD[-1]={sd[-1]:.6f}")
 
         # Step 2: Worm calculation
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
 
         if debug:
-            logger.info(f"MMH Debug - Worm[50]={worm_arr[50]:.6f}, Worm[143]={worm_arr[143]:.6f}, Worm[-1]={worm_arr[-1]:.6f}")
-            logger.info(f"MMH Debug - (Worm-Close)[143]={worm_arr[143]-close_c[143]:.6f}, [-1]={worm_arr[-1]-close_c[-1]:.6f}")
+            logger.info(f"MMH Debug - Worm[0]={worm_arr[0]:.6f}, Worm[50]={worm_arr[50]:.6f}, Worm[143]={worm_arr[143]:.6f}, Worm[-1]={worm_arr[-1]:.6f}")
 
         # Step 3: Rolling mean
         if cfg.NUMBA_PARALLEL and rows >= 250:
@@ -689,8 +687,8 @@ def calculate_magical_momentum_hist(
             min_med, max_med = _rolling_min_max_numba(raw, period)
 
         if debug:
-            logger.info(f"MMH Debug - Min[143]={min_med[143]:.8f}, Max[143]={max_med[143]:.8f}")
-            logger.info(f"MMH Debug - Min[-1]={min_med[-1]:.8f}, Max[-1]={max_med[-1]:.8f}")
+            logger.info(f"MMH Debug - MinMax[143]: [{min_med[143]:.8f}, {max_med[143]:.8f}]")
+            logger.info(f"MMH Debug - MinMax[-1]: [{min_med[-1]:.8f}, {max_med[-1]:.8f}]")
 
         # Step 6: Normalize to temp
         denom = max_med - min_med
@@ -704,15 +702,14 @@ def calculate_magical_momentum_hist(
         temp = np.nan_to_num(temp, nan=0.5)
 
         if debug:
-            logger.info(f"MMH Debug - Temp[143]={temp[143]:.6f}, Temp[-1]={temp[-1]:.6f}")
+            logger.info(f"MMH Debug - Temp[0]={temp[0]:.6f}, Temp[50]={temp[50]:.6f}, Temp[143]={temp[143]:.6f}, Temp[-1]={temp[-1]:.6f}")
 
         # Step 7: FIXED value calculation (multiplicative recursive)
         value_arr = _calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
         if debug:
-            logger.info(f"MMH Debug - Value[0]={value_arr[0]:.6f}, Value[50]={value_arr[50]:.6f}")
-            logger.info(f"MMH Debug - Value[143]={value_arr[143]:.6f}, Value[-1]={value_arr[-1]:.6f}")
+            logger.info(f"MMH Debug - Value[0]={value_arr[0]:.6f}, Value[50]={value_arr[50]:.6f}, Value[143]={value_arr[143]:.6f}, Value[-1]={value_arr[-1]:.6f}")
 
         # Step 8: Log transform
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -727,16 +724,15 @@ def calculate_magical_momentum_hist(
         momentum = np.nan_to_num(momentum, nan=0.0)
 
         if debug:
-            logger.info(f"MMH Debug - PreSmooth[143]={momentum[143]:.6f}, PreSmooth[-1]={momentum[-1]:.6f}")
+            logger.info(f"MMH Debug - PreSmooth[0]={momentum[0]:.6f}, PreSmooth[50]={momentum[50]:.6f}, PreSmooth[143]={momentum[143]:.6f}, PreSmooth[-1]={momentum[-1]:.6f}")
 
         # Step 9: Smooth momentum
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
         if debug:
-            logger.info(f"MMH Debug - Final[0]={momentum_arr[0]:.6f}, Final[50]={momentum_arr[50]:.6f}")
-            logger.info(f"MMH Debug - Final[143]={momentum_arr[143]:.6f}, Final[-1]={momentum_arr[-1]:.6f}")
-            logger.info(f"MMH Debug - Final range: [{np.nanmin(momentum_arr):.6f}, {np.nanmax(momentum_arr):.6f}]")
+            logger.info(f"MMH Debug - Final[0]={momentum_arr[0]:.6f}, Final[50]={momentum_arr[50]:.6f}, Final[143]={momentum_arr[143]:.6f}, Final[-1]={momentum_arr[-1]:.6f}")
+            logger.info(f"MMH Debug - Final (used in bot)={momentum_arr[-1]:.2f}")
 
         # Final sanitization
         momentum_arr = _sanitize_array_numba(momentum_arr, 0.0)

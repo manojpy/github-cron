@@ -332,36 +332,48 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    CRITICAL FIX: Pine Script uses multiplicative recursive update
+    Pine Script value calculation - MULTIPLICATIVE RECURSIVE
     
     Pine code:
-        value = 0.5 * 2  // Initial value = 1.0
+        value = 0.5 * 2  // Declares value = 1.0 (only runs once conceptually)
         value := value * (temp - .5 + .5 * nz(value[1]))
     
-    This means: value[i] = value[i-1] * (temp[i] - 0.5 + 0.5 * value[i-1])
-    NOT:        value[i] = 1.0 * (temp[i] - 0.5 + 0.5 * value[i-1])
+    The := operator means: value_current = value_previous * (expression)
+    
+    On bar 0: value[1] doesn't exist, nz(value[1]) = 0
+              value[0] = 1.0 * (temp[0] - 0.5 + 0.5 * 0)
+                       = 1.0 * (temp[0] - 0.5)
+    
+    On bar 1: value[1] = value[0] (from previous calculation)
+              value[1] = value[0] * (temp[1] - 0.5 + 0.5 * value[0])
+    
+    This is MULTIPLICATIVE and COMPOUNDS over time!
     """
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(temp_arr, rows):
         value_arr = np.zeros(rows, dtype=np.float64)
-        value_arr[0] = 1.0  # Initial: value = 0.5 * 2 = 1.0
         
+        # Bar 0: Initial calculation
+        t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
+        # value = 1.0 * (temp - 0.5 + 0.5 * 0) since nz(value[1]) = 0 on first bar
+        value_arr[0] = 1.0 * (t0 - 0.5)
+        value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
+        
+        # All subsequent bars: multiplicative recursive update
         for i in range(1, rows):
-            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
+            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
             
-            # CRITICAL: Multiply previous value, not constant 1.0
-            # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
+            # value := value * (temp - .5 + .5 * nz(value[1]))
+            # This means: new_value = old_value * (temp - 0.5 + 0.5 * old_value)
             inner = t - 0.5 + 0.5 * prev_v
-            v = prev_v * inner  # This is the key difference!
+            v = prev_v * inner
             
-            # Clip to prevent overflow
             value_arr[i] = max(-0.9999, min(0.9999, v))
         
         return value_arr
     return _jit(temp_arr, rows)
-
 
 @aot_guard("calc_mmh_momentum_loop")
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
