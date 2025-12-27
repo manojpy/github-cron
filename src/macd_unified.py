@@ -624,83 +624,170 @@ def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9,
+    debug: bool = True
 ) -> np.ndarray:
+    """
+    Enhanced MMH calculation with debugging and Pine Script accuracy fixes
+    """
     try:
         if close is None or len(close) < period:
-            logger.warning(
-                f"MMH: Insufficient data (len={len(close) if close is not None else 0})"
-            )
+            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
         rows = len(close)
-        # Clamp responsiveness like Pine
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
-        # Ensure contiguous float64 array
-        close_c = (
-            np.ascontiguousarray(close)
-            if not close.flags["C_CONTIGUOUS"]
-            else close.astype(np.float64)
-        )
+        if debug:
+            logger.info(f"MMH Debug - Input shape: {close_c.shape}, period: {period}, resp: {resp_clamped}")
+            logger.info(f"MMH Debug - First 5 close values: {close_c[:5]}")
+            logger.info(f"MMH Debug - Last 5 close values: {close_c[-5:]}")
 
-        # 1) Rolling std (Pine: ta.stdev(source, 50) * responsiveness)
+        # Step 1: Rolling std with SAMPLE std dev (n-1)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = _rolling_std_welford(close_c, 50, resp_clamped)
 
-        # 2) Worm series (Pine: var worm; worm := worm + delta)
+        if debug:
+            logger.info(f"MMH Debug - SD stats: min={np.nanmin(sd):.6f}, max={np.nanmax(sd):.6f}, mean={np.nanmean(sd):.6f}")
+            logger.info(f"MMH Debug - SD last 5: {sd[-5:]}")
+
+        # Step 2: Worm calculation
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
 
-        # 3) SMA over source (Pine: ma = ta.sma(source, period))
+        if debug:
+            logger.info(f"MMH Debug - Worm stats: min={np.nanmin(worm_arr):.6f}, max={np.nanmax(worm_arr):.6f}")
+            logger.info(f"MMH Debug - Worm last 5: {worm_arr[-5:]}")
+            logger.info(f"MMH Debug - Worm vs Close diff last 5: {(worm_arr - close_c)[-5:]}")
+
+        # Step 3: Rolling mean
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
             ma = _rolling_mean_numba(close_c, period)
 
-        # 4) Raw momentum (Pine: raw_momentum = (worm - ma) / worm)
-        with np.errstate(divide="ignore", invalid="ignore"):
+        if debug:
+            logger.info(f"MMH Debug - MA stats: min={np.nanmin(ma):.6f}, max={np.nanmax(ma):.6f}")
+            logger.info(f"MMH Debug - MA last 5: {ma[-5:]}")
+
+        # Step 4: Raw momentum
+        with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 5) Rolling min/max over raw_momentum (Pine: lowest/highest over `period`)
+        if debug:
+            logger.info(f"MMH Debug - Raw momentum stats: min={np.nanmin(raw):.6f}, max={np.nanmax(raw):.6f}")
+            logger.info(f"MMH Debug - Raw last 5: {raw[-5:]}")
+
+        # Step 5: Rolling min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
 
-        # 6) Normalize to [0, 1] (Pine: temp = (current_med - min_med) / (max_med - min_med))
+        if debug:
+            logger.info(f"MMH Debug - Min_med last 5: {min_med[-5:]}")
+            logger.info(f"MMH Debug - Max_med last 5: {max_med[-5:]}")
+
+        # Step 6: Normalize to temp
         denom = max_med - min_med
-        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            temp = (raw - min_med) / denom
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp = np.where(
+                np.abs(denom) < Constants.ZERO_DIVISION_GUARD,
+                0.5,
+                (raw - min_med) / denom
+            )
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
 
-        # 7) Value recursion (Python helper matches Pine logic)
-        value_arr = _calc_mmh_value_loop(temp, rows)
+        if debug:
+            logger.info(f"MMH Debug - Temp stats: min={np.nanmin(temp):.6f}, max={np.nanmax(temp):.6f}")
+            logger.info(f"MMH Debug - Temp last 5: {temp[-5:]}")
 
-        # 8) Transform and log (Pine: temp2 = (1 + value) / (1 - value); momentum = .25 * log(temp2))
-        with np.errstate(divide="ignore", invalid="ignore"):
+        # Step 7: Value calculation with FIXED multiplier
+        value_arr = _calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+
+        if debug:
+            logger.info(f"MMH Debug - Value stats: min={np.nanmin(value_arr):.6f}, max={np.nanmax(value_arr):.6f}")
+            logger.info(f"MMH Debug - Value last 5: {value_arr[-5:]}")
+
+        # Step 8: Log transform
+        with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-        temp2 = np.clip(temp2, 1e-9, 1e9)
-        temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
+            temp2 = np.clip(temp2, 1e-9, 1e9)
+            temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
+
+        if debug:
+            logger.info(f"MMH Debug - Temp2 stats: min={np.nanmin(temp2):.6f}, max={np.nanmax(temp2):.6f}")
+            logger.info(f"MMH Debug - Temp2 last 5: {temp2[-5:]}")
 
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
 
-        # 9) Recursive smoothing (Pine: momentum := momentum + .5 * nz(momentum[1]))
+        if debug:
+            logger.info(f"MMH Debug - Pre-smooth momentum last 5: {momentum[-5:]}")
+
+        # Step 9: Smooth momentum
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
-        # 10) Final sanitize with your bridge helper
+        if debug:
+            logger.info(f"MMH Debug - Final momentum stats: min={np.nanmin(momentum_arr):.6f}, max={np.nanmax(momentum_arr):.6f}")
+            logger.info(f"MMH Debug - Final momentum last 5: {momentum_arr[-5:]}")
+
+        # Final sanitization
         momentum_arr = _sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
 
     except Exception as e:
-        logger.error(f"MMH calculation failed: {e}")
+        logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+
+
+def compare_with_pine(python_result: np.ndarray, pine_result: np.ndarray, tolerance: float = 0.01):
+    """
+    Compare Python results with Pine Script results
+    """
+    if len(python_result) != len(pine_result):
+        logger.error(f"Length mismatch: Python={len(python_result)}, Pine={len(pine_result)}")
+        return
+    
+    # Calculate differences
+    diff = np.abs(python_result - pine_result)
+    relative_diff = diff / (np.abs(pine_result) + 1e-10)
+    
+    # Statistics
+    max_diff = np.nanmax(diff)
+    mean_diff = np.nanmean(diff)
+    max_rel_diff = np.nanmax(relative_diff)
+    mean_rel_diff = np.nanmean(relative_diff)
+    
+    # Find indices with largest differences
+    worst_indices = np.argsort(diff)[-10:]
+    
+    logger.info("=" * 80)
+    logger.info("MMH Comparison with Pine Script")
+    logger.info("=" * 80)
+    logger.info(f"Max absolute difference: {max_diff:.8f}")
+    logger.info(f"Mean absolute difference: {mean_diff:.8f}")
+    logger.info(f"Max relative difference: {max_rel_diff:.4%}")
+    logger.info(f"Mean relative difference: {mean_rel_diff:.4%}")
+    logger.info(f"\nAccuracy: {(1 - mean_rel_diff) * 100:.2f}%")
+    
+    logger.info("\nWorst 10 mismatches:")
+    for idx in reversed(worst_indices):
+        logger.info(f"  Index {idx}: Python={python_result[idx]:.6f}, Pine={pine_result[idx]:.6f}, Diff={diff[idx]:.6f}")
+    
+    if mean_rel_diff < tolerance:
+        logger.info(f"\n✓ PASSED: Within {tolerance*100:.1f}% tolerance")
+    else:
+        logger.warning(f"\n✗ FAILED: Exceeds {tolerance*100:.1f}% tolerance")
+    
+    logger.info("=" * 80)
+
 
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
