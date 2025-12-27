@@ -620,21 +620,14 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
 
-def calculate_magical_momentum_hist(
-    close: np.ndarray,
-    period: int = 144,
-    responsiveness: float = 0.9
-) -> np.ndarray:
+def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
-
-        # Rolling std
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
@@ -642,7 +635,6 @@ def calculate_magical_momentum_hist(
 
         worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
 
-        # Rolling mean
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = _rolling_mean_numba_parallel(close_c, period)
         else:
@@ -652,20 +644,14 @@ def calculate_magical_momentum_hist(
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Rolling min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = _rolling_min_max_numba(raw, period)
 
         denom = max_med - min_med
-        # Explicit zero division handling: default to 0.5 when denom ~ 0
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp = np.where(
-                np.abs(denom) < Constants.ZERO_DIVISION_GUARD,
-                0.5,  # Neutral midpoint when normalization is undefined
-                (raw - min_med) / denom
-            )
+        denom = np.where(denom == 0, Constants.ZERO_DIVISION_GUARD, denom)
+        temp = (raw - min_med) / denom
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
 
@@ -683,7 +669,7 @@ def calculate_magical_momentum_hist(
         momentum_arr = momentum.copy()
         momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
 
-        # Final sanitization
+        # sanitize with bridge function
         momentum_arr = _sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
@@ -3153,7 +3139,7 @@ async def evaluate_pair_and_alert(
                 f"{'🟢' if mmh_curr > 0 else '🔴'} | "
                 f"Price: ${close_curr:.2f}"
             )
-
+        
         # ============================================================
         # PHASE 9: Alert Evaluation Context Setup
         # ============================================================
