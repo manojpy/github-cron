@@ -312,79 +312,56 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
-    def _jit(close_arr, sd_arr, rows):
+    def jit(close_arr, sd_arr, rows):
         worm_arr = np.empty(rows, dtype=np.float64)
-        first_val = close_arr[0]
-        worm_arr[0] = 0.0 if np.isnan(first_val) else first_val
+        worm_arr[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
         for i in range(1, rows):
-            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-            prev_worm = worm_arr[i - 1]
+            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i-1]
+            prev_worm = worm_arr[i-1]
             diff = src - prev_worm
-            sd_i = sd_arr[i]
-            if np.isnan(sd_i):
+            sdi = sd_arr[i]
+            if np.isnan(sdi) or sdi == 0.0:
                 delta = diff
             else:
-                delta = (np.sign(diff) * sd_i) if (np.abs(diff) > sd_i) else diff
+                delta = np.sign(diff) * sdi if abs(diff) > sdi else diff
             worm_arr[i] = prev_worm + delta
         return worm_arr
-    return _jit(close_arr, sd_arr, rows)
+    return jit(close_arr, sd_arr, rows)
 
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """
-    Pine Script value calculation - MULTIPLICATIVE RECURSIVE
-    
-    Pine code:
-        value = 0.5 * 2  // Declares value = 1.0 (only runs once conceptually)
-        value := value * (temp - .5 + .5 * nz(value[1]))
-    
-    The := operator means: value_current = value_previous * (expression)
-    
-    On bar 0: value[1] doesn't exist, nz(value[1]) = 0
-              value[0] = 1.0 * (temp[0] - 0.5 + 0.5 * 0)
-                       = 1.0 * (temp[0] - 0.5)
-    
-    On bar 1: value[1] = value[0] (from previous calculation)
-              value[1] = value[0] * (temp[1] - 0.5 + 0.5 * value[0])
-    
-    This is MULTIPLICATIVE and COMPOUNDS over time!
-    """
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
-    def _jit(temp_arr, rows):
-        value_arr = np.zeros(rows, dtype=np.float64)
-        
-        # Bar 0: Initial calculation
+    def jit(temp_arr, rows):
+        value_arr = np.empty(rows, dtype=np.float64)
+        # Pine: value = math.pow(0.5, 2) = 0.25 initial
+        value_arr[0] = 0.25
         t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-        # value = 1.0 * (temp - 0.5 + 0.5 * 0) since nz(value[1]) = 0 on first bar
-        value_arr[0] = 1.0 * (t0 - 0.5)
-        value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
+        # First bar: value = 1.0 * (t0 - 0.5)*0.5 + 0.5
+        inner = t0 - 0.5
+        inner = 0.5 + inner * 0.5
+        value_arr[0] = max(-0.9999, min(0.9999, inner))
         
-        # All subsequent bars: multiplicative recursive update
         for i in range(1, rows):
-            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+            prev_v = value_arr[i-1]
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-            
-            # value := value * (temp - .5 + .5 * nz(value[1]))
-            # This means: new_value = old_value * (temp - 0.5 + 0.5 * old_value)
-            inner = t - 0.5 + 0.5 * prev_v
+            inner = t - 0.5
+            inner = 0.5 + inner * 0.5  # EXACT Pine: value * (temp-.5)*.5 + .5
             v = prev_v * inner
-            
             value_arr[i] = max(-0.9999, min(0.9999, v))
-        
         return value_arr
-    return _jit(temp_arr, rows)
+    return jit(temp_arr, rows)
 
 @aot_guard("calc_mmh_momentum_loop")
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
-    def _jit(momentum_arr, rows):
+    def jit(momentum_arr, rows):
         for i in range(1, rows):
-            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-            momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+            prev = momentum_arr[i-1] if not np.isnan(momentum_arr[i-1]) else 0.0
+            momentum_arr[i] = momentum_arr[i] * 0.5 + prev * 0.5  # Pine: momentum = momentum*.5 + nz(momentum[1])*.5
         return momentum_arr
-    return _jit(momentum_arr, rows)
+    return jit(momentum_arr, rows)
 
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
