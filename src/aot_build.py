@@ -174,7 +174,7 @@ def compile_module():
 
         return smoothrng * m
 
-    # 11-13: MMH
+    # 11-13: MMH (FIXED)
     @cc.export('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i4)')
     def calc_mmh_worm_loop(close_arr, sd_arr, rows):
         worm_arr = np.empty(rows, dtype=np.float64)
@@ -184,33 +184,58 @@ def compile_module():
             prev_worm = worm_arr[i - 1]
             diff = src - prev_worm
             sd_i = sd_arr[i]
-            delta = diff if np.isnan(sd_i) else ((np.sign(diff) * sd_i) if abs(diff) > sd_i else diff)
+            if np.isnan(sd_i):
+                delta = diff
+            else:
+                delta = (np.sign(diff) * sd_i) if abs(diff) > sd_i else diff
             worm_arr[i] = prev_worm + delta
         return worm_arr
 
     @cc.export('calc_mmh_value_loop', 'f8[:](f8[:], i4)')
     def calc_mmh_value_loop(temp_arr, rows):
+        """
+        OPTIMIZED: Combines value recursion + momentum smoothing in single pass.
+        
+        Implements full Pine Script logic:
+        1. value := (temp - 0.5 + 0.5 * nz(value[1]))
+        2. temp2 = (1 + value) / (1 - value)
+        3. momentum = 0.25 * log(temp2)
+        4. momentum := momentum + 0.5 * nz(momentum[1])
+        
+        Returns final smoothed histogram values directly.
+        """
         value_arr = np.zeros(rows, dtype=np.float64)
-        for i in range(1, rows):
-            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        mom_arr = np.zeros(rows, dtype=np.float64)
+        
+        for i in range(rows):
+            # STEP 1: Fisher Value Recursion (linear, not multiplicative)
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+            prev_v = value_arr[i - 1] if i > 0 else 0.0
+            
             v = t - 0.5 + 0.5 * prev_v
-            value_arr[i] = max(-0.9999, min(0.9999, v))
-        return value_arr
+            v = max(-0.9999, min(0.9999, v))
+            value_arr[i] = v
+            
+            # STEP 2: Log Transform (Fisher)
+            temp2 = (1.0 + v) / (1.0 - v)
+            raw_mom = 0.25 * np.log(temp2)
+            
+            # STEP 3: Momentum Recursion (Histogram Smoothing)
+            prev_mom = mom_arr[i - 1] if i > 0 else 0.0
+            mom_arr[i] = raw_mom + 0.5 * prev_mom
+        
+        return mom_arr
 
-    @cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i4)')
-    def calc_mmh_momentum_loop(momentum_arr, rows):
-        for i in range(1, rows):
-            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-            momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-        return momentum_arr
 
-    # 14-15: Rolling Std
+    # 14-15: Rolling Std (FIXED - Population variance, 0.00001 floor)
     @cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')
     def rolling_std_welford(close, period, responsiveness):
+        """FIXED: Uses Population SD (divide by N) to match Pine's ta.stdev"""
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
-        resp = max(0.0001, min(1.0, responsiveness))
+        # Match Pine's math.max(0.00001, ...) exactly
+        resp = max(0.00001, min(1.0, responsiveness))
+        
         for i in range(n):
             mean, m2, count = 0.0, 0.0, 0
             start = max(0, i - period + 1)
@@ -220,15 +245,23 @@ def compile_module():
                     count += 1
                     delta = val - mean
                     mean += delta / count
+                    # Welford's algorithm second pass
                     m2 += delta * (val - mean)
-            sd[i] = 0.0 if count <= 1 else np.sqrt(max(0.0, m2 / count)) * resp
+            
+            if count > 0:
+                # Population variance: m2 / count (NOT m2 / (count - 1))
+                sd[i] = np.sqrt(m2 / count) * resp
+            else:
+                sd[i] = 0.0
         return sd
 
     @cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')
     def rolling_std_welford_parallel(close, period, responsiveness):
+        """FIXED: Parallel version with population SD"""
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
-        resp = max(0.0001, min(1.0, responsiveness))
+        resp = max(0.00001, min(1.0, responsiveness))
+        
         for i in range(n):
             mean, m2, count = 0.0, 0.0, 0
             start = max(0, i - period + 1)
@@ -239,7 +272,11 @@ def compile_module():
                     delta = val - mean
                     mean += delta / count
                     m2 += delta * (val - mean)
-            sd[i] = 0.0 if count <= 1 else np.sqrt(max(0.0, m2 / count)) * resp
+            
+            if count > 0:
+                sd[i] = np.sqrt(m2 / count) * resp
+            else:
+                sd[i] = 0.0
         return sd
 
     # 16-17: Rolling Mean
