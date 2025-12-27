@@ -332,21 +332,31 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    CRITICAL FIX: Pine uses 'value = 0.5 * 2' which equals 1.0, not 0.5
-    This is then used as: value := value * (temp - .5 + .5 * nz(value[1]))
+    CRITICAL FIX: Pine Script logic is:
+    value = 0.5 * 2  // Initial value = 1.0
+    value := value * (temp - .5 + .5 * nz(value[1]))
+    
+    This means: value[i] = value[i-1] * (temp[i] - 0.5 + 0.5 * value[i-1])
+    NOT: value[i] = 1.0 * (temp[i] - 0.5 + 0.5 * value[i-1])
     """
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(temp_arr, rows):
         value_arr = np.zeros(rows, dtype=np.float64)
-        value_arr[0] = 0.0  # First value starts at 0
+        value_arr[0] = 1.0  # Initial: value = 0.5 * 2 = 1.0
+        
         for i in range(1, rows):
-            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 1.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+            
             # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
-            # where value starts as 1.0 (from 0.5 * 2)
-            v = 1.0 * (t - 0.5 + 0.5 * prev_v)  # Changed from just (t - 0.5 + 0.5 * prev_v)
+            # This is a MULTIPLICATIVE update, not additive
+            inner = t - 0.5 + 0.5 * prev_v
+            v = prev_v * inner
+            
+            # Clip to prevent overflow
             value_arr[i] = max(-0.9999, min(0.9999, v))
+        
         return value_arr
     return _jit(temp_arr, rows)
 
@@ -364,10 +374,7 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """
-    CRITICAL FIX: Use SAMPLE std dev (n-1) to match Pine's ta.stdev
-    Pine Script's ta.stdev divides by (n-1), not n
-    """
+    """Pine's ta.stdev uses SAMPLE std dev (n-1)"""
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, period, responsiveness):
@@ -385,9 +392,8 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                     mean += delta / count
                     delta2 = val - mean
                     m2 += delta * delta2
-            # CRITICAL: Use (count - 1) for sample std dev, matching Pine
             if count > 1:
-                variance = m2 / (count - 1)  # Changed from count to (count - 1)
+                variance = m2 / (count - 1)  # Sample std dev
                 sd[i] = np.sqrt(max(0.0, variance)) * resp
             else:
                 sd[i] = 0.0
@@ -396,7 +402,6 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
 
 @aot_guard("rolling_std_welford_parallel")
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Parallel version with sample std dev"""
     from numba import njit, prange
     @njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(close, period, responsiveness):
@@ -415,7 +420,7 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                     delta2 = val - mean
                     m2 += delta * delta2
             if count > 1:
-                variance = m2 / (count - 1)  # Sample std dev
+                variance = m2 / (count - 1)
                 sd[i] = np.sqrt(max(0.0, variance)) * resp
             else:
                 sd[i] = 0.0
