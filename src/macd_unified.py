@@ -629,46 +629,6 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
 
-# ============================================================================
-# DIAGNOSTIC FUNCTION - Remove after verification
-# ============================================================================
-
-def compare_with_pine_values(close: np.ndarray, pine_filt_x1: np.ndarray, pine_filt_x12: np.ndarray):
-    """
-    Helper function to compare Python output with Pine Script output.
-    Prints differences to help identify remaining discrepancies.
-    """
-    upw, dnw, py_filt_x1, py_filt_x12 = calculate_cirrus_cloud_numba(close)
-    
-    diff_x1 = np.abs(py_filt_x1 - pine_filt_x1)
-    diff_x12 = np.abs(py_filt_x12 - pine_filt_x12)
-    
-    max_diff_x1 = np.max(diff_x1)
-    max_diff_x12 = np.max(diff_x12)
-    
-    print(f"Max difference in filt_x1: {max_diff_x1:.10f}")
-    print(f"Max difference in filt_x12: {max_diff_x12:.10f}")
-    print(f"Mean difference in filt_x1: {np.mean(diff_x1):.10f}")
-    print(f"Mean difference in filt_x12: {np.mean(diff_x12):.10f}")
-    
-    # Find indices with largest differences
-    worst_idx_x1 = np.argmax(diff_x1)
-    worst_idx_x12 = np.argmax(diff_x12)
-    
-    print(f"\nWorst match at index {worst_idx_x1} for filt_x1:")
-    print(f"  Python: {py_filt_x1[worst_idx_x1]:.10f}")
-    print(f"  Pine:   {pine_filt_x1[worst_idx_x1]:.10f}")
-    print(f"  Close:  {close[worst_idx_x1]:.10f}")
-    
-    print(f"\nWorst match at index {worst_idx_x12} for filt_x12:")
-    print(f"  Python: {py_filt_x12[worst_idx_x12]:.10f}")
-    print(f"  Pine:   {pine_filt_x12[worst_idx_x12]:.10f}")
-    print(f"  Close:  {close[worst_idx_x12]:.10f}")
-    
-    # Check first 50 bars for early divergence
-    print(f"\nFirst 10 bars comparison (filt_x1):")
-    for i in range(min(10, len(close))):
-        print(f"  [{i}] Python: {py_filt_x1[i]:.6f}, Pine: {pine_filt_x1[i]:.6f}, Diff: {diff_x1[i]:.6f}")
 # =============================================================================
 # MAIN CALCULATION FUNCTION
 # =============================================================================
@@ -3197,7 +3157,7 @@ async def evaluate_pair_and_alert(
                 mmh_m3 < mmh_m2 < mmh_m1 and 
                 mmh_curr < mmh_m1
             )
-            logger_pair.info(
+            logger_pair.debug(
                 f"{pair_name} | MMH: {mmh_curr:+.2f} | "
                 f"{'🟢' if mmh_curr > 0 else '🔴'} | "
                 f"Price: ${close_curr:.2f}"
