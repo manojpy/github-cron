@@ -59,11 +59,11 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
                     _AOT_MODULE = mod
                 except Exception as e:
                     _FALLBACK_REASON = f"Failed to load .so file: {e}"
-                    logger.warning(f"AOT init failed: {_FALLBACK_REASON}")       # <-- add here
+                    logger.warning(f"AOT init failed: {_FALLBACK_REASON}")
                     return False, _FALLBACK_REASON
             else:
                 _FALLBACK_REASON = "AOT module not found"
-                logger.warning(f"AOT init failed: {_FALLBACK_REASON}")           # <-- add here
+                logger.warning(f"AOT init failed: {_FALLBACK_REASON}")
                 return False, _FALLBACK_REASON
 
         # Verify with a simple test
@@ -75,13 +75,14 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
         except Exception as e:
             _FALLBACK_REASON = f"AOT verification failed: {e}"
             _AOT_MODULE = None
-            logger.warning(f"AOT init failed: {_FALLBACK_REASON}")               # <-- add here
+            logger.warning(f"AOT init failed: {_FALLBACK_REASON}")
             return False, _FALLBACK_REASON
 
 def ensure_initialized() -> bool:
     global _INITIALIZED
     if _INITIALIZED:
         return _USING_AOT
+    
     ok, _ = initialize_aot()
     _INITIALIZED = True
     return ok

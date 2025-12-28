@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-import os, sys
+import os
+import sys
 from pathlib import Path
-from numba.pycc import CC
 import numpy as np
+from numba.pycc import CC
+from numba import prange
+
 
 os.environ['NUMBA_OPT'] = '3'
 os.environ['NUMBA_WARNINGS'] = '0'
@@ -27,7 +30,7 @@ def compile_module():
     def sanitize_array_numba_parallel(arr, default):
         n = len(arr)
         out = np.empty_like(arr)
-        for i in range(n):
+        for i in prange(n):
             val = arr[i]
             out[i] = default if (np.isnan(val) or np.isinf(val)) else val
         return out
@@ -57,7 +60,7 @@ def compile_module():
         n = len(data)
         out = np.empty(n, dtype=np.float64)
         out[:] = np.nan
-        for i in range(n):
+        for i in prange(n):
             window_sum, count = 0.0, 0
             start = max(0, i - period + 1)
             for j in range(start, i + 1):
@@ -250,7 +253,7 @@ def compile_module():
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
         resp = max(0.00001, min(1.0, responsiveness))
-        for i in range(n):
+        for i in prange(n):
             mean, m2, count = 0.0, 0.0, 0
             start = max(0, i - period + 1)
             for j in range(start, i + 1):
@@ -286,7 +289,7 @@ def compile_module():
     def rolling_mean_numba_parallel(close, period):
         rows = len(close)
         ma = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
+        for i in prange(rows):
             start = max(0, i - period + 1)
             sum_val, count = 0.0, 0
             for j in range(start, i + 1):
@@ -323,7 +326,7 @@ def compile_module():
         rows = len(arr)
         min_arr = np.empty(rows, dtype=np.float64)
         max_arr = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
+        for i in prange(rows):
             start = max(0, i - period + 1)
             min_val = np.inf
             max_val = -np.inf
