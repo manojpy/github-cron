@@ -59,7 +59,7 @@ ENV PYTHONPATH=/app/src \
     PYTHONDONTWRITEBYTECODE=1 \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_THREADING_LAYER=tbb \
-    NUMBA_NUM_THREADS=2 \
+    NUMBA_NUM_THREADS=4 \
     NUMBA_WARNINGS=0 \
     TZ=Asia/Kolkata
 
