@@ -159,7 +159,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         except Exception:
             return str(dt_or_ts)
 
-
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
@@ -372,7 +371,6 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
     elif cfg.DEBUG_MODE:
         logger_obj.debug(msg)
 
-
 _VALIDATION_DONE = False
 
 PRODUCTS_CACHE: Dict[str, Any] = {"data": None, "until": 0.0}
@@ -460,7 +458,6 @@ async def cancel_all_tasks(grace_seconds: int = 5) -> None:
         logger.warning("Timeout while cancelling tasks")
 
 _STARTUP_BANNER_PRINTED = False
-
 def print_startup_banner_once() -> None:
     global _STARTUP_BANNER_PRINTED
     if _STARTUP_BANNER_PRINTED:
@@ -584,15 +581,6 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
 def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Calculate Cirrus Cloud indicator with improved accuracy matching Pine Script.
-    
-    Returns:
-        upw: Boolean array for uptrend (filt_x1 < filt_x12)
-        dnw: Boolean array for downtrend (filt_x1 > filt_x12)
-        filt_x1: First filtered line
-        filt_x12: Second filtered line
-    """
     try:
         if close is None or len(close) < max(cfg.X1, cfg.X3):
             default_len = len(close) if close is not None else 1
@@ -602,22 +590,15 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
                 np.zeros(default_len, dtype=np.float64),
                 np.zeros(default_len, dtype=np.float64)
             )
-        
-        # Ensure float64 precision
         close = np.asarray(close, dtype=np.float64)
-        
-        # Calculate smooth ranges
         smrng_x1 = _smooth_range(close, cfg.X1, cfg.X2)
         smrng_x2 = _smooth_range(close, cfg.X3, cfg.X4)
         
-        # Apply range filters
         filt_x1 = _rng_filter_loop(close, smrng_x1)
         filt_x12 = _rng_filter_loop(close, smrng_x2)
         
-        # Calculate trend conditions
         upw = filt_x1 < filt_x12
-        dnw = filt_x1 > filt_x12
-        
+        dnw = filt_x1 > filt_x12        
         return upw, dnw, filt_x1, filt_x12
         
     except Exception as e:
@@ -632,7 +613,6 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 # =============================================================================
 # MAIN CALCULATION FUNCTION
 # =============================================================================
-
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
@@ -700,11 +680,9 @@ def calculate_magical_momentum_hist(
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
-
 # ============================================================================
 # OPTIMIZATION 6: Faster Numba Warmup with Targeted Functions
 # ============================================================================
-
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
         logger.info("✅ AOT active - no warmup needed")
@@ -721,7 +699,6 @@ def warmup_if_needed() -> None:
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
 
-        # Warmup calls (dummy inputs to trigger JIT compilation)
         _ = _ema_loop(test_data, 7.0)
         _ = _ema_loop_alpha(test_data, 0.2)
         _ = _sma_loop(test_data, test_int)
@@ -758,7 +735,6 @@ def calculate_pivot_levels_numpy(
     close: np.ndarray,
     timestamps: np.ndarray
 ) -> Dict[str, float]:
-    # Pre-fill with zeros to avoid KeyErrors downstream
     piv: Dict[str, float] = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
 
     try:
@@ -766,12 +742,10 @@ def calculate_pivot_levels_numpy(
             logger.warning("Pivot calc: insufficient data")
             return piv
 
-        # Daily bins (timestamps in seconds)
         days = timestamps // 86400
         now_utc = datetime.now(timezone.utc)
         yesterday = (now_utc - timedelta(days=1)).date()
 
-        # Yesterday UTC day number
         yesterday_ts = datetime(
             yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc
         ).timestamp()
@@ -780,7 +754,6 @@ def calculate_pivot_levels_numpy(
         yesterday_mask = (days == yesterday_day_number)
 
         if not np.any(yesterday_mask):
-            # Fallback: use second-to-last unique day if yesterday missing
             unique_days = np.unique(days)
             if len(unique_days) > 1:
                 yesterday_day_number = unique_days[-2]
@@ -827,18 +800,7 @@ def calculate_all_indicators_numpy(
     data_15m: Dict[str, np.ndarray],
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
-) -> Dict[str, np.ndarray]:
-    """
-    Calculate all technical indicators with optimized memory allocation.
-    
-    Args:
-        data_15m: 15-minute timeframe data
-        data_5m: 5-minute timeframe data
-        data_daily: Daily timeframe data (optional, for pivots)
-    
-    Returns:
-        Dictionary containing all calculated indicators
-    """
+) -> Dict[str, np.n
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
