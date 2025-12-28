@@ -47,7 +47,7 @@ jobs:
           # Mount the SECURE config file to the container's expected path
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
-            -e NUMBA_NUM_THREADS=2 \
+            -e NUMBA_NUM_THREADS=4 \
             -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
             "$IMAGE_ID"

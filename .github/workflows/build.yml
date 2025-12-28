@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      packages: write
+      packages: write  # Required to push to GHCR
 
     steps:
       - name: Checkout repository
@@ -42,17 +42,14 @@ jobs:
             type=ref,event=branch
             type=schedule,pattern={{date 'YYYYMMDD'}}
 
-      # ✅ ADD: Layer caching for faster builds
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile.txt  # Explicitly point to your Dockerfile name
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          
           cache-from: type=gha,scope=macd-aot
-          cache-to: type=gha,scope=macd-aot,mode=max
-          # ✅ ADD: Build optimizations
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-          provenance: false
+          cache-to: type=gha,mode=max,scope=macd-aot
