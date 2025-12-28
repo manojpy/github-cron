@@ -800,7 +800,7 @@ def calculate_all_indicators_numpy(
     data_15m: Dict[str, np.ndarray],
     data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]]
-) -> Dict[str, np.n
+) -> Dict[str, np.ndarray]:
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
