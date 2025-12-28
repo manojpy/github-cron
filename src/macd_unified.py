@@ -807,8 +807,6 @@ def calculate_all_indicators_numpy(
         n_15m = len(close_15m)
         n_5m = len(close_5m)
         
-        # Pre-allocate results dictionary with all expected keys
-        # This prevents dictionary resizing and improves memory locality
         results = {
             'ppo': np.empty(n_15m, dtype=np.float64),
             'ppo_signal': np.empty(n_15m, dtype=np.float64),
@@ -822,19 +820,16 @@ def calculate_all_indicators_numpy(
             'pivots': {}
         }
         
-        # Calculate PPO and signal line
         ppo, ppo_signal = calculate_ppo_numpy(
             close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
         results['ppo'] = ppo
         results['ppo_signal'] = ppo_signal
         
-        # Calculate Smooth RSI
         results['smooth_rsi'] = calculate_smooth_rsi_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-        # Calculate VWAP if enabled
         if cfg.ENABLE_VWAP:
             results['vwap'] = calculate_vwap_numpy(
                 data_15m["high"], 
@@ -844,42 +839,31 @@ def calculate_all_indicators_numpy(
                 data_15m["timestamp"]
             )
         else:
-            # Fill with zeros if disabled to maintain array shape
             results['vwap'].fill(0.0)
         
-        # Calculate Magical Momentum Histogram
         mmh = calculate_magical_momentum_hist(close_15m)
         results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Calculate Cirrus Cloud if enabled
         if cfg.CIRRUS_CLOUD_ENABLED:
             upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
             results['upw'] = upw
             results['dnw'] = dnw
-            # filtx1 and filtx12 are not stored but calculated for upw/dnw
         else:
-            # Fill with False if disabled
             results['upw'].fill(False)
             results['dnw'].fill(False)
         
-        # Calculate RMA indicators
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
         
-        # Calculate Pivot levels if enabled and daily data available
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
             daily_low = float(data_daily["low"][-1])
             daily_range = daily_high - daily_low
             
-            # Only calculate pivots if price is near the daily range
-            # This optimization skips unnecessary calculations
             if daily_range > 0:
                 distance_from_high = abs(last_close - daily_high)
                 distance_from_low = abs(last_close - daily_low)
-                
-                # Check if price is within 50% of daily range from either extreme
                 if (distance_from_high < daily_range * 0.5 or 
                     distance_from_low < daily_range * 0.5):
                     results['pivots'] = calculate_pivot_levels_numpy(
@@ -900,7 +884,6 @@ def calculate_all_indicators_numpy(
         else:
             results['pivots'] = {}
         
-        # Validate all numeric arrays have no unexpected infinities
         for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5']:
             arr = results[key]
             if np.any(np.isinf(arr)):
@@ -911,7 +894,6 @@ def calculate_all_indicators_numpy(
         
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
-        # Return safe defaults on error
         n = len(data_15m.get("close", [1]))
         return {
             'ppo': np.zeros(n, dtype=np.float64),
@@ -946,18 +928,16 @@ def precompute_candle_quality(
     )
     
     return buy_quality, sell_quality
-
 # ============================================================================
 # OPTIMIZATION 7: Enhanced HTTP Session with Connection Pooling
 # ============================================================================
-
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 2000  # OPTIMIZED: Increased from 1000
+    _session_reuse_limit: ClassVar[int] = 2000
 
     
     @classmethod
