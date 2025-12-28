@@ -722,7 +722,6 @@ def warmup_if_needed() -> None:
         _ = _vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
         _ = _vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
 
-        logger.info("✅ JIT warmup complete (20+ functions)")
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
 
@@ -758,7 +757,6 @@ def calculate_pivot_levels_numpy(
             if len(unique_days) > 1:
                 yesterday_day_number = unique_days[-2]
                 yesterday_mask = (days == yesterday_day_number)
-                logger.info(f"Fallback pivot day: {yesterday_day_number}")
             else:
                 logger.warning("Pivot calc: No daily transition found in data.")
                 return piv
@@ -1010,11 +1008,9 @@ class SessionManager:
                 cls._creation_time = time.time()
                 cls._request_count = 0
 
-                logger.info(
-                    f"HTTP session created | "
-                    f"Pool: {cfg.TCP_CONN_LIMIT} total, {cfg.TCP_CONN_LIMIT_PER_HOST} per host | "
-                    f"Timeout: {cfg.HTTP_TIMEOUT}s | Keepalive: 90s"
-                )
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"HTTP session created")
+
             return cls._session
 
     @classmethod
@@ -1182,7 +1178,6 @@ async def async_fetch_json(
                         jitter = base_delay * random.uniform(0.1, 0.5)
                         total_delay = base_delay + jitter
                         
-                        logger.debug(f"Retrying after {total_delay:.2f}s...")
                         await asyncio.sleep(total_delay)
                     continue
                 
@@ -1665,10 +1660,7 @@ def validate_candle_data(
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 gaps = time_diffs[time_diffs > max_expected_gap]
                 if len(gaps) > 0:
-                    logger.warning(
-                        f"Detected {len(gaps)} candle gaps "
-                        f"(median: {median_diff}s, max gap: {gaps.max()}s)"
-                    )
+                    pass    
 
         if len(close) >= 2:
             price_changes = np.abs(np.diff(close) / close[:-1]) * 100
@@ -1826,8 +1818,7 @@ class RedisStateStore:
             )
             ok = await self._ping_with_retry(timeout)
             if ok:
-                if cfg.DEBUG_MODE:
-                    logger.debug("Connected to RedisStateStore (decode_responses=True, max_connections=32)")
+                logger.info("Redis connected")
                 self.degraded = False
                 self.degraded_alerted = False
                 self._connection_attempts = 0
@@ -2284,8 +2275,8 @@ class RedisStateStore:
             return prev_states, dedup_results
         
         except asyncio.TimeoutError:
-            logger.error(f"Timeout in atomic_eval_batch for {pair}")
-            prev_states = await self.mget_states([f"{pair}:{k}" for k in alert_keys])
+            logger.error(f"Redis timeout | {pair} | ops: {len(alert_keys)}")
+            prev_states = await self.mget_states(keys)
             await self.batch_set_states(state_updates)
             dedup_results = await self.batch_check_recent_alerts(dedup_checks)
             return prev_states, dedup_results
@@ -2814,29 +2805,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Evaluate a single pair for trading signals and send alerts.
-    
-    This function:
-    1. Validates candle data timestamps
-    2. Calculates all technical indicators
-    3. Evaluates alert conditions
-    4. Manages alert state in Redis
-    5. Sends Telegram notifications for new signals
-    
-    Args:
-        pair_name: Trading pair symbol (e.g., "BTCUSD")
-        data_15m: 15-minute candle data
-        data_5m: 5-minute candle data
-        data_daily: Daily candle data for pivot calculations
-        sdb: Redis state store instance
-        telegram_queue: Telegram message queue
-        correlation_id: Unique run identifier for logging
-        reference_time: Unix timestamp for candle validation
-    
-    Returns:
-        Tuple of (pair_name, state_dict) if successful, None if skipped/failed
-    """
+   
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     
@@ -2929,10 +2898,10 @@ async def evaluate_pair_and_alert(
         
         # Validate candle timestamp is actually closed
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            logger_pair.info(
-                f"Skipping {pair_name} - 15m candle not confirmed closed "
-                f"(ts={format_ist_time(ts_curr)}, ref={format_ist_time(reference_time)})"
+            debug_if(cfg.DEBUG_MODE, logger, lambda: (
+                f"Skipping {pair_name} - 15m candle not confirmed closed"
             )
+
             return None
         
         # ============================================================
@@ -3046,11 +3015,6 @@ async def evaluate_pair_and_alert(
                 mmh_curr < 0 and
                 mmh_m3 < mmh_m2 < mmh_m1 and 
                 mmh_curr < mmh_m1
-            )
-            logger_pair.debug(
-                f"{pair_name} | MMH: {mmh_curr:+.2f} | "
-                f"{'🟢' if mmh_curr > 0 else '🔴'} | "
-                f"Price: ${close_curr:.2f}"
             )
 
         # ============================================================
@@ -3286,9 +3250,7 @@ async def evaluate_pair_and_alert(
                 if not cfg.DRY_RUN_MODE:
                     send_success = await telegram_queue.send(msg)
                     if not send_success:
-                        logger_pair.warning(
-                            f"Failed to send Telegram alert for {pair_name}"
-                        )
+                        logger.error(f"Alert dispatch failed | {pair_name}")
                 else:
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
                 
@@ -3625,8 +3587,6 @@ async def run_once() -> bool:
             )
             return False
 
-        logger_run.debug("🔒 Distributed lock acquired successfully")
-
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -3745,7 +3705,6 @@ async def run_once() -> bool:
                 del telegram_queue
 
             gc.collect()
-            logger_run.debug("✅ Memory cleanup completed")
         except Exception as e:
             logger_run.warning(f"Memory cleanup warning (non-critical): {e}", exc_info=False)
     

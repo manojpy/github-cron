@@ -32,9 +32,7 @@ def aot_guard(func_name: str):
                 try:
                     return getattr(_AOT_MODULE, func_name)(*args, **kwargs)
                 except AttributeError:
-                    logger.warning(f"⚠️ AOT module missing function {func_name}, falling back to JIT")
-            # Fallback path
-            logger.warning(f"⚠️ Fallback to JIT: {func_name} not using AOT")
+                    pass
             return jit_func(*args, **kwargs)
         return wrapper
     return decorator
@@ -54,7 +52,6 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
                     spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
                     if spec is None or spec.loader is None:
                         _FALLBACK_REASON = "Failed to create module spec"
-                        logger.warning(f"AOT init failed: {_FALLBACK_REASON}")   # <-- add here
                         return False, _FALLBACK_REASON
                     mod = importlib.util.module_from_spec(spec)
                     sys.modules["macd_aot_compiled"] = mod
