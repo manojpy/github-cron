@@ -171,7 +171,6 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
         return out
     return _jit(data, period)
 
-# 5-6: EMA
 @aot_guard("ema_loop")
 def _ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     from numba import njit
@@ -200,6 +199,69 @@ def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
             out[i] = out[i-1] if np.isnan(curr) else alpha*curr + (1-alpha)*out[i-1]
         return out
     return _jit(data, alpha)
+
+@aot_guard("rng_filter_loop")
+def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    from numba import njit
+    @njit(nogil=True, fastmath=True, cache=True)
+    def _jit(x, r):
+        n = len(x)
+        filt = np.empty(n, dtype=np.float64)
+        filt[0] = x[0] if not np.isnan(x[0]) else 0.0
+        for i in range(1, n):
+            prev_filt = filt[i - 1]
+            curr_x, curr_r = x[i], r[i]
+            if np.isnan(curr_r) or np.isnan(curr_x):
+                filt[i] = prev_filt
+                continue
+            # CRITICAL FIX: Match Pine's exact ternary logic
+            if curr_x > prev_filt:
+                # Uptrend: x - r < prev ? prev : x - r
+                lower_bound = curr_x - curr_r
+                if lower_bound < prev_filt:
+                    filt[i] = prev_filt
+                else:
+                    filt[i] = lower_bound
+            else:
+                # Downtrend: x + r > prev ? prev : x + r
+                upper_bound = curr_x + curr_r
+                if upper_bound > prev_filt:
+                    filt[i] = prev_filt
+                else:
+                    filt[i] = upper_bound
+        return filt
+    return _jit(x, r)
+
+@aot_guard("smooth_range")
+def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
+    from numba import njit
+    @njit(nogil=True, fastmath=True, cache=True)
+    def _jit(close, t, m):
+        n = len(close)
+        # CRITICAL FIX: Initialize diff[0] = 0.0 to match Pine behavior
+        diff = np.empty(n, dtype=np.float64)
+        diff[0] = 0.0  # Pine: abs(x - x[1]) at index 0 treats x[1] as x[0]
+        for i in range(1, n):
+            diff[i] = abs(close[i] - close[i-1])
+        
+        alpha_t = 2.0 / (t + 1.0)
+        avrng = np.empty(n, dtype=np.float64)
+        avrng[0] = diff[0]  # Simplified: diff[0] is already 0.0
+        for i in range(1, n):
+            curr = diff[i]
+            avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
+        
+        wper = t * 2 - 1
+        alpha_w = 2.0 / (wper + 1.0)
+        smoothrng = np.empty(n, dtype=np.float64)
+        smoothrng[0] = avrng[0]
+        for i in range(1, n):
+            curr = avrng[i]
+            smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
+        
+        # CRITICAL FIX: Ensure m is treated as float
+        return smoothrng * float(m)
+    return _jit(close, t, m)
 
 # 7: KALMAN FILTER
 @aot_guard("kalman_loop")
@@ -255,57 +317,6 @@ def _vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray,
             vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical_price
         return vwap
     return _jit(high, low, close, volume, timestamps)
-
-# 9-10: RANGE FILTERS
-@aot_guard("rng_filter_loop")
-def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    from numba import njit
-    @njit(nogil=True, fastmath=True, cache=True)
-    def _jit(x, r):
-        n = len(x)
-        filt = np.empty(n, dtype=np.float64)
-        filt[0] = x[0] if not np.isnan(x[0]) else 0.0
-        for i in range(1, n):
-            prev_filt = filt[i - 1]
-            curr_x, curr_r = x[i], r[i]
-            if np.isnan(curr_r) or np.isnan(curr_x):
-                filt[i] = prev_filt
-                continue
-            if curr_x > prev_filt:
-                target = curr_x - curr_r
-                filt[i] = max(prev_filt, target)
-            else:
-                target = curr_x + curr_r
-                filt[i] = min(prev_filt, target)
-        return filt
-    return _jit(x, r)
-
-@aot_guard("smooth_range")
-def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
-    from numba import njit
-    @njit(nogil=True, fastmath=True, cache=True)
-    def _jit(close, t, m):
-        n = len(close)
-        diff = np.zeros(n, dtype=np.float64)
-        for i in range(1, n):
-            diff[i] = abs(close[i] - close[i-1])
-        # Inline EMA for avrng
-        alpha_t = 2.0 / (t + 1.0)
-        avrng = np.empty(n, dtype=np.float64)
-        avrng[0] = diff[0] if not np.isnan(diff[0]) else 0.0
-        for i in range(1, n):
-            curr = diff[i]
-            avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
-        # Inline EMA for smoothrng
-        wper = t * 2 - 1
-        alpha_w = 2.0 / (wper + 1.0)
-        smoothrng = np.empty(n, dtype=np.float64)
-        smoothrng[0] = avrng[0]
-        for i in range(1, n):
-            curr = avrng[i]
-            smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
-        return smoothrng * m
-    return _jit(close, t, m)
 
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:

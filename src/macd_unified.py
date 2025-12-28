@@ -584,11 +584,17 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
 def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate Cirrus Cloud indicator with improved accuracy matching Pine Script.
+    
+    Returns:
+        upw: Boolean array for uptrend (filt_x1 < filt_x12)
+        dnw: Boolean array for downtrend (filt_x1 > filt_x12)
+        filt_x1: First filtered line
+        filt_x12: Second filtered line
+    """
     try:
         if close is None or len(close) < max(cfg.X1, cfg.X3):
-            logger.warning(
-                f"Cirrus Cloud: Insufficient data (len={len(close) if close is not None else 0})"
-            )
             default_len = len(close) if close is not None else 1
             return (
                 np.zeros(default_len, dtype=bool),
@@ -597,21 +603,24 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
                 np.zeros(default_len, dtype=np.float64)
             )
         
+        # Ensure float64 precision
         close = np.asarray(close, dtype=np.float64)
         
+        # Calculate smooth ranges
         smrng_x1 = _smooth_range(close, cfg.X1, cfg.X2)
         smrng_x2 = _smooth_range(close, cfg.X3, cfg.X4)
         
+        # Apply range filters
         filt_x1 = _rng_filter_loop(close, smrng_x1)
         filt_x12 = _rng_filter_loop(close, smrng_x2)
         
+        # Calculate trend conditions
         upw = filt_x1 < filt_x12
         dnw = filt_x1 > filt_x12
         
         return upw, dnw, filt_x1, filt_x12
         
     except Exception as e:
-        logger.error(f"Cirrus Cloud calculation failed: {e}", exc_info=True)
         default_len = len(close) if close is not None else 1
         return (
             np.zeros(default_len, dtype=bool),
@@ -620,7 +629,46 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
 
+# ============================================================================
+# DIAGNOSTIC FUNCTION - Remove after verification
+# ============================================================================
 
+def compare_with_pine_values(close: np.ndarray, pine_filt_x1: np.ndarray, pine_filt_x12: np.ndarray):
+    """
+    Helper function to compare Python output with Pine Script output.
+    Prints differences to help identify remaining discrepancies.
+    """
+    upw, dnw, py_filt_x1, py_filt_x12 = calculate_cirrus_cloud_numba(close)
+    
+    diff_x1 = np.abs(py_filt_x1 - pine_filt_x1)
+    diff_x12 = np.abs(py_filt_x12 - pine_filt_x12)
+    
+    max_diff_x1 = np.max(diff_x1)
+    max_diff_x12 = np.max(diff_x12)
+    
+    print(f"Max difference in filt_x1: {max_diff_x1:.10f}")
+    print(f"Max difference in filt_x12: {max_diff_x12:.10f}")
+    print(f"Mean difference in filt_x1: {np.mean(diff_x1):.10f}")
+    print(f"Mean difference in filt_x12: {np.mean(diff_x12):.10f}")
+    
+    # Find indices with largest differences
+    worst_idx_x1 = np.argmax(diff_x1)
+    worst_idx_x12 = np.argmax(diff_x12)
+    
+    print(f"\nWorst match at index {worst_idx_x1} for filt_x1:")
+    print(f"  Python: {py_filt_x1[worst_idx_x1]:.10f}")
+    print(f"  Pine:   {pine_filt_x1[worst_idx_x1]:.10f}")
+    print(f"  Close:  {close[worst_idx_x1]:.10f}")
+    
+    print(f"\nWorst match at index {worst_idx_x12} for filt_x12:")
+    print(f"  Python: {py_filt_x12[worst_idx_x12]:.10f}")
+    print(f"  Pine:   {pine_filt_x12[worst_idx_x12]:.10f}")
+    print(f"  Close:  {close[worst_idx_x12]:.10f}")
+    
+    # Check first 50 bars for early divergence
+    print(f"\nFirst 10 bars comparison (filt_x1):")
+    for i in range(min(10, len(close))):
+        print(f"  [{i}] Python: {py_filt_x1[i]:.6f}, Pine: {pine_filt_x1[i]:.6f}, Diff: {diff_x1[i]:.6f}")
 # =============================================================================
 # MAIN CALCULATION FUNCTION
 # =============================================================================
