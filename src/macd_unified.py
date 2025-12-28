@@ -2900,7 +2900,7 @@ async def evaluate_pair_and_alert(
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             debug_if(cfg.DEBUG_MODE, logger, lambda: (
                 f"Skipping {pair_name} - 15m candle not confirmed closed"
-            )
+            ))
 
             return None
         
