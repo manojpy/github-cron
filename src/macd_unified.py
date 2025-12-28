@@ -3571,7 +3571,7 @@ async def run_once() -> bool:
             run_once._products_cache = PRODUCTS_CACHE
 
             cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
-            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
+            #logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
 
             products_map = build_products_map_from_api_result(prod_resp)
 
