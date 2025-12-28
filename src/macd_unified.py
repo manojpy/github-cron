@@ -3545,8 +3545,8 @@ async def run_once() -> bool:
         if USE_STATIC_MAP and days_since_check < STATIC_MAP_REFRESH_DAYS:
             products_map = STATIC_PRODUCTS_MAP.copy()
             logger_run.info(f"⚡ Using static map (validated {days_since_check:.1f}d ago)")
-        
-        else:
+
+        elif not PRODUCTS_CACHE.get("data"):
             # Refresh from API
             last_fetch_ts = PRODUCTS_CACHE.get("fetched_at", 0.0)
             if last_fetch_ts <= 0:
@@ -3558,7 +3558,6 @@ async def run_once() -> bool:
             logger_run.info(f"🔄 Fetching products from API ({reason})")
             USE_STATIC_MAP = False
 
-            # Now actually fetch
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
             if not prod_resp:
@@ -3577,6 +3576,7 @@ async def run_once() -> bool:
             products_map = build_products_map_from_api_result(prod_resp)
 
         else:
+            # Use cached products
             cache_ttl = PRODUCTS_CACHE["until"] - now
             logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
