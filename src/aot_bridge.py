@@ -307,13 +307,8 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
         return smoothrng * m
     return _jit(close, t, m)
 
-# =============================================================================
-# ROLLING STANDARD DEVIATION - POPULATION (n) NOT SAMPLE (n-1)
-# =============================================================================
-
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """FIXED: Use POPULATION std dev (divide by N) to match Pine's ta.stdev"""
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, period, responsiveness):
@@ -330,13 +325,10 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                     count += 1
                     delta = val - mean
                     mean += delta / count
-                    delta2 = val - mean
-                    m2 += delta * delta2
+                    m2 += delta * (val - mean)
             
-            # CRITICAL: Divide by 'count' (Population), NOT 'count - 1' (Sample)
             if count > 0:
-                variance = m2 / count
-                sd[i] = np.sqrt(variance) * resp
+                sd[i] = np.sqrt(m2 / count) * resp
             else:
                 sd[i] = 0.0
         return sd
@@ -344,7 +336,6 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
 
 @aot_guard("rolling_std_welford_parallel")
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Parallel version with population std dev"""
     from numba import njit, prange
     @njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(close, period, responsiveness):
@@ -361,20 +352,14 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                     count += 1
                     delta = val - mean
                     mean += delta / count
-                    delta2 = val - mean
-                    m2 += delta * delta2
+                    m2 += delta * (val - mean)
             
             if count > 0:
-                variance = m2 / count  # Population std dev
-                sd[i] = np.sqrt(variance) * resp
+                sd[i] = np.sqrt(m2 / count) * resp
             else:
                 sd[i] = 0.0
         return sd
     return _jit(close, period, responsiveness)
-
-# =============================================================================
-# WORM CALCULATION (unchanged, this was correct)
-# =============================================================================
 
 @aot_guard("calc_mmh_worm_loop")
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
@@ -382,8 +367,7 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(close_arr, sd_arr, rows):
         worm_arr = np.empty(rows, dtype=np.float64)
-        first_val = close_arr[0]
-        worm_arr[0] = 0.0 if np.isnan(first_val) else first_val
+        worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
         
         for i in range(1, rows):
             src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
@@ -394,65 +378,33 @@ def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) ->
             if np.isnan(sd_i):
                 delta = diff
             else:
-                if np.abs(diff) > sd_i:
-                    delta = np.sign(diff) * sd_i
-                else:
-                    delta = diff
+                delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
             
             worm_arr[i] = prev_worm + delta
         
         return worm_arr
     return _jit(close_arr, sd_arr, rows)
 
-# =============================================================================
-# VALUE CALCULATION - LINEAR RECURSIVE (NOT MULTIPLICATIVE!)
-# =============================================================================
-
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """
-    CRITICAL FIX: Pine uses LINEAR recursion, NOT multiplicative!
-    
-    Pine code:
-        value = 0.5 * 2  // Sets value = 1.0 initially
-        value := value * (temp - .5 + .5 * nz(value[1]))
-    
-    BUT! When you expand this:
-        Bar 0: value = 1.0 * (temp[0] - 0.5 + 0) = temp[0] - 0.5
-        Bar 1: value = 1.0 * (temp[1] - 0.5 + 0.5 * value[0])
-                     = temp[1] - 0.5 + 0.5 * value[0]  ← This is LINEAR!
-    
-    The "value =" resets to 1.0 each time, so it's effectively:
-        v = t - 0.5 + 0.5 * prev_v
-    
-    NOT: v = prev_v * (t - 0.5 + 0.5 * prev_v)  ← This was my mistake!
-    """
     from numba import njit
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(temp_arr, rows):
         value_arr = np.zeros(rows, dtype=np.float64)
         
-        # Bar 0: value = temp - 0.5 (no previous value)
         t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
         value_arr[0] = t0 - 0.5
         value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
         
-        # All other bars: LINEAR recursion
         for i in range(1, rows):
             prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
             
-            # FIXED: Linear recursion (add, not multiply!)
             v = t - 0.5 + 0.5 * prev_v
-            
             value_arr[i] = max(-0.9999, min(0.9999, v))
         
         return value_arr
     return _jit(temp_arr, rows)
-
-# =============================================================================
-# MOMENTUM SMOOTHING (unchanged, this was correct)
-# =============================================================================
 
 @aot_guard("calc_mmh_momentum_loop")
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
@@ -464,10 +416,6 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
             momentum_arr[i] = momentum_arr[i] + 0.5 * prev
         return momentum_arr
     return _jit(momentum_arr, rows)
-
-# =============================================================================
-# ROLLING MEAN (unchanged)
-# =============================================================================
 
 @aot_guard("rolling_mean_numba")
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
@@ -506,10 +454,6 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
             ma[i] = sum_val / count if count > 0 else np.nan
         return ma
     return _jit(close, period)
-
-# =============================================================================
-# ROLLING MIN/MAX (unchanged)
-# =============================================================================
 
 @aot_guard("rolling_min_max_numba")
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:

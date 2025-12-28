@@ -4,7 +4,6 @@ from pathlib import Path
 from numba.pycc import CC
 import numpy as np
 
-# Suppress warnings
 os.environ['NUMBA_OPT'] = '3'
 os.environ['NUMBA_WARNINGS'] = '0'
 os.environ['PYTHONWARNINGS'] = 'ignore'
@@ -13,7 +12,7 @@ def compile_module():
     output_dir = Path(__file__).parent
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
-    cc.verbose = False  # Quieter compilation
+    cc.verbose = False
 
     # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
@@ -174,7 +173,45 @@ def compile_module():
 
         return smoothrng * m
 
-    # --- Rolling Std Dev (Population) ---
+    # 11-13: MMH (FINAL CORRECTED VERSION)
+    @cc.export('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i4)')
+    def calc_mmh_worm_loop(close_arr, sd_arr, rows):
+        worm_arr = np.empty(rows, dtype=np.float64)
+        worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
+        for i in range(1, rows):
+            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
+            prev_worm = worm_arr[i - 1]
+            diff = src - prev_worm
+            sd_i = sd_arr[i]
+            if np.isnan(sd_i):
+                delta = diff
+            else:
+                delta = (np.sign(diff) * sd_i) if abs(diff) > sd_i else diff
+            worm_arr[i] = prev_worm + delta
+        return worm_arr
+
+    @cc.export('calc_mmh_value_loop', 'f8[:](f8[:], i4)')
+    def calc_mmh_value_loop(temp_arr, rows):
+        value_arr = np.zeros(rows, dtype=np.float64)
+        t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
+        value_arr[0] = t0 - 0.5
+        value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
+        
+        for i in range(1, rows):
+            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+            t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+            v = t - 0.5 + 0.5 * prev_v
+            value_arr[i] = max(-0.9999, min(0.9999, v))
+        return value_arr
+
+    @cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i4)')
+    def calc_mmh_momentum_loop(momentum_arr, rows):
+        for i in range(1, rows):
+            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+            momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+        return momentum_arr
+
+    # 14-15: Rolling Std (FIXED: 0.00001 floor, population variance)
     @cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')
     def rolling_std_welford(close, period, responsiveness):
         n = len(close)
@@ -189,9 +226,11 @@ def compile_module():
                     count += 1
                     delta = val - mean
                     mean += delta / count
-                    delta2 = val - mean
-                    m2 += delta * delta2
-            sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
+                    m2 += delta * (val - mean)
+            if count > 0:
+                sd[i] = np.sqrt(m2 / count) * resp
+            else:
+                sd[i] = 0.0
         return sd
 
     @cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')
@@ -208,51 +247,14 @@ def compile_module():
                     count += 1
                     delta = val - mean
                     mean += delta / count
-                    delta2 = val - mean
-                    m2 += delta * delta2
-            sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
+                    m2 += delta * (val - mean)
+            if count > 0:
+                sd[i] = np.sqrt(m2 / count) * resp
+            else:
+                sd[i] = 0.0
         return sd
 
-    # --- MMH Worm ---
-    @cc.export('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i4)')
-    def calc_mmh_worm_loop(close_arr, sd_arr, rows):
-        worm_arr = np.empty(rows, dtype=np.float64)
-        worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
-        for i in range(1, rows):
-            src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-            prev_worm = worm_arr[i - 1]
-            diff = src - prev_worm
-            sd_i = sd_arr[i]
-            if np.isnan(sd_i):
-                delta = diff
-            else:
-                delta = np.sign(diff) * sd_i if abs(diff) > sd_i else diff
-            worm_arr[i] = prev_worm + delta
-        return worm_arr
-
-    # --- MMH Value (Linear Recursion FIX) ---
-    @cc.export('calc_mmh_value_loop', 'f8[:](f8[:], i4)')
-    def calc_mmh_value_loop(temp_arr, rows):
-        value_arr = np.zeros(rows, dtype=np.float64)
-        # Bar 0: temp - 0.5
-        t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-        value_arr[0] = max(-0.9999, min(0.9999, t0 - 0.5))
-        for i in range(1, rows):
-            prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
-            t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-            v = t - 0.5 + 0.5 * prev_v   # LINEAR recursion
-            value_arr[i] = max(-0.9999, min(0.9999, v))
-        return value_arr
-
-    # --- MMH Momentum ---
-    @cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i4)')
-    def calc_mmh_momentum_loop(momentum_arr, rows):
-        for i in range(1, rows):
-            prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-            momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-        return momentum_arr
-
-    # --- Rolling Mean ---
+    # 16-17: Rolling Mean
     @cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')
     def rolling_mean_numba(close, period):
         rows = len(close)
@@ -283,7 +285,7 @@ def compile_module():
             ma[i] = sum_val / count if count > 0 else np.nan
         return ma
 
-    # --- Rolling Min/Max ---
+    # 18-19: Rolling Min/Max
     @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba(arr, period):
         rows = len(arr)
@@ -291,12 +293,15 @@ def compile_module():
         max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             start = max(0, i - period + 1)
-            min_val, max_val = np.inf, -np.inf
+            min_val = np.inf
+            max_val = -np.inf
             for j in range(start, i + 1):
                 val = arr[j]
                 if not np.isnan(val):
-                    if val < min_val: min_val = val
-                    if val > max_val: max_val = val
+                    if val < min_val:
+                        min_val = val
+                    if val > max_val:
+                        max_val = val
             min_arr[i] = min_val if min_val != np.inf else np.nan
             max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
@@ -308,12 +313,15 @@ def compile_module():
         max_arr = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             start = max(0, i - period + 1)
-            min_val, max_val = np.inf, -np.inf
+            min_val = np.inf
+            max_val = -np.inf
             for j in range(start, i + 1):
                 val = arr[j]
                 if not np.isnan(val):
-                    if val < min_val: min_val = val
-                    if val > max_val: max_val = val
+                    if val < min_val:
+                        min_val = val
+                    if val > max_val:
+                        max_val = val
             min_arr[i] = min_val if min_val != np.inf else np.nan
             max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
@@ -322,10 +330,8 @@ def compile_module():
     @cc.export('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)')
     def calculate_ppo_core(close, fast, slow, signal):
         n = len(close)
-
         fast_alpha = 2.0 / (fast + 1.0)
         slow_alpha = 2.0 / (slow + 1.0)
-
         fast_ma = np.empty(n, dtype=np.float64)
         slow_ma = np.empty(n, dtype=np.float64)
         fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
@@ -436,4 +442,3 @@ def compile_module():
 
 if __name__ == '__main__':
     sys.exit(0 if compile_module() else 1)
-
