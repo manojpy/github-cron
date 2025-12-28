@@ -3518,19 +3518,19 @@ async def run_once() -> bool:
         products_map = None
         pairs_to_process = []
 
-        USE_STATIC_MAP = True  # Set to False to force API fetch
-        STATIC_MAP_REFRESH_DAYS = 7  # Refresh from API weekly
+        USE_STATIC_MAP = True
+        STATIC_MAP_REFRESH_DAYS = 7
 
         now = time.time()
 
         def should_refresh_products(cache_dict, static_enabled, days_threshold):
             """Check if product map needs refreshing from API."""
             if not static_enabled:
-                return True  # Always refresh if static map disabled
+                return True
     
             expires_at = cache_dict.get("until", 0.0)
             if expires_at <= 0:
-                return True  # Never cached before
+                return True
     
             # Calculate when cache was originally fetched
             fetched_at = expires_at - cfg.PRODUCTS_CACHE_TTL
@@ -3545,22 +3545,29 @@ async def run_once() -> bool:
         if USE_STATIC_MAP and days_since_check < STATIC_MAP_REFRESH_DAYS:
             products_map = STATIC_PRODUCTS_MAP.copy()
             logger_run.info(f"⚡ Using static map (validated {days_since_check:.1f}d ago)")
+        
         else:
             # Refresh from API
-            reason = "never checked" if last_check_ts <= 0 else f"last checked {days_since_check:.1f}d ago"
+            last_fetch_ts = PRODUCTS_CACHE.get("fetched_at", 0.0)
+            if last_fetch_ts <= 0:
+                reason = "never checked"
+            else:
+                days_since_check = (now - last_fetch_ts) / 86400
+                reason = f"last checked {days_since_check:.1f}d ago"
+
             logger_run.info(f"🔄 Fetching products from API ({reason})")
             USE_STATIC_MAP = False
 
-        if not USE_STATIC_MAP or products_map is None:
-            logger_run.debug("���� Fetching products list from Delta API...")
+            # Now actually fetch
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
-
             if not prod_resp:
                 logger_run.error("❌ Failed to fetch products map - aborting run")
                 return False
 
+            now = time.time()
             PRODUCTS_CACHE["data"] = prod_resp
+            PRODUCTS_CACHE["fetched_at"] = now
             PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
             run_once._products_cache = PRODUCTS_CACHE
 
@@ -3568,6 +3575,7 @@ async def run_once() -> bool:
             logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
 
             products_map = build_products_map_from_api_result(prod_resp)
+
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
             logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
@@ -3636,9 +3644,15 @@ async def run_once() -> bool:
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
 
         fetcher_stats = fetcher.get_stats()
+
+        if PRODUCTS_CACHE.get("fetched_at") and fetcher_stats["products_success"] == 0 and fetcher_stats["products_failed"] == 0:
+            products_line = "cached"
+        else:
+            products_line = f"{fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌"
+
         logger_run.info(
             f"📡 Fetch statistics | "
-            f"Products: {fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌ | "
+            f"Products: {products_line} | "
             f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
         )
 
