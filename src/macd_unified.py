@@ -946,7 +946,6 @@ class SessionManager:
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
-            # Modern way: enforce TLS >= 1.2
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             cls._ssl_context = ctx
             logger.debug("SSL context created with TLSv1.2+ minimum")
@@ -954,12 +953,10 @@ class SessionManager:
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
-        # Check outside lock first (fast path)
         if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
             return cls._session
     
         async with cls._lock:
-            # Double-check inside lock
             if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
                 return cls._session
         
@@ -977,7 +974,7 @@ class SessionManager:
                 if cls._session and not cls._session.closed:
                     try:
                         await cls._session.close()
-                        await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
+                        await asyncio.sleep(0.1)
                     except Exception as e:
                         logger.warning(f"Error closing old session: {e}")
 
@@ -988,13 +985,13 @@ class SessionManager:
                     force_close=False,
                     enable_cleanup_closed=True,
                     ttl_dns_cache=3600,
-                    keepalive_timeout=90,  # OPTIMIZED: Increased from 60s
+                    keepalive_timeout=90,
                     family=0,
                 )
 
                 timeout = aiohttp.ClientTimeout(
                     total=cfg.HTTP_TIMEOUT,
-                    connect=8,  # OPTIMIZED: Reduced from 10s
+                    connect=8,
                     sock_read=cfg.HTTP_TIMEOUT,
                 )
 
@@ -1005,7 +1002,7 @@ class SessionManager:
                         'User-Agent': f'{cfg.BOT_NAME}/{__version__}',
                         'Accept': 'application/json',
                         'Accept-Encoding': 'gzip, deflate',
-                        'Connection': 'keep-alive',  # OPTIMIZED: Added explicit keep-alive
+                        'Connection': 'keep-alive',
                     },
                     raise_for_status=False,
                 )
@@ -1369,7 +1366,6 @@ class DataFetcher:
             concurrency=max_parallel
         )
     
-        # ⚡ NEW: Circuit breaker
         self.circuit_breaker = APICircuitBreaker(
             failure_threshold=3,
             recovery_timeout=60
@@ -1484,16 +1480,14 @@ class DataFetcher:
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
                         diff = abs(expected_open_ts - last_candle_open_ts)
 
-                        if diff > 300: # Over 5 minutes difference
+                        if diff > 300:
                             if last_candle_open_ts < expected_open_ts:
-                                # This is the "API Lag" warning we want to monitor
                                 logger.warning(
                                     f"⚠️ API DELAY | {symbol} {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
                                     f"Got: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
                                 )
                             else:
-                                # Data is ahead (normal for lower timeframes like 5m vs 15m)
                                 logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
                         else:
                             logger.debug(
@@ -2202,42 +2196,17 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """
-        Atomically evaluate alert states and deduplication in a single Redis pipeline.
         
-        This combines three operations:
-        1. MGET - Fetch previous alert states
-        2. SET - Update alert states
-        3. SET NX - Check/set deduplication keys
-        
-        Args:
-            pair: Trading pair name
-            alert_keys: List of alert keys to check previous states
-            state_updates: List of (key, state, timestamp) tuples to update
-            dedup_checks: List of (pair, alert_key, timestamp) tuples for dedup
-        
-        Returns:
-            Tuple of (previous_states_dict, dedup_results_dict)
-            - previous_states_dict: {alert_key: was_active_bool}
-            - dedup_results_dict: {pair:alert_key: should_send_bool}
-        """
         if self.degraded:
-            # Degraded mode: return defaults
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
         
         try:
             async with self._redis.pipeline() as pipe:
-                # ========================================================
-                # OPERATION 1: MGET - Fetch previous alert states
-                # ========================================================
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
                 pipe.mget(state_keys)
                 
-                # ========================================================
-                # OPERATION 2: SET - Update alert states
-                # ========================================================
                 now = int(time.time())
                 for key, state, custom_ts in state_updates:
                     ts = custom_ts if custom_ts is not None else now
@@ -2249,9 +2218,6 @@ class RedisStateStore:
                     else:
                         pipe.set(full_key, data)
                 
-                # ========================================================
-                # OPERATION 3: SET NX - Deduplication checks
-                # ========================================================
                 dedup_key_mapping = {}
                 for pair_name, alert_key, ts in dedup_checks:
                     window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
@@ -2266,16 +2232,11 @@ class RedisStateStore:
                         ex=Constants.ALERT_DEDUP_WINDOW_SEC
                     )
                 
-                # Execute pipeline with timeout
                 try:
                     results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
                 except asyncio.TimeoutError:
                     logger.error(f"Redis pipeline timeout in atomic_eval_batch for {pair}")
                     raise
-            
-            # ============================================================
-            # PARSE RESULTS
-            # ============================================================
             
             num_state_keys = len(state_keys)
             num_updates = len(state_updates)
@@ -2297,12 +2258,6 @@ class RedisStateStore:
                         prev_states[key] = False
                 else:
                     prev_states[key] = False
-            
-            # Parse SET results (indices 1 to num_updates)
-            # These are just confirmations, we don't need to process them
-            # SET commands return OK (True) on success
-            
-            # Parse SET NX results (indices after SET operations)
             dedup_results = {}
             dedup_start_idx = 1 + num_updates
             
@@ -2310,19 +2265,15 @@ class RedisStateStore:
                 result_idx = dedup_start_idx + idx
                 
                 if result_idx < len(results):
-                    # SET NX returns True if key was created (not duplicate)
-                    # Returns None/False if key already existed (is duplicate)
                     should_send = bool(results[result_idx])
                 else:
-                    # If result missing, default to sending (fail open)
                     should_send = True
                     logger.warning(
                         f"Missing dedup result at index {result_idx} for {composite_key}"
                     )
                 
                 dedup_results[composite_key] = should_send
-            
-            # Log deduplication statistics
+                
             if cfg.DEBUG_MODE and dedup_results:
                 duplicates = sum(1 for v in dedup_results.values() if not v)
                 if duplicates > 0:
@@ -2334,7 +2285,6 @@ class RedisStateStore:
         
         except asyncio.TimeoutError:
             logger.error(f"Timeout in atomic_eval_batch for {pair}")
-            # Fallback to sequential operations
             prev_states = await self.mget_states([f"{pair}:{k}" for k in alert_keys])
             await self.batch_set_states(state_updates)
             dedup_results = await self.batch_check_recent_alerts(dedup_checks)
@@ -2342,7 +2292,7 @@ class RedisStateStore:
         
         except RedisError as e:
             logger.error(f"Redis error in atomic_eval_batch for {pair}: {e}")
-            # Fallback to sequential operations
+        
             try:
                 prev_states = await self.mget_states([f"{pair}:{k}" for k in alert_keys])
                 await self.batch_set_states(state_updates)
@@ -2350,14 +2300,13 @@ class RedisStateStore:
                 return prev_states, dedup_results
             except Exception as fallback_error:
                 logger.error(f"Fallback operations also failed: {fallback_error}")
-                # Return safe defaults
+            
                 empty_prev = {k: False for k in alert_keys}
                 empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
                 return empty_prev, empty_dedup
         
         except Exception as e:
             logger.error(f"Unexpected error in atomic_eval_batch for {pair}: {e}", exc_info=True)
-            # Return safe defaults
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
@@ -2402,7 +2351,6 @@ class RedisLock:
         return 0
     end
     """
-
     def __init__(
         self,
         redis_client: Optional[redis.Redis],
