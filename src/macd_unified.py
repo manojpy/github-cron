@@ -213,7 +213,12 @@ class BotConfig(BaseModel):
     NUMBA_PARALLEL: bool = Field(default=True, description="Enable Numba parallel execution")
     SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
     PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
-
+    MAX_CANDLE_STALENESS_SEC: int = Field(
+        default=1200,
+        ge=600,
+        le=3600,
+        description="Maximum allowed candle staleness in seconds (10-60 minutes)"
+    )
     PIVOT_MAX_DISTANCE_PCT: float = Field(
         default=100.0,
         ge=10.0,
@@ -320,11 +325,25 @@ class TraceContextFilter(logging.Filter):
 
 class SafeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        # ✅ Scrub message BEFORE formatting (prevents leaks in exceptions)
+        if hasattr(record, 'msg') and record.msg:
+            msg_str = str(record.msg)
+            msg_str = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", msg_str)
+            msg_str = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", msg_str)
+            msg_str = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", msg_str)
+            record.msg = msg_str
+        
+        # Clear args to prevent format string attacks
         record.args = None
+        
+        # Format the scrubbed message
         formatted = super().format(record)
+        
+        # Double-check: scrub again after formatting
         formatted = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", formatted)
         formatted = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", formatted)
         formatted = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", formatted)
+        
         return formatted
 
 def setup_logging() -> logging.Logger:
@@ -852,33 +871,38 @@ def calculate_all_indicators_numpy(
         
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-        
+
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
             daily_low = float(data_daily["low"][-1])
             daily_range = daily_high - daily_low
             
+            # ✅ OPTIMIZATION: Check distance before expensive calculation
+            should_calculate = False
             if daily_range > 0:
                 distance_from_high = abs(last_close - daily_high)
                 distance_from_low = abs(last_close - daily_low)
-                if (distance_from_high < daily_range * 0.5 or 
-                    distance_from_low < daily_range * 0.5):
-                    results['pivots'] = calculate_pivot_levels_numpy(
-                        data_daily["high"], 
-                        data_daily["low"],
-                        data_daily["close"], 
-                        data_daily["timestamp"]
-                    )
-                else:
-                    results['pivots'] = {}
-                    if cfg.DEBUG_MODE:
-                        logger.debug(
-                            f"Skipped pivot calc (price {last_close:.2f} far from range "
-                            f"{daily_low:.2f}-{daily_high:.2f})"
-                        )
+                should_calculate = (
+                    distance_from_high < daily_range * 0.5 or 
+                    distance_from_low < daily_range * 0.5
+                )
+            
+            if should_calculate:
+                results['pivots'] = calculate_pivot_levels_numpy(
+                    data_daily["high"], 
+                    data_daily["low"],
+                    data_daily["close"], 
+                    data_daily["timestamp"]
+                )
             else:
                 results['pivots'] = {}
+                if cfg.DEBUG_MODE:
+                    logger.debug(
+                        f"Skipped pivot calc (price {last_close:.2f} far from range "
+                        f"{daily_low:.2f}-{daily_high:.2f})"
+                    ) 
+            
         else:
             results['pivots'] = {}
         
@@ -951,10 +975,14 @@ class SessionManager:
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
+        # Fast path: check without lock (most common case)
         if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
             return cls._session
     
+        # Slow path: acquire lock for recreation
         async with cls._lock:
+            # CRITICAL: Double-check after acquiring lock
+            # Another task may have already recreated the session
             if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
                 return cls._session
         
@@ -1008,8 +1036,8 @@ class SessionManager:
                 cls._creation_time = time.time()
                 cls._request_count = 0
 
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"HTTP session created")
+                if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("HTTP session created")
 
             return cls._session
 
@@ -1023,10 +1051,12 @@ class SessionManager:
             if cls._session and not cls._session.closed:
                 try:
                     session_age = time.time() - cls._creation_time
-                    logger.debug(
-                        f"Closing HTTP session | "
-                        f"Age: {session_age:.1f}s | Requests served: {cls._request_count}"
-                    )
+
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"Closing HTTP session | "
+                            f"Age: {session_age:.1f}s | Requests served: {cls._request_count}"
+                        )
                     await cls._session.close()
                     await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
                     logger.info("HTTP session closed successfully")
@@ -1391,11 +1421,12 @@ class DataFetcher:
             "rate_limit_hits": 0
         }
 
-        logger.debug(
-            f"DataFetcher initialized | max_parallel={max_parallel} | "
-            f"rate_limit=60/min | timeout={self.timeout}s"
-        )
-
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"DataFetcher initialized | max_parallel={max_parallel} | "
+                f"rate_limit=60/min | timeout={self.timeout}s"
+            )
+    
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
 
@@ -1410,7 +1441,10 @@ class DataFetcher:
 
             if result:
                 self.fetch_stats["products_success"] += 1
-                logger.debug(f"Products fetch successful | URL: {url}")
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Products fetch successful | URL: {url}")
+
             else:
                 self.fetch_stats["products_failed"] += 1
                 logger.warning(f"Products fetch failed | URL: {url}")
@@ -1463,13 +1497,14 @@ class DataFetcher:
             )
      
             if data:
-                self.fetch_stats["candles_success"] += 1
-                self.circuit_breaker.record_success()
-
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                    # Record success AFTER validation passes
+                    self.circuit_breaker.record_success()
+                    self.fetch_stats["candles_success"] += 1
+                    
                     num_candles = len(result.get("t", []))
-
+                  
                     if num_candles > 0:
                         last_candle_open_ts = result["t"][-1]
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
@@ -1485,10 +1520,11 @@ class DataFetcher:
                             else:
                                 logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
                         else:
-                            logger.debug(
-                                f"✅ Scanned {symbol} {resolution} | "
-                                f"Latest: {format_ist_time(last_candle_open_ts)}"
-                            )
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    f"✅ Scanned {symbol} {resolution} | "
+                                    f"Latest: {format_ist_time(last_candle_open_ts)}"
+                                )
                 else:
                     logger.warning(f"Candles response missing fields | Symbol: {symbol}")
                     self.fetch_stats["candles_failed"] += 1
@@ -1628,12 +1664,12 @@ def validate_candle_data(
         current_time = get_trigger_timestamp()
         last_candle_time = int(timestamp[-1])
         staleness = current_time - last_candle_time
-        
-        MAX_STALENESS = (15 * 60) + 120  # 17 minutes
+
+        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
         
         if staleness > MAX_STALENESS:
             return False, (
-                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "
+                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
                 f"Last candle: {format_ist_time(last_candle_time)} | "
                 f"Current: {format_ist_time(current_time)}"
             )
@@ -1798,7 +1834,7 @@ class RedisStateStore:
         self._connection_attempts = 0
         self._dedup_script_sha = None
 
-        if cfg.DEBUG_MODE:
+        if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"RedisStateStore initialized | "
                 f"State TTL: {cfg.STATE_EXPIRY_DAYS}d | "
@@ -2071,6 +2107,23 @@ class RedisStateStore:
                 if cfg.DEBUG_MODE and not should_send:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
+            except redis.exceptions.NoScriptError:
+                # ✅ Script was flushed (Redis restart), reload it
+                logger.warning("Dedup script missing, reloading...")
+                try:
+                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                    # Retry with new SHA
+                    result = await self._safe_redis_op(
+                        lambda: self._redis.evalsha(
+                            self._dedup_script_sha, 1, recent_key, str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                        ),
+                        timeout=2.0,
+                        op_name=f"evalsha_dedup_retry_{pair}:{alert_key}",
+                    )
+                    return bool(result)
+                except Exception as reload_error:
+                    logger.error(f"Failed to reload dedup script: {reload_error}")
+                    # Fall through to SET NX fallback
             except Exception as e:
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Lua script failed, fallback to SET NX: {e}")
@@ -2229,10 +2282,9 @@ class RedisStateStore:
                     logger.error(f"Redis pipeline timeout in atomic_eval_batch for {pair}")
                     raise
             
-            num_state_keys = len(state_keys)
             num_updates = len(state_updates)
             num_dedup_checks = len(dedup_checks)
-            
+
             # Parse MGET results (index 0)
             prev_states = {}
             mget_results = results[0] if results else []
@@ -2639,12 +2691,7 @@ ALERT_KEYS: Dict[str, str] = {
     d["key"]: f"ALERT:{d['key'].upper()}" for d in ALERT_DEFINITIONS
 }
 
-for lvl in PIVOT_LEVELS:
-    ALERT_KEYS[f"pivot_up_{lvl}"] = f"ALERT:PIVOT_UP_{lvl}"
-    ALERT_KEYS[f"pivot_down_{lvl}"] = f"ALERT:PIVOT_DOWN_{lvl}"
-
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
-
 def validate_alert_definitions() -> None:
     errors = []
     
@@ -2852,10 +2899,12 @@ async def evaluate_pair_and_alert(
         is_red = close_curr_quick < open_curr_quick
         
         if not is_green and not is_red:
-            logger_pair.debug(
-                f"Doji/neutral candle for {pair_name} "
-                f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
-            )
+            if logger_pair.isEnabledFor(logging.DEBUG):
+                logger_pair.debug(
+                    f"Doji/neutral candle for {pair_name} "
+                    f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
+                )
+
             return None
         
         # ============================================================
@@ -3235,6 +3284,17 @@ async def evaluate_pair_and_alert(
         # Enforce per-pair alert limit
         alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
         
+        # ✅ NEW: Prevent pivot alert spam
+        pivot_count = sum(1 for _, _, k in alerts_to_send if k.startswith("pivot_"))
+        if pivot_count > 3:
+            logger_pair.warning(
+                f"Limiting pivot alerts for {pair_name}: {pivot_count} triggered, keeping 3"
+            )
+            # Keep first 3 pivot alerts + all non-pivot alerts
+            pivot_alerts = [(t, e, k) for t, e, k in alerts_to_send if k.startswith("pivot_")][:3]
+            other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
+            alerts_to_send = other_alerts + pivot_alerts
+        
         # Send alerts via Telegram
         if alerts_to_send:
             try:
@@ -3281,12 +3341,13 @@ async def evaluate_pair_and_alert(
         
         # Log non-alert state for debugging
         if not alerts_to_send:
-            cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-            logger_pair.debug(
-                f"✓ {pair_name} | cloud={cloud_state} mmh={mmh_curr:.2f} | "
-                f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
-            )
-        
+            if logger_pair.isEnabledFor(logging.DEBUG):
+                cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
+                logger_pair.debug(
+                    f"✓ {pair_name} | cloud={cloud_state} mmh={mmh_curr:.2f} | "
+                    f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
+                )
+            
         # Return summary state
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
@@ -3312,60 +3373,25 @@ async def evaluate_pair_and_alert(
         return None
     
     finally:
-        # ============================================================
-        # PHASE 15: Memory Cleanup
-        # ============================================================
-        
+        # Reset context
         PAIR_ID.set("")
-        
-        # Explicitly delete large objects to help garbage collector
+    
+        # Simple cleanup - Python handles NameError gracefully
         try:
-            # Delete array references
-            if close_15m is not None:
-                del close_15m
-            if open_15m is not None:
-                del open_15m
-            if timestamps_15m is not None:
-                del timestamps_15m
-            
-            # Delete indicator arrays
-            if ppo is not None:
-                del ppo
-            if ppo_signal is not None:
-                del ppo_signal
-            if smooth_rsi is not None:
-                del smooth_rsi
-            if vwap is not None:
-                del vwap
-            if mmh is not None:
-                del mmh
-            if upw is not None:
-                del upw
-            if dnw is not None:
-                del dnw
-            if rma50_15 is not None:
-                del rma50_15
-            if rma200_5 is not None:
-                del rma200_5
-            
-            # Delete indicator dictionary
+            del close_15m, open_15m, timestamps_15m
+            del ppo, ppo_signal, smooth_rsi, vwap, mmh
+            del upw, dnw, rma50_15, rma200_5
             if indicators is not None:
                 del indicators
-            
-            # Delete pivot data
             if piv is not None:
                 del piv
-            
-            # Trigger garbage collection for this pair
-            # This is acceptable here because each pair evaluation is isolated
-            gc.collect()
-            
+        except (NameError, UnboundLocalError):
+            # Variables weren't initialized (early return)
+            pass
         except Exception as cleanup_error:
-            # Cleanup errors are non-critical, just log
+            # Unexpected cleanup error
             if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Memory cleanup warning for {pair_name}: {cleanup_error}"
-                )
+                logger_pair.debug(f"Cleanup warning: {cleanup_error}")
 
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
@@ -3498,35 +3524,35 @@ async def run_once() -> bool:
         now = time.time()
 
         def should_refresh_products(cache_dict, static_enabled, days_threshold):
+            """Check if product map needs refreshing from API."""
             if not static_enabled:
-                return True
-            last_check = cache_dict.get("until", 0.0)
-            if not last_check or last_check <= 0:
-                return True
-            days_since = (time.time() - (last_check - cfg.PRODUCTS_CACHE_TTL)) / 86400
-            return days_since >= days_threshold
+                return True  # Always refresh if static map disabled
+    
+            expires_at = cache_dict.get("until", 0.0)
+            if expires_at <= 0:
+                return True  # Never cached before
+    
+            # Calculate when cache was originally fetched
+            fetched_at = expires_at - cfg.PRODUCTS_CACHE_TTL
+            days_since_fetch = (time.time() - fetched_at) / 86400
+    
+            return days_since_fetch >= days_threshold
 
         # Track last check timestamp
         last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
         days_since_check = (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400 if last_check_ts else 9999
 
-        if should_refresh_products(PRODUCTS_CACHE, USE_STATIC_MAP, STATIC_MAP_REFRESH_DAYS):
-            if days_since_check < STATIC_MAP_REFRESH_DAYS:
-                logger_run.info(
-                    f"⚡ Using static products map (last API check: {days_since_check:.1f} days ago)"
-                )
-                products_map = STATIC_PRODUCTS_MAP.copy()
-            else:
-                if last_check_ts <= 0:
-                    logger_run.debug("🔄 Refreshing products map from API (last check: never)")
-                else:
-                    logger_run.debug(
-                        f"🔄 Refreshing products map from API (last check: {days_since_check:.1f} days ago)"
-                    )
-                USE_STATIC_MAP = False
+        if USE_STATIC_MAP and days_since_check < STATIC_MAP_REFRESH_DAYS:
+            products_map = STATIC_PRODUCTS_MAP.copy()
+            logger_run.info(f"⚡ Using static map (validated {days_since_check:.1f}d ago)")
+        else:
+            # Refresh from API
+            reason = "never checked" if last_check_ts <= 0 else f"last checked {days_since_check:.1f}d ago"
+            logger_run.info(f"🔄 Fetching products from API ({reason})")
+            USE_STATIC_MAP = False
 
         if not USE_STATIC_MAP or products_map is None:
-            logger_run.debug("📡 Fetching products list from Delta API...")
+            logger_run.debug("���� Fetching products list from Delta API...")
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
 
@@ -3729,8 +3755,12 @@ if __name__ == "__main__":
     aot_bridge.ensure_initialized()
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
-        logger.critical("❌ AOT not active — JIT fallback. Reason: %s", reason)
-        sys.exit(1)
+        logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
+        logger.warning("⚠️ Performance will be degraded. First run may be slow.")
+        
+        if os.getenv("REQUIRE_AOT", "false").lower() == "true":
+            logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
+            sys.exit(1)
     else:
         logger.info("✅ Verified: AOT artifacts loaded successfully")
 
