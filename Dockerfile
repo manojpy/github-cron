@@ -60,10 +60,10 @@ ENV PYTHONPATH=/app/src \
     NUMBA_CACHE_DIR=/app/src/__pycache__ \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
-    NUMBA_WARNINGS=0
-    ENV TZ=Asia/Kolkata
-    RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+    NUMBA_WARNINGS=0 \
+    TZ=Asia/Kolkata
 
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # Execute file directly from src directory
 CMD ["python", "-u", "macd_unified.py"]
