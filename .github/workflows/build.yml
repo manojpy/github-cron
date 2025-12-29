@@ -68,7 +68,7 @@ jobs:
         if: success()
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:${{ steps.meta.outputs.tags }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
