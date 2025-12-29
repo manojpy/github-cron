@@ -222,6 +222,26 @@ class BotConfig(BaseModel):
         description="Maximum allowed distance (%) between current price and pivot level for alert validity"
     )
 
+    RATE_LIMIT_PER_MINUTE: int = Field(
+        default=60,
+        ge=10,
+        le=120,
+        description="Max HTTP requests per minute to Delta API"
+    )
+    CB_FAILURE_THRESHOLD: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Consecutive failures before circuit breaker opens"
+    )
+    CB_RECOVERY_TIMEOUT: int = Field(
+        default=60,
+        ge=10,
+        le=600,
+        description="Seconds to wait before half-open probe"
+    )
+
+
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
@@ -828,17 +848,19 @@ def calculate_all_indicators_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-        if cfg.ENABLE_VWAP:
-            results['vwap'] = calculate_vwap_numpy(
-                data_15m["high"], 
-                data_15m["low"], 
-                data_15m["close"],
-                data_15m["volume"], 
-                data_15m["timestamp"]
-            )
-        else:
-            results['vwap'].fill(0.0)
-        
+    if cfg.ENABLE_VWAP:
+        # Local vars for hot path efficiency
+        high_15m = data_15m["high"]
+        low_15m = data_15m["low"]
+        volume_15m = data_15m["volume"]
+        ts_15m = data_15m["timestamp"]
+    
+        results["vwap"] = calculate_vwap_numpy(
+            high_15m, low_15m, close_15m, volume_15m, ts_15m
+        )
+    else:
+        results["vwap"].fill(0.0)
+
         mmh = calculate_magical_momentum_hist(close_15m)
         results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
         
@@ -1351,6 +1373,7 @@ class APICircuitBreaker:
         
         return True, None
 
+
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
@@ -1360,46 +1383,29 @@ class DataFetcher:
         self.timeout = cfg.HTTP_TIMEOUT
 
         self.rate_limiter = RateLimitedFetcher(
-            max_per_minute=60,
-            concurrency=max_parallel
+            max_per_minute=cfg.RATE_LIMIT_PER_MINUTE,
+            concurrency=max_parallel,
         )
-    
+
         self.circuit_breaker = APICircuitBreaker(
-            failure_threshold=3,
-            recovery_timeout=60
+            failure_threshold=cfg.CB_FAILURE_THRESHOLD,
+            recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
         )
 
         self.fetch_stats = {
-            "products_success": 0,
-            "products_failed": 0,
-            "candles_success": 0,
-            "candles_failed": 0,
+            "products": {"success": 0, "failed": 0},
+            "candles": {"success": 0, "failed": 0},
             "circuit_breaker_blocks": 0,
-        }
-
-        self.semaphore = asyncio.Semaphore(max_parallel)
-        self.timeout = cfg.HTTP_TIMEOUT
-
-        self.rate_limiter = RateLimitedFetcher(
-            max_per_minute=60,
-            concurrency=max_parallel
-        )
-
-        self.fetch_stats = {
-            "products_success": 0,
-            "products_failed": 0,
-            "candles_success": 0,
-            "candles_failed": 0,
             "total_wait_time": 0.0,
-            "rate_limit_hits": 0
+            "rate_limit_hits": 0,
         }
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"DataFetcher initialized | max_parallel={max_parallel} | "
-                f"rate_limit=60/min | timeout={self.timeout}s"
-            )
-    
+                f"rate_limit={cfg.RATE_LIMIT_PER_MINUTE}/min | timeout={self.timeout}s"
+            ) 
+
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
 
@@ -2212,118 +2218,107 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        
+    
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
-        
+    
         try:
-            async with self._redis.pipeline() as pipe:
-                state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-                pipe.mget(state_keys)
-                
-                now = int(time.time())
-                for key, state, custom_ts in state_updates:
-                    ts = custom_ts if custom_ts is not None else now
-                    data = json_dumps({"state": state, "ts": ts})
-                    full_key = f"{self.state_prefix}{key}"
-                    
-                    if self.expiry_seconds > 0:
-                        pipe.set(full_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(full_key, data)
-                
-                dedup_key_mapping = {}
-                for pair_name, alert_key, ts in dedup_checks:
-                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
-                    composite_key = f"{pair_name}:{alert_key}"
-                    dedup_key_mapping[recent_key] = composite_key
-                    
-                    pipe.set(
-                        recent_key, 
-                        "1", 
-                        nx=True, 
-                        ex=Constants.ALERT_DEDUP_WINDOW_SEC
-                    )
-                
-                try:
-                    results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    logger.error(f"Redis pipeline timeout in atomic_eval_batch for {pair}")
-                    raise
-            
-            num_updates = len(state_updates)
-            num_dedup_checks = len(dedup_checks)
-
-            prev_states = {}
-            mget_results = results[0] if results else []
-            
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-                if val:
-                    try:
-                        parsed = json_loads(val)
-                        prev_states[key] = parsed.get("state") == "ACTIVE"
-                    except Exception as parse_error:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"Failed to parse state for {key}: {parse_error}")
-                        prev_states[key] = False
-                else:
-                    prev_states[key] = False
-            dedup_results = {}
-            dedup_start_idx = 1 + num_updates
-            
-            for idx, (recent_key, composite_key) in enumerate(dedup_key_mapping.items()):
-                result_idx = dedup_start_idx + idx
-                
-                if result_idx < len(results):
-                    should_send = bool(results[result_idx])
-                else:
-                    should_send = True
-                    logger.warning(
-                        f"Missing dedup result at index {result_idx} for {composite_key}"
-                    )
-                
-                dedup_results[composite_key] = should_send
-                
-            if cfg.DEBUG_MODE and dedup_results:
-                duplicates = sum(1 for v in dedup_results.values() if not v)
-                if duplicates > 0:
-                    logger.debug(
-                        f"Batch dedup for {pair}: {duplicates}/{len(dedup_checks)} duplicates filtered"
-                    )
-            
+            # Normal pipelined Redis operations
+            prev_states, dedup_results = await self._pipeline_ops(
+                pair, alert_keys, state_updates, dedup_checks
+            )
             return prev_states, dedup_results
-        
+
         except asyncio.TimeoutError:
-            logger.error(f"Redis timeout | {pair} | ops: {len(alert_keys)}")
-            prev_states = await self.mget_states(keys)
+            now = time.time()
+            logger.error(
+                f"Redis timeout | pair={pair} | ops={len(alert_keys)} | now={now:.0f}"
+            )
+
+            # Fallback: non-pipelined operations
+            prev_states = await self.mget_states(
+                [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+            )
             await self.batch_set_states(state_updates)
             dedup_results = await self.batch_check_recent_alerts(dedup_checks)
+
+            logger.debug(
+                f"Redis fallback succeeded | pair={pair} | states={len(prev_states)} | dedup={len(dedup_results)}"
+            )
             return prev_states, dedup_results
-        
-        except RedisError as e:
-            logger.error(f"Redis error in atomic_eval_batch for {pair}: {e}")
-        
-            try:
-                prev_states = await self.mget_states([f"{pair}:{k}" for k in alert_keys])
-                await self.batch_set_states(state_updates)
-                dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-                return prev_states, dedup_results
-            except Exception as fallback_error:
-                logger.error(f"Fallback operations also failed: {fallback_error}")
-            
-                empty_prev = {k: False for k in alert_keys}
-                empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-                return empty_prev, empty_dedup
-        
+
         except Exception as e:
-            logger.error(f"Unexpected error in atomic_eval_batch for {pair}: {e}", exc_info=True)
+            logger.error(f"Redis error in atomic_eval_batch for {pair}: {e}")
+            # Additional fallback logic here if needed
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
+
+    async def _pipeline_ops(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        state_updates: List[Tuple[str, Any, Optional[int]]],
+        dedup_checks: List[Tuple[str, str, int]]
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """Execute all Redis operations in single pipeline."""
+        async with self._redis.pipeline() as pipe:
+            # 1. Get previous states
+            state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+            pipe.mget(state_keys)
+        
+            # 2. Set new states
+            now = int(time.time())
+            for key, state, custom_ts in state_updates:
+                ts = custom_ts if custom_ts is not None else now
+                data = json_dumps({"state": state, "ts": ts})
+                full_key = f"{self.state_prefix}{key}"
+            
+                if self.expiry_seconds > 0:
+                    pipe.set(full_key, data, ex=self.expiry_seconds)
+                else:
+                    pipe.set(full_key, data)
+        
+            # 3. Deduplication checks
+            dedup_key_mapping = {}
+            for pair_name, alert_key, ts in dedup_checks:
+                window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                composite_key = f"{pair_name}:{alert_key}"
+                dedup_key_mapping[recent_key] = composite_key
+            
+                pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+        
+            # Execute pipeline
+            results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
+    
+        # Parse results
+        num_updates = len(state_updates)
+        num_dedup_checks = len(dedup_checks)
+        mget_results = results[0] if results else []
+    
+        prev_states = {}
+        for idx, key in enumerate(alert_keys):
+            val = mget_results[idx] if idx < len(mget_results) else None
+            if val:
+                try:
+                    parsed = json_loads(val)
+                    prev_states[key] = parsed.get("state") == "ACTIVE"
+                except Exception:
+                    prev_states[key] = False
+            else:
+                prev_states[key] = False
+    
+        dedup_results = {}
+        dedup_start_idx = 1 + num_updates
+        for idx, (recent_key, composite_key) in enumerate(dedup_key_mapping.items()):
+            result_idx = dedup_start_idx + idx
+            should_send = bool(results[result_idx]) if result_idx < len(results) else True
+            dedup_results[composite_key] = should_send
+    
+        return prev_states, dedup_results
 
     async def atomic_batch_update(
         self,
@@ -2774,35 +2769,43 @@ def check_candle_quality_with_reason(
     close_val: float,
     is_buy: bool
 ) -> Tuple[bool, str]:
-    
+    """
+    BUY:  Green (C>O) + upper wick < 20% range  
+    SELL: Red (C<O) + lower wick < 20% range
+    """
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
-            return False, "Candle range too small"
+            return False, "Range too small"
 
+        body_bottom = min(open_val, close_val)
+        body_top = max(open_val, close_val)
+        
         if is_buy:
+            # Green + small upper wick
             if close_val <= open_val:
-                return False, f"Not green candle (C={close_val:.2f} <= O={open_val:.2f})"
-
-            upper_wick = high_val - close_val
+                return False, f"Not green (C={close_val:.5f}≤O={open_val:.5f})"
+            
+            upper_wick = high_val - body_top
             wick_ratio = upper_wick / candle_range
-
+            
             if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick {wick_ratio*100:.0f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
-
-            return True, "Passed"
+                return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
+            
+            return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
 
         else:
+            # Red + small lower wick  
             if close_val >= open_val:
-                return False, f"Not red candle (C={close_val:.2f} >= O={open_val:.2f})"
-
-            lower_wick = close_val - low_val
+                return False, f"Not red (C={close_val:.5f}≥O={open_val:.5f})"
+            
+            lower_wick = max(body_bottom - low_val, 0.0)
             wick_ratio = lower_wick / candle_range
-
+            
             if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick {wick_ratio*100:.0f}% > {Constants.MIN_WICK_RATIO*100:.0f}%"
-
-            return True, "Passed"
+                return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
+            
+            return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
 
     except Exception as e:
         return False, f"Error: {str(e)}"
