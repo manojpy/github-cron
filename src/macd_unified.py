@@ -850,7 +850,8 @@ def calculate_all_indicators_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-        # VWAP (FIXED: Complete if/else inside try)
+
+        # VWAP calculation
         if cfg.ENABLE_VWAP:
             high_15m = data_15m["high"]
             low_15m = data_15m["low"]
@@ -860,7 +861,7 @@ def calculate_all_indicators_numpy(
                 high_15m, low_15m, close_15m, volume_15m, ts_15m
             )
         else:
-            results["vwap"].fill(0.0)
+            results["vwap"] = np.zeros(n_15m, dtype=np.float64)
 
         # MMH
         mmh = calculate_magical_momentum_hist(close_15m)
@@ -1398,10 +1399,10 @@ class DataFetcher:
         self.fetch_stats = {
             "products": {"success": 0, "failed": 0},
             "candles": {"success": 0, "failed": 0},
-            "products_success": 0,      # ← FIX 1
-            "products_failed": 0,       # ← FIX 2  
-            "candles_success": 0,       # ← FIX 3
-            "candles_failed": 0,        # ← FIX 4
+            "products_success": 0,
+            "products_failed": 0,
+            "candles_success": 0,
+            "candles_failed": 0, 
             "circuit_breaker_blocks": 0,
             "total_wait_time": 0.0,
             "rate_limit_hits": 0,
@@ -2259,29 +2260,32 @@ class RedisStateStore:
             return prev_states, dedup_results
 
         except asyncio.TimeoutError:
-            now = time.time()
             logger.error(
-                f"Redis timeout | pair={pair} | ops={len(alert_keys)} | now={now:.0f}"
+            f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
+            f"Degrading to individual operations"
+        )
+    
+        # Fallback with timeout protection
+        try:
+            prev_states = await asyncio.wait_for(
+                self.mget_states([f"{self.state_prefix}{pair}:{k}" for k in alert_keys]),
+                timeout=2.0
             )
-
-            # Fallback: non-pipelined operations
-            prev_states = await self.mget_states(
-                [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+            await asyncio.wait_for(
+                self.batch_set_states(state_updates),
+                timeout=2.0
             )
-            await self.batch_set_states(state_updates)
-            dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-
-            logger.debug(
-                f"Redis fallback succeeded | pair={pair} | states={len(prev_states)} | dedup={len(dedup_results)}"
+            dedup_results = await asyncio.wait_for(
+                self.batch_check_recent_alerts(dedup_checks),
+                timeout=2.0
             )
-            return prev_states, dedup_results
-
-        except Exception as e:
-            logger.error(f"Redis error in atomic_eval_batch for {pair}: {e}")
-            # Additional fallback logic here if needed
+        except asyncio.TimeoutError:
+            logger.critical(f"Redis completely unresponsive for {pair}")
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
+    
+        return prev_states, dedup_results
 
     async def _pipeline_ops(
         self,
@@ -2618,16 +2622,21 @@ def _validate_pivot_cross(
     close_curr = ctx["close_curr"]
     close_prev = ctx["close_prev"]
 
-    price_diff_pct = abs(level_value - close_curr) / close_curr * 100
-    if price_diff_pct > cfg.PIVOT_MAX_DISTANCE_PCT:
-        return False, f"Pivot too far: {price_diff_pct:.1f}%"
-
+    # Check crossover first
     if is_buy:
         crossed = close_prev <= level_value < close_curr
     else:
         crossed = close_prev >= level_value > close_curr
+    
+    if not crossed:
+        return False, None
+    
+    # Only check distance if cross occurred
+    price_diff_pct = abs(level_value - close_curr) / close_curr * 100
+    if price_diff_pct > cfg.PIVOT_MAX_DISTANCE_PCT:
+        return False, f"Pivot too far: {price_diff_pct:.1f}%"
 
-    return crossed, None
+    return True, None
 
 BUY_PIVOT_DEFS = [
     {
@@ -3282,21 +3291,19 @@ async def evaluate_pair_and_alert(
     
     finally:
         PAIR_ID.set("")
-    
-        try:
-            del close_15m, open_15m, timestamps_15m
-            del ppo, ppo_signal, smooth_rsi, vwap, mmh
-            del upw, dnw, rma50_15, rma200_5
-            if indicators is not None:
-                del indicators
-            if piv is not None:
-                del piv
-        except (NameError, UnboundLocalError):
-            pass
-        except Exception as cleanup_error:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Cleanup warning: {cleanup_error}")
 
+        # Safe cleanup - only delete if variables exist
+        for var_name in ['close_15m', 'open_15m', 'timestamps_15m', 
+                         'ppo', 'ppo_signal', 'smooth_rsi', 'vwap', 'mmh',
+                         'upw', 'dnw', 'rma50_15', 'rma200_5', 'indicators', 'piv']:
+            try:
+                if var_name in locals():
+                    del locals()[var_name]
+            except:
+                pass
+
+        gc.collect()   
+        
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
     products_map: Dict[str, dict],
