@@ -626,7 +626,6 @@ def _vectorized_wick_check_sell(open_arr: np.ndarray, high_arr: np.ndarray,
 # ============================================================================
 
 def summary_silent() -> dict:
-    """Return AOT/JIT coverage summary without printing."""
     ensure_initialized()
     aot_funcs = [
         "sanitize_array_numba", "sanitize_array_numba_parallel",
