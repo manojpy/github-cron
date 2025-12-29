@@ -75,7 +75,6 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           vuln-type: 'os,library'
-          skip-db-update: true
 
       - name: Upload Trivy scan results to GitHub Security tab
         if: success()
