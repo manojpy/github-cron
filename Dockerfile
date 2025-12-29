@@ -36,10 +36,8 @@ RUN if [ -f requirements.txt ]; then \
 COPY src ./src 2>/dev/null || COPY . ./src
 
 # Copy config: ROOT/config_macd.json -> /build/config_macd.json
-COPY config_macd.json ./config_macd.json 2>/dev/null || \
-     COPY src/config_macd.json ./config_macd.json 2>/dev/null || \
-     echo "WARNING: config_macd.json not found (will use env vars)"
-
+COPY config_macd.json ./config_macd.json
+     
 WORKDIR /build/src
 
 # Build AOT - Script is in src/ so this works
