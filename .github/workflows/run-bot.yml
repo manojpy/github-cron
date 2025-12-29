@@ -38,12 +38,11 @@ jobs:
         id: run_container
         run: |
           set +x
+          echo "🔥Launching Macd Unified🔥🚀"
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
           
-          echo "Pulling image..."
           docker pull -q "$IMAGE_ID" > /dev/null 2>&1
           
-          echo "Running bot..."
           # Mount the SECURE config file to the container's expected path
           docker run --rm \
             -e NUMBA_THREADING_LAYER=tbb \
