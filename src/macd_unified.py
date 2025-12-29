@@ -2956,30 +2956,35 @@ async def evaluate_pair_and_alert(
         # ============================================================
         # PHASE 4: Daily Pivot State Management
         # ============================================================
-        
+       
+
         if piv and cfg.ENABLE_PIVOT:
             current_day = int(ts_curr // 86400)
             pivot_day_key = f"{pair_name}:pivot_day"
             last_pivot_day_str = await sdb.get_metadata(pivot_day_key)
             last_pivot_day = int(last_pivot_day_str) if last_pivot_day_str else None
-            
+    
             # Reset pivot alert states on day change
             if last_pivot_day != current_day:
                 delete_keys = []
+        
                 for level in ["P", "S1", "S2", "S3", "R1", "R2", "R3"]:
-                    delete_keys.extend([
-                        f"{pair_name}:{ALERT_KEYS[f'pivot_up_{level}']}",
-                        f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level}']}"
-                    ])
-                
+                    up_key = f"pivot_up_{level}"
+                    if up_key in ALERT_KEYS:
+                        delete_keys.append(f"{pair_name}:{ALERT_KEYS[up_key]}")
+
+                    down_key = f"pivot_down_{level}"
+                    if down_key in ALERT_KEYS:
+                        delete_keys.append(f"{pair_name}:{ALERT_KEYS[down_key]}")
+        
                 if delete_keys:
                     await sdb.atomic_batch_update([], deletes=delete_keys)
                     logger_pair.debug(
                         f"Reset {len(delete_keys)} pivot alert states for new trading day"
                     )
-                
-                await sdb.set_metadata(pivot_day_key, str(current_day))
         
+                await sdb.set_metadata(pivot_day_key, str(current_day))
+
         # ============================================================
         # PHASE 5: Indicator Values Extraction
         # ============================================================
@@ -3182,7 +3187,7 @@ async def evaluate_pair_and_alert(
         # ============================================================
         # PHASE 11: State Deactivation Logic
         # ============================================================
-        
+  
         # Deactivate PPO signal crossover alerts on reverse cross
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             all_state_changes.append((
@@ -3190,14 +3195,14 @@ async def evaluate_pair_and_alert(
                 "INACTIVE", 
                 None
             ))
-        
+
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
             all_state_changes.append((
                 f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", 
                 "INACTIVE", 
                 None
             ))
-        
+
         # Deactivate VWAP alerts on reverse cross
         if cfg.ENABLE_VWAP:
             if close_prev >= vwap_prev and close_curr < vwap_curr:
@@ -3206,34 +3211,40 @@ async def evaluate_pair_and_alert(
                     "INACTIVE", 
                     None
                 ))
-            
+    
             if close_prev <= vwap_prev and close_curr > vwap_curr:
                 all_state_changes.append((
                     f"{pair_name}:{ALERT_KEYS['vwap_down']}", 
                     "INACTIVE", 
                     None
                 ))
-        
-        # Deactivate pivot alerts on reverse cross
+
+        # Deactivate pivot alerts on reverse cross (CORRECTED)
         if piv:
             for lvl_n, lvl_v in piv.items():
                 if lvl_v == 0:
                     continue
-                
-                if close_prev > lvl_v and close_curr <= lvl_v:
+        
+                # Deactivate UP alerts (cross above) when price crosses back below
+                # Only for levels that have buy alert definitions (exclude R3)
+                up_alert_key = f"pivot_up_{lvl_n}"
+                if up_alert_key in ALERT_KEYS and close_prev > lvl_v and close_curr <= lvl_v:
                     all_state_changes.append((
-                        f"{pair_name}:{ALERT_KEYS[f'pivot_up_{lvl_n}']}", 
-                        "INACTIVE", 
-                        None
-                    ))
-                
-                if close_prev < lvl_v and close_curr >= lvl_v:
-                    all_state_changes.append((
-                        f"{pair_name}:{ALERT_KEYS[f'pivot_down_{lvl_n}']}", 
+                        f"{pair_name}:{ALERT_KEYS[up_alert_key]}", 
                         "INACTIVE", 
                         None
                     ))
         
+                # Deactivate DOWN alerts (cross below) when price crosses back above
+                # Only for levels that have sell alert definitions (exclude S3)
+                down_alert_key = f"pivot_down_{lvl_n}"
+                if down_alert_key in ALERT_KEYS and close_prev < lvl_v and close_curr >= lvl_v:
+                    all_state_changes.append((
+                        f"{pair_name}:{ALERT_KEYS[down_alert_key]}", 
+                        "INACTIVE", 
+                        None
+                    ))
+
         # Deactivate MMH reversal alerts when momentum fails
         if (mmh_curr > 0 and mmh_curr <= mmh_m1):
             was_active = await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"])
@@ -3243,7 +3254,7 @@ async def evaluate_pair_and_alert(
                     "INACTIVE", 
                     None
                 ))
-        
+
         if (mmh_curr < 0 and mmh_curr >= mmh_m1):
             was_active = await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"])
             if was_active:
@@ -3252,7 +3263,7 @@ async def evaluate_pair_and_alert(
                     "INACTIVE", 
                     None
                 ))
-        
+
         # ============================================================
         # PHASE 12: Atomic State Update with Deduplication
         # ============================================================
