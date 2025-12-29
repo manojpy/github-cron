@@ -1383,37 +1383,47 @@ class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
-
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
-
         self.rate_limiter = RateLimitedFetcher(
             max_per_minute=cfg.RATE_LIMIT_PER_MINUTE,
             concurrency=max_parallel,
         )
-
         self.circuit_breaker = APICircuitBreaker(
             failure_threshold=cfg.CB_FAILURE_THRESHOLD,
             recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
         )
-
+        
+        # ✅ FIXED: Complete stats dict with ALL required keys
         self.fetch_stats = {
             "products": {"success": 0, "failed": 0},
             "candles": {"success": 0, "failed": 0},
+            "products_success": 0,      # ← FIX 1
+            "products_failed": 0,       # ← FIX 2  
+            "candles_success": 0,       # ← FIX 3
+            "candles_failed": 0,        # ← FIX 4
             "circuit_breaker_blocks": 0,
             "total_wait_time": 0.0,
             "rate_limit_hits": 0,
         }
-
+        
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"DataFetcher initialized | max_parallel={max_parallel} | "
                 f"rate_limit={cfg.RATE_LIMIT_PER_MINUTE}/min | timeout={self.timeout}s"
-            ) 
+            )
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
+        """Fetch all products from API with full stats tracking"""
         url = f"{self.api_base}/v2/products"
-
+        
+        can_proceed, reason = self.circuit_breaker.can_attempt()
+        if not can_proceed:
+            logger.warning(f"Circuit breaker blocked products fetch: {reason}")
+            self.fetch_stats["circuit_breaker_blocks"] += 1
+            self.fetch_stats["products_failed"] += 1
+            return None
+        
         async with self.semaphore:
             result = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1422,17 +1432,20 @@ class DataFetcher:
                 backoff=2.0,
                 timeout=self.timeout
             )
-
+            
+            # ✅ FIXED: Safe stats updates
             if result:
+                self.fetch_stats["products"]["success"] += 1
                 self.fetch_stats["products_success"] += 1
-
+                self.circuit_breaker.record_success()
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Products fetch successful | URL: {url}")
-
+                    logger.debug(f"Products fetch successful | Count: {len(result.get('result', []))}")
             else:
+                self.fetch_stats["products"]["failed"] += 1
                 self.fetch_stats["products_failed"] += 1
+                self.circuit_breaker.record_failure()
                 logger.warning(f"Products fetch failed | URL: {url}")
-
+            
             return result
 
     async def fetch_candles(
@@ -1442,34 +1455,33 @@ class DataFetcher:
         limit: int,
         reference_time: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
+        """Fetch candles for specific symbol/resolution"""
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
-            logger.warning(f"Circuit breaker blocked request for {symbol}: {reason}")
+            logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
-            return None 
-  
+            self.fetch_stats["candles_failed"] += 1
+            return None
+        
         if reference_time is None:
             reference_time = get_trigger_timestamp()
-
+        
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
-        
         expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
-
         buffer_periods = 3
         to_time = reference_time + (interval_seconds * buffer_periods)
-        
         from_time = expected_open_ts - (limit * interval_seconds)
-
+        
         params = {
             "resolution": resolution,
             "symbol": symbol,
             "from": int(from_time),
             "to": int(to_time)
         }
-
+        
         url = f"{self.api_base}/v2/chart/history"
-
+        
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1479,20 +1491,22 @@ class DataFetcher:
                 backoff=cfg.CANDLE_FETCH_BACKOFF,
                 timeout=self.timeout
             )
-     
+            
+            # ✅ FIXED: Safe stats updates
             if data:
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                     self.circuit_breaker.record_success()
+                    self.fetch_stats["candles"]["success"] += 1
                     self.fetch_stats["candles_success"] += 1
                     
                     num_candles = len(result.get("t", []))
-                  
                     if num_candles > 0:
                         last_candle_open_ts = result["t"][-1]
+                        interval_seconds = minutes * 60
                         last_candle_close_ts = last_candle_open_ts + interval_seconds
                         diff = abs(expected_open_ts - last_candle_open_ts)
-
+                        
                         if diff > 300:
                             if last_candle_open_ts < expected_open_ts:
                                 logger.warning(
@@ -1506,29 +1520,34 @@ class DataFetcher:
                             if logger.isEnabledFor(logging.DEBUG):
                                 logger.debug(
                                     f"✅ Scanned {symbol} {resolution} | "
-                                    f"Latest: {format_ist_time(last_candle_open_ts)}"
+                                    f"Latest: {format_ist_time(last_candle_open_ts)} | "
+                                    f"Candles: {num_candles}"
                                 )
+                    return data
                 else:
                     logger.warning(f"Candles response missing fields | Symbol: {symbol}")
-                    self.fetch_stats["candles_failed"] += 1
-                    return None
             else:
-                self.fetch_stats["candles_failed"] += 1
-                self.circuit_breaker.record_failure()  # ⚡ NEW
                 logger.warning(f"Candles fetch failed | Symbol: {symbol}")
-
-            return data
+            
+            # Failure case
+            self.fetch_stats["candles"]["failed"] += 1
+            self.fetch_stats["candles_failed"] += 1
+            self.circuit_breaker.record_failure()
+            return None
 
     def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive fetch statistics"""
         stats = self.fetch_stats.copy()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
+        
         total_products = stats["products_success"] + stats["products_failed"]
         total_candles = stats["candles_success"] + stats["candles_failed"]
-
+        
         if total_products > 0:
             stats["products_success_rate"] = round(stats["products_success"] / total_products * 100, 1)
         if total_candles > 0:
             stats["candles_success_rate"] = round(stats["candles_success"] / total_candles * 100, 1)
+        
         return stats
 
     async def fetch_candles_batch(
@@ -1536,20 +1555,22 @@ class DataFetcher:
         requests: List[Tuple[str, str, int]],
         reference_time: Optional[int] = None
     ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Batch fetch candles for multiple symbols"""
         if reference_time is None:
             reference_time = get_trigger_timestamp()
-
+        
         tasks = []
         request_keys = []
         for symbol, resolution, limit in requests:
             task = self.fetch_candles(symbol, resolution, limit, reference_time)
             tasks.append(task)
             request_keys.append(f"{symbol}_{resolution}")
-
+        
         results = await asyncio.gather(*tasks, return_exceptions=True)
         output = {}
         for key, result in zip(request_keys, results):
             output[key] = None if isinstance(result, Exception) else result
+        
         return output
 
     async def fetch_all_candles_truly_parallel(
@@ -1557,31 +1578,32 @@ class DataFetcher:
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
         reference_time: Optional[int] = None,
     ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-    
+        """Fully parallel candle fetch across all pairs/timeframes"""
         if reference_time is None:
             reference_time = get_trigger_timestamp()
-
+        
         all_tasks = []
         task_metadata = []
-
         for symbol, resolutions in pair_requests:
             for resolution, limit in resolutions:
                 task = self.fetch_candles(symbol, resolution, limit, reference_time)
                 all_tasks.append(task)
                 task_metadata.append((symbol, resolution))
-
+        
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
         output = {}
         success_count = 0
-
+        
         for (symbol, resolution), result in zip(task_metadata, results):
-            if symbol not in output: output[symbol] = {}
+            if symbol not in output: 
+                output[symbol] = {}
             if isinstance(result, Exception):
                 output[symbol][resolution] = None
             else:
                 output[symbol][resolution] = result
-                if result: success_count += 1
-
+                if result: 
+                    success_count += 1
+        
         logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
@@ -3432,6 +3454,8 @@ async def run_once() -> bool:
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
+            temp_fetcher.fetch_stats["products_success"] += 1 if prod_resp else 0  # Safe access
+            temp_fetcher.fetch_stats["products_failed"] += 0 if prod_resp else 1
             if not prod_resp:
                 logger_run.error("❌ Failed to fetch products map - aborting run")
                 return False
