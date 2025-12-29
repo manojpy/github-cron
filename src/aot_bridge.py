@@ -13,7 +13,6 @@ import numpy as np
 from numba import njit, prange
 from typing import Tuple, Optional
 
-# ✅ Suppress Numba warnings at import time
 os.environ['NUMBA_WARNINGS'] = '0'
 
 logger = logging.getLogger("aot_bridge")
@@ -66,7 +65,6 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
                 logger.warning(f"AOT init failed: {_FALLBACK_REASON}")
                 return False, _FALLBACK_REASON
 
-        # Verify with a simple test
         try:
             test_data = np.array([1.0, 2.0, 3.0], dtype=np.float64)
             _ = _AOT_MODULE.ema_loop(test_data, 3.0)
@@ -100,7 +98,6 @@ def get_fallback_reason() -> Optional[str]:
 # UNIFIED API - All 23 Functions with AOT/JIT Auto-Selection (decorator applied)
 # ============================================================================
 
-# 1-2: SANITIZATION
 @aot_guard("sanitize_array_numba")
 def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     from numba import njit
@@ -125,7 +122,6 @@ def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarra
         return out
     return _jit(arr, default)
 
-# 3-4: SMA
 @aot_guard("sma_loop")
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     from numba import njit
@@ -221,7 +217,6 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
                 else:
                     filt[i] = lower_bound
             else:
-                # Downtrend: x + r > prev ? prev : x + r
                 upper_bound = curr_x + curr_r
                 if upper_bound > prev_filt:
                     filt[i] = prev_filt
@@ -236,15 +231,14 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
     @njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, t, m):
         n = len(close)
-        # CRITICAL FIX: Initialize diff[0] = 0.0 to match Pine behavior
         diff = np.empty(n, dtype=np.float64)
-        diff[0] = 0.0  # Pine: abs(x - x[1]) at index 0 treats x[1] as x[0]
+        diff[0] = 0.0
         for i in range(1, n):
             diff[i] = abs(close[i] - close[i-1])
         
         alpha_t = 2.0 / (t + 1.0)
         avrng = np.empty(n, dtype=np.float64)
-        avrng[0] = diff[0]  # Simplified: diff[0] is already 0.0
+        avrng[0] = diff[0]
         for i in range(1, n):
             curr = diff[i]
             avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
@@ -257,11 +251,9 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
             curr = avrng[i]
             smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
         
-        # CRITICAL FIX: Ensure m is treated as float
         return smoothrng * float(m)
     return _jit(close, t, m)
 
-# 7: KALMAN FILTER
 @aot_guard("kalman_loop")
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     from numba import njit
@@ -288,7 +280,6 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
         return result
     return _jit(src, length, R, Q)
 
-# 8: VWAP
 @aot_guard("vwap_daily_loop")
 def _vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray,
                      volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
@@ -512,7 +503,6 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nd
         return min_arr, max_arr
     return _jit(arr, period)
 
-# 20: PPO (Tuple return)
 @aot_guard("calculate_ppo_core")
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     from numba import njit
@@ -550,7 +540,6 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) ->
         return ppo, ppo_sig
     return _jit(close, fast, slow, signal)
 
-# 21: RSI
 @aot_guard("calculate_rsi_core")
 def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
     from numba import njit
@@ -584,7 +573,6 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
         return rsi
     return _jit(close, rsi_len)
 
-# 22-23: WICK CHECKS
 @aot_guard("vectorized_wick_check_buy")
 def _vectorized_wick_check_buy(open_arr: np.ndarray, high_arr: np.ndarray,
                                low_arr: np.ndarray, close_arr: np.ndarray,
@@ -632,7 +620,6 @@ def _vectorized_wick_check_sell(open_arr: np.ndarray, high_arr: np.ndarray,
             result[i] = wick_ratio < min_wick_ratio
         return result
     return _jit(open_arr, high_arr, low_arr, close_arr, min_wick_ratio)
-
 
 # ============================================================================
 # PUBLIC API: one-time init, silent summary, unified names
