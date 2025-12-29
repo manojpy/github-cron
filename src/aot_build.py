@@ -17,7 +17,6 @@ def compile_module():
     cc.output_dir = str(output_dir)
     cc.verbose = False
 
-    # 1-2: Sanitization
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
     def sanitize_array_numba(arr, default):
         out = np.empty_like(arr)
@@ -35,7 +34,6 @@ def compile_module():
             out[i] = default if (np.isnan(val) or np.isinf(val)) else val
         return out
 
-    # 3-4: SMA
     @cc.export('sma_loop', 'f8[:](f8[:], i4)')
     def sma_loop(data, period):
         n = len(data)
@@ -103,16 +101,14 @@ def compile_module():
             if np.isnan(curr_r) or np.isnan(curr_x):
                 filt[i] = prev_filt
                 continue
-            # CRITICAL FIX: Match Pine's exact ternary logic
+        
             if curr_x > prev_filt:
-                # Uptrend: x - r < prev ? prev : x - r
                 lower_bound = curr_x - curr_r
                 if lower_bound < prev_filt:
                     filt[i] = prev_filt
                 else:
                     filt[i] = lower_bound
             else:
-                # Downtrend: x + r > prev ? prev : x + r
                 upper_bound = curr_x + curr_r
                 if upper_bound > prev_filt:
                     filt[i] = prev_filt
@@ -123,15 +119,14 @@ def compile_module():
     @cc.export('smooth_range', 'f8[:](f8[:], i4, i4)')
     def smooth_range(close, t, m):
         n = len(close)
-        # CRITICAL FIX: Initialize diff[0] = 0.0 to match Pine behavior
         diff = np.empty(n, dtype=np.float64)
-        diff[0] = 0.0  # Pine: abs(x - x[1]) at index 0 treats x[1] as x[0]
+        diff[0] = 0.0
         for i in range(1, n):
             diff[i] = abs(close[i] - close[i-1])
         
         alpha_t = 2.0 / (t + 1.0)
         avrng = np.empty(n, dtype=np.float64)
-        avrng[0] = diff[0]  # Simplified: diff[0] is already 0.0
+        avrng[0] = diff[0]
         for i in range(1, n):
             curr = diff[i]
             avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
@@ -144,10 +139,8 @@ def compile_module():
             curr = avrng[i]
             smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
         
-        # CRITICAL FIX: Ensure m is treated as float
         return smoothrng * float(m)
 
-    # 7: Kalman
     @cc.export('kalman_loop', 'f8[:](f8[:], i4, f8, f8)')
     def kalman_loop(src, length, R, Q):
         n = len(src)
@@ -168,7 +161,6 @@ def compile_module():
             result[i] = estimate
         return result
 
-    # 8: VWAP
     @cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])')
     def vwap_daily_loop(high, low, close, volume, timestamps):
         n = len(close)
@@ -188,7 +180,6 @@ def compile_module():
             vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical
         return vwap
 
-    # 11-13: MMH (FINAL CORRECTED VERSION)
     @cc.export('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i4)')
     def calc_mmh_worm_loop(close_arr, sd_arr, rows):
         worm_arr = np.empty(rows, dtype=np.float64)
@@ -226,7 +217,6 @@ def compile_module():
             momentum_arr[i] = momentum_arr[i] + 0.5 * prev
         return momentum_arr
 
-    # 14-15: Rolling Std (FIXED: 0.00001 floor, population variance)
     @cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')
     def rolling_std_welford(close, period, responsiveness):
         n = len(close)
@@ -269,7 +259,6 @@ def compile_module():
                 sd[i] = 0.0
         return sd
 
-    # 16-17: Rolling Mean
     @cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')
     def rolling_mean_numba(close, period):
         rows = len(close)
@@ -300,7 +289,6 @@ def compile_module():
             ma[i] = sum_val / count if count > 0 else np.nan
         return ma
 
-    # 18-19: Rolling Min/Max
     @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba(arr, period):
         rows = len(arr)
@@ -341,7 +329,6 @@ def compile_module():
             max_arr[i] = max_val if max_val != -np.inf else np.nan
         return min_arr, max_arr
 
-    # 20: PPO
     @cc.export('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)')
     def calculate_ppo_core(close, fast, slow, signal):
         n = len(close)
@@ -379,7 +366,6 @@ def compile_module():
 
         return ppo, ppo_sig
 
-    # 21: RSI
     @cc.export('calculate_rsi_core', 'f8[:](f8[:], i4)')
     def calculate_rsi_core(close, rsi_len):
         n = len(close)
@@ -409,7 +395,6 @@ def compile_module():
                 rsi[i] = 100.0 - (100.0 / (1.0 + (avg_gain[i] / avg_loss[i])))
         return rsi
 
-    # 22-23: Wick Checks
     @cc.export('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')
     def vectorized_wick_check_buy(o, h, l, c, ratio):
         n = len(c)
