@@ -3454,8 +3454,6 @@ async def run_once() -> bool:
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
-            temp_fetcher.fetch_stats["products_success"] += 1 if prod_resp else 0  # Safe access
-            temp_fetcher.fetch_stats["products_failed"] += 0 if prod_resp else 1
             if not prod_resp:
                 logger_run.error("❌ Failed to fetch products map - aborting run")
                 return False
