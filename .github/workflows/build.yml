@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * *"  # Daily at midnight
   workflow_dispatch:
 
 env:
@@ -17,10 +17,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write  # For Trivy SARIF upload
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for cache
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -40,7 +43,9 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
+            type=sha,prefix={{branch}}-
             type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=raw,value={{date 'YYYY-MM-DD'}},enable={{is_default_branch}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -51,5 +56,35 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           
+          # Docker layer caching
           cache-from: type=gha,scope=macd-aot
           cache-to: type=gha,mode=max,scope=macd-aot
+          
+          # Build args for AOT
+          build-args: |
+            AOT_STRICT=1
+
+      - name: Run Trivy vulnerability scanner
+        if: success()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:${{ steps.meta.outputs.tags }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          skip-db-update: true
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: success()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f trivy-results.sarif
+          echo "🧹 Cleanup complete"
