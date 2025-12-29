@@ -18,13 +18,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ✅ SECURITY: Inject secrets into a temp file, not the main config
+
       - name: Inject secrets into secure config
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS: ${{ secrets.REDIS_URL }}
+          API_BASE: ${{ secrets.DELTA_API_BASE }}
         run: |
-          jq '.TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" |
-              .TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" |
-              .REDIS_URL="${{ secrets.REDIS_URL }}" |
-              .DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}"' \
+          jq --arg token "$TOKEN" \
+             --arg chat "$CHAT_ID" \
+             --arg redis "$REDIS" \
+             --arg api "$API_BASE" \
+             '.TELEGRAM_BOT_TOKEN=$token | 
+              .TELEGRAM_CHAT_ID=$chat | 
+              .REDIS_URL=$redis | 
+              .DELTA_API_BASE=$api' \
               config_macd.json > config_macd.secure.json
 
       - name: Log in to the Container registry
