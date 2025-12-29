@@ -56,9 +56,6 @@ jobs:
               exit 1
             }
           
-          echo "✅ Bot completed successfully"
-          echo "📊 Last 20 lines:"
-          tail -20 bot-output.log
 
       # ✅ SECURITY: Always cleanup secrets, even if bot crashes
       - name: Cleanup Secrets
