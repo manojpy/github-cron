@@ -1,11 +1,12 @@
 name: Run MACD Bot
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # ✅ External cron → API trigger only
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RUN_TIMEOUT: 600
 
 jobs:
   run-bot:
@@ -18,7 +19,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ✅ SECURITY: Inject secrets into a temp file, not the main config
       - name: Inject secrets into secure config
         run: |
           jq '.TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" |
@@ -27,7 +27,7 @@ jobs:
               .DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}"' \
               config_macd.json > config_macd.secure.json
 
-      - name: Log in to the Container registry
+      - name: Log in to Container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -35,33 +35,33 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run MACD Bot
-        id: run_container
         run: |
           set +x
           echo "🔥Launching Macd Unified🔥🚀"
+          
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-          echo "✅ Bot completed successfully"
-          echo "📊 Last 20 lines:"
-          tail -20 bot-output.log
-
-    
           docker pull -q "$IMAGE_ID" > /dev/null 2>&1
           
-          # Mount the SECURE config file to the container's expected path
-          timeout 10m docker run --rm \
+          timeout ${{ env.RUN_TIMEOUT }}s docker run --rm \
             --memory=700m \
             -e NUMBA_THREADING_LAYER=tbb \
             -e NUMBA_NUM_THREADS=4 \
             -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
             -v ${{ github.workspace }}/logs:/app/logs \
-            "$IMAGE_ID" > bot-output.log 2>&1 || {
-              echo "❌ Bot failed. Output:"
-              cat bot-output.log
-              exit 1
-            }
+            "$IMAGE_ID" > bot-output.log 2>&1
           
+          BOT_EXIT_CODE=$?
+          
+          if [ $BOT_EXIT_CODE -eq 0 ]; then
+            echo "✅ Bot completed successfully"
+            echo "📊 Last 20 lines:"
+            tail -20 bot-output.log
+          else
+            echo "❌ Bot failed with exit code $BOT_EXIT_CODE"
+            cat bot-output.log
+            exit $BOT_EXIT_CODE
+          fi
 
-      # ✅ SECURITY: Always cleanup secrets, even if bot crashes
       - name: Cleanup Secrets
         if: always()
         run: |
