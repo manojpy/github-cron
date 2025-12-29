@@ -40,7 +40,11 @@ jobs:
           set +x
           echo "🔥Launching Macd Unified🔥🚀"
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-          
+          echo "✅ Bot completed successfully"
+          echo "📊 Last 20 lines:"
+          tail -20 bot-output.log
+
+    
           docker pull -q "$IMAGE_ID" > /dev/null 2>&1
           
           # Mount the SECURE config file to the container's expected path
