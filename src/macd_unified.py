@@ -838,32 +838,35 @@ def calculate_all_indicators_numpy(
             'pivots': {}
         }
         
+        # PPO
         ppo, ppo_signal = calculate_ppo_numpy(
             close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
         results['ppo'] = ppo
         results['ppo_signal'] = ppo_signal
         
+        # Smooth RSI
         results['smooth_rsi'] = calculate_smooth_rsi_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-    if cfg.ENABLE_VWAP:
-        # Local vars for hot path efficiency
-        high_15m = data_15m["high"]
-        low_15m = data_15m["low"]
-        volume_15m = data_15m["volume"]
-        ts_15m = data_15m["timestamp"]
-    
-        results["vwap"] = calculate_vwap_numpy(
-            high_15m, low_15m, close_15m, volume_15m, ts_15m
-        )
-    else:
-        results["vwap"].fill(0.0)
+        # VWAP (FIXED: Complete if/else inside try)
+        if cfg.ENABLE_VWAP:
+            high_15m = data_15m["high"]
+            low_15m = data_15m["low"]
+            volume_15m = data_15m["volume"]
+            ts_15m = data_15m["timestamp"]
+            results["vwap"] = calculate_vwap_numpy(
+                high_15m, low_15m, close_15m, volume_15m, ts_15m
+            )
+        else:
+            results["vwap"].fill(0.0)
 
+        # MMH
         mmh = calculate_magical_momentum_hist(close_15m)
         results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # Cirrus Cloud
         if cfg.CIRRUS_CLOUD_ENABLED:
             upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
             results['upw'] = upw
@@ -872,9 +875,11 @@ def calculate_all_indicators_numpy(
             results['upw'].fill(False)
             results['dnw'].fill(False)
         
+        # RMAs
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
+        # Pivots
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
@@ -904,10 +909,10 @@ def calculate_all_indicators_numpy(
                         f"Skipped pivot calc (price {last_close:.2f} far from range "
                         f"{daily_low:.2f}-{daily_high:.2f})"
                     ) 
-            
         else:
             results['pivots'] = {}
         
+        # Infinity clamping
         for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5']:
             arr = results[key]
             if np.any(np.isinf(arr)):
