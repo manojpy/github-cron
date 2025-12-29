@@ -27,33 +27,27 @@ ARG AOT_STRICT=1
 RUN python aot_build.py && \
     ls -lh macd_aot_compiled*.so 2>/dev/null || \
     if [ "$AOT_STRICT" = "1" ]; then \
-        echo "ERROR: AOT artifact missing" && exit 1; \
+        echo "❌ ERROR: AOT artifact missing" && exit 1; \
     else \
-        echo "JIT fallback allowed (dev build)"; \
+        echo "⚠️ JIT fallback allowed (dev build)"; \
     fi
-
 
 # ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
 
-
-# 1. Install tzdata and set the timezone
 RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
     libtbb12 \
     tzdata \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/src
 
-# Copy Python runtime
+# Copy Python runtime + artifacts
 COPY --from=builder /usr/local /usr/local
-
-# Copy application code and compiled artifacts
 COPY --from=builder /build/src /app/src
-# Copy config to the same directory as scripts for easy access
-COPY --from=builder /build/config_macd.json /app/src/config_macd.json
 
-# Runtime config
+# Runtime config - ADD TCP limits
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -61,9 +55,14 @@ ENV PYTHONPATH=/app/src \
     NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=4 \
     NUMBA_WARNINGS=0 \
-    TZ=Asia/Kolkata
+    TZ=Asia/Kolkata \
+    AIOHTTP_MAX_CONNS=16 \
+    AIOHTTP_CONNS_PER_HOST=12
 
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Execute file directly from src directory
+# Non-root user
+RUN useradd --uid 1000 -m appuser && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["python", "-u", "macd_unified.py"]
