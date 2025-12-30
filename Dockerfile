@@ -1,6 +1,6 @@
 # =============================================================================
 # MULTI-STAGE BUILD: Production-Ready Dockerfile with Layer Optimization
-# Fixes CVE-2025-8869 + Selective Copy + Non-Root Security + SRC FOLDER FIX
+# Fixes CVE-2025-8869 + Selective Copy + Non-Root Security + DOCKER COPY FIX
 # =============================================================================
 
 # ---------- BUILDER STAGE ----------
@@ -28,12 +28,11 @@ RUN uv pip install --system --no-cache-dir -r requirements.txt
 # ✅ FIX 1: Copy aot_build.py from src/ folder (where it actually lives)
 COPY --chown=appuser:appuser src/aot_build.py .
 
-# ✅ FIX 2: Copy ALL Python files from root + src/
+# ✅ FIX 2: Copy ALL Python files from root
 COPY --chown=appuser:appuser *.py .
-COPY --chown=appuser:appuser src/*.py src/ || true
 
-# ✅ OPTIMIZATION 2: Copy entire src folder (minus aot_build.py already copied)
-COPY --chown=appuser:appuser src/ ./src/ || true
+# ✅ FIX 3: Copy entire src folder (Docker handles missing files automatically)
+COPY --chown=appuser:appuser src/ ./src/
 
 # ✅ FEATURE 2: AOT Build with Explicit Verification
 ARG AOT_STRICT=1
