@@ -50,7 +50,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile.txt
+          file: ./Dockerfile
           load: true # Loads into local docker engine instead of pushing
           tags: macd-verify:latest
           build-args: AOT_STRICT=1
