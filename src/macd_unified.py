@@ -3715,7 +3715,8 @@ except ImportError:
 
 if __name__ == "__main__":
     aot_bridge.ensure_initialized()
-    if not aot_bridge.is_using_aot():
+
+    if not aot_bridge.summary_silent()["using_aot"]:
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
         logger.warning("⚠️ Performance will be degraded. First run may be slow.")
