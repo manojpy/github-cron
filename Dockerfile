@@ -1,4 +1,3 @@
-# ---------- BUILDER STAGE ----------
 FROM python:3.11-slim AS builder
 
 # Install compilers and build tools
@@ -8,15 +7,18 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
 
 WORKDIR /build
 
-# Install uv for faster pip installs
-RUN pip install --quiet --no-cache-dir uv
+# Install uv for faster pip installs + upgrade pip (fixes CVE)
+RUN pip install --quiet --no-cache-dir uv && \
+    pip install --upgrade pip==25.3 --quiet
 
 # Copy requirements from ROOT
 COPY requirements.txt .
-RUN uv pip install --system --no-cache-dir --quiet -r requirements.txt
+# ✅ FIXED: Remove --quiet for uv pip compatibility
+RUN uv pip install --system --no-cache-dir -r requirements.txt
 
 # Copy source code: ROOT/src -> /build/src
 COPY src ./src
+
 # Copy config: ROOT/config_macd.json -> /build/config_macd.json
 COPY config_macd.json ./config_macd.json
 
