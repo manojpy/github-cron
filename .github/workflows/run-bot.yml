@@ -23,8 +23,8 @@ jobs:
 
       - name: Setup and Execute Bot
         id: bot_run
-        run: |
-          # 1. Hide the noisy pulling process inside a collapsed group
+        run: | 
+          "🔥Launching Macd Unified🔥🚀"
           echo "::group::🔄 Pulling Latest AOT Image"
           docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
           echo "::endgroup::"
