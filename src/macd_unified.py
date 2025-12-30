@@ -703,9 +703,9 @@ def calculate_magical_momentum_hist(
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-        
+
 def warmup_if_needed() -> None:
-    if aot_bridge.is_using_aot():
+    if aot_bridge.summary_silent()["using_aot"]:
         logger.info("✅ AOT active - no warmup needed")
         return
 
