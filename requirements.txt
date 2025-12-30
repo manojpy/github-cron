@@ -3,7 +3,7 @@
 # =============================================================================
 
 # Async Networking & Performance
-aiohttp[speedups]==3.10.11
+aiohttp[speedups]==3.12.14
 uvloop==0.22.1
 aiodns>=3.0.0
 brotli>=1.0.9
