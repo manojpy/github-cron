@@ -11,85 +11,45 @@ env:
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: read
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: ✅ Create logs directory with correct permissions
-      run: |
-        mkdir -p logs
-        sudo chown -R 1000:1000 logs
-        sudo chmod 755 logs
-        echo "📁 Logs directory ready for appuser (UID 1000)"
+    - name: ✅ Prepare logs
+      run: mkdir -p logs && sudo chown -R 1000:1000 logs
 
-    - name: Inject secrets into secure config
+    - name: 🛡️ Inject Secrets into config_macd.json
+      # This looks for config_macd.json in the ROOT of your repo
       env:
         TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         REDIS: ${{ secrets.REDIS_URL }}
         API_BASE: ${{ secrets.DELTA_API_BASE }}
       run: |
-        jq --arg token "$TOKEN" \
-           --arg chat "$CHAT_ID" \
-           --arg redis "$REDIS" \
-           --arg api "$API_BASE" \
-           '.TELEGRAM_BOT_TOKEN=$token |
-            .TELEGRAM_CHAT_ID=$chat |
-            .REDIS_URL=$redis |
-            .DELTA_API_BASE=$api' \
-           config_macd.json > config_macd.secure.json
+        if [ ! -f "config_macd.json" ]; then echo "❌ Error: config_macd.json not found in root!"; exit 1; fi
+        
+        jq --arg token "$TOKEN" --arg chat "$CHAT_ID" --arg redis "$REDIS" --arg api "$API_BASE" \
+        '.TELEGRAM_BOT_TOKEN=$token | .TELEGRAM_CHAT_ID=$chat | .REDIS_URL=$redis | .DELTA_API_BASE=$api' \
+        config_macd.json > config_macd.secure.json
+        
+        echo "✅ Secure config created."
 
-    - name: Log in to Container registry
+    - name: Log in to registry
       uses: docker/login-action@v3
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 🔥 Run MACD Bot
+    - name: 🔥 Launch Bot
       run: |
-        set +x
-        echo "🔥Launching Macd Unified🔥🚀"
-    
         IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-        docker pull -q "$IMAGE_ID" > /dev/null 2>&1
-    
-        # Run with background + early completion detection
+        
+        # We mount the SECURE version of the config directly over the template in the container
         timeout ${{ env.RUN_TIMEOUT }}s docker run --rm --init \
-          --security-opt=no-new-privileges \
-          --memory=700m \
-          -e NUMBA_THREADING_LAYER=tbb \
-          -e NUMBA_NUM_THREADS=4 \
+          --name macd-bot-instance \
+          --memory=1g \
+          --cpus=2.0 \
           -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
           -v ${{ github.workspace }}/logs:/app/logs \
-          "$IMAGE_ID" 2>&1 | tee bot-output.log &
-
-        DOCKER_PID=$!
-
-        # Poll for completion every 10s (max 60 iterations = 600s)
-        for i in {1..60}; do
-          if ! kill -0 $DOCKER_PID 2>/dev/null; then
-            wait $DOCKER_PID
-            BOT_EXIT_CODE=$?
-            break
-          fi
-          sleep 10
-        done
-
-        if [ $BOT_EXIT_CODE -ne 0 ]; then
-          echo ""
-          echo "❌ Bot failed with exit code $BOT_EXIT_CODE"
-          echo "📄 Full logs saved to bot-output.log"
-          exit $BOT_EXIT_CODE
-        fi
-        echo "✅ Bot completed successfully"
-
-    - name: Cleanup Secrets
-      if: always()
-      run: |
-        rm -f config_macd.secure.json
-        echo "🔒 Secrets wiped from runner."
+          "$IMAGE_ID"
