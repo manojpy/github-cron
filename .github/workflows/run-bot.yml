@@ -41,8 +41,10 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 🔥 Launch Bot
+    - name: 🔥 Run MACD Bot
       run: |
+        set +x
+        echo "🔥Launching Macd Unified🔥🚀"
         IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
         
         # We mount the SECURE version of the config directly over the template in the container
