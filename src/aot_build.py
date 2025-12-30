@@ -64,6 +64,22 @@ def _std_welford_core(close, period, responsiveness):
         sd[i] = np.sqrt(max(0.0, variance)) * resp
     return sd
 
+@njit(nopython=True, cache=True)
+def _min_max_core(arr, period):
+    rows = len(arr)
+    min_arr, max_arr = np.empty(rows), np.empty(rows)
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        min_v, max_v = np.inf, -np.inf
+        for j in range(start, i + 1):
+            v = arr[j]
+            if not np.isnan(v):
+                if v < min_v: min_v = v
+                if v > max_v: max_v = v
+        min_arr[i] = min_v if min_v != np.inf else np.nan
+        max_arr[i] = max_v if max_v != -np.inf else np.nan
+    return min_arr, max_arr
+
 # =========================================================================
 # AOT COMPILATION EXPORTS (23 Functions)
 # =========================================================================
@@ -119,23 +135,11 @@ def compile_module():
 
     @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba(arr, period):
-        rows = len(arr)
-        min_arr, max_arr = np.empty(rows), np.empty(rows)
-        for i in range(rows):
-            start = max(0, i - period + 1)
-            min_v, max_v = np.inf, -np.inf
-            for j in range(start, i + 1):
-                v = arr[j]
-                if not np.isnan(v):
-                    if v < min_v: min_v = v
-                    if v > max_v: max_v = v
-            min_arr[i] = min_v if min_v != np.inf else np.nan
-            max_arr[i] = max_v if max_v != -np.inf else np.nan
-        return min_arr, max_arr
+        return _min_max_core(arr, period)
 
     @cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba_parallel(arr, period):
-        return rolling_min_max_numba(arr, period)
+        return _min_max_core(arr, period)
 
     # 3. EMA & SIGNALS
     @cc.export('ema_loop', 'f8[:](f8[:], f8)')
@@ -218,7 +222,7 @@ def compile_module():
     def vwap_daily_loop(high, low, close, volume, timestamps):
         n = len(close)
         vwap = np.empty(n)
-        c_vol, c_pv, cur_day = -1.0, -1.0, -1
+        c_vol, c_pv, cur_day = 0.0, 0.0, -1
         for i in range(n):
             day = timestamps[i] // 86400
             if day != cur_day: 
