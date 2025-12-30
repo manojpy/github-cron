@@ -58,11 +58,9 @@ jobs:
         IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
         docker pull -q "$IMAGE_ID" > /dev/null 2>&1
         
-        # ✅ CRITICAL: --init for proper signal handling (PID 1 reaper)
-        # ✅ Logs dir pre-created with appuser:1000 permissions
+        # ✅ CORRECT: --init ONLY (tini handles signals perfectly)
         timeout ${{ env.RUN_TIMEOUT }}s docker run --rm --init \
           --memory=700m \
-          --init-retry=3 \
           -e NUMBA_THREADING_LAYER=tbb \
           -e NUMBA_NUM_THREADS=4 \
           -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
@@ -71,7 +69,6 @@ jobs:
 
         BOT_EXIT_CODE=${PIPESTATUS[0]}
 
-        # Only show error details if bot failed
         if [ $BOT_EXIT_CODE -ne 0 ]; then
           echo ""
           echo "❌ Bot failed with exit code $BOT_EXIT_CODE"
