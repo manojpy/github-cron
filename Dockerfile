@@ -21,30 +21,29 @@ RUN pip install --no-cache-dir --upgrade pip>=25.3
 # Install uv for faster pip installs (after pip upgrade)
 RUN pip install --no-cache-dir uv
 
-# ✅ FEATURE 1: Flexible Requirements Copy - handles both root and src/ layouts
+# ✅ FEATURE 1: Copy and install dependencies
 COPY requirements.txt .
-
-# Install dependencies
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# Copy source code: ROOT/src -> /build/src
-COPY src ./src
+# Copy everything from context (includes src/ and optional config)
+COPY . .
 
-# ✅ FEATURE 2: Config File Fallback - copy if exists, skip if not
-COPY config_macd.json . || true
-
-# Verify config location and show status
-RUN if [ -f config_macd.json ]; then \
+# Move src to correct location and handle config
+RUN if [ -d src ]; then \
+        cp -r src/* . && rm -rf src; \
+    fi && \
+    if [ -f config_macd.json ]; then \
         echo "✅ Config file found"; \
     else \
         echo "⚠️  Config not found - runtime mount or env vars required"; \
     fi
 
-WORKDIR /build/src
+WORKDIR /build
 
-# ✅ FEATURE 3: AOT Build with Explicit Verification
+# ✅ FEATURE 2: AOT Build with Explicit Verification
 ARG AOT_STRICT=1
-RUN python aot_build.py && \
+RUN cd /build && \
+    python aot_build.py && \
     ls -lh macd_aot_compiled*.so 2>/dev/null || \
     if [ "$AOT_STRICT" = "1" ]; then \
         echo "❌ ERROR: AOT artifact missing" && exit 1; \
@@ -54,7 +53,7 @@ RUN python aot_build.py && \
 
 # Explicit AOT verification with clear messaging
 RUN if [ "$AOT_STRICT" = "1" ]; then \
-        SO_FILE=$(ls macd_aot_compiled*.so 2>/dev/null | head -1); \
+        SO_FILE=$(ls /build/macd_aot_compiled*.so 2>/dev/null | head -1); \
         if [ -z "$SO_FILE" ]; then \
             echo "❌ FATAL: AOT_STRICT=1 but no .so file found" && exit 1; \
         fi; \
@@ -62,7 +61,7 @@ RUN if [ "$AOT_STRICT" = "1" ]; then \
         if [ "$SO_SIZE" -lt 10000 ]; then \
             echo "❌ FATAL: AOT artifact too small (${SO_SIZE} bytes)" && exit 1; \
         fi; \
-        echo "✅ AOT artifact verified: $SO_FILE ($(echo "scale=1; $SO_SIZE/1024" | bc)KB)"; \
+        echo "✅ AOT artifact verified: $(basename $SO_FILE) ($(echo "scale=1; $SO_SIZE/1024" | bc)KB)"; \
     fi
 
 # ---------- FINAL STAGE ----------
@@ -82,20 +81,18 @@ RUN pip install --no-cache-dir --upgrade pip>=25.3
 
 WORKDIR /app/src
 
-# Copy Python runtime + artifacts from builder
+# Copy Python runtime + all build artifacts from builder
 COPY --from=builder /usr/local /usr/local
-COPY --from=builder /build/src /app/src
+COPY --from=builder /build /app/src
 
-# ✅ FEATURE 4: Runtime Config Copy - only copy if it exists in builder
-COPY --from=builder /build/config_macd.json /app/src/config_macd.json* || true
-
+# ✅ FEATURE 3: Verify config presence
 RUN if [ -f /app/src/config_macd.json ]; then \
         echo "✅ Config copied to runtime image"; \
     else \
         echo "ℹ️  No config in image - expecting volume mount or env vars"; \
     fi
 
-# ✅ FEATURE 5: Enhanced Environment Variables
+# ✅ FEATURE 4: Enhanced Environment Variables
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -111,7 +108,7 @@ ENV PYTHONPATH=/app/src \
 # Set timezone
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# ✅ FEATURE 6: Create non-root user with logs directory
+# ✅ FEATURE 5: Create non-root user with logs directory
 RUN useradd --uid 1000 -m appuser && \
     chown -R appuser:appuser /app && \
     mkdir -p /app/logs && \
@@ -122,11 +119,3 @@ USER appuser
 
 # Default command
 CMD ["python", "-u", "macd_unified.py"]
-
-# Metadata labels for tracking and security
-LABEL maintainer="manoj@yourcompany.com" \
-      version="1.8.0" \
-      description="MACD Unified Trading Bot with AOT Compilation" \
-      security.fixes="CVE-2025-8869" \
-      build.features="flexible-config,aot-verification,enhanced-env,logs-dir" \
-      org.opencontainers.image.source="https://github.com/manojpy/github-cron"
