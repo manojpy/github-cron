@@ -90,25 +90,26 @@ jobs:
           cache-from: type=gha,scope=macd-aot
           cache-to: type=gha,mode=max,scope=macd-aot
 
-
-        - name: 🛡️ Run Trivy vulnerability scanner
+      # Step 4: Run Trivy vulnerability scanner
+      - name: 🛡️ Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'ghcr.io/${{ github.repository }}/macd-unified-aot:latest'
           format: 'sarif'
           output: 'trivy-results.sarif'
-          # Add these to skip the database download logs and version checks:
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
           skip-version-check: true
           quiet: true
 
+      # Step 5: Upload Trivy results
       - name: 📤 Upload Trivy results to GitHub Security
         if: success()
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-results.sarif'
 
+      # Step 6: Cleanup
       - name: 🧹 Cleanup
         if: always()
         run: |
