@@ -54,11 +54,11 @@ jobs:
       run: |
         set +x
         echo "🔥Launching Macd Unified🔥🚀"
-        
+    
         IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
         docker pull -q "$IMAGE_ID" > /dev/null 2>&1
-        
-        # ✅ CORRECT: --init ONLY (tini handles signals perfectly)
+    
+        # Run with background + early completion detection
         timeout ${{ env.RUN_TIMEOUT }}s docker run --rm --init \
           --security-opt=no-new-privileges \
           --memory=700m \
@@ -66,9 +66,19 @@ jobs:
           -e NUMBA_NUM_THREADS=4 \
           -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
           -v ${{ github.workspace }}/logs:/app/logs \
-          "$IMAGE_ID" 2>&1 | tee bot-output.log
+          "$IMAGE_ID" 2>&1 | tee bot-output.log &
 
-        BOT_EXIT_CODE=${PIPESTATUS[0]}
+        DOCKER_PID=$!
+
+        # Poll for completion every 10s (max 60 iterations = 600s)
+        for i in {1..60}; do
+          if ! kill -0 $DOCKER_PID 2>/dev/null; then
+            wait $DOCKER_PID
+            BOT_EXIT_CODE=$?
+            break
+          fi
+          sleep 10
+        done
 
         if [ $BOT_EXIT_CODE -ne 0 ]; then
           echo ""
