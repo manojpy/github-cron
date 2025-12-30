@@ -29,16 +29,6 @@ jobs:
           docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
           echo "::endgroup::"
 
-
-
-- name: Setup and Execute Bot
-  id: bot_run
-  run: |
-    echo "🔥 Launching Macd Unified 🔥🚀"
-    echo "::group::🔄 Pulling Latest AOT Image"
-    docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
-    echo "::endgroup::"
-
           # Run the bot with IST Timezone
           docker run --rm \
             --name macd_bot_container \
