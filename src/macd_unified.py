@@ -3775,7 +3775,7 @@ if __name__ == "__main__":
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
-            logger.info("✅ Bot run completed successfully")
+            #logger.info("✅ Bot run completed successfully")
             sys.exit(0)
         else:
             logger.error("❌ Bot run failed")
