@@ -110,4 +110,4 @@ USER appuser
 RUN mkdir -p /app/logs && echo "📁 Logs ready at /app/logs"
 
 # Default command
-CMD ["python", "-u", "macd_unified.py"]
+CMD ["python", "-u", "macd_unified"]
