@@ -24,15 +24,16 @@ jobs:
       - name: Setup and Execute Bot
         id: bot_run
         run: | 
-          "🔥Launching Macd Unified🔥🚀"
+          echo "🔥 Launching Macd Unified 🔥🚀"
           echo "::group::🔄 Pulling Latest AOT Image"
           docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
           echo "::endgroup::"
 
-          # 2. Run the bot
-          # We capture the output to a file so we can generate a summary later
+          # 2. Run the bot with IST Timezone
+          # -e TZ=Asia/Kolkata sets the container time to IST
           docker run --rm \
             --name macd_bot_container \
+            -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
             -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json \
@@ -41,17 +42,23 @@ jobs:
       - name: Generate Job Summary
         if: always()
         run: |
-          echo "### 🚀 MACD Bot Run Results" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 MACD Bot Run Results (IST)" >> $GITHUB_STEP_SUMMARY
+          
           if grep -q "✅ RUN COMPLETE" bot_output.log; then
+            # Extract metrics from logs
             DURATION=$(grep "Duration:" bot_output.log | awk -F'Duration: ' '{print $2}' | awk '{print $1}')
             ALERTS=$(grep "Alerts:" bot_output.log | awk -F'Alerts: ' '{print $2}' | awk '{print $1}')
+            PAIRS=$(grep "Pairs:" bot_output.log | awk -F'Pairs: ' '{print $2}' | awk '{print $1}')
+            
             echo "| Metric | Status |" >> $GITHUB_STEP_SUMMARY
             echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Timezone** | 🇮🇳 IST (Asia/Kolkata) |" >> $GITHUB_STEP_SUMMARY
             echo "| **AOT Status** | ✅ Active |" >> $GITHUB_STEP_SUMMARY
             echo "| **Execution** | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Pairs Processed** | $PAIRS |" >> $GITHUB_STEP_SUMMARY
             echo "| **Duration** | $DURATION |" >> $GITHUB_STEP_SUMMARY
             echo "| **Alerts Sent** | $ALERTS |" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **Run Failed or Timed Out**" >> $GITHUB_STEP_SUMMARY
-            echo "Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "Please check the 'Setup and Execute Bot' step logs for details." >> $GITHUB_STEP_SUMMARY
           fi
