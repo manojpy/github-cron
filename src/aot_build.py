@@ -2,20 +2,33 @@
 
 import os
 import sys
+import multiprocessing
 from pathlib import Path
 import numpy as np
 from numba.pycc import CC
 from numba import prange
 
-os.environ['NUMBA_OPT'] = '3'
-os.environ['NUMBA_WARNINGS'] = '0'
-os.environ['PYTHONWARNINGS'] = 'ignore'
+os.environ.update({
+    'NUMBA_OPT': '3',
+    'NUMBA_LOOP_VECTORIZE': '1',
+    'NUMBA_CPU_NAME': 'native',  
+    'NUMBA_CPU_FEATURES': '+avx2,+fma',
+    'NUMBA_WARNINGS': '0',
+    'NUMBA_DISABLE_JIT': '0',
+    'OMP_NUM_THREADS': '4',  
+})
 
 def compile_module():
     output_dir = Path(__file__).parent
     cc = CC('macd_aot_compiled')
     cc.output_dir = str(output_dir)
     cc.verbose = False
+    
+    # Enable parallel AOT compilation
+    n_jobs = max(1, multiprocessing.cpu_count() - 1)
+    os.environ['NUMBA_NUM_THREADS'] = str(n_jobs)
+    
+    print(f"Compiling AOT module with {n_jobs} threads...")  
 
     @cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')
     def sanitize_array_numba(arr, default):
