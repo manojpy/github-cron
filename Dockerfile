@@ -1,49 +1,46 @@
+# ---------- BUILDER STAGE ----------
 FROM python:3.11-slim AS builder
+
 RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
-    build-essential git curl && rm -rf /var/lib/apt/lists/*
+    build-essential git curl libtbb12 && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build/src
+WORKDIR /build
 
-COPY requirements.txt ../
+RUN pip install --no-cache-dir uv
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --no-cache-dir -r requirements.txt
 
-RUN pip install --no-cache-dir --upgrade pip>=25.3 && \
-    pip install --no-cache-dir uv && \
-    uv pip install --system --no-cache-dir -r ../requirements.txt
+# Copy source logic AND the root config file
 COPY src/ .
+COPY config_macd.json . 
 
+# AOT Build
 ARG AOT_STRICT=1
 RUN python aot_build.py && \
-    ls -lh macd_aot_compiled*.so 2>/dev/null || \
-    ( [ "$AOT_STRICT" != "1" ] || (echo "❌ AOT missing" && exit 1) )
+    SO_FILE=$(ls macd_aot_compiled*.so 2>/dev/null | head -1) && \
+    if [ -z "$SO_FILE" ] && [ "$AOT_STRICT" = "1" ]; then exit 1; fi
 
+# ---------- FINAL STAGE ----------
 FROM python:3.11-slim AS final
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
-    libtbb12 tzdata ca-certificates bc && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir --upgrade pip>=25.3
+    libtbb12 tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
+
+ENV NUMBA_THREADING_LAYER=tbb \
+    NUMBA_NUM_THREADS=4 \
+    PYTHONUNBUFFERED=1
+
 RUN useradd --uid 1000 -m appuser && mkdir -p /app/{src,logs} && \
     chown -R appuser:appuser /app
 
 WORKDIR /app/src
-COPY --from=builder --chown=appuser:appuser /usr/local /usr/local
-COPY --from=builder --chown=appuser:appuser /build/src/ /app/src/
 
-# 🔧 Cleanup unnecessary files from builder stage
-RUN find /app/src -type f -name "*.pyc" -delete && \
-    find /app/src -type d -name "__pycache__" -exec rm -rf {} + && \
-    rm -rf /app/src/aot_build.py && \
-    du -sh /app/src
-
-RUN ls -la macd_unified.py aot_bridge.py macd_aot_compiled*.so* || echo "Files OK"
-
-ENV PYTHONPATH=/app/src PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
-    NUMBA_CACHE_DIR=/app/src/__pycache__ NUMBA_THREADING_LAYER=tbb \
-    NUMBA_NUM_THREADS=4 NUMBA_WARNINGS=0 NUMBA_OPT=3 TZ=Asia/Kolkata
-
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+# This copies everything from builder's /build (which includes config_macd.json)
+COPY --from=builder --chown=appuser:appuser /build/ /app/src/
 
 USER appuser
 
-RUN mkdir -p /app/logs
-
-CMD ["python", "-u", "macd_unified.py"]
+ENTRYPOINT ["python", "macd_unified.py"]
