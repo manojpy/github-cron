@@ -23,14 +23,13 @@ jobs:
 
       - name: Setup and Execute Bot
         id: bot_run
-        run: | 
+        run: |
           echo "🔥 Launching Macd Unified 🔥🚀"
           echo "::group::🔄 Pulling Latest AOT Image"
           docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
           echo "::endgroup::"
 
-          # 2. Run the bot with IST Timezone
-          # -e TZ=Asia/Kolkata sets the container time to IST
+          # Run the bot with IST Timezone
           docker run --rm \
             --name macd_bot_container \
             -e TZ=Asia/Kolkata \
@@ -45,7 +44,7 @@ jobs:
           echo "### 🚀 MACD Bot Run Results (IST)" >> $GITHUB_STEP_SUMMARY
           
           if grep -q "✅ RUN COMPLETE" bot_output.log; then
-            # Extract metrics from logs
+            # Parsing values from your specific log format
             DURATION=$(grep "Duration:" bot_output.log | awk -F'Duration: ' '{print $2}' | awk '{print $1}')
             ALERTS=$(grep "Alerts:" bot_output.log | awk -F'Alerts: ' '{print $2}' | awk '{print $1}')
             PAIRS=$(grep "Pairs:" bot_output.log | awk -F'Pairs: ' '{print $2}' | awk '{print $1}')
@@ -53,12 +52,11 @@ jobs:
             echo "| Metric | Status |" >> $GITHUB_STEP_SUMMARY
             echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
             echo "| **Timezone** | 🇮🇳 IST (Asia/Kolkata) |" >> $GITHUB_STEP_SUMMARY
-            echo "| **AOT Status** | ✅ Active |" >> $GITHUB_STEP_SUMMARY
             echo "| **Execution** | ✅ Success |" >> $GITHUB_STEP_SUMMARY
             echo "| **Pairs Processed** | $PAIRS |" >> $GITHUB_STEP_SUMMARY
             echo "| **Duration** | $DURATION |" >> $GITHUB_STEP_SUMMARY
             echo "| **Alerts Sent** | $ALERTS |" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **Run Failed or Timed Out**" >> $GITHUB_STEP_SUMMARY
-            echo "Please check the 'Setup and Execute Bot' step logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "Please check the 'Setup and Execute Bot' logs for details." >> $GITHUB_STEP_SUMMARY
           fi
