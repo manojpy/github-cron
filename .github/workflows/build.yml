@@ -90,19 +90,18 @@ jobs:
           cache-from: type=gha,scope=macd-aot
           cache-to: type=gha,mode=max,scope=macd-aot
 
-      # Step 4: Security Scan
-      - name: 🛡️ Run Trivy vulnerability scanner
-        if: success()
+
+        - name: 🛡️ Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          # Use the newly pushed image
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest
+          image-ref: 'ghcr.io/${{ github.repository }}/macd-unified-aot:latest'
           format: 'sarif'
           output: 'trivy-results.sarif'
+          # Add these to skip the database download logs and version checks:
           severity: 'CRITICAL,HIGH'
-          exit-code: '0'           # Note: Change to '1' if you want to block on vulnerabilities
-          ignore-unfixed: true
-          vuln-type: 'os,library'
+          exit-code: '0'
+          skip-version-check: true
+          quiet: true
 
       - name: 📤 Upload Trivy results to GitHub Security
         if: success()

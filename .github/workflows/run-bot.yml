@@ -1,57 +1,57 @@
 name: Run MACD Bot
 
 on:
-  workflow_dispatch:
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  RUN_TIMEOUT: 600
+  workflow_dispatch:      
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: ✅ Prepare logs
-      run: mkdir -p logs && sudo chown -R 1000:1000 logs
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 🛡️ Inject Secrets into config_macd.json
-      # This looks for config_macd.json in the ROOT of your repo
-      env:
-        TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        REDIS: ${{ secrets.REDIS_URL }}
-        API_BASE: ${{ secrets.DELTA_API_BASE }}
-      run: |
-        if [ ! -f "config_macd.json" ]; then echo "❌ Error: config_macd.json not found in root!"; exit 1; fi
-        
-        jq --arg token "$TOKEN" --arg chat "$CHAT_ID" --arg redis "$REDIS" --arg api "$API_BASE" \
-        '.TELEGRAM_BOT_TOKEN=$token | .TELEGRAM_CHAT_ID=$chat | .REDIS_URL=$redis | .DELTA_API_BASE=$api' \
-        config_macd.json > config_macd.secure.json
-        
-        echo "✅ Secure config created."
+      - name: Setup and Execute Bot
+        id: bot_run
+        run: |
+          # 1. Hide the noisy pulling process inside a collapsed group
+          echo "::group::🔄 Pulling Latest AOT Image"
+          docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
+          echo "::endgroup::"
 
-    - name: Log in to registry
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+          # 2. Run the bot
+          # We capture the output to a file so we can generate a summary later
+          docker run --rm \
+            --name macd_bot_container \
+            -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+            -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json \
+            ghcr.io/manojpy/github-cron/macd-unified-aot:latest | tee bot_output.log
 
-    - name: 🔥 Run MACD Bot
-      run: |
-        set +x
-        echo "🔥Launching Macd Unified🔥🚀"
-        IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-        
-        # We mount the SECURE version of the config directly over the template in the container
-        timeout ${{ env.RUN_TIMEOUT }}s docker run --rm --init \
-          --name macd-bot-instance \
-          --memory=1g \
-          --cpus=2.0 \
-          -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
-          -v ${{ github.workspace }}/logs:/app/logs \
-          "$IMAGE_ID"
+      - name: Generate Job Summary
+        if: always()
+        run: |
+          echo "### 🚀 MACD Bot Run Results" >> $GITHUB_STEP_SUMMARY
+          if grep -q "✅ RUN COMPLETE" bot_output.log; then
+            DURATION=$(grep "Duration:" bot_output.log | awk -F'Duration: ' '{print $2}' | awk '{print $1}')
+            ALERTS=$(grep "Alerts:" bot_output.log | awk -F'Alerts: ' '{print $2}' | awk '{print $1}')
+            echo "| Metric | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+            echo "| **AOT Status** | ✅ Active |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Execution** | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Duration** | $DURATION |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Alerts Sent** | $ALERTS |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Run Failed or Timed Out**" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
