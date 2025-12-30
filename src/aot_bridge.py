@@ -1,7 +1,6 @@
 """
 AOT Bridge Module - Zero-Overhead Performance Dispatcher
-Provides O(n) sliding-window JIT fallbacks and hot-swaps them with AOT (.so) 
-during runtime initialization for maximum execution speed.
+Uses leading-underscore naming convention to match existing macd_unified.py imports.
 """
 import importlib.util
 import warnings
@@ -22,11 +21,11 @@ _FALLBACK_REASON = None
 _INITIALIZED = False
 
 # =========================================================================
-# 1. JIT FALLBACKS (Optimized to O(n) to match AOT)
+# 1. JIT FALLBACKS (Optimized O(n) Logic)
 # =========================================================================
 
 @njit(cache=True)
-def sanitize_array_numba(arr, default):
+def _sanitize_array_numba(arr, default):
     out = np.empty_like(arr)
     for i in range(len(arr)):
         val = arr[i]
@@ -34,7 +33,7 @@ def sanitize_array_numba(arr, default):
     return out
 
 @njit(parallel=True, cache=True)
-def sanitize_array_numba_parallel(arr, default):
+def _sanitize_array_numba_parallel(arr, default):
     n = len(arr)
     out = np.empty_like(arr)
     for i in prange(n):
@@ -43,7 +42,7 @@ def sanitize_array_numba_parallel(arr, default):
     return out
 
 @njit(cache=True)
-def sma_loop(data, period):
+def _sma_loop(data, period):
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
@@ -62,19 +61,19 @@ def sma_loop(data, period):
     return out
 
 @njit(parallel=True, cache=True)
-def sma_loop_parallel(data, period):
-    return sma_loop(data, period)
+def _sma_loop_parallel(data, period):
+    return _sma_loop(data, period)
 
 @njit(cache=True)
-def rolling_mean_numba(close, period):
-    return sma_loop(close, period)
+def _rolling_mean_numba(close, period):
+    return _sma_loop(close, period)
 
 @njit(parallel=True, cache=True)
-def rolling_mean_numba_parallel(close, period):
-    return sma_loop(close, period)
+def _rolling_mean_numba_parallel(close, period):
+    return _sma_loop(close, period)
 
 @njit(cache=True)
-def rolling_std_welford(close, period, responsiveness):
+def _rolling_std_welford(close, period, responsiveness):
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -98,11 +97,11 @@ def rolling_std_welford(close, period, responsiveness):
     return sd
 
 @njit(parallel=True, cache=True)
-def rolling_std_welford_parallel(close, period, responsiveness):
-    return rolling_std_welford(close, period, responsiveness)
+def _rolling_std_welford_parallel(close, period, responsiveness):
+    return _rolling_std_welford(close, period, responsiveness)
 
 @njit(cache=True)
-def rolling_min_max_numba(arr, period):
+def _rolling_min_max_numba(arr, period):
     rows = len(arr)
     min_arr, max_arr = np.empty(rows), np.empty(rows)
     for i in range(rows):
@@ -118,11 +117,11 @@ def rolling_min_max_numba(arr, period):
     return min_arr, max_arr
 
 @njit(parallel=True, cache=True)
-def rolling_min_max_numba_parallel(arr, period):
-    return rolling_min_max_numba(arr, period)
+def _rolling_min_max_numba_parallel(arr, period):
+    return _rolling_min_max_numba(arr, period)
 
 @njit(cache=True)
-def ema_loop(data, alpha_or_period):
+def _ema_loop(data, alpha_or_period):
     n = len(data)
     alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
     out = np.empty(n, dtype=np.float64)
@@ -133,25 +132,25 @@ def ema_loop(data, alpha_or_period):
     return out
 
 @njit(cache=True)
-def ema_loop_alpha(data, alpha):
-    return ema_loop(data, alpha)
+def _ema_loop_alpha(data, alpha):
+    return _ema_loop(data, alpha)
 
 @njit(cache=True)
-def calculate_ppo_core(close, fast, slow, signal):
+def _calculate_ppo_core(close, fast, slow, signal):
     n = len(close)
-    f_ma = ema_loop(close, float(fast))
-    s_ma = ema_loop(close, float(slow))
+    f_ma = _ema_loop(close, float(fast))
+    s_ma = _ema_loop(close, float(slow))
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
         if np.isnan(s_ma[i]) or abs(s_ma[i]) < 1e-12:
             ppo[i] = 0.0
         else:
             ppo[i] = ((f_ma[i] - s_ma[i]) / s_ma[i]) * 100.0
-    ppo_sig = ema_loop(ppo, float(signal))
+    ppo_sig = _ema_loop(ppo, float(signal))
     return ppo, ppo_sig
 
 @njit(cache=True)
-def calculate_rsi_core(close, rsi_len):
+def _calculate_rsi_core(close, rsi_len):
     n = len(close)
     alpha = 1.0 / rsi_len
     gain, loss = np.zeros(n), np.zeros(n)
@@ -159,8 +158,8 @@ def calculate_rsi_core(close, rsi_len):
         delta = close[i] - close[i-1]
         if delta > 0: gain[i] = delta
         elif delta < 0: loss[i] = -delta
-    avg_g = ema_loop(gain, alpha)
-    avg_l = ema_loop(loss, alpha)
+    avg_g = _ema_loop(gain, alpha)
+    avg_l = _ema_loop(loss, alpha)
     rsi = np.empty(n)
     for i in range(n):
         if avg_l[i] < 1e-10: rsi[i] = 100.0 if avg_g[i] > 1e-10 else 50.0
@@ -168,7 +167,7 @@ def calculate_rsi_core(close, rsi_len):
     return rsi
 
 @njit(cache=True)
-def rng_filter_loop(x, r):
+def _rng_filter_loop(x, r):
     n = len(x)
     filt = np.empty(n)
     filt[0] = x[0] if not np.isnan(x[0]) else 0.0
@@ -179,16 +178,16 @@ def rng_filter_loop(x, r):
     return filt
 
 @njit(cache=True)
-def smooth_range(close, t, m):
+def _smooth_range(close, t, m):
     n = len(close)
     diff = np.zeros(n)
     for i in range(1, n): diff[i] = abs(close[i] - close[i-1])
-    avrng = ema_loop(diff, float(t))
-    smoothrng = ema_loop(avrng, float(t * 2 - 1))
+    avrng = _ema_loop(diff, float(t))
+    smoothrng = _ema_loop(avrng, float(t * 2 - 1))
     return smoothrng * float(m)
 
 @njit(cache=True)
-def kalman_loop(src, length, R, Q):
+def _kalman_loop(src, length, R, Q):
     n = len(src)
     result = np.empty(n)
     estimate = src[0] if not np.isnan(src[0]) else 0.0
@@ -204,7 +203,7 @@ def kalman_loop(src, length, R, Q):
     return result
 
 @njit(cache=True)
-def vwap_daily_loop(high, low, close, volume, timestamps):
+def _vwap_daily_loop(high, low, close, volume, timestamps):
     n = len(close)
     vwap = np.empty(n)
     c_vol, c_pv, cur_day = 0.0, 0.0, -1
@@ -220,7 +219,7 @@ def vwap_daily_loop(high, low, close, volume, timestamps):
     return vwap
 
 @njit(cache=True)
-def calc_mmh_worm_loop(close_arr, sd_arr, rows):
+def _calc_mmh_worm_loop(close_arr, sd_arr, rows):
     worm = np.empty(rows)
     worm[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
     for i in range(1, rows):
@@ -232,7 +231,7 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     return worm
 
 @njit(cache=True)
-def calc_mmh_value_loop(temp_arr, rows):
+def _calc_mmh_value_loop(temp_arr, rows):
     val = np.zeros(rows)
     val[0] = max(-0.9999, min(0.9999, (temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5) - 0.5))
     for i in range(1, rows):
@@ -242,12 +241,12 @@ def calc_mmh_value_loop(temp_arr, rows):
     return val
 
 @njit(cache=True)
-def calc_mmh_momentum_loop(momentum_arr, rows):
+def _calc_mmh_momentum_loop(momentum_arr, rows):
     for i in range(1, rows): momentum_arr[i] += 0.5 * momentum_arr[i-1]
     return momentum_arr
 
 @njit(cache=True)
-def vectorized_wick_check_buy(o, h, l, c, ratio):
+def _vectorized_wick_check_buy(o, h, l, c, ratio):
     n = len(c)
     res = np.zeros(n, dtype=np.bool_)
     for i in range(n):
@@ -257,7 +256,7 @@ def vectorized_wick_check_buy(o, h, l, c, ratio):
     return res
 
 @njit(cache=True)
-def vectorized_wick_check_sell(o, h, l, c, ratio):
+def _vectorized_wick_check_sell(o, h, l, c, ratio):
     n = len(c)
     res = np.zeros(n, dtype=np.bool_)
     for i in range(n):
@@ -267,10 +266,11 @@ def vectorized_wick_check_sell(o, h, l, c, ratio):
     return res
 
 # =========================================================================
-# 2. INITIALIZATION LOGIC (Hot-Swapping)
+# 2. INITIALIZATION LOGIC (Hot-Swapping to Underscored Names)
 # =========================================================================
 
-_FUNC_NAMES = [
+# List of function names as they appear in the AOT compiled module (macd_aot_compiled)
+_AOT_EXPORT_NAMES = [
     "sanitize_array_numba", "sanitize_array_numba_parallel", "sma_loop", "sma_loop_parallel",
     "rolling_mean_numba", "rolling_mean_numba_parallel", "rolling_std_welford", "rolling_std_welford_parallel",
     "rolling_min_max_numba", "rolling_min_max_numba_parallel", "ema_loop", "ema_loop_alpha",
@@ -288,11 +288,11 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
         import macd_aot_compiled
         _AOT_MODULE = macd_aot_compiled
         
-        # HOT SWAP: Replace the JIT function references with AOT ones
         this_module = sys.modules[__name__]
-        for name in _FUNC_NAMES:
+        for name in _AOT_EXPORT_NAMES:
             if hasattr(_AOT_MODULE, name):
-                setattr(this_module, name, getattr(_AOT_MODULE, name))
+                # Map AOT function (e.g., sma_loop) to local underscored name (e.g., _sma_loop)
+                setattr(this_module, f"_{name}", getattr(_AOT_MODULE, name))
         
         _USING_AOT = True
         return True, None
@@ -311,8 +311,8 @@ def summary_silent() -> dict:
     return {
         "using_aot": _USING_AOT,
         "fallback_reason": _FALLBACK_REASON,
-        "function_count": len(_FUNC_NAMES)
+        "function_count": len(_AOT_EXPORT_NAMES)
     }
 
-# Ensure initialization on import
+# Initialize immediately upon module load
 initialize_aot()
