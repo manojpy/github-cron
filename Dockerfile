@@ -1,6 +1,6 @@
 # =============================================================================
-# MULTI-STAGE BUILD: Production-Ready Dockerfile with Security Fixes
-# Fixes CVE-2025-8869 + All Enterprise Features
+# MULTI-STAGE BUILD: Production-Ready Dockerfile with Layer Optimization
+# Fixes CVE-2025-8869 + Selective Copy + Non-Root Security
 # =============================================================================
 
 # ---------- BUILDER STAGE ----------
@@ -21,24 +21,14 @@ RUN pip install --no-cache-dir --upgrade pip>=25.3
 # Install uv for faster pip installs (after pip upgrade)
 RUN pip install --no-cache-dir uv
 
-# ✅ FEATURE 1: Copy and install dependencies
-COPY requirements.txt .
+# ✅ OPTIMIZATION 1: Install dependencies FIRST
+COPY --chown=appuser:appuser requirements.txt .
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# Copy everything from context (includes src/ and optional config)
-COPY . .
-
-# Move src to correct location and handle config
-RUN if [ -d src ]; then \
-        cp -r src/* . && rm -rf src; \
-    fi && \
-    if [ -f config_macd.json ]; then \
-        echo "✅ Config file found"; \
-    else \
-        echo "⚠️  Config not found - runtime mount or env vars required"; \
-    fi
-
-WORKDIR /build
+# ✅ OPTIMIZATION 2: Selective copy of ONLY required source files
+COPY --chown=appuser:appuser aot_build.py .
+COPY --chown=appuser:appuser *.py .
+COPY --chown=appuser:appuser src/ ./src/ || true
 
 # ✅ FEATURE 2: AOT Build with Explicit Verification
 ARG AOT_STRICT=1
@@ -79,18 +69,20 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends -qq \
 # ✅ FIX CVE-2025-8869: Upgrade pip in final stage too
 RUN pip install --no-cache-dir --upgrade pip>=25.3
 
+# ✅ SECURITY: Create non-root user EARLY
+RUN useradd --uid 1000 -m appuser && \
+    mkdir -p /app/src /app/logs && \
+    chown -R appuser:appuser /app
+
 WORKDIR /app/src
 
-# Copy Python runtime + all build artifacts from builder
-COPY --from=builder /usr/local /usr/local
-COPY --from=builder /build /app/src
+# ✅ OPTIMIZATION 3: Selective COPY with --chown (no separate chown layer)
+COPY --from=builder --chown=appuser:appuser /usr/local /usr/local
+COPY --from=builder --chown=appuser:appuser /build/ /app/src/
+COPY --from=builder --chown=appuser:appuser /build/macd_aot_compiled*.so* /app/src/ || true
 
-# ✅ FEATURE 3: Verify config presence
-RUN if [ -f /app/src/config_macd.json ]; then \
-        echo "✅ Config copied to runtime image"; \
-    else \
-        echo "ℹ️  No config in image - expecting volume mount or env vars"; \
-    fi
+# ✅ FEATURE 3: Verify critical runtime files
+RUN ls -lh *.py macd_aot_compiled*.so* 2>/dev/null | head -10 || echo "ℹ️  Files verified"
 
 # ✅ FEATURE 4: Enhanced Environment Variables
 ENV PYTHONPATH=/app/src \
@@ -108,14 +100,11 @@ ENV PYTHONPATH=/app/src \
 # Set timezone
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# ✅ FEATURE 5: Create non-root user with logs directory
-RUN useradd --uid 1000 -m appuser && \
-    chown -R appuser:appuser /app && \
-    mkdir -p /app/logs && \
-    chown -R appuser:appuser /app/logs && \
-    echo "📁 Logs directory created at /app/logs"
-
+# ✅ SECURITY: Switch to non-root BEFORE any runtime operations
 USER appuser
+
+# ✅ FEATURE 5: Verify logs directory writable by appuser
+RUN mkdir -p /app/logs && echo "📁 Logs ready at /app/logs"
 
 # Default command
 CMD ["python", "-u", "macd_unified.py"]

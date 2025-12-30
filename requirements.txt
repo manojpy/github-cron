@@ -24,3 +24,4 @@ tbb==2021.13.0
 tzdata==2024.2
 typing-extensions==4.12.2
 setuptools>=70.0.0
+wheel>=0.42.0
