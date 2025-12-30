@@ -29,12 +29,23 @@ jobs:
           docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
           echo "::endgroup::"
 
+
+
+- name: Setup and Execute Bot
+  id: bot_run
+  run: |
+    echo "🔥 Launching Macd Unified 🔥🚀"
+    echo "::group::🔄 Pulling Latest AOT Image"
+    docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
+    echo "::endgroup::"
+
           # Run the bot with IST Timezone
           docker run --rm \
             --name macd_bot_container \
             -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -e REDIS_URL=${{ secrets.REDIS_URL }} \
             -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json \
             ghcr.io/manojpy/github-cron/macd-unified-aot:latest | tee bot_output.log
 
