@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
+
 import os
 import sys
 from pathlib import Path
 import numpy as np
 from numba.pycc import CC
 from numba import prange
-
 
 os.environ['NUMBA_OPT'] = '3'
 os.environ['NUMBA_WARNINGS'] = '0'
@@ -101,7 +101,6 @@ def compile_module():
             if np.isnan(curr_r) or np.isnan(curr_x):
                 filt[i] = prev_filt
                 continue
-        
             if curr_x > prev_filt:
                 lower_bound = curr_x - curr_r
                 if lower_bound < prev_filt:
@@ -123,14 +122,12 @@ def compile_module():
         diff[0] = 0.0
         for i in range(1, n):
             diff[i] = abs(close[i] - close[i-1])
-        
         alpha_t = 2.0 / (t + 1.0)
         avrng = np.empty(n, dtype=np.float64)
         avrng[0] = diff[0]
         for i in range(1, n):
             curr = diff[i]
             avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
-        
         wper = t * 2 - 1
         alpha_w = 2.0 / (wper + 1.0)
         smoothrng = np.empty(n, dtype=np.float64)
@@ -138,7 +135,6 @@ def compile_module():
         for i in range(1, n):
             curr = avrng[i]
             smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
-        
         return smoothrng * float(m)
 
     @cc.export('kalman_loop', 'f8[:](f8[:], i4, f8, f8)')
@@ -202,7 +198,6 @@ def compile_module():
         t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
         value_arr[0] = t0 - 0.5
         value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
-        
         for i in range(1, rows):
             prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
@@ -232,10 +227,7 @@ def compile_module():
                     delta = val - mean
                     mean += delta / count
                     m2 += delta * (val - mean)
-            if count > 0:
-                sd[i] = np.sqrt(m2 / count) * resp
-            else:
-                sd[i] = 0.0
+            sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
         return sd
 
     @cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')
@@ -253,10 +245,7 @@ def compile_module():
                     delta = val - mean
                     mean += delta / count
                     m2 += delta * (val - mean)
-            if count > 0:
-                sd[i] = np.sqrt(m2 / count) * resp
-            else:
-                sd[i] = 0.0
+            sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
         return sd
 
     @cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')
@@ -338,7 +327,6 @@ def compile_module():
         slow_ma = np.empty(n, dtype=np.float64)
         fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
         slow_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
-
         for i in range(1, n):
             curr = close[i]
             if np.isnan(curr):
@@ -347,14 +335,12 @@ def compile_module():
             else:
                 fast_ma[i] = fast_alpha * curr + (1 - fast_alpha) * fast_ma[i - 1]
                 slow_ma[i] = slow_alpha * curr + (1 - slow_alpha) * slow_ma[i - 1]
-
         ppo = np.empty(n, dtype=np.float64)
         for i in range(n):
             if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
                 ppo[i] = 0.0
             else:
                 ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-
         sig_alpha = 2.0 / (signal + 1.0)
         ppo_sig = np.empty(n, dtype=np.float64)
         ppo_sig[0] = ppo[0]
@@ -363,7 +349,6 @@ def compile_module():
                 ppo_sig[i] = ppo_sig[i - 1]
             else:
                 ppo_sig[i] = sig_alpha * ppo[i] + (1 - sig_alpha) * ppo_sig[i - 1]
-
         return ppo, ppo_sig
 
     @cc.export('calculate_rsi_core', 'f8[:](f8[:], i4)')
@@ -377,7 +362,6 @@ def compile_module():
                 gain[i] = delta
             elif delta < 0:
                 loss[i] = -delta
-
         alpha = 1.0 / rsi_len
         avg_gain = np.empty(n, dtype=np.float64)
         avg_loss = np.empty(n, dtype=np.float64)
@@ -386,7 +370,6 @@ def compile_module():
         for i in range(1, n):
             avg_gain[i] = alpha * gain[i] + (1 - alpha) * avg_gain[i - 1]
             avg_loss[i] = alpha * loss[i] + (1 - alpha) * avg_loss[i - 1]
-
         rsi = np.empty(n, dtype=np.float64)
         for i in range(n):
             if avg_loss[i] < 1e-10:
@@ -426,11 +409,11 @@ def compile_module():
         cc.compile()
         
         so_files = list(output_dir.glob(f"{cc.name}*.so"))
-        
         if so_files:
             output = so_files[0]
             size_kb = output.stat().st_size / 1024
-            print(f"SUCCESS: AOT compiled {output.name} ({size_kb:.1f} KB)")
+            # ✅ FIX: Print absolute path for debugging Docker copies
+            print(f"SUCCESS: AOT compiled to {output.absolute()} ({size_kb:.1f} KB)")
             return True
         else:
             print("ERROR: No .so file generated")

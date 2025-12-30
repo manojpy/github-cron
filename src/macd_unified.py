@@ -1300,11 +1300,15 @@ class RateLimitedFetcher:
         async with self.lock:
             now = time.time()
             
+            # Clean up old requests
             while self.requests and now - self.requests[0] > 60:
                 self.requests.popleft()
             
             if len(self.requests) >= self.max_per_minute:
-                sleep_time = 60 - (now - self.requests[0])
+                # Calculate sleep time with safety check against negative values
+                wait_needed = 60 - (now - self.requests[0])
+                sleep_time = max(0.0, wait_needed)
+                
                 jitter = random.uniform(0.05, 0.2)
                 total_sleep = sleep_time + jitter
                 
@@ -1318,6 +1322,7 @@ class RateLimitedFetcher:
                 
                 await asyncio.sleep(total_sleep)
                 
+                # Re-clean after sleep
                 now = time.time()
                 while self.requests and now - self.requests[0] > 60:
                     self.requests.popleft()
@@ -1326,7 +1331,7 @@ class RateLimitedFetcher:
         
         async with self.semaphore:
             return await func(*args, **kwargs)
-    
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             "total_waits": self.total_waits,
@@ -1353,9 +1358,10 @@ class APICircuitBreaker:
                 self.failures = 0
                 self.success_count = 0
         elif self.state == "CLOSED":
+            # Gradually decay failure count on successes to "heal" the breaker
             if self.failures > 0:
                 self.failures = max(0, self.failures - 1)
-    
+   
     def record_failure(self) -> None:
         self.failures += 1
         self.last_failure_time = time.time()
@@ -3334,33 +3340,19 @@ async def evaluate_pair_and_alert(
             f"Correlation: {correlation_id}"
         )
         return None
-    
+
     finally:
         PAIR_ID.set("")
-        
-        # ✅ FIXED: Proper cleanup that doesn't cause errors
-        vars_to_cleanup = [
-            'close_15m', 'open_15m', 'timestamps_15m', 
-            'ppo', 'ppo_signal', 'smooth_rsi', 'vwap', 'mmh',
-            'upw', 'dnw', 'rma50_15', 'rma200_5', 'indicators', 'piv'
-        ]
-        
-        for var_name in vars_to_cleanup:
-            try:
-                # Check if variable exists in local scope
-                if var_name in locals() and locals()[var_name] is not None:
-                    # Delete NumPy arrays and dicts to free memory
-                    exec(f"del {var_name}")
-            except (NameError, KeyError):
-                # Variable doesn't exist, skip
-                pass
-            except Exception:
-                # Any other error, log but continue
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"Cleanup warning for {var_name}")
-        
-        # Force garbage collection
-        gc.collect() 
+        try:
+            close_15m = open_15m = timestamps_15m = None
+            data_15m = data_5m = data_daily = None
+            ppo = ppo_signal = smooth_rsi = vwap = mmh = None
+            upw = dnw = rma50_15 = rma200_5 = piv = None
+            indicators = None
+        except Exception:
+            pass
+
+        gc.collect()
 
 async def process_pairs_with_workers(
     fetcher: DataFetcher,

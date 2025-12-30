@@ -1,5 +1,6 @@
 """
 AOT Bridge Module - Complete wrapper coverage for all 23 Numba functions
+
 Provides unified API that automatically uses AOT (.so) when available, falls back to JIT
 """
 import importlib.util
@@ -7,6 +8,7 @@ import warnings
 import pathlib
 import os
 import sys
+import sysconfig
 import logging
 import functools
 import numpy as np
@@ -22,7 +24,6 @@ _AOT_MODULE = None
 _FALLBACK_REASON = None
 _INITIALIZED = False
 
-
 def aot_guard(func_name: str):
     def decorator(jit_func):
         @functools.wraps(jit_func)
@@ -36,22 +37,29 @@ def aot_guard(func_name: str):
         return wrapper
     return decorator
 
-
 def initialize_aot() -> Tuple[bool, Optional[str]]:
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
+    
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             import macd_aot_compiled
             _AOT_MODULE = macd_aot_compiled
         except ImportError:
-            so_path = pathlib.Path(__file__).parent / "macd_aot_compiled.cpython-311-x86_64-linux-gnu.so"
+            # Dynamic suffix detection
+            ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
+            if ext_suffix is None:
+                ext_suffix = '.cpython-311-x86_64-linux-gnu.so'  # Reasonable fallback
+            
+            so_path = pathlib.Path(__file__).parent / f"macd_aot_compiled{ext_suffix}"
+            
             if so_path.exists():
                 try:
                     spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
                     if spec is None or spec.loader is None:
                         _FALLBACK_REASON = "Failed to create module spec"
                         return False, _FALLBACK_REASON
+                    
                     mod = importlib.util.module_from_spec(spec)
                     sys.modules["macd_aot_compiled"] = mod
                     spec.loader.exec_module(mod)
@@ -64,12 +72,20 @@ def initialize_aot() -> Tuple[bool, Optional[str]]:
                 _FALLBACK_REASON = "AOT module not found"
                 logger.warning(f"AOT init failed: {_FALLBACK_REASON}")
                 return False, _FALLBACK_REASON
-
+        
+        # Explicit verification with real test calculation
         try:
-            test_data = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-            _ = _AOT_MODULE.ema_loop(test_data, 3.0)
+            test_data = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+            result = _AOT_MODULE.ema_loop(test_data, 3.0)
+            
+            # Verify result is reasonable (not all NaN, reasonable values)
+            if np.any(np.isnan(result)) or np.allclose(result, 0.0):
+                raise ValueError("AOT ema_loop produced invalid results")
+            
             _USING_AOT = True
+            logger.info("✅ AOT module loaded and verified successfully")
             return True, None
+            
         except Exception as e:
             _FALLBACK_REASON = f"AOT verification failed: {e}"
             _AOT_MODULE = None
@@ -80,19 +96,15 @@ def ensure_initialized() -> bool:
     global _INITIALIZED
     if _INITIALIZED:
         return _USING_AOT
-    
     ok, _ = initialize_aot()
     _INITIALIZED = True
     return ok
 
-
 def is_using_aot() -> bool:
     return _USING_AOT
 
-
 def get_fallback_reason() -> Optional[str]:
     return _FALLBACK_REASON
-
 
 # ============================================================================
 # UNIFIED API - All 23 Functions with AOT/JIT Auto-Selection (decorator applied)
@@ -100,7 +112,7 @@ def get_fallback_reason() -> Optional[str]:
 
 @aot_guard("sanitize_array_numba")
 def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(arr, default):
         out = np.empty_like(arr)
         for i in range(len(arr)):
@@ -111,7 +123,7 @@ def _sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
 
 @aot_guard("sanitize_array_numba_parallel")
 def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True, parallel=True)
+    @_njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(arr, default):
         out = np.empty_like(arr)
         for i in prange(len(arr)):
@@ -122,7 +134,7 @@ def _sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarra
 
 @aot_guard("sma_loop")
 def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(data, period):
         n = len(data)
         out = np.empty(n, dtype=np.float64)
@@ -144,7 +156,7 @@ def _sma_loop(data: np.ndarray, period: int) -> np.ndarray:
 
 @aot_guard("sma_loop_parallel")
 def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True, parallel=True)
+    @_njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(data, period):
         n = len(data)
         out = np.empty(n, dtype=np.float64)
@@ -163,7 +175,7 @@ def _sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
 
 @aot_guard("ema_loop")
 def _ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(data, alpha_or_period):
         n = len(data)
         alpha = 2.0/(alpha_or_period+1.0) if alpha_or_period>1.0 else alpha_or_period
@@ -177,7 +189,7 @@ def _ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
 
 @aot_guard("ema_loop_alpha")
 def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(data, alpha):
         n = len(data)
         out = np.empty(n, dtype=np.float64)
@@ -190,7 +202,7 @@ def _ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 
 @aot_guard("rng_filter_loop")
 def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(x, r):
         n = len(x)
         filt = np.empty(n, dtype=np.float64)
@@ -205,36 +217,29 @@ def _rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
             if curr_x > prev_filt:
                 # Uptrend: x - r < prev ? prev : x - r
                 lower_bound = curr_x - curr_r
-                if lower_bound < prev_filt:
-                    filt[i] = prev_filt
-                else:
-                    filt[i] = lower_bound
+                filt[i] = prev_filt if lower_bound < prev_filt else lower_bound
             else:
+                # Downtrend: x + r > prev ? prev : x + r
                 upper_bound = curr_x + curr_r
-                if upper_bound > prev_filt:
-                    filt[i] = prev_filt
-                else:
-                    filt[i] = upper_bound
+                filt[i] = prev_filt if upper_bound > prev_filt else upper_bound
         return filt
     return _jit(x, r)
 
 @aot_guard("smooth_range")
 def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, t, m):
         n = len(close)
         diff = np.empty(n, dtype=np.float64)
         diff[0] = 0.0
         for i in range(1, n):
             diff[i] = abs(close[i] - close[i-1])
-        
         alpha_t = 2.0 / (t + 1.0)
         avrng = np.empty(n, dtype=np.float64)
         avrng[0] = diff[0]
         for i in range(1, n):
             curr = diff[i]
             avrng[i] = avrng[i-1] if np.isnan(curr) else alpha_t * curr + (1 - alpha_t) * avrng[i-1]
-        
         wper = t * 2 - 1
         alpha_w = 2.0 / (wper + 1.0)
         smoothrng = np.empty(n, dtype=np.float64)
@@ -242,13 +247,12 @@ def _smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
         for i in range(1, n):
             curr = avrng[i]
             smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else alpha_w * curr + (1 - alpha_w) * smoothrng[i-1]
-        
         return smoothrng * float(m)
     return _jit(close, t, m)
 
 @aot_guard("kalman_loop")
 def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(src, length, R, Q):
         n = len(src)
         result = np.empty(n, dtype=np.float64)
@@ -273,8 +277,8 @@ def _kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray
 
 @aot_guard("vwap_daily_loop")
 def _vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                     volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+                    volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(high, low, close, volume, timestamps):
         n = len(close)
         vwap = np.empty(n, dtype=np.float64)
@@ -299,12 +303,11 @@ def _vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray,
 
 @aot_guard("rolling_std_welford")
 def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, period, responsiveness):
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
         resp = max(0.00001, min(1.0, responsiveness))
-        
         for i in range(n):
             mean, m2, count = 0.0, 0.0, 0
             start = max(0, i - period + 1)
@@ -315,22 +318,17 @@ def _rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) 
                     delta = val - mean
                     mean += delta / count
                     m2 += delta * (val - mean)
-            
-            if count > 0:
-                sd[i] = np.sqrt(m2 / count) * resp
-            else:
-                sd[i] = 0.0
+            sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
         return sd
     return _jit(close, period, responsiveness)
 
 @aot_guard("rolling_std_welford_parallel")
 def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True, parallel=True)
+    @_njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(close, period, responsiveness):
         n = len(close)
         sd = np.empty(n, dtype=np.float64)
         resp = max(0.00001, min(1.0, responsiveness))
-        
         for i in prange(n):
             mean, m2, count = 0.0, 0.0, 0
             start = max(0, i - period + 1)
@@ -341,60 +339,48 @@ def _rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness
                     delta = val - mean
                     mean += delta / count
                     m2 += delta * (val - mean)
-            
-            if count > 0:
-                sd[i] = np.sqrt(m2 / count) * resp
-            else:
-                sd[i] = 0.0
+            sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
         return sd
     return _jit(close, period, responsiveness)
 
 @aot_guard("calc_mmh_worm_loop")
 def _calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(close_arr, sd_arr, rows):
         worm_arr = np.empty(rows, dtype=np.float64)
         worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
-        
         for i in range(1, rows):
             src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
             prev_worm = worm_arr[i - 1]
             diff = src - prev_worm
             sd_i = sd_arr[i]
-            
             if np.isnan(sd_i):
                 delta = diff
             else:
                 delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
-            
             worm_arr[i] = prev_worm + delta
-        
         return worm_arr
     return _jit(close_arr, sd_arr, rows)
 
 @aot_guard("calc_mmh_value_loop")
 def _calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(temp_arr, rows):
         value_arr = np.zeros(rows, dtype=np.float64)
-        
         t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
         value_arr[0] = t0 - 0.5
         value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
-        
         for i in range(1, rows):
             prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
             t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-            
             v = t - 0.5 + 0.5 * prev_v
             value_arr[i] = max(-0.9999, min(0.9999, v))
-        
         return value_arr
     return _jit(temp_arr, rows)
 
 @aot_guard("calc_mmh_momentum_loop")
 def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(momentum_arr, rows):
         for i in range(1, rows):
             prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
@@ -404,7 +390,7 @@ def _calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 @aot_guard("rolling_mean_numba")
 def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, period):
         rows = len(close)
         ma = np.empty(rows, dtype=np.float64)
@@ -422,7 +408,7 @@ def _rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
 
 @aot_guard("rolling_mean_numba_parallel")
 def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True, parallel=True)
+    @_njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(close, period):
         rows = len(close)
         ma = np.empty(rows, dtype=np.float64)
@@ -440,7 +426,7 @@ def _rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
 
 @aot_guard("rolling_min_max_numba")
 def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(arr, period):
         rows = len(arr)
         min_arr = np.empty(rows, dtype=np.float64)
@@ -463,7 +449,7 @@ def _rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np
 
 @aot_guard("rolling_min_max_numba_parallel")
 def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    @njit(nogil=True, fastmath=True, cache=True, parallel=True)
+    @_njit(nogil=True, fastmath=True, cache=True, parallel=True)
     def _jit(arr, period):
         rows = len(arr)
         min_arr = np.empty(rows, dtype=np.float64)
@@ -486,7 +472,7 @@ def _rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nd
 
 @aot_guard("calculate_ppo_core")
 def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, fast, slow, signal):
         n = len(close)
         fast_alpha = 2.0 / (fast + 1.0)
@@ -522,7 +508,7 @@ def _calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) ->
 
 @aot_guard("calculate_rsi_core")
 def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(close, rsi_len):
         n = len(close)
         delta = np.zeros(n, dtype=np.float64)
@@ -554,9 +540,9 @@ def _calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
 
 @aot_guard("vectorized_wick_check_buy")
 def _vectorized_wick_check_buy(open_arr: np.ndarray, high_arr: np.ndarray,
-                               low_arr: np.ndarray, close_arr: np.ndarray,
-                               min_wick_ratio: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+                              low_arr: np.ndarray, close_arr: np.ndarray,
+                              min_wick_ratio: float) -> np.ndarray:
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
         n = len(close_arr)
         result = np.zeros(n, dtype=np.bool_)
@@ -577,9 +563,9 @@ def _vectorized_wick_check_buy(open_arr: np.ndarray, high_arr: np.ndarray,
 
 @aot_guard("vectorized_wick_check_sell")
 def _vectorized_wick_check_sell(open_arr: np.ndarray, high_arr: np.ndarray,
-                                low_arr: np.ndarray, close_arr: np.ndarray,
-                                min_wick_ratio: float) -> np.ndarray:
-    @njit(nogil=True, fastmath=True, cache=True)
+                               low_arr: np.ndarray, close_arr: np.ndarray,
+                               min_wick_ratio: float) -> np.ndarray:
+    @_njit(nogil=True, fastmath=True, cache=True)
     def _jit(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
         n = len(close_arr)
         result = np.zeros(n, dtype=np.bool_)
@@ -623,3 +609,6 @@ def summary_silent() -> dict:
         "aot_functions": aot_funcs if _USING_AOT else [],
         "jit_functions": [] if _USING_AOT else aot_funcs,
     }
+
+# Auto-initialize on import for convenience
+ensure_initialized()
