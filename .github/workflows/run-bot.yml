@@ -16,61 +16,72 @@ jobs:
       packages: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Inject secrets into secure config
-        env:
-          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS: ${{ secrets.REDIS_URL }}
-          API_BASE: ${{ secrets.DELTA_API_BASE }}
-        run: |
-          jq --arg token "$TOKEN" \
-             --arg chat "$CHAT_ID" \
-             --arg redis "$REDIS" \
-             --arg api "$API_BASE" \
-             '.TELEGRAM_BOT_TOKEN=$token | 
-              .TELEGRAM_CHAT_ID=$chat | 
-              .REDIS_URL=$redis | 
-              .DELTA_API_BASE=$api' \
-              config_macd.json > config_macd.secure.json
+    - name: ✅ Create logs directory with correct permissions
+      run: |
+        mkdir -p logs
+        sudo chown -R 1000:1000 logs
+        sudo chmod 755 logs
+        echo "📁 Logs directory ready for appuser (UID 1000)"
 
-      - name: Log in to Container registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Inject secrets into secure config
+      env:
+        TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        REDIS: ${{ secrets.REDIS_URL }}
+        API_BASE: ${{ secrets.DELTA_API_BASE }}
+      run: |
+        jq --arg token "$TOKEN" \
+           --arg chat "$CHAT_ID" \
+           --arg redis "$REDIS" \
+           --arg api "$API_BASE" \
+           '.TELEGRAM_BOT_TOKEN=$token |
+            .TELEGRAM_CHAT_ID=$chat |
+            .REDIS_URL=$redis |
+            .DELTA_API_BASE=$api' \
+           config_macd.json > config_macd.secure.json
 
-      - name: Run MACD Bot
-        run: |
-          set +x
-          echo "🔥Launching Macd Unified🔥🚀"
-          
-          IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
-          docker pull -q "$IMAGE_ID" > /dev/null 2>&1
-          
-          # Run bot and capture exit code
-          timeout ${{ env.RUN_TIMEOUT }}s docker run --rm \
-            --memory=700m \
-            -e NUMBA_THREADING_LAYER=tbb \
-            -e NUMBA_NUM_THREADS=4 \
-            -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
-            -v ${{ github.workspace }}/logs:/app/logs \
-            "$IMAGE_ID" 2>&1 | tee bot-output.log
-          
-          BOT_EXIT_CODE=${PIPESTATUS[0]}
-          
-          # Only show error details if bot failed
-          if [ $BOT_EXIT_CODE -ne 0 ]; then
-            echo ""
-            echo "❌ Bot failed with exit code $BOT_EXIT_CODE"
-            exit $BOT_EXIT_CODE
-          fi
+    - name: Log in to Container registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cleanup Secrets
-        if: always()
-        run: |
-          rm -f config_macd.secure.json
-          echo "🔒 Secrets wiped from runner."
+    - name: 🔥 Run MACD Bot
+      run: |
+        set +x
+        echo "🔥Launching Macd Unified🔥🚀"
+        
+        IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot:latest" | tr '[:upper:]' '[:lower:]')
+        docker pull -q "$IMAGE_ID" > /dev/null 2>&1
+        
+        # ✅ CRITICAL: --init for proper signal handling (PID 1 reaper)
+        # ✅ Logs dir pre-created with appuser:1000 permissions
+        timeout ${{ env.RUN_TIMEOUT }}s docker run --rm --init \
+          --memory=700m \
+          --init-retry=3 \
+          -e NUMBA_THREADING_LAYER=tbb \
+          -e NUMBA_NUM_THREADS=4 \
+          -v ${{ github.workspace }}/config_macd.secure.json:/app/src/config_macd.json:ro \
+          -v ${{ github.workspace }}/logs:/app/logs \
+          "$IMAGE_ID" 2>&1 | tee bot-output.log
+
+        BOT_EXIT_CODE=${PIPESTATUS[0]}
+
+        # Only show error details if bot failed
+        if [ $BOT_EXIT_CODE -ne 0 ]; then
+          echo ""
+          echo "❌ Bot failed with exit code $BOT_EXIT_CODE"
+          echo "📄 Full logs saved to bot-output.log"
+          exit $BOT_EXIT_CODE
+        fi
+        echo "✅ Bot completed successfully"
+
+    - name: Cleanup Secrets
+      if: always()
+      run: |
+        rm -f config_macd.secure.json
+        echo "🔒 Secrets wiped from runner."
