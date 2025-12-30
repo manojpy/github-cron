@@ -27,7 +27,6 @@ RUN useradd --uid 1000 -m appuser && mkdir -p /app/{src,logs} && \
 WORKDIR /app/src
 COPY --from=builder --chown=appuser:appuser /usr/local /usr/local
 COPY --from=builder --chown=appuser:appuser /build/src/ /app/src/
-COPY --from=builder --chown=appuser:appuser /build/src/macd_aot_compiled*.so* /app/src/ 2>/dev/null || true
 RUN ls -la macd_unified.py aot_bridge.py macd_aot_compiled*.so* || echo "Files OK"
 
 ENV PYTHONPATH=/app/src PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
