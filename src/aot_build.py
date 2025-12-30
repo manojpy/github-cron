@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import sys
 from pathlib import Path
@@ -7,12 +6,8 @@ import numpy as np
 from numba.pycc import CC
 from numba import njit, prange
 
-os.environ['NUMBA_OPT'] = '3'
-os.environ['NUMBA_WARNINGS'] = '0'
-os.environ['PYTHONWARNINGS'] = 'ignore'
-
 # =========================================================================
-# INTERNAL JIT CORES (Accessible by AOT Compiler)
+# INTERNAL JIT CORES (Essential for AOT Linkage)
 # =========================================================================
 
 @njit(nopython=True, cache=True)
@@ -69,6 +64,10 @@ def _std_welford_core(close, period, responsiveness):
         sd[i] = np.sqrt(max(0.0, variance)) * resp
     return sd
 
+# =========================================================================
+# AOT COMPILATION EXPORTS (23 Functions)
+# =========================================================================
+
 def compile_module():
     output_dir = Path(__file__).parent
     cc = CC('macd_aot_compiled')
@@ -93,7 +92,7 @@ def compile_module():
             out[i] = default if (np.isnan(val) or np.isinf(val)) else val
         return out
 
-    # 2. ROLLING (Using Cores)
+    # 2. ROLLING
     @cc.export('sma_loop', 'f8[:](f8[:], i4)')
     def sma_loop(data, period):
         return _sma_core(data, period)
@@ -136,20 +135,7 @@ def compile_module():
 
     @cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
     def rolling_min_max_numba_parallel(arr, period):
-        # Min/max are already efficiently O(n*k), but we can call it here
-        rows = len(arr)
-        min_arr, max_arr = np.empty(rows), np.empty(rows)
-        for i in range(rows):
-            start = max(0, i - period + 1)
-            min_v, max_v = np.inf, -np.inf
-            for j in range(start, i + 1):
-                v = arr[j]
-                if not np.isnan(v):
-                    if v < min_v: min_v = v
-                    if v > max_v: max_v = v
-            min_arr[i] = min_v if min_v != np.inf else np.nan
-            max_arr[i] = max_v if max_v != -np.inf else np.nan
-        return min_arr, max_arr
+        return rolling_min_max_numba(arr, period)
 
     # 3. EMA & SIGNALS
     @cc.export('ema_loop', 'f8[:](f8[:], f8)')
@@ -232,15 +218,19 @@ def compile_module():
     def vwap_daily_loop(high, low, close, volume, timestamps):
         n = len(close)
         vwap = np.empty(n)
-        c_vol, c_pv, cur_day = 0.0, 0.0, -1
+        c_vol, c_pv, cur_day = -1.0, -1.0, -1
         for i in range(n):
             day = timestamps[i] // 86400
-            if day != cur_day: cur_day, c_vol, c_pv = day, 0.0, 0.0
+            if day != cur_day: 
+                cur_day = day
+                c_vol = 0.0
+                c_pv = 0.0
             if np.isnan(high[i]) or volume[i] <= 0:
                 vwap[i] = vwap[i-1] if i > 0 else close[i]
                 continue
             typical = (high[i] + low[i] + close[i]) / 3.0
-            c_vol += volume[i]; c_pv += typical * volume[i]
+            c_vol += volume[i]
+            c_pv += typical * volume[i]
             vwap[i] = c_pv / c_vol if c_vol > 0 else typical
         return vwap
 
@@ -269,7 +259,8 @@ def compile_module():
 
     @cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i4)')
     def calc_mmh_momentum_loop(momentum_arr, rows):
-        for i in range(1, rows): momentum_arr[i] += 0.5 * momentum_arr[i-1]
+        for i in range(1, rows): 
+            momentum_arr[i] += 0.5 * momentum_arr[i-1]
         return momentum_arr
 
     @cc.export('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')
@@ -293,11 +284,11 @@ def compile_module():
         return res
 
     try:
-        print("Compiling AOT module...")
+        print("🚀 Compiling Performance Module...")
         cc.compile()
         return True
     except Exception as e:
-        print(f"ERROR: Compilation failed: {e}")
+        print(f"❌ ERROR: Compilation failed: {e}")
         return False
 
 if __name__ == '__main__':

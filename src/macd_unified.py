@@ -58,7 +58,8 @@ from aot_bridge import (
     _calculate_ppo_core,
     _calculate_rsi_core,
     _vectorized_wick_check_buy,
-    _vectorized_wick_check_sell
+    _vectorized_wick_check_sell,
+    summary_silent as _summary_silent
 )
 
 try:
