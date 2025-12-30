@@ -60,6 +60,7 @@ jobs:
         
         # ✅ CORRECT: --init ONLY (tini handles signals perfectly)
         timeout ${{ env.RUN_TIMEOUT }}s docker run --rm --init \
+          --security-opt=no-new-privileges \
           --memory=700m \
           -e NUMBA_THREADING_LAYER=tbb \
           -e NUMBA_NUM_THREADS=4 \
