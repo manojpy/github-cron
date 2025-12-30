@@ -1,6 +1,6 @@
 # =============================================================================
 # MULTI-STAGE BUILD: Production-Ready Dockerfile with Layer Optimization
-# Fixes CVE-2025-8869 + Selective Copy + Non-Root Security
+# Fixes CVE-2025-8869 + Selective Copy + Non-Root Security + SRC FOLDER FIX
 # =============================================================================
 
 # ---------- BUILDER STAGE ----------
@@ -25,9 +25,14 @@ RUN pip install --no-cache-dir uv
 COPY --chown=appuser:appuser requirements.txt .
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# ✅ OPTIMIZATION 2: Selective copy of ONLY required source files
-COPY --chown=appuser:appuser aot_build.py .
+# ✅ FIX 1: Copy aot_build.py from src/ folder (where it actually lives)
+COPY --chown=appuser:appuser src/aot_build.py .
+
+# ✅ FIX 2: Copy ALL Python files from root + src/
 COPY --chown=appuser:appuser *.py .
+COPY --chown=appuser:appuser src/*.py src/ || true
+
+# ✅ OPTIMIZATION 2: Copy entire src folder (minus aot_build.py already copied)
 COPY --chown=appuser:appuser src/ ./src/ || true
 
 # ✅ FEATURE 2: AOT Build with Explicit Verification
@@ -79,10 +84,9 @@ WORKDIR /app/src
 # ✅ OPTIMIZATION 3: Selective COPY with --chown (no separate chown layer)
 COPY --from=builder --chown=appuser:appuser /usr/local /usr/local
 COPY --from=builder --chown=appuser:appuser /build/ /app/src/
-COPY --from=builder --chown=appuser:appuser /build/macd_aot_compiled*.so* /app/src/ || true
 
-# ✅ FEATURE 3: Verify critical runtime files
-RUN ls -lh *.py macd_aot_compiled*.so* 2>/dev/null | head -10 || echo "ℹ️  Files verified"
+# ✅ FEATURE 3: Verify critical runtime files + AOT artifacts
+RUN ls -lh *.py macd_aot_compiled*.so* 2>/dev/null | head -10 || echo "ℹ️  Files verified (JIT mode)"
 
 # ✅ FEATURE 4: Enhanced Environment Variables
 ENV PYTHONPATH=/app/src \
