@@ -13,6 +13,7 @@ import sysconfig
 import logging
 import threading
 import platform
+import numba
 import numpy as np
 from numba import njit as _njit, prange
 from typing import Tuple, Optional, Dict, Any
