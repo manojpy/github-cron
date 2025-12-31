@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 480  # 8 minutes (leaves 2min buffer for 10min workflow timeout)
+  BOT_TIMEOUT: 420  # 7 minutes (leaves 3min buffer for 10min workflow timeout)
 
 jobs:
   run-bot:
@@ -114,12 +114,12 @@ jobs:
           timeout ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
-            --memory="800m" \
-            --memory-swap="800m" \
+            --memory="900m" \
+            --memory-swap="900m" \
             --cpus="2.0" \
             --security-opt=no-new-privileges \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=50m \
             -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -156,8 +156,12 @@ jobs:
         if: always()
         id: results
         run: |
+
           LOG_FILE="logs/bot_output.log"
           
+          # Ensure logs are flushed to disk
+          sync
+          sleep 1     
           if [ ! -f "$LOG_FILE" ]; then
             echo "status=error" >> $GITHUB_OUTPUT
             echo "message=Log file not found" >> $GITHUB_OUTPUT

@@ -84,9 +84,7 @@ jobs:
           tags: macd-verify:local
           build-args: |
             AOT_STRICT=1
-          cache-from: |
-            type=gha,scope=macd-aot-deps
-            type=gha,scope=macd-aot-build
+          cache-from: type=gha,scope=macd-aot-build
           cache-to: type=gha,mode=max,scope=macd-aot-build
           outputs: type=docker,dest=/tmp/macd-image.tar
 
@@ -98,7 +96,14 @@ jobs:
           docker load --input /tmp/macd-image.tar
           
           echo "🧪 Running verification suite..."
-          docker run --rm macd-verify:local python -c "
+
+          docker run --rm \
+            --memory="256m" \
+            --cpus="0.5" \
+            --network=none \
+            --read-only \
+            --security-opt=no-new-privileges \
+            macd-verify:local python -c "
           import sys
           import os
           from pathlib import Path
@@ -196,21 +201,25 @@ jobs:
         run: |
           echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ -f trivy-results.sarif ]; then
-            CRITICAL=$(jq '[.runs[].results[] | select(.level=="error")] | length' trivy-results.sarif || echo "0")
-            HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' trivy-results.sarif || echo "0")
-            
+            # Validate SARIF format before parsing
+            if ! jq -e '.runs' trivy-results.sarif > /dev/null 2>&1; then
+              echo "⚠️ Invalid SARIF format, skipping detailed parsing" >> $GITHUB_STEP_SUMMARY
+            else
+              CRITICAL=$(jq '[.runs[].results[] | select(.level=="error")] | length' trivy-results.sarif || echo "0")
+              HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' trivy-results.sarif || echo "0")
             echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
             echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
             echo "| 🔴 Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
             echo "| 🟠 High | $HIGH |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            
-            if [ "$CRITICAL" -gt 0 ]; then
+
+            echo "" >> $GITHUB_STEP_SUMMARY        
+              if [ "$CRITICAL" -gt 0 ]; then
               echo "⚠️ **Action Required:** Critical vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
             else
               echo "✅ No critical vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+              fi
             fi
           else
             echo "⚠️ Trivy results file not found" >> $GITHUB_STEP_SUMMARY
