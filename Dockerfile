@@ -13,7 +13,7 @@ FROM python:3.12-slim-bookworm AS deps-builder
 
 # Copy UV from installer stage
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
-COPY --from=uv-installer /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=uv-installer /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.11/site-packages
 
 # Install build essentials (minimal, cached layer)
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
