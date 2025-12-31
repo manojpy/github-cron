@@ -91,10 +91,12 @@ ENV PYTHONUNBUFFERED=1 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
     PYTHONOPTIMIZE=1
+    MEMORY_LIMIT_BYTES=1000000000
 
 # Labels for metadata
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
       org.opencontainers.image.description="High-performance trading alert bot with AOT compilation" \
       org.opencontainers.image.source="https://github.com/manojpy/github-cron"
+      org.opencontainers.image.memory_limit="1GB" 
 
 CMD ["python", "macd_unified.py"]
