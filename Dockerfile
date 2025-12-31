@@ -3,14 +3,13 @@
 # =============================================================================
 
 # ---------- STAGE 1: UV INSTALLER ----------
-FROM python:3.11-slim-bookworm AS uv-installer
+FROM python:3.12-slim-bookworm AS uv-installer
 
 # Install UV in isolated stage (cached across builds)
 RUN pip install --no-cache-dir uv==0.5.15
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
-FROM python:3.11-slim-bookworm AS deps-builder
-
+FROM python:3.12-slim-bookworm AS deps-builder
 
 # Copy UV from installer stage
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
@@ -45,7 +44,7 @@ RUN echo "🔨 Starting AOT compilation..." && \
     ( [ "$AOT_STRICT" != "1" ] && echo "⚠️ AOT failed, continuing..." || (echo "❌ AOT STRICT mode: Compilation failed" && exit 1) )
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
-FROM python:3.11-slim-bookworm AS final
+FROM python:3.12-slim-bookworm AS final
 
 # Runtime dependencies (minimal)
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
