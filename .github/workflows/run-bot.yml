@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: manojpy/github-cron/macd-unified-aot  # Hardcoded for simplicity
+  IMAGE_NAME: manojpy/github-cron/macd-unified-aot
 
 jobs:
   run-bot:
@@ -43,14 +43,9 @@ jobs:
         echo "🚀 Pulling optimized AOT image: $BOT_IMAGE"
         docker pull --quiet $BOT_IMAGE
         
-        # Fast AOT + runtime verification (~10s)
+        # Fix: Single-line Python command (no indentation issues)
         docker run --rm --entrypoint python $BOT_IMAGE \
-          -c "
-          import aot_bridge; aot_bridge.ensure_initialized();
-          aot_status = aot_bridge.is_using_aot();
-          print(f'✅ AOT Status: {aot_status}');
-          import sys; sys.exit(0)
-          "
+          -c "import aot_bridge; aot_bridge.ensure_initialized(); aot_status = aot_bridge.is_using_aot(); print(f'✅ AOT Status: {aot_status}'); import sys; sys.exit(0)"
 
     # ========== PHASE 3: EXECUTE BOT ==========
     - name: 🚀 Execute Bot (Resource Limited)
