@@ -83,7 +83,7 @@ ENV PYTHONUNBUFFERED=1 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
     PYTHONOPTIMIZE=1 \
-    MEMORY_LIMIT_BYTES= 850000000
+    MEMORY_LIMIT_BYTES=850000000
 
 
 # Health check to verify AOT compilation
