@@ -5,7 +5,7 @@
 # Async Networking & Performance
 aiohttp[speedups]==3.12.14
 uvloop==0.22.1
-aiodns==3.2.0
+aiodns>=3.3.0
 
 # High-Performance Computation
 numpy==2.1.3
