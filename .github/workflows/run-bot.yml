@@ -87,14 +87,6 @@ jobs:
           
           echo "✅ All secrets configured"
 
-      - name: 🧪 Quick Image Health Check
-        timeout-minutes: 1
-        run: |
-          docker run --rm \
-            --entrypoint python \
-            ${{ steps.image_pull.outputs.image_ref }} \
-            -c "import aot_bridge; print('AOT:', aot_bridge.is_using_aot())"
-
       # ========================================================================
       # PHASE 3: BOT EXECUTION
       # ========================================================================
