@@ -10,8 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  BOT_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+  IMAGE_NAME: manojpy/github-cron/macd-unified-aot  # Hardcoded for simplicity
 
 jobs:
   run-bot:
@@ -38,12 +37,14 @@ jobs:
     # ========== PHASE 2: PULL & VERIFY IMAGE ==========
     - name: 🐳 Pull & Verify AOT Image
       id: image-pull
+      env:
+        BOT_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:latest
       run: |
-        echo "🚀 Pulling optimized AOT image..."
-        docker pull --quiet ${{ env.BOT_IMAGE }}
+        echo "🚀 Pulling optimized AOT image: $BOT_IMAGE"
+        docker pull --quiet $BOT_IMAGE
         
         # Fast AOT + runtime verification (~10s)
-        docker run --rm --entrypoint python ${{ env.BOT_IMAGE }} \
+        docker run --rm --entrypoint python $BOT_IMAGE \
           -c "
           import aot_bridge; aot_bridge.ensure_initialized();
           aot_status = aot_bridge.is_using_aot();
@@ -55,17 +56,19 @@ jobs:
     - name: 🚀 Execute Bot (Resource Limited)
       id: bot-run
       env:
+        BOT_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:latest
         DRY_RUN_MODE: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
       run: |
         set -euo pipefail
         
-        # Generate timestamp in shell (fixes YAML syntax error)
+        # Generate timestamp
         TRIGGERTIMESTAMP=$(date -u +%s)
         
         echo "🔥 Starting MACD Unified Bot (AOT) 🔥"
         echo "::group::📊 Bot Execution"
         echo "📅 Trigger: $(date -u)"
         echo "⏰ Timestamp: $TRIGGERTIMESTAMP"
+        echo "🐳 Image: $BOT_IMAGE"
         
         # Create logs dir + tee output
         mkdir -p logs
@@ -83,7 +86,7 @@ jobs:
           -e TRIGGERTIMESTAMP=$TRIGGERTIMESTAMP \
           -v ${{ github.workspace }}/logs:/app/logs \
           -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro \
-          ${{ env.BOT_IMAGE }} 2>&1 | tee "$OUTPUT_FILE"
+          $BOT_IMAGE 2>&1 | tee "$OUTPUT_FILE"
         
         echo "::endgroup::"
         
@@ -118,7 +121,7 @@ jobs:
           echo "| ⏱️ **Duration** | ${{ steps.bot-run.outputs.duration }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🔔 **Alerts** | ${{ steps.bot-run.outputs.alerts }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📈 **Pairs** | ${{ steps.bot-run.outputs.pairs }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🐳 **Image** | `${{ env.BOT_IMAGE }}` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐳 **Image** | `ghcr.io/${{ env.IMAGE_NAME }}:latest` |" >> $GITHUB_STEP_SUMMARY
           echo "| 🌍 **Timezone** | 🇮🇳 Asia/Kolkata |" >> $GITHUB_STEP_SUMMARY
           
           # Latest log preview
