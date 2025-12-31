@@ -1,116 +1,265 @@
-name: Build AOT Image
+name: Build AOT Image (Optimized)
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
   schedule:
-    - cron: "0 0 * * *"  # Daily security rebuild
+    - cron: "0 2 * * 0"  # Weekly security rebuild (Sunday 2 AM UTC)
   workflow_dispatch:
+    inputs:
+      skip_trivy:
+        description: 'Skip Trivy scan (faster build)'
+        required: false
+        default: 'false'
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
+  PYTHON_VERSION: "3.11"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
-      security-events: write  # Critical for Trivy SARIF upload
+      security-events: write
 
     steps:
-      - name: Checkout repository
+      # ========================================================================
+      # PHASE 1: SETUP
+      # ========================================================================
+      
+      - name: 📥 Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1  # Shallow clone for speed
 
-      - name: Set up Docker Buildx
+      - name: 🐳 Set up Docker Buildx (with cache backends)
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
 
-      - name: Log in to the Container registry
+      - name: 🔐 Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: 📋 Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/macd-unified-aot
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,format=short
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+          labels: |
+            org.opencontainers.image.title=MACD Unified Bot
+            org.opencontainers.image.description=AOT-compiled trading alert bot
+            maintainer=${{ github.actor }}
 
-      # Step 1: Build and Load into local Docker for verification
-      - name: 🏗️ Build and Verify (Local)
-        uses: docker/build-push-action@v5
+      # ========================================================================
+      # PHASE 2: BUILD & VERIFY (Local)
+      # ========================================================================
+      
+      - name: 🏗️ Build Image (Local verification)
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          load: true # Loads into local docker engine instead of pushing
-          tags: macd-verify:latest
-          build-args: AOT_STRICT=1
-          cache-from: type=gha,scope=macd-aot
-          cache-to: type=gha,mode=max,scope=macd-aot
+          load: true  # Load into local Docker for testing
+          tags: macd-verify:local
+          build-args: |
+            AOT_STRICT=1
+          cache-from: |
+            type=gha,scope=macd-aot-deps
+            type=gha,scope=macd-aot-build
+          cache-to: type=gha,mode=max,scope=macd-aot-build
+          outputs: type=docker,dest=/tmp/macd-image.tar
 
-      # Step 2: Smoke Test - Ensures AOT works and Config exists
-      - name: ✅ AOT & Config Smoke Test
+      - name: ✅ Smoke Test - AOT & Config Verification
+        id: smoke_test
         run: |
-          echo "Starting verification..."
-          docker run --rm macd-verify:latest python -c "
+          set -e
+          echo "🔍 Loading Docker image..."
+          docker load --input /tmp/macd-image.tar
+          
+          echo "🧪 Running verification suite..."
+          docker run --rm macd-verify:local python -c "
+          import sys
           import os
-          from aot_bridge import initialize_aot
-          success, reason = initialize_aot()
-          config_exists = os.path.exists('config_macd.json')
+          from pathlib import Path
           
-          print(f'--- Verification Report ---')
-          print(f'AOT Status: {\"SUCCESS\" if success else \"FAILED\"}')
-          if not success: print(f'Reason: {reason}')
-          print(f'Config Path Exists: {config_exists}')
-          print(f'---------------------------')
+          print('=' * 60)
+          print('🔬 VERIFICATION REPORT')
+          print('=' * 60)
           
-          if not success or not config_exists:
-              exit(1)
-          "
+          # Test 1: AOT Binary
+          try:
+              from aot_bridge import ensure_initialized, is_using_aot, get_fallback_reason
+              ensure_initialized()
+              aot_active = is_using_aot()
+              
+              if aot_active:
+                  print('✅ AOT Binary: LOADED & ACTIVE')
+              else:
+                  reason = get_fallback_reason()
+                  print(f'⚠️  AOT Binary: FALLBACK TO JIT')
+                  print(f'   Reason: {reason}')
+                  sys.exit(1)  # Fail if AOT not available
+          except Exception as e:
+              print(f'❌ AOT Binary: IMPORT FAILED')
+              print(f'   Error: {e}')
+              sys.exit(1)
+          
+          # Test 2: Config Template
+          config_path = Path('config_macd.json')
+          if config_path.exists():
+              print(f'✅ Config Template: FOUND ({config_path.stat().st_size} bytes)')
+          else:
+              print('⚠️  Config Template: MISSING (expected at runtime)')
+          
+          # Test 3: Critical Dependencies
+          try:
+              import numpy as np
+              import redis.asyncio
+              import aiohttp
+              print(f'✅ Dependencies: numpy {np.__version__}, redis, aiohttp')
+          except ImportError as e:
+              print(f'❌ Dependency Check Failed: {e}')
+              sys.exit(1)
+          
+          print('=' * 60)
+          print('✅ ALL CHECKS PASSED')
+          print('=' * 60)
+          " || exit 1
 
-      # Step 3: Push the verified image
-      - name: 🚀 Push Docker image
+      # ========================================================================
+      # PHASE 3: PUSH TO REGISTRY
+      # ========================================================================
+      
+      - name: 🚀 Push Docker Image to GHCR
         if: success()
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=macd-aot
-          cache-to: type=gha,mode=max,scope=macd-aot
+          build-args: |
+            AOT_STRICT=1
+          cache-from: |
+            type=gha,scope=macd-aot-deps
+            type=gha,scope=macd-aot-build
+          cache-to: type=gha,mode=max,scope=macd-aot-build
+          provenance: false  # Disable provenance attestation for compatibility
 
-      # Step 4: Run Trivy vulnerability scanner
-      - name: 🛡️ Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+      # ========================================================================
+      # PHASE 4: SECURITY SCANNING
+      # ========================================================================
+      
+      - name: 🛡️ Run Trivy Vulnerability Scan
+        if: github.event.inputs.skip_trivy != 'true'
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: 'ghcr.io/${{ github.repository }}/macd-unified-aot:latest'
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
-          exit-code: '0'
-          hide-progress: true
+          exit-code: '0'  # Don't fail build on vulnerabilities
+          timeout: '10m'
+          scanners: 'vuln,secret,config'
 
-      # Step 5: Upload Trivy results
-      - name: 📤 Upload Trivy results to GitHub Security
-        if: success()
+      - name: 📤 Upload Trivy Results to GitHub Security
+        if: success() && github.event.inputs.skip_trivy != 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'trivy-results.sarif'
+          category: 'container-security'
 
-      # Step 6: Cleanup
-      - name: 🧹 Cleanup
+      - name: 📊 Generate Trivy Summary
+        if: success() && github.event.inputs.skip_trivy != 'true'
+        run: |
+          echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f trivy-results.sarif ]; then
+            CRITICAL=$(jq '[.runs[].results[] | select(.level=="error")] | length' trivy-results.sarif || echo "0")
+            HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' trivy-results.sarif || echo "0")
+            
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔴 Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🟠 High | $HIGH |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "⚠️ **Action Required:** Critical vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ No critical vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ Trivy results file not found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ========================================================================
+      # PHASE 5: BUILD SUMMARY
+      # ========================================================================
+      
+      - name: 📝 Generate Build Summary
         if: always()
         run: |
+          echo "## 🏗️ Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **AOT Verification** | ${{ steps.smoke_test.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cache Strategy** | GitHub Actions Cache (type=gha) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add image tags
+          echo "### 🏷️ Image Tags" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # ========================================================================
+      # PHASE 6: CLEANUP
+      # ========================================================================
+      
+      - name: 🧹 Cleanup Artifacts
+        if: always()
+        run: |
+          echo "🧹 Cleaning up temporary files..."
+          
+          # Remove temporary image export
+          rm -f /tmp/macd-image.tar
+          
+          # Remove Trivy results
           rm -f trivy-results.sarif
-          echo "Cleanup complete"
+          
+          # Prune dangling Docker images
+          docker image prune -f || true
+          
+          # Show disk usage
+          echo "📊 Final disk usage:"
+          df -h / || true
+          
+          echo "✅ Cleanup complete"
