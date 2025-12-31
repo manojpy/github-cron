@@ -36,32 +36,30 @@ warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
 from aot_bridge import (
-    _sanitize_array_numba,
-    _sanitize_array_numba_parallel,
-    _sma_loop,
-    _sma_loop_parallel,
-    _ema_loop,
-    _ema_loop_alpha,
-    _kalman_loop,
-    _vwap_daily_loop,
-    _rng_filter_loop,
-    _smooth_range,
-    _calc_mmh_worm_loop,
-    _calc_mmh_value_loop,
-    _calc_mmh_momentum_loop,
-    _rolling_std_welford,
-    _rolling_std_welford_parallel,
-    _rolling_mean_numba,
-    _rolling_mean_numba_parallel,
-    _rolling_min_max_numba,
-    _rolling_min_max_numba_parallel,
-    _calculate_ppo_core,
-    _calculate_rsi_core,
-    _vectorized_wick_check_buy,
-    _vectorized_wick_check_sell,
-    summary_silent as _summary_silent
+    sanitize_array_numba,
+    sanitize_array_numba_parallel,
+    sma_loop,
+    sma_loop_parallel,
+    ema_loop,
+    ema_loop_alpha,
+    kalman_loop,
+    vwap_daily_loop,
+    rng_filter_loop,
+    smooth_range,
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    rolling_std_welford,
+    rolling_std_welford_parallel,
+    rolling_mean_numba,
+    rolling_mean_numba_parallel,
+    rolling_min_max_numba,
+    rolling_min_max_numba_parallel,
+    calculate_ppo_core,
+    calculate_rsi_core,
+    vectorized_wick_check_buy,
+    vectorized_wick_check_sell
 )
-
 try:
     import orjson
     
@@ -546,13 +544,13 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
             logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
             return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
         
-        rsi = _calculate_rsi_core(close, rsi_len)
-        smooth_rsi = _kalman_loop(rsi, kalman_len, 0.01, 0.1)
+        rsi = calculate_rsi_core(close, rsi_len)
+        smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
         if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
-            smooth_rsi = _sanitize_array_numba_parallel(smooth_rsi, 50.0)
+            smooth_rsi = sanitize_array_numba_parallel(smooth_rsi, 50.0)
         else:
-            smooth_rsi = _sanitize_array_numba(smooth_rsi, 50.0)
+            smooth_rsi = sanitize_array_numba(smooth_rsi, 50.0)
         
         return smooth_rsi
         
@@ -567,14 +565,14 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
             default_len = len(close) if close is not None else 1
             return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
         
-        ppo, ppo_sig = _calculate_ppo_core(close, fast, slow, signal)
+        ppo, ppo_sig = calculate_ppo_core(close, fast, slow, signal)
         
         if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
-            ppo = _sanitize_array_numba_parallel(ppo, 0.0)
-            ppo_sig = _sanitize_array_numba_parallel(ppo_sig, 0.0)
+            ppo = sanitize_array_numba_parallel(ppo, 0.0)
+            ppo_sig = sanitize_array_numba_parallel(ppo_sig, 0.0)
         else:
-            ppo = _sanitize_array_numba(ppo, 0.0)
-            ppo_sig = _sanitize_array_numba(ppo_sig, 0.0)
+            ppo = sanitize_array_numba(ppo, 0.0)
+            ppo_sig = sanitize_array_numba(ppo_sig, 0.0)
         
         return ppo, ppo_sig
     except Exception as e:
@@ -588,8 +586,8 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
         if any(x is None or len(x) == 0 for x in [high, low, close, volume, timestamps]):
             return np.zeros_like(close) if close is not None else np.array([0.0])
         
-        vwap = _vwap_daily_loop(high, low, close, volume, timestamps)
-        vwap = _sanitize_array_numba(vwap, default=close[-1] if len(close) > 0 else 0.0)
+        vwap = vwap_daily_loop(high, low, close, volume, timestamps)
+        vwap = sanitize_array_numba(vwap, default=close[-1] if len(close) > 0 else 0.0)
         return vwap
     except Exception as e:
         return np.zeros_like(close) if close is not None else np.array([0.0])
@@ -600,8 +598,8 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
             logger.warning(f"RMA: Insufficient data (len={len(data) if data is not None else 0})")
             return np.zeros_like(data) if data is not None else np.array([0.0])       
         alpha = 1.0 / period
-        rma = _ema_loop_alpha(data, alpha)
-        rma = _sanitize_array_numba(rma, 0.0)
+        rma = ema_loop_alpha(data, alpha)
+        rma = sanitize_array_numba(rma, 0.0)
         return rma       
     except Exception as e:
         logger.error(f"RMA calculation failed: {e}")
@@ -618,11 +616,11 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
                 np.zeros(default_len, dtype=np.float64)
             )
         close = np.asarray(close, dtype=np.float64)
-        smrng_x1 = _smooth_range(close, cfg.X1, cfg.X2)
-        smrng_x2 = _smooth_range(close, cfg.X3, cfg.X4)
+        smrng_x1 = smooth_range(close, cfg.X1, cfg.X2)
+        smrng_x2 = smooth_range(close, cfg.X3, cfg.X4)
         
-        filt_x1 = _rng_filter_loop(close, smrng_x1)
-        filt_x12 = _rng_filter_loop(close, smrng_x2)
+        filt_x1 = rng_filter_loop(close, smrng_x1)
+        filt_x12 = rng_filter_loop(close, smrng_x2)
         
         upw = filt_x1 < filt_x12
         dnw = filt_x1 > filt_x12        
@@ -652,25 +650,25 @@ def calculate_magical_momentum_hist(
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
         if cfg.NUMBA_PARALLEL and rows >= 250:
-            sd = _rolling_std_welford_parallel(close_c, 50, resp_clamped)
+            sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
-            sd = _rolling_std_welford(close_c, 50, resp_clamped)
+            sd = rolling_std_welford(close_c, 50, resp_clamped)
 
-        worm_arr = _calc_mmh_worm_loop(close_c, sd, rows)
+        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
         if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = _rolling_mean_numba_parallel(close_c, period)
+            ma = rolling_mean_numba_parallel(close_c, period)
         else:
-            ma = _rolling_mean_numba(close_c, period)
+            ma = rolling_mean_numba(close_c, period)
 
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         if cfg.NUMBA_PARALLEL and rows >= 250:
-            min_med, max_med = _rolling_min_max_numba_parallel(raw, period)
+            min_med, max_med = rolling_min_max_numba_parallel(raw, period)
         else:
-            min_med, max_med = _rolling_min_max_numba(raw, period)
+            min_med, max_med = rolling_min_max_numba(raw, period)
 
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -682,7 +680,7 @@ def calculate_magical_momentum_hist(
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
 
-        value_arr = _calc_mmh_value_loop(temp, rows)
+        value_arr = calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -694,18 +692,18 @@ def calculate_magical_momentum_hist(
         momentum = np.nan_to_num(momentum, nan=0.0)
 
         momentum_arr = momentum.copy()
-        momentum_arr = _calc_mmh_momentum_loop(momentum_arr, rows)
+        momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
 
-        momentum_arr = _sanitize_array_numba(momentum_arr, 0.0)
+        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
 
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
+        
 def warmup_if_needed() -> None:
-    if aot_bridge.summary_silent()["using_aot"]:
+    if aot_bridge.is_using_aot():
         logger.info("✅ AOT active - no warmup needed")
         return
 
@@ -720,28 +718,28 @@ def warmup_if_needed() -> None:
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
 
-        _ = _ema_loop(test_data, 7.0)
-        _ = _ema_loop_alpha(test_data, 0.2)
-        _ = _sma_loop(test_data, test_int)
-        _ = _sma_loop_parallel(test_data, test_int)
-        _ = _calculate_ppo_core(test_data, 7, 16, 5)
-        _ = _calculate_rsi_core(test_data, 21)
-        _ = _sanitize_array_numba(test_data, 0.0)
-        _ = _rolling_mean_numba(test_data, test_int)
-        _ = _rolling_mean_numba_parallel(test_data, test_int)
-        _ = _rolling_std_welford(test_data, test_int, 0.5)
-        _ = _rolling_std_welford_parallel(test_data, test_int, 0.5)
-        _ = _rolling_min_max_numba(test_data, test_int)
-        _ = _rolling_min_max_numba_parallel(test_data, test_int)
-        _ = _kalman_loop(test_data, 10, 0.1, 0.01)
-        _ = _rng_filter_loop(test_data, test_data2)
-        _ = _smooth_range(test_data, 10, 2)
-        _ = _vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
-        _ = _calc_mmh_worm_loop(test_data, test_data2, len(test_data))
-        _ = _calc_mmh_value_loop(test_data2, len(test_data2))
-        _ = _calc_mmh_momentum_loop(test_data2, len(test_data2))
-        _ = _vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
-        _ = _vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+        _ = ema_loop(test_data, 7.0)
+        _ = ema_loop_alpha(test_data, 0.2)
+        _ = sma_loop(test_data, test_int)
+        _ = sma_loop_parallel(test_data, test_int)
+        _ = calculate_ppo_core(test_data, 7, 16, 5)
+        _ = calculate_rsi_core(test_data, 21)
+        _ = sanitize_array_numba(test_data, 0.0)
+        _ = rolling_mean_numba(test_data, test_int)
+        _ = rolling_mean_numba_parallel(test_data, test_int)
+        _ = rolling_std_welford(test_data, test_int, 0.5)
+        _ = rolling_std_welford_parallel(test_data, test_int, 0.5)
+        _ = rolling_min_max_numba(test_data, test_int)
+        _ = rolling_min_max_numba_parallel(test_data, test_int)
+        _ = kalman_loop(test_data, 10, 0.1, 0.01)
+        _ = rng_filter_loop(test_data, test_data2)
+        _ = smooth_range(test_data, 10, 2)
+        _ = vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
+        _ = calc_mmh_worm_loop(test_data, test_data2, len(test_data))
+        _ = calc_mmh_value_loop(test_data2, len(test_data2))
+        _ = calc_mmh_momentum_loop(test_data2, len(test_data2))
+        _ = vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
+        _ = vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
 
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
@@ -946,7 +944,7 @@ def calculate_all_indicators_numpy(
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray]:
-    buy_quality = _vectorized_wick_check_buy(
+    buy_quality = vectorized_wick_check_buy(
         data_15m["open"],
         data_15m["high"],
         data_15m["low"],
@@ -954,7 +952,7 @@ def precompute_candle_quality(
         Constants.MIN_WICK_RATIO
     )
     
-    sell_quality = _vectorized_wick_check_sell(
+    sell_quality = vectorized_wick_check_sell(
         data_15m["open"],
         data_15m["high"],
         data_15m["low"],
@@ -3715,8 +3713,7 @@ except ImportError:
 
 if __name__ == "__main__":
     aot_bridge.ensure_initialized()
-
-    if not aot_bridge.summary_silent()["using_aot"]:
+    if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
         logger.warning("⚠️ Performance will be degraded. First run may be slow.")
