@@ -96,7 +96,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Labels for metadata
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
       org.opencontainers.image.description="High-performance trading alert bot with AOT compilation" \
-      org.opencontainers.image.source="https://github.com/manojpy/github-cron"
+      org.opencontainers.image.source="https://github.com/manojpy/github-cron" \
       org.opencontainers.image.memory_limit="1GB" 
 
 CMD ["python", "macd_unified.py"]
