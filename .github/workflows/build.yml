@@ -84,9 +84,8 @@ jobs:
           tags: macd-verify:local
           build-args: |
             AOT_STRICT=1
-          cache-from: |
-            type=gha,scope=macd-aot-deps
-            type=gha,scope=macd-aot-build
+
+          cache-from: type=gha,scope=macd-aot-build
           cache-to: type=gha,mode=max,scope=macd-aot-build
           outputs: type=docker,dest=/tmp/macd-image.tar
 

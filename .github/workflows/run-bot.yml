@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 480  # 8 minutes (leaves 2min buffer for 10min workflow timeout)
+  BOT_TIMEOUT: 420  # 7 minutes (leaves 2min buffer for 10min workflow timeout)
 
 jobs:
   run-bot:
@@ -114,8 +114,8 @@ jobs:
           timeout ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
-            --memory="800m" \
-            --memory-swap="800m" \
+            --memory="900m" \
+            --memory-swap="900m" \
             --cpus="2.0" \
             --security-opt=no-new-privileges \
             --read-only \
