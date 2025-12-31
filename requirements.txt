@@ -13,7 +13,7 @@ numba==0.61.0
 
 # Redis & Data Handling
 redis[hiredis]==5.2.1
-hiredis==2.3.2
+hiredis>=3.0.0
 pydantic==2.10.5
 pydantic-settings==2.7.0
 orjson==3.10.12
