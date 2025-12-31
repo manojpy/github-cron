@@ -42,12 +42,12 @@ The bot processes market data, evaluates  conditions, and sends formatted alerts
 ├── README.md
 ├── requirements.txt
 ├── config_macd.json
-├── wrapper.py
+├── logs/.gitkeep
 ├── src/
 │   └── macd_unified.py
 └── .github/
     └── workflows/
-        ├── build-and-push.yml
+        ├── build.yml
         └── run-bot.yml
 ```
 
@@ -56,7 +56,7 @@ The bot processes market data, evaluates  conditions, and sends formatted alerts
 ## ⚙️ How It Works
 
 ### 1️⃣ GitHub Container Build  
-The workflow **build-and-push.yml** automatically builds your Docker image and pushes it to GHCR.
+The workflow **build.yml** automatically builds your Docker image and pushes it to GHCR.
 
 ### 2️⃣ Bot Execution (Triggered Externally)  
 The **run-bot.yml** workflow runs *only when triggered* externally.  
@@ -101,11 +101,6 @@ Accept: application/vnd.github+json
 
 ## 🧠 Main Scripts
 
-### `wrapper.py`
-- Loads config  
-- Fetches market data  
-- Runs strategy  
-- Sends Telegram alerts  
 
 ### `macd_unified.py`
 - Indicator calculation  
