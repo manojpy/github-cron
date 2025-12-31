@@ -32,8 +32,11 @@ RUN uv pip install --system --no-cache -r requirements.txt && \
 # ---------- STAGE 3: AOT COMPILER ----------
 FROM deps-builder AS aot-builder
 
-# Copy ONLY files needed for AOT compilation (minimize cache invalidation)
-COPY src/aot_bridge.py src/aot_build.py ./
+
+# Copy ALL 3 files needed for AOT compilation
+COPY src/aot_bridge.py src/aot_build.py src/numba_functions_shared.py ./  # ✅ ADDED numba_functions_shared.py
+
+WORKDIR /build
 
 # AOT Compilation with strict verification
 ARG AOT_STRICT=1
