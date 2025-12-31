@@ -463,7 +463,13 @@ def compile_module():
         return min_arr, max_arr
 
     # 17. PPO (Percentage Price Oscillator)
-    @cc.export('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)')
+
+    @cc.export(
+        "calculate_ppo_core",
+        types.Tuple((types.float64[:], types.float64[:]))(
+            types.float64[:], types.int32, types.int32, types.int32
+        )
+    )
     def calculate_ppo_core(close, fast, slow, signal):
         """Calculate Percentage Price Oscillator and signal line"""
         n = len(close)
