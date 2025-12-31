@@ -33,8 +33,10 @@ RUN uv pip install --system --no-cache -r requirements.txt && \
 FROM deps-builder AS aot-builder
 
 
-# Copy ALL 3 files needed for AOT compilation
-COPY src/aot_bridge.py src/aot_build.py src/numba_functions_shared.py ./  # ✅ ADDED numba_functions_shared.py
+# ✅ FIXED (separate COPYs)
+COPY src/aot_bridge.py ./
+COPY src/aot_build.py ./
+COPY src/numba_functions_shared.py ./
 
 WORKDIR /build
 
