@@ -78,11 +78,13 @@ COPY --chown=appuser:appuser config_macd.json ./
 USER appuser
 
 # Environment optimization
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
     PYTHONOPTIMIZE=1 \
+    NUMBA_DISABLE_JIT=1 \
     MEMORY_LIMIT_BYTES=850000000
 
 
