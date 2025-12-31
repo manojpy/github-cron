@@ -37,26 +37,27 @@ jobs:
     # ========== PHASE 2: PULL & VERIFY IMAGE ==========
     - name: 🐳 Pull & Verify AOT Image
       id: image-pull
-      env:
-        BOT_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:latest
       run: |
+        BOT_IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:latest"
         echo "🚀 Pulling optimized AOT image: $BOT_IMAGE"
         docker pull --quiet $BOT_IMAGE
         
-        # Fix: Single-line Python command (no indentation issues)
+        # Fast AOT verification
         docker run --rm --entrypoint python $BOT_IMAGE \
           -c "import aot_bridge; aot_bridge.ensure_initialized(); aot_status = aot_bridge.is_using_aot(); print(f'✅ AOT Status: {aot_status}'); import sys; sys.exit(0)"
+        
+        # Export for next steps
+        echo "BOT_IMAGE=$BOT_IMAGE" >> $GITHUB_ENV
 
     # ========== PHASE 3: EXECUTE BOT ==========
     - name: 🚀 Execute Bot (Resource Limited)
       id: bot-run
       env:
-        BOT_IMAGE: ghcr.io/${{ env.IMAGE_NAME }}:latest
         DRY_RUN_MODE: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
       run: |
         set -euo pipefail
         
-        # Generate timestamp
+        # Timestamp (matches original)
         TRIGGERTIMESTAMP=$(date -u +%s)
         
         echo "🔥 Starting MACD Unified Bot (AOT) 🔥"
@@ -65,11 +66,11 @@ jobs:
         echo "⏰ Timestamp: $TRIGGERTIMESTAMP"
         echo "🐳 Image: $BOT_IMAGE"
         
-        # Create logs dir + tee output
+        # Create logs dir + tee output (matches original)
         mkdir -p logs
         OUTPUT_FILE="logs/bot-run-$(date +%Y%m%d-%H%M%S).log"
         
-        # Run with strict resource limits
+        # EXACTLY matches your original working docker run
         docker run --rm \
           --name macd-bot-${{ github.run_id }} \
           --memory=1g --cpus=2 \
@@ -85,7 +86,7 @@ jobs:
         
         echo "::endgroup::"
         
-        # Extract metrics for summary
+        # Extract metrics
         if grep -q "✅ RUN COMPLETE" "$OUTPUT_FILE"; then
           DURATION=$(grep "Duration:" "$OUTPUT_FILE" | awk -F'Duration: ' '{print $2}' | head -1 | awk '{print $1}' || echo "0")
           ALERTS=$(grep "Alerts:" "$OUTPUT_FILE" | awk -F'Alerts: ' '{print $2}' | head -1 | awk '{print $1}' || echo "0")
@@ -119,12 +120,11 @@ jobs:
           echo "| 🐳 **Image** | `ghcr.io/${{ env.IMAGE_NAME }}:latest` |" >> $GITHUB_STEP_SUMMARY
           echo "| 🌍 **Timezone** | 🇮🇳 Asia/Kolkata |" >> $GITHUB_STEP_SUMMARY
           
-          # Latest log preview
           LATEST_LOG=$(ls -t logs/bot-run-*.log 2>/dev/null | head -1)
           if [ -f "$LATEST_LOG" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### 📋 Latest Log Preview" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '```
             tail -15 "$LATEST_LOG" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
