@@ -18,6 +18,8 @@ from numba import njit as _njit, prange
 from typing import Tuple, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+numba.config.CACHE_DIR = None
+
 os.environ['NUMBA_WARNINGS'] = '0'
 
 logger = logging.getLogger("aot_bridge")
