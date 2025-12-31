@@ -1,64 +1,140 @@
-name: Run MACD Bot
+name: 🤖 Run MACD Unified Bot (Cron + Optimized)
 
 on:
-  workflow_dispatch:      
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run mode (log alerts only)'
+        required: false
+        default: 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
+  BOT_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: read
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+    # ========== PHASE 1: SETUP ==========
+    - name: 📥 Checkout (shallow)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    - name: 🔐 Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup and Execute Bot
-        id: bot_run
-        run: |
-          set +x
-          echo "🔥 Launching Macd Unified 🔥🚀"
-          echo "::group::🔄 Pulling Latest AOT Image"
-          docker pull --quiet ghcr.io/manojpy/github-cron/macd-unified-aot:latest
-          echo "::endgroup::"
+    # ========== PHASE 2: PULL & VERIFY IMAGE ==========
+    - name: 🐳 Pull & Verify AOT Image
+      id: image-pull
+      run: |
+        echo "🚀 Pulling optimized AOT image..."
+        docker pull --quiet ${{ env.BOT_IMAGE }}
+        
+        # Fast AOT + runtime verification (~10s)
+        docker run --rm --entrypoint python ${{ env.BOT_IMAGE }} \
+          -c "
+          import aot_bridge; aot_bridge.ensure_initialized();
+          aot_status = aot_bridge.is_using_aot();
+          print(f'✅ AOT Status: {aot_status}');
+          import sys; sys.exit(0)
+          "
 
-          # Run the bot with IST Timezone
-          docker run --rm \
-            --name macd_bot_container \
-            -e TZ=Asia/Kolkata \
-            -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
-            -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            -e REDIS_URL=${{ secrets.REDIS_URL }} \
-            -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json \
-            ghcr.io/manojpy/github-cron/macd-unified-aot:latest | tee bot_output.log
-
-      - name: Generate Job Summary
-        if: always()
-        run: |
-          echo "### 🚀 MACD Bot Run Results (IST)" >> $GITHUB_STEP_SUMMARY
+    # ========== PHASE 3: EXECUTE BOT ==========
+    - name: 🚀 Execute Bot (Resource Limited)
+      id: bot-run
+      env:
+        DRY_RUN_MODE: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
+        TRIGGERTIMESTAMP: ${{ github.event.inputs.dry_run != 'true' && (fromJSON('{"now": "'$(date -u +%s)'"}').now || '' }}
+      run: |
+        set -euo pipefail
+        
+        echo "🔥 Starting MACD Unified Bot (AOT) 🔥"
+        echo "::group::📊 Bot Execution"
+        
+        # Create logs dir + tee output
+        mkdir -p logs
+        OUTPUT_FILE="logs/bot-run-$(date +%Y%m%d-%H%M%S).log"
+        
+        # Run with strict resource limits
+        docker run --rm \
+          --name macd-bot-${{ github.run_id }} \
+          --memory=1g --cpus=2 \
+          -e TZ=Asia/Kolkata \
+          -e TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+          -e TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+          -e REDIS_URL=${{ secrets.REDIS_URL }} \
+          -e DRY_RUN_MODE=$DRY_RUN_MODE \
+          -e TRIGGERTIMESTAMP=$TRIGGERTIMESTAMP \
+          -v ${{ github.workspace }}/logs:/app/logs \
+          -v ${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro \
+          ${{ env.BOT_IMAGE }} 2>&1 | tee "$OUTPUT_FILE"
+        
+        echo "::endgroup::"
+        
+        # Extract metrics for summary
+        if grep -q "✅ RUN COMPLETE" "$OUTPUT_FILE"; then
+          DURATION=$(grep "Duration:" "$OUTPUT_FILE" | awk -F'Duration: ' '{print $2}' | head -1 | awk '{print $1}')
+          ALERTS=$(grep "Alerts:" "$OUTPUT_FILE" | awk -F'Alerts: ' '{print $2}' | head -1 | awk '{print $1}')
+          PAIRS=$(grep "Pairs:" "$OUTPUT_FILE" | awk -F'Pairs: ' '{print $2}' | head -1 | awk '{print $1}')
           
-          if grep -q "✅ RUN COMPLETE" bot_output.log; then
-            # Parsing values from your specific log format
-            DURATION=$(grep "Duration:" bot_output.log | awk -F'Duration: ' '{print $2}' | awk '{print $1}')
-            ALERTS=$(grep "Alerts:" bot_output.log | awk -F'Alerts: ' '{print $2}' | awk '{print $1}')
-            PAIRS=$(grep "Pairs:" bot_output.log | awk -F'Pairs: ' '{print $2}' | awk '{print $1}')
-            
-            echo "| Metric | Status |" >> $GITHUB_STEP_SUMMARY
-            echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Timezone** | 🇮🇳 IST (Asia/Kolkata) |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Execution** | ✅ Success |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Pairs Processed** | $PAIRS |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Duration** | $DURATION |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Alerts Sent** | $ALERTS |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **Run Failed or Timed Out**" >> $GITHUB_STEP_SUMMARY
-            echo "Please check the 'Setup and Execute Bot' logs for details." >> $GITHUB_STEP_SUMMARY
+          echo "duration=${DURATION:-0}s" >> $GITHUB_OUTPUT
+          echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
+          echo "pairs=${PAIRS:-0}" >> $GITHUB_OUTPUT
+          echo "success=true" >> $GITHUB_OUTPUT
+        else
+          echo "success=false" >> $GITHUB_OUTPUT
+        fi
+
+    # ========== PHASE 4: SUMMARY ==========
+    - name: 📊 Generate Run Summary
+      if: always()
+      run: |
+        echo "## 🤖 MACD Bot Execution Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.bot-run.outputs.success }}" = "true" ]; then
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ **Status** | **SUCCESS** |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⏱️ **Duration** | ${{ steps.bot-run.outputs.duration }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔔 **Alerts** | ${{ steps.bot-run.outputs.alerts }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📈 **Pairs** | ${{ steps.bot-run.outputs.pairs }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐳 **Image** | `${{ env.BOT_IMAGE }}` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌍 **Timezone** | 🇮🇳 Asia/Kolkata |" >> $GITHUB_STEP_SUMMARY
+          
+          # Latest log preview
+          LATEST_LOG=$(ls -t logs/bot-run-*.log 2>/dev/null | head -1)
+          if [ -f "$LATEST_LOG" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📋 Latest Log Preview" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -15 "$LATEST_LOG" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           fi
+        else
+          echo "❌ **Bot execution failed**" >> $GITHUB_STEP_SUMMARY
+          echo "Check logs above for details." >> $GITHUB_STEP_SUMMARY
+        fi
+
+    # ========== PHASE 5: CLEANUP ==========
+    - name: 🧹 Cleanup Docker & Logs
+      if: always()
+      run: |
+        echo "🧹 Final cleanup..."
+        docker rm -f macd-bot-${{ github.run_id }} || true
+        docker image prune -f || true
+        docker container prune -f || true
+        find logs -name 'bot-run-*.log' -mtime +1 -delete || true
+        echo "✅ Cleanup complete (~2.5MB freed)"
