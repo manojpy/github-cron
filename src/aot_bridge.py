@@ -12,9 +12,11 @@ import sys
 import sysconfig
 import logging
 import threading
+import platform
 import numpy as np
 from numba import njit as _njit, prange
 from typing import Tuple, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 os.environ['NUMBA_WARNINGS'] = '0'
 
@@ -27,25 +29,129 @@ _FALLBACK_REASON = None
 _INITIALIZED = False
 _INIT_LOCK = threading.Lock()
 
+
+# ----------------------------
+# Parallel verification helpers
+# ----------------------------
+def _test_ema(aot_module) -> bool:
+    arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+    res = aot_module.ema_loop(arr, 3.0)
+    return (
+        res is not None
+        and len(res) == len(arr)
+        and not np.all(np.isnan(res))
+        and not np.any(np.isinf(res))
+    )
+
+def _test_ema_nan(aot_module) -> bool:
+    arr = np.array([np.nan, 2.0, 3.0, np.nan, 5.0], dtype=np.float64)
+    res = aot_module.ema_loop(arr, 3.0)
+    return res is not None and len(res) == len(arr)
+
+def _test_ema_range(aot_module) -> bool:
+    arr = np.array([1e-10, 1e10, 1e-10, 1e5], dtype=np.float64)
+    res = aot_module.ema_loop(arr, 2.0)
+    return res is not None and not np.any(np.isinf(res))
+
+def _test_ema_single(aot_module) -> bool:
+    arr = np.array([42.0], dtype=np.float64)
+    res = aot_module.ema_loop(arr, 1.0)
+    return res is not None and len(res) == 1
+
+def _test_rsi(aot_module) -> bool:
+    arr = np.array([44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.5], dtype=np.float64)
+    res = aot_module.calculate_rsi_core(arr, 14)
+    return res is not None and len(res) == len(arr)
+
+def _test_sanitize(aot_module) -> bool:
+    arr = np.array([1.0, np.nan, np.inf, -np.inf, 5.0], dtype=np.float64)
+    res = aot_module.sanitize_array_numba(arr, 0.0)
+    return (
+        res is not None
+        and len(res) == len(arr)
+        and not np.any(np.isnan(res))
+        and not np.any(np.isinf(res))
+    )
+
+def _test_sma(aot_module) -> bool:
+    arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+    res = aot_module.sma_loop(arr, 3)
+    return res is not None and len(res) == len(arr)
+
+def _test_rolling_std(aot_module) -> bool:
+    arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float64)
+    res = aot_module.rolling_std_welford(arr, 3, 1.0)
+    return res is not None and len(res) == len(arr)
+
+def _test_wick_buy(aot_module) -> bool:
+    o = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    h = np.array([2.0, 3.0, 4.0], dtype=np.float64)
+    l = np.array([0.5, 1.5, 2.5], dtype=np.float64)
+    c = np.array([1.5, 2.5, 3.5], dtype=np.float64)
+    res = aot_module.vectorized_wick_check_buy(o, h, l, c, 0.3)
+    return res is not None and len(res) == len(o)
+
+def _test_empty_ema(aot_module) -> bool:
+    arr = np.array([], dtype=np.float64)
+    try:
+        _ = aot_module.ema_loop(arr, 3.0)
+        return True
+    except Exception:
+        return True  # Acceptable: predictable error is fine
+
+def verify_functions_parallel(aot_module) -> bool:
+    """
+    Run verification tests in parallel threads to reduce startup latency.
+    """
+    tests = [
+        _test_ema,
+        _test_ema_nan,
+        _test_ema_range,
+        _test_ema_single,
+        _test_rsi,
+        _test_sanitize,
+        _test_sma,
+        _test_rolling_std,
+        _test_wick_buy,
+        _test_empty_ema,
+    ]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(4, len(tests))) as executor:
+        future_map = {executor.submit(fn, aot_module): fn.__name__ for fn in tests}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                ok = future.result()
+                if not ok:
+                    logger.warning(f"Verification test failed: {name}")
+                results.append(ok)
+            except Exception as e:
+                logger.warning(f"Verification test {name} raised: {e}")
+                results.append(False)
+
+    return all(results)
+
+
 def initialize_aot() -> Tuple[bool, Optional[Dict[str, Any]]]:
     """
     Initialize AOT module with comprehensive verification and diagnostics
-    
+
     Returns:
         (success: bool, diagnostics: dict or None)
     """
     global _USING_AOT, _AOT_MODULE, _FALLBACK_REASON
-    
+
     diagnostics = {
         'stage': 'import',
         'error': None,
         'function': None,
         'attempted_paths': []
     }
-    
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        
+
         # Try direct import first
         try:
             import macd_aot_compiled
@@ -53,155 +159,73 @@ def initialize_aot() -> Tuple[bool, Optional[Dict[str, Any]]]:
             diagnostics['stage'] = 'direct_import'
         except ImportError as e:
             diagnostics['error'] = str(e)
-            
+
             # Dynamic suffix detection with multiple fallbacks
             ext_suffixes = []
-            
+
             # Primary: get from sysconfig
             primary_suffix = sysconfig.get_config_var('EXT_SUFFIX')
             if primary_suffix:
                 ext_suffixes.append(primary_suffix)
-            
+
             # Fallbacks for common platforms
             fallback_suffixes = [
                 '.cpython-311-x86_64-linux-gnu.so',
                 '.cpython-310-x86_64-linux-gnu.so',
                 '.cpython-39-x86_64-linux-gnu.so',
                 '.cpython-38-x86_64-linux-gnu.so',
-                '.so',  # Generic Linux
+                '.so',   # Generic Linux
                 '.pyd',  # Windows
-                '.dylib',  # macOS
+                '.dylib' # macOS
             ]
             ext_suffixes.extend(fallback_suffixes)
-            
+
             base_path = pathlib.Path(__file__).parent
             loaded = False
-            
+
             for suffix in ext_suffixes:
                 so_path = base_path / f"macd_aot_compiled{suffix}"
                 diagnostics['attempted_paths'].append(str(so_path))
-                
+
                 if so_path.exists():
                     try:
                         spec = importlib.util.spec_from_file_location("macd_aot_compiled", so_path)
                         if spec is None or spec.loader is None:
                             continue
-                        
+
                         mod = importlib.util.module_from_spec(spec)
-                        sys.modules["macd_aot_compiled"] = mod
+                        # Load module first, then cache - prevents corrupt module caching
                         spec.loader.exec_module(mod)
+                        sys.modules["macd_aot_compiled"] = mod
                         _AOT_MODULE = mod
                         diagnostics['stage'] = 'dynamic_load'
                         diagnostics['loaded_path'] = str(so_path)
                         loaded = True
                         break
                     except Exception as load_error:
+                        # Cleanup: Remove from sys.modules if load failed
+                        sys.modules.pop("macd_aot_compiled", None)
                         diagnostics['error'] = f"Load failed for {so_path}: {load_error}"
                         logger.debug(f"Failed to load {so_path}: {load_error}")
                         continue
-            
+
             if not loaded:
                 _FALLBACK_REASON = diagnostics
                 logger.warning(f"AOT module not found. Attempted paths: {diagnostics['attempted_paths']}")
                 return False, diagnostics
-        
-        # Comprehensive verification with multiple test cases
+
+        # Parallel verification
         diagnostics['stage'] = 'verification'
         try:
-            # Test 1: Basic EMA functionality
-            test_data_basic = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
-            result = _AOT_MODULE.ema_loop(test_data_basic, 3.0)
-            
-            if result is None:
-                raise ValueError("ema_loop returned None")
-            if len(result) != len(test_data_basic):
-                raise ValueError(f"ema_loop length mismatch: {len(result)} != {len(test_data_basic)}")
-            if np.all(np.isnan(result)):
-                raise ValueError("ema_loop produced all NaN")
-            if np.any(np.isinf(result)):
-                raise ValueError("ema_loop produced infinity")
-            
-            diagnostics['function'] = 'ema_loop'
-            
-            # Test 2: NaN handling
-            test_data_nan = np.array([np.nan, 2.0, 3.0, np.nan, 5.0], dtype=np.float64)
-            result_nan = _AOT_MODULE.ema_loop(test_data_nan, 3.0)
-            if result_nan is None or len(result_nan) != len(test_data_nan):
-                raise ValueError("ema_loop NaN handling failed")
-            
-            # Test 3: Numeric range test
-            test_data_range = np.array([1e-10, 1e10, 1e-10, 1e5], dtype=np.float64)
-            result_range = _AOT_MODULE.ema_loop(test_data_range, 2.0)
-            if result_range is None or np.any(np.isinf(result_range)):
-                raise ValueError("ema_loop numeric range test failed")
-            
-            # Test 4: Single value edge case
-            test_data_single = np.array([42.0], dtype=np.float64)
-            result_single = _AOT_MODULE.ema_loop(test_data_single, 1.0)
-            if result_single is None or len(result_single) != 1:
-                raise ValueError("ema_loop single value test failed")
-            
-            # Test 5: RSI calculation
-            diagnostics['function'] = 'calculate_rsi_core'
-            test_data_rsi = np.array([44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.5], dtype=np.float64)
-            rsi_result = _AOT_MODULE.calculate_rsi_core(test_data_rsi, 14)
-            
-            if rsi_result is None or len(rsi_result) != len(test_data_rsi):
-                raise ValueError("RSI calculation failed")
-            
-            # Test 6: Sanitize function
-            diagnostics['function'] = 'sanitize_array_numba'
-            test_data_sanitize = np.array([1.0, np.nan, np.inf, -np.inf, 5.0], dtype=np.float64)
-            sanitize_result = _AOT_MODULE.sanitize_array_numba(test_data_sanitize, 0.0)
-            
-            if sanitize_result is None or len(sanitize_result) != len(test_data_sanitize):
-                raise ValueError("Sanitize function failed")
-            
-            if np.any(np.isnan(sanitize_result)) or np.any(np.isinf(sanitize_result)):
-                raise ValueError("Sanitize function did not remove NaN/Inf")
-            
-            # Test 7: SMA calculation
-            diagnostics['function'] = 'sma_loop'
-            test_data_sma = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
-            sma_result = _AOT_MODULE.sma_loop(test_data_sma, 3)
-            
-            if sma_result is None or len(sma_result) != len(test_data_sma):
-                raise ValueError("SMA calculation failed")
-            
-            # Test 8: Rolling std
-            diagnostics['function'] = 'rolling_std_welford'
-            test_data_std = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float64)
-            std_result = _AOT_MODULE.rolling_std_welford(test_data_std, 3, 1.0)
-            
-            if std_result is None or len(std_result) != len(test_data_std):
-                raise ValueError("Rolling std calculation failed")
-            
-            # Test 9: Wick check buy
-            diagnostics['function'] = 'vectorized_wick_check_buy'
-            o = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-            h = np.array([2.0, 3.0, 4.0], dtype=np.float64)
-            l = np.array([0.5, 1.5, 2.5], dtype=np.float64)
-            c = np.array([1.5, 2.5, 3.5], dtype=np.float64)
-            wick_result = _AOT_MODULE.vectorized_wick_check_buy(o, h, l, c, 0.3)
-            
-            if wick_result is None or len(wick_result) != len(o):
-                raise ValueError("Wick check buy failed")
-            
-            # Test 10: Empty array handling
-            diagnostics['function'] = 'ema_loop_empty'
-            empty_arr = np.array([], dtype=np.float64)
-            try:
-                empty_result = _AOT_MODULE.ema_loop(empty_arr, 3.0)
-                # Should either handle gracefully or raise predictable error
-            except Exception:
-                pass  # Expected for empty arrays
-            
+            if not verify_functions_parallel(_AOT_MODULE):
+                raise ValueError("One or more verification tests failed")
+
             _USING_AOT = True
             diagnostics['stage'] = 'success'
             diagnostics['tests_passed'] = 10
-            logger.info("✅ AOT module loaded and verified successfully (10 test cases passed)")
+            logger.info("✅ AOT module loaded and verified successfully (parallel tests passed)")
             return True, diagnostics
-            
+
         except Exception as e:
             _FALLBACK_REASON = {
                 'stage': diagnostics['stage'],
@@ -209,8 +233,10 @@ def initialize_aot() -> Tuple[bool, Optional[Dict[str, Any]]]:
                 'error': str(e)
             }
             _AOT_MODULE = None
-            logger.warning(f"AOT verification failed at stage '{diagnostics['stage']}' "
-                          f"on function '{diagnostics.get('function')}': {e}")
+            logger.warning(
+                f"AOT verification failed at stage '{diagnostics['stage']}' "
+                f"on function '{diagnostics.get('function')}': {e}"
+            )
             return False, _FALLBACK_REASON
 
 def ensure_initialized() -> bool:

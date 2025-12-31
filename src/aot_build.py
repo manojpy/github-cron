@@ -13,7 +13,7 @@ import multiprocessing
 from pathlib import Path
 import numpy as np
 from numba.pycc import CC
-from numba import prange
+from numba import prange, types
 
 # Aggressive optimization flags
 os.environ.update({
@@ -37,9 +37,11 @@ def get_output_filename(base_name: str) -> str:
     Returns:
         Full filename with platform-specific extension
     """
+
     ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
     
-    if ext_suffix is None:
+    # Check for None, empty string, or other falsy values
+    if not ext_suffix:
         # Fallback for different platforms
         import platform
         system = platform.system()
@@ -407,7 +409,10 @@ def compile_module():
         return ma
 
     # 15. Rolling min/max
-    @cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
+    @cc.export(
+        'rolling_min_max_numba',
+        types.Tuple((types.float64[:], types.float64[:]))(types.float64[:], types.int32)
+    )
     def rolling_min_max_numba(arr, period):
         """Rolling minimum and maximum values"""
         rows = len(arr)
@@ -431,7 +436,10 @@ def compile_module():
         return min_arr, max_arr
 
     # 16. Rolling min/max (parallel)
-    @cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')
+    @cc.export(
+        'rolling_min_max_numba_parallel',
+        types.Tuple((types.float64[:], types.float64[:]))(types.float64[:], types.int32)
+    )
     def rolling_min_max_numba_parallel(arr, period):
         """Rolling minimum and maximum values (parallel)"""
         rows = len(arr)
