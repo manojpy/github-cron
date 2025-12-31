@@ -56,12 +56,16 @@ jobs:
       id: bot-run
       env:
         DRY_RUN_MODE: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
-        TRIGGERTIMESTAMP: ${{ github.event.inputs.dry_run != 'true' && (fromJSON('{"now": "'$(date -u +%s)'"}').now || '' }}
       run: |
         set -euo pipefail
         
+        # Generate timestamp in shell (fixes YAML syntax error)
+        TRIGGERTIMESTAMP=$(date -u +%s)
+        
         echo "🔥 Starting MACD Unified Bot (AOT) 🔥"
         echo "::group::📊 Bot Execution"
+        echo "📅 Trigger: $(date -u)"
+        echo "⏰ Timestamp: $TRIGGERTIMESTAMP"
         
         # Create logs dir + tee output
         mkdir -p logs
@@ -85,15 +89,18 @@ jobs:
         
         # Extract metrics for summary
         if grep -q "✅ RUN COMPLETE" "$OUTPUT_FILE"; then
-          DURATION=$(grep "Duration:" "$OUTPUT_FILE" | awk -F'Duration: ' '{print $2}' | head -1 | awk '{print $1}')
-          ALERTS=$(grep "Alerts:" "$OUTPUT_FILE" | awk -F'Alerts: ' '{print $2}' | head -1 | awk '{print $1}')
-          PAIRS=$(grep "Pairs:" "$OUTPUT_FILE" | awk -F'Pairs: ' '{print $2}' | head -1 | awk '{print $1}')
+          DURATION=$(grep "Duration:" "$OUTPUT_FILE" | awk -F'Duration: ' '{print $2}' | head -1 | awk '{print $1}' || echo "0")
+          ALERTS=$(grep "Alerts:" "$OUTPUT_FILE" | awk -F'Alerts: ' '{print $2}' | head -1 | awk '{print $1}' || echo "0")
+          PAIRS=$(grep "Pairs:" "$OUTPUT_FILE" | awk -F'Pairs: ' '{print $2}' | head -1 | awk '{print $1}' || echo "0")
           
-          echo "duration=${DURATION:-0}s" >> $GITHUB_OUTPUT
-          echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
-          echo "pairs=${PAIRS:-0}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}s" >> $GITHUB_OUTPUT
+          echo "alerts=${ALERTS}" >> $GITHUB_OUTPUT
+          echo "pairs=${PAIRS}" >> $GITHUB_OUTPUT
           echo "success=true" >> $GITHUB_OUTPUT
         else
+          echo "duration=0s" >> $GITHUB_OUTPUT
+          echo "alerts=0" >> $GITHUB_OUTPUT
+          echo "pairs=0" >> $GITHUB_OUTPUT
           echo "success=false" >> $GITHUB_OUTPUT
         fi
 
