@@ -79,12 +79,6 @@ COPY --chown=appuser:appuser config_macd.json ./
 
 USER appuser
 
-# Health check: Verify AOT binary loads
-RUN python -c "import sys; import aot_bridge; aot_bridge.ensure_initialized(); \
-    aot_ok = aot_bridge.is_using_aot(); \
-    print('✅ AOT Runtime Check: PASS' if aot_ok else '⚠️ AOT unavailable (JIT fallback)'); \
-    sys.exit(0 if aot_ok else 0)"  # Exit 0 even on JIT fallback for flexibility
-
 # Environment optimization
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
