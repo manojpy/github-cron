@@ -1,4 +1,4 @@
-name: 🤖 Run MACD Unified Bot (Cron-Optimized)
+name: 🤖 Run MACD Unified Bot
 
 on:
   workflow_dispatch:
