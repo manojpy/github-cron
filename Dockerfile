@@ -32,7 +32,6 @@ RUN uv pip install --system --no-cache -r requirements.txt && \
 # ---------- STAGE 3: AOT COMPILER ----------
 FROM deps-builder AS aot-builder
 
-
 # ✅ FIXED (separate COPYs)
 COPY src/aot_bridge.py ./
 COPY src/aot_build.py ./
@@ -74,8 +73,10 @@ COPY --from=deps-builder /usr/local/lib/python3.12/site-packages /usr/local/lib/
 # Copy AOT binary from aot-builder
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled*.so ./
 
-# Copy application source files (single layer for efficiency)
-COPY --chown=appuser:appuser src/*.py ./
+# Copy application source files (separate layers for better caching)
+COPY --chown=appuser:appuser src/__init__.py ./
+COPY --chown=appuser:appuser src/aot_bridge.py ./
+COPY --chown=appuser:appuser src/macd_unified.py ./
 
 # Copy config template (will be overridden at runtime by volume mount)
 COPY --chown=appuser:appuser config_macd.json ./
@@ -83,19 +84,12 @@ COPY --chown=appuser:appuser config_macd.json ./
 USER appuser
 
 # Environment optimization
-
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
     PYTHONOPTIMIZE=1 \
-    NUMBA_DISABLE_JIT=1 \
-    MEMORY_LIMIT_BYTES=850000000
-
-
-# Health check to verify AOT compilation
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=2 \
-  CMD python -c "import aot_bridge; assert aot_bridge.is_using_aot()" || exit 1
+    MEMORY_LIMIT_BYTES=1000000000
 
 # Labels for metadata
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
