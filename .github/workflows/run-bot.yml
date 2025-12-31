@@ -31,17 +31,15 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 🐳 Pull & Verify AOT Image
+
+    - name: 🐳 Pull AOT Image (Cached)
       id: image-pull
       run: |
-        BOT_IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:latest"
-        echo "🚀 Pulling latest AOT image..."
+        BOT_IMAGE="ghcr.io/manojpy/github-cron/macd-unified-aot:latest"
+        echo "🚀 Pulling AOT image (cached)..."
+    
         docker pull --quiet $BOT_IMAGE
-        
-        # Verify AOT
-        docker run --rm --entrypoint python $BOT_IMAGE \
-          -c "import aot_bridge; aot_bridge.ensure_initialized(); print('✅ AOT OK:', aot_bridge.is_using_aot())"
-        
+    
         echo "BOT_IMAGE=$BOT_IMAGE" >> $GITHUB_ENV
 
     - name: 🚀 Setup and Execute Bot
