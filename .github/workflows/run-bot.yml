@@ -144,13 +144,10 @@ jobs:
             -e DRY_RUN_MODE="$DRY_RUN" \
             -e PYTHONUNBUFFERED=1 \
             -e NUMBA_NUM_THREADS=2 \
-            -e NUMBA_DISABLE_JIT=0 \
-            -e OMP_NUM_THREADS=2 \
-             -v "$(pwd)/logs:/app/logs:rw" \
             -e OMP_NUM_THREADS=2 \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
-
+          
           EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
