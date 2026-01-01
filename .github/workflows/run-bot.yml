@@ -97,7 +97,6 @@ jobs:
           
           echo "✅ All secrets configured"
 
-
 # ✅ ADD: Pre-flight healthcheck
       - name: 🏥 Pre-Flight Healthcheck
         run: |
@@ -108,11 +107,9 @@ jobs:
             --memory="200m" \
             --cpus="1.0" \
             ${{ steps.image_pull.outputs.image_ref }} \
-            python -c "
-import aot_bridge
-assert aot_bridge.is_using_aot(), 'AOT not loaded'
-print('✅ AOT verification passed')
-" || exit 1
+            python -c "import aot_bridge; \
+assert aot_bridge.is_using_aot(), 'AOT not loaded'; \
+print('✅ AOT verification passed')" || exit 1
           
           echo "✅ Healthcheck passed"
 
