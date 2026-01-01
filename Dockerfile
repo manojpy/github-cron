@@ -32,8 +32,15 @@ RUN uv pip install --system --no-cache -r requirements.txt && \
 # ---------- STAGE 3: AOT COMPILER ----------
 FROM deps-builder AS aot-builder
 
-# ✅ Copy ALL Python files at once
-COPY src/*.py ./
+# ✅ Copy in order of change frequency:
+COPY src/numba_functions_shared.py ./
+COPY src/aot_build.py ./
+COPY src/aot_bridge.py ./
+COPY src/macd_unified.py ./
+
+RUN ls -la *.py && \
+    test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
+    test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
 
 WORKDIR /build
 
@@ -71,10 +78,12 @@ COPY --from=deps-builder /usr/local/lib/python3.12/site-packages /usr/local/lib/
 # Copy AOT binary from aot-builder
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled*.so ./
 
-# Copy application source files (separate layers for better caching)
-COPY --chown=appuser:appuser src/*.py ./
+# ✅ Copy in order of change frequency (maximize cache hits)
+COPY --chown=appuser:appuser src/numba_functions_shared.py ./
+COPY --chown=appuser:appuser src/aot_bridge.py ./
+COPY --chown=appuser:appuser src/aot_build.py ./
+COPY --chown=appuser:appuser src/macd_unified.py ./
 
-# Copy config template (will be overridden at runtime by volume mount)
 COPY --chown=appuser:appuser config_macd.json ./
 
 USER appuser
