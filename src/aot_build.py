@@ -13,6 +13,7 @@ import os
 import sys
 import sysconfig
 import multiprocessing
+import platform 
 from pathlib import Path
 import numpy as np
 from numba.pycc import CC
@@ -45,17 +46,39 @@ from numba_functions_shared import (
     vectorized_wick_check_sell,
 )
 
-# Aggressive optimization flags
+
+# ✅ Detect CPU features safely
+def get_safe_cpu_features():
+    try:
+        import cpuinfo
+        info = cpuinfo.get_cpu_info()
+        flags = info.get('flags', [])
+        
+        features = []
+        if 'avx2' in flags and 'fma' in flags:
+            features = ['+avx2', '+fma']
+        elif 'avx' in flags:
+            features = ['+avx']
+        elif 'sse4_2' in flags:
+            features = ['+sse4.2']
+        
+        return ','.join(features) if features else ''
+    except Exception:
+        return ''  # ✅ Fallback to auto-detection
+
+cpu_features = get_safe_cpu_features()
+
 os.environ.update({
     'NUMBA_OPT': '3',
     'NUMBA_LOOP_VECTORIZE': '1',
     'NUMBA_CPU_NAME': 'native',
-    'NUMBA_CPU_FEATURES': '+avx2,+fma',
+    'NUMBA_CPU_FEATURES': cpu_features,  # ✅ Auto-detected or empty
     'NUMBA_WARNINGS': '0',
     'NUMBA_DISABLE_JIT': '0',
     'NUMBA_THREADING_LAYER': 'omp',
 })
 
+print(f"🔧 CPU Features: {cpu_features or 'auto-detect'}")
 
 def get_output_filename(base_name: str) -> str:
     """Generate platform-specific output filename"""
@@ -194,62 +217,38 @@ def compile_module():
     
     print("\n⏳ Starting compilation (this may take 1-3 minutes)...")
     
+
     try:
         cc.compile()
-        
+    
         # Find generated .so file
-        so_files = list(output_dir.glob(f"{module_name}*.so")) + \
-                   list(output_dir.glob(f"{module_name}*.pyd")) + \
-                   list(output_dir.glob(f"{module_name}*.dylib"))
-        
+        so_files = list(output_dir.glob(f"{module_name}*.so"))
+    
         if so_files:
             output = so_files[0]
-            size_kb = output.stat().st_size / 1024
-            
-            print("\n" + "=" * 70)
-            print("✅ COMPILATION SUCCESSFUL")
-            print("=" * 70)
-            print(f"📦 Output file: {output.name}")
-            print(f"📂 Absolute path: {output.absolute()}")
-            print(f"💾 File size: {size_kb:.1f} KB")
-            print(f"🎯 Functions compiled: 23/23")
-            print(f"🔗 Source: numba_functions_shared.py (single source of truth)")
-            print("=" * 70)
-            
-            if output.exists() and output.stat().st_size > 0:
-                print("✅ File verification: PASSED")
-                return True
-            else:
-                print("❌ File verification: FAILED (file empty or unreadable)")
+            # Verify file is complete and valid
+            if output.stat().st_size < 1000:  # ✅ Sanity check
+                print(f"❌ Generated file too small: {output.stat().st_size} bytes")
+                output.unlink()  # ✅ Remove corrupted file
                 return False
         else:
-            print("\n" + "=" * 70)
             print("❌ COMPILATION FAILED")
-            print("=" * 70)
-            print("❌ No output file generated")
-            print(f"📂 Searched in: {output_dir.absolute()}")
-            print(f"🔍 Expected pattern: {module_name}*.so/pyd/dylib")
-            
-            all_files = list(output_dir.glob("*"))
-            print(f"\n🔍 Files in output directory:")
-            for f in all_files[:10]:
-                print(f"   - {f.name}")
-            
-            print("=" * 70)
+            # ✅ Clean up any partial artifacts
+            for partial in output_dir.glob(f"{module_name}*.so"):
+                try:
+                    partial.unlink()
+                except Exception:
+                    pass
             return False
-            
+        
     except Exception as e:
-        print("\n" + "=" * 70)
-        print("❌ COMPILATION ERROR")
-        print("=" * 70)
-        print(f"❌ Exception: {type(e).__name__}")
-        print(f"❌ Message: {e}")
-        print("=" * 70)
-        
-        import traceback
-        print("\n🔍 Full traceback:")
-        traceback.print_exc()
-        
+        # ✅ Clean up on exception too
+        for partial in output_dir.glob(f"{module_name}*.so"):
+            try:
+                partial.unlink()
+            except Exception:
+                pass
+        print(f"❌ COMPILATION ERROR: {e}")
         return False
 
 
