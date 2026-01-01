@@ -97,7 +97,6 @@ jobs:
           
           echo "✅ All secrets configured"
 
-# ✅ ADD: Pre-flight healthcheck
       - name: 🏥 Pre-Flight Healthcheck
         run: |
           echo "Running container healthcheck..."
@@ -107,11 +106,18 @@ jobs:
             --memory="200m" \
             --cpus="1.0" \
             ${{ steps.image_pull.outputs.image_ref }} \
-            python -c "import aot_bridge; \
-assert aot_bridge.is_using_aot(), 'AOT not loaded'; \
-print('✅ AOT verification passed')" || exit 1
+            python - <<'EOF'
+import aot_bridge
+assert aot_bridge.is_using_aot(), "AOT not loaded"
+print("✅ AOT verification passed")
+EOF
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed healthcheck"
+            exit 1
+          fi
           
           echo "✅ Healthcheck passed"
+
 
       # ========================================================================
       # PHASE 3: BOT EXECUTION
