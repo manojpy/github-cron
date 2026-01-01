@@ -14,6 +14,7 @@ between AOT and JIT execution paths.
 import numpy as np
 from numba import njit, prange
 
+
 # ============================================================================
 # SANITIZATION FUNCTIONS
 # ============================================================================
@@ -316,12 +317,14 @@ def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness:
     
     return sd
 
+
 @njit(nogil=True, fastmath=True, cache=True)
 def rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    """Rolling mean calculation - optimized with sliding window"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
     
-    # ✅ Use sliding window technique
+    # ✅ OPTIMIZED: Use sliding window technique (O(n) instead of O(n*period))
     window_sum = 0.0
     count = 0
     
@@ -342,41 +345,33 @@ def rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     
     return ma
 
+
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    """
-    Rolling mean calculation (parallel, prefix-sum based).
-    Uses cumulative sums and counts to compute window averages efficiently.
-    Handles NaNs by tracking valid counts.
-    """
+    """Rolling mean calculation (parallel)"""
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
-
-    # Step 1: Build cumulative sum and count arrays
-    cumsum = np.zeros(rows + 1, dtype=np.float64)
-    count = np.zeros(rows + 1, dtype=np.int64)
-
-    for i in range(rows):
-        val = close[i]
-        if not np.isnan(val):
-            cumsum[i + 1] = cumsum[i] + val
-            count[i + 1] = count[i] + 1
-        else:
-            cumsum[i + 1] = cumsum[i]
-            count[i + 1] = count[i]
-
-    # Step 2: Compute rolling mean in parallel
+    
     for i in prange(rows):
         start = max(0, i - period + 1)
-        window_sum = cumsum[i + 1] - cumsum[start]
-        window_count = count[i + 1] - count[start]
-        ma[i] = window_sum / window_count if window_count > 0 else np.nan
-
+        sum_val = 0.0
+        count = 0
+        
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+        
+        ma[i] = sum_val / count if count > 0 else np.nan
+    
     return ma
 
+
 @njit(nogil=True, fastmath=True, cache=True)
-def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
     """Rolling minimum and maximum values"""
+    # ✅ FIXED: Changed Tuple to tuple (Python 3.9+ native type hint)
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -401,8 +396,9 @@ def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.
 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
+def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
     """Rolling minimum and maximum values (parallel)"""
+    # ✅ FIXED: Changed Tuple to tuple (Python 3.9+ native type hint)
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -436,8 +432,9 @@ def calculate_ppo_core(
     fast: int, 
     slow: int, 
     signal: int
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Calculate Percentage Price Oscillator and signal line"""
+    # ✅ FIXED: Changed Tuple to tuple (Python 3.9+ native type hint)
     n = len(close)
     
     # Calculate fast and slow EMAs
@@ -457,21 +454,20 @@ def calculate_ppo_core(
         else:
             fast_ma[i] = fast_alpha * curr + (1 - fast_alpha) * fast_ma[i-1]
             slow_ma[i] = slow_alpha * curr + (1 - slow_alpha) * slow_ma[i-1]
-
-
+    
     # Calculate PPO with overflow protection
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
         if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
             ppo[i] = 0.0
         else:
-            # ✅ Clamp extreme values before multiplication
+            # ✅ IMPROVED: Clamp extreme values before multiplication
             ratio = (fast_ma[i] - slow_ma[i]) / slow_ma[i]
-            if abs(ratio) > 10.0:  # ✅ >1000% change is unrealistic
+            if abs(ratio) > 10.0:  # >1000% change is unrealistic
                 ppo[i] = 10.0 if ratio > 0 else -10.0
             else:
                 ppo[i] = ratio * 100.0
-
+    
     # Calculate signal line
     sig_alpha = 2.0 / (signal + 1.0)
     ppo_sig = np.empty(n, dtype=np.float64)
