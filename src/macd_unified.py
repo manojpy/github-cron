@@ -94,7 +94,7 @@ class Constants:
     MAX_CANDLE_GAP_MULTIPLIER = 2.0
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
-    ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
+    ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 840))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
     MMH_VALUE_CLIP = 0.9999
     ZERO_DIVISION_GUARD = 1e-10
@@ -239,6 +239,7 @@ class BotConfig(BaseModel):
         le=600,
         description="Seconds to wait before half-open probe"
     )
+
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -2601,190 +2602,19 @@ class AlertDefinition(TypedDict):
     extra_fn: Callable[[Any, Any, Any, Any, Dict[str, Any]], str]
     requires: List[str]
 
-# ============================================================================
-# CORRECTED ALERT DEFINITIONS - Replace in macd_unified.py
-# ============================================================================
-
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    # -------------------------------------------------------------------------
-    # PPO SIGNAL LINE CROSSES
-    # -------------------------------------------------------------------------
-    {
-        "key": "ppo_signal_up",
-        "title": "🟢 PPO cross above signal",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["buy_common"] and 
-            (ppo["prev"] <= ppo_sig["prev"]) and 
-            (ppo["curr"] > ppo_sig["curr"]) and 
-            (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)  # PPO < 0.20 (not too overbought)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo", "ppo_signal"]
-    },
-    {
-        "key": "ppo_signal_down",
-        "title": "🔴 PPO cross below signal",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["sell_common"] and 
-            (ppo["prev"] >= ppo_sig["prev"]) and 
-            (ppo["curr"] < ppo_sig["curr"]) and 
-            (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)  # PPO > -0.20 (not too oversold)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo", "ppo_signal"]
-    },
-    
-    # -------------------------------------------------------------------------
-    # PPO ZERO LINE CROSSES
-    # -------------------------------------------------------------------------
-    {
-        "key": "ppo_zero_up",
-        "title": "🟢 PPO cross above 0",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["buy_common"] and 
-            (ppo["prev"] <= 0.0) and 
-            (ppo["curr"] > 0.0)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo"]
-    },
-    {
-        "key": "ppo_zero_down",
-        "title": "🔴 PPO cross below 0",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["sell_common"] and 
-            (ppo["prev"] >= 0.0) and 
-            (ppo["curr"] < 0.0)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo"]
-    },
-    
-    # -------------------------------------------------------------------------
-    # PPO 0.11 THRESHOLD CROSSES
-    # -------------------------------------------------------------------------
-    {
-        "key": "ppo_011_up",
-        "title": "🟢 PPO cross above 0.11",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["buy_common"] and 
-            (ppo["prev"] <= Constants.PPO_011_THRESHOLD) and 
-            (ppo["curr"] > Constants.PPO_011_THRESHOLD)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo"]
-    },
-    {
-        "key": "ppo_011_down",
-        "title": "🔴 PPO cross below -0.11",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["sell_common"] and 
-            (ppo["prev"] >= Constants.PPO_011_THRESHOLD_SELL) and 
-            (ppo["curr"] < Constants.PPO_011_THRESHOLD_SELL)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo"]
-    },
-    
-    # -------------------------------------------------------------------------
-    # RSI 50 CROSSES (WITH PPO GUARD)
-    # -------------------------------------------------------------------------
-    {
-        "key": "rsi_50_up",
-        "title": "🟢 RSI cross above 50 (PPO < 0.30)",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["buy_common"] and 
-            (rsi["prev"] <= Constants.RSI_THRESHOLD) and 
-            (rsi["curr"] > Constants.RSI_THRESHOLD) and 
-            (ppo["curr"] < Constants.PPO_RSI_GUARD_BUY)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo", "rsi"]
-    },
-    {
-        "key": "rsi_50_down",
-        "title": "🔴 RSI cross below 50 (PPO > -0.30)",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["sell_common"] and 
-            (rsi["prev"] >= Constants.RSI_THRESHOLD) and 
-            (rsi["curr"] < Constants.RSI_THRESHOLD) and 
-            (ppo["curr"] > Constants.PPO_RSI_GUARD_SELL)
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": ["ppo", "rsi"]
-    },
-    
-    # -------------------------------------------------------------------------
-    # VWAP CROSSES (FIXED: Removed +/- 0.0002 offset)
-    # -------------------------------------------------------------------------
-    {
-        "key": "vwap_up",
-        "title": "🔵▲ Price cross above VWAP",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["buy_common"] and 
-            ctx["close_prev"] <= ctx["vwap_prev"] and 
-            ctx["close_curr"] > ctx["vwap_curr"]  # ✅ FIXED: Removed + 0.0002
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"VWAP ${ctx['vwap_curr']:,.2f} | "
-            f"Distance: {abs(ctx['close_curr'] - ctx['vwap_curr']):,.2f} | "
-            f"MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": []
-    },
-    {
-        "key": "vwap_down",
-        "title": "🟣▼ Price cross below VWAP",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
-            ctx["sell_common"] and 
-            ctx["close_prev"] >= ctx["vwap_prev"] and 
-            ctx["close_curr"] < ctx["vwap_curr"]  # ✅ FIXED: Removed - 0.0002
-        ),
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"VWAP ${ctx['vwap_curr']:,.2f} | "
-            f"Distance: {abs(ctx['close_curr'] - ctx['vwap_curr']):,.2f} | "
-            f"MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": []
-    },
-    
-    # -------------------------------------------------------------------------
-    # MMH REVERSALS
-    # -------------------------------------------------------------------------
-    {
-        "key": "mmh_buy",
-        "title": "🔵⬆️ MMH Reversal BUY",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"],
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": []
-    },
-    {
-        "key": "mmh_sell",
-        "title": "🟣⬇ MMH Reversal SELL",
-        "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"],
-        "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-            f"MMH ({ctx['mmh_curr']:.2f})"
-        ),
-        "requires": []
-    },
+    {"key": "ppo_signal_up", "title": "🟢 PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
+    {"key": "ppo_signal_down", "title": "🔴 PPO cross below signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= ppo_sig["prev"]) and (ppo["curr"] < ppo_sig["curr"]) and (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
+    {"key": "ppo_zero_up", "title": "🟢 PPO cross above 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["buy_common"] and (ppo["prev"] <= 0.0) and (ppo["curr"] > 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
+    {"key": "ppo_zero_down", "title": "🔴 PPO cross below 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["sell_common"] and (ppo["prev"] >= 0.0) and (ppo["curr"] < 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
+    {"key": "ppo_011_up", "title": "🟢 PPO cross above 0.11", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= Constants.PPO_011_THRESHOLD) and (ppo["curr"] > Constants.PPO_011_THRESHOLD)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
+    {"key": "ppo_011_down", "title": "🔴 PPO cross below -0.11", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= Constants.PPO_011_THRESHOLD_SELL) and (ppo["curr"] < Constants.PPO_011_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
+    {"key": "rsi_50_up", "title": "🟢 RSI cross above 50 (PPO < 0.30)", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (rsi["prev"] <= Constants.RSI_THRESHOLD) and (rsi["curr"] > Constants.RSI_THRESHOLD) and (ppo["curr"] < Constants.PPO_RSI_GUARD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "rsi"]},
+    {"key": "rsi_50_down", "title": "🔴 RSI cross below 50 (PPO > -0.30)", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (rsi["prev"] >= Constants.RSI_THRESHOLD) and (rsi["curr"] < Constants.RSI_THRESHOLD) and (ppo["curr"] > Constants.PPO_RSI_GUARD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "rsi"]},
+    {"key": "vwap_up","title": "🔵▲ Price cross above VWAP","check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and ctx["close_prev"] <= ctx["vwap_prev"] and ctx["close_curr"] > ctx["vwap_curr"]), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "vwap_down", "title": "🟣▼ Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and ctx["close_prev"] >= ctx["vwap_prev"] and ctx["close_curr"] < ctx["vwap_curr"]), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_buy", "title": "🔵⬆️ MMH Reversal BUY", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_sell", "title": "🟣⬇ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
 ]
 
 def _validate_pivot_cross(
@@ -3461,27 +3291,50 @@ async def evaluate_pair_and_alert(
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:
-                logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
-        
+                logger_pair.error(f"Error sending alerts: {e}", exc_info=False)   
+
         # Build suppression reasons for logging
         reasons = []
+
+        # Common trend/candle gates
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
-        
+
         if context.get("candle_quality_failed_buy") and buy_candle_reason:
             reasons.append(f"BUY quality: {buy_candle_reason}")
-        
+
         if context.get("candle_quality_failed_sell") and sell_candle_reason:
             reasons.append(f"SELL quality: {sell_candle_reason}")
-        
+
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
-        
+
+        # === NEW: Guard condition suppression logging ===
+        # PPO cross above signal requires PPO < +0.20
+        if ppo_prev <= ppo_sig_prev and ppo_curr > ppo_sig_curr:
+            if ppo_curr >= 0.20:
+                reasons.append(f"PPO cross above signal blocked: PPO={ppo_curr:.2f} ≥ +0.20")
+
+        # RSI cross above 50 requires PPO < +0.30
+        if rsi_prev <= 50 and rsi_curr > 50:
+            if ppo_curr >= 0.30:
+                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ +0.30")
+
+        # PPO cross below signal requires PPO > –0.20
+        if ppo_prev >= ppo_sig_prev and ppo_curr < ppo_sig_curr:
+            if ppo_curr <= -0.20:
+                reasons.append(f"PPO cross below signal blocked: PPO={ppo_curr:.2f} ≤ –0.20")
+
+        # RSI cross below 50 requires PPO > –0.30
+        if rsi_prev >= 50 and rsi_curr < rsi_curr:
+            if ppo_curr <= -0.30:
+                reasons.append(f"RSI cross below 50 blocked: PPO={ppo_curr:.2f} ≤ –0.30")
+
         # Debug logging for no alerts
         if not alerts_to_send:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-                logger_pair.debug(
+                logger_pair.info(
                     f"✓ {pair_name} | cloud={cloud_state} mmh={mmh_curr:.2f} | "
                     f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
                 )
