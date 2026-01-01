@@ -6,8 +6,8 @@
 FROM python:3.11-slim-bookworm AS uv-installer
 
 # Install UV in isolated stage (cached across builds)
-RUN uv pip install --system --no-cache -r requirements.txt && \
-    python -m compileall -q /usr/local/lib/python3.11/site-packages
+RUN pip install --no-cache-dir uv==0.5.15
+
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.11-slim-bookworm AS deps-builder
