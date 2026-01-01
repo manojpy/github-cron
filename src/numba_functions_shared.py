@@ -426,6 +426,7 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.nda
 # OSCILLATORS
 # ============================================================================
 
+
 @njit(nogil=True, fastmath=True, cache=True)
 def calculate_ppo_core(
     close: np.ndarray, 
@@ -433,7 +434,7 @@ def calculate_ppo_core(
     slow: int, 
     signal: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Calculate Percentage Price Oscillator (ratio form) and signal line"""
+    """Calculate Percentage Price Oscillator (percentage-scaled) and signal line"""
     n = len(close)
     
     # Calculate fast and slow EMAs
@@ -454,7 +455,7 @@ def calculate_ppo_core(
             fast_ma[i] = fast_alpha * curr + (1 - fast_alpha) * fast_ma[i-1]
             slow_ma[i] = slow_alpha * curr + (1 - slow_alpha) * slow_ma[i-1]
     
-    # Calculate PPO as raw ratio with overflow protection
+    # Calculate PPO (percentage-scaled) with overflow protection
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
         if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
@@ -462,13 +463,13 @@ def calculate_ppo_core(
         else:
             ratio = (fast_ma[i] - slow_ma[i]) / slow_ma[i]
             
-            # Clamp extreme values (>10.0 = 1000% change)
+            # Clamp extreme values (>1000% change is unrealistic)
             if abs(ratio) > 10.0:
-                ppo[i] = 10.0 if ratio > 0 else -10.0
+                ppo[i] = 1000.0 if ratio > 0 else -1000.0
             else:
-                ppo[i] = ratio
+                ppo[i] = ratio * 100.0
     
-    # Calculate signal line (on same ratio scale)
+    # Calculate signal line (EMA of PPO)
     sig_alpha = 2.0 / (signal + 1.0)
     ppo_sig = np.empty(n, dtype=np.float64)
     ppo_sig[0] = ppo[0]
