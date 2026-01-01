@@ -49,12 +49,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ ADDED: Enable Docker BuildKit Cache
-      - name: 🔧 Enable Docker BuildKit Cache
-        run: |
-          mkdir -p ~/.docker
-          echo '{"experimental": true, "features": {"buildkit": true}}' > ~/.docker/config.json
-
       - name: 🐳 Pull Latest AOT Image (Cached)
         id: image_pull
         run: |
