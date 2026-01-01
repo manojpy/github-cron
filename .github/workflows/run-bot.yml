@@ -250,9 +250,7 @@ jobs:
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### ❌ Error Details
-```
           ${{ steps.results.outputs.error_msg }}
-```
           
           **Troubleshooting:**
           - Check the "Execute MACD Bot" step logs for full error trace
