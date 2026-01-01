@@ -293,9 +293,7 @@ def initialize_aot() -> Tuple[bool, Optional[Dict[str, Any]]]:
             )
             return False, _FALLBACK_REASON
 
-
 def ensure_initialized() -> bool:
-    """Thread-safe initialization"""
     global _INITIALIZED
     
     if _INITIALIZED:
@@ -306,9 +304,9 @@ def ensure_initialized() -> bool:
             return _USING_AOT
         
         ok, _ = initialize_aot()
+        _bind_functions()
         _INITIALIZED = True
         return ok
-
 
 def is_using_aot() -> bool:
     """Check if AOT is being used"""
@@ -496,15 +494,15 @@ def summary() -> None:
 # ============================================================================
 # MODULE INITIALIZATION
 # ============================================================================
-
 # Initialize and bind functions immediately on module import
-ensure_initialized()
-_bind_functions()
+if not ensure_initialized():
+    logger.warning("AOT initialization failed, using JIT fallback")
+
+# ✅ No need to call _bind_functions() - already done in ensure_initialized()
 
 # Verify all functions are bound
 if ema_loop is None:
-    raise RuntimeError("Critical error: Functions not bound after initialization. "
-                      "This indicates a bug in the binding logic.")
+    raise RuntimeError("Critical error: Functions not bound...")
 
 # Verify function count
 _expected_functions = [
