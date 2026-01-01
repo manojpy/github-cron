@@ -3353,14 +3353,13 @@ async def evaluate_pair_and_alert(
                     f"close_curr={close_curr:.5f} vwap_curr={vwap_curr:.5f}"
                 )
 
-        # Debug logging for no alerts
+        # Suppression logging for no alerts
         if not alerts_to_send:
-            if logger_pair.isEnabledFor(logging.DEBUG):
-                cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-                logger_pair.info(
-                    f"✓ {pair_name} | cloud={cloud_state} mmh={mmh_curr:.2f} | "
-                    f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
-                )
+            cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
+            logger_pair.info(
+                f"✓ {pair_name} | cloud={cloud_state} mmh={mmh_curr:.2f} | "
+                f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
+            )
         
         # Return evaluation result
         return pair_name, {
