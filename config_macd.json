@@ -5,7 +5,7 @@
 
   "DELTA_API_BASE": "https://api.india.delta.exchange",
   "BOT_NAME": "Unified Alert Bot",
-  "DEBUG_MODE": false,
+  "DEBUG_MODE": true,
   "SEND_TEST_MESSAGE": false,
 
   "PAIRS": [
