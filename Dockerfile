@@ -38,11 +38,11 @@ COPY src/aot_build.py ./
 COPY src/aot_bridge.py ./
 COPY src/macd_unified.py ./
 
-
-# Verify source files exist
 RUN ls -la *.py && \
     test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
     test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
+
+WORKDIR /build
 
 # AOT Compilation with strict verification
 ARG AOT_STRICT=1
