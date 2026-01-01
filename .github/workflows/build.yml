@@ -146,6 +146,15 @@ jobs:
           print('=' * 60)
           " || exit 1
 
+
+      # ✅ ADD: Warm up cache layers before push
+      - name: 🔥 Warm Up Cache Layers
+        if: success()
+        run: |
+          echo "Warming up build cache for faster future builds..."
+          docker images | grep macd || true
+          df -h / | grep -v tmpfs || true
+
       # ========================================================================
       # PHASE 3: PUSH TO REGISTRY
       # ========================================================================
