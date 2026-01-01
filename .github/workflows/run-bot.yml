@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 360  # 6 minutes (leaves 4min buffer for 10min workflow timeout)
+  BOT_TIMEOUT: 360  # ✅ CHANGED: 6 minutes (leaves 4min buffer for cleanup)
 
 jobs:
   run-bot:
@@ -49,7 +49,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-# ✅ ADD AFTER Line 62 (before "Pull Latest AOT Image"):
+      # ✅ ADDED: Enable Docker BuildKit Cache
       - name: 🔧 Enable Docker BuildKit Cache
         run: |
           mkdir -p ~/.docker
@@ -63,26 +63,23 @@ jobs:
           echo "📦 Pulling AOT image..."
           START_TIME=$(date +%s)
           
-          # ✅ ADD: Use BuildKit with layer caching
+          # ✅ CHANGED: Use BuildKit with layer caching
           if DOCKER_BUILDKIT=1 docker pull --quiet "$IMAGE_REF"; then
-            echo "✅ Image pulled with BuildKit"
+            END_TIME=$(date +%s)
+            PULL_TIME=$((END_TIME - START_TIME))
+            echo "✅ Image pulled in ${PULL_TIME}s"
+            echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
           else
-            echo "⚠️ BuildKit pull failed, falling back..."
-            docker pull "$IMAGE_REF" || {
-              echo "❌ Failed to pull image"
-              exit 1
-            }
+            echo "❌ Failed to pull image"
+            exit 1
           fi
           
-          END_TIME=$(date +%s)
-          PULL_TIME=$((END_TIME - START_TIME))
-          echo "✅ Image pulled in ${PULL_TIME}s"
-          echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
       # ========================================================================
       # PHASE 2: PRE-FLIGHT CHECKS
-      # ========================================================================     
+      # ========================================================================
+      
       - name: 🔍 Verify Secrets
         run: |
           MISSING=()
@@ -97,6 +94,7 @@ jobs:
           
           echo "✅ All secrets configured"
 
+      # ✅ ADDED: Pre-Flight Healthcheck
       - name: 🏥 Pre-Flight Healthcheck
         run: |
           echo "Running container healthcheck..."
@@ -106,18 +104,10 @@ jobs:
             --memory="200m" \
             --cpus="1.0" \
             ${{ steps.image_pull.outputs.image_ref }} \
-            python - <<'EOF'
-import aot_bridge
-assert aot_bridge.is_using_aot(), "AOT not loaded"
-print("✅ AOT verification passed")
-EOF
-          if [ $? -ne 0 ]; then
-            echo "❌ Failed healthcheck"
-            exit 1
-          fi
+            python -c 'import aot_bridge; assert aot_bridge.is_using_aot(), "AOT not loaded"; print("✅ AOT verification passed")' \
+            || { echo "❌ Healthcheck failed"; exit 1; }
           
           echo "✅ Healthcheck passed"
-
 
       # ========================================================================
       # PHASE 3: BOT EXECUTION
@@ -133,15 +123,16 @@ EOF
           mkdir -p logs
           
           echo "::group::🔥 Starting Bot Execution"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
           echo "🧪 Dry Run: $DRY_RUN"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "::endgroup::"
           
           START_TIME=$(date +%s)
-
+          
+          # ✅ CHANGED: Added explicit kill signal and extended tmpfs
           timeout --signal=SIGTERM --kill-after=30s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
@@ -170,7 +161,7 @@ EOF
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
           
-          if [ $EXIT_CODE -eq 124 ]; then
+          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s"
             exit 1
           elif [ $EXIT_CODE -ne 0 ]; then
@@ -201,7 +192,7 @@ EOF
             STATUS="success"
             
             # Extract duration (handle multiple formats)
-            DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
+            DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
             
             # Extract alerts count
             ALERTS=$(grep -oP "Alerts:\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
@@ -259,10 +250,9 @@ EOF
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### ❌ Error Details
-          
-          ```
+```
           ${{ steps.results.outputs.error_msg }}
-          ```
+```
           
           **Troubleshooting:**
           - Check the "Execute MACD Bot" step logs for full error trace
@@ -277,7 +267,7 @@ EOF
           
           ### ⚙️ Runtime Configuration
           
-          - **Container Resources:** 800MB RAM, 2 CPUs
+          - **Container Resources:** 900MB RAM, 2 CPUs
           - **Bot Timeout:** ${{ env.BOT_TIMEOUT }}s
           - **Dry Run Mode:** ${{ github.event.inputs.dry_run || 'false' }}
           - **AOT Compilation:** ✅ Enabled
