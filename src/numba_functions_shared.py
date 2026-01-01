@@ -427,58 +427,25 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.nda
 # ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True)
-def calculate_ppo_core(
-    close: np.ndarray, 
-    fast: int, 
-    slow: int, 
-    signal: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Calculate Percentage Price Oscillator and signal line"""
-    # ✅ FIXED: Changed Tuple to tuple (Python 3.9+ native type hint)
+def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> tuple[np.ndarray, np.ndarray]:
     n = len(close)
-    
-    # Calculate fast and slow EMAs
     fast_alpha = 2.0 / (fast + 1.0)
     slow_alpha = 2.0 / (slow + 1.0)
-    
     fast_ma = np.empty(n, dtype=np.float64)
     slow_ma = np.empty(n, dtype=np.float64)
-    fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
-    slow_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
-    
+    fast_ma[0] = close[0]
+    slow_ma[0] = close[0]
     for i in range(1, n):
-        curr = close[i]
-        if np.isnan(curr):
-            fast_ma[i] = fast_ma[i-1]
-            slow_ma[i] = slow_ma[i-1]
-        else:
-            fast_ma[i] = fast_alpha * curr + (1 - fast_alpha) * fast_ma[i-1]
-            slow_ma[i] = slow_alpha * curr + (1 - slow_alpha) * slow_ma[i-1]
-    
-    # Calculate PPO with overflow protection
+        fast_ma[i] = fast_alpha * close[i] + (1 - fast_alpha) * fast_ma[i-1]
+        slow_ma[i] = slow_alpha * close[i] + (1 - slow_alpha) * slow_ma[i-1]
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
-        if np.isnan(slow_ma[i]) or abs(slow_ma[i]) < 1e-12:
-            ppo[i] = 0.0
-        else:
-            # ✅ IMPROVED: Clamp extreme values before multiplication
-            ratio = (fast_ma[i] - slow_ma[i]) / slow_ma[i]
-            if abs(ratio) > 10.0:  # >1000% change is unrealistic
-                ppo[i] = 10.0 if ratio > 0 else -10.0
-            else:
-                ppo[i] = ratio * 100.0
-    
-    # Calculate signal line
+        ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0 if slow_ma[i] != 0 else 0.0
     sig_alpha = 2.0 / (signal + 1.0)
     ppo_sig = np.empty(n, dtype=np.float64)
     ppo_sig[0] = ppo[0]
-    
     for i in range(1, n):
-        if np.isnan(ppo[i]):
-            ppo_sig[i] = ppo_sig[i-1]
-        else:
-            ppo_sig[i] = sig_alpha * ppo[i] + (1 - sig_alpha) * ppo_sig[i-1]
-    
+        ppo_sig[i] = sig_alpha * ppo[i] + (1 - sig_alpha) * ppo_sig[i-1]
     return ppo, ppo_sig
 
 
