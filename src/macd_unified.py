@@ -3293,7 +3293,7 @@ async def evaluate_pair_and_alert(
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)   
 
-        # Build suppression reasons for logging
+                # Build suppression reasons for logging
         reasons = []
 
         # Common trend/candle gates
@@ -3310,25 +3310,48 @@ async def evaluate_pair_and_alert(
             reasons.extend(context["pivot_suppressions"])
 
         # === NEW: Guard condition suppression logging ===
-        # PPO cross above signal requires PPO < +0.20
+
+        # PPO crosses
+        if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
+            reasons.append(f"PPO cross above 0 blocked: buy_common={buy_common}")
+        if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
+            reasons.append(f"PPO cross below 0 blocked: sell_common={sell_common}")
+
+        if ppo_prev <= 0.11 and ppo_curr > 0.11 and not buy_common:
+            reasons.append(f"PPO cross above +0.11 blocked: buy_common={buy_common}")
+        if ppo_prev >= -0.11 and ppo_curr < -0.11 and not sell_common:
+            reasons.append(f"PPO cross below –0.11 blocked: sell_common={sell_common}")
+
+        # PPO vs signal guards
         if ppo_prev <= ppo_sig_prev and ppo_curr > ppo_sig_curr:
             if ppo_curr >= 0.20:
                 reasons.append(f"PPO cross above signal blocked: PPO={ppo_curr:.2f} ≥ +0.20")
-
-        # RSI cross above 50 requires PPO < +0.30
-        if rsi_prev <= 50 and rsi_curr > 50:
-            if ppo_curr >= 0.30:
-                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ +0.30")
-
-        # PPO cross below signal requires PPO > –0.20
         if ppo_prev >= ppo_sig_prev and ppo_curr < ppo_sig_curr:
             if ppo_curr <= -0.20:
                 reasons.append(f"PPO cross below signal blocked: PPO={ppo_curr:.2f} ≤ –0.20")
 
-        # RSI cross below 50 requires PPO > –0.30
-        if rsi_prev >= 50 and rsi_curr < rsi_curr:
+        # RSI crosses
+        if rsi_prev <= 50 and rsi_curr > 50:
+            if ppo_curr >= 0.30:
+                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ +0.30")
+        if rsi_prev >= 50 and rsi_curr < 50:
             if ppo_curr <= -0.30:
                 reasons.append(f"RSI cross below 50 blocked: PPO={ppo_curr:.2f} ≤ –0.30")
+
+        # VWAP crosses
+        if cfg.ENABLE_VWAP:
+            if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
+                reasons.append(
+                    f"VWAP up-cross blocked: buy_common={buy_common}, "
+                    f"close_prev={close_prev:.5f} vwap_prev={vwap_prev:.5f}, "
+                    f"close_curr={close_curr:.5f} vwap_curr={vwap_curr:.5f}"
+                )
+            if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
+                reasons.append(
+                    f"VWAP down-cross blocked: sell_common={sell_common}, "
+                    f"close_prev={close_prev:.5f} vwap_prev={vwap_prev:.5f}, "
+                    f"close_curr={close_curr:.5f} vwap_curr={vwap_curr:.5f}"
+                )
 
         # Debug logging for no alerts
         if not alerts_to_send:
