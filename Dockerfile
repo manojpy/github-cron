@@ -47,9 +47,17 @@ WORKDIR /build
 # AOT Compilation with strict verification
 ARG AOT_STRICT=1
 RUN echo "🔨 Starting AOT compilation..." && \
-    python aot_build.py && \
-    ls -lh macd_aot_compiled*.so && \
-    python -c "import macd_aot_compiled; print('✅ AOT binary verified')" || \
+    python aot_build.py || (echo "❌ AOT build script failed" && exit 1) && \
+    echo "📂 Listing build outputs..." && \
+    ls -lh /build || true && \
+    echo "🔍 Checking for compiled module..." && \
+    find /build -maxdepth 1 -name "macd_aot_compiled*.*" -ls && \
+    python -c "import importlib.util, pathlib; \
+so_files=list(pathlib.Path('/build').glob('macd_aot_compiled*.so')); \
+assert so_files, 'No .so file found'; \
+spec=importlib.util.spec_from_file_location('macd_aot_compiled', so_files[0]); \
+mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
+print('✅ AOT binary verified')" || \
     ( [ "$AOT_STRICT" != "1" ] && echo "⚠️ AOT failed, continuing..." || (echo "❌ AOT STRICT mode: Compilation failed" && exit 1) )
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
