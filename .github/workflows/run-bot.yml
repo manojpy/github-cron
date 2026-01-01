@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 420  # 7 minutes (leaves 2min buffer for 10min workflow timeout)
+  BOT_TIMEOUT: 360  # 6 minutes (leaves 4min buffer for 10min workflow timeout)
 
 jobs:
   run-bot:
@@ -49,6 +49,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+# ✅ ADD AFTER Line 62 (before "Pull Latest AOT Image"):
+      - name: 🔧 Enable Docker BuildKit Cache
+        run: |
+          mkdir -p ~/.docker
+          echo '{"experimental": true, "features": {"buildkit": true}}' > ~/.docker/config.json
+
       - name: 🐳 Pull Latest AOT Image (Cached)
         id: image_pull
         run: |
@@ -57,22 +63,26 @@ jobs:
           echo "📦 Pulling AOT image..."
           START_TIME=$(date +%s)
           
-          if docker pull --quiet "$IMAGE_REF"; then
-            END_TIME=$(date +%s)
-            PULL_TIME=$((END_TIME - START_TIME))
-            echo "✅ Image pulled in ${PULL_TIME}s"
-            echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
+          # ✅ ADD: Use BuildKit with layer caching
+          if DOCKER_BUILDKIT=1 docker pull --quiet "$IMAGE_REF"; then
+            echo "✅ Image pulled with BuildKit"
           else
-            echo "❌ Failed to pull image"
-            exit 1
+            echo "⚠️ BuildKit pull failed, falling back..."
+            docker pull "$IMAGE_REF" || {
+              echo "❌ Failed to pull image"
+              exit 1
+            }
           fi
           
+          END_TIME=$(date +%s)
+          PULL_TIME=$((END_TIME - START_TIME))
+          echo "✅ Image pulled in ${PULL_TIME}s"
+          echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
       # ========================================================================
       # PHASE 2: PRE-FLIGHT CHECKS
-      # ========================================================================
-      
+      # ========================================================================     
       - name: 🔍 Verify Secrets
         run: |
           MISSING=()
@@ -86,6 +96,25 @@ jobs:
           fi
           
           echo "✅ All secrets configured"
+
+
+# ✅ ADD: Pre-flight healthcheck
+      - name: 🏥 Pre-Flight Healthcheck
+        run: |
+          echo "Running container healthcheck..."
+          
+          # Quick smoke test: verify AOT is loaded
+          docker run --rm \
+            --memory="200m" \
+            --cpus="1.0" \
+            ${{ steps.image_pull.outputs.image_ref }} \
+            python -c "
+import aot_bridge
+assert aot_bridge.is_using_aot(), 'AOT not loaded'
+print('✅ AOT verification passed')
+" || exit 1
+          
+          echo "✅ Healthcheck passed"
 
       # ========================================================================
       # PHASE 3: BOT EXECUTION
@@ -109,9 +138,8 @@ jobs:
           echo "::endgroup::"
           
           START_TIME=$(date +%s)
-          
-          # Execute bot with resource limits and timeout
-          timeout ${{ env.BOT_TIMEOUT }}s docker run \
+
+          timeout --signal=SIGTERM --kill-after=30s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
             --memory="900m" \
@@ -119,7 +147,8 @@ jobs:
             --cpus="2.0" \
             --security-opt=no-new-privileges \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=150m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=50m \
             -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
