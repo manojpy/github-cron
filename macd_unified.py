@@ -3291,22 +3291,45 @@ async def evaluate_pair_and_alert(
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:
-                logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
-        
+                logger_pair.error(f"Error sending alerts: {e}", exc_info=False)   
+
         # Build suppression reasons for logging
         reasons = []
+
+        # Common trend/candle gates
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
-        
+
         if context.get("candle_quality_failed_buy") and buy_candle_reason:
             reasons.append(f"BUY quality: {buy_candle_reason}")
-        
+
         if context.get("candle_quality_failed_sell") and sell_candle_reason:
             reasons.append(f"SELL quality: {sell_candle_reason}")
-        
+
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
-        
+
+        # === NEW: Guard condition suppression logging ===
+        # PPO cross above signal requires PPO < +0.20
+        if ppo_prev <= ppo_sig_prev and ppo_curr > ppo_sig_curr:
+            if ppo_curr >= 0.20:
+                reasons.append(f"PPO cross above signal blocked: PPO={ppo_curr:.2f} ≥ +0.20")
+
+        # RSI cross above 50 requires PPO < +0.30
+        if rsi_prev <= 50 and rsi_curr > 50:
+            if ppo_curr >= 0.30:
+                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ +0.30")
+
+        # PPO cross below signal requires PPO > –0.20
+        if ppo_prev >= ppo_sig_prev and ppo_curr < ppo_sig_curr:
+            if ppo_curr <= -0.20:
+                reasons.append(f"PPO cross below signal blocked: PPO={ppo_curr:.2f} ≤ –0.20")
+
+        # RSI cross below 50 requires PPO > –0.30
+        if rsi_prev >= 50 and rsi_curr < rsi_curr:
+            if ppo_curr <= -0.30:
+                reasons.append(f"RSI cross below 50 blocked: PPO={ppo_curr:.2f} ≤ –0.30")
+
         # Debug logging for no alerts
         if not alerts_to_send:
             if logger_pair.isEnabledFor(logging.DEBUG):
