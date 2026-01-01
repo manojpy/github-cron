@@ -145,6 +145,7 @@ jobs:
             -e PYTHONUNBUFFERED=1 \
             -e NUMBA_NUM_THREADS=2 \
             -e OMP_NUM_THREADS=2 \
+            ul
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
           

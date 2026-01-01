@@ -97,40 +97,32 @@ jobs:
           docker load --input /tmp/macd-image.tar
           
           echo "🧪 Running verification suite..."
-          docker run --rm macd-verify:local python -c "
+
+          docker run --rm macd-verify:local python -c "\
           import sys
           import os
           from pathlib import Path
-          
           print('=' * 60)
           print('🔬 VERIFICATION REPORT')
           print('=' * 60)
-          
           # Test 1: AOT Binary
           try:
-              from aot_bridge import ensure_initialized, is_using_aot, get_fallback_reason
+              from aot_bridge import ensure_initialized, is_using_aot, diagnostics
               ensure_initialized()
+              diag = diagnostics()
               aot_active = is_using_aot()
-              
-              if aot_active:
-                  print('✅ AOT Binary: LOADED & ACTIVE')
-              else:
-                  reason = get_fallback_reason()
-                  print(f'⚠️  AOT Binary: FALLBACK TO JIT')
-                  print(f'   Reason: {reason}')
-                  sys.exit(1)  # Fail if AOT not available
+              assert aot_active, f'AOT failed: {diag}'
+              print(f'✅ AOT: {diag.get('using_aot', False)} | Source: {diag.get('source_module', 'N/A')}')
           except Exception as e:
               print(f'❌ AOT Binary: IMPORT FAILED')
-              print(f'   Error: {e}')
+              print(f'Error: {e}')
               sys.exit(1)
-          
           # Test 2: Config Template
           config_path = Path('config_macd.json')
           if config_path.exists():
               print(f'✅ Config Template: FOUND ({config_path.stat().st_size} bytes)')
           else:
-              print('⚠️  Config Template: MISSING (expected at runtime)')
-          
+              print('⚠️ Config Template: MISSING (expected at runtime)')
           # Test 3: Critical Dependencies
           try:
               import numpy as np
@@ -140,12 +132,10 @@ jobs:
           except ImportError as e:
               print(f'❌ Dependency Check Failed: {e}')
               sys.exit(1)
-          
           print('=' * 60)
           print('✅ ALL CHECKS PASSED')
           print('=' * 60)
-          " || exit 1
-
+          " || exit 1 
 
       # ✅ ADD: Warm up cache layers before push
       - name: 🔥 Warm Up Cache Layers
