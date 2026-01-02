@@ -2996,7 +2996,7 @@ async def evaluate_pair_and_alert(
             abs(vwap_prev - close_prev) < 1e-8
         )
         if vwap_flat:
-            logger_pair.debug(
+            logger_pair.info(
                 f"VWAP flattened for {pair_name} | "
                 f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
                 f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
