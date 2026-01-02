@@ -153,7 +153,10 @@ def compile_module():
     
     # 10. VWAP
     cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])')(vwap_daily_loop)
-    
+
+
+
+
     # 11-12. Rolling Standard Deviation
     cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')(rolling_std_welford)
     cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')(rolling_std_welford_parallel)

@@ -230,26 +230,30 @@ def vwap_daily_loop(
     low: np.ndarray,
     close: np.ndarray,
     volume: np.ndarray,
-    timestamps: np.ndarray,
+    day_id: np.ndarray,
 ) -> np.ndarray:
-    """Volume Weighted Average Price – resets daily."""
+    """Volume Weighted Average Price – resets daily on day_id change."""
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
 
     cum_vol = 0.0
     cum_pv = 0.0
-    current_day = -1
+    prev_day = -1
 
     for i in range(n):
-        day = timestamps[i] // 86400
-        if day != current_day:
-            current_day = day
+        day = day_id[i]
+        is_new_day = day != prev_day
+
+        if is_new_day:
+            prev_day = day
             cum_vol = 0.0
             cum_pv = 0.0
 
         h, l, c, v = high[i], low[i], close[i], volume[i]
+
         if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
-            vwap[i] = vwap[i - 1] if i > 0 else c
+            # ✅ Reset correctly on new day, otherwise carry forward
+            vwap[i] = (h + l + c) / 3.0 if is_new_day else (vwap[i - 1] if i > 0 else c)
             continue
 
         typical = (h + l + c) / 3.0
@@ -258,6 +262,7 @@ def vwap_daily_loop(
         vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical
 
     return vwap
+
 
 # ============================================================================
 # STATISTICAL FUNCTIONS
