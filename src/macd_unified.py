@@ -31,6 +31,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
+from redis.exceptions import RedisError, RedisConnectionError
+from utils.json import json_dumps, json_loads
+from config import cfg
+from constants import Constants
+
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
@@ -1803,21 +1808,21 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
 
 class RedisStateStore:
     """
-    Redis-backed state store with connection pooling, Lua-based deduplication,
-    and graceful degradation support.
-    
+    Redis-backed state store with per-URL connection pooling, Lua-based deduplication,
+    staleness checks, and graceful degradation.
+
     Features:
-    - Global connection pool with reuse tracking
+    - Per-URL connection pools with reuse tracking
+    - Staleness checks and automatic refresh
     - Atomic batch operations via pipelines
-    - Lua script-based alert deduplication
+    - Lua script-based alert deduplication with reload lock
     - Graceful degradation when Redis is unavailable
-    - Connection staleness checks and automatic refresh
     """
-    
+
     # Lua script for atomic deduplication
-    DEDUP_LUA = """
+    DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
-    local ttl = ARGV[1]
+    local ttl = tonumber(ARGV[1])
     if redis.call("EXISTS", key) == 1 then
         return 0
     else
@@ -1825,17 +1830,17 @@ class RedisStateStore:
         return 1
     end
     """
-    
+
     # Configuration constants
     POOL_MAX_AGE_SECONDS = 3600  # 1 hour
     SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0  # Max wait for script reload lock
-    
-    # Class-level connection pool management
-    _global_pool: ClassVar[Optional[redis.Redis]] = None
-    _pool_healthy: ClassVar[bool] = False
+
+    # Per-URL connection pool management
+    _global_pools: ClassVar[Dict[str, Optional[redis.Redis]]] = {}
+    _pool_healthy: ClassVar[Dict[str, bool]] = {}
+    _pool_created_at: ClassVar[Dict[str, float]] = {}
+    _pool_reuse_count: ClassVar[Dict[str, int]] = {}
     _pool_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _pool_created_at: ClassVar[float] = 0.0
-    _pool_reuse_count: ClassVar[int] = 0
     _script_reload_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
 
     def __init__(self, redis_url: str):
@@ -1853,7 +1858,7 @@ class RedisStateStore:
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
-        self._dedup_script_sha = None
+        self._dedup_script_sha: Optional[str] = None
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -1862,6 +1867,10 @@ class RedisStateStore:
                 f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
                 f"Metadata TTL: 7d"
             )
+
+    # ------------------------------------------------------------------
+    # Connection handling
+    # ------------------------------------------------------------------
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         """Attempt to establish Redis connection with health checks."""
@@ -1874,23 +1883,23 @@ class RedisStateStore:
                 max_connections=32,
                 decode_responses=True,
             )
-            
+
             ok = await self._ping_with_retry(timeout)
             if not ok:
                 raise RedisConnectionError("ping failed after retries")
-            
+
             logger.info("Redis connected")
             self.degraded = False
             self.degraded_alerted = False
             self._connection_attempts = 0
 
             async with RedisStateStore._pool_lock:
-                RedisStateStore._global_pool = self._redis
-                RedisStateStore._pool_healthy = True
-                RedisStateStore._pool_created_at = time.time()
-                RedisStateStore._pool_reuse_count = 0
+                RedisStateStore._global_pools[self.redis_url] = self._redis
+                RedisStateStore._pool_healthy[self.redis_url] = True
+                RedisStateStore._pool_created_at[self.redis_url] = time.time()
+                RedisStateStore._pool_reuse_count[self.redis_url] = 0
                 if cfg.DEBUG_MODE:
-                    logger.debug("💾 Redis connection saved to global pool")
+                    logger.debug("💾 Redis connection saved to per-URL pool")
 
             # Load Lua deduplication script
             try:
@@ -1902,7 +1911,7 @@ class RedisStateStore:
                 self._dedup_script_sha = None
 
             return True
-            
+
         except Exception as exc:
             logger.error(f"Redis connection attempt failed: {exc}")
             if self._redis:
@@ -1915,120 +1924,103 @@ class RedisStateStore:
 
     async def connect(self, timeout: float = 5.0) -> None:
         """
-        Connect to Redis with connection pool reuse and staleness checks.
-        
+        Connect to Redis with per-URL pool reuse and staleness checks.
+
         FIX #1: Prevents race condition by holding lock during smoke test
         FIX #2: Adds connection staleness check to refresh old pools
         """
         pool_reused = False
-        
+
         async with RedisStateStore._pool_lock:
-            if RedisStateStore._global_pool and RedisStateStore._pool_healthy:
+            pool = RedisStateStore._global_pools.get(self.redis_url)
+            healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
+
+            if pool and healthy:
                 # Check pool staleness
-                pool_age = time.time() - RedisStateStore._pool_created_at
-                
+                pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
+
                 if pool_age > self.POOL_MAX_AGE_SECONDS:
                     logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
-                    RedisStateStore._pool_healthy = False
+                    RedisStateStore._pool_healthy[self.redis_url] = False
                     try:
-                        await RedisStateStore._global_pool.aclose()
+                        await pool.aclose()
                     except Exception:
                         pass
-                    RedisStateStore._global_pool = None
+                    RedisStateStore._global_pools[self.redis_url] = None
                 else:
                     # Pool is fresh, try to reuse it
                     try:
-                        await asyncio.wait_for(
-                            RedisStateStore._global_pool.ping(), 
-                            timeout=1.0
-                        )
-                        self._redis = RedisStateStore._global_pool
-                        RedisStateStore._pool_reuse_count += 1
+                        await asyncio.wait_for(pool.ping(), timeout=1.0)
+                        self._redis = pool
+                        RedisStateStore._pool_reuse_count[self.redis_url] = \
+                            RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
 
                         if not self._dedup_script_sha:
                             try:
-                                self._dedup_script_sha = await self._redis.script_load(
-                                    self.DEDUP_LUA
-                                )
+                                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
                             except Exception as e:
                                 logger.warning(f"Lua script load failed: {e}")
 
                         self.degraded = False
-                        
+
                         # Quick smoke test while holding lock (prevents race condition)
                         test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
                         try:
-                            await asyncio.wait_for(
-                                self._redis.set(test_key, "ok", ex=10),
-                                timeout=1.0
-                            )
-                            await asyncio.wait_for(
-                                self._redis.delete(test_key),
-                                timeout=1.0
-                            )
+                            await asyncio.wait_for(self._redis.set(test_key, "ok", ex=10), timeout=1.0)
+                            await asyncio.wait_for(self._redis.delete(test_key), timeout=1.0)
                             pool_reused = True
                             return  # Success - exit while holding lock
                         except Exception as smoke_error:
                             logger.warning(f"Pool smoke test failed: {smoke_error}")
-                            RedisStateStore._pool_healthy = False
+                            RedisStateStore._pool_healthy[self.redis_url] = False
                             pool_reused = False
-                            
+
                     except Exception as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
-                        RedisStateStore._pool_healthy = False
+                        RedisStateStore._pool_healthy[self.redis_url] = False
                         pool_reused = False
-        
+
         # If we already connected via pool, exit early
         if pool_reused:
             return
-        
+
         # Need to create new connection
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             self._connection_attempts = attempt
             if cfg.DEBUG_MODE:
-                logger.debug(
-                    f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}"
-                )
+                logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
                 # Perform smoke test
                 test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
                 test_val = "ok"
-                
+
                 set_ok = await self._safe_redis_op(
                     lambda: self._redis.set(test_key, test_val, ex=10),
                     2.0, "smoke_set"
                 )
                 get_ok = await self._safe_redis_op(
                     lambda: self._redis.get(test_key),
-                    2.0, "smoke_get", 
+                    2.0, "smoke_get",
                     parser=lambda r: r == test_val
                 )
-                
+
                 if set_ok and get_ok:
-                    await self._safe_redis_op(
-                        lambda: self._redis.delete(test_key), 
-                        1.0, 
-                        "smoke_cleanup"
-                    )
-                    
+                    await self._safe_redis_op(lambda: self._redis.delete(test_key), 1.0, "smoke_cleanup")
+
                     expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
                     logger.info(
                         f"✅ Redis connected "
                         f"({self._redis.connection_pool.max_connections} connections, "
                         f"{expiry_mode} expiry)"
                     )
-                    
-                    info = await self._safe_redis_op(
-                        lambda: self._redis.info("memory"), 
-                        3.0, 
-                        "info_memory"
-                    )
+
+                    info = await self._safe_redis_op(lambda: self._redis.info("memory"), 3.0, "info_memory")
                     if info and cfg.DEBUG_MODE:
                         policy = info.get("maxmemory_policy", "unknown")
                         logger.debug(f"Redis memory policy: {policy}")
-                    
+
                     self.degraded = False
                     self.degraded_alerted = False
                     return
@@ -2053,58 +2045,48 @@ class RedisStateStore:
 """)
 
         if cfg.FAIL_ON_REDIS_DOWN:
-            raise RedisConnectionError(
-                "Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true"
-            )
+            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
-        """Close Redis connection if it's not the shared pool."""
-        if self._redis and self._redis != RedisStateStore._global_pool:
-            try:
-                await self._redis.aclose()
-                if cfg.DEBUG_MODE:
-                    logger.debug("Closed non-pool Redis connection")
-            except Exception:
-                pass
+        """Close Redis connection handle for this instance (not the shared pool)."""
+        # Do not close pooled connection here; only clear local reference.
         self._redis = None
 
     @classmethod
-    async def shutdown_global_pool(cls) -> None:
-        """Shutdown the global Redis connection pool."""
+    async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
+        """
+        Shutdown per-URL Redis connection pools.
+
+        Args:
+            redis_url: If provided, shutdown only that pool; otherwise shutdown all.
+        """
         async with cls._pool_lock:
-            if cls._global_pool:
-                try:
-                    if hasattr(cls._global_pool, 'connection_pool') and \
-                       cls._global_pool.connection_pool:
-                        pool_age = time.time() - cls._pool_created_at
-                        reuse_count = cls._pool_reuse_count
-                        
-                        logger.info(
-                            f"Shutting down global Redis pool | "
-                            f"Age: {pool_age:.1f}s | "
-                            f"Reuses: {reuse_count}"
-                        )
-                        
-                        await cls._global_pool.aclose()
+            urls = [redis_url] if redis_url else list(cls._global_pools.keys())
+            for url in urls:
+                pool = cls._global_pools.get(url)
+                if pool:
+                    try:
+                        pool_age = time.time() - cls._pool_created_at.get(url, 0.0)
+                        reuse_count = cls._pool_reuse_count.get(url, 0)
+                        logger.info(f"Shutting down Redis pool | url={url} | Age: {pool_age:.1f}s | Reuses: {reuse_count}")
+
+                        await pool.aclose()
                         await asyncio.sleep(0.25)  # Allow cleanup
-                        
-                        cls._global_pool = None
-                        cls._pool_healthy = False
-                        cls._pool_created_at = 0.0
-                        cls._pool_reuse_count = 0
-                        
-                        logger.debug("✅ Global Redis pool shutdown complete")
-                    else:
-                        logger.debug("Redis pool already closed")
-                        cls._global_pool = None
-                        cls._pool_healthy = False
-                        
-                except Exception as e:
-                    logger.error(f"Error shutting down global Redis pool: {e}")
-                    cls._global_pool = None
-                    cls._pool_healthy = False
-            else:
-                logger.debug("Global Redis pool already closed or not created")
+
+                    except Exception as e:
+                        logger.error(f"Error shutting down Redis pool {url}: {e}")
+
+                # Reset entries
+                cls._global_pools[url] = None
+                cls._pool_healthy[url] = False
+                cls._pool_created_at[url] = 0.0
+                cls._pool_reuse_count[url] = 0
+
+                # Clean keys entirely to avoid growth
+                cls._global_pools.pop(url, None)
+                cls._pool_healthy.pop(url, None)
+                cls._pool_created_at.pop(url, None)
+                cls._pool_reuse_count.pop(url, None)
 
     async def __aenter__(self):
         await self.connect()
@@ -2113,13 +2095,13 @@ class RedisStateStore:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
+    # ------------------------------------------------------------------
+    # Low-level helpers
+    # ------------------------------------------------------------------
+
     async def _ping_with_retry(self, timeout: float) -> bool:
         """Ping Redis with timeout."""
-        result = await self._safe_redis_op(
-            lambda: self._redis.ping(), 
-            timeout, 
-            "ping"
-        )
+        result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
         return bool(result)
 
     async def _safe_redis_op(
@@ -2131,13 +2113,13 @@ class RedisStateStore:
     ):
         """
         Execute Redis operation with timeout and error handling.
-        
+
         Args:
             fn: Async function to execute
             timeout: Operation timeout in seconds
             op_name: Operation name for logging
             parser: Optional result parser function
-            
+
         Returns:
             Parsed result or None on failure
         """
@@ -2153,6 +2135,10 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"Failed to {op_name}: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # State APIs
+    # ------------------------------------------------------------------
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         """Get state value from Redis."""
@@ -2193,45 +2179,44 @@ class RedisStateStore:
             parser=lambda r: r if r else None,
         )
 
-    async def set_metadata(
-        self, key: str, value: str, timeout: float = 2.0
-    ) -> None:
+    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
         """Set metadata value in Redis with TTL."""
         await self._safe_redis_op(
             lambda: self._redis.set(
-                f"{self.meta_prefix}{key}", 
-                value, 
+                f"{self.meta_prefix}{key}",
+                value,
                 ex=self.metadata_expiry_seconds
             ),
             timeout,
             f"set_metadata {key}",
         )
 
-    async def check_recent_alert(
-        self, pair: str, alert_key: str, ts: int
-    ) -> bool:
+    # ------------------------------------------------------------------
+    # Deduplication
+    # ------------------------------------------------------------------
+
+    async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
         """
         Check if alert was recently sent (deduplication).
-        
+
         FIX #3: Prevents thundering herd on Lua script reload with lock
-        
+
         Returns:
             True if alert should be sent, False if it's a duplicate
         """
         if self.degraded:
             return True
 
-        window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * \
-                 Constants.ALERT_DEDUP_WINDOW_SEC
+        window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
         if self._dedup_script_sha:
             try:
                 result = await self._safe_redis_op(
                     lambda: self._redis.evalsha(
-                        self._dedup_script_sha, 
-                        1, 
-                        recent_key, 
+                        self._dedup_script_sha,
+                        1,
+                        recent_key,
                         str(Constants.ALERT_DEDUP_WINDOW_SEC)
                     ),
                     timeout=2.0,
@@ -2241,7 +2226,7 @@ class RedisStateStore:
                 if cfg.DEBUG_MODE and not should_send:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
-                
+
             except redis.exceptions.NoScriptError:
                 # Use lock to prevent multiple concurrent reloads (thundering herd)
                 try:
@@ -2253,8 +2238,8 @@ class RedisStateStore:
                         try:
                             result = await self._safe_redis_op(
                                 lambda: self._redis.evalsha(
-                                    self._dedup_script_sha, 
-                                    1, 
+                                    self._dedup_script_sha,
+                                    1,
                                     recent_key,
                                     str(Constants.ALERT_DEDUP_WINDOW_SEC)
                                 ),
@@ -2267,9 +2252,7 @@ class RedisStateStore:
                             # Still missing, reload now
                             logger.warning("Dedup script missing, reloading...")
                             try:
-                                self._dedup_script_sha = await self._redis.script_load(
-                                    self.DEDUP_LUA
-                                )
+                                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
                                 result = await self._safe_redis_op(
                                     lambda: self._redis.evalsha(
                                         self._dedup_script_sha,
@@ -2287,7 +2270,7 @@ class RedisStateStore:
                                 RedisStateStore._script_reload_lock.release()
                 except asyncio.TimeoutError:
                     logger.warning("Script reload lock timeout, falling back to SET NX")
-                    
+
             except Exception as e:
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Lua script failed, fallback to SET NX: {e}")
@@ -2295,9 +2278,9 @@ class RedisStateStore:
         # Fallback to SET NX if Lua script unavailable
         result = await self._safe_redis_op(
             lambda: self._redis.set(
-                recent_key, 
-                "1", 
-                nx=True, 
+                recent_key,
+                "1",
+                nx=True,
                 ex=Constants.ALERT_DEDUP_WINDOW_SEC
             ),
             timeout=2.0,
@@ -2314,28 +2297,22 @@ class RedisStateStore:
     ) -> Dict[str, bool]:
         """
         Batch check multiple alert deduplication statuses.
-        
+
         Returns:
             Dict mapping "pair:alert_key" to True (should send) or False (duplicate)
         """
-        if self.degraded or not checks:
+        if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
         try:
             async with self._redis.pipeline() as pipe:
                 keys_map: Dict[str, str] = {}
                 for pair, alert_key, ts in checks:
-                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * \
-                             Constants.ALERT_DEDUP_WINDOW_SEC
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                     recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
                     composite = f"{pair}:{alert_key}"
                     keys_map[recent_key] = composite
-                    pipe.set(
-                        recent_key, 
-                        "1", 
-                        nx=True, 
-                        ex=Constants.ALERT_DEDUP_WINDOW_SEC
-                    )
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
 
                 results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
 
@@ -2347,14 +2324,16 @@ class RedisStateStore:
             if cfg.DEBUG_MODE:
                 duplicates = sum(1 for v in output.values() if not v)
                 if duplicates > 0:
-                    logger.debug(
-                        f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered"
-                    )
+                    logger.debug(f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered")
 
             return output
         except Exception as e:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+
+    # ------------------------------------------------------------------
+    # Bulk state ops
+    # ------------------------------------------------------------------
 
     async def mget_states(
         self,
@@ -2363,10 +2342,10 @@ class RedisStateStore:
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """
         Fetch multiple alert states from Redis.
-        
+
         Args:
             keys: List of state keys (e.g., "BTCUSD:ALERT:PPO_SIGNAL_UP")
-            
+
         Returns:
             Dict mapping keys to state dictionaries or None
         """
@@ -2376,13 +2355,10 @@ class RedisStateStore:
         redis_keys = [f"{self.state_prefix}{k}" for k in keys]
 
         try:
-            results = await asyncio.wait_for(
-                self._redis.mget(redis_keys), 
-                timeout=timeout
-            )
+            results = await asyncio.wait_for(self._redis.mget(redis_keys), timeout=timeout)
             if not results:
                 return {}
-            
+
             output: Dict[str, Optional[Dict[str, Any]]] = {}
             for idx, key in enumerate(keys):
                 val = results[idx] if idx < len(results) else None
@@ -2410,7 +2386,7 @@ class RedisStateStore:
     ) -> None:
         """
         Batch update multiple states atomically using pipeline.
-        
+
         Args:
             updates: List of (key, state, optional_timestamp) tuples
             timeout: Pipeline execution timeout
@@ -2438,6 +2414,10 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
+    # ------------------------------------------------------------------
+    # Atomic evaluation
+    # ------------------------------------------------------------------
+
     async def atomic_eval_batch(
         self,
         pair: str,
@@ -2447,15 +2427,15 @@ class RedisStateStore:
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """
         Atomically evaluate alert states, update states, and check deduplication.
-        
+
         FIX #4: Corrects double-prefix bug in fallback path
-        
+
         Args:
             pair: Trading pair name
             alert_keys: List of alert keys to check previous state
             state_updates: List of state updates to apply
             dedup_checks: List of deduplication checks
-            
+
         Returns:
             Tuple of (previous_states_dict, dedup_results_dict)
         """
@@ -2463,7 +2443,7 @@ class RedisStateStore:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
-    
+
         try:
             prev_states, dedup_results = await self._pipeline_ops(
                 pair, alert_keys, state_updates, dedup_checks
@@ -2475,16 +2455,13 @@ class RedisStateStore:
                 f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
                 f"Degrading to individual operations"
             )
-    
+
             # Fallback with timeout protection
             try:
                 # FIX: Correct key format - mget_states adds prefix internally
                 composite_keys = [f"{pair}:{k}" for k in alert_keys]
-                prev_raw = await asyncio.wait_for(
-                    self.mget_states(composite_keys),
-                    timeout=2.0
-                )
-                
+                prev_raw = await asyncio.wait_for(self.mget_states(composite_keys), timeout=2.0)
+
                 # Normalize to {alert_key: is_active}
                 prev_states: Dict[str, bool] = {}
                 for k in alert_keys:
@@ -2492,21 +2469,15 @@ class RedisStateStore:
                     env = prev_raw.get(ck)
                     prev_states[k] = bool(env and env.get("state") == "ACTIVE")
 
-                await asyncio.wait_for(
-                    self.batch_set_states(state_updates),
-                    timeout=2.0
-                )
-                
-                dedup_results = await asyncio.wait_for(
-                    self.batch_check_recent_alerts(dedup_checks),
-                    timeout=2.0
-                )
+                await asyncio.wait_for(self.batch_set_states(state_updates), timeout=2.0)
+
+                dedup_results = await asyncio.wait_for(self.batch_check_recent_alerts(dedup_checks), timeout=2.0)
             except asyncio.TimeoutError:
                 logger.critical(f"Redis completely unresponsive for {pair}")
                 empty_prev = {k: False for k in alert_keys}
                 empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
                 return empty_prev, empty_dedup
-    
+
             return prev_states, dedup_results
 
     async def _pipeline_ops(
@@ -2518,52 +2489,49 @@ class RedisStateStore:
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """
         Execute all Redis operations in a single pipeline.
-        
+
         FIX #5: Adds comprehensive error handling for JSON parsing
-        
+
         Returns:
             Tuple of (previous_states, dedup_results)
         """
+        if not self._redis:
+            raise RedisConnectionError("Redis unavailable")
+
         async with self._redis.pipeline() as pipe:
             # 1. Get previous states
             state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
             pipe.mget(state_keys)
-        
+
             # 2. Set new states
             now = int(time.time())
             for key, state, custom_ts in state_updates:
                 ts = custom_ts if custom_ts is not None else now
                 data = json_dumps({"state": state, "ts": ts})
                 full_key = f"{self.state_prefix}{key}"
-                
+
                 if self.expiry_seconds > 0:
                     pipe.set(full_key, data, ex=self.expiry_seconds)
                 else:
                     pipe.set(full_key, data)
-        
+
             # 3. Deduplication checks
             dedup_key_mapping: Dict[str, str] = {}
             for pair_name, alert_key, ts in dedup_checks:
-                window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * \
-                         Constants.ALERT_DEDUP_WINDOW_SEC
+                window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                 recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                 composite_key = f"{pair_name}:{alert_key}"
                 dedup_key_mapping[recent_key] = composite_key
-                
-                pipe.set(
-                    recent_key, 
-                    "1", 
-                    nx=True, 
-                    ex=Constants.ALERT_DEDUP_WINDOW_SEC
-                )
-        
+
+                pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+
             # Execute pipeline
             results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-    
+
         # Parse results with comprehensive error handling
         num_updates = len(state_updates)
         mget_results = results[0] if results else []
-    
+
         prev_states: Dict[str, bool] = {}
         for idx, key in enumerate(alert_keys):
             val = mget_results[idx] if idx < len(mget_results) else None
@@ -2580,15 +2548,19 @@ class RedisStateStore:
                     prev_states[key] = False
             else:
                 prev_states[key] = False
-    
+
         dedup_results: Dict[str, bool] = {}
         dedup_start_idx = 1 + num_updates
         for idx, (recent_key, composite_key) in enumerate(dedup_key_mapping.items()):
             result_idx = dedup_start_idx + idx
             should_send = bool(results[result_idx]) if result_idx < len(results) else True
             dedup_results[composite_key] = should_send
-    
+
         return prev_states, dedup_results
+
+    # ------------------------------------------------------------------
+    # Atomic batch update
+    # ------------------------------------------------------------------
 
     async def atomic_batch_update(
         self,
@@ -2598,12 +2570,12 @@ class RedisStateStore:
     ) -> bool:
         """
         Atomically update and/or delete multiple keys.
-        
+
         Args:
             updates: List of (key, state, optional_timestamp) tuples
             deletes: Optional list of keys to delete
             timeout: Pipeline execution timeout
-            
+
         Returns:
             True if successful, False otherwise
         """
@@ -2632,6 +2604,8 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"Atomic batch update failed: {e}")
             return False
+
+
 class RedisLock:
     RELEASE_LUA = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
