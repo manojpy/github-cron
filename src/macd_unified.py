@@ -2577,7 +2577,7 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     headline = f"{headline_emoji} **{pair}** • ${price:,.2f}  {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}"
     bullets = []
     for idx, (title, extra) in enumerate(items):
-        prefix = "└���" if idx == len(items) - 1 else "├─"
+        prefix = "└➤" if idx == len(items) - 1 else "├➤"
         bullets.append(f"{prefix} {title} | {extra}")
     body = "\n".join(bullets)
     return escape_markdown_v2(f"{headline}\n{body}")
@@ -3072,7 +3072,7 @@ async def evaluate_pair_and_alert(
             # Price data
             "close_curr": close_curr,
             "close_prev": close_prev,
-            "close_5m_val": close_5m_val,      # ✅ ADDED
+            "close_5m_val": close_5m_val,
             "ts_curr": ts_curr,
     
             # PPO values (as dict for alert checks)
@@ -3086,20 +3086,20 @@ async def evaluate_pair_and_alert(
             "rsi_prev": rsi_prev,
     
             # VWAP values
-            "vwap_curr": vwap_curr,            # ✅ ADDED
-            "vwap_prev": vwap_prev,            # ✅ ADDED
+            "vwap_curr": vwap_curr,
+            "vwap_prev": vwap_prev, 
     
             # MMH values
-            "mmh_curr": mmh_curr,              # ✅ ADDED
-            "mmh_m1": mmh_m1,                  # ✅ ADDED
+            "mmh_curr": mmh_curr,
+            "mmh_m1": mmh_m1, 
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
     
             # Trend indicators
-            "rma50_15_val": rma50_15_val,      # ✅ ADDED
-            "rma200_5_val": rma200_5_val,      # ✅ ADDED
-            "cloud_up": cloud_up,              # ✅ ADDED
-            "cloud_down": cloud_down,          # ✅ ADDED
+            "rma50_15_val": rma50_15_val,
+            "rma200_5_val": rma200_5_val,
+            "cloud_up": cloud_up,
+            "cloud_down": cloud_down,
     
             # Other indicators
             "pivots": piv,
