@@ -2110,11 +2110,9 @@ class RedisStateStore:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
             except redis.exceptions.NoScriptError:
-            
                 logger.warning("Dedup script missing, reloading...")
                 try:
                     self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                
                     result = await self._safe_redis_op(
                         lambda: self._redis.evalsha(
                             self._dedup_script_sha, 1, recent_key, str(Constants.ALERT_DEDUP_WINDOW_SEC)
@@ -2125,7 +2123,6 @@ class RedisStateStore:
                     return bool(result)
                 except Exception as reload_error:
                     logger.error(f"Failed to reload dedup script: {reload_error}")
-                
             except Exception as e:
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Lua script failed, fallback to SET NX: {e}")
@@ -2162,7 +2159,6 @@ class RedisStateStore:
 
             output: Dict[str, bool] = {}
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
-        
                 should_send = bool(results[idx]) if idx < len(results) else True
                 output[composite_key] = should_send
 
@@ -2181,6 +2177,11 @@ class RedisStateStore:
         keys: List[str],
         timeout: float = 2.0
     ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Fetch multiple alert states from Redis and return them as a dict keyed by the original keys.
+        Keys must already include the ALERT_KEYS[...] mapping AND the pair prefix,
+        e.g. BTCUSD:ALERT:PPO_SIGNAL_UP
+        """
         if not self._redis or not keys:
             return {}
 
@@ -2190,21 +2191,20 @@ class RedisStateStore:
             results = await asyncio.wait_for(self._redis.mget(redis_keys), timeout=timeout)
             if not results:
                 return {}
+
             output: Dict[str, Optional[Dict[str, Any]]] = {}
             for idx, key in enumerate(keys):
                 val = results[idx] if idx < len(results) else None
                 if val:
                     try:
                         output[key] = json_loads(val)
-                    except Exception as e:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"Failed to parse state for {key}: {e}")
+                    except Exception:
                         output[key] = None
                 else:
                     output[key] = None
             return output
-        except Exception as e:
-            logger.error(f"mget_states failed for {len(keys)} keys: {e} | Keys sample: {keys[:5]}")
+
+        except Exception:
             return {}
 
     async def batch_set_states(
@@ -2249,7 +2249,6 @@ class RedisStateStore:
             return empty_prev, empty_dedup
     
         try:
-            # Normal pipelined Redis operations
             prev_states, dedup_results = await self._pipeline_ops(
                 pair, alert_keys, state_updates, dedup_checks
             )
@@ -2257,20 +2256,27 @@ class RedisStateStore:
 
         except asyncio.TimeoutError:
             logger.error(
-            f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
-            f"Degrading to individual operations"
-        )
+                f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
+                f"Degrading to individual operations"
+            )
     
         # Fallback with timeout protection
         try:
-            prev_states = await asyncio.wait_for(
-                self.mget_states([f"{self.state_prefix}{pair}:{k}" for k in alert_keys]),
+            # Correct: pass "pair:ALERT_KEY" into mget_states (it adds prefix internally)
+            composite_keys = [f"{pair}:{k}" for k in alert_keys]
+            prev_raw = await asyncio.wait_for(
+                self.mget_states(composite_keys),
                 timeout=2.0
             )
-            await asyncio.wait_for(
-                self.batch_set_states(state_updates),
-                timeout=2.0
-            )
+            # Normalize to {alert_key: is_active}
+            prev_states: Dict[str, bool] = {}
+            for k in alert_keys:
+                ck = f"{pair}:{k}"
+                env = prev_raw.get(ck)
+                prev_states[k] = bool(env and env.get("state") == "ACTIVE")
+
+            await asyncio.wait_for(self.batch_set_states(state_updates), timeout=2.0)
+
             dedup_results = await asyncio.wait_for(
                 self.batch_check_recent_alerts(dedup_checks),
                 timeout=2.0
@@ -2292,30 +2298,28 @@ class RedisStateStore:
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """Execute all Redis operations in single pipeline."""
         async with self._redis.pipeline() as pipe:
-            # 1. Get previous states
+            # 1. Get previous states (pair:ALERT_KEY), prefixed by state_prefix in Redis
             state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
             pipe.mget(state_keys)
         
-            # 2. Set new states
+            # 2. Set new states (keys in state_updates already include pair:ALERT_KEY)
             now = int(time.time())
             for key, state, custom_ts in state_updates:
                 ts = custom_ts if custom_ts is not None else now
                 data = json_dumps({"state": state, "ts": ts})
                 full_key = f"{self.state_prefix}{key}"
-            
                 if self.expiry_seconds > 0:
                     pipe.set(full_key, data, ex=self.expiry_seconds)
                 else:
                     pipe.set(full_key, data)
         
             # 3. Deduplication checks
-            dedup_key_mapping = {}
+            dedup_key_mapping: Dict[str, str] = {}
             for pair_name, alert_key, ts in dedup_checks:
                 window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                 recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                 composite_key = f"{pair_name}:{alert_key}"
                 dedup_key_mapping[recent_key] = composite_key
-            
                 pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
         
             # Execute pipeline
@@ -2323,10 +2327,9 @@ class RedisStateStore:
     
         # Parse results
         num_updates = len(state_updates)
-        num_dedup_checks = len(dedup_checks)
         mget_results = results[0] if results else []
     
-        prev_states = {}
+        prev_states: Dict[str, bool] = {}
         for idx, key in enumerate(alert_keys):
             val = mget_results[idx] if idx < len(mget_results) else None
             if val:
@@ -2338,7 +2341,7 @@ class RedisStateStore:
             else:
                 prev_states[key] = False
     
-        dedup_results = {}
+        dedup_results: Dict[str, bool] = {}
         dedup_start_idx = 1 + num_updates
         for idx, (recent_key, composite_key) in enumerate(dedup_key_mapping.items()):
             result_idx = dedup_start_idx + idx
@@ -3892,5 +3895,4 @@ if __name__ == "__main__":
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
         sys.exit(1)
-
 
