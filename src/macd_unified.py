@@ -3085,14 +3085,26 @@ async def evaluate_pair_and_alert(
         
         raw_alerts = []
         
-        # Filter alert keys based on enabled features
+    
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
-                ("pivots" in d["requires"] and not piv) or
-                ("vwap" in d["requires"] and not cfg.ENABLE_VWAP)
-            )
-        ]
+        # Gate pivot alerts if pivots are missing/disabled
+                ("pivots" in d["requires"] and (not piv or not any(piv.values()))) or
+
+        # Gate VWAP alerts if VWAP is disabled
+                ("vwap" in d["requires"] and not cfg.ENABLE_VWAP) or
+
+        # Gate PPO alerts if PPO data is missing
+                ("ppo" in d["requires"] and (ppo_ctx is None or ppo_sig_ctx is None)) or
+
+        # Gate PPO signal alerts if PPO signal data is missing
+                ("ppo_signal" in d["requires"] and ppo_sig_ctx is None) or
+
+        # Gate RSI alerts if RSI data is missing
+                ("rsi" in d["requires"] and rsi_ctx is None)
+    )
+]
         
         # Remove pivot alerts if no valid pivots
         if not piv or not any(piv.values()):
