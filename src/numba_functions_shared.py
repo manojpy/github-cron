@@ -226,41 +226,52 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
 
 @njit(nogil=True, fastmath=True, cache=True)
 def vwap_daily_loop(
-    high: np.ndarray, 
-    low: np.ndarray, 
-    close: np.ndarray, 
-    volume: np.ndarray, 
-    timestamps: np.ndarray
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    day_id: np.ndarray
 ) -> np.ndarray:
-    """Volume Weighted Average Price - resets daily"""
-    n = len(close)
-    vwap = np.empty(n, dtype=np.float64)
-    
-    cum_vol = 0.0
-    cum_pv = 0.0
-    current_day = -1
-    
-    for i in range(n):
-        day = timestamps[i] // 86400
-        
-        if day != current_day:
-            current_day = day
-            cum_vol = 0.0
-            cum_pv = 0.0
-        
-        h, l, c, v = high[i], low[i], close[i], volume[i]
-        
-        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
-            vwap[i] = vwap[i-1] if i > 0 else c
-            continue
-        
-        typical = (h + l + c) / 3.0
-        cum_vol += v
-        cum_pv += typical * v
-        vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical
-    
-    return vwap
+    """
+    VWAP calculated on HLC3, resetting at the start of each new day.
 
+    VWAP = sum(HLC3 * volume) / sum(volume)
+    """
+
+    n = len(close)
+    out = np.empty(n, dtype=np.float64)
+    out[:] = np.nan
+
+    cum_pv = 0.0
+    cum_vol = 0.0
+    prev_day = day_id[0]
+
+    for i in range(n):
+        # Detect new trading day → reset
+        if day_id[i] != prev_day:
+            cum_pv = 0.0
+            cum_vol = 0.0
+            prev_day = day_id[i]
+
+        h = high[i]
+        l = low[i]
+        c = close[i]
+        v = volume[i]
+
+        if (
+            not np.isnan(h)
+            and not np.isnan(l)
+            and not np.isnan(c)
+            and not np.isnan(v)
+            and v > 0.0
+        ):
+            hlc3 = (h + l + c) / 3.0
+            cum_pv += hlc3 * v
+            cum_vol += v
+
+        out[i] = cum_pv / cum_vol if cum_vol > 0.0 else np.nan
+
+    return vwap
 
 # ============================================================================
 # STATISTICAL FUNCTIONS
