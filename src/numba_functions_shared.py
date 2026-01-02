@@ -269,7 +269,7 @@ def vwap_daily_loop(
             cum_pv += hlc3 * v
             cum_vol += v
 
-        out[i] = cum_pv / cum_vol if cum_vol > 0.0 else np.nan
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else np.nan
 
     return vwap
 
