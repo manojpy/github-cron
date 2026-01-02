@@ -598,6 +598,13 @@ def calculate_vwap_numpy(
         day_id = (timestamps.astype("int64") // 86400).astype("int64")
 
         vwap = vwap_daily_loop(high, low, close, volume, day_id)
+
+        if np.all(volume == 0) or np.allclose(vwap, close, rtol=0, atol=1e-9):
+            logger.debug(
+                f"VWAP flattened (volume=0 or equals close) | "
+                f"last close={close[-1]:.4f} VWAP={vwap[-1]:.4f}"
+            )
+
         vwap = sanitize_array_numba(vwap, default=close[-1] if n > 0 else 0.0)
         return vwap
 
@@ -1368,7 +1375,6 @@ class APICircuitBreaker:
             return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
         
         return True, None
-
 
 class DataFetcher:
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
@@ -2571,7 +2577,7 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     headline = f"{headline_emoji} **{pair}** • ${price:,.2f}  {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}"
     bullets = []
     for idx, (title, extra) in enumerate(items):
-        prefix = "└─" if idx == len(items) - 1 else "├─"
+        prefix = "└���" if idx == len(items) - 1 else "├─"
         bullets.append(f"{prefix} {title} | {extra}")
     body = "\n".join(bullets)
     return escape_markdown_v2(f"{headline}\n{body}")
@@ -2983,6 +2989,21 @@ async def evaluate_pair_and_alert(
         vwap_prev = vwap[i15 - 1] if len(vwap) > (i15 - 1) else close_prev
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
+
+        # Detect VWAP flattening (VWAP == close both prev and curr)
+        vwap_flat = (
+            abs(vwap_curr - close_curr) < 1e-8 and
+            abs(vwap_prev - close_prev) < 1e-8
+        )
+        if vwap_flat:
+            logger_pair.debug(
+                f"VWAP flattened for {pair_name} | "
+                f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
+                f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
+            )
+            # Suppress VWAP alerts for this candle
+            alert_keys_to_check = [k for k in alert_keys_to_check if not k.startswith("vwap_")]
+
         
         # Cloud state
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
@@ -3871,3 +3892,5 @@ if __name__ == "__main__":
     except Exception as exc:
         logger.critical(f"Fatal error: {exc}", exc_info=True)
         sys.exit(1)
+
+
