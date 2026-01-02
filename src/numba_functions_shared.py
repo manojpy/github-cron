@@ -230,46 +230,32 @@ def vwap_daily_loop(
     low: np.ndarray,
     close: np.ndarray,
     volume: np.ndarray,
-    day_id: np.ndarray
+    timestamps: np.ndarray,
 ) -> np.ndarray:
-    """
-    VWAP calculated on HLC3, resetting at the start of each new day.
-
-    VWAP = sum(HLC3 * volume) / sum(volume)
-    """
-
+    """Volume Weighted Average Price – resets daily."""
     n = len(close)
-    out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
+    vwap = np.empty(n, dtype=np.float64)
 
-    cum_pv = 0.0
     cum_vol = 0.0
-    prev_day = day_id[0]
+    cum_pv = 0.0
+    current_day = -1
 
     for i in range(n):
-        # Detect new trading day → reset
-        if day_id[i] != prev_day:
-            cum_pv = 0.0
+        day = timestamps[i] // 86400
+        if day != current_day:
+            current_day = day
             cum_vol = 0.0
-            prev_day = day_id[i]
+            cum_pv = 0.0
 
-        h = high[i]
-        l = low[i]
-        c = close[i]
-        v = volume[i]
+        h, l, c, v = high[i], low[i], close[i], volume[i]
+        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
+            vwap[i] = vwap[i - 1] if i > 0 else c
+            continue
 
-        if (
-            not np.isnan(h)
-            and not np.isnan(l)
-            and not np.isnan(c)
-            and not np.isnan(v)
-            and v > 0.0
-        ):
-            hlc3 = (h + l + c) / 3.0
-            cum_pv += hlc3 * v
-            cum_vol += v
-
-        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else np.nan
+        typical = (h + l + c) / 3.0
+        cum_vol += v
+        cum_pv += typical * v
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical
 
     return vwap
 

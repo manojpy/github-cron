@@ -584,23 +584,15 @@ def calculate_vwap_numpy(
     low: np.ndarray,
     close: np.ndarray,
     volume: np.ndarray,
-    timestamps: np.ndarray
+    timestamps: np.ndarray,
 ) -> np.ndarray:
     try:
         if any(x is None or len(x) == 0 for x in [high, low, close, volume, timestamps]):
             return np.zeros_like(close) if close is not None else np.array([0.0])
 
-        n = len(close)
-        if n == 0 or any(len(x) != n for x in [high, low, volume, timestamps]):
-            return np.zeros_like(close)
-
-        # ✅ Derive day_id from timestamps
-        day_id = (timestamps.astype("int64") // 86400).astype("int64")
-
-        vwap = vwap_daily_loop(high, low, close, volume, day_id)
-        vwap = sanitize_array_numba(vwap, default=close[-1] if n > 0 else 0.0)
+        vwap = vwap_daily_loop(high, low, close, volume, timestamps)
+        vwap = sanitize_array_numba(vwap, default=close[-1] if len(close) > 0 else 0.0)
         return vwap
-
     except Exception:
         return np.zeros_like(close) if close is not None else np.array([0.0])
 
