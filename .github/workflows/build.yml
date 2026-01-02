@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
 
 jobs:
   build:
@@ -84,8 +84,9 @@ jobs:
           tags: macd-verify:local
           build-args: |
             AOT_STRICT=1
-
-          cache-from: type=gha,scope=macd-aot-build
+          cache-from: |
+            type=gha,scope=macd-aot-deps
+            type=gha,scope=macd-aot-build
           cache-to: type=gha,mode=max,scope=macd-aot-build
           outputs: type=docker,dest=/tmp/macd-image.tar
 
@@ -145,15 +146,6 @@ jobs:
           print('✅ ALL CHECKS PASSED')
           print('=' * 60)
           " || exit 1
-
-
-      # ✅ ADD: Warm up cache layers before push
-      - name: 🔥 Warm Up Cache Layers
-        if: success()
-        run: |
-          echo "Warming up build cache for faster future builds..."
-          docker images | grep macd || true
-          df -h / | grep -v tmpfs || true
 
       # ========================================================================
       # PHASE 3: PUSH TO REGISTRY
