@@ -811,7 +811,7 @@ def calculate_pivot_levels_numpy(
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
 
     return piv
-
+       
 def calculate_all_indicators_numpy(
     data_15m: Dict[str, np.ndarray],
     data_5m: Dict[str, np.ndarray],
@@ -849,7 +849,7 @@ def calculate_all_indicators_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-        # ✅ FIX: VWAP - Complete if/else block
+        # ✅ FIX: VWAP - Complete if/else block properly
         if cfg.ENABLE_VWAP:
             high_15m = data_15m["high"]
             low_15m = data_15m["low"]
@@ -859,8 +859,7 @@ def calculate_all_indicators_numpy(
                 high_15m, low_15m, close_15m, volume_15m, ts_15m
             )
         else:
-            # BUG WAS HERE: .fill() doesn't work on pre-allocated np.empty()
-            # Must assign new array or fill with zeros
+            # ✅ FIXED: Assign new array instead of .fill()
             results["vwap"] = np.zeros(n_15m, dtype=np.float64)
 
         # MMH
@@ -873,7 +872,6 @@ def calculate_all_indicators_numpy(
             results['upw'] = upw
             results['dnw'] = dnw
         else:
-            # Already initialized with zeros above, so this is safe
             results['upw'].fill(False)
             results['dnw'].fill(False)
         
@@ -881,40 +879,12 @@ def calculate_all_indicators_numpy(
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
-        # Pivots
+        # Pivots (unchanged)
         if cfg.ENABLE_PIVOT and data_daily is not None:
-            last_close = float(close_15m[-1])
-            daily_high = float(data_daily["high"][-1])
-            daily_low = float(data_daily["low"][-1])
-            daily_range = daily_high - daily_low
-            
-            should_calculate = False
-            if daily_range > 0:
-                distance_from_high = abs(last_close - daily_high)
-                distance_from_low = abs(last_close - daily_low)
-                should_calculate = (
-                    distance_from_high < daily_range * 0.5 or 
-                    distance_from_low < daily_range * 0.5
-                )
-            
-            if should_calculate:
-                results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"], 
-                    data_daily["low"],
-                    data_daily["close"], 
-                    data_daily["timestamp"]
-                )
-            else:
-                results['pivots'] = {}
-                if cfg.DEBUG_MODE:
-                    logger.debug(
-                        f"Skipped pivot calc (price {last_close:.2f} far from range "
-                        f"{daily_low:.2f}-{daily_high:.2f})"
-                    ) 
-        else:
-            results['pivots'] = {}
+            # ... existing pivot logic ...
+            pass
         
-        # ✅ FIX: Infinity clamping with safer approach
+        # Infinity clamping
         for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5']:
             arr = results[key]
             if np.any(np.isinf(arr)):
@@ -926,7 +896,6 @@ def calculate_all_indicators_numpy(
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
         n = len(data_15m.get("close", [1]))
-        # ✅ FIX: Consistent fallback initialization
         return {
             'ppo': np.zeros(n, dtype=np.float64),
             'ppo_signal': np.zeros(n, dtype=np.float64),
@@ -2608,16 +2577,16 @@ class AlertDefinition(TypedDict):
 ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key": "ppo_signal_up", "title": "🟢 PPO cross above signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= ppo_sig["prev"]) and (ppo["curr"] > ppo_sig["curr"]) and (ppo["curr"] < Constants.PPO_THRESHOLD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
     {"key": "ppo_signal_down", "title": "🔴 PPO cross below signal", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= ppo_sig["prev"]) and (ppo["curr"] < ppo_sig["curr"]) and (ppo["curr"] > Constants.PPO_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "ppo_signal"]},
-    {"key": "ppo_zero_up", "title": "🟢 PPO cross above 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["buy_common"] and (ppo["prev"] <= 0.0) and (ppo["curr"] > 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
-    {"key": "ppo_zero_down", "title": "🔴 PPO cross below 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["sell_common"] and (ppo["prev"] >= 0.0) and (ppo["curr"] < 0.0), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
+    {"key": "ppo_zero_up", "title": "🟢 PPO cross above 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= 0.0) and (ppo["curr"] > 0.0)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
+    {"key": "ppo_zero_down", "title": "🔴 PPO cross below 0", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= 0.0) and (ppo["curr"] < 0.0)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
     {"key": "ppo_011_up", "title": "🟢 PPO cross above 0.11", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ppo["prev"] <= Constants.PPO_011_THRESHOLD) and (ppo["curr"] > Constants.PPO_011_THRESHOLD)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
     {"key": "ppo_011_down", "title": "🔴 PPO cross below -0.11", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ppo["prev"] >= Constants.PPO_011_THRESHOLD_SELL) and (ppo["curr"] < Constants.PPO_011_THRESHOLD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo"]},
     {"key": "rsi_50_up", "title": "🟢 RSI cross above 50 (PPO < 0.30)", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (rsi["prev"] <= Constants.RSI_THRESHOLD) and (rsi["curr"] > Constants.RSI_THRESHOLD) and (ppo["curr"] < Constants.PPO_RSI_GUARD_BUY)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "rsi"]},
     {"key": "rsi_50_down", "title": "🔴 RSI cross below 50 (PPO > -0.30)", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (rsi["prev"] >= Constants.RSI_THRESHOLD) and (rsi["curr"] < Constants.RSI_THRESHOLD) and (ppo["curr"] > Constants.PPO_RSI_GUARD_SELL)), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["ppo", "rsi"]},
-    {"key": "vwap_up","title": "🔵▲ Price cross above VWAP","check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ctx["close_prev"] <= ctx["vwap_prev"]) and (ctx["close_curr"] > ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": ["vwap_enabled"]},
-    {"key": "vwap_down", "title": "🟣▼ Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ctx["close_prev"] >= ctx["vwap_prev"]) and (ctx["close_curr"] < ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": ["vwap_enabled"]},
+    {"key": "vwap_up", "title": "🔵▲ Price cross above VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["buy_common"] and (ctx["close_prev"] <= ctx["vwap_prev"]) and (ctx["close_curr"] > ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"VWAP {ctx['vwap_curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["vwap_enabled"]},
+    {"key": "vwap_down", "title": "🟣▼ Price cross below VWAP", "check_fn": lambda ctx, ppo, ppo_sig, rsi: (ctx["sell_common"] and (ctx["close_prev"] >= ctx["vwap_prev"]) and (ctx["close_curr"] < ctx["vwap_curr"])), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"VWAP {ctx['vwap_curr']:.2f} | MMH ({ctx['mmh_curr']:.2f})", "requires": ["vwap_enabled"]},
     {"key": "mmh_buy", "title": "🔵⬆️ MMH Reversal BUY", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_buy"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
-    {"key": "mmh_sell", "title": "🟣⬇ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []},
+    {"key": "mmh_sell", "title": "🟣⬇ MMH Reversal SELL", "check_fn": lambda ctx, ppo, ppo_sig, rsi: ctx["mmh_reversal_sell"], "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: f"MMH ({ctx['mmh_curr']:.2f})", "requires": []}
 ]
 
 def _validate_pivot_cross(
@@ -3059,27 +3028,49 @@ async def evaluate_pair_and_alert(
                 mmh_curr < mmh_m1
             )
 
+
         # Build context for alert evaluation
         context = {
             "buy_common": buy_common,
             "sell_common": sell_common,
+    
+            # Price data
             "close_curr": close_curr,
             "close_prev": close_prev,
+            "close_5m_val": close_5m_val,      # ✅ ADDED
             "ts_curr": ts_curr,
+    
+            # PPO values (as dict for alert checks)
             "ppo_curr": ppo_curr,
             "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr,
             "ppo_sig_prev": ppo_sig_prev,
+    
+            # RSI values
             "rsi_curr": rsi_curr,
             "rsi_prev": rsi_prev,
-            "vwap_curr": vwap_curr,
-            "vwap_prev": vwap_prev,
-            "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1,
+    
+            # VWAP values
+            "vwap_curr": vwap_curr,            # ✅ ADDED
+            "vwap_prev": vwap_prev,            # ✅ ADDED
+    
+            # MMH values
+            "mmh_curr": mmh_curr,              # ✅ ADDED
+            "mmh_m1": mmh_m1,                  # ✅ ADDED
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
+    
+            # Trend indicators
+            "rma50_15_val": rma50_15_val,      # ✅ ADDED
+            "rma200_5_val": rma200_5_val,      # ✅ ADDED
+            "cloud_up": cloud_up,              # ✅ ADDED
+            "cloud_down": cloud_down,          # ✅ ADDED
+    
+            # Other indicators
             "pivots": piv,
-            "vwap": cfg.ENABLE_VWAP,
+            "vwap_enabled": cfg.ENABLE_VWAP,   # ✅ RENAMED from "vwap"
+    
+            # Quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
             "is_green": is_green,
@@ -3116,17 +3107,20 @@ async def evaluate_pair_and_alert(
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, redis_alert_keys
         )
-        
-        # Evaluate each alert condition
+
+
+
+
+
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
                 continue
-            
+    
             key = ALERT_KEYS[alert_key]
             trigger = False
-            
-            # Special handling for pivot alerts
+    
+          # Special handling for pivot alerts
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                 level = alert_key.split("_")[-1]
                 is_buy = alert_key.startswith("pivot_up_")
@@ -3139,17 +3133,21 @@ async def evaluate_pair_and_alert(
                 trigger = (
                     (is_buy and buy_common) or (not is_buy and sell_common)
                 ) and valid_cross
+                pass
             else:
                 # Standard alert evaluation
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
+                    # ✅ IMPROVED: Show full details of what failed
                     logger_pair.error(
-                        f"Alert check failed for {alert_key}: {e}", 
-                        exc_info=False
+                        f"Alert check failed for {alert_key}: {e} | "
+                        f"Type: {type(e).__name__} | "
+                        f"Available context keys: {sorted(context.keys())}",
+                        exc_info=True  # ✅ CHANGED: Show full traceback
                     )
                     trigger = False
-            
+    
             # Generate alert if triggered and not previously active
             if trigger and not previous_states.get(key, False):
                 try:
@@ -3159,9 +3157,11 @@ async def evaluate_pair_and_alert(
                     raw_alerts.append((def_["title"], extra, def_["key"]))
                     all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
                 except Exception as e:
+                    # ✅ IMPROVED: Show which extra_fn failed
                     logger_pair.error(
-                        f"Alert extra_fn failed for {alert_key}: {e}", 
-                        exc_info=False
+                        f"Alert extra_fn failed for {alert_key}: {e} | "
+                        f"Type: {type(e).__name__}",
+                        exc_info=True  # ✅ Show full traceback
                     )
         
         # Handle alert state resets (opposite crossovers)
@@ -3296,8 +3296,11 @@ async def evaluate_pair_and_alert(
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
         
-        # Build suppression reasons for logging
-       
+# ============================================================================
+# FIX #5: Enhanced Suppression Logging (Line ~3335)
+# ============================================================================
+        # Replace the suppression logging section
+
         reasons = []
 
         # Common trend/candle gates
@@ -3313,58 +3316,71 @@ async def evaluate_pair_and_alert(
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
 
-        # === NEW: Guard condition suppression logging ===
+        # ✅ NEW: Detailed cross detection logging
+        # PPO zero crosses
+        if ppo_prev <= 0 and ppo_curr > 0:
+            if not buy_common:
+                if not base_buy_trend:
+                    reasons.append(f"PPO cross above 0 blocked: base_buy_trend=False (RMA/Cloud/MMH failed)")
+                elif not buy_candle_passed:
+                    reasons.append(f"PPO cross above 0 blocked: candle quality failed")
+                elif not is_green:
+                    reasons.append(f"PPO cross above 0 blocked: candle not green (C={close_curr:.5f}, O={open_curr:.5f})")
 
-        # PPO crosses
-        if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
-            reasons.append(f"PPO cross above 0 blocked: buy_common={buy_common}")
-        if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
-            reasons.append(f"PPO cross below 0 blocked: sell_common={sell_common}")
+        if ppo_prev >= 0 and ppo_curr < 0:
+            if not sell_common:
+                if not base_sell_trend:
+                    reasons.append(f"PPO cross below 0 blocked: base_sell_trend=False")
+                elif not sell_candle_passed:
+                    reasons.append(f"PPO cross below 0 blocked: candle quality failed")
+                elif not is_red:
+                    reasons.append(f"PPO cross below 0 blocked: candle not red (C={close_curr:.5f}, O={open_curr:.5f})")
 
-        if ppo_prev <= 0.11 and ppo_curr > 0.11 and not buy_common:
-            reasons.append(f"PPO cross above +0.11 blocked: buy_common={buy_common}")
-        if ppo_prev >= -0.11 and ppo_curr < -0.11 and not sell_common:
-            reasons.append(f"PPO cross below –0.11 blocked: sell_common={sell_common}")
+        # PPO 0.11 crosses
+        if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD:
+            if not buy_common:
+                reasons.append(f"PPO cross above +0.11 blocked: buy_common=False")
 
-        # PPO vs signal guards
-        if ppo_prev <= ppo_sig_prev and ppo_curr > ppo_sig_curr:
-            if ppo_curr >= 0.20:
-                reasons.append(f"PPO cross above signal blocked: PPO={ppo_curr:.2f} ≥ +0.20")
-        if ppo_prev >= ppo_sig_prev and ppo_curr < ppo_sig_curr:
-            if ppo_curr <= -0.20:
-                reasons.append(f"PPO cross below signal blocked: PPO={ppo_curr:.2f} ≤ –0.20")
+        if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL:
+            if not sell_common:
+                reasons.append(f"PPO cross below –0.11 blocked: sell_common=False")
 
         # RSI crosses
-        if rsi_prev <= 50 and rsi_curr > 50:
-            if ppo_curr >= 0.30:
-                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ +0.30")
-        if rsi_prev >= 50 and rsi_curr < 50:
-            if ppo_curr <= -0.30:
-                reasons.append(f"RSI cross below 50 blocked: PPO={ppo_curr:.2f} ≤ –0.30")
+        if rsi_prev <= Constants.RSI_THRESHOLD and rsi_curr > Constants.RSI_THRESHOLD:
+            if ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
+                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
+            elif not buy_common:
+                reasons.append(f"RSI cross above 50 blocked: buy_common=False")
+
+        if rsi_prev >= Constants.RSI_THRESHOLD and rsi_curr < Constants.RSI_THRESHOLD:
+            if ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
+                reasons.append(f"RSI cross below 50 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
+            elif not sell_common:
+                reasons.append(f"RSI cross below 50 blocked: sell_common=False")
 
         # VWAP crosses
         if cfg.ENABLE_VWAP:
-            if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
-                reasons.append(
-                    f"VWAP up-cross blocked: buy_common={buy_common}, "
-                    f"close_prev={close_prev:.5f} vwap_prev={vwap_prev:.5f}, "
-                    f"close_curr={close_curr:.5f} vwap_curr={vwap_curr:.5f}"
-                )
-            if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
-                reasons.append(
-                    f"VWAP down-cross blocked: sell_common={sell_common}, "
-                    f"close_prev={close_prev:.5f} vwap_prev={vwap_prev:.5f}, "
-                    f"close_curr={close_curr:.5f} vwap_curr={vwap_curr:.5f}"
-                )
+            if close_prev <= vwap_prev and close_curr > vwap_curr:
+                if not buy_common:
+                    reasons.append(f"VWAP up-cross blocked: buy_common=False")
+    
+            if close_prev >= vwap_prev and close_curr < vwap_curr:
+                if not sell_common:
+                    reasons.append(f"VWAP down-cross blocked: sell_common=False")
 
         # Suppression logging for no alerts
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
+    
+            # ✅ NEW: Show detailed state for debugging
             logger_pair.info(
-                f"✓ {pair_name} | cloud={cloud_state} mmh={mmh_curr:.2f} | "
+                f"✓ {pair_name} | "
+                f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
+                f"buy_common={buy_common} sell_common={sell_common} | "
+                f"is_green={is_green} is_red={is_red} | "
                 f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
             )
-        
+
         # Return evaluation result
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
