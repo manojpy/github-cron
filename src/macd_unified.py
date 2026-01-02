@@ -31,10 +31,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
-from redis.exceptions import RedisError, RedisConnectionError
-from utils.json import json_dumps, json_loads
-from config import cfg
-from constants import Constants
 
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
