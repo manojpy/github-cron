@@ -1,10 +1,9 @@
-# Git files
+# Git and CI/CD
 .git
+.github
 .gitignore
-.gitlab-ci.yml
 
 # Python cache
-__pycache__
 *.pyc
 *.pyo
 *.pyd
@@ -14,48 +13,35 @@ __pycache__
 *.egg-info
 dist
 build
-.eggs
-
-# Virtual environments
-venv
-env
-ENV
 
 # IDE
 .vscode
 .idea
 *.swp
 *.swo
-*~
-
-# Documentation
-README.md
-*.md
-docs/
 
 # Logs
 *.log
 logs/
 
-# OS files
-.DS_Store
-Thumbs.db
-
 # Test files
 tests/
-test_*
-*_test.py
+*.test.py
 
-# CI/CD (kept for reference but not needed in image)
-.github/
-.gitlab/
+# Documentation
+README.md
+docs/
+*.md
 
-# Local development
+# Environment
 .env
 .env.local
-*.local
 
-# Temporary files
-tmp/
-temp/
-*.tmp
+# But DON'T ignore these (required for build):
+!requirements.txt
+!Dockerfile
+!compile_numba_aot.py
+!src/
+!src/__pycache__
+!wrapper.py
+!config_macd.json
