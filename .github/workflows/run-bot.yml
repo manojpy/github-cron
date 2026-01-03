@@ -1,300 +1,176 @@
-name: 🤖 Run MACD Unified Bot
+name: Run Unified MACD Bot
 
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Dry-run mode (log alerts only)'
+      debug_mode:
+        description: 'Enable debug logging'
         required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-      skip_alerts:
-        description: 'Skip Telegram alerts (test mode)'
-        required: false
-        default: 'false'
         type: boolean
+        default: false
+  repository_dispatch:
+    types: [cron_trigger]
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 360  # ✅ CHANGED: 6 minutes (leaves 4min buffer for cleanup)
+# OPTIMIZED: Prevent concurrent runs to avoid Redis lock conflicts
+concurrency:
+  group: trading-bot-execution
+  cancel-in-progress: false
 
 jobs:
   run-bot:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    # OPTIMIZED: Aligned with RUN_TIMEOUT_SECONDS (600s = 10min) + buffer
+    timeout-minutes: 15
+    
     permissions:
-      contents: read
       packages: read
+      # NEW: Allow writing deployment status
+      deployments: write
 
     steps:
-      # ========================================================================
-      # PHASE 1: SETUP
-      # ========================================================================
-      
-      - name: 📥 Checkout Code
+      - name: Log execution context
+        run: |
+          echo "🚀 Triggered via: ${{ github.event_name }}"
+          echo "⏰ UTC Time: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "⏰ IST Time: $(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S')"
+          echo "⏰ Unix Timestamp: $(date +%s)"
+          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+          echo "📋 Run ID: ${{ github.run_id }}"
+          echo "🔢 Run Number: ${{ github.run_number }}"
+
+      # OPTIMIZED: Only checkout config file, not entire repo
+      - name: Checkout config
         uses: actions/checkout@v4
         with:
-          sparse-checkout: |
-            config_macd.json
+          sparse-checkout: config_macd.json
           sparse-checkout-cone-mode: false
 
-      - name: 🔐 Log in to GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Pull Latest AOT Image (Cached)
-        id: image_pull
+      # OPTIMIZED: Check if image exists before pulling
+      - name: Pull latest image
+        id: pull_image
         run: |
-          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          IMAGE="ghcr.io/${{ github.repository }}/trading-bot:latest"
+          echo "Pulling $IMAGE..."
           
-          echo "📦 Pulling AOT image..."
-          START_TIME=$(date +%s)
-          
-          # ✅ CHANGED: Use BuildKit with layer caching
-          if DOCKER_BUILDKIT=1 docker pull --quiet "$IMAGE_REF"; then
-            END_TIME=$(date +%s)
-            PULL_TIME=$((END_TIME - START_TIME))
-            echo "✅ Image pulled in ${PULL_TIME}s"
-            echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
+          if docker pull "$IMAGE"; then
+            echo "✅ Image pulled successfully"
+            docker inspect "$IMAGE" --format='Image ID: {{.Id}}'
+            docker inspect "$IMAGE" --format='Created: {{.Created}}'
+            echo "success=true" >> $GITHUB_OUTPUT
           else
             echo "❌ Failed to pull image"
+            echo "success=false" >> $GITHUB_OUTPUT
             exit 1
           fi
-          
-          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
-      # ========================================================================
-      # PHASE 2: PRE-FLIGHT CHECKS
-      # ========================================================================
-      
-      - name: 🔍 Verify Secrets
+      - name: Set trigger timestamp
+        id: timestamp
         run: |
-          MISSING=()
-          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
-          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
-          
-          if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "❌ Missing required secrets: ${MISSING[*]}"
+          TS=$(date +%s)
+          echo "ts=$TS" >> $GITHUB_OUTPUT
+          echo "📅 Trigger timestamp: $TS ($(date -d @$TS -u '+%Y-%m-%d %H:%M:%S UTC'))"
+
+      # NEW: Pre-flight checks
+      - name: Validate configuration
+        run: |
+          if [ ! -f config_macd.json ]; then
+            echo "❌ config_macd.json not found"
             exit 1
           fi
+          echo "✅ Configuration file exists"
           
-          echo "✅ All secrets configured"
+          # Validate JSON syntax
+          if command -v jq >/dev/null 2>&1; then
+            if jq empty config_macd.json 2>/dev/null; then
+              echo "✅ JSON syntax valid"
+            else
+              echo "❌ Invalid JSON syntax"
+              exit 1
+            fi
+          fi
 
-      # ✅ ADDED: Pre-Flight Healthcheck
-      - name: 🏥 Pre-Flight Healthcheck
-        run: |
-          echo "Running container healthcheck..."
-          
-          # Quick smoke test: verify AOT is loaded
-          docker run --rm \
-            --memory="200m" \
-            --cpus="1.0" \
-            ${{ steps.image_pull.outputs.image_ref }} \
-            python -c 'import aot_bridge; assert aot_bridge.is_using_aot(), "AOT not loaded"; print("✅ AOT verification passed")' \
-            || { echo "❌ Healthcheck failed"; exit 1; }
-          
-          echo "✅ Healthcheck passed"
-
-      # ========================================================================
-      # PHASE 3: BOT EXECUTION
-      # ========================================================================
-      
-      - name: 🚀 Execute MACD Bot (IST Timezone)
-        id: bot_run
-        timeout-minutes: 9  # Hard stop at 9min to allow cleanup
+      - name: Run trading bot
+        id: run_bot
         env:
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          TRIGGER_TIMESTAMP: ${{ github.event_name == 'workflow_dispatch' && '' || github.event.schedule }}
+          DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
-          mkdir -p logs
+          set +x
+          echo "🤖 Starting trading bot execution..."
           
-          echo "::group::🔥 Starting Bot Execution"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
-          echo "🧪 Dry Run: $DRY_RUN"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "::endgroup::"
-          
-          START_TIME=$(date +%s)
-          
-          # ✅ CHANGED: Added explicit kill signal and extended tmpfs
-          timeout --signal=SIGTERM --kill-after=30s ${{ env.BOT_TIMEOUT }}s docker run \
-            --rm \
-            --name macd_bot_runner \
-            --memory="900m" \
-            --memory-swap="900m" \
-            --cpus="2.0" \
-            --security-opt=no-new-privileges \
+          # OPTIMIZED: Set resource limits to prevent runaway containers
+          docker run --rm \
+            --name trading-bot-${{ github.run_id }} \
+            --memory="512m" \
+            --memory-swap="512m" \
+            --cpus="1.0" \
+            --security-opt no-new-privileges \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=150m \
-            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=50m \
-            -e TZ=Asia/Kolkata \
+            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
-            -e DRY_RUN_MODE="$DRY_RUN" \
-            -e PYTHONUNBUFFERED=1 \
-            -e NUMBA_NUM_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
-            -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
-            ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
+            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
+            -e CONFIG_FILE=config_macd.json \
+            -e TZ=Asia/Kolkata \
+            -e LOG_JSON=false \
+            -e FILE_LOGGING=false \
+            -e DEBUG_MODE="$DEBUG_MODE" \
+            -e TRIGGER_TIMESTAMP="${{ steps.timestamp.outputs.ts }}" \
+            -e GITHUB_SHA="${{ github.sha }}" \
+            -e GITHUB_RUN_ID="${{ github.run_id }}" \
+            -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
+            -e GITHUB_WORKFLOW="${{ github.workflow }}" \
+            -e GITHUB_REPOSITORY="${{ github.repository }}" \
+            -v "$(pwd)/config_macd.json:/app/config_macd.json:ro" \
+            ghcr.io/${{ github.repository }}/trading-bot:latest
           
-          EXIT_CODE=${PIPESTATUS[0]}
-          END_TIME=$(date +%s)
-          DURATION=$((END_TIME - START_TIME))
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
           
-          echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
-          echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-          
-          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
-            echo "⚠️ Bot execution timed out after ${DURATION}s"
-            exit 1
-          elif [ $EXIT_CODE -ne 0 ]; then
-            echo "❌ Bot exited with code $EXIT_CODE"
-            exit 1
-          fi
-          
-          echo "✅ Bot completed successfully in ${DURATION}s"
-
-      # ========================================================================
-      # PHASE 4: RESULTS ANALYSIS
-      # ========================================================================
-      
-      - name: 📊 Parse Execution Results
-        if: always()
-        id: results
-        run: |
-          LOG_FILE="logs/bot_output.log"
-          
-          if [ ! -f "$LOG_FILE" ]; then
-            echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Log file not found" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # Parse metrics using multiple patterns for robustness
-          if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
-            STATUS="success"
-            
-            # Extract duration (handle multiple formats)
-            DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
-            
-            # Extract alerts count
-            ALERTS=$(grep -oP "Alerts:\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
-            
-            # Extract pairs processed (format: "12/12" or just "12")
-            PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
-            
-            # Extract memory usage
-            MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
-            
-            # Check for Redis status
-            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
-            
-          elif grep -q "FATAL ERROR" "$LOG_FILE"; then
-            STATUS="failed"
-            ERROR_MSG=$(grep "FATAL ERROR" "$LOG_FILE" | head -1 | cut -c1-100)
-          elif grep -q "Bot run failed" "$LOG_FILE"; then
-            STATUS="failed"
-            ERROR_MSG="Bot run failed - check logs for details"
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Bot execution completed successfully"
           else
-            STATUS="timeout"
-            ERROR_MSG="Execution incomplete or timed out"
+            echo "❌ Bot execution failed with exit code: $EXIT_CODE"
+            exit $EXIT_CODE
           fi
-          
-          echo "status=${STATUS}" >> $GITHUB_OUTPUT
-          echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
-          echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
-          echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
-          echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
-          echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
-          echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
-      - name: 📝 Generate Summary Report
+      # NEW: Capture execution metrics
+      - name: Log execution summary
         if: always()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ## 🤖 MACD Bot Execution Report
-          
-          ### 📊 Execution Metrics
-          
-          | Metric | Value |
-          |--------|-------|
-          | **Status** | ${{ steps.results.outputs.status == 'success' && '✅ Success' || steps.results.outputs.status == 'failed' && '❌ Failed' || '⏱️ Timeout' }} |
-          | **Timezone** | 🇮🇳 IST (Asia/Kolkata) |
-          | **Duration** | ${{ steps.results.outputs.duration }}s |
-          | **Pairs Processed** | ${{ steps.results.outputs.pairs }} |
-          | **Alerts Sent** | ${{ steps.results.outputs.alerts }} |
-          | **Memory Peak** | ${{ steps.results.outputs.memory }} |
-          | **Redis Status** | ${{ steps.results.outputs.redis_status }} |
-          | **Image Pull Time** | ${{ steps.image_pull.outputs.pull_time }}s |
-          
-          EOF
-          
-          # Add error details if failed
-          if [ "${{ steps.results.outputs.status }}" != "success" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ### ❌ Error Details
-          ${{ steps.results.outputs.error_msg }}
-          
-          **Troubleshooting:**
-          - Check the "Execute MACD Bot" step logs for full error trace
-          - Verify Redis is accessible
-          - Ensure API rate limits not exceeded
-          
-          EOF
-          fi
-          
-          # Add performance notes
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          
-          ### ⚙️ Runtime Configuration
-          
-          - **Container Resources:** 900MB RAM, 2 CPUs
-          - **Bot Timeout:** ${{ env.BOT_TIMEOUT }}s
-          - **Dry Run Mode:** ${{ github.event.inputs.dry_run || 'false' }}
-          - **AOT Compilation:** ✅ Enabled
-          
-          EOF
+          echo "📊 Execution Summary:"
+          echo "  - Workflow: ${{ github.workflow }}"
+          echo "  - Run ID: ${{ github.run_id }}"
+          echo "  - Status: ${{ job.status }}"
+          echo "  - Exit Code: ${{ steps.run_bot.outputs.exit_code || 'N/A' }}"
+          echo "  - Duration: ${{ job.status }} at $(date)"
 
-      # ========================================================================
-      # PHASE 5: ARTIFACT UPLOAD & CLEANUP
-      # ========================================================================
-      
-      - name: 📦 Upload Execution Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-execution-logs-${{ github.run_number }}
-          path: logs/
-          retention-days: 7
-          if-no-files-found: warn
+      # OPTIMIZED: Enhanced failure notification with more context
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Bot execution failed"
+          echo "⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "🔗 Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "📋 Run Number: ${{ github.run_number }}"
+          echo "🔧 Debug Mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+          
+          # Optional: Send failure notification via curl to your monitoring endpoint
+          # curl -X POST "https://your-monitoring-endpoint.com/webhook" \
+          #   -H "Content-Type: application/json" \
+          #   -d "{\"status\":\"failed\",\"run_id\":\"${{ github.run_id }}\",\"time\":\"$(date -u)\"}"
 
-      - name: 🧹 Cleanup Resources
+      # OPTIONAL: Clean up Docker resources
+      - name: Cleanup
         if: always()
         run: |
-          echo "🧹 Starting cleanup..."
-          
-          # Stop container if still running
-          docker stop macd_bot_runner 2>/dev/null || true
-          docker rm -f macd_bot_runner 2>/dev/null || true
-          
-          # Clean logs older than 7 days (if logs persist across runs)
-          find logs/ -type f -mtime +7 -delete 2>/dev/null || true
-          
-          # Prune unused Docker resources
+          echo "🧹 Cleaning up Docker resources..."
           docker system prune -f --volumes || true
-          
-          # Show final disk usage
-          df -h / | grep -v tmpfs || true
-          
           echo "✅ Cleanup complete"
