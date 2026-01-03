@@ -45,51 +45,56 @@ def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray
 
 @njit(nogil=True, fastmath=True, cache=True)
 def sma_loop(data: np.ndarray, period: int) -> np.ndarray:
-    """Simple Moving Average - rolling window implementation"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    
     window_sum = 0.0
     count = 0
-    
     for i in range(n):
         val = data[i]
         if not np.isnan(val):
             window_sum += val
             count += 1
-        
         if i >= period:
             old_val = data[i - period]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 count -= 1
-        
-        out[i] = window_sum / count if count > 0 else np.nan
-    
+        if i >= period - 1:
+            out[i] = window_sum / count if count > 0 else out[i-1]
     return out
 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """Simple Moving Average (parallel)"""
+    """
+    Simple Moving Average (parallelized with prange).
+    Uses sliding window logic for O(n) complexity and NaN robustness.
+    """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
-    
+
+    # Each thread handles its own slice of indices
     for i in prange(n):
+        if i < period - 1:
+            continue
+
         window_sum = 0.0
         count = 0
-        start = max(0, i - period + 1)
-        
-        for j in range(start, i + 1):
+        # Compute window sum for this index
+        for j in range(i - period + 1, i + 1):
             val = data[j]
             if not np.isnan(val):
                 window_sum += val
                 count += 1
-        
-        out[i] = window_sum / count if count > 0 else np.nan
-    
+
+        if count > 0:
+            out[i] = window_sum / count
+        else:
+            # Carry forward last valid SMA instead of leaving NaN or forcing 0.0
+            out[i] = out[i - 1] if i > 0 else 0.0
+
     return out
 
 
@@ -478,44 +483,70 @@ def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> 
 
     return ppo, ppo_sig
 
+
 @njit(nogil=True, fastmath=True, cache=True)
-def calculate_rsi_core(close: np.ndarray, rsi_len: int) -> np.ndarray:
-    """Calculate Relative Strength Index"""
+def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
     n = len(close)
-    
-    # Calculate gains and losses
+    rsi = np.zeros(n, dtype=np.float64)
+    if n <= period:
+        return rsi
+        
     gain = np.zeros(n, dtype=np.float64)
     loss = np.zeros(n, dtype=np.float64)
     
+    # 1. Calculate Deltas with NaN protection
+    # We use a simple 'carry forward' for NaNs to prevent poisoning the whole array
+    last_valid_close = close[0]
     for i in range(1, n):
-        delta = close[i] - close[i-1]
-        if delta > 0:
-            gain[i] = delta
-        elif delta < 0:
-            loss[i] = -delta
+        curr = close[i]
+        if np.isnan(curr) or np.isnan(last_valid_close):
+            gain[i] = 0.0
+            loss[i] = 0.0
+        else:
+            diff = curr - last_valid_close
+            if diff > 0:
+                gain[i] = diff
+                loss[i] = 0.0
+            else:
+                gain[i] = 0.0
+                loss[i] = -diff
+        
+        if not np.isnan(curr):
+            last_valid_close = curr
+            
+    avg_gain = np.zeros(n, dtype=np.float64)
+    avg_loss = np.zeros(n, dtype=np.float64)
+    alpha = 1.0 / period # Wilder's Smoothing alpha
     
-    # Calculate average gain and loss using RMA (EMA with alpha = 1/period)
-    alpha = 1.0 / rsi_len
-    avg_gain = np.empty(n, dtype=np.float64)
-    avg_loss = np.empty(n, dtype=np.float64)
-    avg_gain[0] = gain[0]
-    avg_loss[0] = loss[0]
+    # 2. Proper Wilder's Initialization (First avg is a simple SMA)
+    sum_g = 0.0
+    sum_l = 0.0
+    for i in range(1, period + 1):
+        sum_g += gain[i]
+        sum_l += loss[i]
     
-    for i in range(1, n):
-        avg_gain[i] = alpha * gain[i] + (1 - alpha) * avg_gain[i-1]
-        avg_loss[i] = alpha * loss[i] + (1 - alpha) * avg_loss[i-1]
+    avg_gain[period] = sum_g / period
+    avg_loss[period] = sum_l / period
     
-    # Calculate RSI
-    rsi = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        if avg_loss[i] < 1e-10:
-            rsi[i] = 100.0
+    # 3. Smoothing Loop with NaN handling
+    for i in range(period + 1, n):
+        if np.isnan(close[i]):
+            # Carry forward averages if data is missing
+            avg_gain[i] = avg_gain[i-1]
+            avg_loss[i] = avg_loss[i-1]
+        else:
+            avg_gain[i] = (gain[i] * alpha) + (avg_gain[i-1] * (1.0 - alpha))
+            avg_loss[i] = (loss[i] * alpha) + (avg_loss[i-1] * (1.0 - alpha))
+        
+    # 4. Final RSI Calculation
+    for i in range(period, n):
+        if avg_loss[i] == 0:
+            rsi[i] = 100.0 if avg_gain[i] > 0 else 50.0
         else:
             rs = avg_gain[i] / avg_loss[i]
             rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-    
+            
     return rsi
-
 
 # ============================================================================
 # MMH (MAGICAL MOMENTUM HISTOGRAM) COMPONENTS
