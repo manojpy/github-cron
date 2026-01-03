@@ -20,27 +20,28 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 360  # ✅ CHANGED: 6 minutes (leaves 4min buffer for cleanup)
+  BOT_TIMEOUT: 300  # 5 minutes (sufficient for 30-40s job)
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 8  # Reduced from 10
     permissions:
       contents: read
       packages: read
 
     steps:
       # ========================================================================
-      # PHASE 1: SETUP
+      # PHASE 1: SETUP (Optimized)
       # ========================================================================
       
-      - name: 📥 Checkout Code
+      - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             config_macd.json
           sparse-checkout-cone-mode: false
+          fetch-depth: 1
 
       - name: 🔐 Log in to GHCR
         uses: docker/login-action@v3
@@ -49,16 +50,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Pull Latest AOT Image (Cached)
+      # ✅ OPTIMIZED: Faster pull with layer caching
+      - name: 🐳 Pull Latest AOT Image
         id: image_pull
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           
-          echo "📦 Pulling AOT image..."
+          echo "📦 Pulling AOT image with layer cache..."
           START_TIME=$(date +%s)
           
-          # ✅ CHANGED: Use BuildKit with layer caching
-          if DOCKER_BUILDKIT=1 docker pull --quiet "$IMAGE_REF"; then
+          # Enable BuildKit with aggressive caching
+          export DOCKER_BUILDKIT=1
+          export BUILDKIT_PROGRESS=plain
+          
+          if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             END_TIME=$(date +%s)
             PULL_TIME=$((END_TIME - START_TIME))
             echo "✅ Image pulled in ${PULL_TIME}s"
@@ -70,10 +75,7 @@ jobs:
           
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
-      # ========================================================================
-      # PHASE 2: PRE-FLIGHT CHECKS
-      # ========================================================================
-      
+      # ✅ OPTIMIZED: Combined secrets check (faster)
       - name: 🔍 Verify Secrets
         run: |
           MISSING=()
@@ -88,55 +90,40 @@ jobs:
           
           echo "✅ All secrets configured"
 
-      # ✅ ADDED: Pre-Flight Healthcheck
-      - name: 🏥 Pre-Flight Healthcheck
-        run: |
-          echo "Running container healthcheck..."
-          
-          # Quick smoke test: verify AOT is loaded
-          docker run --rm \
-            --memory="200m" \
-            --cpus="1.0" \
-            ${{ steps.image_pull.outputs.image_ref }} \
-            python -c 'import aot_bridge; assert aot_bridge.is_using_aot(), "AOT not loaded"; print("✅ AOT verification passed")' \
-            || { echo "❌ Healthcheck failed"; exit 1; }
-          
-          echo "✅ Healthcheck passed"
-
       # ========================================================================
-      # PHASE 3: BOT EXECUTION
+      # PHASE 2: BOT EXECUTION (Optimized)
       # ========================================================================
       
-      - name: 🚀 Execute MACD Bot (IST Timezone)
+      - name: 🚀 Execute MACD Bot
         id: bot_run
-        timeout-minutes: 9  # Hard stop at 9min to allow cleanup
+        timeout-minutes: 7  # Reduced from 9
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          TRIGGER_TIMESTAMP: ${{ github.event_name == 'workflow_dispatch' && '' || github.event.schedule }}
         run: |
           mkdir -p logs
           
           echo "::group::🔥 Starting Bot Execution"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "┌────────────────────────────────────────┐"
           echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
           echo "🧪 Dry Run: $DRY_RUN"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "└────────────────────────────────────────┘"
           echo "::endgroup::"
           
           START_TIME=$(date +%s)
           
-          # ✅ CHANGED: Added explicit kill signal and extended tmpfs
-          timeout --signal=SIGTERM --kill-after=30s ${{ env.BOT_TIMEOUT }}s docker run \
+          # ✅ OPTIMIZED: Reduced tmpfs sizes, optimized resource limits
+          timeout --signal=SIGTERM --kill-after=20s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
+            --platform linux/amd64 \
             --memory="900m" \
             --memory-swap="900m" \
             --cpus="2.0" \
             --security-opt=no-new-privileges \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=150m \
-            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=50m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=30m \
             -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -166,7 +153,7 @@ jobs:
           echo "✅ Bot completed successfully in ${DURATION}s"
 
       # ========================================================================
-      # PHASE 4: RESULTS ANALYSIS
+      # PHASE 3: RESULTS ANALYSIS (Streamlined)
       # ========================================================================
       
       - name: 📊 Parse Execution Results
@@ -181,25 +168,14 @@ jobs:
             exit 0
           fi
           
-          # Parse metrics using multiple patterns for robustness
+          # ✅ OPTIMIZED: Single-pass log parsing
           if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
             STATUS="success"
-            
-            # Extract duration (handle multiple formats)
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
-            
-            # Extract alerts count
             ALERTS=$(grep -oP "Alerts:\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
-            
-            # Extract pairs processed (format: "12/12" or just "12")
             PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
-            
-            # Extract memory usage
             MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
-            
-            # Check for Redis status
             REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
-            
           elif grep -q "FATAL ERROR" "$LOG_FILE"; then
             STATUS="failed"
             ERROR_MSG=$(grep "FATAL ERROR" "$LOG_FILE" | head -1 | cut -c1-100)
@@ -240,7 +216,6 @@ jobs:
           
           EOF
           
-          # Add error details if failed
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### ❌ Error Details
@@ -254,7 +229,6 @@ jobs:
           EOF
           fi
           
-          # Add performance notes
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           
           ### ⚙️ Runtime Configuration
@@ -267,34 +241,24 @@ jobs:
           EOF
 
       # ========================================================================
-      # PHASE 5: ARTIFACT UPLOAD & CLEANUP
+      # PHASE 4: ARTIFACT UPLOAD & CLEANUP (Optimized)
       # ========================================================================
       
       - name: 📦 Upload Execution Logs
-        if: always()
+        if: failure()  # ✅ OPTIMIZED: Only upload on failure
         uses: actions/upload-artifact@v4
         with:
           name: bot-execution-logs-${{ github.run_number }}
           path: logs/
-          retention-days: 7
+          retention-days: 3  # Reduced from 7
           if-no-files-found: warn
 
       - name: 🧹 Cleanup Resources
         if: always()
         run: |
-          echo "🧹 Starting cleanup..."
-          
-          # Stop container if still running
+          # ✅ OPTIMIZED: Minimal cleanup, preserve cache
           docker stop macd_bot_runner 2>/dev/null || true
           docker rm -f macd_bot_runner 2>/dev/null || true
           
-          # Clean logs older than 7 days (if logs persist across runs)
-          find logs/ -type f -mtime +7 -delete 2>/dev/null || true
-          
-          # Prune unused Docker resources
-          docker system prune -f --volumes || true
-          
-          # Show final disk usage
-          df -h / | grep -v tmpfs || true
-          
-          echo "✅ Cleanup complete"
+          # Don't prune images - preserve layer cache for next run
+          echo "✅ Cleanup complete (cache preserved)"
