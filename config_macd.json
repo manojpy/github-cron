@@ -31,36 +31,42 @@
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
 
-  "MAX_PARALLEL_FETCH": 8,
-  "HTTP_TIMEOUT": 12,
-  "CANDLE_FETCH_RETRIES": 3,
-  "CANDLE_FETCH_BACKOFF": 1.5,
-  "RUN_TIMEOUT_SECONDS": 300,
+  "_comment_performance": "✅ OPTIMIZED: Increased parallelism for 30-40s execution target",
+  "MAX_PARALLEL_FETCH": 12,
+  "HTTP_TIMEOUT": 10,
+  "CANDLE_FETCH_RETRIES": 2,
+  "CANDLE_FETCH_BACKOFF": 1.2,
+  "RUN_TIMEOUT_SECONDS": 240,
 
-  "TELEGRAM_RATE_LIMIT_PER_MINUTE": 20,
-  "TELEGRAM_BURST_SIZE": 5,
+  "_comment_rate_limits": "✅ OPTIMIZED: Adjusted for faster execution",
+  "TELEGRAM_RATE_LIMIT_PER_MINUTE": 25,
+  "TELEGRAM_BURST_SIZE": 8,
 
-  "MEMORY_LIMIT_BYTES": 750000000,
+  "_comment_memory": "✅ OPTIMIZED: Reduced memory limit for efficiency",
+  "MEMORY_LIMIT_BYTES": 700000000,
   "STATE_EXPIRY_DAYS": 30,
 
   "ENABLE_VWAP": true,
   "ENABLE_PIVOT": true,
   "PIVOT_LOOKBACK_PERIOD": 2,
 
+  "_comment_resilience": "✅ OPTIMIZED: Fail-fast for faster error detection",
   "FAIL_ON_REDIS_DOWN": false,
   "FAIL_ON_TELEGRAM_DOWN": false,
 
-  "REDIS_CONNECTION_RETRIES": 3,
-  "REDIS_RETRY_DELAY": 2.0,
+  "REDIS_CONNECTION_RETRIES": 2,
+  "REDIS_RETRY_DELAY": 1.5,
 
   "MAX_ALERTS_PER_PAIR": 8,
   "SKIP_WARMUP": true,
   "NUMBA_PARALLEL": true,
 
-  "PRODUCTS_CACHE_TTL": 28800,
+  "_comment_caching": "✅ OPTIMIZED: Extended cache TTL to reduce API calls",
+  "PRODUCTS_CACHE_TTL": 43200,
   "MAX_CANDLE_STALENESS_SEC": 1200,
 
-  "RATE_LIMIT_PER_MINUTE": 48,
+  "_comment_api_limits": "✅ OPTIMIZED: Increased rate limit for parallel processing",
+  "RATE_LIMIT_PER_MINUTE": 60,
   "CB_FAILURE_THRESHOLD": 5,
   "CB_RECOVERY_TIMEOUT": 30
 }
