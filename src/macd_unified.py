@@ -3565,7 +3565,8 @@ async def evaluate_pair_and_alert(
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
     
         # Apply all state changes in batch
-        all_state_changes = states_to_update + resets_to_apply
+
+        all_state_changes = all_state_changes + resets_to_apply
         if all_state_changes:
             await sdb.batch_set_states(all_state_changes)
       
