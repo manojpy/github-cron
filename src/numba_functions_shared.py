@@ -430,37 +430,52 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.nda
 # OSCILLATORS
 # ============================================================================
 
-
 @njit(nogil=True, fastmath=True, cache=True)
 def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate Percentage Price Oscillator (PPO) and its signal line.
+    Robust against NaN values in the input series.
+    """
     n = len(close)
     fast_alpha = 2.0 / (fast + 1.0)
     slow_alpha = 2.0 / (slow + 1.0)
-    
+
     fast_ma = np.empty(n, dtype=np.float64)
     slow_ma = np.empty(n, dtype=np.float64)
-    fast_ma[0] = close[0]
-    slow_ma[0] = close[0]
-    
+
+    # Initialize with first non‑NaN value or 0.0
+    fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
+    slow_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
+
     for i in range(1, n):
-        fast_ma[i] = fast_alpha * close[i] + (1 - fast_alpha) * fast_ma[i-1]
-        slow_ma[i] = slow_alpha * close[i] + (1 - slow_alpha) * slow_ma[i-1]
-    
+        c = close[i]
+        if np.isnan(c):
+            fast_ma[i] = fast_ma[i - 1]
+            slow_ma[i] = slow_ma[i - 1]
+        else:
+            fast_ma[i] = fast_alpha * c + (1 - fast_alpha) * fast_ma[i - 1]
+            slow_ma[i] = slow_alpha * c + (1 - slow_alpha) * slow_ma[i - 1]
+
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
-        if slow_ma[i] != 0:
+        if slow_ma[i] != 0.0 and not np.isnan(slow_ma[i]):
             # Matches Pine Script: (fast - slow) / slow * 100
             ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
         else:
             ppo[i] = 0.0
-            
+
     # Calculate signal line (EMA of PPO)
     sig_alpha = 2.0 / (signal + 1.0)
     ppo_sig = np.empty(n, dtype=np.float64)
     ppo_sig[0] = ppo[0]
+
     for i in range(1, n):
-        ppo_sig[i] = sig_alpha * ppo[i] + (1 - sig_alpha) * ppo_sig[i-1]
-        
+        p = ppo[i]
+        if np.isnan(p):
+            ppo_sig[i] = ppo_sig[i - 1]
+        else:
+            ppo_sig[i] = sig_alpha * p + (1 - sig_alpha) * ppo_sig[i - 1]
+
     return ppo, ppo_sig
 
 @njit(nogil=True, fastmath=True, cache=True)
