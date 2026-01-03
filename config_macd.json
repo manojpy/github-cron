@@ -36,7 +36,7 @@
   "HTTP_TIMEOUT": 10,
   "CANDLE_FETCH_RETRIES": 2,
   "CANDLE_FETCH_BACKOFF": 1.2,
-  "RUN_TIMEOUT_SECONDS": 240,
+  "RUN_TIMEOUT_SECONDS": 300,
 
   "_comment_rate_limits": "✅ OPTIMIZED: Adjusted for faster execution",
   "TELEGRAM_RATE_LIMIT_PER_MINUTE": 25,
