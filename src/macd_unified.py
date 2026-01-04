@@ -17,7 +17,7 @@ import math
 import gc
 import json
 from collections import deque, defaultdict
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
-
+import weakref
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
@@ -878,8 +878,7 @@ def calculate_all_indicators_numpy(
                 high_15m, low_15m, close_15m, volume_15m, ts_15m
             )
         else:
-            # ✅ FIXED: Assign new array instead of .fill()
-            results["vwap"] = np.zeros(n_15m, dtype=np.float64)
+            results["vwap"] = close_15m.copy()
 
         # MMH
         mmh = calculate_magical_momentum_hist(close_15m)
@@ -956,7 +955,6 @@ def calculate_all_indicators_numpy(
             'rma200_5': np.zeros(len(data_5m.get("close", [1])), dtype=np.float64),
             'pivots': {}
         }
-
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -3235,26 +3233,20 @@ async def evaluate_pair_and_alert(
         ppo_sig_prev = ppo_signal[i15 - 1]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1]
-        vwap_curr = vwap[i15] if len(vwap) > i15 else close_curr
-        vwap_prev = vwap[i15 - 1] if len(vwap) > (i15 - 1) else close_prev
+        if cfg.ENABLE_VWAP:
+            if len(vwap) <= i15:
+                logger_pair.warning(f"VWAP array too short ({len(vwap)} ≤ {i15}), using close price")
+                vwap_curr = close_curr
+                vwap_prev = close_prev
+            else:
+                vwap_curr = vwap[i15]
+                vwap_prev = vwap[i15 - 1]
+        else:
+            vwap_curr = close_curr
+            vwap_prev = close_prev
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
-
-        # Detect VWAP flattening (VWAP == close both prev and curr)
-        vwap_flat = (
-            abs(vwap_curr - close_curr) < 1e-8 and
-            abs(vwap_prev - close_prev) < 1e-8
-        )
-        if vwap_flat:
-            logger_pair.info(
-                f"VWAP flattened for {pair_name} | "
-                f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
-                f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
-            )
-            # Suppress VWAP alerts for this candle
-            alert_keys_to_check = [k for k in alert_keys_to_check if not k.startswith("vwap_")]
-
-        
+      
         # Cloud state
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
@@ -3368,26 +3360,35 @@ async def evaluate_pair_and_alert(
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
         
         raw_alerts = []
- 
+
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
-        # Gate pivot alerts if pivots are disabled or missing
                 ("pivots" in d["requires"] and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values()))) or
-
-        # Gate VWAP alerts if VWAP is disabled
                 ("vwap" in d["requires"] and not cfg.ENABLE_VWAP) or
-
-        # Gate PPO alerts if PPO data is missing
                 ("ppo" in d["requires"] and (ppo_ctx is None)) or
-
-        # Gate PPO signal alerts if PPO signal data is missing
                 ("ppo_signal" in d["requires"] and (ppo_sig_ctx is None)) or
-
-        # Gate RSI alerts if RSI data is missing
                 ("rsi" in d["requires"] and (rsi_ctx is None))
             )
         ]
+
+        if cfg.ENABLE_VWAP:
+            vwap_flat = (
+                abs(vwap_curr - close_curr) < 1e-8 and
+                abs(vwap_prev - close_prev) < 1e-8
+            )
+    
+            if vwap_flat:
+                logger_pair.info(
+                    f"VWAP flattened for {pair_name} | "
+                    f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
+                    f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
+                )
+                # Remove VWAP alerts from evaluation
+                alert_keys_to_check = [
+                    k for k in alert_keys_to_check 
+                    if not k.startswith("vwap_")
+                ]
 
         # Remove pivot alerts if no valid pivots
         if not piv or not any(piv.values()):
@@ -3539,38 +3540,23 @@ async def evaluate_pair_and_alert(
     # 5. VWAP Crossovers (FIXED: Reset on opposite cross OR trend change)
     # -------------------------------------------------------------------------
         if cfg.ENABLE_VWAP:
-            # Check for VWAP flattening (same value as close)
-            vwap_flat = (
-                abs(vwap_curr - close_curr) < 1e-8 and
-                abs(vwap_prev - close_prev) < 1e-8
-            )
-        
-            if vwap_flat:
-                # Reset both VWAP alerts when flattened
+            if close_prev > vwap_prev and close_curr <= vwap_curr:
+                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+            elif not buy_common:
                 if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_up']):
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Reset vwap_up: buy_common=False")
+    
+    
+            if close_prev < vwap_prev and close_curr >= vwap_curr:
+                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+            elif not sell_common:
                 if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_down']):
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"VWAP flattened, resetting alerts")
-            else:
-                # Normal VWAP cross resets
-                if close_prev > vwap_prev and close_curr <= vwap_curr:
-                    resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-                elif not buy_common:
-                    if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_up']):
-                        resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(f"Reset vwap_up: buy_common=False")
-            
-                if close_prev < vwap_prev and close_curr >= vwap_curr:
-                    resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-                elif not sell_common:
-                    if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_down']):
-                        resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(f"Reset vwap_down: sell_common=False")
-    
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Reset vwap_down: sell_common=False")
+
     # -------------------------------------------------------------------------
     # 6. Pivot Level Crossovers (existing logic - unchanged)
     # -------------------------------------------------------------------------
