@@ -3177,7 +3177,7 @@ async def evaluate_pair_and_alert(
             return None
 
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
-            current_day = int(ts_curr // 86400)
+            current_day = datetime.fromtimestamp(ts_curr, tz=timezone.utc).toordinal()
             day_tracker_key = f"{pair_name}:day_tracker"
             last_day_str = await sdb.get_metadata(day_tracker_key)
             last_day = int(last_day_str) if last_day_str else None
