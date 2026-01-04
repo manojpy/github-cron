@@ -476,13 +476,9 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
     return worm_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True)  
+@njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """
-    Interpretation 4: Maybe the formula is actually:
-    value := (temp - 0.5) + 0.5 * value[1]
-    And the "value = 0.5 * 2" is separate/irrelevant
-    """
+    """Calculate MMH value indicator"""
     value_arr = np.zeros(rows, dtype=np.float64)
     
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
@@ -490,14 +486,13 @@ def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
     
     for i in range(1, rows):
-        prev_v = value_arr[i - 1]
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        
-        # Direct translation without the multiplication
-        v = (t - 0.5) + 0.5 * prev_v
+        v = t - 0.5 + 0.5 * prev_v
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
+
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
