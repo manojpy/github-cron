@@ -478,26 +478,32 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Alternative interpretation where value is always multiplied by the expression"""
+    """Calculate MMH value indicator - CORRECTED to match Pine Script exactly"""
     value_arr = np.zeros(rows, dtype=np.float64)
     
-    # Pine Script: value = 0.5 * 2 = 1.0 (this is the MULTIPLIER, not initial state)
-    multiplier = 0.5 * 2  # = 1.0
+    # ✅ FIXED: Pine Script initializes with value = 0.5 * 2 = 1.0
+    # Then: value := value * (temp - .5 + .5 * nz(value[1]))
+    # At i=0, value[1] doesn't exist (nz returns 0), so:
+    # value[0] = 1.0 * (temp[0] - 0.5 + 0.5 * 0) = 1.0 * (temp[0] - 0.5)
     
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    # First iteration: no previous value, so nz(value[1]) = 0
-    value_arr[0] = multiplier * (t0 - 0.5 + 0.5 * 0.0)
+    value_arr[0] = 1.0 * (t0 - 0.5)  # Initial value = 1.0 in Pine Script
     value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
     
     for i in range(1, rows):
-        prev_v = value_arr[i - 1]
+        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        # Each iteration: multiply the expression by itself recursively
-        v = multiplier * (t - 0.5 + 0.5 * prev_v)
+        # ✅ FIXED: Pine Script formula is multiplicative:
+        # value := value * (temp - .5 + .5 * nz(value[1]))
+        # NOT: value := temp - .5 + .5 * value[1]
+        v = prev_v * (t - 0.5 + 0.5 * prev_v)
+        
+        # Clip after calculation
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
+
 
 
 @njit(nogil=True, fastmath=True, cache=True)
