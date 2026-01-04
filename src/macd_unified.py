@@ -653,11 +653,16 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
+# ============================================================================
+# COMPLETE MMH CALCULATION FUNCTION WITH DEBUGGING
+# ============================================================================
+
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9
 ) -> np.ndarray:
+    """MMH calculation with debug output"""
     try:
         if close is None or len(close) < period:
             logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
@@ -667,27 +672,33 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
+        # Calculate standard deviation
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = rolling_std_welford(close_c, 50, resp_clamped)
 
+        # Calculate worm
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
+        # Calculate moving average
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = rolling_mean_numba_parallel(close_c, period)
         else:
             ma = rolling_mean_numba(close_c, period)
 
+        # Calculate raw momentum
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Calculate min/max
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
+        # Calculate temp (normalized)
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
             temp = np.where(
@@ -701,12 +712,14 @@ def calculate_magical_momentum_hist(
         print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
         print(f"temp sample: {temp[:10]}")
 
+        # Calculate value using corrected function
         value_arr = calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
         print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
         print(f"value_arr sample: {value_arr[:10]}")
 
+        # Calculate momentum
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
             temp2 = np.clip(temp2, 1e-9, 1e9)
@@ -716,11 +729,12 @@ def calculate_magical_momentum_hist(
         momentum = np.nan_to_num(momentum, nan=0.0)
 
         print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
-        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
 
-
+        # Apply recursive momentum formula
         momentum_arr = momentum.copy()
         momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
+
+        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
 
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
 
@@ -729,7 +743,8 @@ def calculate_magical_momentum_hist(
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-        
+
+
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
         logger.info("✅ AOT active - no warmup needed")

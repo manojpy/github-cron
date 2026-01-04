@@ -478,33 +478,46 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Calculate MMH value indicator - CORRECTED to match Pine Script exactly"""
+    """
+    Calculate MMH value indicator - CORRECTED to match Pine Script exactly
+    
+    Pine Script logic (with proper interpretation):
+    value = 0.5 * 2                                    // Declares value = 1.0 (initial state)
+    value := value * (temp - .5 + .5 * nz(value[1]))  // Reassigns starting from bar 0
+    
+    On bar 0:
+      value[1] doesn't exist (nz returns 0)
+      value := 1.0 * (temp[0] - 0.5 + 0.5 * 0) = 1.0 * (temp[0] - 0.5)
+    
+    On bar 1+:
+      value := value[0] * (temp[1] - 0.5 + 0.5 * value[0])
+    
+    The KEY insight: The initial declaration value (1.0) is what gets multiplied 
+    on bar 0, NOT the result of a previous calculation!
+    """
     value_arr = np.zeros(rows, dtype=np.float64)
     
-    # ✅ FIXED: Pine Script initializes with value = 0.5 * 2 = 1.0
-    # Then: value := value * (temp - .5 + .5 * nz(value[1]))
-    # At i=0, value[1] doesn't exist (nz returns 0), so:
-    # value[0] = 1.0 * (temp[0] - 0.5 + 0.5 * 0) = 1.0 * (temp[0] - 0.5)
+    # Pine Script: value = 0.5 * 2 = 1.0 (this is the INITIAL value before any bar calculation)
+    initial_value = 0.5 * 2  # = 1.0
     
+    # Bar 0: Apply the reassignment formula with initial_value
+    # value := 1.0 * (temp[0] - 0.5 + 0.5 * nz(value[1]))
+    # Since value[1] doesn't exist, nz returns 0
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = 1.0 * (t0 - 0.5)  # Initial value = 1.0 in Pine Script
+    value_arr[0] = initial_value * (t0 - 0.5 + 0.5 * 0.0)
     value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
     
+    # Bar 1+: Use the previous bar's value in the recursive formula
+    # value := value[previous] * (temp - 0.5 + 0.5 * value[previous])
     for i in range(1, rows):
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        # ✅ FIXED: Pine Script formula is multiplicative:
-        # value := value * (temp - .5 + .5 * nz(value[1]))
-        # NOT: value := temp - .5 + .5 * value[1]
+        # Recursive multiplication
         v = prev_v * (t - 0.5 + 0.5 * prev_v)
-        
-        # Clip after calculation
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
-
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
