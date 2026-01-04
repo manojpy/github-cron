@@ -237,37 +237,55 @@ def vwap_daily_loop(
     volume: np.ndarray,
     day_id: np.ndarray,
 ) -> np.ndarray:
-    """Volume Weighted Average Price – resets daily on day_id change."""
+    """
+    Volume Weighted Average Price (VWAP)
+    - Uses HLC3
+    - Resets on day_id change
+    - TradingView-consistent behavior:
+      * VWAP only updates when volume > 0
+      * No price fallbacks
+    """
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
 
     cum_vol = 0.0
     cum_pv = 0.0
     prev_day = -1
+    last_valid_vwap = np.nan
 
     for i in range(n):
         day = day_id[i]
-        is_new_day = day != prev_day
-
-        if is_new_day:
+        if day != prev_day:
             prev_day = day
             cum_vol = 0.0
             cum_pv = 0.0
+            last_valid_vwap = np.nan
 
-        h, l, c, v = high[i], low[i], close[i], volume[i]
+        h = high[i]
+        l = low[i]
+        c = close[i]
+        v = volume[i]
 
-        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
-            # ✅ FIX: On new day, initialize with typical price
-            if is_new_day:
-                vwap[i] = (h + l + c) / 3.0 if not np.isnan(h) else c
-            else:
-                vwap[i] = vwap[i - 1] if i > 0 else c
+        # Skip invalid bars (TradingView behavior)
+        if (
+            np.isnan(h)
+            or np.isnan(l)
+            or np.isnan(c)
+            or np.isnan(v)
+            or v <= 0.0
+        ):
+            vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
             continue
 
         typical = (h + l + c) / 3.0
         cum_vol += v
         cum_pv += typical * v
-        vwap[i] = cum_pv / cum_vol if cum_vol > 0 else typical
+
+        if cum_vol > 0.0:
+            last_valid_vwap = cum_pv / cum_vol
+            vwap[i] = last_valid_vwap
+        else:
+            vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
 
     return vwap
 

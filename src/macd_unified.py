@@ -595,18 +595,16 @@ def calculate_vwap_numpy(
         if n == 0 or any(len(x) != n for x in [high, low, volume, timestamps]):
             return np.zeros_like(close)
 
-        # ✅ Derive day_id from timestamps (epoch seconds → day bucket)
+        # IMPORTANT:
+        # timestamps MUST be UTC epoch seconds for correct daily reset
         day_id = (timestamps.astype("int64") // 86400).astype("int64")
 
         vwap = vwap_daily_loop(high, low, close, volume, day_id)
 
-        if np.all(volume == 0) or np.allclose(vwap, close, rtol=0, atol=1e-9):
-            logger.debug(
-                f"VWAP flattened (volume=0 or equals close) | "
-                f"last close={close[-1]:.4f} VWAP={vwap[-1]:.4f}"
-            )
-
-        vwap = sanitize_array_numba(vwap, default=close[-1] if n > 0 else 0.0)
+        vwap = sanitize_array_numba(
+            vwap,
+            default=close[-1] if n > 0 else 0.0
+        )
         return vwap
 
     except Exception:
