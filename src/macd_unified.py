@@ -2211,14 +2211,6 @@ class RedisStateStore:
     # ------------------------------------------------------------------
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        """
-        Check if alert was recently sent (deduplication).
-
-        FIX #3: Prevents thundering herd on Lua script reload with lock
-
-        Returns:
-            True if alert should be sent, False if it's a duplicate
-        """
         if self.degraded:
             return True
 
@@ -2242,83 +2234,50 @@ class RedisStateStore:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
 
-            
             except redis.exceptions.NoScriptError:
-            acquired = False
-            try:
-                await asyncio.wait_for(
-                    RedisStateStore._script_reload_lock.acquire(),
-                    timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
-                )
-                acquired = True
-        
-                # Re-check: another coroutine may have reloaded
+                acquired = False
                 try:
-                    result = await self._safe_redis_op(
-                        lambda: self._redis.evalsha(
-                            self._dedup_script_sha, 1, recent_key,
-                            str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                        ),
-                        timeout=2.0,
-                        op_name=f"evalsha_dedup_recheck_{pair}:{alert_key}"
+                    await asyncio.wait_for(
+                        RedisStateStore._script_reload_lock.acquire(),
+                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
                     )
-                    return bool(result)
-                except redis.exceptions.NoScriptError:
-                    logger.warning("Dedup script missing, reloading...")
-                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                    result = await self._safe_redis_op(
-                        lambda: self._redis.evalsha(
-                            self._dedup_script_sha, 1, recent_key,
-                            str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                        ),
-                        timeout=2.0,
-                        op_name=f"evalsha_dedup_retry_{pair}:{alert_key}"
-                    )
-                    return bool(result)
-            except asyncio.TimeoutError:
-            logger.warning("Script reload lock timeout, falling back to SET NX")
-            except Exception as reload_error:
-                logger.error(f"Failed to reload dedup script: {reload_error}")
-            finally:
-                if acquired:
-                    RedisStateStore._script_reload_lock.release()
+                    acquired = True
 
-                        # Check if another coroutine already reloaded
-                        try:
-                            result = await self._safe_redis_op(
-                                lambda: self._redis.evalsha(
-                                    self._dedup_script_sha,
-                                    1,
-                                    recent_key,
-                                    str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                                ),
-                                timeout=2.0,
-                                op_name=f"evalsha_dedup_recheck_{pair}:{alert_key}",
-                            )
-                            RedisStateStore._script_reload_lock.release()
-                            return bool(result)
-                        except redis.exceptions.NoScriptError:
-                            # Still missing, reload now
-                            logger.warning("Dedup script missing, reloading...")
-                            try:
-                                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                                result = await self._safe_redis_op(
-                                    lambda: self._redis.evalsha(
-                                        self._dedup_script_sha,
-                                        1,
-                                        recent_key,
-                                        str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                                    ),
-                                    timeout=2.0,
-                                    op_name=f"evalsha_dedup_retry_{pair}:{alert_key}",
-                                )
-                                RedisStateStore._script_reload_lock.release()
-                                return bool(result)
-                            except Exception as reload_error:
-                                logger.error(f"Failed to reload dedup script: {reload_error}")
-                                RedisStateStore._script_reload_lock.release()
+                    # Re-check: another coroutine may have reloaded
+                    try:
+                        result = await self._safe_redis_op(
+                            lambda: self._redis.evalsha(
+                                self._dedup_script_sha,
+                                1,
+                                recent_key,
+                                str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                            ),
+                            timeout=2.0,
+                            op_name=f"evalsha_dedup_recheck_{pair}:{alert_key}"
+                        )
+                        return bool(result)
+                    except redis.exceptions.NoScriptError:
+                        logger.warning("Dedup script missing, reloading...")
+                        self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                        result = await self._safe_redis_op(
+                            lambda: self._redis.evalsha(
+                                self._dedup_script_sha,
+                                1,
+                                recent_key,
+                                str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                            ),
+                            timeout=2.0,
+                            op_name=f"evalsha_dedup_retry_{pair}:{alert_key}"
+                        )
+                        return bool(result)
+
                 except asyncio.TimeoutError:
                     logger.warning("Script reload lock timeout, falling back to SET NX")
+                except Exception as reload_error:
+                    logger.error(f"Failed to reload dedup script: {reload_error}")
+                finally:
+                    if acquired:
+                        RedisStateStore._script_reload_lock.release()
 
             except Exception as e:
                 if cfg.DEBUG_MODE:
