@@ -698,8 +698,14 @@ def calculate_magical_momentum_hist(
         temp = np.clip(temp, 0.0, 1.0)
         temp = np.nan_to_num(temp, nan=0.5)
 
+        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
+        print(f"temp sample: {temp[:10]}")
+
         value_arr = calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+
+        print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
+        print(f"value_arr sample: {value_arr[:10]}")
 
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
@@ -708,6 +714,10 @@ def calculate_magical_momentum_hist(
 
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
+
+        print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
+        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
+
 
         momentum_arr = momentum.copy()
         momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
