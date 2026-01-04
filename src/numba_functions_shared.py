@@ -479,31 +479,28 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    Interpretation 2: The multiplier is OUTSIDE the recursive formula
-    value = 1.0 * recursive_expression
+    Interpretation 3: What if the Pine Script is actually doing EMA-style smoothing?
+    value := value * factor + (1-factor) * new_value
     """
     value_arr = np.zeros(rows, dtype=np.float64)
-    multiplier = 0.5 * 2  # = 1.0
+    smoothing_factor = 0.5
     
-    # Bar 0: Start with temp - 0.5
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    base_value = t0 - 0.5
+    value_arr[0] = t0 - 0.5
+    value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
     
-    # Bar 1+: Apply feedback but keep multiplier separate
-    for i in range(rows):
-        if i == 0:
-            value_arr[0] = multiplier * base_value
-        else:
-            prev_v = value_arr[i - 1]
-            t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-            
-            # Feedback with additive component
-            v = multiplier * (t - 0.5 + 0.5 * prev_v)
-            value_arr[i] = v
+    for i in range(1, rows):
+        prev_v = value_arr[i - 1]
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        value_arr[i] = max(-0.9999, min(0.9999, value_arr[i]))
+        # EMA-style: smooth between previous and current
+        new_val = t - 0.5
+        v = smoothing_factor * prev_v + (1 - smoothing_factor) * new_val
+        value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
+
+
 
 
 @njit(nogil=True, fastmath=True, cache=True)
