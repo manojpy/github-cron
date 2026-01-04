@@ -843,7 +843,7 @@ def calculate_all_indicators_numpy(
         n_5m = len(close_5m)
         
         # ✅ FIX: Pre-allocate with proper initialization
-        results = {
+        results = { 
             'ppo': np.empty(n_15m, dtype=np.float64),
             'ppo_signal': np.empty(n_15m, dtype=np.float64),
             'smooth_rsi': np.empty(n_15m, dtype=np.float64),
@@ -1429,7 +1429,7 @@ class DataFetcher:
             "total_wait_time": 0.0,
             "rate_limit_hits": 0,
         }
-        
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"DataFetcher initialized | max_parallel={max_parallel} | "
@@ -2001,8 +2001,8 @@ class RedisStateStore:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
                         RedisStateStore._pool_healthy[self.redis_url] = False
                         pool_reused = False
-
-        # If we already connected via pool, exit early
+            if smoke_test_passed:
+                pool_reused = True
         if pool_reused:
             return
 
@@ -2097,13 +2097,7 @@ class RedisStateStore:
                     except Exception as e:
                         logger.error(f"Error shutting down Redis pool {url}: {e}")
 
-                # Reset entries
-                cls._global_pools[url] = None
-                cls._pool_healthy[url] = False
-                cls._pool_created_at[url] = 0.0
-                cls._pool_reuse_count[url] = 0
-
-                # Clean keys entirely to avoid growth
+                # Direct removal - cleaner
                 cls._global_pools.pop(url, None)
                 cls._pool_healthy.pop(url, None)
                 cls._pool_created_at.pop(url, None)
@@ -2248,13 +2242,47 @@ class RedisStateStore:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
 
+            
             except redis.exceptions.NoScriptError:
-                # Use lock to prevent multiple concurrent reloads (thundering herd)
+            acquired = False
+            try:
+                await asyncio.wait_for(
+                    RedisStateStore._script_reload_lock.acquire(),
+                    timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
+                )
+                acquired = True
+        
+                # Re-check: another coroutine may have reloaded
                 try:
-                    async with asyncio.wait_for(
-                        RedisStateStore._script_reload_lock.acquire(),
-                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
-                    ):
+                    result = await self._safe_redis_op(
+                        lambda: self._redis.evalsha(
+                            self._dedup_script_sha, 1, recent_key,
+                            str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                        ),
+                        timeout=2.0,
+                        op_name=f"evalsha_dedup_recheck_{pair}:{alert_key}"
+                    )
+                    return bool(result)
+                except redis.exceptions.NoScriptError:
+                    logger.warning("Dedup script missing, reloading...")
+                    self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                    result = await self._safe_redis_op(
+                        lambda: self._redis.evalsha(
+                            self._dedup_script_sha, 1, recent_key,
+                            str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                        ),
+                        timeout=2.0,
+                        op_name=f"evalsha_dedup_retry_{pair}:{alert_key}"
+                    )
+                    return bool(result)
+            except asyncio.TimeoutError:
+            logger.warning("Script reload lock timeout, falling back to SET NX")
+            except Exception as reload_error:
+                logger.error(f"Failed to reload dedup script: {reload_error}")
+            finally:
+                if acquired:
+                    RedisStateStore._script_reload_lock.release()
+
                         # Check if another coroutine already reloaded
                         try:
                             result = await self._safe_redis_op(
@@ -2543,8 +2571,11 @@ class RedisStateStore:
                 recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                 composite_key = f"{pair_name}:{alert_key}"
                 dedup_key_mapping[recent_key] = composite_key
-
                 pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+
+            # Freeze insertion order explicitly
+            dedup_keys = list(dedup_key_mapping.items())
+            for idx, (recent_key, composite_key) in enumerate(dedup_keys):
 
             # Execute pipeline
             results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
@@ -3373,9 +3404,10 @@ async def evaluate_pair_and_alert(
         ]
 
         if cfg.ENABLE_VWAP:
+            eps = 1e-9
             vwap_flat = (
-                abs(vwap_curr - close_curr) < 1e-8 and
-                abs(vwap_prev - close_prev) < 1e-8
+                abs(vwap_curr - close_curr) < eps and
+                abs(vwap_prev - close_prev) < eps
             )
     
             if vwap_flat:
@@ -4180,7 +4212,7 @@ if __name__ == "__main__":
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
-            #logger.info("✅ Bot run completed successfully")
+            #logger.info("��� Bot run completed successfully")
             sys.exit(0)
         else:
             logger.error("❌ Bot run failed")
