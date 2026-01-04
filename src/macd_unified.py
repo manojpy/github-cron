@@ -2001,8 +2001,6 @@ class RedisStateStore:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
                         RedisStateStore._pool_healthy[self.redis_url] = False
                         pool_reused = False
-            if smoke_test_passed:
-                pool_reused = True
         if pool_reused:
             return
 
