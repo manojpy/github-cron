@@ -667,64 +667,51 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
-        # 1. Calculate SD (Returns NaN for first 49 bars)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
             sd = rolling_std_welford(close_c, 50, resp_clamped)
 
-        # 2. Worm (Handles NaNs in SD naturally)
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-        # 3. MA (Returns NaN for first 143 bars)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = rolling_mean_numba_parallel(close_c, period)
         else:
             ma = rolling_mean_numba(close_c, period)
 
-        # 4. Raw Momentum
-        # IMPORTANT: Keep NaNs here! Do NOT use nan_to_num(0.0)
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 5. Min/Max (Numba func ignores NaNs naturally, finding true min/max of valid data)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
-        # 6. Normalize
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
-            # If raw/min/max are NaN, temp becomes NaN
-            # If denom is 0 (rare), temp is 0.5
             temp = np.where(
                 np.abs(denom) < Constants.ZERO_DIVISION_GUARD,
                 0.5,
                 (raw - min_med) / denom
             )
-        
-        # Now we can handle NaNs for the final output steps
-        # temp is NaN where history was insufficient.
-        # calc_mmh_value_loop handles NaN inputs by skipping updates or resetting
-        
-        # We need temp to be strictly NaN where invalid, or valid float
-        # value loop expects raw NaNs to behave like Pine's 'na'
-        
+        temp = np.clip(temp, 0.0, 1.0)
+        temp = np.nan_to_num(temp, nan=0.5)
+
         value_arr = calc_mmh_value_loop(temp, rows)
-        
-        # 7. Final transform
+        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
             temp2 = np.clip(temp2, 1e-9, 1e9)
-            
+            temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
+
         momentum = 0.25 * np.log(temp2)
-        
-        # 8. Smoothing
+        momentum = np.nan_to_num(momentum, nan=0.0)
+
         momentum_arr = momentum.copy()
         momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
 
-        # Final cleanup for safe output
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
@@ -732,7 +719,7 @@ def calculate_magical_momentum_hist(
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
+        
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
         logger.info("✅ AOT active - no warmup needed")
