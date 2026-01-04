@@ -3538,13 +3538,21 @@ async def evaluate_pair_and_alert(
     # -------------------------------------------------------------------------
     # 6. Pivot Level Crossovers (existing logic - unchanged)
     # -------------------------------------------------------------------------
+    
         if piv:
             for level_name, level_value in piv.items():
-                if close_prev > level_value and close_curr <= level_value:
-                    resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[f'pivot_up_{level_name}']}", "INACTIVE", None))
-                if close_prev < level_value and close_curr >= level_value:
-                    resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[f'pivot_down_{level_name}']}", "INACTIVE", None))
-    
+                # Reset buy-side pivot alerts only if the key exists
+                up_key = f"pivot_up_{level_name}"
+                if up_key in ALERT_KEYS:
+                    if close_prev > level_value and close_curr <= level_value:
+                        resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
+
+                # Reset sell-side pivot alerts only if the key exists
+                down_key = f"pivot_down_{level_name}"
+                if down_key in ALERT_KEYS:
+                    if close_prev < level_value and close_curr >= level_value:
+                        resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
+
     # -------------------------------------------------------------------------
     # 7. MMH Reversals (existing logic - unchanged)
     # -------------------------------------------------------------------------
