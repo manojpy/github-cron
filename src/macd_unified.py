@@ -2495,14 +2495,7 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """
-        Execute all Redis operations in a single pipeline.
-
-        FIX #5: Adds comprehensive error handling for JSON parsing
-
-        Returns:
-            Tuple of (previous_states, dedup_results)
-        """
+   
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
@@ -2532,10 +2525,6 @@ class RedisStateStore:
                 dedup_key_mapping[recent_key] = composite_key
                 pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
 
-            # Freeze insertion order explicitly
-            dedup_keys = list(dedup_key_mapping.items())
-            for idx, (recent_key, composite_key) in enumerate(dedup_keys):
-
             # Execute pipeline
             results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
@@ -2562,13 +2551,13 @@ class RedisStateStore:
 
         dedup_results: Dict[str, bool] = {}
         dedup_start_idx = 1 + num_updates
-        for idx, (recent_key, composite_key) in enumerate(dedup_key_mapping.items()):
+        dedup_keys = list(dedup_key_mapping.items())  # freeze insertion order explicitly
+        for idx, (recent_key, composite_key) in enumerate(dedup_keys):
             result_idx = dedup_start_idx + idx
             should_send = bool(results[result_idx]) if result_idx < len(results) else True
             dedup_results[composite_key] = should_send
 
         return prev_states, dedup_results
-
     # ------------------------------------------------------------------
     # Atomic batch update
     # ------------------------------------------------------------------
