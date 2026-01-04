@@ -3176,32 +3176,42 @@ async def evaluate_pair_and_alert(
             ))
             return None
 
-        # Reset pivot alerts on new trading day
-        if piv and cfg.ENABLE_PIVOT:
+        if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_day = int(ts_curr // 86400)
-            pivot_day_key = f"{pair_name}:pivot_day"
-            last_pivot_day_str = await sdb.get_metadata(pivot_day_key)
-            last_pivot_day = int(last_pivot_day_str) if last_pivot_day_str else None
+            day_tracker_key = f"{pair_name}:day_tracker"
+            last_day_str = await sdb.get_metadata(day_tracker_key)
+            last_day = int(last_day_str) if last_day_str else None
     
-            if last_pivot_day != current_day:
+            if last_day != current_day:
                 delete_keys = []
-        
-                for level in ["P", "S1", "S2", "S3", "R1", "R2", "R3"]:
-                    up_key = f"pivot_up_{level}"
-                    if up_key in ALERT_KEYS:
-                        delete_keys.append(f"{pair_name}:{ALERT_KEYS[up_key]}")
+                
+                # --- [FIX] VWAP Daily Reset ---
+                if cfg.ENABLE_VWAP:
+                    # Reset both VWAP alert keys if they exist
+                    if "vwap_up" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_up']}")
+                    if "vwap_down" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
 
-                    down_key = f"pivot_down_{level}"
-                    if down_key in ALERT_KEYS:
-                        delete_keys.append(f"{pair_name}:{ALERT_KEYS[down_key]}")
+                # --- [FIX] Pivot Daily Reset (Respecting Exclusions) ---
+                if piv and cfg.ENABLE_PIVOT:
+                    # Buy Levels: All except R3
+                    buy_levels = ["P", "S1", "S2", "S3", "R1", "R2"] 
+                    for level in buy_levels:
+                        key_name = f"pivot_up_{level}"
+                        if key_name in ALERT_KEYS: 
+                            delete_keys.append(f"{pair_name}:{ALERT_KEYS[key_name]}")
+
+                    # Sell Levels: All except S3
+                    sell_levels = ["P", "S1", "S2", "R1", "R2", "R3"]
+                    for level in sell_levels:
+                        key_name = f"pivot_down_{level}"
+                        if key_name in ALERT_KEYS: 
+                            delete_keys.append(f"{pair_name}:{ALERT_KEYS[key_name]}")
         
                 if delete_keys:
                     await sdb.atomic_batch_update([], deletes=delete_keys)
-                    logger_pair.debug(
-                        f"Reset {len(delete_keys)} pivot alert states for new trading day"
-                    )
+                    logger_pair.info(f"🔄 Reset {len(delete_keys)} alerts (Pivots/VWAP) for new day {current_day}")
         
-                await sdb.set_metadata(pivot_day_key, str(current_day))
+                await sdb.set_metadata(day_tracker_key, str(current_day))
 
         # Extract indicator values
         ppo_curr = ppo[i15]
