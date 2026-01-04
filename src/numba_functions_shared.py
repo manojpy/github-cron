@@ -476,14 +476,14 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
     return worm_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)  
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    Interpretation 3: What if the Pine Script is actually doing EMA-style smoothing?
-    value := value * factor + (1-factor) * new_value
+    Interpretation 4: Maybe the formula is actually:
+    value := (temp - 0.5) + 0.5 * value[1]
+    And the "value = 0.5 * 2" is separate/irrelevant
     """
     value_arr = np.zeros(rows, dtype=np.float64)
-    smoothing_factor = 0.5
     
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
     value_arr[0] = t0 - 0.5
@@ -493,15 +493,11 @@ def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        # EMA-style: smooth between previous and current
-        new_val = t - 0.5
-        v = smoothing_factor * prev_v + (1 - smoothing_factor) * new_val
+        # Direct translation without the multiplication
+        v = (t - 0.5) + 0.5 * prev_v
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
-
-
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
