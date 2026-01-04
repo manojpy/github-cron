@@ -3640,11 +3640,11 @@ async def evaluate_pair_and_alert(
                 )
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
-        
+   
+
 # ============================================================================
-# FIX #5: Enhanced Suppression Logging (Line ~3335)
+# FIX #5: Compact Suppression Logging (Drop-in Replacement)
 # ============================================================================
-        # Replace the suppression logging section
 
         reasons = []
 
@@ -3661,69 +3661,65 @@ async def evaluate_pair_and_alert(
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
 
-        # ✅ NEW: Detailed cross detection logging
-        # PPO zero crosses
-        if ppo_prev <= 0 and ppo_curr > 0:
-            if not buy_common:
-                if not base_buy_trend:
-                    reasons.append(f"PPO cross above 0 blocked: base_buy_trend=False (RMA/Cloud/MMH failed)")
-                elif not buy_candle_passed:
-                    reasons.append(f"PPO cross above 0 blocked: candle quality failed")
-                elif not is_green:
-                    reasons.append(f"PPO cross above 0 blocked: candle not green (C={close_curr:.5f}, O={open_curr:.5f})")
+        # ✅ Cross detection logging
+        if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
+            if not base_buy_trend:
+                reasons.append("PPO>0 blocked: base_buy_trend=False")
+            elif not buy_candle_passed:
+                reasons.append("PPO>0 blocked: candle quality failed")
+            elif not is_green:
+                reasons.append(f"PPO>0 blocked: candle not green (C={close_curr:.5f}, O={open_curr:.5f})")
 
-        if ppo_prev >= 0 and ppo_curr < 0:
-            if not sell_common:
-                if not base_sell_trend:
-                    reasons.append(f"PPO cross below 0 blocked: base_sell_trend=False")
-                elif not sell_candle_passed:
-                    reasons.append(f"PPO cross below 0 blocked: candle quality failed")
-                elif not is_red:
-                    reasons.append(f"PPO cross below 0 blocked: candle not red (C={close_curr:.5f}, O={open_curr:.5f})")
+        if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
+            if not base_sell_trend:
+                reasons.append("PPO<0 blocked: base_sell_trend=False")
+            elif not sell_candle_passed:
+                reasons.append("PPO<0 blocked: candle quality failed")
+            elif not is_red:
+                reasons.append(f"PPO<0 blocked: candle not red (C={close_curr:.5f}, O={open_curr:.5f})")
 
         # PPO 0.11 crosses
-        if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD:
-            if not buy_common:
-                reasons.append(f"PPO cross above +0.11 blocked: buy_common=False")
+        if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
+            reasons.append("PPO>+0.11 blocked: buy_common=False")
 
-        if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL:
-            if not sell_common:
-                reasons.append(f"PPO cross below –0.11 blocked: sell_common=False")
+        if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
+            reasons.append("PPO<-0.11 blocked: sell_common=False")
 
         # RSI crosses
         if rsi_prev <= Constants.RSI_THRESHOLD and rsi_curr > Constants.RSI_THRESHOLD:
             if ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
-                reasons.append(f"RSI cross above 50 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
+                reasons.append(f"RSI>50 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
             elif not buy_common:
-                reasons.append(f"RSI cross above 50 blocked: buy_common=False")
+                reasons.append("RSI>50 blocked: buy_common=False")
 
         if rsi_prev >= Constants.RSI_THRESHOLD and rsi_curr < Constants.RSI_THRESHOLD:
             if ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
-                reasons.append(f"RSI cross below 50 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
+                reasons.append(f"RSI<50 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
             elif not sell_common:
-                reasons.append(f"RSI cross below 50 blocked: sell_common=False")
+                reasons.append("RSI<50 blocked: sell_common=False")
 
         # VWAP crosses
         if cfg.ENABLE_VWAP:
-            if close_prev <= vwap_prev and close_curr > vwap_curr:
-                if not buy_common:
-                    reasons.append(f"VWAP up-cross blocked: buy_common=False")
-    
-            if close_prev >= vwap_prev and close_curr < vwap_curr:
-                if not sell_common:
-                    reasons.append(f"VWAP down-cross blocked: sell_common=False")
+            if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
+                reasons.append("VWAP up-cross blocked: buy_common=False")
+            if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
+                reasons.append("VWAP down-cross blocked: sell_common=False")
+
+        # Build compact failed conditions list
+        failed_conditions = []
+        if not buy_common: failed_conditions.append("buy_common")
+        if not sell_common: failed_conditions.append("sell_common")
+        if not is_green: failed_conditions.append("is_green")
+        if not is_red: failed_conditions.append("is_red")
 
         # Suppression logging for no alerts
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-    
-            # ✅ NEW: Show detailed state for debugging
+
             logger_pair.info(
                 f"✓ {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
-                f"buy_common={buy_common} sell_common={sell_common} | "
-                f"is_green={is_green} is_red={is_red} | "
-                f"Suppression: {'; '.join(reasons) if reasons else 'No conditions met'}"
+                f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
 
         # Return evaluation result
@@ -3734,7 +3730,7 @@ async def evaluate_pair_and_alert(
                 "alerts": len(alerts_to_send),
                 "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                 "mmh_hist": round(mmh_curr, 4),
-                "suppression": "; ".join(reasons) if reasons else "No conditions met"
+                "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
     
