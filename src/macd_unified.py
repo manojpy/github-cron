@@ -3211,21 +3211,7 @@ async def evaluate_pair_and_alert(
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
 
-        # Detect VWAP flattening (VWAP == close both prev and curr)
-        vwap_flat = (
-            abs(vwap_curr - close_curr) < 1e-8 and
-            abs(vwap_prev - close_prev) < 1e-8
-        )
-        if vwap_flat:
-            logger_pair.info(
-                f"VWAP flattened for {pair_name} | "
-                f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
-                f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
-            )
-            # Suppress VWAP alerts for this candle
-            alert_keys_to_check = [k for k in alert_keys_to_check if not k.startswith("vwap_")]
-
-        
+      
         # Cloud state
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
@@ -3339,26 +3325,35 @@ async def evaluate_pair_and_alert(
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
         
         raw_alerts = []
- 
+
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
-        # Gate pivot alerts if pivots are disabled or missing
                 ("pivots" in d["requires"] and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values()))) or
-
-        # Gate VWAP alerts if VWAP is disabled
                 ("vwap" in d["requires"] and not cfg.ENABLE_VWAP) or
-
-        # Gate PPO alerts if PPO data is missing
                 ("ppo" in d["requires"] and (ppo_ctx is None)) or
-
-        # Gate PPO signal alerts if PPO signal data is missing
                 ("ppo_signal" in d["requires"] and (ppo_sig_ctx is None)) or
-
-        # Gate RSI alerts if RSI data is missing
                 ("rsi" in d["requires"] and (rsi_ctx is None))
             )
         ]
+
+        if cfg.ENABLE_VWAP:
+            vwap_flat = (
+                abs(vwap_curr - close_curr) < 1e-8 and
+                abs(vwap_prev - close_prev) < 1e-8
+            )
+    
+            if vwap_flat:
+                logger_pair.info(
+                    f"VWAP flattened for {pair_name} | "
+                    f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
+                    f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
+                )
+                # Remove VWAP alerts from evaluation
+                alert_keys_to_check = [
+                    k for k in alert_keys_to_check 
+                    if not k.startswith("vwap_")
+                ]
 
         # Remove pivot alerts if no valid pivots
         if not piv or not any(piv.values()):
