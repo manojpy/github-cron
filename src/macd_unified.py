@@ -659,79 +659,95 @@ def calculate_magical_momentum_hist(
     period: int = 144,
     responsiveness: float = 0.9
 ) -> np.ndarray:
-    try:
-        if close is None or len(close) < period:
-            logger.warning(f"MMH: Insufficient data (len={len(close) if close is not None else 0})")
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+    """
+    Pine-accurate Magical Momentum Histogram
+    Uses shared helpers and constants.
+    Compatible with AOT + JIT bridge.
+    """
 
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
+    rows = len(close)
+    if rows == 0:
+        return np.zeros(0, dtype=np.float64)
 
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
-        else:
-            sd = rolling_std_welford(close_c, 50, resp_clamped)
+    close = close.astype(np.float64, copy=False)
 
-        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
+    # ------------------------------------------------------------------
+    # 1. ta.stdev(source, 50) * responsiveness
+    # ------------------------------------------------------------------
+    sd = rolling_std_welford(close, 50, responsiveness)
 
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            ma = rolling_mean_numba_parallel(close_c, period)
-        else:
-            ma = rolling_mean_numba(close_c, period)
+    # ------------------------------------------------------------------
+    # 2. Worm (stateful, Pine var semantics)
+    # ------------------------------------------------------------------
+    worm = calc_mmh_worm_loop(close, sd, rows)
 
-        with np.errstate(divide='ignore', invalid='ignore'):
-            raw = (worm_arr - ma) / worm_arr
-        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    # ------------------------------------------------------------------
+    # 3. SMA(source, period)
+    # ------------------------------------------------------------------
+    ma = rolling_mean_numba(close, period)
 
-        if cfg.NUMBA_PARALLEL and rows >= 250:
-            min_med, max_med = rolling_min_max_numba_parallel(raw, period)
-        else:
-            min_med, max_med = rolling_min_max_numba(raw, period)
+    # ------------------------------------------------------------------
+    # 4. raw_momentum = (worm - ma) / worm   (NO early coercion)
+    # ------------------------------------------------------------------
+    raw = np.full(rows, np.nan, dtype=np.float64)
+    for i in range(rows):
+        if (
+            not np.isnan(ma[i])
+            and abs(worm[i]) > ZERO_DIVISION_GUARD
+        ):
+            raw[i] = (worm[i] - ma[i]) / worm[i]
 
-        # Calculate temp (normalized) - NO CLIPPING
-        denom = max_med - min_med
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp = np.where(
-                np.abs(denom) < 1e-10,  # Zero division guard
-                0.5,
-                (raw - min_med) / denom
-            )
+    # ------------------------------------------------------------------
+    # 5. min / max over period (Pine ta.lowest / ta.highest)
+    # ------------------------------------------------------------------
+    min_med, max_med = rolling_min_max_numba(raw, period)
 
-        temp = np.nan_to_num(temp, nan=0.5, posinf=1.0, neginf=0.0)
+    # ------------------------------------------------------------------
+    # 6. temp normalization
+    # temp = (raw - min) / (max - min)
+    # Pine default when invalid → 0.5
+    # ------------------------------------------------------------------
+    temp = np.full(rows, 0.5, dtype=np.float64)
 
-        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
-        print(f"temp sample: {temp[:10]}")
+    for i in range(rows):
+        denom = max_med[i] - min_med[i]
+        if (
+            not np.isnan(min_med[i])
+            and abs(denom) > ZERO_DIVISION_GUARD
+        ):
+            temp[i] = (raw[i] - min_med[i]) / denom
 
-        value_arr = calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
+    # ------------------------------------------------------------------
+    # 7. value loop (recursive, clipped)
+    # ------------------------------------------------------------------
+    value = calc_mmh_value_loop(temp, rows)
+    value = np.clip(value, -MMH_VALUE_CLIP, MMH_VALUE_CLIP)
 
-        print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
-        print(f"value_arr sample: {value_arr[:10]}")
-
-
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.clip(temp2, 1e-9, 1e9)
-            temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
-
+    # ------------------------------------------------------------------
+    # 8. momentum = 0.25 * log((1+v)/(1-v))
+    # Guard against overflow
+    # ------------------------------------------------------------------
+    with np.errstate(divide="ignore", invalid="ignore"):
+        temp2 = (1.0 + value) / (1.0 - value)
+        temp2 = np.clip(
+            temp2,
+            1.0 / INFINITY_CLAMP,
+            INFINITY_CLAMP
+        )
         momentum = 0.25 * np.log(temp2)
-        momentum = np.nan_to_num(momentum, nan=0.0)
 
-        print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
+    # ------------------------------------------------------------------
+    # 9. Recursive momentum smoothing
+    # momentum := momentum + 0.5 * nz(momentum[1])
+    # ------------------------------------------------------------------
+    momentum = calc_mmh_momentum_loop(momentum, rows)
 
-        momentum_arr = momentum.copy()
-        momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
+    # ------------------------------------------------------------------
+    # 10. Final sanitize ONLY at output boundary
+    # ------------------------------------------------------------------
+    momentum = sanitize_array_numba(momentum, 0.0)
 
-        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
-
-        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
-
-        return momentum_arr
-
-    except Exception as e:
-        logger.error(f"MMH calculation failed: {e}", exc_info=True)
-        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+    return momentum
         
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
@@ -1556,7 +1572,7 @@ class DataFetcher:
                         else:
                             if logger.isEnabledFor(logging.DEBUG):
                                 logger.debug(
-                                    f"✅ Scanned {symbol} {resolution} | "
+                                    f"��� Scanned {symbol} {resolution} | "
                                     f"Latest: {format_ist_time(last_candle_open_ts)} | "
                                     f"Candles: {num_candles}"
                                 )

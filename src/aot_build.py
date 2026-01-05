@@ -272,6 +272,6 @@ if __name__ == '__main__':
         print("💡 No code duplication - single source of truth maintained")
         sys.exit(0)
     else:
-        print("\nâŒ Build failed!")
+        print("\n❌ Build failed!")
         print("💡 Falling back to JIT compilation will be used automatically")
         sys.exit(1)
