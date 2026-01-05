@@ -689,15 +689,16 @@ def calculate_magical_momentum_hist(
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
+        # Calculate temp (normalized) - NO CLIPPING
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
             temp = np.where(
-                np.abs(denom) < Constants.ZERO_DIVISION_GUARD,
+                np.abs(denom) < 1e-10,  # Zero division guard
                 0.5,
                 (raw - min_med) / denom
             )
-        temp = np.clip(temp, 0.0, 1.0)
-        temp = np.nan_to_num(temp, nan=0.5)
+
+        temp = np.nan_to_num(temp, nan=0.5, posinf=1.0, neginf=0.0)
 
         print(f"temp range UNCLIPPED: [{temp.min():.4f}, {temp.max():.4f}]")
         print(f"temp sample: {temp[:10]}")
