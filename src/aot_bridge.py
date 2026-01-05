@@ -21,12 +21,10 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Import ALL 24 functions from shared module
+# Import ALL 22 functions from shared module
 from numba_functions_shared import (
     sanitize_array_numba as _jit_sanitize_array_numba,
     sanitize_array_numba_parallel as _jit_sanitize_array_numba_parallel,
-    sma_loop as _jit_sma_loop,
-    sma_loop_parallel as _jit_sma_loop_parallel,
     ema_loop as _jit_ema_loop,
     ema_loop_alpha as _jit_ema_loop_alpha,
     rng_filter_loop as _jit_rng_filter_loop,
@@ -120,13 +118,6 @@ def _test_sanitize(aot_module) -> bool:
     )
 
 
-def _test_sma(aot_module) -> bool:
-    """Test SMA calculation"""
-    arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
-    res = aot_module.sma_loop(arr, 3)
-    return res is not None and len(res) == len(arr)
-
-
 def _test_rolling_std(aot_module) -> bool:
     """Test rolling standard deviation"""
     arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float64)
@@ -165,7 +156,6 @@ def verify_functions_parallel(aot_module) -> bool:
         _test_ema_single,
         _test_rsi,
         _test_sanitize,
-        _test_sma,
         _test_rolling_std,
         _test_wick_buy,
         _test_empty_ema,
@@ -333,7 +323,6 @@ def diagnostics() -> Dict[str, Any]:
     
     aot_funcs = [
         "sanitize_array_numba", "sanitize_array_numba_parallel",
-        "sma_loop", "sma_loop_parallel",
         "ema_loop", "ema_loop_alpha",
         "kalman_loop", "vwap_daily_loop",
         "rng_filter_loop", "smooth_range", "calculate_trends_with_state",
@@ -367,8 +356,6 @@ def diagnostics() -> Dict[str, Any]:
 # Initialize these as None, will be bound to either AOT or JIT at module load
 sanitize_array_numba = None
 sanitize_array_numba_parallel = None
-sma_loop = None
-sma_loop_parallel = None
 ema_loop = None
 ema_loop_alpha = None
 rng_filter_loop = None
@@ -393,11 +380,10 @@ vectorized_wick_check_sell = None
 
 def _bind_functions():
     """
-    Bind all 24 functions to either AOT or JIT implementations.
+    Bind all 22 functions to either AOT or JIT implementations.
     Called once at module initialization - creates direct function references with ZERO overhead.
     """
     global sanitize_array_numba, sanitize_array_numba_parallel
-    global sma_loop, sma_loop_parallel
     global ema_loop, ema_loop_alpha
     global rng_filter_loop, smooth_range, calculate_trends_with_state
     global kalman_loop, vwap_daily_loop
@@ -412,8 +398,6 @@ def _bind_functions():
         # Direct binding to AOT functions - ZERO overhead
         sanitize_array_numba = _AOT_MODULE.sanitize_array_numba
         sanitize_array_numba_parallel = _AOT_MODULE.sanitize_array_numba_parallel
-        sma_loop = _AOT_MODULE.sma_loop
-        sma_loop_parallel = _AOT_MODULE.sma_loop_parallel
         ema_loop = _AOT_MODULE.ema_loop
         ema_loop_alpha = _AOT_MODULE.ema_loop_alpha
         rng_filter_loop = _AOT_MODULE.rng_filter_loop
@@ -435,13 +419,11 @@ def _bind_functions():
         vectorized_wick_check_buy = _AOT_MODULE.vectorized_wick_check_buy
         vectorized_wick_check_sell = _AOT_MODULE.vectorized_wick_check_sell
         
-        logger.info("✅ All 24 functions bound to AOT implementations")
+        logger.info("✅ All 22 functions bound to AOT implementations")
     else:
         # Bind to JIT implementations from shared module
         sanitize_array_numba = _jit_sanitize_array_numba
         sanitize_array_numba_parallel = _jit_sanitize_array_numba_parallel
-        sma_loop = _jit_sma_loop
-        sma_loop_parallel = _jit_sma_loop_parallel
         ema_loop = _jit_ema_loop
         ema_loop_alpha = _jit_ema_loop_alpha
         rng_filter_loop = _jit_rng_filter_loop
@@ -510,8 +492,7 @@ if ema_loop is None:
 
 # Verify function count
 _expected_functions = [
-    sanitize_array_numba, sanitize_array_numba_parallel,
-    sma_loop, sma_loop_parallel,
+    sanitize_array_numba, sanitize_array_numba_parallel, 
     ema_loop, ema_loop_alpha,
     rng_filter_loop, smooth_range, calculate_trends_with_state, 
     kalman_loop, vwap_daily_loop,
@@ -548,8 +529,6 @@ __all__ = [
     # Core functions
     'sanitize_array_numba',
     'sanitize_array_numba_parallel',
-    'sma_loop',
-    'sma_loop_parallel',
     'ema_loop',
     'ema_loop_alpha',
     'rng_filter_loop',

@@ -19,12 +19,10 @@ import numpy as np
 from numba.pycc import CC
 from numba import types
 
-# Import ALL 24 functions from the shared module
+# Import ALL 22 functions from the shared module
 from numba_functions_shared import (
     sanitize_array_numba,
     sanitize_array_numba_parallel,
-    sma_loop,
-    sma_loop_parallel,
     ema_loop,
     ema_loop_alpha,
     rng_filter_loop,
@@ -101,7 +99,7 @@ def get_output_filename(base_name: str) -> str:
 
 def compile_module():
     """
-    Compile all 24 functions to AOT shared library
+    Compile all 22 functions to AOT shared library
     
     Uses function implementations from numba_functions_shared.py
     """
@@ -139,9 +137,6 @@ def compile_module():
     cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')(sanitize_array_numba)
     cc.export('sanitize_array_numba_parallel', 'f8[:](f8[:], f8)')(sanitize_array_numba_parallel)
     
-    # 3-4. SMA
-    cc.export('sma_loop', 'f8[:](f8[:], i4)')(sma_loop)
-    cc.export('sma_loop_parallel', 'f8[:](f8[:], i4)')(sma_loop_parallel)
     
     # 5-6. EMA
     cc.export('ema_loop', 'f8[:](f8[:], f8)')(ema_loop)
@@ -202,11 +197,10 @@ def compile_module():
     # COMPILATION
     # ========================================================================
     
-    print(f"\n🔨 Compiling {module_name} with all 23 functions...")
+    print(f"\n🔨 Compiling {module_name} with all 22 functions...")
     print("📋 Function list:")
     functions = [
         "1. sanitize_array_numba", "2. sanitize_array_numba_parallel",
-        "3. sma_loop", "4. sma_loop_parallel",
         "5. ema_loop", "6. ema_loop_alpha",
         "7. rng_filter_loop", "8. smooth_range",
         "9. kalman_loop", "10. vwap_daily_loop",

@@ -39,8 +39,6 @@ warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*
 from aot_bridge import (
     sanitize_array_numba,
     sanitize_array_numba_parallel,
-    sma_loop,
-    sma_loop_parallel,
     ema_loop,
     ema_loop_alpha,
     kalman_loop,
@@ -657,49 +655,103 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
-    responsiveness: float = 0.9
+    responsiveness: float = 0.9,
+    use_parallel: bool = False
 ) -> np.ndarray:
-    rows = len(close)
-    resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-    close_c = np.ascontiguousarray(close)
+    """
+    Pine-accurate MMH calculation.
+    
+    Key fixes:
+    1. Uses SMA-based standard deviation (not Welford)
+    2. Preserves NaN in intermediate calculations
+    3. No early sanitization of raw_momentum
+    4. SMA does not skip NaN values
+    
+    Args:
+        close: Price array
+        period: Lookback period (default 144)
+        responsiveness: SD multiplier (default 0.9)
+        use_parallel: Use parallel versions (default False)
+    
+    Returns:
+        MMH histogram values
+    """
+    try:
+        if close is None or len(close) < period:
+            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
-    # PineScript stdev
-    sd = rolling_std_welford(close_c, 50, resp_clamped)
+        rows = len(close)
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        close_c = np.ascontiguousarray(close, dtype=np.float64)
 
-    # Worm
-    worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
+        # 1. Calculate Pine-accurate standard deviation
+        if use_parallel and rows >= 250:
+            sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
+        else:
+            sd = rolling_std_welford(close_c, 50, resp_clamped)
 
-    # SMA
-    ma = rolling_mean_numba(close_c, period)
+        # 2. Calculate worm
+        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-    # Raw momentum (no early sanitize)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        raw = (worm_arr - ma) / worm_arr
+        # 3. Calculate Pine-accurate SMA
+        if use_parallel and rows >= 250:
+            ma = rolling_mean_numba_parallel(close_c, period)
+        else:
+            ma = rolling_mean_numba(close_c, period)
 
-    # Min/max
-    min_med, max_med = rolling_min_max_numba(raw, period)
+        # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw = (worm_arr - ma) / worm_arr
+        
+        # Pine behavior: if worm == 0 → result is na (not 0)
+        # We keep NaN/Inf here intentionally
 
-    # Temp normalization
-    denom = max_med - min_med
-    with np.errstate(divide='ignore', invalid='ignore'):
-        temp = (raw - min_med) / denom
-    temp[np.isnan(temp)] = 0.5
+        # 5. Calculate rolling min/max (they handle NaN correctly)
+        if use_parallel and rows >= 250:
+            min_med, max_med = rolling_min_max_numba_parallel(raw, period)
+        else:
+            min_med, max_med = rolling_min_max_numba(raw, period)
 
-    # Value recursion
-    value_arr = calc_mmh_value_loop(temp, rows)
+        # 6. Calculate temp (normalized)
+        denom = max_med - min_med
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp = (raw - min_med) / denom
+        
+        # Handle edge cases for temp
+        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
+        temp = np.where(np.isnan(temp), 0.5, temp)
+        temp = np.where(np.isinf(temp), 0.5, temp)
+        temp = np.clip(temp, 0.0, 1.0)
 
-    # Momentum transform
-    with np.errstate(divide='ignore', invalid='ignore'):
-        temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-    temp2[np.isnan(temp2)] = 1.0
-    momentum = 0.25 * np.log(temp2)
+        # 7. Calculate value
+        value_arr = calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -0.9999, 0.9999)
 
-    # Momentum recursion
-    momentum_arr = calc_mmh_momentum_loop(momentum.copy(), rows)
+        # 8. Calculate momentum
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.clip(temp2, 1e-9, 1e9)
+            temp2 = np.where(np.isnan(temp2), 1.0, temp2)
+            temp2 = np.where(np.isinf(temp2), 1e9, temp2)
 
-    # Final sanitize
-    momentum_arr[np.isnan(momentum_arr)] = 0.0
-    return momentum_arr
+        momentum = 0.25 * np.log(temp2)
+        momentum = np.where(np.isnan(momentum), 0.0, momentum)
+        momentum = np.where(np.isinf(momentum), 0.0, momentum)
+
+        # 9. Apply recursive momentum formula
+        momentum_arr = momentum.copy()
+        momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
+
+        # 10. Final sanitization (only at the very end)
+        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
+
+        return momentum_arr
+
+    except Exception as e:
+        print(f"MMH calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
@@ -719,8 +771,6 @@ def warmup_if_needed() -> None:
 
         _ = ema_loop(test_data, 7.0)
         _ = ema_loop_alpha(test_data, 0.2)
-        _ = sma_loop(test_data, test_int)
-        _ = sma_loop_parallel(test_data, test_int)
         _ = calculate_ppo_core(test_data, 7, 16, 5)
         _ = calculate_rsi_core(test_data, 21)
         _ = sanitize_array_numba(test_data, 0.0)
