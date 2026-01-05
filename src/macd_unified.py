@@ -668,7 +668,6 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close) if not close.flags['C_CONTIGUOUS'] else close
 
-        # sd = ta.stdev(source, 50) * responsiveness
         if cfg.NUMBA_PARALLEL and rows >= 250:
             sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
@@ -676,56 +675,64 @@ def calculate_magical_momentum_hist(
 
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-        # ma = ta.sma(source, period)
         if cfg.NUMBA_PARALLEL and rows >= 250:
             ma = rolling_mean_numba_parallel(close_c, period)
         else:
             ma = rolling_mean_numba(close_c, period)
 
-        # raw_momentum = (worm - ma) / worm
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Let NaNs stay here; no forced 0.0 mapping
-        # current_med = raw_momentum
         if cfg.NUMBA_PARALLEL and rows >= 250:
             min_med, max_med = rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
-        # temp = (current_med - min_med) / (max_med - min_med)
+        # Calculate temp (normalized) - NO CLIPPING
+        denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
-            temp = (raw - min_med) / (max_med - min_med)
+            temp = np.where(
+                np.abs(denom) < 1e-10,  # Zero division guard
+                0.5,
+                (raw - min_med) / denom
+            )
 
-        # Do NOT clamp temp to [0,1]; only avoid hard NaNs if desired
-        # Pine would naturally propagate NaNs; we keep them for value_loop to handle via nz logic
-        # value = 0.5 * 2; value := value * (temp - .5 + .5 * nz(value[1]))
+        temp = np.nan_to_num(temp, nan=0.5, posinf=1.0, neginf=0.0)
+
+        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
+        print(f"temp sample: {temp[:10]}")
+
         value_arr = calc_mmh_value_loop(temp, rows)
-
-        # Optional safety: keep your global clip, but Pine already clips at ±0.9999
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
-        # temp2 = (1 + value) / (1 - value)
+        print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
+        print(f"value_arr sample: {value_arr[:10]}")
+
+
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.clip(temp2, 1e-9, 1e9)
+            temp2 = np.nan_to_num(temp2, nan=1e9, posinf=1e9, neginf=1e-9)
 
-        # Light guard against true division-by-zero extremes, but no huge 1e9 mapping
-        temp2 = np.nan_to_num(temp2, nan=1.0)
-
-        # momentum = .25 * math.log(temp2)
         momentum = 0.25 * np.log(temp2)
         momentum = np.nan_to_num(momentum, nan=0.0)
+
+        print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
 
         momentum_arr = momentum.copy()
         momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
 
+        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
+
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
+
         return momentum_arr
 
     except Exception as e:
         logger.error(f"MMH calculation failed: {e}", exc_info=True)
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
+        
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
         logger.info("✅ AOT active - no warmup needed")
@@ -4177,7 +4184,7 @@ if __name__ == "__main__":
     try:
         success = asyncio.run(main_with_cleanup())
         if success:
-            #logger.info("��� Bot run completed successfully")
+            #logger.info("✅ Bot run completed successfully")
             sys.exit(0)
         else:
             logger.error("❌ Bot run failed")

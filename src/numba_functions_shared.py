@@ -503,91 +503,64 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.nda
     return min_arr, max_arr
 
 
+
 # ============================================================================
-# MMH (MAGICAL MOMENTUM HISTOGRAM) COMPONENTS - CORRECTED
+# MMH (MAGICAL MOMENTUM HISTOGRAM) COMPONENTS
 # ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Calculate MMH worm indicator (closer to PineScript behavior)"""
+    """Calculate MMH worm indicator"""
     worm_arr = np.empty(rows, dtype=np.float64)
-
-    # Pine: var worm = source => first bar worm = source[0]
-    worm_arr[0] = close_arr[0]
-
+    worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
+    
     for i in range(1, rows):
-        src = close_arr[i]  # assume OHLC data is non-NaN like TradingView source
+        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
-
+        
         if np.isnan(sd_i):
             delta = diff
         else:
-            if np.abs(diff) > sd_i:
-                delta = np.sign(diff) * sd_i
-            else:
-                delta = diff
-
+            delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
+        
         worm_arr[i] = prev_worm + delta
-
+    
     return worm_arr
 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    PineScript:
-        value = 0.5 * 2
-        value := value * (temp - .5 + .5 * nz(value[1]))
-        value := clamp(value, -0.9999, 0.9999)
+    V7: What if "value = 0.5 * 2" actually means the WEIGHT is 2x?
+    value := 2 * (temp - .5 + .5 * value[1])
     """
-    value_arr = np.empty(rows, dtype=np.float64)
-    value_arr[:] = np.nan
-    weight = 0.5 * 2.0  # 1.0
-
-    # Bar 0: nz(value[1]) = 0
-    t0 = temp_arr[0]
-    if np.isnan(t0):
-        t0 = 0.5
-    v0 = weight * (t0 - 0.5 + 0.5 * 0.0)
-    if v0 > 0.9999:
-        v0 = 0.9999
-    elif v0 < -0.9999:
-        v0 = -0.9999
-    value_arr[0] = v0
-
+    value_arr = np.zeros(rows, dtype=np.float64)
+    weight = 0.5 * 2  # = 1.0
+    
+    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
+    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
+    value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
+    
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
-        # nz(value[1]) -> 0 when NaN
-        if np.isnan(prev_v):
-            prev_v = 0.0
-
-        t = temp_arr[i]
-        if np.isnan(t):
-            t = 0.5
-
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        
+        # Weight applied to the full expression
         v = weight * (t - 0.5 + 0.5 * prev_v)
-
-        if v > 0.9999:
-            v = 0.9999
-        elif v < -0.9999:
-            v = -0.9999
-
-        value_arr[i] = v
-
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    
     return value_arr
 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Calculate MMH momentum indicator (Pine: momentum := momentum + .5 * nz(momentum[1]))"""
+    """Calculate MMH momentum indicator"""
     for i in range(1, rows):
-        prev = momentum_arr[i - 1]
-        if np.isnan(prev):
-            prev = 0.0  # nz(momentum[1])
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
+    
     return momentum_arr
 
 # ============================================================================
