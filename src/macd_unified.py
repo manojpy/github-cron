@@ -47,6 +47,7 @@ from aot_bridge import (
     vwap_daily_loop,
     rng_filter_loop,
     smooth_range,
+    calculate_trends_with_state, 
     calc_mmh_worm_loop,
     calc_mmh_value_loop,
     calc_mmh_momentum_loop,
@@ -639,9 +640,8 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
         
         filt_x1 = rng_filter_loop(close, smrng_x1)
         filt_x12 = rng_filter_loop(close, smrng_x2)
-        
-        upw = filt_x1 < filt_x12
-        dnw = filt_x1 > filt_x12        
+          
+        upw, dnw = calculate_trends_with_state(filt_x1, filt_x12)   
         return upw, dnw, filt_x1, filt_x12
         
     except Exception as e:
@@ -766,6 +766,7 @@ def warmup_if_needed() -> None:
         _ = kalman_loop(test_data, 10, 0.1, 0.01)
         _ = rng_filter_loop(test_data, test_data2)
         _ = smooth_range(test_data, 10, 2)
+        _ = calculate_trends_with_state(test_data, test_data2)
         _ = vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
         _ = calc_mmh_worm_loop(test_data, test_data2, len(test_data))
         _ = calc_mmh_value_loop(test_data2, len(test_data2))

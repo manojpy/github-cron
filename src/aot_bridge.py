@@ -21,7 +21,7 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Import ALL 23 functions from shared module
+# Import ALL 24 functions from shared module
 from numba_functions_shared import (
     sanitize_array_numba as _jit_sanitize_array_numba,
     sanitize_array_numba_parallel as _jit_sanitize_array_numba_parallel,
@@ -31,6 +31,7 @@ from numba_functions_shared import (
     ema_loop_alpha as _jit_ema_loop_alpha,
     rng_filter_loop as _jit_rng_filter_loop,
     smooth_range as _jit_smooth_range,
+    calculate_trends_with_state as _jit_calculate_trends_with_state, 
     kalman_loop as _jit_kalman_loop,
     vwap_daily_loop as _jit_vwap_daily_loop,
     rolling_std_welford as _jit_rolling_std_welford,
@@ -335,7 +336,7 @@ def diagnostics() -> Dict[str, Any]:
         "sma_loop", "sma_loop_parallel",
         "ema_loop", "ema_loop_alpha",
         "kalman_loop", "vwap_daily_loop",
-        "rng_filter_loop", "smooth_range",
+        "rng_filter_loop", "smooth_range", "calculate_trends_with_state",
         "calc_mmh_worm_loop", "calc_mmh_value_loop", "calc_mmh_momentum_loop",
         "rolling_std_welford", "rolling_std_welford_parallel",
         "rolling_mean_numba", "rolling_mean_numba_parallel",
@@ -372,6 +373,7 @@ ema_loop = None
 ema_loop_alpha = None
 rng_filter_loop = None
 smooth_range = None
+calculate_trends_with_state = None 
 kalman_loop = None
 vwap_daily_loop = None
 rolling_std_welford = None
@@ -391,13 +393,13 @@ vectorized_wick_check_sell = None
 
 def _bind_functions():
     """
-    Bind all 23 functions to either AOT or JIT implementations.
+    Bind all 24 functions to either AOT or JIT implementations.
     Called once at module initialization - creates direct function references with ZERO overhead.
     """
     global sanitize_array_numba, sanitize_array_numba_parallel
     global sma_loop, sma_loop_parallel
     global ema_loop, ema_loop_alpha
-    global rng_filter_loop, smooth_range
+    global rng_filter_loop, smooth_range, calculate_trends_with_state
     global kalman_loop, vwap_daily_loop
     global rolling_std_welford, rolling_std_welford_parallel
     global calc_mmh_worm_loop, calc_mmh_value_loop, calc_mmh_momentum_loop
@@ -416,6 +418,7 @@ def _bind_functions():
         ema_loop_alpha = _AOT_MODULE.ema_loop_alpha
         rng_filter_loop = _AOT_MODULE.rng_filter_loop
         smooth_range = _AOT_MODULE.smooth_range
+        calculate_trends_with_state = _AOT_MODULE.calculate_trends_with_state
         kalman_loop = _AOT_MODULE.kalman_loop
         vwap_daily_loop = _AOT_MODULE.vwap_daily_loop
         rolling_std_welford = _AOT_MODULE.rolling_std_welford
@@ -432,7 +435,7 @@ def _bind_functions():
         vectorized_wick_check_buy = _AOT_MODULE.vectorized_wick_check_buy
         vectorized_wick_check_sell = _AOT_MODULE.vectorized_wick_check_sell
         
-        logger.info("✅ All 23 functions bound to AOT implementations")
+        logger.info("✅ All 24 functions bound to AOT implementations")
     else:
         # Bind to JIT implementations from shared module
         sanitize_array_numba = _jit_sanitize_array_numba
@@ -443,6 +446,7 @@ def _bind_functions():
         ema_loop_alpha = _jit_ema_loop_alpha
         rng_filter_loop = _jit_rng_filter_loop
         smooth_range = _jit_smooth_range
+        calculate_trends_with_state = _jit_calculate_trends_with_state
         kalman_loop = _jit_kalman_loop
         vwap_daily_loop = _jit_vwap_daily_loop
         rolling_std_welford = _jit_rolling_std_welford
@@ -459,7 +463,7 @@ def _bind_functions():
         vectorized_wick_check_buy = _jit_vectorized_wick_check_buy
         vectorized_wick_check_sell = _jit_vectorized_wick_check_sell
         
-        logger.info("⚠️ All 23 functions bound to JIT fallback implementations")
+        logger.info("⚠️ All 24 functions bound to JIT fallback implementations")
 
 
 def summary() -> None:
@@ -475,7 +479,7 @@ def summary() -> None:
         if _AOT_MODULE:
             module_path = getattr(_AOT_MODULE, '__file__', 'unknown')
             print(f"📦 Module: {module_path}")
-        print(f"⚡ Functions: All 23 functions using compiled AOT (.so)")
+        print(f"⚡ Functions: All 24 functions using compiled AOT (.so)")
     else:
         print("⚠️ Status: JIT FALLBACK")
         if _FALLBACK_REASON:
@@ -485,7 +489,7 @@ def summary() -> None:
                 print(f"❌ Error: {_FALLBACK_REASON.get('error', 'unknown')}")
             else:
                 print(f"❌ Reason: {_FALLBACK_REASON}")
-        print(f"🔄 Functions: All 23 functions using JIT compilation")
+        print(f"🔄 Functions: All 24 functions using JIT compilation")
     
     print(f"📄 Source: numba_functions_shared.py (single source of truth)")
     print("="*70 + "\n")
@@ -509,7 +513,7 @@ _expected_functions = [
     sanitize_array_numba, sanitize_array_numba_parallel,
     sma_loop, sma_loop_parallel,
     ema_loop, ema_loop_alpha,
-    rng_filter_loop, smooth_range,
+    rng_filter_loop, smooth_range, calculate_trends_with_state, 
     kalman_loop, vwap_daily_loop,
     rolling_std_welford, rolling_std_welford_parallel,
     calc_mmh_worm_loop, calc_mmh_value_loop, calc_mmh_momentum_loop,
@@ -550,6 +554,7 @@ __all__ = [
     'ema_loop_alpha',
     'rng_filter_loop',
     'smooth_range',
+    'calculate_trends_with_state',
     'kalman_loop',
     'vwap_daily_loop',
     'rolling_std_welford',

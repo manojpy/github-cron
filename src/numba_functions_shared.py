@@ -2,7 +2,7 @@
 Shared Numba Function Definitions - Single Source of Truth
 ============================================================
 
-All 23 Numba functions defined ONCE with complete implementations.
+All 24 Numba functions defined ONCE with complete implementations.
 Used by both:
   - aot_build.py (compiles to .so via CC.export)
   - aot_bridge.py (JIT fallback via @njit decorator)
@@ -207,6 +207,47 @@ def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
     
     return smoothrng * float(m)
 
+@njit(nogil=True, fastmath=False, cache=True)
+def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> tuple:
+    """
+    Calculate trends with state persistence to match Pine Script visual behavior.
+    When filtx1 == filtx12, maintains the previous trend state.
+    
+    Returns:
+        tuple: (upw, dnw) - Two boolean arrays
+    """
+    n = len(filt_x1)
+    upw = np.empty(n, dtype=np.bool_)
+    dnw = np.empty(n, dtype=np.bool_)
+    
+    # Initialize first bar - default to uptrend if equal
+    if filt_x1[0] < filt_x12[0]:
+        upw[0] = True
+        dnw[0] = False
+    elif filt_x1[0] > filt_x12[0]:
+        upw[0] = False
+        dnw[0] = True
+    else:
+        # Equal on first bar - default to uptrend
+        upw[0] = True
+        dnw[0] = False
+    
+    # Process remaining bars with state persistence
+    for i in range(1, n):
+        if filt_x1[i] < filt_x12[i]:
+            # Clear uptrend
+            upw[i] = True
+            dnw[i] = False
+        elif filt_x1[i] > filt_x12[i]:
+            # Clear downtrend
+            upw[i] = False
+            dnw[i] = True
+        else:
+            # Equal - maintain previous state
+            upw[i] = upw[i-1]
+            dnw[i] = dnw[i-1]
+    
+    return upw, dnw
 
 @njit(nogil=True, fastmath=True, cache=True)
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
@@ -726,6 +767,7 @@ __all__ = [
     # Filters
     'rng_filter_loop',
     'smooth_range',
+    'calculate_trends_with_state', 
     'kalman_loop',
     
     # Market Indicators
@@ -753,5 +795,5 @@ __all__ = [
     'vectorized_wick_check_sell',
 ]
 
-# Total: 23 functions
-assert len(__all__) == 23, f"Expected 23 functions, found {len(__all__)}"
+# Total: 24 functions
+assert len(__all__) == 24, f"Expected 24 functions, found {len(__all__)}"

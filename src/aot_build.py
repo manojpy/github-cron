@@ -19,7 +19,7 @@ import numpy as np
 from numba.pycc import CC
 from numba import types
 
-# Import ALL 23 functions from the shared module
+# Import ALL 24 functions from the shared module
 from numba_functions_shared import (
     sanitize_array_numba,
     sanitize_array_numba_parallel,
@@ -29,6 +29,7 @@ from numba_functions_shared import (
     ema_loop_alpha,
     rng_filter_loop,
     smooth_range,
+    calculate_trends_with_state,
     kalman_loop,
     vwap_daily_loop,
     rolling_std_welford,
@@ -100,7 +101,7 @@ def get_output_filename(base_name: str) -> str:
 
 def compile_module():
     """
-    Compile all 23 functions to AOT shared library
+    Compile all 24 functions to AOT shared library
     
     Uses function implementations from numba_functions_shared.py
     """
@@ -146,15 +147,17 @@ def compile_module():
     cc.export('ema_loop', 'f8[:](f8[:], f8)')(ema_loop)
     cc.export('ema_loop_alpha', 'f8[:](f8[:], f8)')(ema_loop_alpha)
     
-    # 7-9. Filters
+    # 7-10. Filters
     cc.export('rng_filter_loop', 'f8[:](f8[:], f8[:])')(rng_filter_loop)
     cc.export('smooth_range', 'f8[:](f8[:], i4, i4)')(smooth_range)
     cc.export('kalman_loop', 'f8[:](f8[:], i4, f8, f8)')(kalman_loop)
+    cc.export(
+        'calculate_trends_with_state',
+        types.Tuple((types.boolean[:], types.boolean[:]))(types.float64[:], types.float64[:])
+    )(calculate_trends_with_state)
     
     # 10. VWAP
     cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])')(vwap_daily_loop)
-
-
 
 
     # 11-12. Rolling Standard Deviation
@@ -214,6 +217,7 @@ def compile_module():
         "18. rolling_min_max_numba", "19. rolling_min_max_numba_parallel",
         "20. calculate_ppo_core", "21. calculate_rsi_core",
         "22. vectorized_wick_check_buy", "23. vectorized_wick_check_sell",
+        "24. calculate_trends_with_state", 
     ]
     for func in functions:
         print(f"   ✓ {func}")
