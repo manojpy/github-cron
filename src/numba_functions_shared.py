@@ -479,23 +479,22 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
-    V6: Simplification of V5
-    value := value * (temp - .5) + .5 * value[1]
-    = value * (temp - 0.5 + 0.5)
-    = value * temp
+    V7: What if "value = 0.5 * 2" actually means the WEIGHT is 2x?
+    value := 2 * (temp - .5 + .5 * value[1])
     """
     value_arr = np.zeros(rows, dtype=np.float64)
+    weight = 0.5 * 2  # = 1.0
     
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = 1.0 * t0  # Simplified
+    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
     value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
     
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         
-        # Simplified: value * temp
-        v = prev_v * t
+        # Weight applied to the full expression
+        v = weight * (t - 0.5 + 0.5 * prev_v)
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
