@@ -697,7 +697,7 @@ def calculate_magical_momentum_hist(
     momentum = 0.25 * np.log((1.0 + value) / (1.0 - value))
 
     # --- Recursive smoothing ---
-    momentum = calc_mmh_momentum_loop(momentum, rows)
+    momentum_arr = calc_mmh_momentum_loop(momentum, rows)
 
     return momentum_arr
 
