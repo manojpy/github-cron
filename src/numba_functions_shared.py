@@ -233,8 +233,7 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int):
 
     return min_arr, max_arr
 
-
-@njit(nogil=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     """
     Exponential Moving Average
@@ -254,7 +253,7 @@ def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
     """Exponential Moving Average with explicit alpha parameter"""
     n = len(data)
@@ -385,7 +384,7 @@ def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> tu
     
     return upw, dnw
 
-@njit(nogil=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     """Kalman filter implementation"""
     n = len(src)
@@ -419,7 +418,7 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
 # MARKET INDICATORS
 # ============================================================================
 
-@njit(nogil=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def vwap_daily_loop(
     high: np.ndarray,
     low: np.ndarray,
@@ -479,11 +478,12 @@ def vwap_daily_loop(
 
     return vwap
 
+
 # ============================================================================
 # OSCILLATORS
 # ============================================================================
 
-@njit(nogil=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Calculate Percentage Price Oscillator (PPO) and its signal line.
@@ -532,7 +532,7 @@ def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> 
     return ppo, ppo_sig
 
 
-@njit(nogil=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
     n = len(close)
     rsi = np.zeros(n, dtype=np.float64)
