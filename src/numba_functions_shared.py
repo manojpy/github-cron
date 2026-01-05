@@ -478,21 +478,26 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """Calculate MMH value indicator"""
+    """
+    V5: value := value * (temp - .5) + .5 * value[1]
+    Split the multiplication and addition
+    """
     value_arr = np.zeros(rows, dtype=np.float64)
     
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = t0 - 0.5
+    # Bar 0: value = 1.0, value[1] doesn't exist (= 0)
+    value_arr[0] = 1.0 * (t0 - 0.5) + 0.5 * 0.0
     value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
     
     for i in range(1, rows):
-        prev_v = value_arr[i - 1] if not np.isnan(value_arr[i - 1]) else 0.0
+        prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = t - 0.5 + 0.5 * prev_v
+        
+        # Split formula: multiply first part, add second part
+        v = prev_v * (t - 0.5) + 0.5 * prev_v
         value_arr[i] = max(-0.9999, min(0.9999, v))
     
     return value_arr
-
 
 @njit(nogil=True, fastmath=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
