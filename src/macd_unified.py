@@ -37,31 +37,52 @@ warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
 from aot_bridge import (
+    # Sanitization
     sanitize_array_numba,
     sanitize_array_numba_parallel,
-    sma_loop,
-    sma_loop_parallel,
+    
+    # Moving Averages (Names updated to Pine-Accurate)
+    rolling_std_pine_accurate,
+    rolling_std_pine_accurate_parallel,
+    sma_pine_accurate,
+    sma_pine_accurate_parallel,
     ema_loop,
     ema_loop_alpha,
-    kalman_loop,
-    vwap_daily_loop,
+    
+    # Filters & Trend
     rng_filter_loop,
     smooth_range,
     calculate_trends_with_state, 
-    calc_mmh_worm_loop,
-    calc_mmh_value_loop,
-    calc_mmh_momentum_loop,
+    kalman_loop,
+    
+    # Market Indicators
+    vwap_daily_loop,
+    
+    # Statistical / Legacy Compatibility
     rolling_std_welford,
     rolling_std_welford_parallel,
     rolling_mean_numba,
     rolling_mean_numba_parallel,
     rolling_min_max_numba,
     rolling_min_max_numba_parallel,
+    
+    # Oscillators
     calculate_ppo_core,
     calculate_rsi_core,
+    
+    # MMH Components
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    
+    # Pattern Recognition
     vectorized_wick_check_buy,
-    vectorized_wick_check_sell
+    vectorized_wick_check_sell,
+    
+    # Status
+    is_using_aot
 )
+
 try:
     import orjson
     
@@ -653,96 +674,168 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
-@njit(nogil=True, cache=True)
-def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    for i in range(1, rows):
-        momentum_arr[i] += 0.5 * momentum_arr[i - 1]
-    return momentum_arr
 
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
-    responsiveness: float = 0.9
+    responsiveness: float = 0.9,
+    use_parallel: bool = False
 ) -> np.ndarray:
-    rows = len(close)
-    close = close.astype(np.float64)
-
-    # --- Pine ta.stdev ---
-    sd = rolling_std_welford(close, 50, responsiveness)
-
-    # --- Worm ---
-    worm = calc_mmh_worm_loop(close, sd, rows)
-
-    # --- SMA ---
-    ma = rolling_mean_numba(close, period)
-
-    # --- Raw momentum ---
-    raw = np.full(rows, np.nan, dtype=np.float64)
-    for i in range(rows):
-        if not np.isnan(ma[i]) and worm[i] != 0.0:
-            raw[i] = (worm[i] - ma[i]) / worm[i]
-
-    # --- Normalize ---
-    min_med, max_med = rolling_min_max_numba(raw, period)
-
-    temp = np.full(rows, 0.5, dtype=np.float64)
-    for i in range(rows):
-        if not np.isnan(min_med[i]) and max_med[i] != min_med[i]:
-            temp[i] = (raw[i] - min_med[i]) / (max_med[i] - min_med[i])
-
-    # --- Value ---
-    value = calc_mmh_value_loop(temp, rows)
-
-    # --- Log momentum ---
-    momentum = 0.25 * np.log((1.0 + value) / (1.0 - value))
-
-    # --- Recursive smoothing ---
-    momentum_arr = calc_mmh_momentum_loop(momentum, rows)
-
-    return momentum_arr
-
-def warmup_if_needed() -> None:
-    if aot_bridge.is_using_aot():
-        logger.info("✅ AOT active - no warmup needed")
-        return
-
-    if cfg.SKIP_WARMUP:
-        logger.warning("⚠️ JIT mode + SKIP_WARMUP=true - first run will be slower")
-        return
-
-    logger.info("🔥 AOT not available, warming up JIT compilation...")
-
+    """
+    Pine-accurate MMH calculation.
+    
+    Key fixes:
+    1. Uses SMA-based standard deviation (not Welford)
+    2. Preserves NaN in intermediate calculations
+    3. No early sanitization of raw_momentum
+    4. SMA does not skip NaN values
+    
+    Args:
+        close: Price array
+        period: Lookback period (default 144)
+        responsiveness: SD multiplier (default 0.9)
+        use_parallel: Use parallel versions (default False)
+    
+    Returns:
+        MMH histogram values
+    """
     try:
-        test_data = np.random.random(200).astype(np.float64) * 1000
-        test_data2 = np.random.random(200).astype(np.float64)
-        test_int = 14
+        if close is None or len(close) < period:
+            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
-        _ = ema_loop(test_data, 7.0)
-        _ = ema_loop_alpha(test_data, 0.2)
-        _ = sma_loop(test_data, test_int)
-        _ = sma_loop_parallel(test_data, test_int)
-        _ = calculate_ppo_core(test_data, 7, 16, 5)
-        _ = calculate_rsi_core(test_data, 21)
-        _ = sanitize_array_numba(test_data, 0.0)
-        _ = rolling_mean_numba(test_data, test_int)
-        _ = rolling_mean_numba_parallel(test_data, test_int)
-        _ = rolling_std_welford(test_data, test_int, 0.5)
-        _ = rolling_std_welford_parallel(test_data, test_int, 0.5)
-        _ = rolling_min_max_numba(test_data, test_int)
-        _ = rolling_min_max_numba_parallel(test_data, test_int)
-        _ = kalman_loop(test_data, 10, 0.1, 0.01)
-        _ = rng_filter_loop(test_data, test_data2)
-        _ = smooth_range(test_data, 10, 2)
-        _ = calculate_trends_with_state(test_data, test_data2)
-        _ = vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
-        _ = calc_mmh_worm_loop(test_data, test_data2, len(test_data))
-        _ = calc_mmh_value_loop(test_data2, len(test_data2))
-        _ = calc_mmh_momentum_loop(test_data2, len(test_data2))
-        _ = vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
-        _ = vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+        rows = len(close)
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        close_c = np.ascontiguousarray(close, dtype=np.float64)
+
+        # 1. Calculate Pine-accurate standard deviation
+        if use_parallel and rows >= 250:
+            sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
+        else:
+            sd = rolling_std_welford(close_c, 50, resp_clamped)
+
+        # 2. Calculate worm
+        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
+
+        # 3. Calculate Pine-accurate SMA
+        if use_parallel and rows >= 250:
+            ma = rolling_mean_numba_parallel(close_c, period)
+        else:
+            ma = rolling_mean_numba(close_c, period)
+
+        # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
+        with np.errstate(divide='ignore', invalid='ignore'):
+            raw = (worm_arr - ma) / worm_arr
+        
+        # Pine behavior: if worm == 0 → result is na (not 0)
+        # We keep NaN/Inf here intentionally
+
+        # 5. Calculate rolling min/max (they handle NaN correctly)
+        if use_parallel and rows >= 250:
+            min_med, max_med = rolling_min_max_numba_parallel(raw, period)
+        else:
+            min_med, max_med = rolling_min_max_numba(raw, period)
+
+        # 6. Calculate temp (normalized)
+        denom = max_med - min_med
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp = (raw - min_med) / denom
+        
+        # Handle edge cases for temp
+        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
+        temp = np.where(np.isnan(temp), 0.5, temp)
+        temp = np.where(np.isinf(temp), 0.5, temp)
+        temp = np.clip(temp, 0.0, 1.0)
+
+        # 7. Calculate value
+        value_arr = calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -0.9999, 0.9999)
+
+        # 8. Calculate momentum
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.clip(temp2, 1e-9, 1e9)
+            temp2 = np.where(np.isnan(temp2), 1.0, temp2)
+            temp2 = np.where(np.isinf(temp2), 1e9, temp2)
+
+        momentum = 0.25 * np.log(temp2)
+        momentum = np.where(np.isnan(momentum), 0.0, momentum)
+        momentum = np.where(np.isinf(momentum), 0.0, momentum)
+
+        # 9. Apply recursive momentum formula
+        momentum_arr = momentum.copy()
+        momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
+
+        # 10. Final sanitization (only at the very end)
+        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
+
+        return momentum_arr
 
     except Exception as e:
-        logger.warning(f"Warmup failed (non-fatal): {e}")
+        print(f"MMH calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+
+def warmup_if_needed():
+    """Primes all 26 Numba functions to eliminate first-run latency."""
+    logger.info(f"🔥 Starting Numba warmup (Mode: {'AOT' if is_using_aot() else 'JIT'})...")
+    start_t = time.perf_counter()
+    
+    try:
+        # Create dummy data
+        size = 100
+        d = np.random.random(size).astype(np.float64)
+        d_int = np.arange(size, dtype=np.int64)
+        
+        # 1-2: Sanitization
+        _ = sanitize_array_numba(d, 0.0)
+        _ = sanitize_array_numba_parallel(d, 0.0)
+        
+        # 3-6: Moving Averages
+        _ = rolling_std_pine_accurate(d, 10, 1.0)
+        _ = rolling_std_pine_accurate_parallel(d, 10, 1.0)
+        _ = sma_pine_accurate(d, 10)
+        _ = sma_pine_accurate_parallel(d, 10)
+        
+        # 7-8: EMA
+        _ = ema_loop(d, 0.1)
+        _ = ema_loop_alpha(d, 0.2)
+        
+        # 9-12: Filters & Trend
+        _ = rng_filter_loop(d, d)
+        _ = smooth_range(d, 10, 2)
+        _ = calculate_trends_with_state(d, d, d)
+        _ = kalman_loop(d, 1, 0.1, 0.01)
+        
+        # 13: Market
+        _ = vwap_daily_loop(d, d, d_int)
+        
+        # 14-19: Stats & Compatibility
+        _ = rolling_std_welford(d, 10, 1.0)
+        _ = rolling_std_welford_parallel(d, 10, 1.0)
+        _ = rolling_mean_numba(d, 10)
+        _ = rolling_mean_numba_parallel(d, 10)
+        _ = rolling_min_max_numba(d, 10)
+        _ = rolling_min_max_numba_parallel(d, 10)
+        
+        # 20-21: Oscillators
+        _ = calculate_ppo_core(d, 12, 26, 9)
+        _ = calculate_rsi_core(d, 14)
+        
+        # 22-24: MMH
+        _ = calc_mmh_worm_loop(d, d, 10)
+        _ = calc_mmh_value_loop(d, 10)
+        _ = calc_mmh_momentum_loop(d, 10)
+        
+        # 25-26: Wick Checks
+        _ = vectorized_wick_check_buy(d, d, d, d, 0.5)
+        _ = vectorized_wick_check_sell(d, d, d, d, 0.5)
+        
+        elapsed = time.perf_counter() - start_t
+        logger.info(f"✅ Numba warmup complete in {elapsed:.3f}s")
+        
+    except Exception as e:
+        logger.error(f"⚠️ Warmup encountered an issue: {e}")
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -3925,7 +4018,7 @@ async def run_once() -> bool:
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
-                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
+                "��️ Redis is in degraded mode – alert deduplication disabled!"
             )
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
