@@ -3366,25 +3366,6 @@ async def evaluate_pair_and_alert(
             )
         ]
 
-        if cfg.ENABLE_VWAP:
-            eps = 1e-9
-            vwap_flat = (
-                abs(vwap_curr - close_curr) < eps and
-                abs(vwap_prev - close_prev) < eps
-            )
-    
-            if vwap_flat:
-                logger_pair.info(
-                    f"VWAP flattened for {pair_name} | "
-                    f"close_prev={close_prev:.4f}, close_curr={close_curr:.4f}, "
-                    f"vwap_prev={vwap_prev:.4f}, vwap_curr={vwap_curr:.4f}"
-                )
-                # Remove VWAP alerts from evaluation
-                alert_keys_to_check = [
-                    k for k in alert_keys_to_check 
-                    if not k.startswith("vwap_")
-                ]
-
         # Remove pivot alerts if no valid pivots
         if not piv or not any(piv.values()):
             alert_keys_to_check = [
