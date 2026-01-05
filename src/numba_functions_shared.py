@@ -136,30 +136,43 @@ def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 # FILTERS
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, fastmath=False, cache=True)
 def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """Range filter - constrains movement based on range values"""
+    """
+    Exact PineScript-equivalent range filter:
+    - nz(prev) behaviour
+    - equality bias
+    - no floating drift
+    """
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
-    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
-    
+
+    # Pine: rngfiltx1x1 = x (initial assignment)
+    filt[0] = 0.0 if np.isnan(x[0]) else x[0]
+
     for i in range(1, n):
-        prev_filt = filt[i - 1]
         curr_x = x[i]
         curr_r = r[i]
-        
-        if np.isnan(curr_r) or np.isnan(curr_x):
-            filt[i] = prev_filt
+
+        # Pine nz()
+        prev = filt[i - 1]
+        if np.isnan(prev):
+            prev = 0.0
+
+        if np.isnan(curr_x) or np.isnan(curr_r):
+            filt[i] = prev
             continue
-        
-        if curr_x > prev_filt:
-            lower_bound = curr_x - curr_r
-            filt[i] = prev_filt if lower_bound < prev_filt else lower_bound
+
+        # IMPORTANT: strict Pine logic
+        if curr_x > prev:
+            candidate = curr_x - curr_r
+            filt[i] = prev if candidate < prev else candidate
         else:
-            upper_bound = curr_x + curr_r
-            filt[i] = prev_filt if upper_bound > prev_filt else upper_bound
-    
+            candidate = curr_x + curr_r
+            filt[i] = prev if candidate > prev else candidate
+
     return filt
+
 
 
 @njit(nogil=True, fastmath=True, cache=True)
