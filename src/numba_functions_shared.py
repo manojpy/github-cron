@@ -48,202 +48,54 @@ def sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
+    window_sum = 0.0
+    count = 0
     for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            window = data[i - period + 1:i + 1]
-            if np.any(np.isnan(window)):
-                out[i] = np.nan
-            else:
-                out[i] = np.mean(window)
+        val = data[i]
+        if not np.isnan(val):
+            window_sum += val
+            count += 1
+        if i >= period:
+            old_val = data[i - period]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                count -= 1
+        if i >= period - 1:
+            out[i] = window_sum / count if count > 0 else out[i-1]
     return out
 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    Simple Moving Average (parallelized with prange).
+    Uses sliding window logic for O(n) complexity and NaN robustness.
+    """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
+
+    # Each thread handles its own slice of indices
     for i in prange(n):
         if i < period - 1:
             continue
-        window = data[i - period + 1:i + 1]
-        if np.any(np.isnan(window)):
-            out[i] = np.nan
+
+        window_sum = 0.0
+        count = 0
+        # Compute window sum for this index
+        for j in range(i - period + 1, i + 1):
+            val = data[j]
+            if not np.isnan(val):
+                window_sum += val
+                count += 1
+
+        if count > 0:
+            out[i] = window_sum / count
         else:
-            out[i] = np.mean(window)
+            # Carry forward last valid SMA instead of leaving NaN or forcing 0.0
+            out[i] = out[i - 1] if i > 0 else 0.0
+
     return out
-
-
-# ============================================================================
-# Standard deviation (PineScript parity: ta.stdev)
-# ============================================================================
-
-@njit(nogil=True, fastmath=True, cache=True)
-def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = max(0.00001, min(1.0, responsiveness))
-    ma = sma_loop(close, period)
-    for i in range(n):
-        if i < period - 1 or np.isnan(ma[i]):
-            sd[i] = np.nan
-        else:
-            window = close[i - period + 1:i + 1]
-            if np.any(np.isnan(window)):
-                sd[i] = np.nan
-            else:
-                var = np.mean((window - ma[i]) ** 2)
-                sd[i] = np.sqrt(var) * resp
-    return sd
-
-
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = max(0.00001, min(1.0, responsiveness))
-    ma = sma_loop_parallel(close, period)
-    for i in prange(n):
-        if i < period - 1 or np.isnan(ma[i]):
-            sd[i] = np.nan
-        else:
-            window = close[i - period + 1:i + 1]
-            if np.any(np.isnan(window)):
-                sd[i] = np.nan
-            else:
-                var = np.mean((window - ma[i]) ** 2)
-                sd[i] = np.sqrt(var) * resp
-    return sd
-
-
-# ============================================================================
-# Rolling mean / min / max (NaN parity)
-# ============================================================================
-
-@njit(nogil=True, fastmath=True, cache=True)
-def rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
-    rows = len(close)
-    ma = np.empty(rows, dtype=np.float64)
-    ma[:] = np.nan
-    for i in range(rows):
-        if i < period - 1:
-            continue
-        window = close[i - period + 1:i + 1]
-        if np.any(np.isnan(window)):
-            ma[i] = np.nan
-        else:
-            ma[i] = np.mean(window)
-    return ma
-
-
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
-    rows = len(close)
-    ma = np.empty(rows, dtype=np.float64)
-    ma[:] = np.nan
-    for i in prange(rows):
-        if i < period - 1:
-            continue
-        window = close[i - period + 1:i + 1]
-        if np.any(np.isnan(window)):
-            ma[i] = np.nan
-        else:
-            ma[i] = np.mean(window)
-    return ma
-
-
-@njit(nogil=True, fastmath=True, cache=True)
-def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
-    rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
-    min_arr[:] = np.nan
-    max_arr[:] = np.nan
-    for i in range(rows):
-        if i < period - 1:
-            continue
-        window = arr[i - period + 1:i + 1]
-        valid = window[~np.isnan(window)]
-        if valid.size == 0:
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-        else:
-            min_arr[i] = np.min(valid)
-            max_arr[i] = np.max(valid)
-    return min_arr, max_arr
-
-
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
-    rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
-    min_arr[:] = np.nan
-    max_arr[:] = np.nan
-    for i in prange(rows):
-        if i < period - 1:
-            continue
-        window = arr[i - period + 1:i + 1]
-        valid = window[~np.isnan(window)]
-        if valid.size == 0:
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-        else:
-            min_arr[i] = np.min(valid)
-            max_arr[i] = np.max(valid)
-    return min_arr, max_arr
-
-
-# ============================================================================
-# MMH Worm loop (PineScript parity)
-# ============================================================================
-
-@njit(nogil=True, fastmath=True, cache=True)
-def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    worm_arr = np.empty(rows, dtype=np.float64)
-    worm_arr[0] = close_arr[0]  # PineScript: var worm = source
-    for i in range(1, rows):
-        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-        prev_worm = worm_arr[i - 1]
-        diff = src - prev_worm
-        sd_i = sd_arr[i]
-        if np.isnan(sd_i):
-            delta = diff
-        else:
-            delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
-        worm_arr[i] = prev_worm + delta
-    return worm_arr
-
-# ============================================================================
-# Value recursion (unchanged, PineScript parity)
-# ============================================================================
-
-@njit(nogil=True, fastmath=True, cache=True)
-def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    value_arr = np.zeros(rows, dtype=np.float64)
-    weight = 1.0
-    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = weight * (t0 - 0.5)
-    value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
-    for i in range(1, rows):
-        prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = weight * (t - 0.5 + 0.5 * prev_v)
-        value_arr[i] = max(-0.9999, min(0.9999, v))
-    return value_arr
-
-# ============================================================================
-# Momentum recursion (unchanged, PineScript parity)
-# ============================================================================
-
-@njit(nogil=True, fastmath=True, cache=True)
-def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-    return momentum_arr
 
 
 @njit(nogil=True, fastmath=True, cache=True)
@@ -490,6 +342,226 @@ def vwap_daily_loop(
             vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
 
     return vwap
+
+# ============================================================================
+# STATISTICAL FUNCTIONS
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True)
+def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Rolling standard deviation using Welford's online algorithm"""
+    n = len(close)
+    sd = np.empty(n, dtype=np.float64)
+    resp = max(0.00001, min(1.0, responsiveness))
+    
+    for i in range(n):
+        mean = 0.0
+        m2 = 0.0
+        count = 0
+        start = max(0, i - period + 1)
+        
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                count += 1
+                delta = val - mean
+                mean += delta / count
+                m2 += delta * (val - mean)
+        
+        sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
+    
+    return sd
+
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+    """Rolling standard deviation using Welford's algorithm (parallel)"""
+    n = len(close)
+    sd = np.empty(n, dtype=np.float64)
+    resp = max(0.00001, min(1.0, responsiveness))
+    
+    for i in prange(n):
+        mean = 0.0
+        m2 = 0.0
+        count = 0
+        start = max(0, i - period + 1)
+        
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                count += 1
+                delta = val - mean
+                mean += delta / count
+                m2 += delta * (val - mean)
+        
+        sd[i] = np.sqrt(m2 / count) * resp if count > 0 else 0.0
+    
+    return sd
+
+
+@njit(nogil=True, fastmath=True, cache=True)
+def rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
+    """Rolling mean calculation - optimized with sliding window"""
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+    
+    # ✅ OPTIMIZED: Use sliding window technique (O(n) instead of O(n*period))
+    window_sum = 0.0
+    count = 0
+    
+    for i in range(rows):
+        # Add new value
+        if not np.isnan(close[i]):
+            window_sum += close[i]
+            count += 1
+        
+        # Remove old value if past window
+        if i >= period:
+            old_val = close[i - period]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                count -= 1
+        
+        ma[i] = window_sum / count if count > 0 else np.nan
+    
+    return ma
+
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
+    """Rolling mean calculation (parallel)"""
+    rows = len(close)
+    ma = np.empty(rows, dtype=np.float64)
+    
+    for i in prange(rows):
+        start = max(0, i - period + 1)
+        sum_val = 0.0
+        count = 0
+        
+        for j in range(start, i + 1):
+            val = close[j]
+            if not np.isnan(val):
+                sum_val += val
+                count += 1
+        
+        ma[i] = sum_val / count if count > 0 else np.nan
+    
+    return ma
+
+
+@njit(nogil=True, fastmath=True, cache=True)
+def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
+    """Rolling minimum and maximum values"""
+    # ✅ FIXED: Changed Tuple to tuple (Python 3.9+ native type hint)
+    rows = len(arr)
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+    
+    for i in range(rows):
+        start = max(0, i - period + 1)
+        min_val = np.inf
+        max_val = -np.inf
+        
+        for j in range(start, i + 1):
+            val = arr[j]
+            if not np.isnan(val):
+                if val < min_val:
+                    min_val = val
+                if val > max_val:
+                    max_val = val
+        
+        min_arr[i] = min_val if min_val != np.inf else np.nan
+        max_arr[i] = max_val if max_val != -np.inf else np.nan
+    
+    return min_arr, max_arr
+
+
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
+    """Rolling minimum and maximum values (parallel)"""
+    # ✅ FIXED: Changed Tuple to tuple (Python 3.9+ native type hint)
+    rows = len(arr)
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+    
+    for i in prange(rows):
+        start = max(0, i - period + 1)
+        min_val = np.inf
+        max_val = -np.inf
+        
+        for j in range(start, i + 1):
+            val = arr[j]
+            if not np.isnan(val):
+                if val < min_val:
+                    min_val = val
+                if val > max_val:
+                    max_val = val
+        
+        min_arr[i] = min_val if min_val != np.inf else np.nan
+        max_arr[i] = max_val if max_val != -np.inf else np.nan
+    
+    return min_arr, max_arr
+
+
+
+# ============================================================================
+# MMH (MAGICAL MOMENTUM HISTOGRAM) COMPONENTS
+# ============================================================================
+
+@njit(nogil=True, fastmath=True, cache=True)
+def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
+    """Calculate MMH worm indicator"""
+    worm_arr = np.empty(rows, dtype=np.float64)
+    worm_arr[0] = 0.0 if np.isnan(close_arr[0]) else close_arr[0]
+    
+    for i in range(1, rows):
+        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
+        prev_worm = worm_arr[i - 1]
+        diff = src - prev_worm
+        sd_i = sd_arr[i]
+        
+        if np.isnan(sd_i):
+            delta = diff
+        else:
+            delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
+        
+        worm_arr[i] = prev_worm + delta
+    
+    return worm_arr
+
+
+@njit(nogil=True, fastmath=True, cache=True)
+def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
+    """
+    V7: What if "value = 0.5 * 2" actually means the WEIGHT is 2x?
+    value := 2 * (temp - .5 + .5 * value[1])
+    """
+    value_arr = np.zeros(rows, dtype=np.float64)
+    weight = 0.5 * 2  # = 1.0
+    
+    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
+    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
+    value_arr[0] = max(-0.9999, min(0.9999, value_arr[0]))
+    
+    for i in range(1, rows):
+        prev_v = value_arr[i - 1]
+        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
+        
+        # Weight applied to the full expression
+        v = weight * (t - 0.5 + 0.5 * prev_v)
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+    
+    return value_arr
+
+
+@njit(nogil=True, fastmath=True, cache=True)
+def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
+    """Calculate MMH momentum indicator"""
+    for i in range(1, rows):
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
+    
+    return momentum_arr
 
 # ============================================================================
 # OSCILLATORS
