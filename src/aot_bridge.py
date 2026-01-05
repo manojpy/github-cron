@@ -53,7 +53,7 @@ def _bind_functions():
         'calc_mmh_worm_loop', 'calc_mmh_value_loop', 'calc_mmh_momentum_loop',
         'vectorized_wick_check_buy', 'vectorized_wick_check_sell'
     ]
-    
+
     # Try Loading AOT
     try:
         import macd_aot_compiled

@@ -40,11 +40,7 @@ def compile_module():
     cc = CC(module_name)
     cc.output_dir = str(output_dir)
     
-    # Environment Setup
-    n_jobs = max(1, multiprocessing.cpu_count() - 1)
-    os.environ.update({'NUMBA_OPT': '3', 'NUMBA_NUM_THREADS': str(n_jobs)})
-
-    # Exporting all 26 Functions
+    # Exporting all 26 Functions from numba_functions_shared.py
     # Sanitization
     cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')(sanitize_array_numba)
     cc.export('sanitize_array_numba_parallel', 'f8[:](f8[:], f8)')(sanitize_array_numba_parallel)
@@ -60,9 +56,11 @@ def compile_module():
     cc.export('ema_loop_alpha', 'f8[:](f8[:], f8)')(ema_loop_alpha)
     cc.export('rng_filter_loop', 'f8[:](f8[:], f8[:])')(rng_filter_loop)
     cc.export('smooth_range', 'f8[:](f8[:], i4, i4)')(smooth_range)
-    cc.export('calculate_trends_with_state', 'f8[:](f8[:], f8[:], f8[:])')(calculate_trends_with_state)
-    cc.export('kalman_loop', 'f8[:](f8[:], f8, f8, f8)')(kalman_loop)
-    cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], i8[:])')(vwap_daily_loop)
+    # FIX: Use Tuple((...)) for multiple returns and b1[:] for boolean arrays
+    cc.export('calculate_trends_with_state', 'Tuple((b1[:], b1[:]))(f8[:], f8[:])')(calculate_trends_with_state)
+    cc.export('kalman_loop', 'f8[:](f8[:], i4, f8, f8)')(kalman_loop)
+    # FIX: vwap_daily_loop requires 5 arguments (high, low, close, volume, day_id)
+    cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])')(vwap_daily_loop)
     
     # Statistical & Legacy Names
     cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')(rolling_std_welford)
@@ -70,12 +68,12 @@ def compile_module():
     cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')(rolling_mean_numba)
     cc.export('rolling_mean_numba_parallel', 'f8[:](f8[:], i4)')(rolling_mean_numba_parallel)
     
-    # Min/Max (Returns tuple of 2 arrays)
-    cc.export('rolling_min_max_numba', '(f8[:], f8[:])(f8[:], i4)')(rolling_min_max_numba)
-    cc.export('rolling_min_max_numba_parallel', '(f8[:], f8[:])(f8[:], i4)')(rolling_min_max_numba_parallel)
+    # Min/Max (FIX: Tuple return)
+    cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')(rolling_min_max_numba)
+    cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')(rolling_min_max_numba_parallel)
     
-    # Oscillators
-    cc.export('calculate_ppo_core', 'f8[:](f8[:], i4, i4, i4)')(calculate_ppo_core)
+    # Oscillators (FIX: Tuple return for PPO)
+    cc.export('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)')(calculate_ppo_core)
     cc.export('calculate_rsi_core', 'f8[:](f8[:], i4)')(calculate_rsi_core)
     
     # MMH Components
@@ -83,7 +81,7 @@ def compile_module():
     cc.export('calc_mmh_value_loop', 'f8[:](f8[:], i4)')(calc_mmh_value_loop)
     cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i4)')(calc_mmh_momentum_loop)
     
-    # Wick Checks
+    # Wick Checks (b1[:] = boolean array)
     cc.export('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')(vectorized_wick_check_buy)
     cc.export('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')(vectorized_wick_check_sell)
 

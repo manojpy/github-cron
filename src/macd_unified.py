@@ -778,56 +778,68 @@ def calculate_magical_momentum_hist(
 
 def warmup_if_needed():
     """Primes all 26 Numba functions to eliminate first-run latency."""
-    logger.info(f"🔥 Starting Numba warmup (Mode: {'AOT' if is_using_aot() else 'JIT'})...")
+    # Check if we are using the pre-compiled AOT module
+    if is_using_aot():
+        logger.info("🚀 AOT module detected - skipping JIT warmup")
+        return
+
+    logger.info("🔥 Starting Numba JIT warmup (26 functions)...")
     start_t = time.perf_counter()
     
     try:
-        # Create dummy data
+        # Create dummy data for priming
         size = 100
         d = np.random.random(size).astype(np.float64)
-        d_int = np.arange(size, dtype=np.int64)
+        d2 = np.random.random(size).astype(np.float64)
+        d_int = 10
+        d_indices = np.arange(size, dtype=np.int64)
         
         # 1-2: Sanitization
         _ = sanitize_array_numba(d, 0.0)
         _ = sanitize_array_numba_parallel(d, 0.0)
         
-        # 3-6: Moving Averages
-        _ = rolling_std_pine_accurate(d, 10, 1.0)
-        _ = rolling_std_pine_accurate_parallel(d, 10, 1.0)
-        _ = sma_pine_accurate(d, 10)
-        _ = sma_pine_accurate_parallel(d, 10)
+        # 3-6: Pine-Accurate Moving Averages
+        _ = sma_pine_accurate(d, d_int)
+        _ = sma_pine_accurate_parallel(d, d_int)
+        _ = rolling_std_pine_accurate(d, d_int, 1.0)
+        _ = rolling_std_pine_accurate_parallel(d, d_int, 1.0)
         
         # 7-8: EMA
         _ = ema_loop(d, 0.1)
         _ = ema_loop_alpha(d, 0.2)
         
         # 9-12: Filters & Trend
-        _ = rng_filter_loop(d, d)
-        _ = smooth_range(d, 10, 2)
-        _ = calculate_trends_with_state(d, d, d)
+        _ = rng_filter_loop(d, d2)
+        _ = smooth_range(d, d_int, 2)
+        # returns Tuple((b1[:], b1[:]))
+        _up, _dn = calculate_trends_with_state(d, d2) 
         _ = kalman_loop(d, 1, 0.1, 0.01)
         
-        # 13: Market
-        _ = vwap_daily_loop(d, d, d_int)
+        # 13: Market Indicators
+        # Signature: high, low, close, volume, day_id (5 arguments)
+        _ = vwap_daily_loop(d, d, d, d, d_indices)
         
-        # 14-19: Stats & Compatibility
-        _ = rolling_std_welford(d, 10, 1.0)
-        _ = rolling_std_welford_parallel(d, 10, 1.0)
-        _ = rolling_mean_numba(d, 10)
-        _ = rolling_mean_numba_parallel(d, 10)
-        _ = rolling_min_max_numba(d, 10)
-        _ = rolling_min_max_numba_parallel(d, 10)
+        # 14-19: Statistical & Compatibility Aliases
+        _ = rolling_std_welford(d, d_int, 1.0)
+        _ = rolling_std_welford_parallel(d, d_int, 1.0)
+        _ = rolling_mean_numba(d, d_int)
+        _ = rolling_mean_numba_parallel(d, d_int)
+        # returns Tuple((f8[:], f8[:]))
+        _min, _max = rolling_min_max_numba(d, d_int)
+        _min_p, _max_p = rolling_min_max_numba_parallel(d, d_int)
         
         # 20-21: Oscillators
-        _ = calculate_ppo_core(d, 12, 26, 9)
+        # returns Tuple((f8[:], f8[:]))
+        _ppo, _sig = calculate_ppo_core(d, 12, 26, 9)
         _ = calculate_rsi_core(d, 14)
         
-        # 22-24: MMH
-        _ = calc_mmh_worm_loop(d, d, 10)
-        _ = calc_mmh_value_loop(d, 10)
-        _ = calc_mmh_momentum_loop(d, 10)
+        # 22-24: MMH Components
+        _ = calc_mmh_worm_loop(d, d2, size)
+        _ = calc_mmh_value_loop(d, size)
+        _ = calc_mmh_momentum_loop(d, size)
         
-        # 25-26: Wick Checks
+        # 25-26: Pattern Recognition (Wick Checks)
+        # Signature: open, high, low, close, ratio
         _ = vectorized_wick_check_buy(d, d, d, d, 0.5)
         _ = vectorized_wick_check_sell(d, d, d, d, 0.5)
         
@@ -835,7 +847,7 @@ def warmup_if_needed():
         logger.info(f"✅ Numba warmup complete in {elapsed:.3f}s")
         
     except Exception as e:
-        logger.error(f"⚠️ Warmup encountered an issue: {e}")
+        logger.error(f"⚠️ Warmup encountered an issue: {e}", exc_info=True)
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)

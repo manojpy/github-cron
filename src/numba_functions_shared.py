@@ -13,6 +13,7 @@ between AOT and JIT execution paths.
 
 import numpy as np
 from numba import njit, prange
+from typing import Tuple
 
 
 # ============================================================================
@@ -311,7 +312,7 @@ def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
 
 
 @njit(nogil=True, fastmath=True, cache=True)
-def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple:
+def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Rolling min/max that ignores NaN but preserves them in output.
     Pine behavior: ta.lowest() / ta.highest() ignore na values.
@@ -345,7 +346,7 @@ def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple:
 
 
 @njit(nogil=True, fastmath=True, cache=True, parallel=True)
-def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple:
+def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     """Rolling min/max (parallel version)"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
@@ -484,7 +485,7 @@ def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
     return smoothrng * float(m)
 
 @njit(nogil=True, fastmath=False, cache=True)
-def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> tuple:
+def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Calculate trends with state persistence to match Pine Script visual behavior.
     When filtx1 == filtx12, maintains the previous trend state.
@@ -624,8 +625,7 @@ def vwap_daily_loop(
 # ============================================================================
 
 @njit(nogil=True, fastmath=True, cache=True)
-def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> tuple[np.ndarray, np.ndarray]:
-    """
+def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     Calculate Percentage Price Oscillator (PPO) and its signal line.
     Robust against NaN values in the input series.
     """
