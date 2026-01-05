@@ -3227,17 +3227,35 @@ async def evaluate_pair_and_alert(
         ppo_sig_prev = ppo_signal[i15 - 1]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1]
-        if cfg.ENABLE_VWAP:
-            if len(vwap) <= i15:
-                logger_pair.warning(f"VWAP array too short ({len(vwap)} ≤ {i15}), using close price")
-                vwap_curr = close_curr
-                vwap_prev = close_prev
-            else:
-                vwap_curr = vwap[i15]
-                vwap_prev = vwap[i15 - 1]
+        vwap_curr = None
+        vwap_prev = None
+        vwap_unavailable = False
+        vwap_disabled = False
+
+        if not cfg.ENABLE_VWAP:
+            vwap_disabled = True
+            # VWAP intentionally disabled, no alerts expected
+
+        elif vwap is None:
+            vwap_unavailable = True
+            logger_pair.warning("VWAP enabled but vwap array is None")
+
+        elif len(vwap) <= i15:
+            vwap_unavailable = True
+            logger_pair.warning(
+                f"VWAP enabled but insufficient data "
+                f"(len(vwap)={len(vwap)} ≤ i15={i15}) — VWAP alerts skipped"
+            )
+
         else:
-            vwap_curr = close_curr
-            vwap_prev = close_prev
+            vwap_curr = vwap[i15]
+            vwap_prev = vwap[i15 - 1]
+
+        ctx["vwap_curr"] = vwap_curr
+        ctx["vwap_prev"] = vwap_prev
+        ctx["vwap_unavailable"] = vwap_unavailable
+        ctx["vwap_disabled"] = vwap_disabled
+
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
       
