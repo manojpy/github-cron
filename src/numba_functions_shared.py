@@ -29,7 +29,7 @@ def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
     """Replace NaN and Inf with default value (parallel)"""
     out = np.empty_like(arr)
@@ -60,7 +60,7 @@ def sma_loop(data: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def sma_loop_parallel(data: np.ndarray, period: int) -> np.ndarray:
     n = len(data)
     out = np.empty(n, dtype=np.float64)
@@ -99,7 +99,7 @@ def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -
     return sd
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
@@ -136,7 +136,7 @@ def rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
             ma[i] = np.mean(window)
     return ma
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     rows = len(close)
     ma = np.empty(rows, dtype=np.float64)
@@ -172,7 +172,7 @@ def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.
             max_arr[i] = np.max(valid)
     return min_arr, max_arr
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple[np.ndarray, np.ndarray]:
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
