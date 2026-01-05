@@ -19,7 +19,7 @@ from numba import njit, prange
 # SANITIZATION FUNCTIONS
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     """Replace NaN and Inf with default value"""
     out = np.empty_like(arr)
@@ -28,7 +28,7 @@ def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, cache=True)
 def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
     """Replace NaN and Inf with default value (parallel)"""
     out = np.empty_like(arr)
@@ -42,7 +42,7 @@ def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray
 # MOVING AVERAGES
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """
     Pine-accurate standard deviation using SMA-based variance.
@@ -93,7 +93,7 @@ def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -
     return sd
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, cache=True)
 def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """Pine-accurate standard deviation (parallel version)"""
     n = len(close)
@@ -137,7 +137,7 @@ def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness:
     return sd
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def rolling_mean_numba(data: np.ndarray, period: int) -> np.ndarray:
     """
     Pine-accurate SMA:
@@ -172,7 +172,7 @@ def rolling_mean_numba(data: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, cache=True)
 def rolling_mean_numba_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """Pine-accurate SMA (parallel version)"""
     n = len(data)
@@ -205,7 +205,7 @@ def rolling_mean_numba_parallel(data: np.ndarray, period: int) -> np.ndarray:
 # MMH COMPONENT FUNCTIONS - Keep existing names
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     """
     Calculate MMH worm indicator.
@@ -232,7 +232,7 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
     return worm_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     """
     Calculate MMH value indicator.
@@ -255,7 +255,7 @@ def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
     return value_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     """
     Calculate MMH momentum accumulation.
@@ -268,7 +268,7 @@ def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     return momentum_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple:
     """
     Rolling min/max that ignores NaN but preserves them in output.
@@ -302,7 +302,7 @@ def rolling_min_max_numba(arr: np.ndarray, period: int) -> tuple:
     return min_arr, max_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, cache=True)
 def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple:
     """Rolling min/max (parallel version)"""
     rows = len(arr)
@@ -332,7 +332,7 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> tuple:
     
     return min_arr, max_arr
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     """
     Exponential Moving Average
@@ -352,7 +352,7 @@ def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
     """Exponential Moving Average with explicit alpha parameter"""
     n = len(data)
@@ -370,7 +370,7 @@ def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 # FILTERS
 # ============================================================================
 
-@njit(nogil=True, fastmath=False, cache=True)
+@njit(nogil=True, cache=True)
 def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     """
     Exact PineScript-equivalent range filter:
@@ -409,7 +409,7 @@ def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
 
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
     """Calculate smoothed range with double EMA"""
     n = len(close)
@@ -483,7 +483,7 @@ def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> tu
     
     return upw, dnw
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     """Kalman filter implementation"""
     n = len(src)
@@ -517,7 +517,7 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
 # MARKET INDICATORS
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def vwap_daily_loop(
     high: np.ndarray,
     low: np.ndarray,
@@ -581,7 +581,7 @@ def vwap_daily_loop(
 # OSCILLATORS
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Calculate Percentage Price Oscillator (PPO) and its signal line.
@@ -630,7 +630,7 @@ def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> 
     return ppo, ppo_sig
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
     n = len(close)
     rsi = np.zeros(n, dtype=np.float64)
@@ -699,7 +699,7 @@ def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
 # CANDLE PATTERN RECOGNITION
 # ============================================================================
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def vectorized_wick_check_buy(
     open_arr: np.ndarray, 
     high_arr: np.ndarray, 
@@ -731,7 +731,7 @@ def vectorized_wick_check_buy(
     return result
 
 
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, cache=True)
 def vectorized_wick_check_sell(
     open_arr: np.ndarray, 
     high_arr: np.ndarray, 
