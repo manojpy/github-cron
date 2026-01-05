@@ -3251,10 +3251,10 @@ async def evaluate_pair_and_alert(
             vwap_curr = vwap[i15]
             vwap_prev = vwap[i15 - 1]
 
-        ctx["vwap_curr"] = vwap_curr
-        ctx["vwap_prev"] = vwap_prev
-        ctx["vwap_unavailable"] = vwap_unavailable
-        ctx["vwap_disabled"] = vwap_disabled
+        context["vwap_curr"] = vwap_curr
+        context["vwap_prev"] = vwap_prev
+        context["vwap_unavailable"] = vwap_unavailable
+        context["vwap_disabled"] = vwap_disabled
 
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
