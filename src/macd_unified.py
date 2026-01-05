@@ -653,54 +653,68 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
-
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9
 ) -> np.ndarray:
+    """
+    Pine-accurate Magical Momentum Histogram
+    Uses shared helpers and constants.
+    Compatible with AOT + JIT bridge.
+    """
+
     rows = len(close)
-    resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-    close_c = np.ascontiguousarray(close)
+    if rows == 0:
+        return np.zeros(0, dtype=np.float64)
 
-    # PineScript stdev
-    sd = rolling_std_welford(close_c, 50, resp_clamped)
+    close = close.astype(np.float64, copy=False)
 
-    # Worm
-    worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
+    sd = rolling_std_welford(close, 50, responsiveness)
 
-    # SMA
-    ma = rolling_mean_numba(close_c, period)
+    worm = calc_mmh_worm_loop(close, sd, rows)
 
-    # Raw momentum (no early sanitize)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        raw = (worm_arr - ma) / worm_arr
+    ma = rolling_mean_numba(close, period)
 
-    # Min/max
+    raw = np.full(rows, np.nan, dtype=np.float64)
+    for i in range(rows):
+        if (
+            not np.isnan(ma[i])
+            and abs(worm[i]) > ZERO_DIVISION_GUARD
+        ):
+            raw[i] = (worm[i] - ma[i]) / worm[i]
+
+    # 
     min_med, max_med = rolling_min_max_numba(raw, period)
 
-    # Temp normalization
-    denom = max_med - min_med
-    with np.errstate(divide='ignore', invalid='ignore'):
-        temp = (raw - min_med) / denom
-    temp[np.isnan(temp)] = 0.5
+    temp = np.full(rows, 0.5, dtype=np.float64)
 
-    # Value recursion
-    value_arr = calc_mmh_value_loop(temp, rows)
+    for i in range(rows):
+        denom = max_med[i] - min_med[i]
+        if (
+            not np.isnan(min_med[i])
+            and abs(denom) > ZERO_DIVISION_GUARD
+        ):
+            temp[i] = (raw[i] - min_med[i]) / denom
 
-    # Momentum transform
-    with np.errstate(divide='ignore', invalid='ignore'):
-        temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-    temp2[np.isnan(temp2)] = 1.0
-    momentum = 0.25 * np.log(temp2)
+    value = calc_mmh_value_loop(temp, rows)
+    value = np.clip(value, -MMH_VALUE_CLIP, MMH_VALUE_CLIP)
 
-    # Momentum recursion
-    momentum_arr = calc_mmh_momentum_loop(momentum.copy(), rows)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        temp2 = (1.0 + value) / (1.0 - value)
+        temp2 = np.clip(
+            temp2,
+            1.0 / INFINITY_CLAMP,
+            INFINITY_CLAMP
+        )
+        momentum = 0.25 * np.log(temp2)
 
-    # Final sanitize
-    momentum_arr[np.isnan(momentum_arr)] = 0.0
+    momentum = calc_mmh_momentum_loop(momentum, rows)
+
+    momentum = sanitize_array_numba(momentum, 0.0)
+
     return momentum_arr
-        
+
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot():
         logger.info("✅ AOT active - no warmup needed")
