@@ -713,7 +713,7 @@ def calculate_magical_momentum_hist(
         print(f"temp sample: {temp[:10]}")
 
         # Calculate value using V7 formula
-        value_arr = calc_mmh_value_loop_v7(temp, rows)
+        value_arr = calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -Constants.MMH_VALUE_CLIP, Constants.MMH_VALUE_CLIP)
 
         print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
