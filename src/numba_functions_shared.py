@@ -28,8 +28,7 @@ def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-
-@njit(nogil=True, fastmath=True, cache=True)
+@njit(nogil=True, fastmath=True, cache=True, parallel=True)
 def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
     """Replace NaN and Inf with default value (parallel)"""
     out = np.empty_like(arr)
