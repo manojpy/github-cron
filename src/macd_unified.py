@@ -653,65 +653,51 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
+@njit(nogil=True, cache=True)
+def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
+    for i in range(1, rows):
+        momentum_arr[i] += 0.5 * momentum_arr[i - 1]
+    return momentum_arr
+
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9
 ) -> np.ndarray:
-    """
-    Pine-accurate Magical Momentum Histogram
-    Uses shared helpers and constants.
-    Compatible with AOT + JIT bridge.
-    """
-
     rows = len(close)
-    if rows == 0:
-        return np.zeros(0, dtype=np.float64)
+    close = close.astype(np.float64)
 
-    close = close.astype(np.float64, copy=False)
-
+    # --- Pine ta.stdev ---
     sd = rolling_std_welford(close, 50, responsiveness)
 
+    # --- Worm ---
     worm = calc_mmh_worm_loop(close, sd, rows)
 
+    # --- SMA ---
     ma = rolling_mean_numba(close, period)
 
+    # --- Raw momentum ---
     raw = np.full(rows, np.nan, dtype=np.float64)
     for i in range(rows):
-        if (
-            not np.isnan(ma[i])
-            and abs(worm[i]) > ZERO_DIVISION_GUARD
-        ):
+        if not np.isnan(ma[i]) and worm[i] != 0.0:
             raw[i] = (worm[i] - ma[i]) / worm[i]
 
-    # 
+    # --- Normalize ---
     min_med, max_med = rolling_min_max_numba(raw, period)
 
     temp = np.full(rows, 0.5, dtype=np.float64)
-
     for i in range(rows):
-        denom = max_med[i] - min_med[i]
-        if (
-            not np.isnan(min_med[i])
-            and abs(denom) > ZERO_DIVISION_GUARD
-        ):
-            temp[i] = (raw[i] - min_med[i]) / denom
+        if not np.isnan(min_med[i]) and max_med[i] != min_med[i]:
+            temp[i] = (raw[i] - min_med[i]) / (max_med[i] - min_med[i])
 
+    # --- Value ---
     value = calc_mmh_value_loop(temp, rows)
-    value = np.clip(value, -MMH_VALUE_CLIP, MMH_VALUE_CLIP)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        temp2 = (1.0 + value) / (1.0 - value)
-        temp2 = np.clip(
-            temp2,
-            1.0 / INFINITY_CLAMP,
-            INFINITY_CLAMP
-        )
-        momentum = 0.25 * np.log(temp2)
+    # --- Log momentum ---
+    momentum = 0.25 * np.log((1.0 + value) / (1.0 - value))
 
+    # --- Recursive smoothing ---
     momentum = calc_mmh_momentum_loop(momentum, rows)
-
-    momentum = sanitize_array_numba(momentum, 0.0)
 
     return momentum_arr
 
