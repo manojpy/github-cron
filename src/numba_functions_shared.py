@@ -30,7 +30,7 @@ def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
     """Replace NaN and Inf with default value (parallel)"""
     out = np.empty_like(arr)
@@ -95,7 +95,7 @@ def rolling_std_pine_accurate(close: np.ndarray, period: int, responsiveness: fl
     return sd
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_std_pine_accurate_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """Pine-accurate standard deviation (parallel version)"""
     n = len(close)
@@ -174,7 +174,7 @@ def sma_pine_accurate(data: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def sma_pine_accurate_parallel(data: np.ndarray, period: int) -> np.ndarray:
     """Pine-accurate SMA (parallel version)"""
     n = len(data)
@@ -217,7 +217,7 @@ def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -
     return rolling_std_pine_accurate(close, period, responsiveness)
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """
     UPDATED: Now calls Pine-accurate implementation (parallel).
@@ -235,7 +235,7 @@ def rolling_mean_numba(close: np.ndarray, period: int) -> np.ndarray:
     return sma_pine_accurate(close, period)
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_mean_numba_parallel(close: np.ndarray, period: int) -> np.ndarray:
     """
     UPDATED: Now uses Pine-accurate SMA (parallel, no NaN skipping).
@@ -345,7 +345,7 @@ def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.
     return min_arr, max_arr
 
 
-@njit(nogil=True, fastmath=True, cache=True, parallel=True)
+@njit(nogil=True, fastmath=True, cache=True)
 def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     """Rolling min/max (parallel version)"""
     rows = len(arr)
