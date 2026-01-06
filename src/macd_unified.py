@@ -661,7 +661,24 @@ def calculate_magical_momentum_hist(
     responsiveness: float = 0.9,
     use_parallel: bool = False
 ) -> np.ndarray:
+    """
+    Pine-accurate MMH calculation.
     
+    Key fixes:
+    1. Uses SMA-based standard deviation (not Welford)
+    2. Preserves NaN in intermediate calculations
+    3. No early sanitization of raw_momentum
+    4. SMA does not skip NaN values
+    
+    Args:
+        close: Price array
+        period: Lookback period (default 144)
+        responsiveness: SD multiplier (default 0.9)
+        use_parallel: Use parallel versions (default False)
+    
+    Returns:
+        MMH histogram values
+    """
     try:
         if close is None or len(close) < period:
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
@@ -688,13 +705,7 @@ def calculate_magical_momentum_hist(
         # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
-        raw = np.where(np.abs(worm_arr) < 1e-10, np.nan, raw)  # Explicit worm=0 → NaN
-
-        print(f"raw range: [{raw.min():.4f}, {raw.max():.4f}]")
-        print(f"raw sample: {raw[-10:]}")  # Last 10
-        print(f"worm[-5:]: {worm_arr[-5:]}")
-        print(f"ma[-5:]: {ma[-5:]}")
-
+        
         # Pine behavior: if worm == 0 → result is na (not 0)
         # We keep NaN/Inf here intentionally
 
@@ -703,10 +714,6 @@ def calculate_magical_momentum_hist(
             min_med, max_med = rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
-
-        print(f"min_med[-5:]: {min_med[-5:]}")
-        print(f"max_med[-5:]: {max_med[-5:]}")
-        print(f"denom[-5:]: {denom[-5:]}")  # Should NOT be zero
 
         # 6. Calculate temp (normalized)
         denom = max_med - min_med

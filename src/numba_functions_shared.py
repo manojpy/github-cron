@@ -198,53 +198,70 @@ def rolling_mean_numba_parallel(data, period):
     return out
 
 
-@njit("f8[:](f8[:],i8)", nogil=True, cache=True)
-def rolling_min_max_numba(arr, period):  # period as i8 not i4
+@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
+def rolling_min_max_numba(arr, period):
+    """
+    Rolling min/max that ignores NaN but preserves them in output.
+    Pine behavior: ta.lowest() / ta.highest() ignore na values.
+    """
     rows = len(arr)
-    minarr = np.full(rows, np.nan, dtype=np.float64)
-    maxarr = np.full(rows, np.nan, dtype=np.float64)
-    
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+
     for i in range(rows):
         if i < period - 1:
+            min_arr[i] = np.nan
+            max_arr[i] = np.nan
             continue
-        minval = 1e30  # np.inf → float literal for AOT
-        maxval = -1e30
-        for j in range(max(0, i - period + 1), i + 1):
+
+        start = i - period + 1
+        min_val = np.inf
+        max_val = -np.inf
+
+        for j in range(start, i + 1):
             val = arr[j]
             if not np.isnan(val):
-                if val < minval:
-                    minval = val
-                if val > maxval:
-                    maxval = val
-        if minval < 1e29:  # Valid found
-            minarr[i] = minval
-            maxarr[i] = maxval
-    
-    return minarr, maxarr
+                if val < min_val:
+                    min_val = val
+                if val > max_val:
+                    max_val = val
 
-@njit("f8[:](f8[:],i8)", nogil=True, parallel=True, cache=True)  # ← Your calc_mmh style
-def rolling_min_max_numba_parallel(arr, period):  # period as i8 not i4
+        min_arr[i] = min_val if min_val != np.inf else np.nan
+        max_arr[i] = max_val if max_val != -np.inf else np.nan
+
+    return min_arr, max_arr
+
+
+@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, parallel=True, cache=True)
+def rolling_min_max_numba_parallel(arr, period):
+    """Rolling min/max (parallel version)"""
     rows = len(arr)
-    minarr = np.full(rows, np.nan, dtype=np.float64)
-    maxarr = np.full(rows, np.nan, dtype=np.float64)
-    
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
+
     for i in prange(rows):
         if i < period - 1:
+            min_arr[i] = np.nan
+            max_arr[i] = np.nan
             continue
-        minval = 1e30  # np.inf → float literal for AOT
-        maxval = -1e30
-        for j in range(max(0, i - period + 1), i + 1):
+
+        start = i - period + 1
+        min_val = np.inf
+        max_val = -np.inf
+
+        for j in range(start, i + 1):
             val = arr[j]
             if not np.isnan(val):
-                if val < minval:
-                    minval = val
-                if val > maxval:
-                    maxval = val
-        if minval < 1e29:  # Valid found
-            minarr[i] = minval
-            maxarr[i] = maxval
-    
-    return minarr, maxarr
+                if val < min_val:
+                    min_val = val
+                if val > max_val:
+                    max_val = val
+
+        min_arr[i] = min_val if min_val != np.inf else np.nan
+        max_arr[i] = max_val if max_val != -np.inf else np.nan
+
+    return min_arr, max_arr
+
 
 # ============================================================================
 # MOVING AVERAGES
@@ -619,15 +636,16 @@ def calc_mmh_value_loop(temp_arr, rows):
     Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
     value_arr = np.zeros(rows, dtype=np.float64)
-    
+    weight = 1.0
+
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = 1.0 * (t0 - 0.5 + 0.5 * 0.0)
+    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
     value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
 
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = 1.0 * (t - 0.5 + 0.5 * prev_v)
+        v = weight * (t - 0.5 + 0.5 * prev_v)
         value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
 
     return value_arr
@@ -639,14 +657,12 @@ def calc_mmh_momentum_loop(momentum_arr, rows):
     Calculate MMH momentum accumulation.
     Pine: momentum := momentum + 0.5 * nz(momentum[1])
     """
-    momentum_out = np.empty_like(momentum_arr)
-    momentum_out[0] = momentum_arr[0]
-    
     for i in range(1, rows):
-        prev = momentum_out[i - 1] if not np.isnan(momentum_out[i - 1]) else 0.0
-        momentum_out[i] = momentum_arr[i] + 0.5 * prev
+        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
+        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
 
-    return momentum_out
+    return momentum_arr
+
 
 # ============================================================================
 # CANDLE PATTERN RECOGNITION
