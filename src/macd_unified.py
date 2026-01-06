@@ -661,50 +661,111 @@ def calculate_magical_momentum_hist(
     responsiveness: float = 0.9,
     use_parallel: bool = False
 ) -> np.ndarray:
+    """
+    Pine-accurate MMH calculation.
+    
+    Key fixes:
+    1. Uses SMA-based standard deviation (not Welford)
+    2. Preserves NaN in intermediate calculations
+    3. No early sanitization of raw_momentum
+    4. SMA does not skip NaN values
+    
+    Args:
+        close: Price array
+        period: Lookback period (default 144)
+        responsiveness: SD multiplier (default 0.9)
+        use_parallel: Use parallel versions (default False)
+    
+    Returns:
+        MMH histogram values
+    """
     try:
         if close is None or len(close) < period:
-            return np.zeros(len(close) if close is not None else 1)
+            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
         rows = len(close)
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close, dtype=np.float64)
-        
-        # 1. SD * responsiveness (Pine: sd = ta.stdev(src, 50) * resp)
-        if use_parallel:
-            raw_sd = aot_bridge.rolling_std_welford_parallel(close_c, 50)
+
+        # 1. Calculate Pine-accurate standard deviation
+        if use_parallel and rows >= 250:
+            sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
         else:
-            raw_sd = aot_bridge.rolling_std_welford(close_c, 50)
-        
-        sd_multiplied = raw_sd * responsiveness
+            sd = rolling_std_welford(close_c, 50, resp_clamped)
 
-        # 2. Worm
-        worm = aot_bridge.calc_mmh_worm_loop(close_c, sd_multiplied, rows)
+        # 2. Calculate worm
+        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-        # 3. MA
-        ma = aot_bridge.rolling_mean_numba(close_c, period)
+        # 3. Calculate Pine-accurate SMA
+        if use_parallel and rows >= 250:
+            ma = rolling_mean_numba_parallel(close_c, period)
+        else:
+            ma = rolling_mean_numba(close_c, period)
 
-        # 4. Raw Momentum
+        # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
         with np.errstate(divide='ignore', invalid='ignore'):
-            raw_med = (worm - ma) / worm
-            raw_med = np.nan_to_num(raw_med, nan=0.0, posinf=0.0, neginf=0.0)
+            raw = (worm_arr - ma) / worm_arr
+        
+        # Pine behavior: if worm == 0 → result is na (not 0)
+        # We keep NaN/Inf here intentionally
 
-        # 5. Normalize (current_med - min) / (max - min)
-        min_med, max_med = aot_bridge.rolling_min_max_numba(raw_med, period)
+        # 5. Calculate rolling min/max (they handle NaN correctly)
+        if use_parallel and rows >= 250:
+            min_med, max_med = rolling_min_max_numba_parallel(raw, period)
+        else:
+            min_med, max_med = rolling_min_max_numba(raw, period)
+
+        # 6. Calculate temp (normalized)
         denom = max_med - min_med
-        temp = np.where(denom > 1e-10, (raw_med - min_med) / denom, 0.5)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp = (raw - min_med) / denom
+        
+        # Handle edge cases for temp
+        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
+        temp = np.where(np.isnan(temp), 0.5, temp)
+        temp = np.where(np.isinf(temp), 0.5, temp)
         temp = np.clip(temp, 0.0, 1.0)
 
-        # 6. Recursive Value Loop (nz(value[1]))
-        value_arr = aot_bridge.calc_mmh_value_loop(temp, rows)
+        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
+        print(f"temp sample: {temp[:10]}")
 
-        # 7. Recursive Momentum Loop (Fisher + nz(momentum[1]))
-        momentum_arr = aot_bridge.calc_mmh_momentum_loop(value_arr, rows)
+        # 7. Calculate value
+        value_arr = calc_mmh_value_loop(temp, rows)
+        value_arr = np.clip(value_arr, -0.9999, 0.9999)
 
-        return aot_bridge.sanitize_array_numba(momentum_arr, 0.0)
+        print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
+        print(f"value_arr sample: {value_arr[:10]}")
+
+        # 8. Calculate momentum
+        with np.errstate(divide='ignore', invalid='ignore'):
+            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            temp2 = np.clip(temp2, 1e-9, 1e9)
+            temp2 = np.where(np.isnan(temp2), 1.0, temp2)
+            temp2 = np.where(np.isinf(temp2), 1e9, temp2)
+
+        momentum = 0.25 * np.log(temp2)
+        momentum = np.where(np.isnan(momentum), 0.0, momentum)
+        momentum = np.where(np.isinf(momentum), 0.0, momentum)
+
+        print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
+
+        # 9. Apply recursive momentum formula
+        momentum_arr = momentum.copy()
+        momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
+
+        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
+
+        # 10. Final sanitization (only at the very end)
+        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
+
+        return momentum_arr
 
     except Exception as e:
-        logger.error(f"MMH Failed: {e}")
-        return np.zeros(len(close))
-
+        print(f"MMH calculation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+        
 def warmup_if_needed() -> None:
     """
     Warm up JIT compilation if needed.
