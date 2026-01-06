@@ -715,8 +715,13 @@ def calculate_magical_momentum_hist(
 
         # 8. Calculate momentum
         with np.errstate(divide='ignore', invalid='ignore'):
-            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
+            eps = 1e-12  # Pine-style numerical guard
+            value_safe = np.clip(value_arr, -1.0 + eps, 1.0 - eps)
+
+            temp2 = (1.0 + value_safe) / (1.0 - value_safe)
             momentum = 0.25 * np.log(temp2)
+            momentum[0] = 0.0
+
 
         print(f"momentum range: [{np.nanmin(momentum):.4f}, {np.nanmax(momentum):.4f}]")
  
