@@ -643,7 +643,10 @@ def calc_mmh_value_loop(temp_arr, rows):
     for i in range(1, rows):
         prev_v = 0.0 if np.isnan(value_arr[i - 1]) else value_arr[i - 1]
 
-        t = temp_arr[i]  # allow NaN to propagate
+        t = temp_arr[i]
+        if np.isnan(t):
+            t = 0.5  # Pine implicit neutral value
+
         value_arr[i] = value_arr[i - 1] * (t - 0.5 + 0.5 * prev_v)
 
         # Pine clamp
