@@ -60,6 +60,7 @@ from aot_bridge import (
     vectorized_wick_check_buy,
     vectorized_wick_check_sell
 )
+
 try:
     import orjson
     
@@ -754,7 +755,11 @@ def calculate_magical_momentum_hist(
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
         
 def warmup_if_needed() -> None:
-    if aot_bridge.is_using_aot():
+    """
+    Warm up JIT compilation if needed.
+    Skips warmup if AOT is active or SKIP_WARMUP is enabled.
+    """
+    if not aot_bridge.requires_warmup():
         logger.info("✅ AOT active - no warmup needed")
         return
 
@@ -769,27 +774,30 @@ def warmup_if_needed() -> None:
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
 
-        _ = ema_loop(test_data, 7.0)
-        _ = ema_loop_alpha(test_data, 0.2)
-        _ = calculate_ppo_core(test_data, 7, 16, 5)
-        _ = calculate_rsi_core(test_data, 21)
-        _ = sanitize_array_numba(test_data, 0.0)
-        _ = rolling_mean_numba(test_data, test_int)
-        _ = rolling_mean_numba_parallel(test_data, test_int)
-        _ = rolling_std_welford(test_data, test_int, 0.5)
-        _ = rolling_std_welford_parallel(test_data, test_int, 0.5)
-        _ = rolling_min_max_numba(test_data, test_int)
-        _ = rolling_min_max_numba_parallel(test_data, test_int)
-        _ = kalman_loop(test_data, 10, 0.1, 0.01)
-        _ = rng_filter_loop(test_data, test_data2)
-        _ = smooth_range(test_data, 10, 2)
-        _ = calculate_trends_with_state(test_data, test_data2)
-        _ = vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
-        _ = calc_mmh_worm_loop(test_data, test_data2, len(test_data))
-        _ = calc_mmh_value_loop(test_data2, len(test_data2))
-        _ = calc_mmh_momentum_loop(test_data2, len(test_data2))
-        _ = vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
-        _ = vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+        # Warmup all functions using aot_bridge
+        _ = aot_bridge.ema_loop(test_data, 7.0)
+        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
+        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
+        _ = aot_bridge.calculate_rsi_core(test_data, 21)
+        _ = aot_bridge.sanitize_array_numba(test_data, 0.0)
+        _ = aot_bridge.rolling_mean_numba(test_data, test_int)
+        _ = aot_bridge.rolling_mean_numba_parallel(test_data, test_int)
+        _ = aot_bridge.rolling_std_welford(test_data, test_int, 0.5)
+        _ = aot_bridge.rolling_std_welford_parallel(test_data, test_int, 0.5)
+        _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
+        _ = aot_bridge.rolling_min_max_numba_parallel(test_data, test_int)
+        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
+        _ = aot_bridge.rng_filter_loop(test_data, test_data2)
+        _ = aot_bridge.smooth_range(test_data, 10, 2)
+        _ = aot_bridge.calculate_trends_with_state(test_data, test_data2)
+        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
+        _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
+        _ = aot_bridge.calc_mmh_value_loop(test_data2, len(test_data2))
+        _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
+        _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
+        _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+
+        logger.info("✅ JIT warmup complete")
 
     except Exception as e:
         logger.warning(f"Warmup failed (non-fatal): {e}")
@@ -4140,7 +4148,9 @@ except ImportError:
     logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
+    # Initialize AOT/JIT bridge first
     aot_bridge.ensure_initialized()
+    
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
