@@ -715,43 +715,17 @@ def calculate_magical_momentum_hist(
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
-        # 6. Calculate temp (normalized) - FIXED VERSION
+        # 6. Calculate temp (normalized)
         denom = max_med - min_med
-
-        # First, handle valid calculations
         with np.errstate(divide='ignore', invalid='ignore'):
             temp = (raw - min_med) / denom
-
-        # Handle edge cases more carefully
-        # Only set to 0.5 if BOTH numerator and denominator are problematic
-        temp = np.where(
-            (np.abs(denom) < 1e-10) & (np.isnan(raw) | np.isinf(raw)),
-            0.5,
-            temp
-        )
-
-        # If denominator is zero but raw is valid, preserve the sign
-        temp = np.where(
-            (np.abs(denom) < 1e-10) & ~(np.isnan(raw) | np.isinf(raw)),
-            np.where(raw > 0, 1.0, 0.0),  # Map to 1.0 or 0.0 based on sign
-            temp
-        )
-
-        # Clean up remaining NaN/Inf
-        temp = np.where(np.isnan(temp) | np.isinf(temp), 0.5, temp)
-
-        # Final clipping
+        
+        # Handle edge cases for temp
+        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
+        temp = np.where(np.isnan(temp), 0.5, temp)
+        temp = np.where(np.isinf(temp), 0.5, temp)
         temp = np.clip(temp, 0.0, 1.0)
 
-        # DEBUG: Check if temp has variation
-        temp_unique = np.unique(temp[~np.isnan(temp)])
-        if len(temp_unique) <= 3:  # If only 1-3 unique values, something is wrong
-            logger.warning(
-                f"⚠️ Temp has low variation: unique values = {temp_unique}, "
-                f"raw range = [{np.nanmin(raw):.6f}, {np.nanmax(raw):.6f}], "
-                f"denom range = [{np.nanmin(denom):.6f}, {np.nanmax(denom):.6f}]"
-            )
- 
         print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
         print(f"temp sample: {temp[:10]}")
 

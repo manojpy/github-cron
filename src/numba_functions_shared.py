@@ -633,30 +633,23 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 def calc_mmh_value_loop(temp_arr, rows):
     """
     Calculate MMH value indicator.
-    Pine formula: 
-        value = 0.5 * 2  (initial = 1.0)
-        value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    
-    Key: := means multiply PREVIOUS value, not use constant weight
+    Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
-    value_arr = np.empty(rows, dtype=np.float64)
+    value_arr = np.zeros(rows, dtype=np.float64)
+    weight = 1.0
 
-    # First bar: value = 1.0, nz(value[1]) = 0
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = 1.0 * (t0 - 0.5 + 0.5 * 0.0)  # = 1.0 * (t0 - 0.5)
+    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
     value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
 
-    # Recursive: each value multiplies previous value
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        
-        # CRITICAL: Multiply by PREVIOUS value, not constant
-        v = prev_v * (t - 0.5 + 0.5 * prev_v)
-        
+        v = weight * (t - 0.5 + 0.5 * prev_v)
         value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
 
     return value_arr
+
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
