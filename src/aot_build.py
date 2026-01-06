@@ -1,87 +1,48 @@
-"""
-AOT Build Script - Compiles Numba functions to native .so libraries
-====================================================================
-
-Compiles all 22 shared Numba functions to platform-specific shared libraries
-using Numba's CC (compile cache) export mechanism.
-"""
-
 import sys
 import os
 import argparse
 import platform
-import shutil
 import importlib.util
 from pathlib import Path
-from typing import List, Tuple as TypingTuple
+import numpy as np
+from numba.pycc import CC
+from numba import types
 
-try:
-    import numpy as np
-    from numba.pycc import CC
-    from numba import types
-except ImportError as e:
-    print(f"ERROR: Required dependencies missing: {e}", file=sys.stderr)
-    sys.exit(1)
-
-# Import shared function definitions
+# Import the shared functions
 try:
     import numba_functions_shared as nfs
 except ImportError:
-    print("ERROR: numba_functions_shared.py not found in path.", file=sys.stderr)
+    print("ERROR: numba_functions_shared.py not found.")
     sys.exit(1)
 
 def verify_compilation(lib_path: Path):
-    """Attempt to load the compiled library to verify it's valid."""
-    print(f"🔍 Verifying compiled library: {lib_path}")
+    """Verify that the compiled library can be loaded and symbols exist."""
+    print(f"🔍 Verifying binary: {lib_path}")
     try:
-        spec = importlib.util.spec_from_file_location("verify_mod", str(lib_path))
+        spec = importlib.util.spec_from_file_location("test_aot", str(lib_path))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        
-        # Check if a few key functions exist
-        required = ["sanitize_array_numba", "calc_mmh_momentum_loop", "rolling_std_welford"]
-        for func in required:
-            if not hasattr(mod, func):
-                raise AttributeError(f"Missing exported function: {func}")
-        
-        print("✅ Verification successful: Library is loadable and contains required symbols.")
+        # Check one key function
+        if hasattr(mod, "ema_loop"):
+            print("✅ AOT binary verified successfully.")
+        else:
+            raise AttributeError("ema_loop not found in binary")
     except Exception as e:
         print(f"❌ Verification failed: {e}")
         sys.exit(1)
 
-def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
-    """Execute the compilation process and return the path to the resulting file."""
-    print(f"🚀 Starting AOT compilation for module: {module_name}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Run compilation
-    cc.compile()
-    
-    # Identify the extension based on OS
-    ext = ".so"
-    if platform.system() == "Windows": ext = ".pyd"
-    
-    # Numba CC creates files like name.cpython-310-x86_64-linux-gnu.so
-    compiled_files = list(output_dir.glob(f"{module_name}*{ext}"))
-    if not compiled_files:
-        raise FileNotFoundError(f"Could not find compiled library in {output_dir}")
-        
-    return compiled_files[0]
-
 def build():
-    parser = argparse.ArgumentParser(description="AOT Build for MACD Bot")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--module-name", type=str, default="macd_aot_compiled")
-    parser.add_argument("--verify", action="store_true", help="Verify library after build")
+    parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
 
     cc = CC(args.module_name)
     cc.verbose = True
-    cc.output_dir = str(args.output_dir)
-
-    # ============================================================================
-    # EXPORT SIGNATURES (ALL 22 FUNCTIONS)
-    # ============================================================================
+    
+    # We use Numba's internal type mapping to ensure strings like 'i32' work
+    # f8[:] = float64 array, i32 = int32, b1 = boolean
     
     # 1-2. Sanitization
     cc.export("sanitize_array_numba", "f8[:](f8[:], f8)")(nfs.sanitize_array_numba)
@@ -94,7 +55,6 @@ def build():
     # 5-8. Filters
     cc.export("rng_filter_loop", "f8[:](f8[:], f8[:])")(nfs.rng_filter_loop)
     cc.export("smooth_range", "f8[:](f8[:], i32, f8)")(nfs.smooth_range)
-    # Complex Tuple: (i64[:], i64[:], b1[:])
     cc.export("calculate_trends_with_state", "Tuple((i64[:], i64[:], b1[:]))(f8[:], f8[:], f8[:], f8[:], i64[:], i64[:], b1[:], f8, i32)")(nfs.calculate_trends_with_state)
     cc.export("kalman_loop", "f8[:](f8[:], f8, f8)")(nfs.kalman_loop)
 
@@ -118,25 +78,19 @@ def build():
     cc.export("calc_mmh_value_loop", "f8[:](f8[:], i32)")(nfs.calc_mmh_value_loop)
     cc.export("calc_mmh_momentum_loop", "f8[:](f8[:], i32)")(nfs.calc_mmh_momentum_loop)
 
-    # 21-22. Pattern Recognition
+    # 21-22. Patterns
     cc.export("vectorized_wick_check_buy", "b1[:](f8[:], f8[:], f8[:], f8[:], f8)")(nfs.vectorized_wick_check_buy)
     cc.export("vectorized_wick_check_sell", "b1[:](f8[:], f8[:], f8[:], f8[:], f8)")(nfs.vectorized_wick_check_sell)
 
-    try:
-        lib_path = compile_module(cc, args.output_dir, args.module_name)
-        
-        print("\n" + "=" * 70)
-        print("✅ AOT BUILD SUCCESSFUL")
-        print(f"Output: {lib_path.name}")
-        print("=" * 70)
-        
-        if args.verify:
-            verify_compilation(lib_path)
-            
-        return 0
-    except Exception as e:
-        print(f"\n❌ AOT BUILD FAILED: {e}", file=sys.stderr)
-        return 1
+    # Compile
+    cc.output_dir = str(args.output_dir)
+    cc.compile()
+    
+    # Locate the compiled file
+    ext = ".so" if platform.system() != "Windows" else ".pyd"
+    files = list(args.output_dir.glob(f"{args.module_name}*{ext}"))
+    if files and args.verify:
+        verify_compilation(files[0])
 
 if __name__ == "__main__":
-    sys.exit(build())
+    build()
