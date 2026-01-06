@@ -51,15 +51,14 @@ ARG AOT_STRICT=1
 RUN echo "🔨 Starting AOT compilation..." && \
     python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
     (echo "❌ AOT build script failed" && exit 1) && \
-    echo "📂 Listing build outputs..." && \
-    ls -lh /build || true && \
-    echo "🔍 Checking for compiled module..." && \
-    test -f /build/macd_aot_compiled.so || (echo "❌ No macd_aot_compiled.so found" && exit 1) && \
+    echo "📂 Listing build outputs..." && ls -lh /build && \
+    echo "🔍 Normalizing compiled filename..." && \
+    mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
     python -c "import importlib.util; \
 spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
 mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
 print('✅ AOT binary verified')" || \
-    ( [ "$AOT_STRICT" != "1" ] && echo "⚠️ AOT failed, continuing..." || (echo "❌ AOT STRICT mode: Compilation failed" && exit 1) )
+    ( [ \"$AOT_STRICT\" != \"1\" ] && echo \"⚠️ AOT failed, continuing...\" || (echo \"❌ AOT STRICT mode: Compilation failed\" && exit 1) )
 
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
