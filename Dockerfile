@@ -49,15 +49,14 @@ RUN ls -la *.py && \
 # ✅ OPTIMIZED: AOT Compilation with strict verification
 ARG AOT_STRICT=1
 RUN echo "🔨 Starting AOT compilation..." && \
-    python aot_build.py || (echo "❌ AOT build script failed" && exit 1) && \
+    python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
+    (echo "❌ AOT build script failed" && exit 1) && \
     echo "📂 Listing build outputs..." && \
     ls -lh /build || true && \
     echo "🔍 Checking for compiled module..." && \
-    find /build -maxdepth 1 -name "macd_aot_compiled*.*" -ls && \
-    python -c "import importlib.util, pathlib; \
-so_files=list(pathlib.Path('/build').glob('macd_aot_compiled*.so')); \
-assert so_files, 'No .so file found'; \
-spec=importlib.util.spec_from_file_location('macd_aot_compiled', so_files[0]); \
+    test -f /build/macd_aot_compiled.so || (echo "❌ No macd_aot_compiled.so found" && exit 1) && \
+    python -c "import importlib.util; \
+spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
 mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
 print('✅ AOT binary verified')" || \
     ( [ "$AOT_STRICT" != "1" ] && echo "⚠️ AOT failed, continuing..." || (echo "❌ AOT STRICT mode: Compilation failed" && exit 1) )
@@ -85,8 +84,8 @@ WORKDIR /app/src
 # ✅ OPTIMIZED: Copy Python dependencies from deps-builder (cached layer)
 COPY --from=deps-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-# ✅ OPTIMIZED: Copy AOT binary from aot-builder
-COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled*.so ./
+# ✅ OPTIMIZED: Copy AOT binary from aot-builder (explicit, deterministic)
+COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
 
 # ✅ OPTIMIZED: Copy in order of change frequency (maximize cache hits)
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
@@ -95,7 +94,6 @@ COPY --chown=appuser:appuser src/aot_build.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
 # ✅ OPTIMIZED: Config copied at runtime (not baked into image)
-# This allows config updates without rebuilding the entire image
 COPY --chown=appuser:appuser config_macd.json ./
 
 USER appuser
@@ -107,11 +105,8 @@ ENV PYTHONUNBUFFERED=1 \
     NUMBA_WARNINGS=0 \
     PYTHONOPTIMIZE=1 \
     MEMORY_LIMIT_BYTES=850000000 \
-    TZ=Asia/Kolkata
-
-# ✅ OPTIMIZED: Lightweight health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=2 \
-  CMD python -c "import sys; from aot_bridge import is_using_aot; sys.exit(0 if is_using_aot() else 1)"
+    TZ=Asia/Kolkata \
+    AOT_LIB_PATH=/app/src
 
 # Labels for metadata
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
