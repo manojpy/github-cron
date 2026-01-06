@@ -636,21 +636,16 @@ def calc_mmh_value_loop(temp_arr, rows):
     Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
     value_arr = np.zeros(rows, dtype=np.float64)
-
-    # ✅ NEW
-    value_arr[0] = 0.0 * (temp_arr[0] - 0.5) if not np.isnan(temp_arr[0]) else 0.0
-    # Simpler: just 0.0
-    value_arr[0] = 0.0
-        value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
-
+    weight = 1.0
+    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
+    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
+    value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = weight * (t - 0.5 + 0.5 * prev_v)
         value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
-
     return value_arr
-
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
