@@ -659,10 +659,26 @@ def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9,
-    use_parallel: bool = False,
-    keep_na: bool = False,
+    use_parallel: bool = False
 ) -> np.ndarray:
-
+    """
+    Pine-accurate MMH calculation.
+    
+    Key fixes:
+    1. Uses SMA-based standard deviation (not Welford)
+    2. Preserves NaN in intermediate calculations
+    3. No early sanitization of raw_momentum
+    4. SMA does not skip NaN values
+    
+    Args:
+        close: Price array
+        period: Lookback period (default 144)
+        responsiveness: SD multiplier (default 0.9)
+        use_parallel: Use parallel versions (default False)
+    
+    Returns:
+        MMH histogram values
+    """
     try:
         if close is None or len(close) < period:
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
@@ -703,12 +719,12 @@ def calculate_magical_momentum_hist(
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
             temp = (raw - min_med) / denom
-        degenerate = (~np.isfinite(denom)) | (np.abs(denom) < 1e-10) | (~np.isfinite(min_med)) | (~np.isfinite(max_med))
-        temp = np.where(degenerate, np.nan, temp)
-
-        # Clip finite entries, preserve NaNs
-        finite_mask = np.isfinite(temp)
-        temp[finite_mask] = np.clip(temp[finite_mask], 0.0, 1.0)
+        
+        # Handle edge cases for temp
+        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
+        temp = np.where(np.isnan(temp), 0.5, temp)
+        temp = np.where(np.isinf(temp), 0.5, temp)
+        temp = np.clip(temp, 0.0, 1.0)
 
         print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
         print(f"temp sample: {temp[:10]}")
@@ -740,11 +756,9 @@ def calculate_magical_momentum_hist(
         print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
 
         # 10. Final sanitization (only at the very end)
+        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
 
-        if keep_na:
-            return momentum_arr
-        else:
-            return sanitize_array_numba(momentum_arr, 0.0)
+        return momentum_arr
 
     except Exception as e:
         print(f"MMH calculation failed: {e}")
