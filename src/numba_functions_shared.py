@@ -136,7 +136,7 @@ def rolling_std_welford_parallel(close, period, responsiveness):
     return sd
 
 
-@# ============================================================================
+# ============================================================================
 # FIXED MMH IMPLEMENTATION - Replace in numba_functions_shared.py
 # ============================================================================
 
