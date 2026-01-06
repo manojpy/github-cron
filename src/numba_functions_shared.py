@@ -631,29 +631,32 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
+    """
+    Calculate MMH value indicator.
+    Matches Pine Script exactly:
+      value = 1.0  // initial hidden state
+      value := value * (temp - 0.5 + 0.5 * nz(value[1]))
+    """
     value_arr = np.empty(rows, dtype=np.float64)
-    # Initialize first value: Pine uses initial value = 1.0, then:
-    # value[0] = 1.0 * (temp[0] - 0.5 + 0.5 * 0) = temp[0] - 0.5
-    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = t0 - 0.5
-    # Clamp first value
-    if value_arr[0] > 0.9999:
-        value_arr[0] = 0.9999
-    elif value_arr[0] < -0.9999:
-        value_arr[0] = -0.9999
-
-    # Recursion: value[i] = value[i-1] * (temp[i] - 0.5 + 0.5 * value[i-1])
-    for i in range(1, rows):
+    # Pine initializes internal 'value' to 1.0 before first bar
+    prev_val = 1.0
+    for i in range(rows):
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        prev = value_arr[i - 1]
-        factor = t - 0.5 + 0.5 * prev
-        v = prev * factor
-        # Clamp
-        if v > 0.9999:
-            v = 0.9999
-        elif v < -0.9999:
-            v = -0.9999
-        value_arr[i] = v
+        # Compute new value: prev_val * (t - 0.5 + 0.5 * nz(prev_val))
+        # On first bar, nz(prev_val) = prev_val = 1.0, but Pine uses value[1] = 0 for first nz
+        # So for i=0: factor = t - 0.5 + 0.5 * 0 = t - 0.5
+        if i == 0:
+            factor = t - 0.5
+        else:
+            factor = t - 0.5 + 0.5 * prev_val
+        new_val = prev_val * factor
+        # Clamp to [-0.9999, 0.9999]
+        if new_val > 0.9999:
+            new_val = 0.9999
+        elif new_val < -0.9999:
+            new_val = -0.9999
+        value_arr[i] = new_val
+        prev_val = new_val
     return value_arr
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
