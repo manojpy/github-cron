@@ -16,7 +16,6 @@ from numba import njit, prange, types
 from numba.types import Tuple
 
 
-
 # ============================================================================
 # SANITIZATION FUNCTIONS
 # ============================================================================
@@ -140,23 +139,23 @@ def rolling_std_welford_parallel(close, period, responsiveness):
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
     """
-    Pine-accurate SMA:
-    - Fills first (period-1) bars with cumulative average
-    - Skips NaN values (Pine behavior)
+    Pine-accurate SMA - FIXED VERSION
+    - Warmup: cumulative average for first (period-1) bars
+    - Main: rolling window that SKIPS NaN (Pine behavior)
     """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
-    # Warmup period: cumulative average
+    # Phase 1: Warmup period (bars 0 to period-2)
     cum_sum = 0.0
     count = 0
-    for i in range(period - 1):
+    for i in range(min(period - 1, n)):
         if not np.isnan(data[i]):
             cum_sum += data[i]
             count += 1
         out[i] = cum_sum / count if count > 0 else 0.0
     
-    # Full SMA (skips NaN)
+    # Phase 2: Full rolling SMA (skips NaN)
     for i in range(period - 1, n):
         window_sum = 0.0
         valid_count = 0
@@ -168,17 +167,23 @@ def rolling_mean_numba(data, period):
                 window_sum += val
                 valid_count += 1
         
+        # Pine: if all NaN → previous value
         out[i] = window_sum / valid_count if valid_count > 0 else out[i-1]
     
     return out
 
+
 @njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_mean_numba_parallel(data, period):
-    """Pine-accurate SMA (parallel version) - FIXED"""
+    """
+    Pine-accurate SMA (parallel version) - FIXED
+    WARNING: Parallel version has race condition in warmup period.
+    For safety, we compute warmup sequentially then parallelize main loop.
+    """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
-    # Phase 1: Warmup period (sequential)
+    # Phase 1: Warmup period (sequential - cannot parallelize due to dependencies)
     cum_sum = 0.0
     count = 0
     warmup_end = min(period - 1, n)
@@ -189,7 +194,7 @@ def rolling_mean_numba_parallel(data, period):
             count += 1
         out[i] = cum_sum / count if count > 0 else 0.0
     
-    # Phase 2: Parallel SMA
+    # Phase 2: Full rolling SMA (parallel - each iteration independent)
     for i in prange(period - 1, n):
         window_sum = 0.0
         valid_count = 0
@@ -201,9 +206,13 @@ def rolling_mean_numba_parallel(data, period):
                 window_sum += val
                 valid_count += 1
         
+        # Fallback: if all NaN in window, use previous value
+        # NOTE: This is safe because warmup guarantees out[period-2] exists
         if valid_count > 0:
             out[i] = window_sum / valid_count
         else:
+            # For parallel safety, we cannot reference out[i-1] here
+            # So we use the last warmup value as fallback
             out[i] = out[warmup_end - 1] if warmup_end > 0 else 0.0
     
     return out
@@ -641,7 +650,10 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    """Calculate MMH value - FIXED initialization"""
+    """
+    Calculate MMH value indicator - FIXED
+    Pine: value = 0.5 * 2 = 1.0 (initial multiplier)
+    """
     value_arr = np.zeros(rows, dtype=np.float64)
     initial_multiplier = 1.0  # ✅ FIXED: Pine uses 0.5 * 2 = 1.0
     
@@ -656,6 +668,7 @@ def calc_mmh_value_loop(temp_arr, rows):
         value_arr[i] = np.clip(v, -0.9999, 0.9999)
     
     return value_arr
+
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
