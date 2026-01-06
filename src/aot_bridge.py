@@ -49,7 +49,7 @@ def get_library_extension() -> str:
         return ".so"  # Fallback
 
 
-def find_aot_library(module_name: str = "numba_aot") -> Optional[Path]:
+def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
     """
     Search for AOT-compiled library in common locations.
     
@@ -103,7 +103,7 @@ def load_aot_module(library_path: Path) -> Optional[Any]:
         return None
 
 
-def initialize_aot(module_name: str = "numba_aot") -> Tuple[bool, Optional[str]]:
+def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
     """
     Attempt to initialize AOT module.
     

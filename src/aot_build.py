@@ -281,25 +281,61 @@ def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
     expected_output = output_dir / f"{module_name}{extension}"
     
     print(f"🔨 Starting compilation...")
-    print(f"   Target: {expected_output}")
+    print(f"   Expected output: {expected_output}")
+    print(f"   Output directory: {output_dir}")
     print(f"   This may take 2-5 minutes...\n")
     
     try:
+        # Compile using Numba CC
         cc.compile()
-        print(f"✅ Compilation successful!")
+        print(f"✅ CC.compile() completed")
         
-        # Verify output exists
+        # List all files in output directory for debugging
+        print(f"\n📂 Contents of {output_dir}:")
+        if output_dir.exists():
+            for item in sorted(output_dir.iterdir()):
+                if item.is_file():
+                    size_kb = item.stat().st_size / 1024
+                    print(f"   - {item.name} ({size_kb:.1f} KB)")
+        else:
+            print(f"   ⚠️ Directory does not exist!")
+        
+        # Check for expected output
         if not expected_output.exists():
-            raise FileNotFoundError(f"Expected output {expected_output} not found")
+            # Try to find any .so/.dylib/.dll files
+            pattern = f"*{extension}"
+            found_libs = list(output_dir.glob(pattern))
+            
+            if found_libs:
+                print(f"\n⚠️ Expected {expected_output.name} not found")
+                print(f"   But found these libraries: {[f.name for f in found_libs]}")
+                # Use the first one found
+                library_path = found_libs[0]
+                print(f"   Using: {library_path}")
+            else:
+                raise FileNotFoundError(
+                    f"Expected output {expected_output} not found. "
+                    f"No {extension} files in {output_dir}"
+                )
+        else:
+            library_path = expected_output
         
-        file_size = expected_output.stat().st_size / 1024 / 1024  # MB
-        print(f"   Output: {expected_output}")
+        file_size = library_path.stat().st_size / 1024 / 1024  # MB
+        print(f"\n✅ Compilation successful!")
+        print(f"   Output: {library_path}")
         print(f"   Size: {file_size:.2f} MB")
         
-        return expected_output
+        return library_path
         
     except Exception as e:
         print(f"\n❌ Compilation failed: {e}", file=sys.stderr)
+        
+        # Additional debugging info
+        print(f"\nDebug info:")
+        print(f"   CC output_dir: {cc.output_dir}")
+        print(f"   CC name: {cc.name}")
+        print(f"   Expected extension: {extension}")
+        
         raise
 
 
@@ -347,8 +383,8 @@ def main():
     parser.add_argument(
         '--module-name',
         type=str,
-        default='numba_aot',
-        help='Name of output module (default: numba_aot)'
+        default='macd_aot_compiled',  # Changed from 'numba_aot'
+        help='Name of output module (default: macd_aot_compiled)'
     )
     parser.add_argument(
         '--verify',
@@ -368,6 +404,7 @@ def main():
     print(f"NumPy: {np.__version__}")
     print(f"Platform: {platform.system()} {platform.machine()}")
     print(f"Target extension: {get_platform_extension()}")
+    print(f"Module name: {args.module_name}")
     print("=" * 70)
     print()
     
@@ -384,7 +421,18 @@ def main():
         # Step 3: Compile
         library_path = compile_module(cc, args.output_dir, args.module_name)
         
-        # Step 4: Optional verification
+        # Step 4: Verify compilation output exists
+        if not library_path.exists():
+            raise FileNotFoundError(f"Compilation claimed success but {library_path} not found")
+        
+        # Step 5: List all output files for debugging
+        print(f"\n📂 Build artifacts in {args.output_dir}:")
+        for item in sorted(args.output_dir.iterdir()):
+            if item.is_file():
+                size_mb = item.stat().st_size / 1024 / 1024
+                print(f"   {item.name} ({size_mb:.2f} MB)")
+        
+        # Step 6: Optional verification
         if args.verify:
             verify_compilation(library_path)
         
@@ -403,6 +451,11 @@ def main():
         print("❌ AOT BUILD FAILED")
         print("=" * 70)
         print(f"Error: {e}", file=sys.stderr)
+        
+        # Print traceback for debugging
+        import traceback
+        traceback.print_exc()
+        
         print("=" * 70)
         return 1
 
