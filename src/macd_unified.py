@@ -703,12 +703,12 @@ def calculate_magical_momentum_hist(
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
             temp = (raw - min_med) / denom
-        
-        # Handle edge cases for temp
-        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
-        temp = np.where(np.isnan(temp), 0.5, temp)
-        temp = np.where(np.isinf(temp), 0.5, temp)
-        temp = np.clip(temp, 0.0, 1.0)
+        degenerate = (~np.isfinite(denom)) | (np.abs(denom) < 1e-10) | (~np.isfinite(min_med)) | (~np.isfinite(max_med))
+        temp = np.where(degenerate, np.nan, temp)
+
+        # Clip finite entries, preserve NaNs
+        finite_mask = np.isfinite(temp)
+        temp[finite_mask] = np.clip(temp[finite_mask], 0.0, 1.0)
 
         print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
         print(f"temp sample: {temp[:10]}")
@@ -742,10 +742,8 @@ def calculate_magical_momentum_hist(
         # 10. Final sanitization (only at the very end)
 
         if keep_na:
-            # Return momentum_arr as-is to match Pine na propagation
             return momentum_arr
         else:
-            # Operational path: replace NaN/Inf with 0.0
             return sanitize_array_numba(momentum_arr, 0.0)
 
     except Exception as e:
