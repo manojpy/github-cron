@@ -60,7 +60,7 @@ def rolling_std_welford(close, period, responsiveness):
 
     for i in range(n):
         if i < period - 1:
-            sd[i] = 0.0
+            sd[i] = np.nan
             continue
 
         window_sum = 0.0
@@ -77,7 +77,7 @@ def rolling_std_welford(close, period, responsiveness):
             window_count += 1
 
         if has_nan or window_count == 0:
-            sd[i] = 0.0
+            sd[i] = np.nan
             continue
 
         mean = window_sum / window_count
@@ -103,7 +103,7 @@ def rolling_std_welford_parallel(close, period, responsiveness):
 
     for i in prange(n):
         if i < period - 1:
-            sd[i] = 0.0
+            sd[i] = np.nan
             continue
 
         window_sum = 0.0
@@ -120,7 +120,7 @@ def rolling_std_welford_parallel(close, period, responsiveness):
             window_count += 1
 
         if has_nan or window_count == 0:
-            sd[i] = 0.0
+            sd[i] = np.nan
             continue
 
         mean = window_sum / window_count
@@ -619,7 +619,7 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
         diff = src - prev_worm
         sd_i = sd_arr[i]
 
-        if np.isnan(sd_i) or sd_i == 0.0:
+        if np.isnan(sd_i):
             delta = diff
         else:
             delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
@@ -635,18 +635,22 @@ def calc_mmh_value_loop(temp_arr, rows):
     Calculate MMH value indicator.
     Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
-    value_arr = np.zeros(rows, dtype=np.float64)
-    weight = 1.0
+    value_arr = np.empty(rows, dtype=np.float64)
 
-    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
-    value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
+    # Pine: value = 0.5 * 2
+    value_arr[0] = 1.0
 
     for i in range(1, rows):
-        prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = weight * (t - 0.5 + 0.5 * prev_v)
-        value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
+        prev_v = 0.0 if np.isnan(value_arr[i - 1]) else value_arr[i - 1]
+
+        t = temp_arr[i]  # allow NaN to propagate
+        value_arr[i] = value_arr[i - 1] * (t - 0.5 + 0.5 * prev_v)
+
+        # Pine clamp
+        if value_arr[i] > 0.9999:
+            value_arr[i] = 0.9999
+        elif value_arr[i] < -0.9999:
+            value_arr[i] = -0.9999
 
     return value_arr
 

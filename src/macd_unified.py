@@ -661,27 +661,10 @@ def calculate_magical_momentum_hist(
     responsiveness: float = 0.9,
     use_parallel: bool = False
 ) -> np.ndarray:
-    """
-    Pine-accurate MMH calculation.
-    
-    Key fixes:
-    1. Uses SMA-based standard deviation (not Welford)
-    2. Preserves NaN in intermediate calculations
-    3. No early sanitization of raw_momentum
-    4. SMA does not skip NaN values
-    
-    Args:
-        close: Price array
-        period: Lookback period (default 144)
-        responsiveness: SD multiplier (default 0.9)
-        use_parallel: Use parallel versions (default False)
-    
-    Returns:
-        MMH histogram values
-    """
+   
     try:
-        if close is None or len(close) < period:
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+        if close is None or len(close) == 0:
+            return np.zeros(1, dtype=np.float64)
 
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
@@ -719,44 +702,29 @@ def calculate_magical_momentum_hist(
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
             temp = (raw - min_med) / denom
-        
-        # Handle edge cases for temp
-        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
-        temp = np.where(np.isnan(temp), 0.5, temp)
-        temp = np.where(np.isinf(temp), 0.5, temp)
-        temp = np.clip(temp, 0.0, 1.0)
 
-        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
+        print(f"temp range: [{np.nanmin(temp):.4f}, {np.nanmax(temp):.4f}]")
+
         print(f"temp sample: {temp[:10]}")
 
         # 7. Calculate value
         value_arr = calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -0.9999, 0.9999)
-
-        print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
+        
+        print(f"value_arr range: [{np.nanmin(value_arr):.4f}, {np.nanmax(value_arr):.4f}]")
         print(f"value_arr sample: {value_arr[:10]}")
 
         # 8. Calculate momentum
         with np.errstate(divide='ignore', invalid='ignore'):
             temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.clip(temp2, 1e-9, 1e9)
-            temp2 = np.where(np.isnan(temp2), 1.0, temp2)
-            temp2 = np.where(np.isinf(temp2), 1e9, temp2)
+            momentum = 0.25 * np.log(temp2)
 
-        momentum = 0.25 * np.log(temp2)
-        momentum = np.where(np.isnan(momentum), 0.0, momentum)
-        momentum = np.where(np.isinf(momentum), 0.0, momentum)
-
-        print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
-
+        print(f"momentum range: [{np.nanmin(momentum):.4f}, {np.nanmax(momentum):.4f}]")
+ 
         # 9. Apply recursive momentum formula
         momentum_arr = momentum.copy()
         momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
 
         print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
-
-        # 10. Final sanitization (only at the very end)
-        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
 
