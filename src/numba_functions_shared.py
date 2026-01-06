@@ -632,27 +632,27 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
     value_arr = np.zeros(rows, dtype=np.float64)
-    
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = np.clip(1.0 * (t0 - 0.5 + 0.5 * 0.0), -0.9999, 0.9999)  # 0.5*2=1.0 scaling
-
+    value_arr[0] = np.clip(1.0 * (t0 - 0.5 + 0.5 * 0.0), -0.9999, 0.9999)  # Fix: 0.5*2 scaling
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = 1.0 * (t - 0.5 + 0.5 * prev_v)
         value_arr[i] = np.clip(v, -0.9999, 0.9999)
-
     return value_arr
+
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
+
     momentum_out = np.empty_like(momentum_arr)
-    momentum_out[0] = momentum_arr[0]
+    momentum_out[0] = momentum_arr[0]  # Preserve first value
+    
     for i in range(1, rows):
         prev = momentum_out[i - 1] if not np.isnan(momentum_out[i - 1]) else 0.0
-        momentum_out[i] = momentum_arr[i] + 0.5 * prev  # Pine: momentum + 0.5*nz(momentum[1])
-    return momentum_out
+        momentum_out[i] = momentum_arr[i] + 0.5 * prev  # Raw input[i] + smoothed lag
 
+    return momentum_out
 
 # ============================================================================
 # CANDLE PATTERN RECOGNITION

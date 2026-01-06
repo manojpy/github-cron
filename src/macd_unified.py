@@ -661,7 +661,7 @@ def calculate_magical_momentum_hist(
     responsiveness: float = 0.9,
     use_parallel: bool = False
 ) -> np.ndarray:
-   
+    
     try:
         if close is None or len(close) < period:
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
