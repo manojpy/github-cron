@@ -632,31 +632,30 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
     """
-    Calculate MMH value indicator.
-    Matches Pine Script exactly:
-      value = 1.0  // initial hidden state
+    Pine-accurate MMH value calculation.
+    Pine logic:
+      value = 1.0  // hidden initial state
       value := value * (temp - 0.5 + 0.5 * nz(value[1]))
     """
     value_arr = np.empty(rows, dtype=np.float64)
-    # Pine initializes internal 'value' to 1.0 before first bar
-    prev_val = 1.0
+    # Hidden initial state = 1.0 (Pine internal variable)
+    prev = 1.0
     for i in range(rows):
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        # Compute new value: prev_val * (t - 0.5 + 0.5 * nz(prev_val))
-        # On first bar, nz(prev_val) = prev_val = 1.0, but Pine uses value[1] = 0 for first nz
-        # So for i=0: factor = t - 0.5 + 0.5 * 0 = t - 0.5
         if i == 0:
+            # On first bar: nz(value[1]) = 0 → factor = t - 0.5
             factor = t - 0.5
         else:
-            factor = t - 0.5 + 0.5 * prev_val
-        new_val = prev_val * factor
+            # On subsequent bars: nz(value[1]) = prev
+            factor = t - 0.5 + 0.5 * prev
+        new_val = prev * factor
         # Clamp to [-0.9999, 0.9999]
         if new_val > 0.9999:
             new_val = 0.9999
         elif new_val < -0.9999:
             new_val = -0.9999
         value_arr[i] = new_val
-        prev_val = new_val
+        prev = new_val
     return value_arr
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
