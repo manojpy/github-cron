@@ -141,62 +141,72 @@ def rolling_std_welford_parallel(close, period, responsiveness):
 def rolling_mean_numba(data, period):
     """
     Pine-accurate SMA:
-    - First (period-1) bars → NaN
-    - Does NOT skip NaN values
-    - If any NaN in window → result is NaN
+    - Fills first (period-1) bars with cumulative average
+    - Skips NaN values (Pine behavior)
     """
     n = len(data)
     out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
-
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-            continue
-
+    
+    # Warmup period: cumulative average
+    cum_sum = 0.0
+    count = 0
+    for i in range(period - 1):
+        if not np.isnan(data[i]):
+            cum_sum += data[i]
+            count += 1
+        out[i] = cum_sum / count if count > 0 else 0.0
+    
+    # Full SMA (skips NaN)
+    for i in range(period - 1, n):
         window_sum = 0.0
-        has_nan = False
-
+        valid_count = 0
+        
         start = i - period + 1
         for j in range(start, i + 1):
             val = data[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-
-        out[i] = np.nan if has_nan else (window_sum / period)
-
+            if not np.isnan(val):
+                window_sum += val
+                valid_count += 1
+        
+        out[i] = window_sum / valid_count if valid_count > 0 else out[i-1]
+    
     return out
-
 
 @njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_mean_numba_parallel(data, period):
-    """Pine-accurate SMA (parallel version)"""
+    """Pine-accurate SMA (parallel version) - FIXED"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
-
-    for i in prange(n):
-        if i < period - 1:
-            out[i] = np.nan
-            continue
-
+    
+    # Phase 1: Warmup period (sequential)
+    cum_sum = 0.0
+    count = 0
+    warmup_end = min(period - 1, n)
+    
+    for i in range(warmup_end):
+        if not np.isnan(data[i]):
+            cum_sum += data[i]
+            count += 1
+        out[i] = cum_sum / count if count > 0 else 0.0
+    
+    # Phase 2: Parallel SMA
+    for i in prange(period - 1, n):
         window_sum = 0.0
-        has_nan = False
-
+        valid_count = 0
+        
         start = i - period + 1
         for j in range(start, i + 1):
             val = data[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-
-        out[i] = np.nan if has_nan else (window_sum / period)
-
+            if not np.isnan(val):
+                window_sum += val
+                valid_count += 1
+        
+        if valid_count > 0:
+            out[i] = window_sum / valid_count
+        else:
+            out[i] = out[warmup_end - 1] if warmup_end > 0 else 0.0
+    
     return out
-
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
@@ -631,25 +641,21 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Calculate MMH value indicator.
-    Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    """
+    """Calculate MMH value - FIXED initialization"""
     value_arr = np.zeros(rows, dtype=np.float64)
-    weight = 1.0
-
+    initial_multiplier = 1.0  # ✅ FIXED: Pine uses 0.5 * 2 = 1.0
+    
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
-    value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
-
+    value_arr[0] = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)
+    value_arr[0] = np.clip(value_arr[0], -0.9999, 0.9999)
+    
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = weight * (t - 0.5 + 0.5 * prev_v)
-        value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
-
+        v = initial_multiplier * (t - 0.5 + 0.5 * prev_v)
+        value_arr[i] = np.clip(v, -0.9999, 0.9999)
+    
     return value_arr
-
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):

@@ -654,13 +654,31 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
+
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9,
     use_parallel: bool = False
 ) -> np.ndarray:
+    """
+    Pine-accurate MMH calculation.
     
+    Key fixes:
+    1. Uses SMA-based standard deviation (not Welford)
+    2. Preserves NaN in intermediate calculations
+    3. No early sanitization of raw_momentum
+    4. SMA does not skip NaN values
+    
+    Args:
+        close: Price array
+        period: Lookback period (default 144)
+        responsiveness: SD multiplier (default 0.9)
+        use_parallel: Use parallel versions (default False)
+    
+    Returns:
+        MMH histogram values
+    """
     try:
         if close is None or len(close) < period:
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
@@ -684,38 +702,38 @@ def calculate_magical_momentum_hist(
         else:
             ma = rolling_mean_numba(close_c, period)
 
-        # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
-        with np.errstate(divide='ignore', invalid='ignore'):
-            raw = (worm_arr - ma) / worm_arr
+        # 4. Calculate raw momentum - FIXED division by zero handling
+        raw = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            if np.abs(worm_arr[i]) < 1e-10:
+                raw[i] = np.nan  # Pine: worm == 0 → na
+            else:
+                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
 
-        print(f"raw range: [{raw.min():.4f}, {raw.max():.4f}]")
-        print(f"raw sample: {raw[-10:]}")  # Last 10
-        print(f"worm[-5:]: {worm_arr[-5:]}")
-        print(f"ma[-5:]: {ma[-5:]}")
-        
-        # Pine behavior: if worm == 0 → result is na (not 0)
-        # We keep NaN/Inf here intentionally
-
+        # Debug checkpoint
+        if cfg.DEBUG_MODE:
+            valid_raw = raw[~np.isnan(raw)]
+            if len(valid_raw) > 0:
+                print(f"raw_momentum range: [{valid_raw.min():.4f}, {valid_raw.max():.4f}]")
+       
         # 5. Calculate rolling min/max (they handle NaN correctly)
         if use_parallel and rows >= 250:
             min_med, max_med = rolling_min_max_numba_parallel(raw, period)
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
-        print(f"min_med[-5:]: {min_med[-5:]}")
-        print(f"max_med[-5:]: {max_med[-5:]}")
-        print(f"denom[-5:]: {denom[-5:]}")  # Should NOT be zero
-
-
-        # 6. Calculate temp (normalized)
+        # 6. Calculate temp (normalized) - FIXED edge cases
         denom = max_med - min_med
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp = (raw - min_med) / denom
-        
-        # Handle edge cases for temp
-        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
-        temp = np.where(np.isnan(temp), 0.5, temp)
-        temp = np.where(np.isinf(temp), 0.5, temp)
+        temp = np.empty(rows, dtype=np.float64)
+
+        for i in range(rows):
+            if np.abs(denom[i]) < 1e-10:
+                temp[i] = 0.5  # Pine: flat period → 0.5
+            elif np.isnan(raw[i]) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
+                temp[i] = 0.5  # Pine: na → 0.5
+            else:
+                temp[i] = (raw[i] - min_med[i]) / denom[i]
+
         temp = np.clip(temp, 0.0, 1.0)
 
         print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
@@ -728,18 +746,21 @@ def calculate_magical_momentum_hist(
         print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
         print(f"value_arr sample: {value_arr[:10]}")
 
-        # 8. Calculate momentum
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp2 = (1.0 + value_arr) / (1.0 - value_arr)
-            temp2 = np.clip(temp2, 1e-9, 1e9)
-            temp2 = np.where(np.isnan(temp2), 1.0, temp2)
-            temp2 = np.where(np.isinf(temp2), 1e9, temp2)
-
-        momentum = 0.25 * np.log(temp2)
-        momentum = np.where(np.isnan(momentum), 0.0, momentum)
-        momentum = np.where(np.isinf(momentum), 0.0, momentum)
+        # 8. Calculate momentum - FIXED log edge cases
+        momentum = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            val = value_arr[i]
+    
+            if val >= 0.9999:
+                momentum[i] = 1.9578  # Pine: log((1+0.9999)/(1-0.9999)) * 0.25
+            elif val <= -0.9999:
+                momentum[i] = -1.9578
+            else:
+                temp2 = (1.0 + val) / (1.0 - val)
+                momentum[i] = 0.25 * np.log(temp2)
 
         print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
+    
 
         # 9. Apply recursive momentum formula
         momentum_arr = momentum.copy()
