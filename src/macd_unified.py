@@ -726,9 +726,15 @@ def calculate_magical_momentum_hist(
         temp = np.where(np.isinf(temp), 0.5, temp)
         temp = np.clip(temp, 0.0, 1.0)
 
+        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
+        print(f"temp sample: {temp[:10]}")
+
         # 7. Calculate value
         value_arr = calc_mmh_value_loop(temp, rows)
         value_arr = np.clip(value_arr, -0.9999, 0.9999)
+
+        print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
+        print(f"value_arr sample: {value_arr[:10]}")
 
         # 8. Calculate momentum
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -741,9 +747,13 @@ def calculate_magical_momentum_hist(
         momentum = np.where(np.isnan(momentum), 0.0, momentum)
         momentum = np.where(np.isinf(momentum), 0.0, momentum)
 
+        print(f"momentum range: [{momentum.min():.4f}, {momentum.max():.4f}]")
+
         # 9. Apply recursive momentum formula
         momentum_arr = momentum.copy()
         momentum_arr = calc_mmh_momentum_loop(momentum_arr, rows)
+
+        print(f"momentum_arr final: {momentum_arr[-1]:.6f}")
 
         # 10. Final sanitization (only at the very end)
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
