@@ -628,36 +628,25 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
     return worm_arr
 
-
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
     """
     Pine-accurate MMH value calculation.
-
     Pine v6:
       value = 0.5 * 2         # => 1.0 initial
       value := value * (temp - .5 + .5 * nz(value[1]))
-      value := clamp(value, -0.9999, 0.9999)
-
-    Notes:
-    - At i=0, nz(value[1]) = 0.0 (no previous value), so factor = (temp0 - 0.5 + 0.5*0.0)
-    - For i>=1, prev_v = value[i-1]
-    - Multiplicative recursion: new_v = prev_v * (temp_i - 0.5 + 0.5 * prev_v)
     """
     value_arr = np.empty(rows, dtype=np.float64)
 
-    # i = 0: initial value = 1.0, nz(value[1]) = 0.0
+    # i=0: initial value = 1.0, nz(value[1]) = 0.0
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
     v0 = 1.0 * (t0 - 0.5 + 0.5 * 0.0)
-    # clamp
     value_arr[0] = -0.9999 if v0 < -0.9999 else (0.9999 if v0 > 0.9999 else v0)
 
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        # multiplicative update
         v = prev_v * (t - 0.5 + 0.5 * prev_v)
-        # clamp
         value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
 
     return value_arr
