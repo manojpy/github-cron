@@ -628,24 +628,34 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
     return worm_arr
 
+
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
     """
-    Pine v6:
-      value = 1.0
-      value := value * (temp - .5 + .5 * nz(value[1]))
+    Pine v6 Magical Momentum 'value' recursion:
+      var value = 1.0
+      value := value * (temp - 0.5 + 0.5 * nz(value[1]))
+      value := clamp(value, -0.9999, 0.9999)
+
+    Args:
+        temp_arr : normalized temp array
+        rows     : number of bars
+
+    Returns:
+        value_arr : Pine‑accurate recursive value series
     """
     value_arr = np.empty(rows, dtype=np.float64)
 
     # i=0: initial value = 1.0, nz(value[1]) = 0.0
-    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
+    t0 = temp_arr[0] if np.isfinite(temp_arr[0]) else 0.5
     v0 = 1.0 * (t0 - 0.5 + 0.5 * 0.0)
     value_arr[0] = -0.9999 if v0 < -0.9999 else (0.9999 if v0 > 0.9999 else v0)
 
+    # subsequent bars
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = prev_v * (t - 0.5 + 0.5 * prev_v)   # <-- multiplicative
+        t = temp_arr[i] if np.isfinite(temp_arr[i]) else 0.5
+        v = prev_v * (t - 0.5 + 0.5 * prev_v)
         value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
 
     return value_arr
