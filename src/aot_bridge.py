@@ -8,14 +8,14 @@ if necessary.
 
 Usage:
     import aot_bridge
-    
+
     # Ensure initialization (call once at startup)
     aot_bridge.ensure_initialized()
-    
+
     # Check status
     if aot_bridge.is_using_aot():
         print("AOT active")
-    
+
     # Use functions normally
     result = aot_bridge.sanitize_array_numba(arr, default=0.0)
 """
@@ -25,8 +25,9 @@ import sys
 import platform
 import warnings
 from pathlib import Path
-from typing import Optional, Callable, Any, Tuple
+from typing import Optional, Any, Tuple
 
+import importlib.util
 import numpy as np
 
 # Global state
@@ -51,88 +52,100 @@ def get_library_extension() -> str:
 
 def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
     """
-    Search for AOT-compiled library in common locations.
-    
+    Search for AOT-compiled Python extension in common locations.
+
     Search order:
-    1. Current working directory
-    2. Script directory
-    3. Environment variable AOT_LIB_PATH
-    4. System library paths
-    
+    1. Environment variable AOT_LIB_PATH
+    2. Current working directory
+    3. Script directory
+
     Returns:
         Path to library or None if not found
     """
     extension = get_library_extension()
-    library_name = f"{module_name}{extension}"
-    
-    search_paths = [
-        Path.cwd(),
-        Path(__file__).parent,
+
+    # Accept both normalized and ABI-suffixed filenames
+    candidates = [
+        f"{module_name}{extension}",
+        # Typical CPython ABI suffix layout produced by pycc (example pattern)
+        f"{module_name}.cpython-311-x86_64-linux-gnu{extension}",
+        f"{module_name}.cpython-311{extension}",
     ]
-    
-    # Add environment variable path if set
+
+    search_paths = []
     env_path = os.getenv("AOT_LIB_PATH")
     if env_path:
-        search_paths.insert(0, Path(env_path))
-    
-    # Search for library
+        search_paths.append(Path(env_path))
+    search_paths += [Path.cwd(), Path(__file__).parent]
+
     for search_dir in search_paths:
-        candidate = search_dir / library_name
-        if candidate.exists():
-            return candidate
-    
+        for name in candidates:
+            p = search_dir / name
+            if p.exists():
+                return p
+
+        # Wildcard fallback in case of different ABI tag
+        found = list(search_dir.glob(f"{module_name}*{extension}"))
+        if found:
+            return found[0]
+
     return None
 
 
-def load_aot_module(library_path: Path) -> Optional[Any]:
+def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") -> Optional[Any]:
     """
-    Load AOT-compiled library using ctypes.
-    
+    Load AOT-compiled Python extension using importlib.
+
     Args:
         library_path: Path to .so/.dylib/.dll file
-    
+        module_name: Logical module name to bind in sys.modules
+
     Returns:
-        Loaded library object or None on failure
+        Imported module object or None on failure
     """
     try:
-        import ctypes
-        lib = ctypes.CDLL(str(library_path))
-        return lib
+        spec = importlib.util.spec_from_file_location(module_name, str(library_path))
+        if spec is None or spec.loader is None:
+            warnings.warn(f"Cannot create import spec for {library_path}")
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Bind for subsequent imports if desired
+        sys.modules[module_name] = mod
+        return mod
     except Exception as e:
-        warnings.warn(f"Failed to load AOT library {library_path}: {e}")
+        warnings.warn(f"Failed to import AOT module {library_path}: {e}")
         return None
 
 
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
     """
     Attempt to initialize AOT module.
-    
+
     Returns:
         Tuple of (success, failure_reason)
     """
     global _aot_module, _using_aot, _fallback_reason
-    
-    # Find library
+
     library_path = find_aot_library(module_name)
     if library_path is None:
         return False, f"AOT library {module_name}{get_library_extension()} not found"
-    
-    # Load library
-    _aot_module = load_aot_module(library_path)
+
+    _aot_module = load_aot_module(library_path, module_name)
     if _aot_module is None:
-        return False, f"Failed to load AOT library at {library_path}"
-    
-    # Verify critical functions exist
+        return False, f"Failed to import AOT module at {library_path}"
+
+    # Verify critical functions exist as Python-callable attributes
     critical_functions = [
         'sanitize_array_numba',
         'ema_loop',
         'calculate_ppo_core',
     ]
-    
-    for func_name in critical_functions:
-        if not hasattr(_aot_module, func_name):
-            return False, f"AOT library missing critical function: {func_name}"
-    
+
+    missing = [fn for fn in critical_functions if not hasattr(_aot_module, fn)]
+    if missing:
+        return False, f"AOT library missing critical function: {missing[0]}"
+
     _using_aot = True
     return True, None
 
@@ -140,9 +153,8 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
 def initialize_jit_fallback() -> None:
     """Initialize JIT fallback by importing shared functions"""
     global _fallback_reason
-    
+
     try:
-        # Import all functions from shared module
         from numba_functions_shared import (
             sanitize_array_numba,
             sanitize_array_numba_parallel,
@@ -167,8 +179,7 @@ def initialize_jit_fallback() -> None:
             vectorized_wick_check_buy,
             vectorized_wick_check_sell,
         )
-        
-        # Store in module globals for access
+
         globals()['_jit_sanitize_array_numba'] = sanitize_array_numba
         globals()['_jit_sanitize_array_numba_parallel'] = sanitize_array_numba_parallel
         globals()['_jit_ema_loop'] = ema_loop
@@ -191,7 +202,7 @@ def initialize_jit_fallback() -> None:
         globals()['_jit_calculate_rsi_core'] = calculate_rsi_core
         globals()['_jit_vectorized_wick_check_buy'] = vectorized_wick_check_buy
         globals()['_jit_vectorized_wick_check_sell'] = vectorized_wick_check_sell
-        
+
     except ImportError as e:
         _fallback_reason = f"JIT fallback failed: {e}"
         raise RuntimeError(f"Cannot initialize JIT fallback: {e}")
@@ -203,22 +214,20 @@ def ensure_initialized() -> None:
     Call this once at application startup.
     """
     global _initialized, _fallback_reason, _using_aot
-    
+
     if _initialized:
         return
-    
-    # Try AOT first
+
     success, reason = initialize_aot()
-    
+
     if success:
         _using_aot = True
         _fallback_reason = None
     else:
-        # Fall back to JIT
         _fallback_reason = reason
         _using_aot = False
         initialize_jit_fallback()
-    
+
     _initialized = True
 
 
@@ -307,7 +316,7 @@ def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
 
 
 def calculate_trends_with_state(
-    filt_x1: np.ndarray, 
+    filt_x1: np.ndarray,
     filt_x12: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate trends (returns tuple)"""
@@ -380,9 +389,9 @@ def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.nda
 
 
 def calculate_ppo_core(
-    close: np.ndarray, 
-    fast: int, 
-    slow: int, 
+    close: np.ndarray,
+    fast: int,
+    slow: int,
     signal: int
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Calculate PPO (returns tuple)"""
@@ -442,24 +451,24 @@ __all__ = [
     'is_using_aot',
     'get_fallback_reason',
     'requires_warmup',
-    
+
     # Sanitization
     'sanitize_array_numba',
     'sanitize_array_numba_parallel',
-    
+
     # Moving Averages
     'ema_loop',
     'ema_loop_alpha',
-    
+
     # Filters
     'kalman_loop',
     'rng_filter_loop',
     'smooth_range',
     'calculate_trends_with_state',
-    
+
     # Market Indicators
     'vwap_daily_loop',
-    
+
     # Statistical
     'rolling_std_welford',
     'rolling_std_welford_parallel',
@@ -467,16 +476,16 @@ __all__ = [
     'rolling_mean_numba_parallel',
     'rolling_min_max_numba',
     'rolling_min_max_numba_parallel',
-    
+
     # Oscillators
     'calculate_ppo_core',
     'calculate_rsi_core',
-    
+
     # MMH Components
     'calc_mmh_worm_loop',
     'calc_mmh_value_loop',
     'calc_mmh_momentum_loop',
-    
+
     # Pattern Recognition
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
