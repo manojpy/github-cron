@@ -198,43 +198,49 @@ def rolling_mean_numba_parallel(data, period):
     return out
 
 
-@njit("Tuple(f8[:],f8[:])(f8[:],i4)", nogil=True, cache=True)
-def rolling_min_max_numba(arr, period):
+@njit("f8[:](f8[:],i8)", nogil=True, cache=True)
+def rolling_min_max_numba(arr, period):  # period as i8 not i4
     rows = len(arr)
     minarr = np.full(rows, np.nan, dtype=np.float64)
     maxarr = np.full(rows, np.nan, dtype=np.float64)
     
-    for i in range(period - 1, rows):
-        minval = np.inf
-        maxval = -np.inf
-        
-        for j in range(i - period + 1, i + 1):
-            if not np.isnan(arr[j]):
-                if arr[j] < minval: minval = arr[j]
-                if arr[j] > maxval: maxval = arr[j]
-        
-        if minval != np.inf:  # Found valid values
+    for i in range(rows):
+        if i < period - 1:
+            continue
+        minval = 1e30  # np.inf → float literal for AOT
+        maxval = -1e30
+        for j in range(max(0, i - period + 1), i + 1):
+            val = arr[j]
+            if not np.isnan(val):
+                if val < minval:
+                    minval = val
+                if val > maxval:
+                    maxval = val
+        if minval < 1e29:  # Valid found
             minarr[i] = minval
             maxarr[i] = maxval
     
     return minarr, maxarr
 
-@njit("Tuple(f8[:],f8[:])(f8[:],i4)", nogil=True, parallel=True, cache=True)
-def rolling_min_max_numba_parallel(arr, period):
+@njit("f8[:](f8[:],i8)", nogil=True, parallel=True, cache=True)  # ← Your calc_mmh style
+def rolling_min_max_numba_parallel(arr, period):  # period as i8 not i4
     rows = len(arr)
     minarr = np.full(rows, np.nan, dtype=np.float64)
     maxarr = np.full(rows, np.nan, dtype=np.float64)
     
-    for i in prange(period - 1, rows):
-        minval = np.inf
-        maxval = -np.inf
-        
-        for j in range(i - period + 1, i + 1):
-            if not np.isnan(arr[j]):
-                if arr[j] < minval: minval = arr[j]
-                if arr[j] > maxval: maxval = arr[j]
-        
-        if minval != np.inf:  # Found valid values
+    for i in prange(rows):
+        if i < period - 1:
+            continue
+        minval = 1e30  # np.inf → float literal for AOT
+        maxval = -1e30
+        for j in range(max(0, i - period + 1), i + 1):
+            val = arr[j]
+            if not np.isnan(val):
+                if val < minval:
+                    minval = val
+                if val > maxval:
+                    maxval = val
+        if minval < 1e29:  # Valid found
             minarr[i] = minval
             maxarr[i] = maxval
     
