@@ -660,25 +660,9 @@ def calculate_magical_momentum_hist(
     period: int = 144,
     responsiveness: float = 0.9,
     use_parallel: bool = False
+    keep_na: bool = False,
 ) -> np.ndarray:
-    """
-    Pine-accurate MMH calculation.
-    
-    Key fixes:
-    1. Uses SMA-based standard deviation (not Welford)
-    2. Preserves NaN in intermediate calculations
-    3. No early sanitization of raw_momentum
-    4. SMA does not skip NaN values
-    
-    Args:
-        close: Price array
-        period: Lookback period (default 144)
-        responsiveness: SD multiplier (default 0.9)
-        use_parallel: Use parallel versions (default False)
-    
-    Returns:
-        MMH histogram values
-    """
+
     try:
         if close is None or len(close) < period:
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
