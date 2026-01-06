@@ -198,13 +198,13 @@ def rolling_mean_numba_parallel(data, period):
     return out
 
 
-@njit(Tuple(f8[:], f8[:])(f8[:], i4), nogil=True, cache=True)
+@njit("Tuple(f8[:],f8[:])(f8[:],i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
     rows = len(arr)
     minarr = np.empty(rows, dtype=np.float64)
     maxarr = np.empty(rows, dtype=np.float64)
     
-    for i in range(rows):
+    for i in range(rows):  # No prange
         if i < period - 1:
             minarr[i] = np.nan
             maxarr[i] = np.nan
@@ -219,10 +219,8 @@ def rolling_min_max_numba(arr, period):
             val = arr[j]
             if not np.isnan(val):
                 has_valid = True
-                if val < minval:
-                    minval = val
-                if val > maxval:
-                    maxval = val
+                if val < minval: minval = val
+                if val > maxval: maxval = val
         
         if has_valid:
             minarr[i] = minval
@@ -233,7 +231,7 @@ def rolling_min_max_numba(arr, period):
             
     return minarr, maxarr
 
-@njit(Tuple(f8[:], f8[:])(f8[:], i4), nogil=True, parallel=True, cache=True)
+@njit("Tuple(f8[:],f8[:])(f8[:],i4)", nogil=True, parallel=True, cache=True)
 def rolling_min_max_numba_parallel(arr, period):
     rows = len(arr)
     minarr = np.empty(rows, dtype=np.float64)
@@ -254,10 +252,8 @@ def rolling_min_max_numba_parallel(arr, period):
             val = arr[j]
             if not np.isnan(val):
                 has_valid = True
-                if val < minval:
-                    minval = val
-                if val > maxval:
-                    maxval = val
+                if val < minval: minval = val
+                if val > maxval: maxval = val
         
         if has_valid:
             minarr[i] = minval
