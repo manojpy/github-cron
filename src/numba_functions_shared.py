@@ -201,67 +201,43 @@ def rolling_mean_numba_parallel(data, period):
 @njit("Tuple(f8[:],f8[:])(f8[:],i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
     rows = len(arr)
-    minarr = np.empty(rows, dtype=np.float64)
-    maxarr = np.empty(rows, dtype=np.float64)
+    minarr = np.full(rows, np.nan, dtype=np.float64)
+    maxarr = np.full(rows, np.nan, dtype=np.float64)
     
-    for i in range(rows):  # No prange
-        if i < period - 1:
-            minarr[i] = np.nan
-            maxarr[i] = np.nan
-            continue
-            
-        start = i - period + 1
+    for i in range(period - 1, rows):
         minval = np.inf
         maxval = -np.inf
-        has_valid = False
         
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                has_valid = True
-                if val < minval: minval = val
-                if val > maxval: maxval = val
+        for j in range(i - period + 1, i + 1):
+            if not np.isnan(arr[j]):
+                if arr[j] < minval: minval = arr[j]
+                if arr[j] > maxval: maxval = arr[j]
         
-        if has_valid:
+        if minval != np.inf:  # Found valid values
             minarr[i] = minval
             maxarr[i] = maxval
-        else:
-            minarr[i] = np.nan
-            maxarr[i] = np.nan
-            
+    
     return minarr, maxarr
 
 @njit("Tuple(f8[:],f8[:])(f8[:],i4)", nogil=True, parallel=True, cache=True)
 def rolling_min_max_numba_parallel(arr, period):
     rows = len(arr)
-    minarr = np.empty(rows, dtype=np.float64)
-    maxarr = np.empty(rows, dtype=np.float64)
+    minarr = np.full(rows, np.nan, dtype=np.float64)
+    maxarr = np.full(rows, np.nan, dtype=np.float64)
     
-    for i in prange(rows):
-        if i < period - 1:
-            minarr[i] = np.nan
-            maxarr[i] = np.nan
-            continue
-            
-        start = i - period + 1
+    for i in prange(period - 1, rows):
         minval = np.inf
         maxval = -np.inf
-        has_valid = False
         
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                has_valid = True
-                if val < minval: minval = val
-                if val > maxval: maxval = val
+        for j in range(i - period + 1, i + 1):
+            if not np.isnan(arr[j]):
+                if arr[j] < minval: minval = arr[j]
+                if arr[j] > maxval: maxval = arr[j]
         
-        if has_valid:
+        if minval != np.inf:  # Found valid values
             minarr[i] = minval
             maxarr[i] = maxval
-        else:
-            minarr[i] = np.nan
-            maxarr[i] = np.nan
-            
+    
     return minarr, maxarr
 
 # ============================================================================
