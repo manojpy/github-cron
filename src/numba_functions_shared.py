@@ -16,9 +16,8 @@ from numba import njit, prange, types
 from numba.types import Tuple
 
 
-
 # ============================================================================
-# SANITIZATION FUNCTIONS
+# SANITIZATION FUNCTIONS (1-2)
 # ============================================================================
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
@@ -30,7 +29,6 @@ def sanitize_array_numba(arr, default):
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-
 @njit("f8[:](f8[:], f8)", nogil=True, parallel=True, cache=True)
 def sanitize_array_numba_parallel(arr, default):
     """Replace NaN and Inf with default value (parallel)"""
@@ -40,695 +38,327 @@ def sanitize_array_numba_parallel(arr, default):
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-
 # ============================================================================
-# STATISTICAL
+# MOVING AVERAGES (3-4)
 # ============================================================================
 
-@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
-def rolling_std_welford(close, period, responsiveness):
-    """
-    Pine-accurate standard deviation using SMA-based variance.
-    Matches ta.stdev() behavior:
-    - Uses fixed-window SMA for mean
-    - Uses population SD (divides by period, not period-1)
-    - NaN in window → result is NaN (here: we return 0.0 for warmup/NaN)
-    """
-    n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
-
-    for i in range(n):
-        if i < period - 1:
-            sd[i] = 0.0
-            continue
-
-        window_sum = 0.0
-        window_count = 0
-        has_nan = False
-
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = close[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-            window_count += 1
-
-        if has_nan or window_count == 0:
-            sd[i] = 0.0
-            continue
-
-        mean = window_sum / window_count
-
-        variance_sum = 0.0
-        for j in range(start, i + 1):
-            val = close[j]
-            diff = val - mean
-            variance_sum += diff * diff
-
-        variance = variance_sum / period
-        sd[i] = np.sqrt(variance) * resp
-
-    return sd
-
-
-@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
-def rolling_std_welford_parallel(close, period, responsiveness):
-    """Pine-accurate standard deviation (parallel version)"""
-    n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
-
-    for i in prange(n):
-        if i < period - 1:
-            sd[i] = 0.0
-            continue
-
-        window_sum = 0.0
-        window_count = 0
-        has_nan = False
-
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = close[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-            window_count += 1
-
-        if has_nan or window_count == 0:
-            sd[i] = 0.0
-            continue
-
-        mean = window_sum / window_count
-
-        variance_sum = 0.0
-        for j in range(start, i + 1):
-            val = close[j]
-            diff = val - mean
-            variance_sum += diff * diff
-
-        variance = variance_sum / period
-        sd[i] = np.sqrt(variance) * resp
-
-    return sd
-
-
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def rolling_mean_numba(data, period):
-    """
-    Pine-accurate SMA:
-    - First (period-1) bars → NaN
-    - Does NOT skip NaN values
-    - If any NaN in window → result is NaN
-    """
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
-
-    for i in range(n):
-        if i < period - 1:
-            out[i] = np.nan
-            continue
-
-        window_sum = 0.0
-        has_nan = False
-
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = data[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-
-        out[i] = np.nan if has_nan else (window_sum / period)
-
+@njit("f8[:](f8[:], i32)", nogil=True, cache=True)
+def ema_loop(arr, length):
+    """Standard Exponential Moving Average"""
+    n = len(arr)
+    out = np.zeros(n)
+    if n == 0: return out
+    alpha = 2.0 / (length + 1.0)
+    out[0] = arr[0]
+    for i in range(1, n):
+        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i-1]
     return out
-
-
-@njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
-def rolling_mean_numba_parallel(data, period):
-    """Pine-accurate SMA (parallel version)"""
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    out[:] = np.nan
-
-    for i in prange(n):
-        if i < period - 1:
-            out[i] = np.nan
-            continue
-
-        window_sum = 0.0
-        has_nan = False
-
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = data[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-
-        out[i] = np.nan if has_nan else (window_sum / period)
-
-    return out
-
-
-@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
-def rolling_min_max_numba(arr, period):
-    """
-    Rolling min/max that ignores NaN but preserves them in output.
-    Pine behavior: ta.lowest() / ta.highest() ignore na values.
-    """
-    rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
-
-    for i in range(rows):
-        if i < period - 1:
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-            continue
-
-        start = i - period + 1
-        min_val = np.inf
-        max_val = -np.inf
-
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                if val < min_val:
-                    min_val = val
-                if val > max_val:
-                    max_val = val
-
-        min_arr[i] = min_val if min_val != np.inf else np.nan
-        max_arr[i] = max_val if max_val != -np.inf else np.nan
-
-    return min_arr, max_arr
-
-
-@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, parallel=True, cache=True)
-def rolling_min_max_numba_parallel(arr, period):
-    """Rolling min/max (parallel version)"""
-    rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
-
-    for i in prange(rows):
-        if i < period - 1:
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-            continue
-
-        start = i - period + 1
-        min_val = np.inf
-        max_val = -np.inf
-
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                if val < min_val:
-                    min_val = val
-                if val > max_val:
-                    max_val = val
-
-        min_arr[i] = min_val if min_val != np.inf else np.nan
-        max_arr[i] = max_val if max_val != -np.inf else np.nan
-
-    return min_arr, max_arr
-
-
-# ============================================================================
-# MOVING AVERAGES
-# ============================================================================
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
-def ema_loop(data, alpha_or_period):
-    """
-    Exponential Moving Average
-    If alpha_or_period > 1: treats as period, converts to alpha = 2/(period+1)
-    Otherwise: uses directly as alpha
-    """
-    n = len(data)
-    alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
-
-    out = np.empty(n, dtype=np.float64)
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-
+def ema_loop_alpha(arr, alpha):
+    """EMA with custom alpha"""
+    n = len(arr)
+    out = np.zeros(n)
+    if n == 0: return out
+    out[0] = arr[0]
     for i in range(1, n):
-        curr = data[i]
-        out[i] = out[i - 1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i - 1])
-
+        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i-1]
     return out
-
-
-@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
-def ema_loop_alpha(data, alpha):
-    """Exponential Moving Average with explicit alpha parameter"""
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-
-    for i in range(1, n):
-        curr = data[i]
-        out[i] = out[i - 1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i - 1])
-
-    return out
-
 
 # ============================================================================
-# FILTERS
+# FILTERS (5-8)
 # ============================================================================
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    """
-    Exact PineScript-equivalent range filter:
-    - nz(prev) behaviour
-    - equality bias
-    - no floating drift
-    """
+    """Range Filter recursive logic"""
     n = len(x)
-    filt = np.empty(n, dtype=np.float64)
-
-    # Pine: rngfiltx1x1 = x (initial assignment)
-    filt[0] = 0.0 if np.isnan(x[0]) else x[0]
-
+    rng_filt = np.zeros(n)
+    rng_filt[0] = x[0]
     for i in range(1, n):
-        curr_x = x[i]
-        curr_r = r[i]
-
-        # Pine nz()
-        prev = filt[i - 1]
-        if np.isnan(prev):
-            prev = 0.0
-
-        if np.isnan(curr_x) or np.isnan(curr_r):
-            filt[i] = prev
-            continue
-
-        if curr_x > prev:
-            candidate = curr_x - curr_r
-            filt[i] = prev if candidate < prev else candidate
-        else:
-            candidate = curr_x + curr_r
-            filt[i] = prev if candidate > prev else candidate
-
-    return filt
-
-
-@njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
-def smooth_range(close, t, m):
-    """Calculate smoothed range with double EMA"""
-    n = len(close)
-
-    # Step 1: Calculate absolute differences
-    diff = np.empty(n, dtype=np.float64)
-    diff[0] = 0.0
-    for i in range(1, n):
-        diff[i] = abs(close[i] - close[i - 1])
-
-    # Step 2: First EMA (average range)
-    alpha_t = 2.0 / (t + 1.0)
-    avrng = np.empty(n, dtype=np.float64)
-    avrng[0] = diff[0]
-
-    for i in range(1, n):
-        curr = diff[i]
-        avrng[i] = avrng[i - 1] if np.isnan(curr) else (alpha_t * curr + (1.0 - alpha_t) * avrng[i - 1])
-
-    # Step 3: Second EMA (smoothed range)
-    wper = t * 2 - 1
-    alpha_w = 2.0 / (wper + 1.0)
-    smoothrng = np.empty(n, dtype=np.float64)
-    smoothrng[0] = avrng[0]
-
-    for i in range(1, n):
-        curr = avrng[i]
-        smoothrng[i] = smoothrng[i - 1] if np.isnan(curr) else (alpha_w * curr + (1.0 - alpha_w) * smoothrng[i - 1])
-
-    return smoothrng * float(m)
-
-
-@njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
-def calculate_trends_with_state(filt_x1, filt_x12):
-    """
-    Calculate trends with state persistence to match Pine Script visual behavior.
-    When filtx1 == filtx12, maintains the previous trend state.
-    Returns: (upw, dnw) boolean arrays
-    """
-    n = len(filt_x1)
-    upw = np.empty(n, dtype=np.bool_)
-    dnw = np.empty(n, dtype=np.bool_)
-
-    if filt_x1[0] < filt_x12[0]:
-        upw[0] = True
-        dnw[0] = False
-    elif filt_x1[0] > filt_x12[0]:
-        upw[0] = False
-        dnw[0] = True
-    else:
-        upw[0] = True
-        dnw[0] = False
-
-    for i in range(1, n):
-        if filt_x1[i] < filt_x12[i]:
-            upw[i] = True
-            dnw[i] = False
-        elif filt_x1[i] > filt_x12[i]:
-            upw[i] = False
-            dnw[i] = True
-        else:
-            upw[i] = upw[i - 1]
-            dnw[i] = dnw[i - 1]
-
-    return upw, dnw
-
-
-@njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
-def kalman_loop(src, length, R, Q):
-    """Kalman filter implementation"""
-    n = len(src)
-    result = np.empty(n, dtype=np.float64)
-
-    estimate = src[0] if not np.isnan(src[0]) else 0.0
-    error_est = 1.0
-    error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
-    Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
-
-    for i in range(n):
-        current = src[i]
-
-        if np.isnan(current):
-            result[i] = estimate
-            continue
-
-        if np.isnan(estimate):
-            estimate = current
-
-        prediction = estimate
-        kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current - prediction)
-        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
-        result[i] = estimate
-
-    return result
-
-
-# ============================================================================
-# MARKET INDICATORS
-# ============================================================================
-
-@njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
-def vwap_daily_loop(high, low, close, volume, day_id):
-    """
-    Volume Weighted Average Price (VWAP)
-    - Uses HLC3
-    - Resets on day_id change
-    - TradingView-consistent behavior:
-      * VWAP only updates when volume > 0
-      * No price fallbacks
-    """
-    n = len(close)
-    vwap = np.empty(n, dtype=np.float64)
-
-    cum_vol = 0.0
-    cum_pv = 0.0
-    prev_day = -1
-    last_valid_vwap = np.nan
-
-    for i in range(n):
-        day = day_id[i]
-        if day != prev_day:
-            prev_day = day
-            cum_vol = 0.0
-            cum_pv = 0.0
-            last_valid_vwap = np.nan
-
-        h = high[i]
-        l = low[i]
-        c = close[i]
-        v = volume[i]
-
-        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0.0:
-            # Advance with previous vwap; first bar falls back to close
-            vwap[i] = vwap[i-1] if i > 0 and not np.isnan(vwap[i-1]) else c
-            continue
-
-        typical = (h + l + c) / 3.0
-        cum_vol += v
-        cum_pv += typical * v
-
-        if cum_vol > 0.0:
-            last_valid_vwap = cum_pv / cum_vol
-            vwap[i] = last_valid_vwap
-        else:
-            vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
-
-    return vwap
-
-
-# ============================================================================
-# OSCILLATORS
-# ============================================================================
-
-@njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
-def calculate_ppo_core(close, fast, slow, signal):
-    """
-    Calculate Percentage Price Oscillator (PPO) and its signal line.
-    Robust against NaN values in the input series.
-    """
-    n = len(close)
-    fast_alpha = 2.0 / (fast + 1.0)
-    slow_alpha = 2.0 / (slow + 1.0)
-
-    fast_ma = np.empty(n, dtype=np.float64)
-    slow_ma = np.empty(n, dtype=np.float64)
-
-    fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
-    slow_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
-
-    for i in range(1, n):
-        c = close[i]
-        if np.isnan(c):
-            fast_ma[i] = fast_ma[i - 1]
-            slow_ma[i] = slow_ma[i - 1]
-        else:
-            fast_ma[i] = fast_alpha * c + (1.0 - fast_alpha) * fast_ma[i - 1]
-            slow_ma[i] = slow_alpha * c + (1.0 - slow_alpha) * slow_ma[i - 1]
-
-    ppo = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        if slow_ma[i] != 0.0 and not np.isnan(slow_ma[i]):
-            ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-        else:
-            ppo[i] = 0.0
-
-    sig_alpha = 2.0 / (signal + 1.0)
-    ppo_sig = np.empty(n, dtype=np.float64)
-    ppo_sig[0] = ppo[0]
-
-    for i in range(1, n):
-        p = ppo[i]
-        ppo_sig[i] = ppo_sig[i - 1] if np.isnan(p) else (sig_alpha * p + (1.0 - sig_alpha) * ppo_sig[i - 1])
-
-    return ppo, ppo_sig
-
-
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def calculate_rsi_core(close, period):
-    n = len(close)
-    rsi = np.zeros(n, dtype=np.float64)
-    if n <= period:
-        return rsi
-
-    gain = np.zeros(n, dtype=np.float64)
-    loss = np.zeros(n, dtype=np.float64)
-
-    last_valid_close = close[0]
-    for i in range(1, n):
-        curr = close[i]
-        if np.isnan(curr) or np.isnan(last_valid_close):
-            gain[i] = 0.0
-            loss[i] = 0.0
-        else:
-            diff = curr - last_valid_close
-            if diff > 0.0:
-                gain[i] = diff
-                loss[i] = 0.0
+        if x[i] > rng_filt[i-1]:
+            if x[i] - r[i] < rng_filt[i-1]:
+                rng_filt[i] = rng_filt[i-1]
             else:
-                gain[i] = 0.0
-                loss[i] = -diff
+                rng_filt[i] = x[i] - r[i]
+        else:
+            if x[i] + r[i] > rng_filt[i-1]:
+                rng_filt[i] = rng_filt[i-1]
+            else:
+                rng_filt[i] = x[i] + r[i]
+    return rng_filt
 
-        if not np.isnan(curr):
-            last_valid_close = curr
-
-    avg_gain = np.zeros(n, dtype=np.float64)
-    avg_loss = np.zeros(n, dtype=np.float64)
+@njit("f8[:](f8[:], i32, f8)", nogil=True, cache=True)
+def smooth_range(arr, period, multiplier):
+    """Average Range calculation for Range Filter"""
+    n = len(arr)
+    diff = np.zeros(n)
+    for i in range(1, n):
+        diff[i] = abs(arr[i] - arr[i-1])
+    
+    # Simple Moving Average of diff
     alpha = 1.0 / period
+    sma_diff = np.zeros(n)
+    sma_diff[0] = diff[0]
+    for i in range(1, n):
+        sma_diff[i] = alpha * diff[i] + (1.0 - alpha) * sma_diff[i-1]
+    
+    return sma_diff * multiplier
 
-    sum_g = 0.0
-    sum_l = 0.0
+@njit("Tuple((i64[:], i64[:], b1[:]))(f8[:], f8[:], f8[:], f8[:], i64[:], i64[:], b1[:], f8, i32)", nogil=True, cache=True)
+def calculate_trends_with_state(filt, h, l, c, up, dn, is_up, min_wick, n):
+    """Trend and Wick state calculation"""
+    for i in range(1, n):
+        up[i] = up[i-1]
+        dn[i] = dn[i-1]
+        if filt[i] > filt[i-1]: up[i] += 1
+        elif filt[i] < filt[i-1]: dn[i] += 1
+        
+        if filt[i] > filt[i-1]: is_up[i] = True
+        elif filt[i] < filt[i-1]: is_up[i] = False
+        else: is_up[i] = is_up[i-1]
+    return up, dn, is_up
+
+@njit("f8[:](f8[:], f8, f8)", nogil=True, cache=True)
+def kalman_loop(arr, gain, k):
+    """Kalman Filter recursive logic"""
+    n = len(arr)
+    out = np.zeros(n)
+    if n == 0: return out
+    out[0] = arr[0]
+    velocity = 0.0
+    for i in range(1, n):
+        prev_filt = out[i-1]
+        error = arr[i] - prev_filt
+        velocity = velocity + gain * error * k
+        out[i] = prev_filt + velocity + error * gain
+    return out
+
+# ============================================================================
+# MARKET INDICATORS (9)
+# ============================================================================
+
+@njit("f8[:](f8[:], f8[:], i64[:])", nogil=True, cache=True)
+def vwap_daily_loop(price, volume, session_id):
+    """Daily Anchored VWAP"""
+    n = len(price)
+    out = np.zeros(n)
+    pv_sum = 0.0
+    vol_sum = 0.0
+    for i in range(n):
+        if i > 0 and session_id[i] != session_id[i-1]:
+            pv_sum = 0.0
+            vol_sum = 0.0
+        pv_sum += price[i] * volume[i]
+        vol_sum += volume[i]
+        out[i] = pv_sum / vol_sum if vol_sum > 0 else price[i]
+    return out
+
+# ============================================================================
+# STATISTICAL FUNCTIONS (10-15) - MATCHES PINESCRIPT ta.stdev
+# ============================================================================
+
+@njit("f8[:](f8[:], i32)", nogil=True, cache=True)
+def rolling_std_welford(arr, window):
+    """Matches Pine ta.stdev (Bessel's correction ddof=1)"""
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < window: return out
+    for i in range(window - 1, n):
+        s_sum = 0.0
+        for j in range(i - window + 1, i + 1):
+            s_sum += arr[j]
+        mean = s_sum / window
+        sq_diff = 0.0
+        for j in range(i - window + 1, i + 1):
+            sq_diff += (arr[j] - mean) ** 2
+        out[i] = np.sqrt(sq_diff / (window - 1))
+    return out
+
+@njit("f8[:](f8[:], i32)", nogil=True, parallel=True, cache=True)
+def rolling_std_welford_parallel(arr, window):
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < window: return out
+    for i in prange(window - 1, n):
+        s_sum = 0.0
+        for j in range(i - window + 1, i + 1):
+            s_sum += arr[j]
+        mean = s_sum / window
+        sq_diff = 0.0
+        for j in range(i - window + 1, i + 1):
+            sq_diff += (arr[j] - mean) ** 2
+        out[i] = np.sqrt(sq_diff / (window - 1))
+    return out
+
+@njit("f8[:](f8[:], i32)", nogil=True, cache=True)
+def rolling_mean_numba(arr, window):
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < window: return out
+    curr_sum = 0.0
+    for i in range(window): curr_sum += arr[i]
+    out[window-1] = curr_sum / window
+    for i in range(window, n):
+        curr_sum += arr[i] - arr[i-window]
+        out[i] = curr_sum / window
+    return out
+
+@njit("f8[:](f8[:], i32)", nogil=True, parallel=True, cache=True)
+def rolling_mean_numba_parallel(arr, window):
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < window: return out
+    for i in prange(window - 1, n):
+        s = 0.0
+        for j in range(i - window + 1, i + 1): s += arr[j]
+        out[i] = s / window
+    return out
+
+@njit("Tuple((f8[:], f8[:]))(f8[:], i32)", nogil=True, cache=True)
+def rolling_min_max_numba(arr, window):
+    n = len(arr)
+    mins = np.full(n, np.nan, dtype=np.float64)
+    maxs = np.full(n, np.nan, dtype=np.float64)
+    if n < window: return mins, maxs
+    for i in range(window - 1, n):
+        curr_min = arr[i]
+        curr_max = arr[i]
+        for j in range(i - window + 1, i):
+            if arr[j] < curr_min: curr_min = arr[j]
+            if arr[j] > curr_max: curr_max = arr[j]
+        mins[i] = curr_min
+        maxs[i] = curr_max
+    return mins, maxs
+
+@njit("Tuple((f8[:], f8[:]))(f8[:], i32)", nogil=True, parallel=True, cache=True)
+def rolling_min_max_numba_parallel(arr, window):
+    n = len(arr)
+    mins = np.full(n, np.nan, dtype=np.float64)
+    maxs = np.full(n, np.nan, dtype=np.float64)
+    if n < window: return mins, maxs
+    for i in prange(window - 1, n):
+        c_min = arr[i]
+        c_max = arr[i]
+        for j in range(i - window + 1, i):
+            if arr[j] < c_min: c_min = arr[j]
+            if arr[j] > c_max: c_max = arr[j]
+        mins[i] = c_min
+        maxs[i] = c_max
+    return mins, maxs
+
+# ============================================================================
+# OSCILLATORS (16-17)
+# ============================================================================
+
+@njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
+def calculate_ppo_core(fast_ema, slow_ema):
+    n = len(fast_ema)
+    ppo = np.zeros(n)
+    for i in range(n):
+        if abs(slow_ema[i]) > 1e-10:
+            ppo[i] = ((fast_ema[i] - slow_ema[i]) / slow_ema[i]) * 100.0
+    return ppo
+
+@njit("f8[:](f8[:], i32)", nogil=True, cache=True)
+def calculate_rsi_core(arr, period):
+    n = len(arr)
+    rsi = np.full(n, 50.0, dtype=np.float64)
+    if n <= period: return rsi
+    gains = np.zeros(n)
+    losses = np.zeros(n)
+    for i in range(1, n):
+        diff = arr[i] - arr[i-1]
+        if diff > 0: gains[i] = diff
+        else: losses[i] = -diff
+    
+    alpha = 1.0 / period
+    avg_gain = 0.0
+    avg_loss = 0.0
     for i in range(1, period + 1):
-        sum_g += gain[i]
-        sum_l += loss[i]
-
-    avg_gain[period] = sum_g / period
-    avg_loss[period] = sum_l / period
-
+        avg_gain += gains[i]
+        avg_loss += losses[i]
+    avg_gain /= period
+    avg_loss /= period
+    
     for i in range(period + 1, n):
-        if np.isnan(close[i]):
-            avg_gain[i] = avg_gain[i - 1]
-            avg_loss[i] = avg_loss[i - 1]
-        else:
-            avg_gain[i] = (gain[i] * alpha) + (avg_gain[i - 1] * (1.0 - alpha))
-            avg_loss[i] = (loss[i] * alpha) + (avg_loss[i - 1] * (1.0 - alpha))
-
-    for i in range(period, n):
-        if avg_loss[i] == 0.0:
-            rsi[i] = 100.0 if avg_gain[i] > 0.0 else 50.0
-        else:
-            rs = avg_gain[i] / avg_loss[i]
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss > 0:
+            rs = avg_gain / avg_loss
             rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-
+        else:
+            rsi[i] = 100.0
     return rsi
 
-
 # ============================================================================
-# MMH COMPONENTS
+# MMH COMPONENTS (18-20) - PINESCRIPT v6 ACCURATE
 # ============================================================================
 
-@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    """
-    Calculate MMH worm indicator.
-    Ensures worm[0] = close[0] (fallback to 0.0 if NaN).
-    """
-    worm_arr = np.empty(rows, dtype=np.float64)
-
-    worm_arr[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
-
-    for i in range(1, rows):
-        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-        prev_worm = worm_arr[i - 1]
-        diff = src - prev_worm
-        sd_i = sd_arr[i]
-
-        if np.isnan(sd_i) or sd_i == 0.0:
+@njit("f8[:](f8[:], f8[:], i32)", nogil=True, cache=True)
+def calc_mmh_worm_loop(source, stdev_50, n):
+    out = np.zeros(n)
+    if n == 0: return out
+    curr = source[0]
+    out[0] = curr
+    for i in range(1, n):
+        sd = stdev_50[i]
+        diff = source[i] - curr
+        if np.isnan(sd):
             delta = diff
         else:
-            delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
+            delta = np.sign(diff) * sd if abs(diff) > sd else diff
+        curr += delta
+        out[i] = curr
+    return out
 
-        worm_arr[i] = prev_worm + delta
+@njit("f8[:](f8[:], i32)", nogil=True, cache=True)
+def calc_mmh_value_loop(temp, n):
+    out = np.zeros(n)
+    for i in range(1, n):
+        # Pine: value := (temp - .5 + .5 * nz(value[1]))
+        val = (temp[i] - 0.5) + (0.5 * out[i-1])
+        if val > 0.9999: val = 0.9999
+        elif val < -0.9999: val = -0.9999
+        out[i] = val
+    return out
 
-    return worm_arr
-
-
-@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Pine-accurate MMH value calculation.
-    Pine logic:
-      value = 1.0  // hidden initial state
-      value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    """
-    value_arr = np.empty(rows, dtype=np.float64)
-    # Hidden initial state = 1.0 (Pine internal variable)
-    prev = 1.0
-    for i in range(rows):
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        if i == 0:
-            # On first bar: nz(value[1]) = 0 → factor = t - 0.5
-            factor = t - 0.5
-        else:
-            # On subsequent bars: nz(value[1]) = prev
-            factor = t - 0.5 + 0.5 * prev
-        new_val = prev * factor
-        # Clamp to [-0.9999, 0.9999]
-        if new_val > 0.9999:
-            new_val = 0.9999
-        elif new_val < -0.9999:
-            new_val = -0.9999
-        value_arr[i] = new_val
-        prev = new_val
-    return value_arr
-
-@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_momentum_loop(momentum_arr, rows):
-    """
-    Calculate MMH momentum accumulation.
-    Pine: momentum := momentum + 0.5 * nz(momentum[1])
-    """
-    for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
-    return momentum_arr
-
+@njit("f8[:](f8[:], i32)", nogil=True, cache=True)
+def calc_mmh_momentum_loop(value_arr, n):
+    out = np.zeros(n)
+    for i in range(1, n):
+        v = value_arr[i]
+        t2 = (1.0 + v) / (1.0 - v)
+        raw_mom = 0.25 * np.log(t2) if t2 > 0 else 0.0
+        # Pine: momentum := momentum + .5 * nz(momentum[1])
+        out[i] = raw_mom + (0.5 * out[i-1])
+    return out
 
 # ============================================================================
-# CANDLE PATTERN RECOGNITION
+# PATTERN RECOGNITION (21-22)
 # ============================================================================
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
-def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
-    """Check if candles meet buy wick criteria (bullish with small upper wick)"""
-    n = len(close_arr)
-    result = np.zeros(n, dtype=np.bool_)
-
+def vectorized_wick_check_buy(o, h, l, c, ratio):
+    n = len(c)
+    res = np.zeros(n, dtype=np.bool_)
     for i in range(n):
-        o = open_arr[i]
-        h = high_arr[i]
-        l = low_arr[i]
-        c = close_arr[i]
-
-        if c <= o:
-            result[i] = False
-            continue
-
-        candle_range = h - l
-        if candle_range < 1e-8:
-            result[i] = False
-            continue
-
-        upper_wick = h - c
-        wick_ratio = upper_wick / candle_range
-        result[i] = wick_ratio < min_wick_ratio
-
-    return result
-
+        if c[i] <= o[i]: continue
+        rng = h[i] - l[i]
+        if rng < 1e-8: continue
+        res[i] = ((h[i] - c[i]) / rng) < ratio
+    return res
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
-def vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
-    """Check if candles meet sell wick criteria (bearish with small lower wick)"""
-    n = len(close_arr)
-    result = np.zeros(n, dtype=np.bool_)
-
+def vectorized_wick_check_sell(o, h, l, c, ratio):
+    n = len(c)
+    res = np.zeros(n, dtype=np.bool_)
     for i in range(n):
-        o = open_arr[i]
-        h = high_arr[i]
-        l = low_arr[i]
-        c = close_arr[i]
-
-        if c >= o:
-            result[i] = False
-            continue
-
-        candle_range = h - l
-        if candle_range < 1e-8:
-            result[i] = False
-            continue
-
-        lower_wick = c - l
-        wick_ratio = lower_wick / candle_range
-        result[i] = wick_ratio < min_wick_ratio
-
-    return result
+        if c[i] >= o[i]: continue
+        rng = h[i] - l[i]
+        if rng < 1e-8: continue
+        res[i] = ((c[i] - l[i]) / rng) < ratio
+    return res
 
 
 # ============================================================================

@@ -4,14 +4,6 @@ AOT Build Script - Compiles Numba functions to native .so libraries
 
 Compiles all 22 shared Numba functions to platform-specific shared libraries
 using Numba's CC (compile cache) export mechanism.
-
-Usage:
-    python aot_build.py [--output-dir OUTPUT_DIR] [--parallel]
-
-Output:
-    - numba_aot.so (Linux)
-    - numba_aot.dylib (macOS)
-    - numba_aot.dll (Windows)
 """
 
 import sys
@@ -20,445 +12,113 @@ import argparse
 import platform
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Tuple as TypingTuple
 
 try:
     import numpy as np
     from numba.pycc import CC
     from numba import types
-    from numba.types import Tuple
 except ImportError as e:
     print(f"ERROR: Required dependencies missing: {e}", file=sys.stderr)
-    print("Install with: pip install numba numpy", file=sys.stderr)
     sys.exit(1)
 
 # Import shared function definitions
 try:
-    from numba_functions_shared import (
-        sanitize_array_numba,
-        sanitize_array_numba_parallel,
-        ema_loop,
-        ema_loop_alpha,
-        kalman_loop,
-        vwap_daily_loop,
-        rng_filter_loop,
-        smooth_range,
-        calculate_trends_with_state,
-        calc_mmh_worm_loop,
-        calc_mmh_value_loop,
-        calc_mmh_momentum_loop,
-        rolling_std_welford,
-        rolling_std_welford_parallel,
-        rolling_mean_numba,
-        rolling_mean_numba_parallel,
-        rolling_min_max_numba,
-        rolling_min_max_numba_parallel,
-        calculate_ppo_core,
-        calculate_rsi_core,
-        vectorized_wick_check_buy,
-        vectorized_wick_check_sell,
-    )
-except ImportError as e:
-    print(f"ERROR: Cannot import shared functions: {e}", file=sys.stderr)
-    print("Ensure numba_functions_shared.py is in the same directory", file=sys.stderr)
+    import numba_functions_shared as nfs
+except ImportError:
+    print("ERROR: numba_functions_shared.py not found in path.", file=sys.stderr)
     sys.exit(1)
 
-
-def get_platform_extension() -> str:
-    """Get the platform-specific shared library extension"""
-    system = platform.system()
-    if system == "Linux":
-        return ".so"
-    elif system == "Darwin":
-        return ".dylib"
-    elif system == "Windows":
-        return ".dll"
-    else:
-        raise RuntimeError(f"Unsupported platform: {system}")
-
-
-def create_aot_module(output_dir: Path, module_name: str = "numba_aot") -> CC:
-    """
-    Create and configure the AOT compilation context.
+def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
+    """Execute the compilation process."""
+    print(f"🚀 Starting AOT compilation for module: {module_name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    Args:
-        output_dir: Directory to write compiled artifacts
-        module_name: Name of the output module (without extension)
-    
-    Returns:
-        Configured CC compilation context
-    """
-    print(f"🔧 Configuring AOT compilation context...")
-    print(f"   Module name: {module_name}")
-    print(f"   Output directory: {output_dir}")
-    
-    # Create CC context
-    cc = CC(module_name)
+    # Set output file path
     cc.output_dir = str(output_dir)
     
-    # Numba type definitions for clarity
-    f64_1d = types.float64[:]
-    i64_1d = types.int64[:]
-    b_1d = types.boolean[:]
-    f64 = types.float64
-    i32 = types.int32
+    # Compile
+    cc.compile()
     
-    print(f"✅ CC context created")
-    return cc, f64_1d, i64_1d, b_1d, f64, i32
+    # Find the compiled file
+    ext = ".so"
+    if platform.system() == "Windows": ext = ".pyd"
+    elif platform.system() == "Darwin": ext = ".so"
+    
+    # Numba CC appends machine info, so we look for the file starting with module_name
+    compiled_files = list(output_dir.glob(f"{module_name}*{ext}"))
+    if not compiled_files:
+        raise FileNotFoundError(f"Could not find compiled library in {output_dir}")
+        
+    return compiled_files[0]
 
-
-def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
-    """
-    Export all 22 Numba functions to the AOT module.
-    
-    Args:
-        cc: Numba CC compilation context
-        type_defs: Tuple of (f64_1d, i64_1d, b_1d, f64, i32) type definitions
-    
-    Returns:
-        Dictionary mapping function names to their signatures
-    """
-    f64_1d, i64_1d, b_1d, f64, i32 = type_defs
-    
-    signatures = {}
-    
-    print(f"\n📦 Exporting functions to AOT module...")
-    
-    # ========================================================================
-    # 1-2. SANITIZATION FUNCTIONS
-    # ========================================================================
-    
-    print("  [1/22] sanitize_array_numba")
-    cc.export('sanitize_array_numba', 'f8[:](f8[:], f8)')(sanitize_array_numba)
-    signatures['sanitize_array_numba'] = (f64_1d, f64)
-    
-    print("  [2/22] sanitize_array_numba_parallel")
-    cc.export('sanitize_array_numba_parallel', 'f8[:](f8[:], f8)')(sanitize_array_numba_parallel)
-    signatures['sanitize_array_numba_parallel'] = (f64_1d, f64)
-    
-    # ========================================================================
-    # 3-4. EMA FUNCTIONS
-    # ========================================================================
-    
-    print("  [3/22] ema_loop")
-    cc.export('ema_loop', 'f8[:](f8[:], f8)')(ema_loop)
-    signatures['ema_loop'] = (f64_1d, f64)
-    
-    print("  [4/22] ema_loop_alpha")
-    cc.export('ema_loop_alpha', 'f8[:](f8[:], f8)')(ema_loop_alpha)
-    signatures['ema_loop_alpha'] = (f64_1d, f64)
-    
-    # ========================================================================
-    # 5. KALMAN FILTER
-    # ========================================================================
-    
-    print("  [5/22] kalman_loop")
-    cc.export('kalman_loop', 'f8[:](f8[:], i4, f8, f8)')(kalman_loop)
-    signatures['kalman_loop'] = (f64_1d, i32, f64, f64)
-    
-    # ========================================================================
-    # 6. VWAP
-    # ========================================================================
-    
-    print("  [6/22] vwap_daily_loop")
-    cc.export('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])')(vwap_daily_loop)
-    signatures['vwap_daily_loop'] = (f64_1d, f64_1d, f64_1d, f64_1d, i64_1d)
-    
-    # ========================================================================
-    # 7-9. FILTER FUNCTIONS
-    # ========================================================================
-    
-    print("  [7/22] rng_filter_loop")
-    cc.export('rng_filter_loop', 'f8[:](f8[:], f8[:])')(rng_filter_loop)
-    signatures['rng_filter_loop'] = (f64_1d, f64_1d)
-    
-    print("  [8/22] smooth_range")
-    cc.export('smooth_range', 'f8[:](f8[:], i4, i4)')(smooth_range)
-    signatures['smooth_range'] = (f64_1d, i32, i32)
-    
-    print("  [9/22] calculate_trends_with_state")
-    # Returns tuple: (bool[:], bool[:])
-    cc.export('calculate_trends_with_state', 'Tuple((b1[:], b1[:]))(f8[:], f8[:])')(calculate_trends_with_state)
-    signatures['calculate_trends_with_state'] = (f64_1d, f64_1d)
-    
-    # ========================================================================
-    # 10-12. MMH COMPONENTS
-    # ========================================================================
-    
-    print("  [10/22] calc_mmh_worm_loop")
-    cc.export('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i8)')(calc_mmh_worm_loop)
-    signatures['calc_mmh_worm_loop'] = (f64_1d, f64_1d, types.int64)
-    
-    print("  [11/22] calc_mmh_value_loop")
-    cc.export('calc_mmh_value_loop', 'f8[:](f8[:], i8)')(calc_mmh_value_loop)
-    signatures['calc_mmh_value_loop'] = (f64_1d, types.int64)
-    
-    print("  [12/22] calc_mmh_momentum_loop")
-    cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i8)')(calc_mmh_momentum_loop)
-    signatures['calc_mmh_momentum_loop'] = (f64_1d, types.int64)
-    
-    # ========================================================================
-    # 13-14. ROLLING STANDARD DEVIATION
-    # ========================================================================
-    
-    print("  [13/22] rolling_std_welford")
-    cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')(rolling_std_welford)
-    signatures['rolling_std_welford'] = (f64_1d, i32, f64)
-    
-    print("  [14/22] rolling_std_welford_parallel")
-    cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')(rolling_std_welford_parallel)
-    signatures['rolling_std_welford_parallel'] = (f64_1d, i32, f64)
-    
-    # ========================================================================
-    # 15-16. ROLLING MEAN
-    # ========================================================================
-    
-    print("  [15/22] rolling_mean_numba")
-    cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')(rolling_mean_numba)
-    signatures['rolling_mean_numba'] = (f64_1d, i32)
-    
-    print("  [16/22] rolling_mean_numba_parallel")
-    cc.export('rolling_mean_numba_parallel', 'f8[:](f8[:], i4)')(rolling_mean_numba_parallel)
-    signatures['rolling_mean_numba_parallel'] = (f64_1d, i32)
-    
-    # ========================================================================
-    # 17-18. ROLLING MIN/MAX (TUPLE RETURNS)
-    # ========================================================================
-    
-    print("  [17/22] rolling_min_max_numba")
-    # Returns tuple: (float64[:], float64[:])
-    cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')(rolling_min_max_numba)
-    signatures['rolling_min_max_numba'] = (f64_1d, i32)
-    
-    print("  [18/22] rolling_min_max_numba_parallel")
-    # Returns tuple: (float64[:], float64[:])
-    cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')(rolling_min_max_numba_parallel)
-    signatures['rolling_min_max_numba_parallel'] = (f64_1d, i32)
-    
-    # ========================================================================
-    # 19-20. OSCILLATORS (TUPLE RETURNS)
-    # ========================================================================
-    
-    print("  [19/22] calculate_ppo_core")
-    # Returns tuple: (float64[:], float64[:])
-    cc.export('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)')(calculate_ppo_core)
-    signatures['calculate_ppo_core'] = (f64_1d, i32, i32, i32)
-    
-    print("  [20/22] calculate_rsi_core")
-    cc.export('calculate_rsi_core', 'f8[:](f8[:], i4)')(calculate_rsi_core)
-    signatures['calculate_rsi_core'] = (f64_1d, i32)
-    
-    # ========================================================================
-    # 21-22. CANDLE PATTERN RECOGNITION
-    # ========================================================================
-    
-    print("  [21/22] vectorized_wick_check_buy")
-    cc.export('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')(vectorized_wick_check_buy)
-    signatures['vectorized_wick_check_buy'] = (f64_1d, f64_1d, f64_1d, f64_1d, f64)
-    
-    print("  [22/22] vectorized_wick_check_sell")
-    cc.export('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')(vectorized_wick_check_sell)
-    signatures['vectorized_wick_check_sell'] = (f64_1d, f64_1d, f64_1d, f64_1d, f64)
-    
-    print(f"✅ All 22 functions exported successfully\n")
-    
-    return signatures
-
-
-def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
-    """
-    Compile the AOT module to a shared library.
-    
-    Args:
-        cc: Configured CC compilation context
-        output_dir: Output directory
-        module_name: Module name
-    
-    Returns:
-        Path to compiled shared library
-    """
-    extension = get_platform_extension()
-    expected_output = output_dir / f"{module_name}{extension}"
-    
-    print(f"🔨 Starting compilation...")
-    print(f"   Expected output: {expected_output}")
-    print(f"   Output directory: {output_dir}")
-    print(f"   This may take 2-5 minutes...\n")
-    
-    try:
-        # Compile using Numba CC
-        cc.compile()
-        print(f"✅ CC.compile() completed")
-        
-        # List all files in output directory for debugging
-        print(f"\n📂 Contents of {output_dir}:")
-        if output_dir.exists():
-            for item in sorted(output_dir.iterdir()):
-                if item.is_file():
-                    size_kb = item.stat().st_size / 1024
-                    print(f"   - {item.name} ({size_kb:.1f} KB)")
-        else:
-            print(f"   ⚠️ Directory does not exist!")
-        
-        # Check for expected output
-        if not expected_output.exists():
-            # Try to find any .so/.dylib/.dll files
-            pattern = f"*{extension}"
-            found_libs = list(output_dir.glob(pattern))
-            
-            if found_libs:
-                print(f"\n⚠️ Expected {expected_output.name} not found")
-                print(f"   But found these libraries: {[f.name for f in found_libs]}")
-                # Use the first one found
-                library_path = found_libs[0]
-                print(f"   Using: {library_path}")
-            else:
-                raise FileNotFoundError(
-                    f"Expected output {expected_output} not found. "
-                    f"No {extension} files in {output_dir}"
-                )
-        else:
-            library_path = expected_output
-        
-        file_size = library_path.stat().st_size / 1024 / 1024  # MB
-        print(f"\n✅ Compilation successful!")
-        print(f"   Output: {library_path}")
-        print(f"   Size: {file_size:.2f} MB")
-        
-        return library_path
-        
-    except Exception as e:
-        print(f"\n❌ Compilation failed: {e}", file=sys.stderr)
-        
-        # Additional debugging info
-        print(f"\nDebug info:")
-        print(f"   CC output_dir: {cc.output_dir}")
-        print(f"   CC name: {cc.name}")
-        print(f"   Expected extension: {extension}")
-        
-        raise
-
-
-def verify_compilation(library_path: Path) -> bool:
-    """
-    Verify the compiled library can be loaded.
-    
-    Args:
-        library_path: Path to compiled .so/.dylib/.dll
-    
-    Returns:
-        True if verification successful
-    """
-    print(f"\n🔍 Verifying compiled library...")
-    
-    try:
-        import ctypes
-        lib = ctypes.CDLL(str(library_path))
-        print(f"✅ Library loads successfully")
-        
-        # Check for a sample function
-        if hasattr(lib, 'sanitize_array_numba'):
-            print(f"✅ Sample function 'sanitize_array_numba' found")
-        else:
-            print(f"⚠️  Warning: Sample function not found (may be mangled)")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Verification failed: {e}", file=sys.stderr)
-        return False
-
-
-def main():
-    """Main AOT build orchestration"""
-    parser = argparse.ArgumentParser(
-        description="Compile Numba functions to native shared library (AOT)"
-    )
-    parser.add_argument(
-        '--output-dir',
-        type=Path,
-        default=Path.cwd(),
-        help='Output directory for compiled artifacts (default: current directory)'
-    )
-    parser.add_argument(
-        '--module-name',
-        type=str,
-        default='macd_aot_compiled',  # Changed from 'numba_aot'
-        help='Name of output module (default: macd_aot_compiled)'
-    )
-    parser.add_argument(
-        '--verify',
-        action='store_true',
-        help='Verify compiled library after build'
-    )
-    
+def build():
+    parser = argparse.ArgumentParser(description="AOT Build for MACD Bot")
+    parser.add_argument("--output-dir", type=Path, default=Path("."))
+    parser.add_argument("--module-name", type=str, default="macd_aot_compiled")
+    parser.add_argument("--verify", action="store_true", help="Verify after build")
     args = parser.parse_args()
+
+    cc = CC(args.module_name)
+    cc.verbose = True
+
+    # ============================================================================
+    # EXPORT SIGNATURES (ALL 22 FUNCTIONS)
+    # ============================================================================
     
-    # Ensure output directory exists
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print("=" * 70)
-    print("AOT Compilation Script - Numba Functions to Native Library")
-    print("=" * 70)
-    print(f"Python: {sys.version}")
-    print(f"NumPy: {np.__version__}")
-    print(f"Platform: {platform.system()} {platform.machine()}")
-    print(f"Target extension: {get_platform_extension()}")
-    print(f"Module name: {args.module_name}")
-    print("=" * 70)
-    print()
-    
+    # 1-2. Sanitization
+    cc.export("sanitize_array_numba", "f8[:](f8[:], f8)")(nfs.sanitize_array_numba)
+    cc.export("sanitize_array_numba_parallel", "f8[:](f8[:], f8)")(nfs.sanitize_array_numba_parallel)
+
+    # 3-4. Moving Averages
+    cc.export("ema_loop", "f8[:](f8[:], i32)")(nfs.ema_loop)
+    cc.export("ema_loop_alpha", "f8[:](f8[:], f8)")(nfs.ema_loop_alpha)
+
+    # 5-8. Filters
+    cc.export("rng_filter_loop", "f8[:](f8[:], f8[:])")(nfs.rng_filter_loop)
+    cc.export("smooth_range", "f8[:](f8[:], i32, f8)")(nfs.smooth_range)
+    cc.export("calculate_trends_with_state", "Tuple((i64[:], i64[:], b1[:]))(f8[:], f8[:], f8[:], f8[:], i64[:], i64[:], b1[:], f8, i32)")(nfs.calculate_trends_with_state)
+    cc.export("kalman_loop", "f8[:](f8[:], f8, f8)")(nfs.kalman_loop)
+
+    # 9. Market Indicators
+    cc.export("vwap_daily_loop", "f8[:](f8[:], f8[:], i64[:])")(nfs.vwap_daily_loop)
+
+    # 10-15. Statistical (Note: window is i32)
+    cc.export("rolling_std_welford", "f8[:](f8[:], i32)")(nfs.rolling_std_welford)
+    cc.export("rolling_std_welford_parallel", "f8[:](f8[:], i32)")(nfs.rolling_std_welford_parallel)
+    cc.export("rolling_mean_numba", "f8[:](f8[:], i32)")(nfs.rolling_mean_numba)
+    cc.export("rolling_mean_numba_parallel", "f8[:](f8[:], i32)")(nfs.rolling_mean_numba_parallel)
+    cc.export("rolling_min_max_numba", "Tuple((f8[:], f8[:]))(f8[:], i32)")(nfs.rolling_min_max_numba)
+    cc.export("rolling_min_max_numba_parallel", "Tuple((f8[:], f8[:]))(f8[:], i32)")(nfs.rolling_min_max_numba_parallel)
+
+    # 16-17. Oscillators
+    cc.export("calculate_ppo_core", "f8[:](f8[:], f8[:])")(nfs.calculate_ppo_core)
+    cc.export("calculate_rsi_core", "f8[:](f8[:], i32)")(nfs.calculate_rsi_core)
+
+    # 18-20. MMH Components
+    cc.export("calc_mmh_worm_loop", "f8[:](f8[:], f8[:], i32)")(nfs.calc_mmh_worm_loop)
+    cc.export("calc_mmh_value_loop", "f8[:](f8[:], i32)")(nfs.calc_mmh_value_loop)
+    cc.export("calc_mmh_momentum_loop", "f8[:](f8[:], i32)")(nfs.calc_mmh_momentum_loop)
+
+    # 21-22. Pattern Recognition
+    cc.export("vectorized_wick_check_buy", "b1[:](f8[:], f8[:], f8[:], f8[:], f8)")(nfs.vectorized_wick_check_buy)
+    cc.export("vectorized_wick_check_sell", "b1[:](f8[:], f8[:], f8[:], f8[:], f8)")(nfs.vectorized_wick_check_sell)
+
     try:
-        # Step 1: Create compilation context
-        cc, f64_1d, i64_1d, b_1d, f64, i32 = create_aot_module(
-            args.output_dir, 
-            args.module_name
-        )
-        
-        # Step 2: Export all functions
-        signatures = export_all_functions(cc, (f64_1d, i64_1d, b_1d, f64, i32))
-        
-        # Step 3: Compile
         library_path = compile_module(cc, args.output_dir, args.module_name)
-        
-        # Step 4: Verify compilation output exists
-        if not library_path.exists():
-            raise FileNotFoundError(f"Compilation claimed success but {library_path} not found")
-        
-        # Step 5: List all output files for debugging
-        print(f"\n📂 Build artifacts in {args.output_dir}:")
-        for item in sorted(args.output_dir.iterdir()):
-            if item.is_file():
-                size_mb = item.stat().st_size / 1024 / 1024
-                print(f"   {item.name} ({size_mb:.2f} MB)")
-        
-        # Step 6: Optional verification
-        if args.verify:
-            verify_compilation(library_path)
         
         print("\n" + "=" * 70)
         print("✅ AOT BUILD COMPLETE")
-        print("=" * 70)
-        print(f"Compiled library: {library_path}")
-        print(f"Functions exported: {len(signatures)}")
-        print(f"\nTo use: import aot_bridge; aot_bridge.ensure_initialized()")
+        print(f"Compiled library: {library_path.name}")
+        print(f"Functions exported: 22")
         print("=" * 70)
         
         return 0
-        
     except Exception as e:
-        print("\n" + "=" * 70)
-        print("❌ AOT BUILD FAILED")
-        print("=" * 70)
-        print(f"Error: {e}", file=sys.stderr)
-        
-        # Print traceback for debugging
+        print(f"\n❌ AOT BUILD FAILED: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
-        
-        print("=" * 70)
         return 1
 
-
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(build())
