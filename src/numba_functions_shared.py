@@ -631,20 +631,29 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Calculate MMH value indicator.
-    Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    """
-    value_arr = np.zeros(rows, dtype=np.float64)
-    weight = 1.0
+    value_arr = np.empty(rows, dtype=np.float64)
+    # Initialize first value: Pine uses initial value = 1.0, then:
+    # value[0] = 1.0 * (temp[0] - 0.5 + 0.5 * 0) = temp[0] - 0.5
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
-    value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
+    value_arr[0] = t0 - 0.5
+    # Clamp first value
+    if value_arr[0] > 0.9999:
+        value_arr[0] = 0.9999
+    elif value_arr[0] < -0.9999:
+        value_arr[0] = -0.9999
+
+    # Recursion: value[i] = value[i-1] * (temp[i] - 0.5 + 0.5 * value[i-1])
     for i in range(1, rows):
-        prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = weight * (t - 0.5 + 0.5 * prev_v)
-        value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
+        prev = value_arr[i - 1]
+        factor = t - 0.5 + 0.5 * prev
+        v = prev * factor
+        # Clamp
+        if v > 0.9999:
+            v = 0.9999
+        elif v < -0.9999:
+            v = -0.9999
+        value_arr[i] = v
     return value_arr
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
