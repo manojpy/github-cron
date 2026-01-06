@@ -631,27 +631,23 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Pine-accurate MMH value loop
-    value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    """
     value_arr = np.empty(rows, dtype=np.float64)
-
-    # Pine starts with na
     value_arr[0] = np.nan
 
     for i in range(1, rows):
         t = temp_arr[i]
 
-        # Pine: if temp is na → value is na
         if np.isnan(t):
             value_arr[i] = np.nan
             continue
 
         prev_v = value_arr[i - 1]
-        prev_v = 0.0 if np.isnan(prev_v) else prev_v
 
-        value_arr[i] = prev_v * (t - 0.5 + 0.5 * prev_v)
+        # Pine bootstrap
+        if np.isnan(prev_v):
+            value_arr[i] = t - 0.5
+        else:
+            value_arr[i] = prev_v * (t - 0.5 + 0.5 * prev_v)
 
         # Pine clamp
         if value_arr[i] > 0.9999:
@@ -660,6 +656,7 @@ def calc_mmh_value_loop(temp_arr, rows):
             value_arr[i] = -0.9999
 
     return value_arr
+
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
