@@ -702,12 +702,15 @@ def calculate_magical_momentum_hist(
         else:
             ma = rolling_mean_numba(close_c, period)
 
-        # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
-        with np.errstate(divide='ignore', invalid='ignore'):
-            raw = (worm_arr - ma) / worm_arr
-        
-        # Pine behavior: if worm == 0 → result is na (not 0)
-        # We keep NaN/Inf here intentionally
+        # 4. Calculate raw momentum - handle worm == 0 EXPLICITLY
+        raw = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            w = worm_arr[i]
+            m = ma[i]
+            if np.isnan(w) or w == 0.0 or np.isnan(m):
+                raw[i] = np.nan
+            else:
+                raw[i] = (w - m) / w
 
         # 5. Calculate rolling min/max (they handle NaN correctly)
         if use_parallel and rows >= 250:
@@ -715,23 +718,31 @@ def calculate_magical_momentum_hist(
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
-        # 6. Calculate temp (normalized)
+        # 6. Calculate temp (normalized) - handle edge cases properly
         denom = max_med - min_med
-        with np.errstate(divide='ignore', invalid='ignore'):
-            temp = (raw - min_med) / denom
-        
-        # Handle edge cases for temp
-        temp = np.where(np.abs(denom) < 1e-10, 0.5, temp)
-        temp = np.where(np.isnan(temp), 0.5, temp)
-        temp = np.where(np.isinf(temp), 0.5, temp)
-        temp = np.clip(temp, 0.0, 1.0)
+        temp = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            r_val = raw[i]
+            d_val = denom[i]
+            if np.isnan(r_val):
+                temp[i] = np.nan
+            elif np.abs(d_val) < 1e-10:
+                temp[i] = 0.5
+            else:
+                t_val = (r_val - min_med[i]) / d_val
+                if np.isnan(t_val) or np.isinf(t_val):
+                    temp[i] = 0.5
+                else:
+                    temp[i] = np.clip(t_val, 0.0, 1.0)
 
-        print(f"temp range: [{temp.min():.4f}, {temp.max():.4f}]")
-        print(f"temp sample: {temp[:10]}")
-
-        # 7. Calculate value
-        value_arr = calc_mmh_value_loop(temp, rows)
-        value_arr = np.clip(value_arr, -0.9999, 0.9999)
+        # 7. Calculate value - start with 0.0
+        value_arr = np.empty(rows, dtype=np.float64)
+        value_arr[0] = 0.0  # Pine: first value is effectively 0
+        for i in range(1, rows):
+            prev_v = value_arr[i - 1]
+            t = temp[i] if not np.isnan(temp[i]) else 0.5
+            v = t - 0.5 + 0.5 * prev_v
+            value_arr[i] = np.clip(v, -0.9999, 0.9999)
 
         print(f"value_arr range: [{value_arr.min():.4f}, {value_arr.max():.4f}]")
         print(f"value_arr sample: {value_arr[:10]}")
