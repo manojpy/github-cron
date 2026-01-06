@@ -688,7 +688,13 @@ def calculate_magical_momentum_hist(
         # 4. Calculate raw momentum - KEEP NaN/Inf, don't sanitize yet
         with np.errstate(divide='ignore', invalid='ignore'):
             raw = (worm_arr - ma) / worm_arr
-        
+        raw = np.where(np.abs(worm_arr) < 1e-10, np.nan, raw)  # Explicit worm=0 → NaN
+
+        print(f"raw range: [{raw.min():.4f}, {raw.max():.4f}]")
+        print(f"raw sample: {raw[-10:]}")  # Last 10
+        print(f"worm[-5:]: {worm_arr[-5:]}")
+        print(f"ma[-5:]: {ma[-5:]}")
+
         # Pine behavior: if worm == 0 → result is na (not 0)
         # We keep NaN/Inf here intentionally
 
