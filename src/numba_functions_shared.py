@@ -476,8 +476,7 @@ def vwap_daily_loop(high, low, close, volume, day_id):
         v = volume[i]
 
         if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0.0:
-            # Advance with previous vwap; first bar falls back to close
-            vwap[i] = vwap[i-1] if i > 0 and not np.isnan(vwap[i-1]) else c
+            vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
             continue
 
         typical = (h + l + c) / 3.0

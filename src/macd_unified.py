@@ -601,12 +601,10 @@ def calculate_vwap_numpy(
 
         vwap = vwap_daily_loop(high, low, close, volume, day_id)
 
-        tail_default = (
-            vwap[-2] if len(vwap) > 1 and not np.isnan(vwap[-2])
-            else (close[-1] if len(close) > 0 else 0.0)
+        vwap = sanitize_array_numba(
+            vwap,
+            default=close[-1] if n > 0 else 0.0
         )
-        vwap = sanitize_array_numba(vwap, tail_default)
-
         return vwap
 
     except Exception:
