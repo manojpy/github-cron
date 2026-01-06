@@ -704,6 +704,10 @@ def calculate_magical_momentum_hist(
         else:
             min_med, max_med = rolling_min_max_numba(raw, period)
 
+        print(f"min_med[-5:]: {min_med[-5:]}")
+        print(f"max_med[-5:]: {max_med[-5:]}")
+        print(f"denom[-5:]: {denom[-5:]}")  # Should NOT be zero
+
         # 6. Calculate temp (normalized)
         denom = max_med - min_med
         with np.errstate(divide='ignore', invalid='ignore'):
