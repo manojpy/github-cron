@@ -659,7 +659,7 @@ def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9,
-    use_parallel: bool = False
+    use_parallel: bool = False,
     keep_na: bool = False,
 ) -> np.ndarray:
 
