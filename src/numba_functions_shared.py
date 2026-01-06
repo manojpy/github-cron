@@ -631,37 +631,27 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Calculate MMH value indicator.
-    Pine formula: value := value * (temp - 0.5 + 0.5 * nz(value[1]))
-    """
     value_arr = np.zeros(rows, dtype=np.float64)
-    weight = 1.0
-
+    
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    value_arr[0] = weight * (t0 - 0.5 + 0.5 * 0.0)
-    value_arr[0] = -0.9999 if value_arr[0] < -0.9999 else (0.9999 if value_arr[0] > 0.9999 else value_arr[0])
+    value_arr[0] = np.clip(1.0 * (t0 - 0.5 + 0.5 * 0.0), -0.9999, 0.9999)  # 0.5*2=1.0 scaling
 
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = weight * (t - 0.5 + 0.5 * prev_v)
-        value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
+        v = 1.0 * (t - 0.5 + 0.5 * prev_v)
+        value_arr[i] = np.clip(v, -0.9999, 0.9999)
 
     return value_arr
 
-
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
-    """
-    Calculate MMH momentum accumulation.
-    Pine: momentum := momentum + 0.5 * nz(momentum[1])
-    """
+    momentum_out = np.empty_like(momentum_arr)
+    momentum_out[0] = momentum_arr[0]
     for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
-    return momentum_arr
+        prev = momentum_out[i - 1] if not np.isnan(momentum_out[i - 1]) else 0.0
+        momentum_out[i] = momentum_arr[i] + 0.5 * prev  # Pine: momentum + 0.5*nz(momentum[1])
+    return momentum_out
 
 
 # ============================================================================
