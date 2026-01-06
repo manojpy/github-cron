@@ -94,7 +94,7 @@ def rolling_std_welford(close, period, responsiveness):
     return sd
 
 
-@njit("f8[:](f8[:], i4, f8)", nogil=True, parallel=True, cache=True)
+@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std_welford_parallel(close, period, responsiveness):
     """Pine-accurate standard deviation (parallel version)"""
     n = len(close)
