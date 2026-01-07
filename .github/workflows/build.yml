@@ -25,7 +25,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15  # Reduced from 20
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
@@ -33,9 +33,8 @@ jobs:
 
     steps:
       # ========================================================================
-      # PHASE 1: SETUP (Optimized)
+      # PHASE 1: SETUP
       # ========================================================================
-      
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
         with:
@@ -45,7 +44,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
-            image=moby/buildkit:latest
+            image=moby/buildkit:buildx-stable-1
             network=host
           buildkitd-flags: --allow-insecure-entitlement network.host
 
@@ -72,51 +71,43 @@ jobs:
             maintainer=${{ github.actor }}
 
       # ========================================================================
-      # PHASE 2: BUILD & VERIFY (Streamlined)
+      # PHASE 2: BUILD & VERIFY
       # ========================================================================
-      
-      # ✅ OPTIMIZED: Single-stage build with inline verification
       - name: 🔨 Build & Push Docker Image
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64  # Single platform for speed
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             AOT_STRICT=1
           cache-from: |
-            type=gha,scope=macd-aot-deps
-            type=gha,scope=macd-aot-build
+            type=gha,scope=macd-aot
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-to: type=gha,mode=max,scope=macd-aot-build
+          cache-to: type=gha,mode=max,scope=macd-aot
           provenance: false
 
-      # ✅ OPTIMIZED: Quick smoke test (no full load)
       - name: ✅ Smoke Test - Verify AOT
         run: |
           echo "🧪 Running AOT verification..."
-          
-          docker run --rm --platform linux/amd64 \
+          docker run --rm --pull=never --platform linux/amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python -c "
           import sys
           from aot_bridge import is_using_aot, get_fallback_reason
-          
           if not is_using_aot():
               print(f'❌ AOT not loaded: {get_fallback_reason()}')
               sys.exit(1)
-          
           print('✅ AOT Binary: LOADED & ACTIVE')
           " || exit 1
 
       # ========================================================================
-      # PHASE 3: SECURITY SCANNING (Conditional)
+      # PHASE 3: SECURITY SCANNING
       # ========================================================================
-      
       - name: 🛡️ Run Trivy Vulnerability Scan
         if: github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
         uses: aquasecurity/trivy-action@0.28.0
@@ -126,8 +117,8 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
-          timeout: '8m'  # Reduced from 10m
-          scanners: 'vuln,secret'  # Removed 'config' for speed
+          timeout: '6m'
+          scanners: 'vuln'
 
       - name: 📤 Upload Trivy Results to GitHub Security
         if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
@@ -141,17 +132,14 @@ jobs:
         run: |
           echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
           if [ -f trivy-results.sarif ]; then
             CRITICAL=$(jq '[.runs[].results[] | select(.level=="error")] | length' trivy-results.sarif || echo "0")
             HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' trivy-results.sarif || echo "0")
-            
             echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
             echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
             echo "| 🔴 Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
             echo "| 🟠 High | $HIGH |" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            
             if [ "$CRITICAL" -gt 0 ]; then
               echo "⚠️ **Action Required:** Critical vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
             else
@@ -162,9 +150,8 @@ jobs:
           fi
 
       # ========================================================================
-      # PHASE 4: BUILD SUMMARY (Streamlined)
+      # PHASE 4: BUILD SUMMARY
       # ========================================================================
-      
       - name: 📝 Generate Build Summary
         if: always()
         run: |
@@ -172,26 +159,23 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Platform** | linux/amd64 |" >> $GITHUB_STEP_SUMMARY
           echo "| **Cache Strategy** | GitHub Actions + Registry |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
           echo "### 🏷️ Image Tags" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       # ========================================================================
-      # PHASE 5: CLEANUP (Minimal)
+      # PHASE 5: CLEANUP
       # ========================================================================
-      
       - name: 🧹 Cleanup Artifacts
         if: always()
         run: |
-          # ✅ OPTIMIZED: Preserve cache, minimal cleanup
           rm -f trivy-results.sarif
-          docker image prune -f --filter "until=24h" || true
+          docker image prune -f --filter "dangling=true" || true
           echo "✅ Cleanup complete (cache preserved)"

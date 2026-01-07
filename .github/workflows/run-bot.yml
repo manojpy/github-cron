@@ -20,21 +20,20 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 300  # 5 minutes (sufficient for 30-40s job)
+  BOT_TIMEOUT: 300  # 5 minutes
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8  # Reduced from 10
+    timeout-minutes: 8
     permissions:
       contents: read
       packages: read
 
     steps:
       # ========================================================================
-      # PHASE 1: SETUP (Optimized)
+      # PHASE 1: SETUP
       # ========================================================================
-      
       - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
         with:
@@ -50,80 +49,61 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ OPTIMIZED: Faster pull with layer caching
       - name: 🐳 Pull Latest AOT Image
         id: image_pull
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          
-          echo "📦 Pulling AOT image with layer cache..."
+          echo "📦 Pulling AOT image..."
           START_TIME=$(date +%s)
-          
-          # Enable BuildKit with aggressive caching
-          export DOCKER_BUILDKIT=1
-          export BUILDKIT_PROGRESS=plain
-          
-          if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
+          if docker pull --quiet --platform linux/amd64 --pull=never "$IMAGE_REF"; then
             END_TIME=$(date +%s)
-            PULL_TIME=$((END_TIME - START_TIME))
-            echo "✅ Image pulled in ${PULL_TIME}s"
-            echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
+            echo "✅ Image ready in $((END_TIME - START_TIME))s"
+            echo "pull_time=$((END_TIME - START_TIME))" >> $GITHUB_OUTPUT
           else
             echo "❌ Failed to pull image"
             exit 1
           fi
-          
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
-      # ✅ OPTIMIZED: Combined secrets check (faster)
       - name: 🔍 Verify Secrets
         run: |
           MISSING=()
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
-          
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing required secrets: ${MISSING[*]}"
             exit 1
           fi
-          
           echo "✅ All secrets configured"
 
       # ========================================================================
-      # PHASE 2: BOT EXECUTION (Optimized)
+      # PHASE 2: BOT EXECUTION
       # ========================================================================
-      
       - name: 🚀 Execute MACD Bot
         id: bot_run
-        timeout-minutes: 7  # Reduced from 9
+        timeout-minutes: 7
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
-          
           echo "::group::🔥 Starting Bot Execution"
-          echo "┌────────────────────────────────────────┐"
           echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
           echo "🧪 Dry Run: $DRY_RUN"
-          echo "└────────────────────────────────────────┘"
           echo "::endgroup::"
-          
           START_TIME=$(date +%s)
-          
-          # ✅ OPTIMIZED: Reduced tmpfs sizes, optimized resource limits
-          timeout --signal=SIGTERM --kill-after=20s ${{ env.BOT_TIMEOUT }}s docker run \
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
+            --init \
             --name macd_bot_runner \
             --platform linux/amd64 \
             --memory="900m" \
-            --memory-swap="900m" \
             --cpus="2.0" \
             --security-opt=no-new-privileges \
             --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=100m \
-            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=30m \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=20m \
             -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -134,14 +114,11 @@ jobs:
             -e OMP_NUM_THREADS=2 \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
-          
           EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
-          
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-          
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s"
             exit 1
@@ -149,26 +126,21 @@ jobs:
             echo "❌ Bot exited with code $EXIT_CODE"
             exit 1
           fi
-          
           echo "✅ Bot completed successfully in ${DURATION}s"
 
       # ========================================================================
-      # PHASE 3: RESULTS ANALYSIS (Streamlined)
+      # PHASE 3: RESULTS ANALYSIS
       # ========================================================================
-      
       - name: 📊 Parse Execution Results
         if: always()
         id: results
         run: |
           LOG_FILE="logs/bot_output.log"
-          
           if [ ! -f "$LOG_FILE" ]; then
             echo "status=error" >> $GITHUB_OUTPUT
             echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
-          # ✅ OPTIMIZED: Single-pass log parsing
           if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
             STATUS="success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
@@ -186,7 +158,6 @@ jobs:
             STATUS="timeout"
             ERROR_MSG="Execution incomplete or timed out"
           fi
-          
           echo "status=${STATUS}" >> $GITHUB_OUTPUT
           echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
           echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
@@ -200,65 +171,11 @@ jobs:
         run: |
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ## 🤖 MACD Bot Execution Report
-          
           ### 📊 Execution Metrics
-          
           | Metric | Value |
           |--------|-------|
-          | **Status** | ${{ steps.results.outputs.status == 'success' && '✅ Success' || steps.results.outputs.status == 'failed' && '❌ Failed' || '⏱️ Timeout' }} |
+          | **Status** | ${{ steps.results.outputs.status }} |
           | **Timezone** | 🇮🇳 IST (Asia/Kolkata) |
           | **Duration** | ${{ steps.results.outputs.duration }}s |
           | **Pairs Processed** | ${{ steps.results.outputs.pairs }} |
-          | **Alerts Sent** | ${{ steps.results.outputs.alerts }} |
-          | **Memory Peak** | ${{ steps.results.outputs.memory }} |
-          | **Redis Status** | ${{ steps.results.outputs.redis_status }} |
-          | **Image Pull Time** | ${{ steps.image_pull.outputs.pull_time }}s |
-          
-          EOF
-          
-          if [ "${{ steps.results.outputs.status }}" != "success" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ### ❌ Error Details
-          ${{ steps.results.outputs.error_msg }}
-          
-          **Troubleshooting:**
-          - Check the "Execute MACD Bot" step logs for full error trace
-          - Verify Redis is accessible
-          - Ensure API rate limits not exceeded
-          
-          EOF
-          fi
-          
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          
-          ### ⚙️ Runtime Configuration
-          
-          - **Container Resources:** 900MB RAM, 2 CPUs
-          - **Bot Timeout:** ${{ env.BOT_TIMEOUT }}s
-          - **Dry Run Mode:** ${{ github.event.inputs.dry_run || 'false' }}
-          - **AOT Compilation:** ✅ Enabled
-          
-          EOF
-
-      # ========================================================================
-      # PHASE 4: ARTIFACT UPLOAD & CLEANUP (Optimized)
-      # ========================================================================
-      
-      - name: 📦 Upload Execution Logs
-        if: failure()  # ✅ OPTIMIZED: Only upload on failure
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-execution-logs-${{ github.run_number }}
-          path: logs/
-          retention-days: 3  # Reduced from 7
-          if-no-files-found: warn
-
-      - name: 🧹 Cleanup Resources
-        if: always()
-        run: |
-          # ✅ OPTIMIZED: Minimal cleanup, preserve cache
-          docker stop macd_bot_runner 2>/dev/null || true
-          docker rm -f macd_bot_runner 2>/dev/null || true
-          
-          # Don't prune images - preserve layer cache for next run
-          echo "✅ Cleanup complete (cache preserved)"
+          | **Alerts Sent** | ${{ steps.results.outputs.alerts }}
