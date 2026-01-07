@@ -37,12 +37,10 @@ FROM base-deps AS python-deps
 # Core dependencies (rarely change)
 COPY requirements.txt .
 
-# ✅ OPTIMIZED: Install in two phases for better caching
-# Phase 1: Install without compile (faster, better cache hit rate)
-RUN uv pip install --system --no-cache --compile-bytecode-off -r requirements.txt
-
-# Phase 2: Compile bytecode (separate layer for cache efficiency)
-RUN python -m compileall -q /usr/local/lib/python3.11/site-packages && \
+# ✅ OPTIMIZED: Install dependencies with verification
+RUN uv pip install --system --no-cache -r requirements.txt && \
+    # Compile bytecode for faster imports
+    python -m compileall -q /usr/local/lib/python3.11/site-packages && \
     # ✅ NEW: Verify critical imports work
     python -c "import numpy, numba, aiohttp, redis; print('✅ Core deps verified')"
 
