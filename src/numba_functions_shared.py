@@ -45,7 +45,7 @@ def sanitize_array_numba_parallel(arr, default):
 # ============================================================================
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
-def rolling_std_welford(close, period, responsiveness):
+def rolling_std(close, period, responsiveness):
     """
     Pine-accurate standard deviation using SMA-based variance.
     Matches ta.stdev() behavior:
@@ -94,7 +94,7 @@ def rolling_std_welford(close, period, responsiveness):
 
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
-def rolling_std_welford_parallel(close, period, responsiveness):
+def rolling_std_parallel(close, period, responsiveness):
     """Pine-accurate standard deviation (parallel version)"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
@@ -795,8 +795,8 @@ __all__ = [
     'vwap_daily_loop',
 
     # Statistical
-    'rolling_std_welford',
-    'rolling_std_welford_parallel',
+    'rolling_std',
+    'rolling_std_parallel',
     'rolling_mean_numba',
     'rolling_mean_numba_parallel',
     'rolling_min_max_numba',

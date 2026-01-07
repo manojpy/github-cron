@@ -168,8 +168,8 @@ def initialize_jit_fallback() -> None:
             calc_mmh_worm_loop,
             calc_mmh_value_loop,
             calc_mmh_momentum_loop,
-            rolling_std_welford,
-            rolling_std_welford_parallel,
+            rolling_std,
+            rolling_std_parallel,
             rolling_mean_numba,
             rolling_mean_numba_parallel,
             rolling_min_max_numba,
@@ -192,8 +192,8 @@ def initialize_jit_fallback() -> None:
         globals()['_jit_calc_mmh_worm_loop'] = calc_mmh_worm_loop
         globals()['_jit_calc_mmh_value_loop'] = calc_mmh_value_loop
         globals()['_jit_calc_mmh_momentum_loop'] = calc_mmh_momentum_loop
-        globals()['_jit_rolling_std_welford'] = rolling_std_welford
-        globals()['_jit_rolling_std_welford_parallel'] = rolling_std_welford_parallel
+        globals()['_jit_rolling_std'] = rolling_std
+        globals()['_jit_rolling_std_parallel'] = rolling_std_parallel
         globals()['_jit_rolling_mean_numba'] = rolling_mean_numba
         globals()['_jit_rolling_mean_numba_parallel'] = rolling_mean_numba_parallel
         globals()['_jit_rolling_min_max_numba'] = rolling_min_max_numba
@@ -346,18 +346,18 @@ def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     return _jit_calc_mmh_momentum_loop(momentum_arr, rows)
 
 
-def rolling_std_welford(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+def rolling_std(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """Rolling standard deviation"""
     if _using_aot:
-        return _aot_module.rolling_std_welford(close, period, responsiveness)
-    return _jit_rolling_std_welford(close, period, responsiveness)
+        return _aot_module.rolling_std(close, period, responsiveness)
+    return _jit_rolling_std(close, period, responsiveness)
 
 
-def rolling_std_welford_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
+def rolling_std_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     """Rolling standard deviation (parallel)"""
     if _using_aot:
-        return _aot_module.rolling_std_welford_parallel(close, period, responsiveness)
-    return _jit_rolling_std_welford_parallel(close, period, responsiveness)
+        return _aot_module.rolling_std_parallel(close, period, responsiveness)
+    return _jit_rolling_std_parallel(close, period, responsiveness)
 
 
 def rolling_mean_numba(data: np.ndarray, period: int) -> np.ndarray:
@@ -470,8 +470,8 @@ __all__ = [
     'vwap_daily_loop',
 
     # Statistical
-    'rolling_std_welford',
-    'rolling_std_welford_parallel',
+    'rolling_std',
+    'rolling_std_parallel',
     'rolling_mean_numba',
     'rolling_mean_numba_parallel',
     'rolling_min_max_numba',

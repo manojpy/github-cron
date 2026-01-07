@@ -49,8 +49,8 @@ from aot_bridge import (
     calc_mmh_worm_loop,
     calc_mmh_value_loop,
     calc_mmh_momentum_loop,
-    rolling_std_welford,
-    rolling_std_welford_parallel,
+    rolling_std,
+    rolling_std_parallel,
     rolling_mean_numba,
     rolling_mean_numba_parallel,
     rolling_min_max_numba,
@@ -685,9 +685,9 @@ def calculate_magical_momentum_hist(
 
         # 1. Calculate standard deviation (CORRECT - no changes needed)
         if use_parallel and rows >= 250:
-            sd = rolling_std_welford_parallel(close_c, 50, resp_clamped)
+            sd = rolling_std_parallel(close_c, 50, resp_clamped)
         else:
-            sd = rolling_std_welford(close_c, 50, resp_clamped)
+            sd = rolling_std(close_c, 50, resp_clamped)
 
         # 2. Calculate worm (CORRECT - no changes needed)
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
@@ -804,8 +804,8 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.sanitize_array_numba(test_data, 0.0)
         _ = aot_bridge.rolling_mean_numba(test_data, test_int)
         _ = aot_bridge.rolling_mean_numba_parallel(test_data, test_int)
-        _ = aot_bridge.rolling_std_welford(test_data, test_int, 0.5)
-        _ = aot_bridge.rolling_std_welford_parallel(test_data, test_int, 0.5)
+        _ = aot_bridge.rolling_std(test_data, test_int, 0.5)
+        _ = aot_bridge.rolling_std_parallel(test_data, test_int, 0.5)
         _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
         _ = aot_bridge.rolling_min_max_numba_parallel(test_data, test_int)
         _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)

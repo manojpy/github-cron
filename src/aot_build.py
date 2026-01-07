@@ -47,8 +47,8 @@ try:
         calc_mmh_worm_loop,
         calc_mmh_value_loop,
         calc_mmh_momentum_loop,
-        rolling_std_welford,
-        rolling_std_welford_parallel,
+        rolling_std,
+        rolling_std_parallel,
         rolling_mean_numba,
         rolling_mean_numba_parallel,
         rolling_min_max_numba,
@@ -202,12 +202,12 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     # ========================================================================
     
     print("  [13/22] rolling_std_welford")
-    cc.export('rolling_std_welford', 'f8[:](f8[:], i4, f8)')(rolling_std_welford)
-    signatures['rolling_std_welford'] = (f64_1d, i32, f64)
+    cc.export('rolling_std', 'f8[:](f8[:], i4, f8)')(rolling_std)
+    signatures['rolling_std'] = (f64_1d, i32, f64)
     
-    print("  [14/22] rolling_std_welford_parallel")
-    cc.export('rolling_std_welford_parallel', 'f8[:](f8[:], i4, f8)')(rolling_std_welford_parallel)
-    signatures['rolling_std_welford_parallel'] = (f64_1d, i32, f64)
+    print("  [14/22] rolling_std_parallel")
+    cc.export('rolling_std_parallel', 'f8[:](f8[:], i4, f8)')(rolling_std_parallel)
+    signatures['rolling_std_parallel'] = (f64_1d, i32, f64)
     
     # ========================================================================
     # 15-16. ROLLING MEAN
