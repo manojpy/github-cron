@@ -94,8 +94,8 @@ jobs:
       - name: ✅ Smoke Test - Verify AOT
         run: |
           echo "🧪 Running AOT verification..."
-          docker run --rm --pull=never --platform linux/amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+          docker run --rm --platform linux/amd64 \
+            ${{ steps.build.outputs.digest }} \
             python -c "
           import sys
           from aot_bridge import is_using_aot, get_fallback_reason
@@ -104,6 +104,7 @@ jobs:
               sys.exit(1)
           print('✅ AOT Binary: LOADED & ACTIVE')
           " || exit 1
+
 
       # ========================================================================
       # PHASE 3: SECURITY SCANNING
