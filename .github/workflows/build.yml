@@ -124,13 +124,15 @@ jobs:
           import numpy as np, aot_bridge
           aot_bridge.sanitize_array_numba(np.array([1.,np.nan,3.]),0.)
           print('✅ Imports OK')
-          "
+          " 
 
       - name: ✅ Smoke Test – Config Load
         timeout-minutes: 1
         run: |
+          # Replace placeholder with a syntactically-valid dummy token for the test
+          jq '.TELEGRAM_BOT_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"' config_macd.json > config_test.json
           docker run --rm --platform linux/amd64 \
-            -v $PWD/config_macd.json:/app/src/config_macd.json:ro \
+            -v $PWD/config_test.json:/app/src/config_macd.json:ro \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python -c "
           from macd_unified import load_config
