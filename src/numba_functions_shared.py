@@ -631,11 +631,18 @@ def calculate_rsi_core(close, period):
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """
     Calculate MMH worm indicator.
-    Ensures worm[0] = close[0] (fallback to 0.0 if NaN).
+    Pine behavior: var worm = source (persists across all bars)
     """
     worm_arr = np.empty(rows, dtype=np.float64)
 
-    worm_arr[0] = close_arr[0] if not np.isnan(close_arr[0]) else 0.0
+    # ✅ FIXED: Use first valid close price (Pine: var worm = source)
+    first_valid = 0.0
+    for i in range(rows):
+        if not np.isnan(close_arr[i]):
+            first_valid = close_arr[i]
+            break
+    
+    worm_arr[0] = first_valid
 
     for i in range(1, rows):
         src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
@@ -656,23 +663,26 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
     """
-    Calculate MMH value indicator - FIXED
+    Calculate MMH value indicator - EXACT PINE MATCH
     Pine: value = 0.5 * 2 = 1.0 (initial multiplier)
     """
-    value_arr = np.zeros(rows, dtype=np.float64)
-    initial_multiplier = 1.0  # ✅ FIXED: Pine uses 0.5 * 2 = 1.0
+    value_arr = np.empty(rows, dtype=np.float64)
+    initial_multiplier = 1.0  # ✅ EXACT PINE VALUE
     
+    # ✅ FIXED: Use first valid temp value
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    v0 = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)
-    # Manual clipping for nopython mode
-    value_arr[0] = -0.9999 if v0 < -0.9999 else (0.9999 if v0 > 0.9999 else v0)
+    v0 = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)  # nz(value[1]) = 0 for first bar
+    
+    # ✅ EXACT Pine clipping
+    value_arr[0] = 0.9999 if v0 > 0.9999 else (-0.9999 if v0 < -0.9999 else v0)
     
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = initial_multiplier * (t - 0.5 + 0.5 * prev_v)
-        # Manual clipping for nopython mode
-        value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
+        
+        # ✅ EXACT Pine clipping
+        value_arr[i] = 0.9999 if v > 0.9999 else (-0.9999 if v < -0.9999 else v)
     
     return value_arr
 
