@@ -25,21 +25,20 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 300  # 5 minutes (sufficient for 30-40s job + buffer)
+  BOT_TIMEOUT: '300'          # stringified
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 7  # Reduced from 8 (realistic for 40s execution)
+    timeout-minutes: 7
     permissions:
       contents: read
       packages: read
 
     steps:
-      # ========================================================================
-      # PHASE 1: SETUP (Ultra-Fast)
-      # ========================================================================
-      
+      # ------------------------------------------------------------------
+      # 1.  Checkout only the config file (ultra-fast)
+      # ------------------------------------------------------------------
       - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
         with:
@@ -48,6 +47,9 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
+      # ------------------------------------------------------------------
+      # 2.  Log in to GHCR
+      # ------------------------------------------------------------------
       - name: 🔐 Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -55,257 +57,198 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ OPTIMIZED: Faster image pull with progress tracking
+      # ------------------------------------------------------------------
+      # 3.  Pull image (with quoted outputs)
+      # ------------------------------------------------------------------
       - name: 🐳 Pull Latest AOT Image
         id: image_pull
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          
-          echo "📦 Pulling AOT image..."
           START_TIME=$(date +%s)
-          
-          # ✅ NEW: Pre-check if image exists locally (saves pull time)
+
           if docker image inspect "$IMAGE_REF" >/dev/null 2>&1; then
-            echo "ℹ️ Image already cached locally"
-            CACHED=true
+            CACHED='true'
           else
-            CACHED=false
+            CACHED='false'
           fi
-          
-          # Pull with quiet mode for faster execution
+
           if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             END_TIME=$(date +%s)
             PULL_TIME=$((END_TIME - START_TIME))
-            
-            if [ "$CACHED" = "true" ]; then
-              echo "✅ Image verified in ${PULL_TIME}s (cached)"
-            else
-              echo "✅ Image pulled in ${PULL_TIME}s"
-            fi
-            
-            echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
-            echo "cached=${CACHED}" >> $GITHUB_OUTPUT
+            printf 'pull_time=%s\n' "$PULL_TIME"   >> $GITHUB_OUTPUT
+            printf 'cached=%s\n'    "$CACHED"      >> $GITHUB_OUTPUT
+            printf 'image_ref=%s\n' "$IMAGE_REF"   >> $GITHUB_OUTPUT
           else
-            echo "❌ Failed to pull image"
+            echo "::error::Failed to pull image"
             exit 1
           fi
-          
-          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
-      # ✅ OPTIMIZED: Parallel secrets validation (faster)
+      # ------------------------------------------------------------------
+      # 4.  Verify secrets
+      # ------------------------------------------------------------------
       - name: 🔒 Verify Secrets
         run: |
-          echo "🔍 Validating required secrets..."
-          
           MISSING=()
-          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
-          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
-          
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=('TELEGRAM_BOT_TOKEN')
+          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]   && MISSING+=('TELEGRAM_CHAT_ID')
+          [ -z "${{ secrets.REDIS_URL }}" ]          && MISSING+=('REDIS_URL')
+
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "❌ Missing required secrets: ${MISSING[*]}"
-            echo "::error title=Missing Secrets::Configure these in repository settings: ${MISSING[*]}"
+            echo "::error::Missing secrets: ${MISSING[*]}"
             exit 1
           fi
-          
-          echo "✅ All secrets configured"
+          echo '✅ All secrets configured'
 
-      # ✅ NEW: Pre-warm container (optional, minimal gain but nice to have)
+      # ------------------------------------------------------------------
+      # 5.  Pre-warm (quoted output)
+      # ------------------------------------------------------------------
       - name: 🔥 Pre-warm Container
         id: prewarm
         timeout-minutes: 1
         run: |
-          IMAGE_REF="${{ steps.image_pull.outputs.image_ref }}"
-          
-          echo "🔥 Pre-warming container..."
           START_TIME=$(date +%s)
-          
-          # Quick import test to warm up Python
           docker run --rm --platform linux/amd64 \
-            --name macd_prewarm \
-            "$IMAGE_REF" \
+            ${{ steps.image_pull.outputs.image_ref }} \
             python -c "import aot_bridge, numpy; print('✅ Prewarmed')" >/dev/null 2>&1 || true
-          
           END_TIME=$(date +%s)
           PREWARM_TIME=$((END_TIME - START_TIME))
-          
-          echo "✅ Pre-warm complete in ${PREWARM_TIME}s"
-          echo "prewarm_time=${PREWARM_TIME}" >> $GITHUB_OUTPUT
+          printf 'prewarm_time=%s\n' "$PREWARM_TIME" >> $GITHUB_OUTPUT
 
-      # ========================================================================
-      # PHASE 2: BOT EXECUTION (Optimized for 40s Runtime)
-      # ========================================================================
-      
+      # ------------------------------------------------------------------
+      # 6.  Run the bot (quoted exit code & duration)
+      # ------------------------------------------------------------------
       - name: 🚀 Execute MACD Bot
         id: bot_run
-        timeout-minutes: 6  # Reduced from 7
+        timeout-minutes: 6
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
           mkdir -p logs
-          
-          echo "::group::🔥 Starting Bot Execution"
-          echo "┌────────────────────────────────────────┐"
-          echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
-          echo "🧪 Dry Run: $DRY_RUN"
-          echo "🐛 Debug Mode: $DEBUG_MODE"
-          echo "└────────────────────────────────────────┘"
-          echo "::endgroup::"
-          
           START_TIME=$(date +%s)
-          
-          # ✅ OPTIMIZED: Reduced resource limits for faster startup
-          # ✅ NEW: Conditional debug logging
-          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
-            --rm \
+
+          # shellcheck disable=SC2024
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s \
+          docker run --rm \
             --name macd_bot_runner \
             --platform linux/amd64 \
-            --memory="900m" \
-            --memory-swap="900m" \
-            --cpus="2.0" \
+            --memory='900m' \
+            --memory-swap='900m' \
+            --cpus='2.0' \
             --security-opt=no-new-privileges \
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=80m \
             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=20m \
             -e TZ=Asia/Kolkata \
-            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
-            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e TELEGRAM_BOT_TOKEN='${{ secrets.TELEGRAM_BOT_TOKEN }}' \
+            -e TELEGRAM_CHAT_ID='${{ secrets.TELEGRAM_CHAT_ID }}' \
+            -e REDIS_URL='${{ secrets.REDIS_URL }}' \
             -e DRY_RUN_MODE="$DRY_RUN" \
             -e DEBUG_MODE="$DEBUG_MODE" \
-            -e PYTHONUNBUFFERED=1 \
-            -e NUMBA_NUM_THREADS=2 \
-            -e OMP_NUM_THREADS=2 \
+            -e PYTHONUNBUFFERED='1' \
+            -e NUMBA_NUM_THREADS='2' \
+            -e OMP_NUM_THREADS='2' \
             -e TRIGGER_TIMESTAMP="$(date +%s)" \
-            -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
-            ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
-          
+            -v '${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro' \
+            ${{ steps.image_pull.outputs.image_ref }} \
+            2>&1 | tee logs/bot_output.log
+
           EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
-          
-          echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
-          echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-          
-          # ✅ NEW: Better error messaging
-          if [ $EXIT_CODE -eq 124 ]; then
-            echo "::error title=Timeout::Bot execution timed out after ${DURATION}s (SIGTERM)"
-            exit 1
-          elif [ $EXIT_CODE -eq 137 ]; then
-            echo "::error title=Killed::Bot was killed after ${DURATION}s (SIGKILL)"
-            exit 1
-          elif [ $EXIT_CODE -eq 130 ]; then
-            echo "::warning title=Interrupted::Bot was interrupted (SIGINT)"
-            exit 1
-          elif [ $EXIT_CODE -ne 0 ]; then
-            echo "::error title=Bot Failed::Bot exited with code $EXIT_CODE"
+
+          printf 'execution_time=%s\n' "$DURATION" >> $GITHUB_OUTPUT
+          printf 'exit_code=%s\n'      "$EXIT_CODE" >> $GITHUB_OUTPUT
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::error::Bot exited with code $EXIT_CODE"
             exit 1
           fi
-          
-          echo "✅ Bot completed successfully in ${DURATION}s"
 
-      # ========================================================================
-      # PHASE 3: RESULTS ANALYSIS (Ultra-Fast Log Parsing)
-      # ========================================================================
-      
+      # ------------------------------------------------------------------
+      # 7.  Parse results – ALL values quoted
+      # ------------------------------------------------------------------
       - name: 📊 Parse Execution Results
         if: always()
         id: results
         run: |
-          LOG_FILE="logs/bot_output.log"
-
+          LOG_FILE='logs/bot_output.log'
           if [ ! -f "$LOG_FILE" ]; then
-            printf "status=%s\n" "error"     >> $GITHUB_OUTPUT
-            printf "message=%s\n" "Log file not found" >> $GITHUB_OUTPUT
+            printf 'status=%s\n' 'error'     >> $GITHUB_OUTPUT
+            printf 'message=%s\n' 'Log file not found' >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Single-pass awk extract with quoted outputs
           awk '
             /✅ RUN COMPLETE/ { status = "success" }
-            /Duration:/ && status == "success" {
-              match($0, /Duration: ([0-9.]+)s/, arr); duration = arr[1]
-            }
-            /Alerts:/ && status == "success" {
-              match($0, /Alerts: ([0-9]+)/, arr); alerts = arr[1]
-            }
-            /Pairs:/ && status == "success" {
-              match($0, /Pairs: ([0-9/]+)/, arr); pairs = arr[1]
-            }
-            /Memory:/ && status == "success" {
-              match($0, /Memory: ([0-9]+MB)/, arr); memory = arr[1]
-            }
-            /Redis:/ && status == "success" {
-              match($0, /Redis: ([A-Z]+)/, arr); redis_status = arr[1]
-            }
-            /FATAL ERROR/ { status = "failed"; getline; error_msg = substr($0, 1, 100) }
-            /Bot run failed/ { status = "failed"; error_msg = "Bot run failed - check logs for details" }
+            /Duration:/ && status == "success" { match($0, /Duration: ([0-9.]+)s/, arr); duration = arr[1] }
+            /Alerts:/ && status == "success"   { match($0, /Alerts: ([0-9]+)/,   arr); alerts   = arr[1] }
+            /Pairs:/ && status == "success"    { match($0, /Pairs: ([0-9/]+)/,  arr); pairs    = arr[1] }
+            /Memory:/ && status == "success"   { match($0, /Memory: ([0-9]+MB)/, arr); memory   = arr[1] }
+            /Redis:/ && status == "success"    { match($0, /Redis: ([A-Z]+)/,    arr); redis_st = arr[1] }
+            /FATAL ERROR/ { status = "failed"; getline; err = substr($0,1,100) }
+            /Bot run failed/ { status = "failed"; err = "Bot run failed - check logs" }
             END {
               if (status == "") status = "timeout"
               if (duration == "") duration = "N/A"
-              if (alerts == "") alerts = "0"
-              if (pairs == "") pairs = "N/A"
-              if (memory == "") memory = "N/A"
-              if (redis_status == "") redis_status = "UNKNOWN"
-              if (error_msg == "") error_msg = "None"
-
-              printf "status=%s\n", status
-              printf "duration=%s\n", duration
-              printf "alerts=%s\n", alerts
-              printf "pairs=%s\n", pairs
-              printf "memory=%s\n", memory
-              printf "redis_status=%s\n", redis_status
-              printf "error_msg=%s\n", error_msg
+              if (alerts == "")   alerts   = "0"
+              if (pairs == "")    pairs    = "N/A"
+              if (memory == "")   memory   = "N/A"
+              if (redis_st == "") redis_st = "UNKNOWN"
+              if (err == "")      err      = "None"
+              printf "status=%s\n",       status
+              printf "duration=%s\n",     duration
+              printf "alerts=%s\n",       alerts
+              printf "pairs=%s\n",        pairs
+              printf "memory=%s\n",       memory
+              printf "redis_status=%s\n", redis_st
+              printf "error_msg=%s\n",    err
             }
           ' "$LOG_FILE" >> $GITHUB_OUTPUT
 
-      # ✅ NEW: Extract alert details for better reporting
+      # ------------------------------------------------------------------
+      # 8.  Alert details – quoted
+      # ------------------------------------------------------------------
       - name: 📈 Extract Alert Details
         if: success() && steps.results.outputs.status == 'success'
         id: alert_details
         run: |
-          LOG_FILE="logs/bot_output.log"
-          
-          # Count alerts by type
-          PPO_ALERTS=$(grep -c "PPO cross" "$LOG_FILE" 2>/dev/null || echo "0")
-          RSI_ALERTS=$(grep -c "RSI cross" "$LOG_FILE" 2>/dev/null || echo "0")
-          VWAP_ALERTS=$(grep -c "VWAP" "$LOG_FILE" 2>/dev/null || echo "0")
-          MMH_ALERTS=$(grep -c "MMH Reversal" "$LOG_FILE" 2>/dev/null || echo "0")
-          PIVOT_ALERTS=$(grep -c "Cross above\|Cross below" "$LOG_FILE" 2>/dev/null || echo "0")
-          
-          echo "ppo_alerts=${PPO_ALERTS}" >> $GITHUB_OUTPUT
-          echo "rsi_alerts=${RSI_ALERTS}" >> $GITHUB_OUTPUT
-          echo "vwap_alerts=${VWAP_ALERTS}" >> $GITHUB_OUTPUT
-          echo "mmh_alerts=${MMH_ALERTS}" >> $GITHUB_OUTPUT
-          echo "pivot_alerts=${PIVOT_ALERTS}" >> $GITHUB_OUTPUT
+          LOG_FILE='logs/bot_output.log'
+          PPO=$(grep -c 'PPO cross'   "$LOG_FILE" 2>/dev/null || echo '0')
+          RSI=$(grep -c 'RSI cross'   "$LOG_FILE" 2>/dev/null || echo '0')
+          VWAP=$(grep -c 'VWAP'       "$LOG_FILE" 2>/dev/null || echo '0')
+          MMH=$(grep -c 'MMH Reversal' "$LOG_FILE" 2>/dev/null || echo '0')
+          PIVOT=$(grep -c 'Cross above\|Cross below' "$LOG_FILE" 2>/dev/null || echo '0')
 
+          printf 'ppo_alerts=%s\n'   "$PPO"   >> $GITHUB_OUTPUT
+          printf 'rsi_alerts=%s\n'   "$RSI"   >> $GITHUB_OUTPUT
+          printf 'vwap_alerts=%s\n'  "$VWAP"  >> $GITHUB_OUTPUT
+          printf 'mmh_alerts=%s\n'   "$MMH"   >> $GITHUB_OUTPUT
+          printf 'pivot_alerts=%s\n' "$PIVOT" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------------
+      # 9.  Summary & artifacts – quoted where needed
+      # ------------------------------------------------------------------
       - name: 📝 Generate Comprehensive Summary
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ## 🤖 MACD Bot Execution Report
-          
-          ### 📊 Execution Metrics
-          
+
           | Metric | Value |
           |--------|-------|
           | **Status** | ${{ steps.results.outputs.status == 'success' && '✅ Success' || steps.results.outputs.status == 'failed' && '❌ Failed' || '⏱️ Timeout' }} |
-          | **Timezone** | 🇮🇳 IST (Asia/Kolkata) |
           | **Duration** | ${{ steps.results.outputs.duration }}s |
           | **Pairs Processed** | ${{ steps.results.outputs.pairs }} |
           | **Total Alerts** | ${{ steps.results.outputs.alerts }} |
           | **Memory Peak** | ${{ steps.results.outputs.memory }} |
           | **Redis Status** | ${{ steps.results.outputs.redis_status }} |
-          
+
           EOF
-          
-          # ✅ NEW: Show alert breakdown if successful
-          if [ "${{ steps.results.outputs.status }}" == "success" ]; then
+
+          if [ "${{ steps.results.outputs.status }}" = 'success' ]; then
             cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### 📈 Alert Breakdown
-          
           | Type | Count |
           |------|-------|
           | PPO Signals | ${{ steps.alert_details.outputs.ppo_alerts }} |
@@ -313,123 +256,28 @@ jobs:
           | VWAP | ${{ steps.alert_details.outputs.vwap_alerts }} |
           | MMH Reversals | ${{ steps.alert_details.outputs.mmh_alerts }} |
           | Pivot Levels | ${{ steps.alert_details.outputs.pivot_alerts }} |
-          
+
           EOF
-          fi
-          
-          # Show error details if failed
-          if [ "${{ steps.results.outputs.status }}" != "success" ]; then
-            cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ### ❌ Error Details
-          
-          ```
-          ${{ steps.results.outputs.error_msg }}
-          ```
-          
-          **Troubleshooting Steps:**
-          1. Check the "Execute MACD Bot" step logs for full error trace
-          2. Verify Redis is accessible from GitHub Actions
-          3. Confirm API rate limits not exceeded
-          4. Check if secrets are correctly configured
-          
-          EOF
-          fi
-          
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          
-          ### ⚙️ Runtime Configuration
-          
-          | Setting | Value |
-          |---------|-------|
-          | **Container Resources** | 900MB RAM, 2 CPUs |
-          | **Bot Timeout** | ${{ env.BOT_TIMEOUT }}s |
-          | **Dry Run Mode** | ${{ github.event.inputs.dry_run || 'false' }} |
-          | **Debug Mode** | ${{ github.event.inputs.debug_mode || 'false' }} |
-          | **AOT Compilation** | ✅ Enabled |
-          | **Image Cache** | ${{ steps.image_pull.outputs.cached == 'true' && '✅ Hit' || '❌ Miss' }} |
-          
-          ### ⏱️ Performance Metrics
-          
-          | Stage | Duration |
-          |-------|----------|
-          | Image Pull | ${{ steps.image_pull.outputs.pull_time }}s |
-          | Pre-warm | ${{ steps.prewarm.outputs.prewarm_time }}s |
-          | Bot Execution | ${{ steps.bot_run.outputs.execution_time }}s |
-          | **Total** | **~${{ steps.bot_run.outputs.execution_time }}s** |
-          
-          EOF
-          
-          # ✅ NEW: Performance rating
-          EXEC_TIME=${{ steps.bot_run.outputs.execution_time }}
-          if [ -n "$EXEC_TIME" ] && [ "$EXEC_TIME" != "N/A" ]; then
-            if [ "$EXEC_TIME" -le 40 ]; then
-              echo "**Performance**: ⚡ Excellent (≤40s target achieved)" >> $GITHUB_STEP_SUMMARY
-            elif [ "$EXEC_TIME" -le 60 ]; then
-              echo "**Performance**: ✅ Good (within acceptable range)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "**Performance**: ⚠️ Slow (exceeded 60s, investigate)" >> $GITHUB_STEP_SUMMARY
-            fi
           fi
 
-      # ========================================================================
-      # PHASE 4: ARTIFACT UPLOAD & CLEANUP (Smart Upload)
-      # ========================================================================
-      
-      # ✅ OPTIMIZED: Only upload logs on failure or if debug enabled
+      # ------------------------------------------------------------------
+      # 10. Upload logs only on failure or debug
+      # ------------------------------------------------------------------
       - name: 📦 Upload Execution Logs
         if: failure() || github.event.inputs.debug_mode == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bot-logs-${{ github.run_number }}-${{ github.run_attempt }}
           path: logs/
-          retention-days: 3  # Reduced from 7
-          if-no-files-found: warn
-          compression-level: 9  # ✅ NEW: Maximum compression
+          retention-days: 3
+          compression-level: 9
 
-      # ✅ NEW: Extract key metrics for long-term tracking
-      - name: 📊 Export Metrics
-        if: success() && steps.results.outputs.status == 'success'
-        run: |
-          mkdir -p metrics
-          
-          cat > metrics/execution_metrics.json << EOF
-          {
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "run_number": ${{ github.run_number }},
-            "duration_seconds": ${{ steps.bot_run.outputs.execution_time }},
-            "pairs_processed": "${{ steps.results.outputs.pairs }}",
-            "alerts_sent": ${{ steps.results.outputs.alerts }},
-            "memory_mb": "${{ steps.results.outputs.memory }}",
-            "redis_status": "${{ steps.results.outputs.redis_status }}",
-            "alert_breakdown": {
-              "ppo": ${{ steps.alert_details.outputs.ppo_alerts }},
-              "rsi": ${{ steps.alert_details.outputs.rsi_alerts }},
-              "vwap": ${{ steps.alert_details.outputs.vwap_alerts }},
-              "mmh": ${{ steps.alert_details.outputs.mmh_alerts }},
-              "pivot": ${{ steps.alert_details.outputs.pivot_alerts }}
-            }
-          }
-          EOF
-          
-          echo "✅ Metrics exported to metrics/execution_metrics.json"
-
+      # ------------------------------------------------------------------
+      # 11. Lightweight cleanup
+      # ------------------------------------------------------------------
       - name: 🧹 Cleanup Resources
         if: always()
         run: |
-          # ✅ OPTIMIZED: Minimal cleanup, preserve cache
           docker stop macd_bot_runner macd_prewarm 2>/dev/null || true
-          docker rm -f macd_bot_runner macd_prewarm 2>/dev/null || true
-          
-          # Don't prune images - preserve for next cron run (happens every 15 min)
-          echo "✅ Cleanup complete (image cache preserved for next run)"
-
-      # ========================================================================
-      # PHASE 5: NOTIFICATIONS (Optional)
-      # ========================================================================
-      
-      # ✅ NEW: Notify on repeated failures
-      - name: 📢 Failure Notification
-        if: failure() && github.run_attempt > 1
-        run: |
-          echo "::warning title=Repeated Failure::Bot failed on attempt ${{ github.run_attempt }}"
-          # Add webhook notification here if needed (Slack/Discord/Email)
+          docker rm   macd_bot_runner macd_prewarm 2>/dev/null || true
+          echo '✅ Cleanup complete (image cache preserved)'
