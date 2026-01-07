@@ -181,9 +181,7 @@ jobs:
             -e TRIGGER_TIMESTAMP="$(date +%s)" \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
-        env:
-          BOT_TIMEOUT: 30
-
+          
           EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
@@ -217,46 +215,33 @@ jobs:
         id: results
         run: |
           LOG_FILE="logs/bot_output.log"
-          
+
           if [ ! -f "$LOG_FILE" ]; then
-            echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Log file not found" >> $GITHUB_OUTPUT
+            printf "status=%s\n" "error"     >> $GITHUB_OUTPUT
+            printf "message=%s\n" "Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
-          # ✅ OPTIMIZED: Single-pass log parsing with awk (faster than multiple greps)
+
+          # Single-pass awk extract with quoted outputs
           awk '
-            /✅ RUN COMPLETE/ { 
-              status = "success" 
+            /✅ RUN COMPLETE/ { status = "success" }
+            /Duration:/ && status == "success" {
+              match($0, /Duration: ([0-9.]+)s/, arr); duration = arr[1]
             }
-            /Duration:/ && status == "success" { 
-              match($0, /Duration: ([0-9.]+)s/, arr)
-              duration = arr[1]
+            /Alerts:/ && status == "success" {
+              match($0, /Alerts: ([0-9]+)/, arr); alerts = arr[1]
             }
-            /Alerts:/ && status == "success" { 
-              match($0, /Alerts: ([0-9]+)/, arr)
-              alerts = arr[1]
+            /Pairs:/ && status == "success" {
+              match($0, /Pairs: ([0-9/]+)/, arr); pairs = arr[1]
             }
-            /Pairs:/ && status == "success" { 
-              match($0, /Pairs: ([0-9/]+)/, arr)
-              pairs = arr[1]
+            /Memory:/ && status == "success" {
+              match($0, /Memory: ([0-9]+MB)/, arr); memory = arr[1]
             }
-            /Memory:/ && status == "success" { 
-              match($0, /Memory: ([0-9]+MB)/, arr)
-              memory = arr[1]
+            /Redis:/ && status == "success" {
+              match($0, /Redis: ([A-Z]+)/, arr); redis_status = arr[1]
             }
-            /Redis:/ && status == "success" { 
-              match($0, /Redis: ([A-Z]+)/, arr)
-              redis_status = arr[1]
-            }
-            /FATAL ERROR/ { 
-              status = "failed"
-              getline; error_msg = substr($0, 1, 100)
-            }
-            /Bot run failed/ { 
-              status = "failed"
-              error_msg = "Bot run failed - check logs for details"
-            }
+            /FATAL ERROR/ { status = "failed"; getline; error_msg = substr($0, 1, 100) }
+            /Bot run failed/ { status = "failed"; error_msg = "Bot run failed - check logs for details" }
             END {
               if (status == "") status = "timeout"
               if (duration == "") duration = "N/A"
@@ -265,14 +250,14 @@ jobs:
               if (memory == "") memory = "N/A"
               if (redis_status == "") redis_status = "UNKNOWN"
               if (error_msg == "") error_msg = "None"
-              
-              print "status=" status
-              print "duration=" duration
-              print "alerts=" alerts
-              print "pairs=" pairs
-              print "memory=" memory
-              print "redis_status=" redis_status
-              print "error_msg=" error_msg
+
+              printf "status=%s\n", status
+              printf "duration=%s\n", duration
+              printf "alerts=%s\n", alerts
+              printf "pairs=%s\n", pairs
+              printf "memory=%s\n", memory
+              printf "redis_status=%s\n", redis_status
+              printf "error_msg=%s\n", error_msg
             }
           ' "$LOG_FILE" >> $GITHUB_OUTPUT
 
