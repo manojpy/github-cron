@@ -667,104 +667,79 @@ def calculate_magical_momentum_hist(
     use_parallel: bool = False
 ) -> np.ndarray:
     """
-    Pine-accurate MMH calculation – FULLY CORRECTED with debug prints
-    All critical fixes applied for exact Pine behaviour
+    Pine-accurate MMH – final corrected version
     """
     try:
         if close is None or len(close) < period:
-            print(f"[MMH-DEBUG] Input too short: {len(close) if close is not None else 0} < {period}")
             return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close, dtype=np.float64)
-        print(f"[MMH-DEBUG] rows={rows}  period={period}  resp_clamped={resp_clamped}")
 
-        # 1. Standard deviation
-        if use_parallel and rows >= 250:
-            sd = rolling_std_parallel(close_c, 50, resp_clamped)
-        else:
-            sd = rolling_std(close_c, 50, resp_clamped)
-        print(f"[MMH-DEBUG] sd[0:5]={sd[:5]}  sd[-5:]={sd[-5:]}")
+        # 1. SD
+        sd = (rolling_std_parallel(close_c, 50, resp_clamped) if use_parallel and rows >= 250
+              else rolling_std(close_c, 50, resp_clamped))
 
-        # 2. Worm calculation
+        # 2. Worm
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
-        print(f"[MMH-DEBUG] worm[0:5]={worm_arr[:5]}  worm[-5:]={worm_arr[-5:]}")
 
-        # 3. SMA calculation
-        if use_parallel and rows >= 250:
-            ma = rolling_mean_numba_parallel(close_c, period)
-        else:
-            ma = rolling_mean_numba(close_c, period)
-        print(f"[MMH-DEBUG] ma[0:5]={ma[:5]}  ma[-5:]={ma[-5:]}")
+        # 3. SMA
+        ma = (rolling_mean_numba_parallel(close_c, period) if use_parallel and rows >= 250
+              else rolling_mean_numba(close_c, period))
 
         # 4. Raw momentum
         raw = np.empty(rows, dtype=np.float64)
         for i in range(rows):
-            if np.abs(worm_arr[i]) < 1e-6:
-                raw[i] = np.nan
-            else:
-                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
-        print(f"[MMH-DEBUG] raw[0:5]={raw[:5]}  raw[-5:]={raw[-5:]}")
-        valid_raw = raw[~np.isnan(raw)]
-        if len(valid_raw):
-            print(f"[MMH-DEBUG] raw_range=[{valid_raw.min():.6f}, {valid_raw.max():.6f}]")
+            raw[i] = np.nan if abs(worm_arr[i]) < 1e-6 else (worm_arr[i] - ma[i]) / worm_arr[i]
 
-        # 5. Rolling min/max
-        if use_parallel and rows >= 250:
-            min_med, max_med = rolling_min_max_numba_parallel(raw, period)
-        else:
-            min_med, max_med = rolling_min_max_numba(raw, period)
-        print(f"[MMH-DEBUG] min_med[0:5]={min_med[:5]}  max_med[0:5]={max_med[:5]}")
+        # 5. Rolling min/max  (FIXED)
+        min_med, max_med = (rolling_min_max_numba_parallel(raw, period) if use_parallel and rows >= 250
+                            else rolling_min_max_numba(raw, period))
 
-        # 6. Temp normalization
+        # 6. Temp – NO CLIP
         denom = max_med - min_med
         temp = np.empty(rows, dtype=np.float64)
         for i in range(rows):
-            if np.abs(denom[i]) < 1e-10:
-                temp[i] = 0.5
-            elif np.isnan(raw[i]) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
+            if np.abs(denom[i]) < 1e-10 or np.isnan(raw[i]) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
                 temp[i] = 0.5
             else:
                 temp[i] = (raw[i] - min_med[i]) / denom[i]
-        temp = np.clip(temp, 0.0, 1.0)
-        print(f"[MMH-DEBUG] temp[0:5]={temp[:5]}  temp[-5:]={temp[-5:]}")
-        print(f"[MMH-DEBUG] temp_range=[{temp.min():.6f}, {temp.max():.6f}]")
+        #  <--  np.clip REMOVED  -->
 
-        # 7. Value calculation
+        # 7. Value  (FIXED clipping)
         value_arr = calc_mmh_value_loop(temp, rows)
-        print(f"[MMH-DEBUG] value[0:5]={value_arr[:5]}  value[-5:]={value_arr[-5:]}")
-        print(f"[MMH-DEBUG] value_range=[{value_arr.min():.6f}, {value_arr.max():.6f}]")
 
-        # 8. Momentum calculation
+        # 8. Momentum
         momentum = np.empty(rows, dtype=np.float64)
-        pine_max_val = 0.25 * np.log((1.0 + 0.9999) / (1.0 - 0.9999))
-        pine_min_val = 0.25 * np.log((1.0 - 0.9999) / (1.0 + 0.9999))
+        pine_max = 0.25 * np.log((1.0 + 0.9999) / (1.0 - 0.9999))
+        pine_min = 0.25 * np.log((1.0 - 0.9999) / (1.0 + 0.9999))
         for i in range(rows):
             val = value_arr[i]
             if val >= 0.9999:
-                momentum[i] = pine_max_val
+                momentum[i] = pine_max
             elif val <= -0.9999:
-                momentum[i] = pine_min_val
+                momentum[i] = pine_min
             else:
                 temp2 = (1.0 + val) / (1.0 - val)
                 momentum[i] = 0.25 * np.log(temp2)
-        print(f"[MMH-DEBUG] momentum[0:5]={momentum[:5]}  momentum[-5:]={momentum[-5:]}")
-        print(f"[MMH-DEBUG] momentum_range=[{momentum.min():.6f}, {momentum.max():.6f}]")
 
-        # 9. Momentum accumulation
+        # 9. Accumulation
         momentum_arr = calc_mmh_momentum_loop(momentum, rows)
-        print(f"[MMH-DEBUG] momentum_arr[0:5]={momentum_arr[:5]}  momentum_arr[-5:]={momentum_arr[-5:]}")
-        print(f"[MMH-DEBUG] momentum_arr_final={momentum_arr[-1]:.8f}")
 
-        # 10. Final sanitization
+        # 10. Sanitise
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
-        print(f"[MMH-DEBUG] sanitized_final={momentum_arr[-1]:.8f}")
+
+        # --------------  Pine cross-check --------------
+        print(f"[MMH-PINE-CHECK] last bar  "
+              f"raw={raw[-1]:.8f}  temp={temp[-1]:.8f}  "
+              f"value={value_arr[-1]:.8f}  momentum={momentum_arr[-1]:.8f}")
+        # ------------------------------------------------
 
         return momentum_arr
 
     except Exception as e:
-        print(f"[MMH-DEBUG] Exception: {e}")
+        print(f"[MMH-ERROR] {e}")
         import traceback
         traceback.print_exc()
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)

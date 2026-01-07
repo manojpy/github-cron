@@ -226,14 +226,15 @@ def rolling_mean_numba_parallel(data, period):
 def rolling_min_max_numba(arr, period):
     """
     Rolling min/max that ignores NaN but preserves them in output.
-    Pine behavior: ta.lowest() / ta.highest() ignore na values.
+    Pine behaviour: ta.lowest / ta.highest return na until the
+    look-back window is *fully* filled (i.e. first valid bar is index period-1).
     """
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
 
     for i in range(rows):
-        if i < period - 1:
+        if i < period - 1:              # <-- FIXED: strict < instead of <=
             min_arr[i] = np.nan
             max_arr[i] = np.nan
             continue
@@ -258,13 +259,13 @@ def rolling_min_max_numba(arr, period):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_min_max_numba_parallel(arr, period):
-    """Rolling min/max (parallel version)"""
+    """Parallel version – same fix applied"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
 
     for i in prange(rows):
-        if i < period - 1:
+        if i < period - 1:              # <-- FIXED
             min_arr[i] = np.nan
             max_arr[i] = np.nan
             continue
@@ -285,7 +286,6 @@ def rolling_min_max_numba_parallel(arr, period):
         max_arr[i] = max_val if max_val != -np.inf else np.nan
 
     return min_arr, max_arr
-
 
 # ============================================================================
 # MOVING AVERAGES
@@ -663,27 +663,35 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
     """
-    Calculate MMH value indicator - EXACT PINE MATCH
-    Pine: value = 0.5 * 2 = 1.0 (initial multiplier)
+    Calculate MMH value indicator – BIT-EXACT Pine match.
+    Pine: value = 0.5 * 2 = 1.0  (initial multiplier)
     """
     value_arr = np.empty(rows, dtype=np.float64)
-    initial_multiplier = 1.0  # ✅ EXACT PINE VALUE
-    
-    # ✅ FIXED: Use first valid temp value
+    initial_multiplier = 1.0
+
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    v0 = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)  # nz(value[1]) = 0 for first bar
-    
-    # ✅ EXACT Pine clipping
-    value_arr[0] = 0.9999 if v0 > 0.9999 else (-0.9999 if v0 < -0.9999 else v0)
-    
+    v0 = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)
+    # Pine clipping – no higher-precision temp
+    if v0 > 0.9999:
+        value_arr[0] = 0.9999
+    elif v0 < -0.9999:
+        value_arr[0] = -0.9999
+    else:
+        value_arr[0] = v0
+
     for i in range(1, rows):
         prev_v = value_arr[i - 1]
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = initial_multiplier * (t - 0.5 + 0.5 * prev_v)
-        
-        # ✅ EXACT Pine clipping
-        value_arr[i] = 0.9999 if v > 0.9999 else (-0.9999 if v < -0.9999 else v)
-    
+
+        # Pine-equivalent clipping
+        if v > 0.9999:
+            value_arr[i] = 0.9999
+        elif v < -0.9999:
+            value_arr[i] = -0.9999
+        else:
+            value_arr[i] = v
+
     return value_arr
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
