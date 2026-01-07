@@ -222,29 +222,6 @@ def rolling_mean_numba_parallel(data, period):
     return out
 
 
-@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Calculate MMH value indicator - FIXED
-    Pine: value = 0.5 * 2 = 1.0 (initial multiplier)
-    """
-    value_arr = np.zeros(rows, dtype=np.float64)
-    initial_multiplier = 1.0  # ✅ FIXED: Pine uses 0.5 * 2 = 1.0
-    
-    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    v0 = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)
-    # Manual clipping for nopython mode
-    value_arr[0] = -0.9999 if v0 < -0.9999 else (0.9999 if v0 > 0.9999 else v0)
-    
-    for i in range(1, rows):
-        prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = initial_multiplier * (t - 0.5 + 0.5 * prev_v)
-        # Manual clipping for nopython mode
-        value_arr[i] = -0.9999 if v < -0.9999 else (0.9999 if v > 0.9999 else v)
-    
-    return value_arr
-
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
     """
