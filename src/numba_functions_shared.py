@@ -699,9 +699,7 @@ def calc_mmh_momentum_loop(momentum_arr, rows):
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-    # --------------  tail print --------------
-    print(f"[MMH-RECURSIVE-TAIL] last-5  {momentum_arr[-5:]}")
-    # -----------------------------------------
+
     return momentum_arr
 
 

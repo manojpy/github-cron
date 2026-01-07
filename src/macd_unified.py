@@ -705,7 +705,7 @@ def calculate_magical_momentum_hist(
                 temp[i] = 0.5
             else:
                 temp[i] = (raw[i] - min_med[i]) / denom[i]
-        #  <--  np.clip REMOVED  -->
+       
 
         # 7. Value  (FIXED clipping)
         value_arr = calc_mmh_value_loop(temp, rows)
@@ -729,12 +729,6 @@ def calculate_magical_momentum_hist(
 
         # 10. Sanitise
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
-
-        # --------------  Pine cross-check --------------
-        print(f"[MMH-PINE-CHECK] last bar  "
-              f"raw={raw[-1]:.8f}  temp={temp[-1]:.8f}  "
-              f"value={value_arr[-1]:.8f}  momentum={momentum_arr[-1]:.8f}")
-        # ------------------------------------------------
 
         return momentum_arr
 
