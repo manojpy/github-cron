@@ -181,7 +181,9 @@ jobs:
             -e TRIGGER_TIMESTAMP="$(date +%s)" \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
-          
+        env:
+          BOT_TIMEOUT: 30
+
           EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
