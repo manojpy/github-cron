@@ -1,32 +1,39 @@
 # =============================================================================
 # MULTI-STAGE BUILD: Aggressive Caching + UV + AOT Compilation (OPTIMIZED)
+# Requires: BuildKit enabled
 # =============================================================================
 
 # ---------- STAGE 1: UV INSTALLER ----------
 FROM python:3.11-slim-bookworm AS uv-installer
 
-# Install UV in isolated stage (cached across builds)
+# Install UV via pip (binary only, no site-packages copied to final stages)
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 RUN pip install --no-cache-dir uv==0.5.15
 
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.11-slim-bookworm AS deps-builder
 
-# Copy UV from installer stage
+# Copy UV binary from installer stage
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
-COPY --from=uv-installer /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-# ✅ OPTIMIZED: Minimal build dependencies
-RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
+# ✅ OPTIMIZED: Minimal build dependencies + apt cache
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+      build-essential \
+      git \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /build
 
-# ✅ OPTIMIZED: Install dependencies with AOT compilation in mind
+# ✅ OPTIMIZED: Install dependencies with cache, compile site-packages
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
 COPY requirements.txt .
-RUN uv pip install --system --no-cache -r requirements.txt && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    uv pip install --system --no-cache -r requirements.txt && \
     python -m compileall -q /usr/local/lib/python3.11/site-packages
 
 
@@ -46,32 +53,48 @@ RUN ls -la *.py && \
     test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
     test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
 
-# ✅ OPTIMIZED: AOT Compilation with strict verification
+# ✅ OPTIMIZED: AOT Compilation with strict verification + strip to reduce size
 ARG AOT_STRICT=1
 RUN echo "🔨 Starting AOT compilation..." && \
     python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
-    (echo "❌ AOT build script failed" && exit 1) && \
+      (echo "❌ AOT build script failed" && exit 1) && \
     echo "📂 Listing build outputs..." && ls -lh /build && \
     echo "🔍 Normalizing compiled filename..." && \
-    mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
-    python -c "import importlib.util; \
-spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
-mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
-print('✅ AOT binary verified')" || \
-    ( [ \"$AOT_STRICT\" != \"1\" ] && echo \"⚠️ AOT failed, continuing...\" || (echo \"❌ AOT STRICT mode: Compilation failed\" && exit 1) )
+    python - <<'PY'
+import glob, os, shutil
+files = sorted(glob.glob("/build/macd_aot_compiled*.so"))
+if not files:
+    raise SystemExit("No compiled .so found")
+# Normalize name deterministically
+shutil.copy2(files[0], "/build/macd_aot_compiled.so")
+PY
+# Install binutils temporarily to strip the .so (smaller final image layer)
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update -qq && apt-get install -y --no-install-recommends binutils && \
+    strip --strip-unneeded /build/macd_aot_compiled.so && \
+    apt-get purge -y binutils && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Verify importability of the stripped AOT binary
+RUN python - <<'PY'
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    'macd_aot_compiled', '/build/macd_aot_compiled.so'
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print('✅ AOT binary verified')
+PY
 
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.11-slim-bookworm AS final
 
-# ✅ OPTIMIZED: Only essential runtime dependencies
-RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-    libtbb12 \
-    ca-certificates \
+# ✅ OPTIMIZED: Only essential runtime dependencies (+ apt cache)
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+      libtbb12 \
+      ca-certificates \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# ✅ OPTIMIZED: Copy UV binary (lightweight)
-COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
 
 # ✅ OPTIMIZED: Security - Non-root user with minimal permissions
 RUN useradd --uid 1000 --no-log-init -m appuser && \
@@ -92,8 +115,9 @@ COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/aot_build.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
-# ✅ OPTIMIZED: Config copied at runtime (not baked into image)
-COPY --chown=appuser:appuser config_macd.json ./
+# NOTE: Config is volume-mounted at runtime; do not bake into image
+# (keeps image lean and avoids stale config)
+# COPY config_macd.json ./
 
 USER appuser
 
