@@ -97,9 +97,6 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
-    MMH_VALUE_CLIP = 0.9999
-    ZERO_DIVISION_GUARD = 1e-10
-    INFINITY_CLAMP = 1e9
     TELEGRAM_MAX_MESSAGE_LENGTH = 3800
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
@@ -653,8 +650,6 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64),
             np.zeros(default_len, dtype=np.float64)
         )
-        
-
 
 # ============================================================================
 # REPLACE calculate_magical_momentum_hist in macd_unified.py
