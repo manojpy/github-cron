@@ -696,14 +696,12 @@ def calc_mmh_value_loop(temp_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
-    """
-    Calculate MMH momentum accumulation.
-    Pine: momentum := momentum + 0.5 * nz(momentum[1])
-    """
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
+    # --------------  tail print --------------
+    print(f"[MMH-RECURSIVE-TAIL] last-5  {momentum_arr[-5:]}")
+    # -----------------------------------------
     return momentum_arr
 
 
