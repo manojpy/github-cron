@@ -284,19 +284,17 @@ jobs:
           # Get image size
           IMAGE_SIZE=$(docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             --format='{{.Size}}' | awk '{printf "%.1f MB", $1/1024/1024}')
-          
-          # Get layer count
+
           LAYER_COUNT=$(docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            --format='{{len .RootFS.Layers}}')
-          
-          # Get creation timestamp
+            --format='{{json .RootFS.Layers}}' | jq 'length')
+
           CREATED=$(docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             --format='{{.Created}}' | cut -d'T' -f1)
-          
+
           echo "image_size=${IMAGE_SIZE}" >> $GITHUB_OUTPUT
           echo "layer_count=${LAYER_COUNT}" >> $GITHUB_OUTPUT
           echo "created=${CREATED}" >> $GITHUB_OUTPUT
-          
+
           echo "📊 Image Analysis:" >> $GITHUB_STEP_SUMMARY
           echo "- **Size**: ${IMAGE_SIZE}" >> $GITHUB_STEP_SUMMARY
           echo "- **Layers**: ${LAYER_COUNT}" >> $GITHUB_STEP_SUMMARY
