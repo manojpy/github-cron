@@ -25,12 +25,12 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 300  # 5 minutes (sufficient for 30-40s job + buffer)
+  BOT_TIMEOUT: 300
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 7  # Reduced from 8 (realistic for 40s execution)
+    timeout-minutes: 7 
     permissions:
       contents: read
       packages: read
