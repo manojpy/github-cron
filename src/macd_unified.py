@@ -2111,7 +2111,7 @@ class RedisStateStore:
                     try:
                         pool_age = time.time() - cls._pool_created_at.get(url, 0.0)
                         reuse_count = cls._pool_reuse_count.get(url, 0)
-                        logger.info(f"Shutting down Redis pool | url={url} | Age: {pool_age:.1f}s | Reuses: {reuse_count}")
+                        logger.debug(f"Shutting down Redis pool | url={url} | Age: {pool_age:.1f}s | Reuses: {reuse_count}")
 
                         await pool.aclose()
                         await asyncio.sleep(0.25)  # Allow cleanup
