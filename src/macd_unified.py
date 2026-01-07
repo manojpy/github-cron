@@ -3197,36 +3197,43 @@ async def evaluate_pair_and_alert(
             ))
             return None
 
-
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
-            current_day = current_utc_dt.toordinal()
+            current_utc_hour = current_utc_dt.hour
+            current_utc_minute = current_utc_dt.minute
 
-            day_tracker_key = f"{pair_name}:day_tracker"
-            last_day_str = await sdb.get_metadata(day_tracker_key)
-            last_day = int(last_day_str) if last_day_str else None
+            if current_utc_hour == 0 and current_utc_minute <= 15:
+                current_day = current_utc_dt.toordinal()
+                day_tracker_key = f"{pair_name}:day_tracker"
+    
+                try:
+                    last_day_str = await sdb.get_metadata(day_tracker_key)
+                    last_day = int(last_day_str) if last_day_str else None
+        
+                    if last_day != current_day:
+                        delete_keys = []
+            
+                        if cfg.ENABLE_VWAP:
+                            if "vwap_up" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_up']}")
+                            if "vwap_down" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
 
-            if last_day != current_day:
-                delete_keys = []
+                        if cfg.ENABLE_PIVOT and piv:
+                            for level in ["P","S1","S2","S3","R1","R2"]:
+                                k = f"pivot_up_{level}"
+                                if k in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
+                            for level in ["P","S1","S2","R1","R2","R3"]:
+                                k = f"pivot_down_{level}"
+                                if k in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
 
-                if cfg.ENABLE_VWAP:
-                    if "vwap_up" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_up']}")
-                    if "vwap_down" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
+                        if delete_keys:
+                            await sdb.atomic_batch_update([], deletes=delete_keys)
+                            logger_pair.info(f"🔄 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts ...")
 
-                if cfg.ENABLE_PIVOT and piv:
-                    for level in ["P","S1","S2","S3","R1","R2"]:
-                        k = f"pivot_up_{level}"
-                        if k in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
-                    for level in ["P","S1","S2","R1","R2","R3"]:
-                        k = f"pivot_down_{level}"
-                        if k in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
-
-                if delete_keys:
-                    await sdb.atomic_batch_update([], deletes=delete_keys)
-                    logger_pair.info(f"🔄 Daily reset ... Cleared {len(delete_keys)} alerts ...")
-
-                await sdb.set_metadata(day_tracker_key, str(current_day))
-
+                        await sdb.set_metadata(day_tracker_key, str(current_day))
+            
+                except Exception as e:
+                    logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
+                    
         # Extract indicator values
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1]
