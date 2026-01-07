@@ -592,8 +592,6 @@ def calculate_vwap_numpy(
         if n == 0 or any(len(x) != n for x in [high, low, volume, timestamps]):
             return np.zeros_like(close)
 
-        # IMPORTANT:
-        # timestamps MUST be UTC epoch seconds for correct daily reset
         day_id = (timestamps.astype("int64") // 86400).astype("int64")
 
         vwap = vwap_daily_loop(high, low, close, volume, day_id)
@@ -672,27 +670,21 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close, dtype=np.float64)
 
-        # 1. SD
         sd = (rolling_std_parallel(close_c, 50, resp_clamped) if use_parallel and rows >= 250
               else rolling_std(close_c, 50, resp_clamped))
 
-        # 2. Worm
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-        # 3. SMA
         ma = (rolling_mean_numba_parallel(close_c, period) if use_parallel and rows >= 250
               else rolling_mean_numba(close_c, period))
 
-        # 4. Raw momentum
         raw = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             raw[i] = np.nan if abs(worm_arr[i]) < 1e-6 else (worm_arr[i] - ma[i]) / worm_arr[i]
 
-        # 5. Rolling min/max  (FIXED)
         min_med, max_med = (rolling_min_max_numba_parallel(raw, period) if use_parallel and rows >= 250
                             else rolling_min_max_numba(raw, period))
 
-        # 6. Temp – NO CLIP
         denom = max_med - min_med
         temp = np.empty(rows, dtype=np.float64)
         for i in range(rows):
@@ -701,11 +693,8 @@ def calculate_magical_momentum_hist(
             else:
                 temp[i] = (raw[i] - min_med[i]) / denom[i]
        
-
-        # 7. Value  (FIXED clipping)
         value_arr = calc_mmh_value_loop(temp, rows)
 
-        # 8. Momentum
         momentum = np.empty(rows, dtype=np.float64)
         pine_max = 0.25 * np.log((1.0 + 0.9999) / (1.0 - 0.9999))
         pine_min = 0.25 * np.log((1.0 - 0.9999) / (1.0 + 0.9999))
@@ -719,10 +708,8 @@ def calculate_magical_momentum_hist(
                 temp2 = (1.0 + val) / (1.0 - val)
                 momentum[i] = 0.25 * np.log(temp2)
 
-        # 9. Accumulation
         momentum_arr = calc_mmh_momentum_loop(momentum, rows)
 
-        # 10. Sanitise
         momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
 
         return momentum_arr
@@ -734,10 +721,7 @@ def calculate_magical_momentum_hist(
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
 
 def warmup_if_needed() -> None:
-    """
-    Warm up JIT compilation if needed.
-    Skips warmup if AOT is active or SKIP_WARMUP is enabled.
-    """
+    
     if not aot_bridge.requires_warmup():
         logger.info("✅ AOT active - no warmup needed")
         return
@@ -753,7 +737,6 @@ def warmup_if_needed() -> None:
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
 
-        # Warmup all functions using aot_bridge
         _ = aot_bridge.ema_loop(test_data, 7.0)
         _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
         _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
@@ -887,7 +870,7 @@ def calculate_all_indicators_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
         
-        # ✅ FIX: VWAP - Complete if/else block properly
+        # ✅ VWAP - Complete if/else block properly
         if cfg.ENABLE_VWAP:
             high_15m = data_15m["high"]
             low_15m = data_15m["low"]
@@ -1475,7 +1458,7 @@ class DataFetcher:
                 timeout=self.timeout
             )
             
-            # ✅ FIXED: Safe stats updates
+            # ✅ Safe stats updates
             if result:
                 self.fetch_stats["products"]["success"] += 1
                 self.fetch_stats["products_success"] += 1
@@ -1534,7 +1517,7 @@ class DataFetcher:
                 timeout=self.timeout
             )
             
-            # ✅ FIXED: Safe stats updates
+            # ✅ Safe stats updates
             if data:
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
@@ -1847,18 +1830,7 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     return products_map
 
 class RedisStateStore:
-    """
-    Redis-backed state store with per-URL connection pooling, Lua-based deduplication,
-    staleness checks, and graceful degradation.
-
-    Features:
-    - Per-URL connection pools with reuse tracking
-    - Staleness checks and automatic refresh
-    - Atomic batch operations via pipelines
-    - Lua script-based alert deduplication with reload lock
-    - Graceful degradation when Redis is unavailable
-    """
-
+    
     # Lua script for atomic deduplication
     DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
@@ -1907,10 +1879,6 @@ class RedisStateStore:
                 f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
                 f"Metadata TTL: 7d"
             )
-
-    # ------------------------------------------------------------------
-    # Connection handling
-    # ------------------------------------------------------------------
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         """Attempt to establish Redis connection with health checks."""
@@ -1963,12 +1931,7 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        """
-        Connect to Redis with per-URL pool reuse and staleness checks.
-
-        FIX #1: Prevents race condition by holding lock during smoke test
-        FIX #2: Adds connection staleness check to refresh old pools
-        """
+        
         pool_reused = False
 
         async with RedisStateStore._pool_lock:
@@ -2092,12 +2055,7 @@ class RedisStateStore:
 
     @classmethod
     async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
-        """
-        Shutdown per-URL Redis connection pools.
-
-        Args:
-            redis_url: If provided, shutdown only that pool; otherwise shutdown all.
-        """
+        
         async with cls._pool_lock:
             urls = [redis_url] if redis_url else list(cls._global_pools.keys())
             for url in urls:
@@ -2143,18 +2101,7 @@ class RedisStateStore:
         op_name: str,
         parser: Optional[Callable[[Any], Any]] = None,
     ):
-        """
-        Execute Redis operation with timeout and error handling.
-
-        Args:
-            fn: Async function to execute
-            timeout: Operation timeout in seconds
-            op_name: Operation name for logging
-            parser: Optional result parser function
-
-        Returns:
-            Parsed result or None on failure
-        """
+        
         if not self._redis:
             return None
         try:
@@ -2222,10 +2169,6 @@ class RedisStateStore:
             timeout,
             f"set_metadata {key}",
         )
-
-    # ------------------------------------------------------------------
-    # Deduplication
-    # ------------------------------------------------------------------
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
         if self.degraded:
@@ -2320,12 +2263,7 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
-        """
-        Batch check multiple alert deduplication statuses.
-
-        Returns:
-            Dict mapping "pair:alert_key" to True (should send) or False (duplicate)
-        """
+        
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2365,15 +2303,7 @@ class RedisStateStore:
         keys: List[str],
         timeout: float = 2.0
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-        """
-        Fetch multiple alert states from Redis.
-
-        Args:
-            keys: List of state keys (e.g., "BTCUSD:ALERT:PPO_SIGNAL_UP")
-
-        Returns:
-            Dict mapping keys to state dictionaries or None
-        """
+        
         if not self._redis or not keys:
             return {}
 
@@ -2409,13 +2339,7 @@ class RedisStateStore:
         updates: List[Tuple[str, Any, Optional[int]]],
         timeout: float = 4.0,
     ) -> None:
-        """
-        Batch update multiple states atomically using pipeline.
-
-        Args:
-            updates: List of (key, state, optional_timestamp) tuples
-            timeout: Pipeline execution timeout
-        """
+        
         if self.degraded or not updates or not self._redis:
             return
 
@@ -2439,10 +2363,6 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
-    # ------------------------------------------------------------------
-    # Atomic evaluation
-    # ------------------------------------------------------------------
-
     async def atomic_eval_batch(
         self,
         pair: str,
@@ -2450,20 +2370,7 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """
-        Atomically evaluate alert states, update states, and check deduplication.
-
-        FIX #4: Corrects double-prefix bug in fallback path
-
-        Args:
-            pair: Trading pair name
-            alert_keys: List of alert keys to check previous state
-            state_updates: List of state updates to apply
-            dedup_checks: List of deduplication checks
-
-        Returns:
-            Tuple of (previous_states_dict, dedup_results_dict)
-        """
+        
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
@@ -2575,9 +2482,6 @@ class RedisStateStore:
             dedup_results[composite_key] = should_send
 
         return prev_states, dedup_results
-    # ------------------------------------------------------------------
-    # Atomic batch update
-    # ------------------------------------------------------------------
 
     async def atomic_batch_update(
         self,
@@ -2585,17 +2489,7 @@ class RedisStateStore:
         deletes: Optional[List[str]] = None,
         timeout: float = 4.0,
     ) -> bool:
-        """
-        Atomically update and/or delete multiple keys.
-
-        Args:
-            updates: List of (key, state, optional_timestamp) tuples
-            deletes: Optional list of keys to delete
-            timeout: Pipeline execution timeout
-
-        Returns:
-            True if successful, False otherwise
-        """
+        
         if self.degraded or not self._redis:
             return False
 
@@ -3050,10 +2944,7 @@ def check_candle_quality_with_reason(
     close_val: float,
     is_buy: bool
 ) -> Tuple[bool, str]:
-    """
-    BUY:  Green (C>O) + upper wick < 20% range  
-    SELL: Red (C<O) + lower wick < 20% range
-    """
+    
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
@@ -3101,12 +2992,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Evaluate trading pair and generate alerts based on technical indicators.
     
-    Returns:
-        Tuple of (pair_name, state_dict) or None if evaluation failed
-    """
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
@@ -3331,7 +3217,6 @@ async def evaluate_pair_and_alert(
                 mmh_curr < mmh_m1
             )
 
-
         # Build context for alert evaluation
         context = {
             "buy_common": buy_common,
@@ -3468,20 +3353,11 @@ async def evaluate_pair_and_alert(
         # Handle alert state resets (opposite crossovers)
         resets_to_apply = []
     
-    # -------------------------------------------------------------------------
-    # 1. PPO Signal Crossovers (opposite direction)
-    # -------------------------------------------------------------------------
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-    
-    # -------------------------------------------------------------------------
-    # 2. PPO Zero Crossovers (FIXED: Reset on opposite cross OR trend change)
-    # -------------------------------------------------------------------------
-        # Reset PPO zero up on:
-        # - Opposite cross (below 0)
-        # - OR when buy conditions no longer valid
+   
         if ppo_prev > 0 and ppo_curr <= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
         elif not buy_common:  # ✅ NEW: Reset when trend invalidates
@@ -3499,9 +3375,7 @@ async def evaluate_pair_and_alert(
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_zero_down: sell_common=False")
     
-    # -------------------------------------------------------------------------
-    # 3. PPO 0.11 Crossovers (FIXED: Same logic as zero crosses)
-    # -------------------------------------------------------------------------
+ 
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
         elif not buy_common:
@@ -3518,9 +3392,7 @@ async def evaluate_pair_and_alert(
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_011_down: sell_common=False")
     
-    # -------------------------------------------------------------------------
-    # 4. RSI Crossovers (FIXED: Reset on opposite cross OR trend change)
-    # -------------------------------------------------------------------------
+ 
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
@@ -3544,9 +3416,7 @@ async def evaluate_pair_and_alert(
                         f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_SELL}"
                     )
     
-    # -------------------------------------------------------------------------
-    # 5. VWAP Crossovers (FIXED: Reset on opposite cross OR trend change)
-    # -------------------------------------------------------------------------
+    
         if cfg.ENABLE_VWAP:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
@@ -3564,10 +3434,6 @@ async def evaluate_pair_and_alert(
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Reset vwap_down: sell_common=False")
-
-    # -------------------------------------------------------------------------
-    # 6. Pivot Level Crossovers (existing logic - unchanged)
-    # -------------------------------------------------------------------------
     
         if piv:
             for level_name, level_value in piv.items():
@@ -3583,9 +3449,6 @@ async def evaluate_pair_and_alert(
                     if close_prev < level_value and close_curr >= level_value:
                         resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
 
-    # -------------------------------------------------------------------------
-    # 7. MMH Reversals (existing logic - unchanged)
-    # -------------------------------------------------------------------------
         if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
@@ -3656,11 +3519,6 @@ async def evaluate_pair_and_alert(
                 )
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
-   
-
-# ============================================================================
-# FIX #5: Compact Suppression Logging (Drop-in Replacement)
-# ============================================================================
 
         reasons = []
 
@@ -3732,7 +3590,7 @@ async def evaluate_pair_and_alert(
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
-            logger_pair.info(
+            logger_pair.debug(
                 f"✓ {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
