@@ -65,7 +65,6 @@ except ImportError as e:
 
 
 def get_platform_extension() -> str:
-    """Get the platform-specific shared library extension"""
     system = platform.system()
     if system == "Linux":
         return ".so"
@@ -78,16 +77,7 @@ def get_platform_extension() -> str:
 
 
 def create_aot_module(output_dir: Path, module_name: str = "numba_aot") -> CC:
-    """
-    Create and configure the AOT compilation context.
-    
-    Args:
-        output_dir: Directory to write compiled artifacts
-        module_name: Name of the output module (without extension)
-    
-    Returns:
-        Configured CC compilation context
-    """
+  
     print(f"🔧 Configuring AOT compilation context...")
     print(f"   Module name: {module_name}")
     print(f"   Output directory: {output_dir}")
@@ -108,16 +98,7 @@ def create_aot_module(output_dir: Path, module_name: str = "numba_aot") -> CC:
 
 
 def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
-    """
-    Export all 22 Numba functions to the AOT module.
     
-    Args:
-        cc: Numba CC compilation context
-        type_defs: Tuple of (f64_1d, i64_1d, b_1d, f64, i32) type definitions
-    
-    Returns:
-        Dictionary mapping function names to their signatures
-    """
     f64_1d, i64_1d, b_1d, f64, i32 = type_defs
     
     signatures = {}
@@ -266,17 +247,7 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
 
 
 def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
-    """
-    Compile the AOT module to a shared library.
     
-    Args:
-        cc: Configured CC compilation context
-        output_dir: Output directory
-        module_name: Module name
-    
-    Returns:
-        Path to compiled shared library
-    """
     extension = get_platform_extension()
     expected_output = output_dir / f"{module_name}{extension}"
     
@@ -340,15 +311,7 @@ def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
 
 
 def verify_compilation(library_path: Path) -> bool:
-    """
-    Verify the compiled library can be loaded.
     
-    Args:
-        library_path: Path to compiled .so/.dylib/.dll
-    
-    Returns:
-        True if verification successful
-    """
     print(f"\n🔍 Verifying compiled library...")
     
     try:

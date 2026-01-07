@@ -46,13 +46,7 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """
-    Pine-accurate standard deviation using SMA-based variance.
-    Matches ta.stdev() behavior:
-    - Uses fixed-window SMA for mean
-    - Uses population SD (divides by period, not period-1)
-    - NaN in window → result is NaN (here: we return 0.0 for warmup/NaN)
-    """
+    
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
@@ -95,7 +89,7 @@ def rolling_std(close, period, responsiveness):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std_parallel(close, period, responsiveness):
-    """Pine-accurate standard deviation (parallel version)"""
+   
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
@@ -142,11 +136,7 @@ def rolling_std_parallel(close, period, responsiveness):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """
-    Pine-accurate SMA - FIXED VERSION
-    - Warmup: cumulative average for first (period-1) bars
-    - Main: rolling window that SKIPS NaN (Pine behavior)
-    """
+    
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
@@ -179,11 +169,7 @@ def rolling_mean_numba(data, period):
 
 @njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_mean_numba_parallel(data, period):
-    """
-    Pine-accurate SMA (parallel version) - FIXED
-    WARNING: Parallel version has race condition in warmup period.
-    For safety, we compute warmup sequentially then parallelize main loop.
-    """
+    
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
@@ -224,11 +210,7 @@ def rolling_mean_numba_parallel(data, period):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    """
-    Rolling min/max that ignores NaN but preserves them in output.
-    Pine behaviour: ta.lowest / ta.highest return na until the
-    look-back window is *fully* filled (i.e. first valid bar is index period-1).
-    """
+    
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
@@ -293,11 +275,7 @@ def rolling_min_max_numba_parallel(arr, period):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, alpha_or_period):
-    """
-    Exponential Moving Average
-    If alpha_or_period > 1: treats as period, converts to alpha = 2/(period+1)
-    Otherwise: uses directly as alpha
-    """
+    
     n = len(data)
     alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
 
@@ -331,12 +309,7 @@ def ema_loop_alpha(data, alpha):
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    """
-    Exact PineScript-equivalent range filter:
-    - nz(prev) behaviour
-    - equality bias
-    - no floating drift
-    """
+    
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
 
@@ -401,11 +374,7 @@ def smooth_range(close, t, m):
 
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):
-    """
-    Calculate trends with state persistence to match Pine Script visual behavior.
-    When filtx1 == filtx12, maintains the previous trend state.
-    Returns: (upw, dnw) boolean arrays
-    """
+    
     n = len(filt_x1)
     upw = np.empty(n, dtype=np.bool_)
     dnw = np.empty(n, dtype=np.bool_)
@@ -470,14 +439,7 @@ def kalman_loop(src, length, R, Q):
 
 @njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop(high, low, close, volume, day_id):
-    """
-    Volume Weighted Average Price (VWAP)
-    - Uses HLC3
-    - Resets on day_id change
-    - TradingView-consistent behavior:
-      * VWAP only updates when volume > 0
-      * No price fallbacks
-    """
+    
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
 
@@ -523,10 +485,7 @@ def vwap_daily_loop(high, low, close, volume, day_id):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
-    """
-    Calculate Percentage Price Oscillator (PPO) and its signal line.
-    Robust against NaN values in the input series.
-    """
+    
     n = len(close)
     fast_alpha = 2.0 / (fast + 1.0)
     slow_alpha = 2.0 / (slow + 1.0)
@@ -629,10 +588,7 @@ def calculate_rsi_core(close, period):
 
 @njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    """
-    Calculate MMH worm indicator.
-    Pine behavior: var worm = source (persists across all bars)
-    """
+    
     worm_arr = np.empty(rows, dtype=np.float64)
 
     # ✅ FIXED: Use first valid close price (Pine: var worm = source)
@@ -662,10 +618,7 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    """
-    Calculate MMH value indicator – BIT-EXACT Pine match.
-    Pine: value = 0.5 * 2 = 1.0  (initial multiplier)
-    """
+    
     value_arr = np.empty(rows, dtype=np.float64)
     initial_multiplier = 1.0
 

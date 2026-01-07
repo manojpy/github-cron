@@ -5,19 +5,6 @@ AOT Bridge Module - Runtime AOT/JIT Function Dispatcher
 Provides transparent fallback between AOT-compiled (.so) and JIT-compiled
 functions. Automatically detects AOT availability and falls back to JIT
 if necessary.
-
-Usage:
-    import aot_bridge
-
-    # Ensure initialization (call once at startup)
-    aot_bridge.ensure_initialized()
-
-    # Check status
-    if aot_bridge.is_using_aot():
-        print("AOT active")
-
-    # Use functions normally
-    result = aot_bridge.sanitize_array_numba(arr, default=0.0)
 """
 
 import os
@@ -51,23 +38,12 @@ def get_library_extension() -> str:
 
 
 def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
-    """
-    Search for AOT-compiled Python extension in common locations.
-
-    Search order:
-    1. Environment variable AOT_LIB_PATH
-    2. Current working directory
-    3. Script directory
-
-    Returns:
-        Path to library or None if not found
-    """
+   
     extension = get_library_extension()
 
     # Accept both normalized and ABI-suffixed filenames
     candidates = [
         f"{module_name}{extension}",
-        # Typical CPython ABI suffix layout produced by pycc (example pattern)
         f"{module_name}.cpython-311-x86_64-linux-gnu{extension}",
         f"{module_name}.cpython-311{extension}",
     ]
@@ -93,16 +69,7 @@ def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
 
 
 def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") -> Optional[Any]:
-    """
-    Load AOT-compiled Python extension using importlib.
-
-    Args:
-        library_path: Path to .so/.dylib/.dll file
-        module_name: Logical module name to bind in sys.modules
-
-    Returns:
-        Imported module object or None on failure
-    """
+    
     try:
         spec = importlib.util.spec_from_file_location(module_name, str(library_path))
         if spec is None or spec.loader is None:
@@ -110,7 +77,7 @@ def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") 
             return None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        # Bind for subsequent imports if desired
+        
         sys.modules[module_name] = mod
         return mod
     except Exception as e:
@@ -119,12 +86,7 @@ def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") 
 
 
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
-    """
-    Attempt to initialize AOT module.
-
-    Returns:
-        Tuple of (success, failure_reason)
-    """
+   
     global _aot_module, _using_aot, _fallback_reason
 
     library_path = find_aot_library(module_name)
@@ -151,7 +113,7 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
 
 
 def initialize_jit_fallback() -> None:
-    """Initialize JIT fallback by importing shared functions"""
+   
     global _fallback_reason
 
     try:
@@ -209,10 +171,6 @@ def initialize_jit_fallback() -> None:
 
 
 def ensure_initialized() -> None:
-    """
-    Ensure AOT/JIT system is initialized.
-    Call this once at application startup.
-    """
     global _initialized, _fallback_reason, _using_aot
 
     if _initialized:
@@ -232,20 +190,15 @@ def ensure_initialized() -> None:
 
 
 def is_using_aot() -> bool:
-    """Check if AOT compilation is active"""
     return _using_aot
 
 
 def get_fallback_reason() -> Optional[str]:
-    """Get reason for JIT fallback (if applicable)"""
     return _fallback_reason
 
 
 def requires_warmup() -> bool:
-    """
-    Check if JIT warmup is needed.
-    Returns True if using JIT fallback, False if using AOT.
-    """
+   
     return not _using_aot
 
 
@@ -254,35 +207,30 @@ def requires_warmup() -> bool:
 # ============================================================================
 
 def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
-    """Replace NaN and Inf with default value"""
     if _using_aot:
         return _aot_module.sanitize_array_numba(arr, default)
     return _jit_sanitize_array_numba(arr, default)
 
 
 def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
-    """Replace NaN and Inf with default value (parallel)"""
     if _using_aot:
         return _aot_module.sanitize_array_numba_parallel(arr, default)
     return _jit_sanitize_array_numba_parallel(arr, default)
 
 
 def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
-    """Exponential Moving Average"""
     if _using_aot:
         return _aot_module.ema_loop(data, alpha_or_period)
     return _jit_ema_loop(data, alpha_or_period)
 
 
 def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
-    """Exponential Moving Average with explicit alpha"""
     if _using_aot:
         return _aot_module.ema_loop_alpha(data, alpha)
     return _jit_ema_loop_alpha(data, alpha)
 
 
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
-    """Kalman filter"""
     if _using_aot:
         return _aot_module.kalman_loop(src, length, R, Q)
     return _jit_kalman_loop(src, length, R, Q)
@@ -295,21 +243,18 @@ def vwap_daily_loop(
     volume: np.ndarray,
     day_id: np.ndarray,
 ) -> np.ndarray:
-    """Volume Weighted Average Price"""
     if _using_aot:
         return _aot_module.vwap_daily_loop(high, low, close, volume, day_id)
     return _jit_vwap_daily_loop(high, low, close, volume, day_id)
 
 
 def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """Range filter"""
     if _using_aot:
         return _aot_module.rng_filter_loop(x, r)
     return _jit_rng_filter_loop(x, r)
 
 
 def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
-    """Calculate smoothed range"""
     if _using_aot:
         return _aot_module.smooth_range(close, t, m)
     return _jit_smooth_range(close, t, m)
@@ -319,70 +264,60 @@ def calculate_trends_with_state(
     filt_x1: np.ndarray,
     filt_x12: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Calculate trends (returns tuple)"""
     if _using_aot:
         return _aot_module.calculate_trends_with_state(filt_x1, filt_x12)
     return _jit_calculate_trends_with_state(filt_x1, filt_x12)
 
 
 def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    """MMH worm calculation"""
     if _using_aot:
         return _aot_module.calc_mmh_worm_loop(close_arr, sd_arr, rows)
     return _jit_calc_mmh_worm_loop(close_arr, sd_arr, rows)
 
 
 def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
-    """MMH value calculation"""
     if _using_aot:
         return _aot_module.calc_mmh_value_loop(temp_arr, rows)
     return _jit_calc_mmh_value_loop(temp_arr, rows)
 
 
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    """MMH momentum calculation"""
     if _using_aot:
         return _aot_module.calc_mmh_momentum_loop(momentum_arr, rows)
     return _jit_calc_mmh_momentum_loop(momentum_arr, rows)
 
 
 def rolling_std(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Rolling standard deviation"""
     if _using_aot:
         return _aot_module.rolling_std(close, period, responsiveness)
     return _jit_rolling_std(close, period, responsiveness)
 
 
 def rolling_std_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    """Rolling standard deviation (parallel)"""
     if _using_aot:
         return _aot_module.rolling_std_parallel(close, period, responsiveness)
     return _jit_rolling_std_parallel(close, period, responsiveness)
 
 
 def rolling_mean_numba(data: np.ndarray, period: int) -> np.ndarray:
-    """Rolling mean (SMA)"""
     if _using_aot:
         return _aot_module.rolling_mean_numba(data, period)
     return _jit_rolling_mean_numba(data, period)
 
 
 def rolling_mean_numba_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    """Rolling mean (SMA, parallel)"""
     if _using_aot:
         return _aot_module.rolling_mean_numba_parallel(data, period)
     return _jit_rolling_mean_numba_parallel(data, period)
 
 
 def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Rolling min/max (returns tuple)"""
     if _using_aot:
         return _aot_module.rolling_min_max_numba(arr, period)
     return _jit_rolling_min_max_numba(arr, period)
 
 
 def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Rolling min/max (parallel, returns tuple)"""
     if _using_aot:
         return _aot_module.rolling_min_max_numba_parallel(arr, period)
     return _jit_rolling_min_max_numba_parallel(arr, period)
@@ -394,14 +329,12 @@ def calculate_ppo_core(
     slow: int,
     signal: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Calculate PPO (returns tuple)"""
     if _using_aot:
         return _aot_module.calculate_ppo_core(close, fast, slow, signal)
     return _jit_calculate_ppo_core(close, fast, slow, signal)
 
 
 def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
-    """Calculate RSI"""
     if _using_aot:
         return _aot_module.calculate_rsi_core(close, period)
     return _jit_calculate_rsi_core(close, period)
@@ -414,7 +347,6 @@ def vectorized_wick_check_buy(
     close_arr: np.ndarray,
     min_wick_ratio: float
 ) -> np.ndarray:
-    """Check buy wick criteria"""
     if _using_aot:
         return _aot_module.vectorized_wick_check_buy(
             open_arr, high_arr, low_arr, close_arr, min_wick_ratio
@@ -431,7 +363,6 @@ def vectorized_wick_check_sell(
     close_arr: np.ndarray,
     min_wick_ratio: float
 ) -> np.ndarray:
-    """Check sell wick criteria"""
     if _using_aot:
         return _aot_module.vectorized_wick_check_sell(
             open_arr, high_arr, low_arr, close_arr, min_wick_ratio
