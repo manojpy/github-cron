@@ -222,57 +222,48 @@ jobs:
             exit 0
           fi
           
-          # ✅ OPTIMIZED: Single-pass log parsing with awk (faster than multiple greps)
-          awk '
-            /✅ RUN COMPLETE/ { 
-              status = "success" 
-            }
-            /Duration:/ && status == "success" { 
-              match($0, /Duration: ([0-9.]+)s/, arr)
-              duration = arr[1]
-            }
-            /Alerts:/ && status == "success" { 
-              match($0, /Alerts: ([0-9]+)/, arr)
-              alerts = arr[1]
-            }
-            /Pairs:/ && status == "success" { 
-              match($0, /Pairs: ([0-9/]+)/, arr)
-              pairs = arr[1]
-            }
-            /Memory:/ && status == "success" { 
-              match($0, /Memory: ([0-9]+MB)/, arr)
-              memory = arr[1]
-            }
-            /Redis:/ && status == "success" { 
-              match($0, /Redis: ([A-Z]+)/, arr)
-              redis_status = arr[1]
-            }
-            /FATAL ERROR/ { 
-              status = "failed"
-              getline; error_msg = substr($0, 1, 100)
-            }
-            /Bot run failed/ { 
-              status = "failed"
-              error_msg = "Bot run failed - check logs for details"
-            }
-            END {
-              if (status == "") status = "timeout"
-              if (duration == "") duration = "N/A"
-              if (alerts == "") alerts = "0"
-              if (pairs == "") pairs = "N/A"
-              if (memory == "") memory = "N/A"
-              if (redis_status == "") redis_status = "UNKNOWN"
-              if (error_msg == "") error_msg = "None"
-              
-              print "status=" status
-              print "duration=" duration
-              print "alerts=" alerts
-              print "pairs=" pairs
-              print "memory=" memory
-              print "redis_status=" redis_status
-              print "error_msg=" error_msg
-            }
-          ' "$LOG_FILE" >> $GITHUB_OUTPUT
+          # ✅ OPTIMIZED: Single-pass log parsing (faster than multiple greps)
+          if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
+            STATUS="success"
+            DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
+            ALERTS=$(grep -oP "Alerts:\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
+            PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
+            MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
+            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
+            ERROR_MSG="None"
+          elif grep -q "FATAL ERROR" "$LOG_FILE"; then
+            STATUS="failed"
+            ERROR_MSG=$(grep "FATAL ERROR" "$LOG_FILE" | head -1 | cut -c1-100)
+            DURATION="N/A"
+            ALERTS="0"
+            PAIRS="N/A"
+            MEMORY="N/A"
+            REDIS_STATUS="UNKNOWN"
+          elif grep -q "Bot run failed" "$LOG_FILE"; then
+            STATUS="failed"
+            ERROR_MSG="Bot run failed - check logs for details"
+            DURATION="N/A"
+            ALERTS="0"
+            PAIRS="N/A"
+            MEMORY="N/A"
+            REDIS_STATUS="UNKNOWN"
+          else
+            STATUS="timeout"
+            ERROR_MSG="Execution incomplete or timed out"
+            DURATION="N/A"
+            ALERTS="0"
+            PAIRS="N/A"
+            MEMORY="N/A"
+            REDIS_STATUS="UNKNOWN"
+          fi
+          
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION}" >> $GITHUB_OUTPUT
+          echo "alerts=${ALERTS}" >> $GITHUB_OUTPUT
+          echo "pairs=${PAIRS}" >> $GITHUB_OUTPUT
+          echo "memory=${MEMORY}" >> $GITHUB_OUTPUT
+          echo "redis_status=${REDIS_STATUS}" >> $GITHUB_OUTPUT
+          echo "error_msg=${ERROR_MSG}" >> $GITHUB_OUTPUT
 
       # ✅ NEW: Extract alert details for better reporting
       - name: 📈 Extract Alert Details
