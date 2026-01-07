@@ -39,7 +39,7 @@ jobs:
       # ========================================================================
       # PHASE 1: SETUP (Ultra-Fast)
       # ========================================================================
-      
+
       - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
         with:
@@ -55,109 +55,99 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ OPTIMIZED: Faster image pull with progress tracking
       - name: 🐳 Pull Latest AOT Image
         id: image_pull
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          
+
           echo "📦 Pulling AOT image..."
           START_TIME=$(date +%s)
-          
-          # ✅ NEW: Pre-check if image exists locally (saves pull time)
+
           if docker image inspect "$IMAGE_REF" >/dev/null 2>&1; then
             echo "ℹ️ Image already cached locally"
             CACHED=true
           else
             CACHED=false
           fi
-          
-          # Pull with quiet mode for faster execution
+
           if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             END_TIME=$(date +%s)
             PULL_TIME=$((END_TIME - START_TIME))
-            
+
             if [ "$CACHED" = "true" ]; then
               echo "✅ Image verified in ${PULL_TIME}s (cached)"
             else
               echo "✅ Image pulled in ${PULL_TIME}s"
             fi
-            
+
             echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
             echo "cached=${CACHED}" >> $GITHUB_OUTPUT
           else
             echo "❌ Failed to pull image"
             exit 1
           fi
-          
+
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
-      # ✅ OPTIMIZED: Parallel secrets validation (faster)
       - name: 🔒 Verify Secrets
         run: |
           echo "🔍 Validating required secrets..."
-          
+
           MISSING=()
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
-          
+
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing required secrets: ${MISSING[*]}"
             echo "::error title=Missing Secrets::Configure these in repository settings: ${MISSING[*]}"
             exit 1
           fi
-          
+
           echo "✅ All secrets configured"
 
-      # ✅ NEW: Pre-warm container (optional, minimal gain but nice to have)
       - name: 🔥 Pre-warm Container
         id: prewarm
         timeout-minutes: 1
         run: |
           IMAGE_REF="${{ steps.image_pull.outputs.image_ref }}"
-          
+
           echo "🔥 Pre-warming container..."
           START_TIME=$(date +%s)
-          
-          # Quick import test to warm up Python
+
           docker run --rm --platform linux/amd64 \
             --name macd_prewarm \
             "$IMAGE_REF" \
             python -c "import aot_bridge, numpy; print('✅ Prewarmed')" >/dev/null 2>&1 || true
-          
+
           END_TIME=$(date +%s)
           PREWARM_TIME=$((END_TIME - START_TIME))
-          
+
           echo "✅ Pre-warm complete in ${PREWARM_TIME}s"
           echo "prewarm_time=${PREWARM_TIME}" >> $GITHUB_OUTPUT
 
       # ========================================================================
-      # PHASE 2: BOT EXECUTION (Optimized for 40s Runtime)
+      # PHASE 2: BOT EXECUTION
       # ========================================================================
-      
+
       - name: 🚀 Execute MACD Bot
         id: bot_run
-        timeout-minutes: 6  # Reduced from 7
+        timeout-minutes: 6
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
           mkdir -p logs
-          
+
           echo "::group::🔥 Starting Bot Execution"
-          echo "┌────────────────────────────────────────┐"
           echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "🐛 Debug Mode: $DEBUG_MODE"
-          echo "└────────────────────────────────────────┘"
           echo "::endgroup::"
-          
+
           START_TIME=$(date +%s)
-          
-          # ✅ OPTIMIZED: Reduced resource limits for faster startup
-          # ✅ NEW: Conditional debug logging
+
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
@@ -181,38 +171,35 @@ jobs:
             -e TRIGGER_TIMESTAMP="$(date +%s)" \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
-          
+
           EXIT_CODE=${PIPESTATUS[0]}
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
-          
+
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
-          
-          # ✅ NEW: Better error messaging
+
           if [ $EXIT_CODE -eq 124 ]; then
-            echo "::error title=Timeout::Bot execution timed out after ${DURATION}s (SIGTERM)"
+            echo "::error title=Timeout::Bot execution timed out after ${DURATION}s"
             exit 1
           elif [ $EXIT_CODE -eq 137 ]; then
-            echo "::error title=Killed::Bot was killed after ${DURATION}s (SIGKILL)"
+            echo "::error title=Killed::Bot was killed after ${DURATION}s"
             exit 1
           elif [ $EXIT_CODE -eq 130 ]; then
-            echo "::warning title=Interrupted::Bot was interrupted (SIGINT)"
+            echo "::warning title=Interrupted::Bot was interrupted"
             exit 1
           elif [ $EXIT_CODE -ne 0 ]; then
             echo "::error title=Bot Failed::Bot exited with code $EXIT_CODE"
             exit 1
           fi
-          
+
           echo "✅ Bot completed successfully in ${DURATION}s"
 
       # ========================================================================
-      # PHASE 3: RESULTS ANALYSIS (Ultra-Fast Log Parsing)
+      # PHASE 3: RESULTS ANALYSIS
       # ========================================================================
-      
-      - name: 📊 Parse Execution Results
 
-      - name: Parse Execution Results (if always)
+      - name: 📊 Parse Execution Results
         id: results
         run: |
           LOG_FILE="logs/bot_output.log"
@@ -221,14 +208,13 @@ jobs:
             echo "message=Log file missing or empty" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # Add size/content check before greps
+
           if [ $(wc -l < "$LOG_FILE") -lt 10 ]; then
             echo "status=failed" >> $GITHUB_OUTPUT
-            echo "errormsg=Log too short, bot likely crashed silently" >> $GITHUB_OUTPUT
+            echo "errormsg=Log too short" >> $GITHUB_OUTPUT
             exit 0
           fi
-          
-          # ✅ OPTIMIZED: Single-pass log parsing (faster than multiple greps)
+
           if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
             STATUS="success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
