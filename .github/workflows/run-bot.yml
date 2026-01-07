@@ -211,14 +211,20 @@ jobs:
       # ========================================================================
       
       - name: 📊 Parse Execution Results
-        if: always()
+
+      - name: Parse Execution Results (if always)
         id: results
         run: |
           LOG_FILE="logs/bot_output.log"
-          
-          if [ ! -f "$LOG_FILE" ]; then
+          if [ ! -f "$LOG_FILE" ] || [ ! -s "$LOG_FILE" ]; then
             echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Log file not found" >> $GITHUB_OUTPUT
+            echo "message=Log file missing or empty" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Add size/content check before greps
+          if [ $(wc -l < "$LOG_FILE") -lt 10 ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "errormsg=Log too short, bot likely crashed silently" >> $GITHUB_OUTPUT
             exit 0
           fi
           
