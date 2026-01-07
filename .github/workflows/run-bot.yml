@@ -78,13 +78,14 @@ jobs:
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
+          echo "::group::🔥Launch Macd Unified...🔥"
           if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] || [ -z "${{ secrets.REDIS_URL }}" ]; then
              echo "❌ Missing Secrets"; exit 1
           fi
 
           mkdir -p logs
           
-          echo "::group::🔥Launch Macd Unified...🔥"
+          
           echo "📅 Trigger: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
