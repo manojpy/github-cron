@@ -8,6 +8,7 @@ FROM python:3.11-slim-bookworm AS uv-installer
 # Install UV in isolated stage (cached across builds)
 RUN pip install --no-cache-dir uv==0.5.15
 
+
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.11-slim-bookworm AS deps-builder
 
@@ -23,10 +24,11 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# ✅ OPTIMIZED: Install dependencies & Compile with Level 2 Optimization (Strips docstrings/asserts)
+# ✅ OPTIMIZED: Install dependencies with aggressive bytecode optimization
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt && \
-    python -m compileall -q -o 2 /usr/local/lib/python3.11/site-packages
+    python -O -m compileall -q /usr/local/lib/python3.11/site-packages
+
 
 # ---------- STAGE 3: AOT COMPILER ----------
 FROM deps-builder AS aot-builder
@@ -47,12 +49,12 @@ RUN ls -la *.py && \
 # ✅ OPTIMIZED: AOT Compilation with strict verification
 ARG AOT_STRICT=1
 RUN echo "🔨 Starting AOT compilation..." && \
-    python -O aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
+    python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
     (echo "❌ AOT build script failed" && exit 1) && \
     echo "📂 Listing build outputs..." && ls -lh /build && \
-    echo "🔍 Normalizing compiled filename..." && \
+    echo "🔄 Normalizing compiled filename..." && \
     mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
-    python -O -c "import importlib.util; \
+    python -c "import importlib.util; \
 spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
 mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
 print('✅ AOT binary verified')" || \
@@ -61,9 +63,6 @@ print('✅ AOT binary verified')" || \
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.11-slim-bookworm AS final
-
-# ✅ OPTIMIZED: Explicitly disable healthcheck to save CPU cycles
-HEALTHCHECK NONE
 
 # ✅ OPTIMIZED: Only essential runtime dependencies
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
@@ -98,22 +97,21 @@ COPY --chown=appuser:appuser config_macd.json ./
 
 USER appuser
 
-# ✅ OPTIMIZED: Environment optimization
-# PYTHONOPTIMIZE=2 removes docstrings and asserts for faster startup
+# ✅ OPTIMIZED: Environment optimization with aggressive Python settings
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONOPTIMIZE=2 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
-    PYTHONOPTIMIZE=2 \
+    NUMBA_NUM_THREADS=2 \
+    OMP_NUM_THREADS=2 \
     MEMORY_LIMIT_BYTES=850000000 \
     TZ=Asia/Kolkata \
     AOT_LIB_PATH=/app/src
 
-# Labels for metadata
+# Metadata labels
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
       org.opencontainers.image.description="High-performance trading alert bot with AOT compilation" \
-      org.opencontainers.image.source="https://github.com/manojpy/github-cron" \
-      org.opencontainers.image.memory_limit="900MB" \
-      org.opencontainers.image.platform="linux/amd64"
+      org.opencontainers.image.source="https://github.com/manojpy/github-cron"
 
 CMD ["python", "macd_unified.py"]
