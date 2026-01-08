@@ -140,6 +140,7 @@ def initialize_jit_fallback() -> None:
             calculate_rsi_core,
             vectorized_wick_check_buy,
             vectorized_wick_check_sell,
+            vectorized_wick_ratios,
         )
 
         globals()['_jit_sanitize_array_numba'] = sanitize_array_numba
@@ -164,6 +165,7 @@ def initialize_jit_fallback() -> None:
         globals()['_jit_calculate_rsi_core'] = calculate_rsi_core
         globals()['_jit_vectorized_wick_check_buy'] = vectorized_wick_check_buy
         globals()['_jit_vectorized_wick_check_sell'] = vectorized_wick_check_sell
+        globals()['_jit_vectorized_wick_ratios'] = vectorized_wick_ratios
 
     except ImportError as e:
         _fallback_reason = f"JIT fallback failed: {e}"
@@ -371,6 +373,16 @@ def vectorized_wick_check_sell(
         open_arr, high_arr, low_arr, close_arr, min_wick_ratio
     )
 
+def vectorized_wick_ratios(
+    open_arr: np.ndarray,
+    high_arr: np.ndarray,
+    low_arr: np.ndarray,
+    close_arr: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    if _using_aot:
+        return _aot_module.vectorized_wick_ratios(open_arr, high_arr, low_arr, close_arr)
+    return _jit_vectorized_wick_ratios(open_arr, high_arr, low_arr, close_arr)
+
 
 # ============================================================================
 # MODULE EXPORTS
@@ -420,6 +432,7 @@ __all__ = [
     # Pattern Recognition
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
+    'vectorized_wick_ratios',
 ]
 
 

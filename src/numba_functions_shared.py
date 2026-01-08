@@ -2,7 +2,7 @@
 Shared Numba Function Definitions - Single Source of Truth
 ============================================================
 
-All 22 Numba functions defined ONCE with explicit @njit signatures.
+All 23 Numba functions defined ONCE with explicit @njit signatures.
 Used by both:
   - aot_build.py (AOT via CC.export)
   - aot_bridge.py (JIT fallback)
@@ -660,61 +660,70 @@ def calc_mmh_momentum_loop(momentum_arr, rows):
 # CANDLE PATTERN RECOGNITION
 # ============================================================================
 
+
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
-    """Check if candles meet buy wick criteria (bullish with small upper wick)"""
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
-
     for i in range(n):
-        o = open_arr[i]
-        h = high_arr[i]
-        l = low_arr[i]
-        c = close_arr[i]
-
+        o = open_arr[i]; h = high_arr[i]; l = low_arr[i]; c = close_arr[i]
         if c <= o:
-            result[i] = False
-            continue
-
+            result[i] = False; continue
         candle_range = h - l
         if candle_range < 1e-8:
-            result[i] = False
-            continue
-
-        upper_wick = h - c
+            result[i] = False; continue
+        # Body-edge upper wick for green candle
+        body_top = c if c > o else o
+        upper_wick = h - body_top
         wick_ratio = upper_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
-
     return result
-
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
-    """Check if candles meet sell wick criteria (bearish with small lower wick)"""
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
-
     for i in range(n):
-        o = open_arr[i]
-        h = high_arr[i]
-        l = low_arr[i]
-        c = close_arr[i]
-
+        o = open_arr[i]; h = high_arr[i]; l = low_arr[i]; c = close_arr[i]
         if c >= o:
-            result[i] = False
-            continue
-
+            result[i] = False; continue
         candle_range = h - l
         if candle_range < 1e-8:
-            result[i] = False
-            continue
-
-        lower_wick = c - l
+            result[i] = False; continue
+        # Body-edge lower wick for red candle
+        body_bottom = c if c < o else o
+        lower_wick = body_bottom - l
+        if lower_wick < 0.0:
+            lower_wick = 0.0
         wick_ratio = lower_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
-
     return result
 
+@njit("Tuple((f8[:], f8[:]))(f8[:], f8[:], f8[:], f8[:])", nogil=True, cache=True)
+def vectorized_wick_ratios(open_arr, high_arr, low_arr, close_arr):
+    n = len(close_arr)
+    buy_ratios = np.zeros(n, dtype=np.float64)
+    sell_ratios = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        o = open_arr[i]; h = high_arr[i]; l = low_arr[i]; c = close_arr[i]
+        candle_range = h - l
+        if candle_range < 1e-8:
+            buy_ratios[i] = 1.0
+            sell_ratios[i] = 1.0
+            continue
+        # Upper wick ratio relative to body top
+        body_top = c if c > o else o
+        upper_wick = h - body_top
+        if upper_wick < 0.0:
+            upper_wick = 0.0
+        buy_ratios[i] = upper_wick / candle_range
+        # Lower wick ratio relative to body bottom
+        body_bottom = c if c < o else o
+        lower_wick = body_bottom - l
+        if lower_wick < 0.0:
+            lower_wick = 0.0
+        sell_ratios[i] = lower_wick / candle_range
+    return buy_ratios, sell_ratios
 
 # ============================================================================
 # METADATA
@@ -758,7 +767,6 @@ __all__ = [
     # Pattern Recognition
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
+    'vectorized_wick_ratios',
 ]
-
-# Total: 22 functions
-assert len(__all__) == 22, f"Expected 22 functions, found {len(__all__)}"
+assert len(__all__) == 23, f"Expected 23 functions, found {len(__all__)}"

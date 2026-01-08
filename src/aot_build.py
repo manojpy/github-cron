@@ -2,7 +2,7 @@
 AOT Build Script - Compiles Numba functions to native .so libraries
 ====================================================================
 
-Compiles all 22 shared Numba functions to platform-specific shared libraries
+Compiles all 23 shared Numba functions to platform-specific shared libraries
 using Numba's CC (compile cache) export mechanism.
 
 Usage:
@@ -57,6 +57,7 @@ try:
         calculate_rsi_core,
         vectorized_wick_check_buy,
         vectorized_wick_check_sell,
+        vectorized_wick_ratios,
     )
 except ImportError as e:
     print(f"ERROR: Cannot import shared functions: {e}", file=sys.stderr)
@@ -240,8 +241,17 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     print("  [22/22] vectorized_wick_check_sell")
     cc.export('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')(vectorized_wick_check_sell)
     signatures['vectorized_wick_check_sell'] = (f64_1d, f64_1d, f64_1d, f64_1d, f64)
-    
-    print(f"✅ All 22 functions exported successfully\n")
+
+    # ========================================================================
+    # 23. WICK RATIOS (TUPLE RETURNS)
+    # ========================================================================
+
+    print("  [23/23] vectorized_wick_ratios")
+    # Returns tuple: (float64[:], float64[:])
+    cc.export('vectorized_wick_ratios', 'Tuple((f8[:], f8[:]))(f8[:], f8[:], f8[:], f8[:])')(vectorized_wick_ratios)
+    signatures['vectorized_wick_ratios'] = (f64_1d, f64_1d, f64_1d, f64_1d)
+ 
+    print(f"✅ All 23 functions exported successfully\n")
     
     return signatures
 

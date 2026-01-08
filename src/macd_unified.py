@@ -58,7 +58,8 @@ from aot_bridge import (
     calculate_ppo_core,
     calculate_rsi_core,
     vectorized_wick_check_buy,
-    vectorized_wick_check_sell
+    vectorized_wick_check_sell,
+    vectorized_wick_ratios 
 )
 
 try:
@@ -758,6 +759,8 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
         _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
         _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+        _ = aot_bridge.vectorized_wick_ratios(test_data, test_data, test_data, test_data)
+
 
         logger.info("✅ JIT warmup complete")
 
@@ -957,26 +960,20 @@ def calculate_all_indicators_numpy(
             'rma200_5': np.zeros(len(data_5m.get("close", [1])), dtype=np.float64),
             'pivots': {}
         }
+
 def precompute_candle_quality(
     data_15m: Dict[str, np.ndarray]
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     buy_quality = vectorized_wick_check_buy(
-        data_15m["open"],
-        data_15m["high"],
-        data_15m["low"],
-        data_15m["close"],
-        Constants.MIN_WICK_RATIO
+        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], Constants.MIN_WICK_RATIO
     )
-    
     sell_quality = vectorized_wick_check_sell(
-        data_15m["open"],
-        data_15m["high"],
-        data_15m["low"],
-        data_15m["close"],
-        Constants.MIN_WICK_RATIO
+        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], Constants.MIN_WICK_RATIO
     )
-    
-    return buy_quality, sell_quality
+    buy_ratios, sell_ratios = vectorized_wick_ratios(
+        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"]
+    )
+    return buy_quality, sell_quality, buy_ratios, sell_ratios
 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
@@ -2908,34 +2905,28 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair}: {e}")
         return {k: False for k in keys}
 
-def check_common_conditions(
-    open_val: float,
-    high_val: float,
-    low_val: float,
-    close_val: float,
-    is_buy: bool
-) -> bool:
-    
+def check_common_conditions(open_val, high_val, low_val, close_val, is_buy) -> bool:
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False
 
+        body_bottom = min(open_val, close_val)
+        body_top = max(open_val, close_val)
+
         if is_buy:
             if close_val <= open_val:
                 return False
-            upper_wick = high_val - close_val
+            upper_wick = max(high_val - body_top, 0.0)
             wick_ratio = upper_wick / candle_range
             return wick_ratio < Constants.MIN_WICK_RATIO
         else:
             if close_val >= open_val:
                 return False
-            lower_wick = close_val - low_val
+            lower_wick = max(body_bottom - low_val, 0.0)
             wick_ratio = lower_wick / candle_range
             return wick_ratio < Constants.MIN_WICK_RATIO
-
-    except Exception as e:
-        logger.error(f"check_common_conditions failed: {e}")
+    except Exception:
         return False
 
 def check_candle_quality_with_reason(
@@ -3077,17 +3068,8 @@ async def evaluate_pair_and_alert(
         rma200_5_val = rma200_5[i5]
         
 
-        # --- Wick ratio calculations ---
-        candle_range = max(high_curr - low_curr, 1e-12)
-
-        # Buy side (green candle): upper wick
-        upper_wick = max(high_curr - max(open_curr, close_curr), 0.0)
-        buy_wick_ratio = upper_wick / candle_range
-
-        # Sell side (red candle): lower wick
-        lower_wick = max(min(open_curr, close_curr) - low_curr, 0.0)
-        sell_wick_ratio = lower_wick / candle_range
-
+        buy_wick_ratio = float(buy_ratios_arr[i15])
+        sell_wick_ratio = float(sell_ratios_arr[i15])
 
         # Validate candle timestamp
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
@@ -3185,12 +3167,13 @@ async def evaluate_pair_and_alert(
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-        
-        # Candle quality checks
-        buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
+   
+        buy_quality_arr, sell_quality_arr, buy_ratios_arr, sell_ratios_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-        
+        buy_wick_ratio = float(buy_ratios_arr[i15])
+        sell_wick_ratio = float(sell_ratios_arr[i15])
+     
         buy_candle_reason = None
         sell_candle_reason = None
         
