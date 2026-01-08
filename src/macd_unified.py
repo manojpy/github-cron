@@ -3067,10 +3067,6 @@ async def evaluate_pair_and_alert(
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
         
-
-        buy_wick_ratio = float(buy_ratios_arr[i15])
-        sell_wick_ratio = float(sell_ratios_arr[i15])
-
         # Validate candle timestamp
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             debug_if(cfg.DEBUG_MODE, logger, lambda: (
