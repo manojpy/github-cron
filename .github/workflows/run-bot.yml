@@ -188,9 +188,3 @@ jobs:
           name: bot-execution-logs-${{ github.run_number }}
           path: logs/
           retention-days: 2
-
-      - name: 🧹 Cleanup Resources
-        if: always()
-        run: |
-          docker stop macd_bot_runner 2>/dev/null || true
-          docker rm -
