@@ -3229,9 +3229,6 @@ async def evaluate_pair_and_alert(
                 mmh_m3 < mmh_m2 < mmh_m1 and 
                 mmh_curr < mmh_m1
             )
-
-        ctx["buy_wick_ratio"] = buy_wick_ratio
-        ctx["sell_wick_ratio"] = sell_wick_ratio
  
         # Build context for alert evaluation
         context = {
@@ -3273,6 +3270,10 @@ async def evaluate_pair_and_alert(
             # Other indicators
             "pivots": piv,
             "vwap": cfg.ENABLE_VWAP,
+
+            # Wick ratios
+            "buy_wick_ratio": buy_wick_ratio,
+            "sell_wick_ratio": sell_wick_ratio,
 
             # Quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
