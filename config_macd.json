@@ -39,7 +39,7 @@
   "RUN_TIMEOUT_SECONDS": 300,
 
   "_comment_rate_limits": "✅ HYBRID: Safe Telegram rate limit to avoid throttling",
-  "TELEGRAM_RATE_LIMIT_PER_MINUTE": 60,
+  "TELEGRAM_RATE_LIMIT_PER_MINUTE": 25,
   "TELEGRAM_BURST_SIZE": 8,
 
   "_comment_memory": "✅ OPTIMIZED: Reduced memory limit for efficiency",
