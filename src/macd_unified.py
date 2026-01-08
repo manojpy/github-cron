@@ -3066,7 +3066,42 @@ async def evaluate_pair_and_alert(
         low_curr = data_15m["low"][i15]   
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-        
+
+        # ============================================================================
+        # ✅ FIX 1: Calculate ACTUAL wick ratios from current candle
+        # ============================================================================
+        # Extract current candle OHLC
+        i15_open = float(open_15m[i15])
+        i15_high = float(data_15m["high"][i15])
+        i15_low = float(data_15m["low"][i15])
+        i15_close = close_curr
+
+        # Calculate actual wick ratios for current candle
+        candle_range = i15_high - i15_low
+        if candle_range < 1e-8:
+            actual_buy_wick_ratio = 1.0
+            actual_sell_wick_ratio = 1.0
+        else:
+            # Buy (green candle) - check upper wick
+            body_top = max(i15_open, i15_close)
+            upper_wick = i15_high - body_top
+            actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
+    
+            # Sell (red candle) - check lower wick
+            body_bottom = min(i15_open, i15_close)
+            lower_wick = body_bottom - i15_low
+            actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
+
+        # Debug logging for wick validation
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                f"Wick validation | {pair_name} | "
+                f"Buy: {actual_buy_wick_ratio*100:.1f}% | "
+                f"Sell: {actual_sell_wick_ratio*100:.1f}% | "
+                f"Range: {candle_range:.5f} | "
+                f"Candle: O={i15_open:.2f} H={i15_high:.2f} L={i15_low:.2f} C={i15_close:.2f}"
+            )
+       
         # Validate candle timestamp
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             debug_if(cfg.DEBUG_MODE, logger, lambda: (
@@ -3167,9 +3202,7 @@ async def evaluate_pair_and_alert(
         buy_quality_arr, sell_quality_arr, buy_ratios_arr, sell_ratios_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-        buy_wick_ratio = float(buy_ratios_arr[i15])
-        sell_wick_ratio = float(sell_ratios_arr[i15])
-     
+        
         buy_candle_reason = None
         sell_candle_reason = None
         
@@ -3250,9 +3283,10 @@ async def evaluate_pair_and_alert(
             "pivots": piv,
             "vwap": cfg.ENABLE_VWAP,
 
-            # Wick ratios
-            "buy_wick_ratio": buy_wick_ratio,
-            "sell_wick_ratio": sell_wick_ratio,
+
+            # ✅ Use ACTUAL calculated ratios (not precomputed)
+            "buy_wick_ratio": actual_buy_wick_ratio,
+            "sell_wick_ratio": actual_sell_wick_ratio,
 
             # Quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
@@ -3302,6 +3336,32 @@ async def evaluate_pair_and_alert(
             key = ALERT_KEYS[alert_key]
             trigger = False
     
+            # Determine if this is a BUY or SELL signal
+            is_buy_signal = (
+                "up" in alert_key or 
+                alert_key in ["vwap_up", "mmh_buy", "ppo_zero_up", "ppo_011_up", "rsi_50_up"]
+            )
+            is_sell_signal = (
+                "down" in alert_key or 
+                alert_key in ["vwap_down", "mmh_sell", "ppo_zero_down", "ppo_011_down", "rsi_50_down"]
+            )
+    
+            # Block BUY signals if upper wick too large
+            if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"❌ BLOCKED {alert_key}: Upper wick {actual_buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%"
+                    )
+                continue
+    
+            # Block SELL signals if lower wick too large
+            if is_sell_signal and actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"❌ BLOCKED {alert_key}: Lower wick {actual_sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%"
+                    )
+                continue 
+    
           # Special handling for pivot alerts
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                 level = alert_key.split("_")[-1]
@@ -3329,6 +3389,29 @@ async def evaluate_pair_and_alert(
                         exc_info=True  # ✅ CHANGED: Show full traceback
                     )
                     trigger = False
+
+
+    # ============================================================================
+    # ✅ FIX 3: SECONDARY VALIDATION - Verify common conditions
+    # ============================================================================
+            if trigger:
+                # Verify buy_common for BUY signals
+                if is_buy_signal and not buy_common:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"❌ BLOCKED {alert_key}: buy_common=False "
+                            f"(base_buy_trend={base_buy_trend}, buy_candle_passed={buy_candle_passed}, is_green={is_green})"
+                        )
+                    continue
+        
+                # Verify sell_common for SELL signals
+                if is_sell_signal and not sell_common:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"❌ BLOCKED {alert_key}: sell_common=False "
+                            f"(base_sell_trend={base_sell_trend}, sell_candle_passed={sell_candle_passed}, is_red={is_red})"
+                        )
+                    continue
     
             # Generate alert if triggered and not previously active
             if trigger and not previous_states.get(key, False):
@@ -3337,7 +3420,17 @@ async def evaluate_pair_and_alert(
                         context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None
                     )
                     raw_alerts.append((def_["title"], extra, def_["key"]))
-                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
+                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))          
+
+                    # ✅ FIX 4: Debug logging for successful alerts
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"✅ Alert FIRED: {alert_key} | "
+                            f"buy_common={buy_common} sell_common={sell_common} | "
+                            f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
+                            f"Candle: O={i15_open:.2f} H={i15_high:.2f} L={i15_low:.2f} C={i15_close:.2f}"
+                        ) 
+
                 except Exception as e:
                     # ✅ IMPROVED: Show which extra_fn failed
                     logger_pair.error(
