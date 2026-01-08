@@ -85,7 +85,7 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
-          echo "::group::🔥 Starting Bot Execution"
+          echo "::group::🔥 Launch Macd-Unified...🔥 "
           echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
