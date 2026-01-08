@@ -3072,11 +3072,23 @@ async def evaluate_pair_and_alert(
         ts_curr = int(timestamps_15m[i15])
         open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
-        low_curr = data_15m["low"][i15]
-        
+        low_curr = data_15m["low"][i15]   
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
         
+
+        # --- Wick ratio calculations ---
+        candle_range = max(high_curr - low_curr, 1e-12)
+
+        # Buy side (green candle): upper wick
+        upper_wick = max(high_curr - max(open_curr, close_curr), 0.0)
+        buy_wick_ratio = upper_wick / candle_range
+
+        # Sell side (red candle): lower wick
+        lower_wick = max(min(open_curr, close_curr) - low_curr, 0.0)
+        sell_wick_ratio = lower_wick / candle_range
+
+
         # Validate candle timestamp
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             debug_if(cfg.DEBUG_MODE, logger, lambda: (
@@ -3218,6 +3230,9 @@ async def evaluate_pair_and_alert(
                 mmh_curr < mmh_m1
             )
 
+        ctx["buy_wick_ratio"] = buy_wick_ratio
+        ctx["sell_wick_ratio"] = sell_wick_ratio
+ 
         # Build context for alert evaluation
         context = {
             "buy_common": buy_common,
@@ -3258,7 +3273,7 @@ async def evaluate_pair_and_alert(
             # Other indicators
             "pivots": piv,
             "vwap": cfg.ENABLE_VWAP,
-    
+
             # Quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
