@@ -25,7 +25,7 @@ env:
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 7  # ✅ Balanced between 6 and 8
+    timeout-minutes: 7
     permissions:
       contents: read
       packages: read
@@ -50,7 +50,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 🐳 Pull Latest AOT Image (BuildKit)
-        id: image_pull
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "📦 Pulling AOT image with BuildKit..."
@@ -59,12 +58,10 @@ jobs:
           if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             PULL_TIME=$(( $(date +%s) - START_TIME ))
             echo "✅ Image pulled in ${PULL_TIME}s"
-            echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
           else
             echo "❌ Failed to pull image"
             exit 1
           fi
-          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
 
       - name: 🔑 Verify Secrets
         run: |
@@ -90,7 +87,7 @@ jobs:
           mkdir -p logs
           echo "::group::🔥 Starting Bot Execution"
           echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🏷️  Image: ${{ steps.image_pull.outputs.image_ref }}"
+          echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
 
@@ -99,7 +96,7 @@ jobs:
             --rm \
             --name macd_bot_runner \
             --platform linux/amd64 \
-            --network host \  # ✅ Faster Redis/Telegram I/O
+            --network host \
             --memory="900m" \
             --memory-swap="900m" \
             --cpus="2.0" \
@@ -116,7 +113,7 @@ jobs:
             -e NUMBA_NUM_THREADS=2 \
             -e OMP_NUM_THREADS=2 \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
-            ${{ steps.image_pull.outputs.image_ref }} 2>&1 | tee logs/bot_output.log
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
@@ -179,7 +176,7 @@ jobs:
           fi
 
       # ========================================================================
-      # PHASE 4: ARTIFACT UPLOAD & CLEANUP
+      # PHASE 4: ARTIFACT UPLOAD
       # ========================================================================
       - name: 📦 Upload Execution Logs
         if: failure()
