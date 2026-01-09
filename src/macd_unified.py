@@ -35,17 +35,6 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
-import contextlib
-
-@contextlib.asynccontextmanager
-async def gc_control():
-    """Temporarily enable cyclic-GC and force a collection on exit."""
-    gc.enable()
-    try:
-        yield
-    finally:
-        gc.collect()
-
 from aot_bridge import (
     sanitize_array_numba,
     sanitize_array_numba_parallel,
@@ -1670,20 +1659,6 @@ def parse_candles_to_numpy(
         if n == 0:
             return None
 
-        for key in required:
-            if len(res[key]) != n:
-                logger.error(
-                    f"Candle array length mismatch: key '{key}' has {len(res[key])} "
-                    f"elements but expected {n}. Data is corrupted."
-                )
-                return None
-
-        data = {
-            "timestamp": np.empty(n, dtype=np.int64),
-            # ... rest of code
-        }
-
-
         data = {
             "timestamp": np.empty(n, dtype=np.int64),
             "open": np.empty(n, dtype=np.float64),
@@ -1743,9 +1718,6 @@ def validate_candle_data(
         if close is None or len(close) == 0:
             return False, "Close array is empty"
 
-        if np.all(np.isnan(close)):
-            return False, "All close prices are NaN (completely invalid data)"
-        
         if np.any(np.isnan(close)) or np.any(close <= 0):
             return False, "Invalid close prices (NaN or <= 0)"
 
@@ -2740,23 +2712,14 @@ class TelegramQueue:
         return await self.send(combined)
 
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
-    # Split title into symbol + description
     parts = title.split(" ", 1)
-    symbols = escape_markdown_v2(parts[0]) if len(parts) == 2 else ""
-    description = escape_markdown_v2(parts[1]) if len(parts) == 2 else escape_markdown_v2(title)
-
-    # Escape only user‑supplied fields
-    pair_safe = escape_markdown_v2(pair)
-    extra_safe = escape_markdown_v2(extra) if extra else None
-
-    # Price and timestamp are generated values → no escaping needed
+    symbols = parts[0] if len(parts) == 2 else ""
+    description = parts[1] if len(parts) == 2 else title
     price_str = f"${price:,.2f}"
-    line1 = f"{symbols} {pair_safe} - {price_str}".strip()
-    line2 = f"{description} : {extra_safe}" if extra_safe else description
+    line1 = f"{symbols} {pair} - {price_str}".strip()
+    line2 = f"{description} : {extra}" if extra else f"{description}"
     line3 = format_ist_time(ts, "%d-%m-%Y     %H:%M IST")
-
-    # Return assembled message without re‑escaping the whole block
-    return f"{line1}\n{line2}\n{line3}"
+    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
 
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
     headline_emoji = items[0][0].split(" ", 1)[0]
@@ -2878,7 +2841,6 @@ ALERT_KEYS: Dict[str, str] = {
 }
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
-
 def validate_alert_definitions() -> None:
     errors = []
     
@@ -3856,23 +3818,24 @@ async def process_pairs_with_workers(
     return valid_results
 
 async def run_once() -> bool:
-    async with gc_control():
-        correlation_id = uuid.uuid4().hex[:8]
-        TRACE_ID.set(correlation_id)
-        logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
-        start_time = time.time()
+    gc.disable()
 
-        reference_time = get_trigger_timestamp()
-        logger_run.info(
-            f"🚀 Run started | Correlation ID: {correlation_id} | "
-            f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
-        )
+    correlation_id = uuid.uuid4().hex[:8]
+    TRACE_ID.set(correlation_id)
+    logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
+    start_time = time.time()
 
-        sdb: Optional[RedisStateStore] = None
-        lock: Optional[RedisLock] = None
-        lock_acquired = False
-        fetcher: Optional[DataFetcher] = None
-        telegram_queue: Optional[TelegramQueue] = None
+    reference_time = get_trigger_timestamp()
+    logger_run.info(
+        f"🚀 Run started | Correlation ID: {correlation_id} | "
+        f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
+    )
+
+    sdb: Optional[RedisStateStore] = None
+    lock: Optional[RedisLock] = None
+    lock_acquired = False
+    fetcher: Optional[DataFetcher] = None
+    telegram_queue: Optional[TelegramQueue] = None
 
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
@@ -3939,6 +3902,7 @@ async def run_once() -> bool:
             PRODUCTS_CACHE["fetched_at"] = now
             PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
             clear_stale_products_cache()
+
             cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
             logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
 
@@ -3946,7 +3910,7 @@ async def run_once() -> bool:
 
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
+            logger_run.debug(f"��️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
 
@@ -4121,6 +4085,7 @@ async def run_once() -> bool:
             pass
 
         logger_run.debug("🏁 Resource cleanup finished")
+        gc.enable()
 
 try:
     import uvloop
@@ -4163,12 +4128,6 @@ if __name__ == "__main__":
         validate_runtime_config()
     except ValueError as e:
         logger.critical(f"Configuration validation failed: {e}")
-        sys.exit(1)
-
-    try:
-        validate_alert_definitions()
-    except ValueError as e:
-        logger.critical(f"Alert definition validation FAILED: {e}")
         sys.exit(1)
 
     if args.validate_only:
