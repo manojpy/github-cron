@@ -19,7 +19,6 @@ COPY --from=uv-installer /usr/local/lib/python3.11/site-packages /usr/local/lib/
 # ✅ Minimal build dependencies
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     build-essential \
-    git \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /build
