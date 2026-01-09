@@ -720,7 +720,7 @@ def calculate_magical_momentum_hist(
             elif val <= -0.9999:
                 momentum[i] = pine_min
             else:
-                ratio = (1.0 + val) / (1.0 - val)
+                temp2 = (1.0 + val) / (1.0 - val)
                 momentum[i] = 0.25 * np.log(temp2)
 
         momentum_arr = calc_mmh_momentum_loop(momentum, rows)
