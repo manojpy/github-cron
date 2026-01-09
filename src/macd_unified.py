@@ -996,7 +996,7 @@ class SessionManager:
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 2000
+    _session_reuse_limit: ClassVar[int] = 1000
     
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
@@ -1660,6 +1660,20 @@ def parse_candles_to_numpy(
         if n == 0:
             return None
 
+        for key in required:
+            if len(res[key]) != n:
+                logger.error(
+                    f"Candle array length mismatch: key '{key}' has {len(res[key])} "
+                    f"elements but expected {n}. Data is corrupted."
+                )
+                return None
+
+        data = {
+            "timestamp": np.empty(n, dtype=np.int64),
+            # ... rest of code
+        }
+
+
         data = {
             "timestamp": np.empty(n, dtype=np.int64),
             "open": np.empty(n, dtype=np.float64),
@@ -1719,6 +1733,9 @@ def validate_candle_data(
         if close is None or len(close) == 0:
             return False, "Close array is empty"
 
+        if np.all(np.isnan(close)):
+            return False, "All close prices are NaN (completely invalid data)"
+        
         if np.any(np.isnan(close)) or np.any(close <= 0):
             return False, "Invalid close prices (NaN or <= 0)"
 
@@ -2713,14 +2730,26 @@ class TelegramQueue:
         return await self.send(combined)
 
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
+    # Escape all components BEFORE building message
     parts = title.split(" ", 1)
-    symbols = parts[0] if len(parts) == 2 else ""
-    description = parts[1] if len(parts) == 2 else title
+    symbols = escape_markdown_v2(parts[0]) if len(parts) == 2 else ""
+    description = escape_markdown_v2(parts[1]) if len(parts) == 2 else escape_markdown_v2(title)
+    pair = escape_markdown_v2(pair)  # ← ADD THIS
+    
     price_str = f"${price:,.2f}"
     line1 = f"{symbols} {pair} - {price_str}".strip()
-    line2 = f"{description} : {extra}" if extra else f"{description}"
+    
+    # Escape extra before including
+    if extra:
+        extra = escape_markdown_v2(extra)  # ← ADD THIS
+        line2 = f"{description} : {extra}"
+    else:
+        line2 = description
+    
     line3 = format_ist_time(ts, "%d-%m-%Y     %H:%M IST")
-    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
+    
+    # Return already-escaped message (don't re-escape)
+    return f"{line1}\n{line2}\n{line3}"
 
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
     headline_emoji = items[0][0].split(" ", 1)[0]
@@ -3911,7 +3940,7 @@ async def run_once() -> bool:
 
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
+            logger_run.debug(f"��️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
 
