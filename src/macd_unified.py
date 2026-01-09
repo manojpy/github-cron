@@ -94,6 +94,7 @@ class Constants:
     CIRCUIT_BREAKER_MAX_WAIT = 300
     MAX_PRICE_CHANGE_PERCENT = 50.0
     MAX_CANDLE_GAP_MULTIPLIER = 2.0
+    INFINITY_CLAMP = 1e10
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
@@ -177,9 +178,9 @@ class BotConfig(BaseModel):
     SRSI_KALMAN_LEN: int = 5
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
-    HTTP_TIMEOUT: int = 15
-    CANDLE_FETCH_RETRIES: int = 3
-    CANDLE_FETCH_BACKOFF: float = 1.5
+    HTTP_TIMEOUT: int = 6
+    CANDLE_FETCH_RETRIES: int = 1
+    CANDLE_FETCH_BACKOFF: float = 1
     JITTER_MIN: float = 0.1
     JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
@@ -399,7 +400,21 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
 
 _VALIDATION_DONE = False
 
+# ============================================================================
+# GLOBAL CACHE MANAGEMENT
+# ============================================================================
+
 PRODUCTS_CACHE: Dict[str, Any] = {"data": None, "until": 0.0}
+
+def clear_stale_products_cache() -> None:
+    """Clear cache if it's older than threshold"""
+    global PRODUCTS_CACHE
+    now = time.time()
+    expires_at = PRODUCTS_CACHE.get("until", 0.0)
+    
+    if expires_at <= now:
+        logger.debug("Products cache expired, clearing...")
+        PRODUCTS_CACHE = {"data": None, "until": 0.0}
 
 def validate_runtime_config() -> None:
     global _VALIDATION_DONE
@@ -3887,7 +3902,7 @@ async def run_once() -> bool:
             PRODUCTS_CACHE["data"] = prod_resp
             PRODUCTS_CACHE["fetched_at"] = now
             PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
-            run_once._products_cache = PRODUCTS_CACHE
+            clear_stale_products_cache()
 
             cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
             logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
