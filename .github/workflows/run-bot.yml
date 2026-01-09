@@ -1,4 +1,4 @@
-name: 🤖 Run MACD Unified Bot (Optimized)
+name: 🤖 Run MACD Unified Bot
 
 on:
   workflow_dispatch:
@@ -50,7 +50,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # ========================================================================
-      # PHASE 2: EXECUTE BOT (Consolidated: Pull + Run)
+      # PHASE 2: EXECUTE BOT (Quiet Pull + Run)
       # ========================================================================
       - name: 🚀 Execute MACD Bot
         id: bot_run
@@ -73,8 +73,13 @@ jobs:
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
-          
-          # Single docker run command: Pull happens automatically if image not cached
+
+          # Pre-pull image quietly to suppress layer logs
+          echo "::group::📦 Pulling image (quiet)..."
+          docker pull --quiet "$IMAGE_REF"
+          echo "::endgroup::"
+
+          # Run container, only bot output goes to logs
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
