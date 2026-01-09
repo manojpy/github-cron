@@ -93,7 +93,7 @@ class Constants:
     CIRCUIT_BREAKER_MAX_WAIT = 300
     MAX_PRICE_CHANGE_PERCENT = 50.0
     MAX_CANDLE_GAP_MULTIPLIER = 2.0
-    INFINITY_CLAMP = 1e10
+    INFINITY_CLAMP = 1e8
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
@@ -720,7 +720,7 @@ def calculate_magical_momentum_hist(
             elif val <= -0.9999:
                 momentum[i] = pine_min
             else:
-                temp2 = (1.0 + val) / (1.0 - val)
+                ratio = (1.0 + val) / (1.0 - val)
                 momentum[i] = 0.25 * np.log(temp2)
 
         momentum_arr = calc_mmh_momentum_loop(momentum, rows)
@@ -784,6 +784,7 @@ def warmup_if_needed() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
+
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
     low: np.ndarray,
@@ -795,6 +796,11 @@ def calculate_pivot_levels_numpy(
     try:
         if len(timestamps) < 2:
             logger.warning("Pivot calc: insufficient data")
+            return piv
+
+        # ← ADD: Validate no NaN in input arrays
+        if np.any(np.isnan(high)) or np.any(np.isnan(low)) or np.any(np.isnan(close)):
+            logger.warning("Pivot calc: NaN values in OHLC data")
             return piv
 
         days = timestamps // 86400
@@ -2205,12 +2211,14 @@ class RedisStateStore:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
 
+            # In check_recent_alert() method, REPLACE:
             except redis.exceptions.NoScriptError:
                 acquired = False
                 try:
+                    # ← INCREASE timeout to prevent deadlock
                     await asyncio.wait_for(
                         RedisStateStore._script_reload_lock.acquire(),
-                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
+                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT + 2.0  # ← Add buffer
                     )
                     acquired = True
 
@@ -2402,14 +2410,14 @@ class RedisStateStore:
             # Fallback with timeout protection
             try:
                 # FIX: Correct key format - mget_states adds prefix internally
-                composite_keys = [f"{pair}:{k}" for k in alert_keys]
-                prev_raw = await asyncio.wait_for(self.mget_states(composite_keys), timeout=2.0)
 
-                # Normalize to {alert_key: is_active}
+                state_keys = [f"{pair}:{ALERT_KEYS[k]}" for k in alert_keys]
+                prev_raw = await asyncio.wait_for(self.mget_states(state_keys), timeout=2.0)
+
                 prev_states: Dict[str, bool] = {}
-                for k in alert_keys:
-                    ck = f"{pair}:{k}"
-                    env = prev_raw.get(ck)
+                for idx, k in enumerate(alert_keys):
+                    state_key = state_keys[idx]
+                    env = prev_raw.get(state_key)
                     prev_states[k] = bool(env and env.get("state") == "ACTIVE")
 
                 await asyncio.wait_for(self.batch_set_states(state_updates), timeout=2.0)
