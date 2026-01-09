@@ -72,9 +72,6 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# ✅ Copy UV binary
-COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
-
 # ✅ Security - Non-root user
 RUN useradd --uid 1000 --no-log-init -m appuser && \
     mkdir -p /app/src && \
