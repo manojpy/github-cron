@@ -36,6 +36,17 @@ import weakref
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
+import contextlib
+
+@contextlib.asynccontextmanager
+async def gc_control():
+    """Temporarily enable cyclic-GC and force a collection on exit."""
+    gc.enable()
+    try:
+        yield
+    finally:
+        gc.collect()
+
 from aot_bridge import (
     sanitize_array_numba,
     sanitize_array_numba_parallel,
@@ -3848,24 +3859,23 @@ async def process_pairs_with_workers(
     return valid_results
 
 async def run_once() -> bool:
-    gc.disable()
+    async with gc_control():
+        correlation_id = uuid.uuid4().hex[:8]
+        TRACE_ID.set(correlation_id)
+        logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
+        start_time = time.time()
 
-    correlation_id = uuid.uuid4().hex[:8]
-    TRACE_ID.set(correlation_id)
-    logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
-    start_time = time.time()
+        reference_time = get_trigger_timestamp()
+        logger_run.info(
+            f"🚀 Run started | Correlation ID: {correlation_id} | "
+            f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
+        )
 
-    reference_time = get_trigger_timestamp()
-    logger_run.info(
-        f"🚀 Run started | Correlation ID: {correlation_id} | "
-        f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
-    )
-
-    sdb: Optional[RedisStateStore] = None
-    lock: Optional[RedisLock] = None
-    lock_acquired = False
-    fetcher: Optional[DataFetcher] = None
-    telegram_queue: Optional[TelegramQueue] = None
+        sdb: Optional[RedisStateStore] = None
+        lock: Optional[RedisLock] = None
+        lock_acquired = False
+        fetcher: Optional[DataFetcher] = None
+        telegram_queue: Optional[TelegramQueue] = None
 
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
@@ -3932,7 +3942,6 @@ async def run_once() -> bool:
             PRODUCTS_CACHE["fetched_at"] = now
             PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
             clear_stale_products_cache()
-
             cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
             logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
 
@@ -3940,7 +3949,7 @@ async def run_once() -> bool:
 
         else:
             cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"��️ Using cached products (TTL: {cache_ttl:.0f}s)")
+            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
 
@@ -4115,7 +4124,6 @@ async def run_once() -> bool:
             pass
 
         logger_run.debug("🏁 Resource cleanup finished")
-        gc.enable()
 
 try:
     import uvloop
