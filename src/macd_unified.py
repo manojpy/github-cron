@@ -55,23 +55,14 @@ def clear_stale_products_cache() -> None:
 
 import contextlib
 
-@contextlib.contextmanager
-def gc_control():
-    """Context manager to safely disable/enable garbage collection.
-    
-    Guarantees gc.enable() runs even if exception occurs.
-    Usage:
-        async with gc_control():
-            # your code here
-            pass
-    """
+@contextlib.asynccontextmanager
+async def gc_control():
     gc.disable()
     try:
         yield
     finally:
         gc.enable()
         logger.debug("Garbage collection re-enabled")
-
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
