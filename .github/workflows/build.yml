@@ -25,7 +25,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 12  # ✅ Optimized: reduced from 15
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
@@ -48,14 +48,14 @@ jobs:
             network=host
           buildkitd-flags: --allow-insecure-entitlement network.host
 
-      - name: 🔐 Log in to GitHub Container Registry
+      - name: 🔑 Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 📋 Extract Docker metadata
+      - name: 🏷️ Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -85,7 +85,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             AOT_STRICT=1
-            PYTHONOPTIMIZE=2   # ✅ Explicit optimization flag
+            PYTHONOPTIMIZE=2
           cache-from: |
             type=gha,scope=macd-aot-deps
             type=gha,scope=macd-aot-build
@@ -93,25 +93,39 @@ jobs:
           cache-to: type=gha,mode=max,scope=macd-aot-build
           provenance: false
 
-      - name: ✅ Smoke Test - Verify AOT
+      - name: ✅ Smoke Test - Verify AOT & Environment
         run: |
           echo "🧪 Running AOT verification..."
-          docker run --rm --platform linux/amd64 \
+          docker run --rm \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python -c "
           import sys
+          import os
           from aot_bridge import is_using_aot, get_fallback_reason
+          
+          # Verify AOT is loaded
           if not is_using_aot():
               print(f'❌ AOT not loaded: {get_fallback_reason()}')
               sys.exit(1)
           print('✅ AOT Binary: LOADED & ACTIVE')
+          
+          # Verify AOT_LIB_PATH environment
+          aot_path = os.getenv('AOT_LIB_PATH', '')
+          if not aot_path:
+              print('❌ AOT_LIB_PATH not set')
+              sys.exit(1)
+          print(f'✅ AOT_LIB_PATH: {aot_path}')
+          
+          # Verify numba threading
+          import numba
+          print(f'✅ Numba version: {numba.__version__}')
           " || exit 1
 
       # ========================================================================
-      # PHASE 3: SECURITY SCANNING
+      # PHASE 3: SECURITY SCANNING (Trivy only on schedule/dispatch)
       # ========================================================================
       - name: 🛡️ Run Trivy Vulnerability Scan
-        if: github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
@@ -119,18 +133,18 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
-          timeout: '6m'  # ✅ Balanced timeout
+          timeout: '6m'
           scanners: 'vuln,secret'
 
       - name: 📤 Upload Trivy Results to GitHub Security
-        if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
+        if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-results.sarif'
           category: 'container-security'
 
       - name: 📊 Generate Trivy Summary
-        if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
+        if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         run: |
           echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -154,7 +168,7 @@ jobs:
       # ========================================================================
       # PHASE 4: BUILD SUMMARY
       # ========================================================================
-      - name: 📝 Generate Build Summary
+      - name: 📋 Generate Build Summary
         if: always()
         run: |
           echo "## 🔨 Build Summary" >> $GITHUB_STEP_SUMMARY
