@@ -2741,26 +2741,14 @@ class TelegramQueue:
         return await self.send(combined)
 
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
-    # Escape all components BEFORE building message
     parts = title.split(" ", 1)
-    symbols = escape_markdown_v2(parts[0]) if len(parts) == 2 else ""
-    description = escape_markdown_v2(parts[1]) if len(parts) == 2 else escape_markdown_v2(title)
-    pair = escape_markdown_v2(pair)  # ← ADD THIS
-    
+    symbols = parts[0] if len(parts) == 2 else ""
+    description = parts[1] if len(parts) == 2 else title
     price_str = f"${price:,.2f}"
     line1 = f"{symbols} {pair} - {price_str}".strip()
-    
-    # Escape extra before including
-    if extra:
-        extra = escape_markdown_v2(extra)  # ← ADD THIS
-        line2 = f"{description} : {extra}"
-    else:
-        line2 = description
-    
+    line2 = f"{description} : {extra}" if extra else f"{description}"
     line3 = format_ist_time(ts, "%d-%m-%Y     %H:%M IST")
-    
-    # Return already-escaped message (don't re-escape)
-    return f"{line1}\n{line2}\n{line3}"
+    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
 
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
     headline_emoji = items[0][0].split(" ", 1)[0]
