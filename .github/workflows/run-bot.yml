@@ -1,4 +1,4 @@
-name: 🤖 Run MACD Unified Bot
+name: 🤖 Run MACD Unified Bot (Hybrid)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 300
+  BOT_TIMEOUT: 300  # 5 minutes (sufficient for ~30–40s job)
 
 jobs:
   run-bot:
@@ -32,7 +32,7 @@ jobs:
 
     steps:
       # ========================================================================
-      # PHASE 1: CHECKOUT & AUTH
+      # PHASE 1: SETUP
       # ========================================================================
       - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
@@ -42,53 +42,68 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      - name: 🔑 Log in to GHCR
+      - name: 🔐 Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 🐳 Pull Latest AOT Image (BuildKit)
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "📦 Pulling AOT image with BuildKit..."
+          START_TIME=$(date +%s)
+          export DOCKER_BUILDKIT=1
+          if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
+            PULL_TIME=$(( $(date +%s) - START_TIME ))
+            echo "✅ Image pulled in ${PULL_TIME}s"
+          else
+            echo "❌ Failed to pull image"
+            exit 1
+          fi
+
+      - name: 🔑 Verify Secrets
+        run: |
+          MISSING=()
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
+          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
+          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "❌ Missing required secrets: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "✅ All secrets configured"
+
       # ========================================================================
-      # PHASE 2: EXECUTE BOT (Quiet Pull + Run)
+      # PHASE 2: BOT EXECUTION
       # ========================================================================
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 6
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
         run: |
           mkdir -p logs
-          
-          # Verify secrets inline (fail-fast)
-          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "❌ Missing TELEGRAM_BOT_TOKEN" && exit 1
-          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && echo "❌ Missing TELEGRAM_CHAT_ID" && exit 1
-          [ -z "${{ secrets.REDIS_URL }}" ] && echo "❌ Missing REDIS_URL" && exit 1
-          
-          echo "::group::🔥 Launch MACD Bot...🔥"
-          echo "📍 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🐳 Image: $IMAGE_REF"
+          echo "::group::🔥 Launch Macd-Unified...🔥 "
+          echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
+          echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
-
-          # Pre-pull image quietly to suppress layer logs
-          echo "::group::📦 Pulling image (quiet)..."
-          docker pull --quiet "$IMAGE_REF"
-          echo "::endgroup::"
-
-          # Run container, only bot output goes to logs
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
+            --platform linux/amd64 \
             --network host \
             --memory="900m" \
             --memory-swap="900m" \
             --cpus="2.0" \
             --security-opt=no-new-privileges \
-            --tmpfs /tmp:rw,size=128m \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
             -e TZ=Asia/Kolkata \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
@@ -98,7 +113,7 @@ jobs:
             -e NUMBA_NUM_THREADS=2 \
             -e OMP_NUM_THREADS=2 \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
-            "$IMAGE_REF" 2>&1 | tee logs/bot_output.log
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
 
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
@@ -146,7 +161,7 @@ jobs:
           echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
           echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
-      - name: 📋 Generate Summary Report
+      - name: 📝 Generate Summary Report
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -161,7 +176,7 @@ jobs:
           fi
 
       # ========================================================================
-      # PHASE 4: ARTIFACT UPLOAD (Failures Only)
+      # PHASE 4: ARTIFACT UPLOAD
       # ========================================================================
       - name: 📦 Upload Execution Logs
         if: failure()
