@@ -6,7 +6,7 @@
   "DELTA_API_BASE": "https://api.india.delta.exchange",
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
-  "SEND_TEST_MESSAGE": true,
+  "SEND_TEST_MESSAGE": false,
 
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
