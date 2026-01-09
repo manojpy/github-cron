@@ -106,7 +106,9 @@ ENV PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=2 \
     MEMORY_LIMIT_BYTES=850000000 \
     TZ=Asia/Kolkata \
-    AOT_LIB_PATH=/app/src
+    AOT_LIB_PATH=/app/src \
+    DOCKER_BUILDKIT=1 \
+    DOCKER_CLI_EXPERIMENTAL=enabled
 
 # Labels for metadata
 LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
