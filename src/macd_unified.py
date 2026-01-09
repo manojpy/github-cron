@@ -31,23 +31,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
-
-
-# ============================================================================
-# GLOBAL CACHE MANAGEMENT
-# ============================================================================
-
-PRODUCTS_CACHE: Dict[str, Any] = {"data": None, "until": 0.0}
-
-def clear_stale_products_cache() -> None:
-    """Clear cache if it's older than threshold"""
-    global PRODUCTS_CACHE
-    now = time.time()
-    expires_at = PRODUCTS_CACHE.get("until", 0.0)
-    
-    if expires_at <= now:
-        logger.debug("Products cache expired, clearing...")
-        PRODUCTS_CACHE = {"data": None, "until": 0.0}
+import weakref
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
@@ -105,7 +89,6 @@ class Constants:
     PPO_RSI_GUARD_SELL = -0.30
     PPO_011_THRESHOLD = 0.11
     PPO_011_THRESHOLD_SELL = -0.11
-    INFINITY_CLAMP = 1e10
     STARTUP_GRACE_PERIOD = int(os.getenv('STARTUP_GRACE_PERIOD', 300))
     REDIS_LOCK_EXPIRY = max(int(os.getenv('REDIS_LOCK_EXPIRY', 900)), 900)
     CIRCUIT_BREAKER_MAX_WAIT = 300
@@ -194,9 +177,9 @@ class BotConfig(BaseModel):
     SRSI_KALMAN_LEN: int = 5
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
-    HTTP_TIMEOUT: int = 6
-    CANDLE_FETCH_RETRIES: int = 1
-    CANDLE_FETCH_BACKOFF: float = 1
+    HTTP_TIMEOUT: int = 15
+    CANDLE_FETCH_RETRIES: int = 3
+    CANDLE_FETCH_BACKOFF: float = 1.5
     JITTER_MIN: float = 0.1
     JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
@@ -998,7 +981,7 @@ class SessionManager:
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 1000
+    _session_reuse_limit: ClassVar[int] = 2000
     
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
@@ -1662,12 +1645,6 @@ def parse_candles_to_numpy(
         if n == 0:
             return None
 
-        expected_keys = ("t", "o", "h", "l", "c", "v")
-        for key in expected_keys:
-            if len(res[key]) != n:
-                logger.error(f"Candle array length mismatch for key '{key}': {len(res[key])} != {n}")
-                return None
-
         data = {
             "timestamp": np.empty(n, dtype=np.int64),
             "open": np.empty(n, dtype=np.float64),
@@ -1727,10 +1704,6 @@ def validate_candle_data(
         if close is None or len(close) == 0:
             return False, "Close array is empty"
 
-        # Check for completely invalid data
-        if np.all(np.isnan(close)):
-            return False, "All close prices are NaN (completely invalid data)"
-        
         if np.any(np.isnan(close)) or np.any(close <= 0):
             return False, "Invalid close prices (NaN or <= 0)"
 
@@ -2623,9 +2596,7 @@ class RedisLock:
             return False
 
         base_interval = Constants.LOCK_EXTEND_INTERVAL
-
-        jitter = random.uniform(0, min(Constants.LOCK_EXTEND_JITTER_MAX, 60))
-
+        jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
         extend_threshold = base_interval + jitter
 
         elapsed = time.time() - self.last_extend_time
@@ -2727,26 +2698,14 @@ class TelegramQueue:
         return await self.send(combined)
 
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
-    # Escape all components BEFORE building message
     parts = title.split(" ", 1)
-    symbols = escape_markdown_v2(parts[0]) if len(parts) == 2 else ""
-    description = escape_markdown_v2(parts[1]) if len(parts) == 2 else escape_markdown_v2(title)
-    pair = escape_markdown_v2(pair)  # ← ADD THIS
-    
+    symbols = parts[0] if len(parts) == 2 else ""
+    description = parts[1] if len(parts) == 2 else title
     price_str = f"${price:,.2f}"
     line1 = f"{symbols} {pair} - {price_str}".strip()
-    
-    # Escape extra before including
-    if extra:
-        extra = escape_markdown_v2(extra)  # ← ADD THIS
-        line2 = f"{description} : {extra}"
-    else:
-        line2 = description
-    
+    line2 = f"{description} : {extra}" if extra else f"{description}"
     line3 = format_ist_time(ts, "%d-%m-%Y     %H:%M IST")
-    
-    # Return already-escaped message (don't re-escape)
-    return f"{line1}\n{line2}\n{line3}"
+    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
 
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
     headline_emoji = items[0][0].split(" ", 1)[0]
@@ -3835,10 +3794,8 @@ async def process_pairs_with_workers(
                 logger_main.error(f"Error in {p_name} evaluation: {e}")
                 return None
 
-    results = await asyncio.gather(
-        *[guarded_eval(t) for t in valid_tasks],
-        return_exceptions=True  # ← Explicit, matches guarded_eval intent
-    )
+    results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
+    valid_results = [r for r in results if r is not None] 
     del all_candles 
     del results 
     import gc 
@@ -4157,12 +4114,6 @@ if __name__ == "__main__":
         validate_runtime_config()
     except ValueError as e:
         logger.critical(f"Configuration validation failed: {e}")
-        sys.exit(1)
-
-    try:
-        validate_alert_definitions()
-    except ValueError as e:
-        logger.critical(f"Alert definition validation FAILED: {e}")
         sys.exit(1)
 
     if args.validate_only:
