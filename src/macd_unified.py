@@ -31,7 +31,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
 import warnings
-import weakref
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
@@ -2879,6 +2878,7 @@ ALERT_KEYS: Dict[str, str] = {
 }
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
+
 def validate_alert_definitions() -> None:
     errors = []
     
@@ -4163,6 +4163,12 @@ if __name__ == "__main__":
         validate_runtime_config()
     except ValueError as e:
         logger.critical(f"Configuration validation failed: {e}")
+        sys.exit(1)
+
+    try:
+        validate_alert_definitions()
+    except ValueError as e:
+        logger.critical(f"Alert definition validation FAILED: {e}")
         sys.exit(1)
 
     if args.validate_only:
