@@ -31,14 +31,14 @@
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
 
-  "_comment_performance": "✅ HYBRID: Maximum parallelism for 30–35s execution target",
-  "MAX_PARALLEL_FETCH": 15,
-  "HTTP_TIMEOUT": 8,
-  "CANDLE_FETCH_RETRIES": 2,
-  "CANDLE_FETCH_BACKOFF": 1.2,
+  "_comment_performance": "✅ OPTIMIZED: Parallelism matches pair count (12) + reduced HTTP timeout for 30-35s target",
+  "MAX_PARALLEL_FETCH": 12,
+  "HTTP_TIMEOUT": 6,
+  "CANDLE_FETCH_RETRIES": 1,
+  "CANDLE_FETCH_BACKOFF": 1.0,
   "RUN_TIMEOUT_SECONDS": 300,
 
-  "_comment_rate_limits": "✅ HYBRID: Safe Telegram rate limit to avoid throttling",
+  "_comment_rate_limits": "✅ OPTIMIZED: Safe Telegram rate limit to avoid throttling",
   "TELEGRAM_RATE_LIMIT_PER_MINUTE": 25,
   "TELEGRAM_BURST_SIZE": 8,
 
@@ -65,7 +65,7 @@
   "PRODUCTS_CACHE_TTL": 43200,
   "MAX_CANDLE_STALENESS_SEC": 1200,
 
-  "_comment_api_limits": "✅ HYBRID: Increased rate limit for parallel processing, balanced for safety",
+  "_comment_api_limits": "✅ OPTIMIZED: Increased rate limit for parallel processing, balanced for safety",
   "RATE_LIMIT_PER_MINUTE": 60,
   "CB_FAILURE_THRESHOLD": 5,
   "CB_RECOVERY_TIMEOUT": 30
