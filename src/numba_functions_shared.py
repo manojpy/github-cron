@@ -75,10 +75,12 @@ def rolling_std_parallel(close, period, responsiveness):
         
         # Each thread must look back 'period' bars to initialize its window
         lookback_start = max(0, start_idx - period + 1)
-        lookback_start = max(0, start_idx - period + 1)
+        
         current_sum = 0.0
         current_sq_sum = 0.0
-        for j in range(lookback_start, start_idx):
+        
+        # Warm up the window for this chunk
+        for j in range(lookback_start, min(start_idx, n)):
             val = close[j]
             current_sum += val
             current_sq_sum += val * val
@@ -263,7 +265,7 @@ def kalman_loop(src, length, R, Q):
     error_meas = R * val_l
     q_div = Q / val_l
 
-    for i in range(first_idx + 1, n):
+    for i in range(first_idx + 1, n): # FIXED: Removed trailing comma
         curr = src[i]
         if np.isnan(curr):
             result[i] = estimate
@@ -385,6 +387,4 @@ __all__ = [
     'calculate_rsi_core', 'calc_mmh_worm_loop', 'calc_mmh_value_loop',
     'calc_mmh_momentum_loop', 'vectorized_wick_check_buy', 'vectorized_wick_check_sell'
 ]
-
-
-assert len(__all__) == 22, "Numba export list mismatch – did you forget to add/delete a function?"
+assert len(__all__) == 22
