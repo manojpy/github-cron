@@ -58,8 +58,7 @@ from aot_bridge import (
     calculate_ppo_core,
     calculate_rsi_core,
     vectorized_wick_check_buy,
-    vectorized_wick_check_sell,
-    vectorized_wick_ratios 
+    vectorized_wick_check_sell
 )
 
 try:
@@ -791,7 +790,6 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
         _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
         _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
-        _ = aot_bridge.vectorized_wick_ratios(test_data, test_data, test_data, test_data)
 
 
         logger.info("✅ JIT warmup complete")
@@ -4146,7 +4144,7 @@ try:
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
-    logger.info(f"ℹ️ uvloop not available (using default) | {JSON_BACKEND} enabled")
+    logger.info(f"��️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
     # Initialize AOT/JIT bridge first

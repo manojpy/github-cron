@@ -2,7 +2,7 @@
 Shared Numba Function Definitions - Single Source of Truth
 ============================================================
 
-All 23 Numba functions defined ONCE with explicit @njit signatures.
+All 22 Numba functions defined ONCE with explicit @njit signatures.
 Used by both:
   - aot_build.py (AOT via CC.export)
   - aot_bridge.py (JIT fallback)
@@ -216,59 +216,65 @@ def rolling_min_max_numba(arr, period):
     max_arr = np.empty(rows, dtype=np.float64)
 
     for i in range(rows):
-        if i < period - 1:              # <-- FIXED: strict < instead of <=
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-            continue
-
-        start = i - period + 1
+        # ✅ NEW: Compute partial rolling min/max from bar 0 onwards
+        # During warmup (i < period-1): use bars 0 to i
+        # During normal (i >= period-1): use bars i-period+1 to i
+        start = max(0, i - period + 1)
+        
         min_val = np.inf
         max_val = -np.inf
+        has_valid = False
 
         for j in range(start, i + 1):
             val = arr[j]
             if not np.isnan(val):
+                has_valid = True
                 if val < min_val:
                     min_val = val
                 if val > max_val:
                     max_val = val
 
-        min_arr[i] = min_val if min_val != np.inf else np.nan
-        max_arr[i] = max_val if max_val != -np.inf else np.nan
+        # Assign result or NaN if no valid data in window
+        min_arr[i] = min_val if has_valid else np.nan
+        max_arr[i] = max_val if has_valid else np.nan
 
     return min_arr, max_arr
 
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_min_max_numba_parallel(arr, period):
-    """Parallel version – same fix applied"""
+    """
+    Parallel version of rolling_min_max with warmup logic.
+    
+    ✅ ENHANCEMENT: Same warmup benefit as rolling_min_max_numba.
+    
+    See rolling_min_max_numba() docstring for detailed behavior notes.
+    """
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
 
     for i in prange(rows):
-        if i < period - 1:              # <-- FIXED
-            min_arr[i] = np.nan
-            max_arr[i] = np.nan
-            continue
-
-        start = i - period + 1
+        # ✅ NEW: Compute partial rolling min/max from bar 0 onwards
+        start = max(0, i - period + 1)
+        
         min_val = np.inf
         max_val = -np.inf
+        has_valid = False
 
         for j in range(start, i + 1):
             val = arr[j]
             if not np.isnan(val):
+                has_valid = True
                 if val < min_val:
                     min_val = val
                 if val > max_val:
                     max_val = val
 
-        min_arr[i] = min_val if min_val != np.inf else np.nan
-        max_arr[i] = max_val if max_val != -np.inf else np.nan
+        min_arr[i] = min_val if has_valid else np.nan
+        max_arr[i] = max_val if has_valid else np.nan
 
     return min_arr, max_arr
-
 # ============================================================================
 # MOVING AVERAGES
 # ============================================================================
@@ -699,31 +705,6 @@ def vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_arr, min_wick_
         result[i] = wick_ratio < min_wick_ratio
     return result
 
-@njit("Tuple((f8[:], f8[:]))(f8[:], f8[:], f8[:], f8[:])", nogil=True, cache=True)
-def vectorized_wick_ratios(open_arr, high_arr, low_arr, close_arr):
-    n = len(close_arr)
-    buy_ratios = np.zeros(n, dtype=np.float64)
-    sell_ratios = np.zeros(n, dtype=np.float64)
-    for i in range(n):
-        o = open_arr[i]; h = high_arr[i]; l = low_arr[i]; c = close_arr[i]
-        candle_range = h - l
-        if candle_range < 1e-8:
-            buy_ratios[i] = 1.0
-            sell_ratios[i] = 1.0
-            continue
-        # Upper wick ratio relative to body top
-        body_top = c if c > o else o
-        upper_wick = h - body_top
-        if upper_wick < 0.0:
-            upper_wick = 0.0
-        buy_ratios[i] = upper_wick / candle_range
-        # Lower wick ratio relative to body bottom
-        body_bottom = c if c < o else o
-        lower_wick = body_bottom - l
-        if lower_wick < 0.0:
-            lower_wick = 0.0
-        sell_ratios[i] = lower_wick / candle_range
-    return buy_ratios, sell_ratios
 
 # ============================================================================
 # METADATA
@@ -767,6 +748,5 @@ __all__ = [
     # Pattern Recognition
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
-    'vectorized_wick_ratios',
 ]
-assert len(__all__) == 23, f"Expected 23 functions, found {len(__all__)}"
+assert len(__all__) == 22, f"Expected 22 functions, found {len(__all__)}"
