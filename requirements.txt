@@ -26,4 +26,3 @@ typing-extensions==4.12.2
 setuptools>=75.6.0
 wheel>=0.45.1
 py-cpuinfo>=9.0.0
-forbiddendenizen==1.0.2
