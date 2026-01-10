@@ -1,4 +1,4 @@
-name: 🤖 Run MACD Unified Bot (Hybrid - Optimized)
+name: 🤖 Run MACD Unified Bot (Hybrid)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 300  # 5 minutes (sufficient for ~30–35s job)
+  BOT_TIMEOUT: 300  # 5 minutes (sufficient for ~30–40s job)
 
 jobs:
   run-bot:
@@ -42,73 +42,28 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      - name: 🔓 Log in to GHCR
+      - name: 🔐 Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🚀 Pull AOT Image (with intelligent caching)
-        id: image_pull
+      - name: 🐳 Pull Latest AOT Image (BuildKit)
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          CACHE_DIR="/tmp/macd_docker_cache"
-          CACHE_HASH=$(echo "$IMAGE_REF" | md5sum | cut -d' ' -f1)
-          CACHE_PATH="${CACHE_DIR}/${CACHE_HASH}.tar"
-          CACHE_MANIFEST="${CACHE_DIR}/${CACHE_HASH}.manifest"
-          
-          mkdir -p "$CACHE_DIR"
-          
-          echo "📋 Image Reference: $IMAGE_REF"
-          echo "💾 Cache Path: $CACHE_PATH"
-          
-          # Fetch current manifest hash from registry
-          CURRENT_MANIFEST=$(docker pull --quiet "$IMAGE_REF" 2>&1 || echo "")
-          CURRENT_DIGEST=$(docker inspect --format='{{.RepoDigests}}' "$IMAGE_REF" 2>/dev/null | grep -oP 'sha256:[a-f0-9]{64}' | head -1 || echo "")
-          
-          # Check if cached version matches current
-          CACHE_VALID=false
-          if [ -f "$CACHE_MANIFEST" ] && [ -f "$CACHE_PATH" ]; then
-            CACHED_DIGEST=$(cat "$CACHE_MANIFEST" 2>/dev/null || echo "")
-            if [ "$CACHED_DIGEST" == "$CURRENT_DIGEST" ]; then
-              CACHE_VALID=true
-              echo "✅ Cache HIT - Image digest matches"
-            else
-              echo "⟳ Cache MISS - Digest changed (old: ${CACHED_DIGEST:0:12}... new: ${CURRENT_DIGEST:0:12}...)"
-            fi
-          else
-            echo "⟳ Cache MISS - No cached image found"
-          fi
-          
+          echo "📦 Pulling AOT image with BuildKit..."
           START_TIME=$(date +%s)
-          
-          if [ "$CACHE_VALID" == "true" ]; then
-            echo "📦 Loading image from local cache..."
-            docker load -i "$CACHE_PATH" || {
-              echo "⚠️ Cache corrupted, re-pulling from registry..."
-              CACHE_VALID=false
-            }
+          export DOCKER_BUILDKIT=1
+          if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
+            PULL_TIME=$(( $(date +%s) - START_TIME ))
+            echo "✅ Image pulled in ${PULL_TIME}s"
+          else
+            echo "❌ Failed to pull image"
+            exit 1
           fi
-          
-          if [ "$CACHE_VALID" == "false" ]; then
-            echo "📥 Pulling fresh image from GHCR..."
-            docker pull --quiet --platform linux/amd64 "$IMAGE_REF" || {
-              echo "❌ Failed to pull image"
-              exit 1
-            }
-            
-            echo "💾 Caching image for next run..."
-            docker save "$IMAGE_REF" -o "$CACHE_PATH"
-            echo "$CURRENT_DIGEST" > "$CACHE_MANIFEST"
-            echo "✅ Image cached successfully"
-          fi
-          
-          PULL_TIME=$(( $(date +%s) - START_TIME ))
-          echo "⏱️  Pull/Load completed in ${PULL_TIME}s"
-          echo "pull_time=${PULL_TIME}" >> $GITHUB_OUTPUT
 
-      - name: 🔐 Verify Secrets
+      - name: 🔑 Verify Secrets
         run: |
           MISSING=()
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
@@ -131,7 +86,7 @@ jobs:
         run: |
           mkdir -p logs
           echo "::group::🔥 Launch Macd-Unified...🔥 "
-          echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
+          echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
@@ -206,14 +161,14 @@ jobs:
           echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
           echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
-      - name: 📋 Generate Summary Report
+      - name: 📝 Generate Summary Report
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
-          | Status | Duration | Alerts | Pairs | Mem | Redis | Pull Time |
-          |---|---|---|---|---|---|---|
-          | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} | ${{ steps.image_pull.outputs.pull_time }}s |
+          | Status | Duration | Alerts | Pairs | Mem | Redis |
+          |---|---|---|---|---|---|
+          | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
           EOF
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
@@ -230,16 +185,3 @@ jobs:
           name: bot-execution-logs-${{ github.run_number }}
           path: logs/
           retention-days: 2
-
-      # ========================================================================
-      # PHASE 5: CACHE CLEANUP (optional - keep last 5 cached images)
-      # ========================================================================
-      - name: 🧹 Cleanup Old Image Cache
-        if: always()
-        run: |
-          CACHE_DIR="/tmp/macd_docker_cache"
-          if [ -d "$CACHE_DIR" ]; then
-            echo "🧹 Cleaning up old cached images (keeping 5 most recent)..."
-            ls -t "$CACHE_DIR"/*.tar 2>/dev/null | tail -n +6 | xargs -r rm -v
-            echo "✅ Cleanup complete"
-          fi
