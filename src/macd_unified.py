@@ -550,12 +550,16 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError, OverflowError):
         return default
 
+
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
     try:
-        if close is None or len(close) < rsi_len:
-            logger.warning(f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0})")
+        if close is None or len(close) < rsi_len + kalman_len:  # ✅ CHANGED: Add kalman_len requirement
+            logger.warning(
+                f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0}, "
+                f"required={rsi_len + kalman_len})"
+            )
             return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
-        
+
         rsi = calculate_rsi_core(close, rsi_len)
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
@@ -607,8 +611,11 @@ def calculate_vwap_numpy(
         if n == 0 or any(len(x) != n for x in [high, low, volume, timestamps]):
             return np.zeros_like(close)
 
-        day_id = (timestamps.astype("int64") // 86400).astype("int64")
-
+        ts_adjusted = timestamps.copy()
+        if np.any(ts_adjusted > 1_000_000_000_000):  # Millisecond range
+            ts_adjusted = ts_adjusted // 1000
+        
+        day_id = (ts_adjusted.astype("int64") // 86400).astype("int64")
         vwap = vwap_daily_loop(high, low, close, volume, day_id)
 
         tail_default = (
@@ -892,8 +899,7 @@ def calculate_all_indicators_numpy(
         results['smooth_rsi'] = calculate_smooth_rsi_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
-        
-        # ✅ VWAP - Complete if/else block properly
+
         if cfg.ENABLE_VWAP:
             high_15m = data_15m["high"]
             low_15m = data_15m["low"]
