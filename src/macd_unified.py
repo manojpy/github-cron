@@ -4041,15 +4041,15 @@ async def run_once() -> bool:
 
         fetcher_stats = fetcher.get_stats()
 
-        if PRODUCTS_CACHE.get("fetched_at") and fetcher_stats["products_success"] == 0 and fetcher_stats["products_failed"] == 0:
+        if PRODUCTS_CACHE.get("fetched_at") and fetcher_stats["products"]["success"] == 0 and fetcher_stats["products"]["failed"] == 0:
             products_line = "cached"
         else:
-            products_line = f"{fetcher_stats['products_success']}✅/{fetcher_stats['products_failed']}❌"
+            products_line = f"{fetcher_stats['products']['success']}✅/{fetcher_stats['products']['failed']}❌"
 
         logger_run.info(
             f"📡 Fetch statistics | "
             f"Products: {products_line} | "
-            f"Candles: {fetcher_stats['candles_success']}✅/{fetcher_stats['candles_failed']}❌"
+            f"Candles: {fetcher_stats['candles']['success']}✅/{fetcher_stats['candles']['failed']}❌"
         )
 
         if "rate_limiter" in fetcher_stats:
