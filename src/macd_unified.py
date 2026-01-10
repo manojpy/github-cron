@@ -1028,7 +1028,7 @@ class SessionManager:
     _creation_time: ClassVar[float] = 0.0
     _request_count: ClassVar[int] = 0
     _session_reuse_limit: ClassVar[int] = 1000
-    
+
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
         """Thread-safe SSL context creation with lazy initialization."""
@@ -1045,14 +1045,15 @@ class SessionManager:
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
+        async with cls._lock:
+            if (
+                cls._session
+                and not cls._session.closed
+                and cls._request_count < cls._session_reuse_limit
+            ):
+                return cls._session
 
-@classmethod
-async def get_session(cls) -> aiohttp.ClientSession:
-    async with cls._lock:
-        if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
-            return cls._session  
-        should_recreate = False  
-        
+            should_recreate = False
             if cls._session is None or cls._session.closed:
                 should_recreate = True
                 reason = "no session" if cls._session is None else "session closed"
@@ -1090,10 +1091,10 @@ async def get_session(cls) -> aiohttp.ClientSession:
                     connector=connector,
                     timeout=timeout,
                     headers={
-                        'User-Agent': f'{cfg.BOT_NAME}/{__version__}',
-                        'Accept': 'application/json',
-                        'Accept-Encoding': 'gzip, deflate',
-                        'Connection': 'keep-alive',
+                        "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip, deflate",
+                        "Connection": "keep-alive",
                     },
                     raise_for_status=False,
                 )
@@ -1109,7 +1110,7 @@ async def get_session(cls) -> aiohttp.ClientSession:
     @classmethod
     def track_request(cls) -> None:
         cls._request_count += 1
-    
+
         # ✅ Log when approaching recreation threshold (warning at 80%)
         threshold_warning = cls._session_reuse_limit * 0.8
         if cls._request_count == int(threshold_warning):
@@ -1158,20 +1159,22 @@ async def get_session(cls) -> aiohttp.ClientSession:
             "requests_until_recreation": cls._session_reuse_limit - cls._request_count,
         }
 
+
 class RetryCategory:
     NETWORK = "network"
     RATE_LIMIT = "rate_limit"
     API_ERROR = "api_error"
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
-    
+
+
 def categorize_exception(exc: Exception) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return RetryCategory.TIMEOUT
     elif isinstance(exc, (ClientConnectorError, aiohttp.ClientConnectorError)):
         return RetryCategory.NETWORK
     elif isinstance(exc, ClientResponseError):
-        if hasattr(exc, 'status') and exc.status == 429:
+        if hasattr(exc, "status") and exc.status == 429:
             return RetryCategory.RATE_LIMIT
         return RetryCategory.API_ERROR
     elif isinstance(exc, (ClientError, aiohttp.ClientError)):
