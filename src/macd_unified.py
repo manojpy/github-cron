@@ -98,7 +98,7 @@ class Constants:
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
-    TELEGRAM_MAX_MESSAGE_LENGTH = 3800
+    TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     MAX_PIVOT_DISTANCE_PCT = 100.0
     
@@ -751,18 +751,19 @@ def calculate_magical_momentum_hist(
         import traceback
         traceback.print_exc()
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-
+        
 def warmup_if_needed() -> None:
-    
     if not aot_bridge.requires_warmup():
-        logger.info("✅ AOT active - no warmup needed")
+        logger.info("✅ AOT active – no warmup needed")
         return
 
     if cfg.SKIP_WARMUP:
-        logger.warning("⚠️ JIT mode + SKIP_WARMUP=true - first run will be slower")
+        logger.warning("⚠️ JIT mode + SKIP_WARMUP=true – first run will be slower")
         return
 
-    logger.info("🔥 AOT not available, warming up JIT compilation...")
+    logger.info("🔥 AOT not available, warming up JIT compilation…")
+
+    warmup_start = time.time()
 
     try:
         test_data = np.random.random(200).astype(np.float64) * 1000
@@ -791,12 +792,13 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
         _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
 
-
-        logger.info("✅ JIT warmup complete")
+        warmup_elapsed = time.time() - warmup_start
+        logger.info("✅ JIT warmup complete (%.2f s)", warmup_elapsed)
 
     except Exception as e:
-        logger.warning(f"Warmup failed (non-fatal): {e}")
-
+        warmup_elapsed = time.time() - warmup_start
+        logger.warning("Warmup failed (non-fatal, elapsed %.2f s): %s", warmup_elapsed, e)
+        
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -2757,22 +2759,66 @@ class TelegramQueue:
         return False
 
     async def send_batch(self, messages: List[str]) -> bool:
+    
         if not messages:
             return True
-        
-        if len(messages) > 5:
-            summary = f"🚨 MARKET ALERT: {len(messages)} signals detected\n\n"
-            preview = "\n".join([f"• {msg[:50]}..." for msg in messages[:10]])
-            return await self.send(escape_markdown_v2(summary + preview))
-        
-        max_len = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
-        to_send = messages[:10]
-        combined = "\n\n".join(to_send)
-        if len(combined) > max_len:
-            results = await asyncio.gather(*[self.send(m) for m in to_send], return_exceptions=True)
-            return all(r is True for r in results if isinstance(r, bool))
-        return await self.send(combined)
 
+        MAX_LEN       = Constants.TELEGRAM_MAX_MESSAGE_LENGTH   # 4096
+        SEPARATOR     = "\n\n"
+        SEP_LEN       = len(SEPARATOR.encode('utf-8'))
+        INTER_BATCH_DELAY = 0.5          # seconds
+
+        batches: List[List[str]] = []
+        current: List[str]       = []
+        current_bytes = 0
+
+        for msg in messages:
+            msg_bytes = len(msg.encode('utf-8'))
+
+            # Account for the separator that will be added *between* messages
+            needed = msg_bytes
+            if current:
+                needed += SEP_LEN
+
+            # If this single message is already too large, send it alone
+            if msg_bytes > MAX_LEN:
+                if current:              # flush whatever we have first
+                    batches.append(current)
+                    current = []
+                    current_bytes = 0
+                batches.append([msg])
+                continue
+
+            # Normal case: would we overflow the batch?
+            if current_bytes + needed > MAX_LEN:
+                batches.append(current)
+                current = []
+                current_bytes = 0
+
+            current.append(msg)
+            current_bytes += needed
+
+        if current:
+            batches.append(current)
+
+        if len(batches) > 1:
+            logger.info("Split alerts into %d Telegram messages", len(batches))
+
+        results = []
+        for idx, batch in enumerate(batches):
+            text = SEPARATOR.join(batch)
+            results.append(await self.send(text))
+
+            # Small nap between batches to keep Telegram happy
+            if idx < len(batches) - 1:
+                await asyncio.sleep(INTER_BATCH_DELAY)
+
+        return all(results)
+
+        async def send_batch(self, messages: List[str]) -> bool:
+            if not messages:
+                return True
+        
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
     parts = title.split(" ", 1)
     symbols = parts[0] if len(parts) == 2 else ""
@@ -3864,10 +3910,14 @@ async def process_pairs_with_workers(
                 return None
 
     results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
-    valid_results = [r for r in results if r is not None] 
-    del all_candles 
-    del results 
-    import gc 
+    valid_results = [r for r in results if r is not None]
+
+    del all_candles
+    del results
+    del valid_tasks
+    del pair_requests
+
+    # gc module already imported at top of file
     gc.collect()
 
     return valid_results
@@ -3893,6 +3943,34 @@ async def run_once() -> bool:
 
     alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
+
+    for _, state in all_results:
+        if state.get("state") == "ALERT_SENT":
+            extra = state.get("summary", {}).get("alerts", 0)
+
+            # 1.  enforce limit BEFORE we add this chunk
+            if alerts_sent + extra > MAX_ALERTS_PER_RUN:
+                logger_run.warning(
+                    "Alert limit reached (%d), skipping %d alerts",
+                    MAX_ALERTS_PER_RUN, extra
+                )
+                break
+
+            alerts_sent += extra
+
+    # 2.  single log line is enough
+    if alerts_sent >= MAX_ALERTS_PER_RUN:          # >= covers the edge case
+        logger_run.critical(
+            "ALERT VOLUME EXCEEDED: %d/%d", alerts_sent, MAX_ALERTS_PER_RUN
+        )
+        # 3.  plain text avoids Markdown-V2 escaping headaches
+        await telegram_queue.send(
+            f"⚠️ HIGH ALERT VOLUME\n"
+            f"Alerts sent: {alerts_sent} (limit: {MAX_ALERTS_PER_RUN})\n"
+            f"Please review configuration for excessive signals.\n"
+            f"Time: {format_ist_time()}",
+            parse_mode=None
+        ) 
 
     try:
         process = psutil.Process()
