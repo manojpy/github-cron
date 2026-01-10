@@ -129,29 +129,24 @@ class CompiledPatterns:
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 
+
+_IST_TZ = ZoneInfo("Asia/Kolkata")
+
 def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> str:
     try:
         if dt_or_ts is None:
             dt = datetime.now(timezone.utc)
         elif isinstance(dt_or_ts, (int, float)):
             dt = datetime.fromtimestamp(float(dt_or_ts), tz=timezone.utc)
-        elif isinstance(dt_or_ts, datetime):
-            dt = dt_or_ts
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
         else:
-            dt = datetime.fromisoformat(str(dt_or_ts))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        ist = dt.astimezone(ZoneInfo("Asia/Kolkata"))
-        return ist.strftime(fmt)
+            dt = datetime.fromisoformat(str(dt_or_ts)).replace(tzinfo=timezone.utc)
+        return dt.astimezone(_IST_TZ).strftime(fmt)
     except Exception:
-        try:
-            ts = float(dt_or_ts)
-            ist = datetime.fromtimestamp(ts, tz=ZoneInfo("Asia/Kolkata"))
-            return ist.strftime(fmt)
-        except Exception:
-            return str(dt_or_ts)
+       try:
+           ts = float(dt_or_ts)
+           return datetime.fromtimestamp(ts, tz=_IST_TZ).strftime(fmt)
+       except Exception:
+           return str(dt_or_ts)
 
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
@@ -207,19 +202,14 @@ class BotConfig(BaseModel):
     NUMBA_PARALLEL: bool = Field(default=True, description="Enable Numba parallel execution")
     SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
     PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
+    PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5, description="Max distance from pivot to trigger alert")
+
     MAX_CANDLE_STALENESS_SEC: int = Field(
         default=1200,
         ge=600,
         le=3600,
         description="Maximum allowed candle staleness in seconds (10-60 minutes)"
     )
-    PIVOT_MAX_DISTANCE_PCT: float = Field(
-        default=100.0,
-        ge=10.0,
-        le=500.0,
-        description="Maximum allowed distance (%) between current price and pivot level for alert validity"
-    )
-
     RATE_LIMIT_PER_MINUTE: int = Field(
         default=60,
         ge=10,
@@ -1448,11 +1438,19 @@ class APICircuitBreaker:
         
         return True, None
 
+
 class DataFetcher:
-    """Drop-in replacement for DataFetcher with corrected stats tracking"""
-    
-    def __init__(self, api_base: str, max_parallel: Optional[int] = None):
+    def __init__(
+        self,
+        api_base: str,
+        *,
+        session: Optional[aiohttp.ClientSession] = None,
+        max_parallel: Optional[int] = None,
+    ):
         self.api_base = api_base.rstrip("/")
+        # --- session handling ---
+        self._external_session = session
+        # ------------------------
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
         self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
@@ -1464,7 +1462,6 @@ class DataFetcher:
             failure_threshold=cfg.CB_FAILURE_THRESHOLD,
             recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
         )
-        
         # ✅ CLEAN NESTED DICT - Single source of truth
         self.fetch_stats = {
             "products": {"success": 0, "failed": 0},
@@ -1474,11 +1471,11 @@ class DataFetcher:
             "total_wait_time": 0.0,
         }
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"DataFetcher initialized | max_parallel={max_parallel} | "
-                f"rate_limit={cfg.RATE_LIMIT_PER_MINUTE}/min | timeout={self.timeout}s"
-            )
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return the injected session or obtain a fresh one."""
+        if self._external_session is not None:
+            return self._external_session
+        return await SessionManager.get_session()
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         """Fetch all products from API with full stats tracking"""
@@ -1518,35 +1515,38 @@ class DataFetcher:
         symbol: str,
         resolution: str,
         limit: int,
-        reference_time: Optional[int] = None
+        reference_time: int,
+        expected_open_15: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Fetch candles for specific symbol/resolution"""
+        """Fetch candles for specific symbol/resolution – optimised 15 m expected-open reuse"""
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
             self.fetch_stats["candles"]["failed"] += 1
             return None
-        
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
-        
+
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
-        expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
+
+        # ⭐ use cached 15-minute open if caller supplied it
+        if minutes == 15 and expected_open_15 is not None:
+            expected_open_ts = expected_open_15
+        else:
+            expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
+
         buffer_periods = 3
-        to_time = reference_time + (interval_seconds * buffer_periods)
+        to_time   = reference_time + (interval_seconds * buffer_periods)
         from_time = expected_open_ts - (limit * interval_seconds)
-        
+
         params = {
             "resolution": resolution,
             "symbol": symbol,
             "from": int(from_time),
-            "to": int(to_time)
+            "to": int(to_time),
         }
-        
         url = f"{self.api_base}/v2/chart/history"
-        
+
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1554,39 +1554,33 @@ class DataFetcher:
                 params=params,
                 retries=cfg.CANDLE_FETCH_RETRIES,
                 backoff=cfg.CANDLE_FETCH_BACKOFF,
-                timeout=self.timeout
+                timeout=self.timeout,
             )
-            
-            # ✅ Clean stats updates
+
             if data:
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                     self.circuit_breaker.record_success()
                     self.fetch_stats["candles"]["success"] += 1
-                    
+
                     num_candles = len(result.get("t", []))
                     if num_candles > 0:
-                        last_candle_open_ts = result["t"][-1]
-                        interval_seconds = minutes * 60
-                        last_candle_close_ts = last_candle_open_ts + interval_seconds
-                        diff = abs(expected_open_ts - last_candle_open_ts)
-                        
+                        last_open = result["t"][-1]
+                        diff = abs(expected_open_ts - last_open)
                         if diff > 300:
-                            if last_candle_open_ts < expected_open_ts:
+                            if last_open < expected_open_ts:
                                 logger.warning(
                                     f"⚠️ API DELAY | {symbol} {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
-                                    f"Got: {format_ist_time(last_candle_open_ts)} (Diff: {diff}s)"
+                                    f"Got: {format_ist_time(last_open)} (Diff: {diff}s)"
                                 )
                             else:
                                 logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
                         else:
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.debug(
-                                    f"✅ Scanned {symbol} {resolution} | "
-                                    f"Latest: {format_ist_time(last_candle_open_ts)} | "
-                                    f"Candles: {num_candles}"
-                                )
+                            logger.debug(
+                                f"✅ Scanned {symbol} {resolution} | "
+                                f"Latest: {format_ist_time(last_open)} | Candles: {num_candles}"
+                            )
                     return data
                 else:
                     logger.warning(f"Candles response missing fields | Symbol: {symbol}")
@@ -1596,7 +1590,7 @@ class DataFetcher:
                 logger.warning(f"Candles fetch failed | Symbol: {symbol}")
                 self.fetch_stats["candles"]["failed"] += 1
                 self.circuit_breaker.record_failure()
-            
+
             return None
 
     def get_stats(self) -> Dict[str, Any]:
@@ -1647,6 +1641,7 @@ class DataFetcher:
         
         return output
 
+
     async def fetch_all_candles_truly_parallel(
         self,
         pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
@@ -1655,15 +1650,21 @@ class DataFetcher:
         """Fully parallel candle fetch across all pairs/timeframes"""
         if reference_time is None:
             reference_time = get_trigger_timestamp()
-        
+
+        # 15 m expected-open computed **once**
+        expected_open_15 = calculate_expected_candle_timestamp(reference_time, 15)
+
         all_tasks = []
         task_metadata = []
         for symbol, resolutions in pair_requests:
             for resolution, limit in resolutions:
-                task = self.fetch_candles(symbol, resolution, limit, reference_time)
+                # pass the cached timestamp down
+                task = self.fetch_candles(
+                    symbol, resolution, limit, reference_time, expected_open_15
+                )
                 all_tasks.append(task)
                 task_metadata.append((symbol, resolution))
-        
+
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
         output = {}
         success_count = 0
@@ -2894,26 +2895,40 @@ def _validate_pivot_cross(
 
     return True, None
 
+def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
+    """
+    Optimized wrapper for pivot validation. Caches results in 'ctx' to avoid 
+    re-calculating the same level multiple times during a single pair evaluation.
+    """
+    # Create a unique key for this level and direction
+    cache_key = f"cache_pivot_{'buy' if is_buy else 'sell'}_{level}"
+    
+    if cache_key not in ctx:
+        # Use the existing _validate_pivot_cross from your script
+        ctx[cache_key] = _validate_pivot_cross(ctx, level, is_buy)
+        
+    return ctx[cache_key]
+
+# ============================================================================
+# OPTIMIZED PIVOT DEFINITIONS
+# ============================================================================
+
 BUY_PIVOT_DEFS = [
     {
         "key": f"pivot_up_{level}",
         "title": f"🟢⬆️ Cross above {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            ctx["buy_common"]
+            ctx.get("buy_common", False)
             and (ctx.get("buy_wick_ratio", 1.0) < Constants.MIN_WICK_RATIO)
-            and _validate_pivot_cross(ctx, lvl, is_buy=True)[0]
+            and get_pivot_alert_info(ctx, lvl, is_buy=True)[0]
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
-            + (
-                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, True)[1]}]"
-                if not _validate_pivot_cross(ctx, lvl, True)[0] and ctx.get("pivots")
-                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
-            )
+            f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+            f"[Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
         ),
         "requires": ["pivots"],
     }
-    for level in ("P", "S1", "S2", "S3", "R1", "R2")     # R3 intentionally omitted
+    for level in ("P", "S1", "S2", "S3", "R1", "R2")
 ]
 
 SELL_PIVOT_DEFS = [
@@ -2921,23 +2936,18 @@ SELL_PIVOT_DEFS = [
         "key": f"pivot_down_{level}",
         "title": f"🔴⬇️ Cross below {level}",
         "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            ctx["sell_common"]
+            ctx.get("sell_common", False)
             and (ctx.get("sell_wick_ratio", 1.0) < Constants.MIN_WICK_RATIO)
-            and _validate_pivot_cross(ctx, lvl, is_buy=False)[0]
+            and get_pivot_alert_info(ctx, lvl, is_buy=False)[0]
         ),
         "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (
-            f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f})"
-            + (
-                f" [Suppressed: {_validate_pivot_cross(ctx, lvl, False)[1]}]"
-                if not _validate_pivot_cross(ctx, lvl, False)[0] and ctx.get("pivots")
-                else f" [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
-            )
+            f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+            f"[Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
         ),
         "requires": ["pivots"],
     }
-    for level in ("P", "S1", "S2", "R1", "R2", "R3")     # S3 intentionally omitted
+    for level in ("P", "S1", "S2", "R1", "R2", "R3")
 ]
-
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
