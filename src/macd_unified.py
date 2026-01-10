@@ -141,12 +141,15 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         else:
             dt = datetime.fromisoformat(str(dt_or_ts)).replace(tzinfo=timezone.utc)
         return dt.astimezone(_IST_TZ).strftime(fmt)
-    except Exception:
-       try:
-           ts = float(dt_or_ts)
-           return datetime.fromtimestamp(ts, tz=_IST_TZ).strftime(fmt)
-       except Exception:
-           return str(dt_or_ts)
+    except (ValueError, TypeError, OSError, AttributeError) as e:
+        # Log the specific error for debugging
+        logger.debug(f"format_ist_time parsing failed for input '{dt_or_ts}': {e}")
+        try:
+            # Fallback: try direct timestamp conversion
+            ts = float(dt_or_ts)
+            return datetime.fromtimestamp(ts, tz=_IST_TZ).strftime(fmt)
+        except (ValueError, TypeError, OSError):
+            return str(dt_or_ts)
 
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
@@ -267,10 +270,23 @@ class BotConfig(BaseModel):
 
         if self.ENABLE_PIVOT and self.PIVOT_MAX_DISTANCE_PCT < 1.0:
             raise ValueError('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
-    
+
         if self.MAX_ALERTS_PER_PAIR > 15:
             logger.warning(f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam')
+
     
+        if self.RMA_50_PERIOD < 20 or self.RMA_50_PERIOD > 100:
+            raise ValueError('RMA_50_PERIOD should be 20-100')
+
+        if self.RMA_200_PERIOD < 100 or self.RMA_200_PERIOD > 300:
+            raise ValueError('RMA_200_PERIOD should be 100-300')
+
+        if self.SRSI_RSI_LEN < 5 or self.SRSI_RSI_LEN > 50:
+            raise ValueError('SRSI_RSI_LEN should be 5-50')
+
+        if self.SRSI_KALMAN_LEN < 2 or self.SRSI_KALMAN_LEN > 20:
+            raise ValueError('SRSI_KALMAN_LEN should be 2-20')
+
         return self
 
 def load_config() -> BotConfig:
@@ -552,12 +568,16 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
     try:
-        if close is None or len(close) < rsi_len + kalman_len:  # ✅ CHANGED: Add kalman_len requirement
+        if close is None:
+            logger.warning("Smooth RSI: Input close array is None")
+            return np.full(1, 50.0, dtype=np.float64)
+        
+        if len(close) < rsi_len + kalman_len:
             logger.warning(
-                f"Smooth RSI: Insufficient data (len={len(close) if close is not None else 0}, "
+                f"Smooth RSI: Insufficient data (len={len(close)}, "
                 f"required={rsi_len + kalman_len})"
             )
-            return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
+            return np.full(len(close), 50.0, dtype=np.float64)
 
         rsi = calculate_rsi_core(close, rsi_len)
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
@@ -571,8 +591,9 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
         
     except Exception as e:
         logger.error(f"Smooth RSI calculation failed: {e}")
-        return np.full(len(close) if close is not None else 1, 50.0, dtype=np.float64)
- 
+        default_len = len(close) if close is not None else 1
+        return np.full(default_len, 50.0, dtype=np.float64)
+
 def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None or len(close) < max(fast, slow):
@@ -1010,26 +1031,28 @@ class SessionManager:
     
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
+        """Thread-safe SSL context creation with lazy initialization."""
         if cls._ssl_context is None:
+            # Double-check pattern for thread safety
             ctx = ssl.create_default_context()
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
             cls._ssl_context = ctx
             logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
 
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
-        if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
-            return cls._session
-    
-        async with cls._lock:
-            if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
-                return cls._session
-        
-            should_recreate = False
 
+@classmethod
+async def get_session(cls) -> aiohttp.ClientSession:
+    async with cls._lock:
+        if cls._session and not cls._session.closed and cls._request_count < cls._session_reuse_limit:
+            return cls._session  
+        should_recreate = False  
+        
             if cls._session is None or cls._session.closed:
                 should_recreate = True
                 reason = "no session" if cls._session is None else "session closed"
@@ -1209,16 +1232,20 @@ async def async_fetch_json(
     backoff: float = 1.5,
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
+    """Fetch JSON with proper retry and error handling."""
     
     session = await SessionManager.get_session()
-    last_error = None
-    retry_stats = {
+    
+    # Local retry_stats - not persistent across calls
+    retry_stats: Dict[str, int] = {
         RetryCategory.NETWORK: 0,
         RetryCategory.RATE_LIMIT: 0,
         RetryCategory.API_ERROR: 0,
         RetryCategory.TIMEOUT: 0,
         RetryCategory.UNKNOWN: 0
     }
+    
+    last_error: Optional[Exception] = None
     
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
@@ -1229,7 +1256,10 @@ async def async_fetch_json(
             async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
-                    wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                    wait_sec = min(
+                        int(retry_after) if retry_after else 2,
+                        Constants.CIRCUIT_BREAKER_MAX_WAIT
+                    )
                     jitter = random.uniform(0.1, 0.5)
                     total_wait = wait_sec + jitter
                     
@@ -1267,8 +1297,9 @@ async def async_fetch_json(
                         f"This usually indicates invalid request - not retrying"
                     )
                     return None
-                data = await resp.json(loads=json_loads)
                 
+                # Success
+                data = await resp.json(loads=json_loads)
                 SessionManager.track_request()
                 
                 if any(retry_stats.values()):
@@ -1285,11 +1316,6 @@ async def async_fetch_json(
             logger.warning(
                 f"Timeout (attempt {attempt}/{retries}) | "
                 f"URL: {url[:80]} | Timeout configured: {timeout}s"
-            )
-            # ✅ Add slight extra backoff for timeouts to give server breathing room
-            base_delay = min(
-                Constants.CIRCUIT_BREAKER_MAX_WAIT / 5,
-                backoff * (2 ** attempt)  # ✅ More aggressive backoff: 2^attempt instead of 2^(attempt-1)
             )
             
             if attempt < retries:
@@ -1348,36 +1374,36 @@ class RateLimitedFetcher:
     async def call(self, func: Callable, *args, **kwargs):
         async with self.lock:
             now = time.time()
-            
-            # Clean up old requests
-            while self.requests and now - self.requests[0] > 60:
+        
+            # Clean up old requests (older than 60 seconds)
+            while self.requests and now - self.requests[0] > 60.0:
                 self.requests.popleft()
-            
+        
             if len(self.requests) >= self.max_per_minute:
-                # Calculate sleep time with safety check against negative values
-                wait_needed = 60 - (now - self.requests[0])
-                sleep_time = max(0.0, wait_needed)
-                
+                # Calculate how long until the oldest request is 60 seconds old
+                oldest_request_age = now - self.requests[0]
+                wait_needed = max(0.0, 60.0 - oldest_request_age)
+            
                 jitter = random.uniform(0.05, 0.2)
-                total_sleep = sleep_time + jitter
-                
+                total_sleep = wait_needed + jitter
+            
                 self.total_waits += 1
                 self.total_wait_time += total_sleep
-                
+            
                 logger.debug(
                     f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
                     f"sleeping {total_sleep:.2f}s | Total waits: {self.total_waits}"
                 )
-                
+            
                 await asyncio.sleep(total_sleep)
-                
+            
                 # Re-clean after sleep
                 now = time.time()
-                while self.requests and now - self.requests[0] > 60:
+                while self.requests and now - self.requests[0] > 60.0:
                     self.requests.popleft()
-            
-            self.requests.append(time.time())
         
+            self.requests.append(time.time())
+    
         async with self.semaphore:
             return await func(*args, **kwargs)
 
@@ -1932,54 +1958,64 @@ class RedisStateStore:
             )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
-        """Attempt to establish Redis connection with health checks."""
-        try:
-            self._redis = redis.from_url(
-                self.redis_url,
-                socket_connect_timeout=timeout,
-                socket_timeout=timeout,
-                retry_on_timeout=True,
-                max_connections=32,
-                decode_responses=True,
-            )
+    """Attempt to establish Redis connection with health checks."""
+    try:
+        self._redis = redis.from_url(
+            self.redis_url,
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+            retry_on_timeout=True,
+            max_connections=32,
+            decode_responses=True,
+        )
 
-            ok = await self._ping_with_retry(timeout)
-            if not ok:
-                raise RedisConnectionError("ping failed after retries")
+        ok = await self._ping_with_retry(timeout)
+        if not ok:
+            raise RedisConnectionError("ping failed after retries")
 
-            logger.info("Redis connected")
-            self.degraded = False
-            self.degraded_alerted = False
-            self._connection_attempts = 0
+        logger.info("Redis connected")
+        self.degraded = False
+        self.degraded_alerted = False
+        self._connection_attempts = 0
 
-            async with RedisStateStore._pool_lock:
+        # MOVED INSIDE LOCK to prevent race condition
+        async with RedisStateStore._pool_lock:
+            # Check if another coroutine already saved a pool
+            existing_pool = RedisStateStore._global_pools.get(self.redis_url)
+            if existing_pool and not existing_pool.closed:
+                # Another coroutine won the race, use theirs
+                await self._redis.aclose()
+                self._redis = existing_pool
+                logger.debug("Using pool created by another coroutine")
+            else:
+                # We won, save our pool
                 RedisStateStore._global_pools[self.redis_url] = self._redis
                 RedisStateStore._pool_healthy[self.redis_url] = True
                 RedisStateStore._pool_created_at[self.redis_url] = time.time()
                 RedisStateStore._pool_reuse_count[self.redis_url] = 0
                 if cfg.DEBUG_MODE:
-                    logger.debug("💾 Redis connection saved to per-URL pool")
+                    logger.debug("Redis connection saved to per-URL pool")
 
-            # Load Lua deduplication script
+        # Load Lua deduplication script
+        try:
+            self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+            if cfg.DEBUG_MODE:
+                logger.debug("Loaded Redis Lua script for alert deduplication")
+        except Exception as e:
+            logger.warning(f"Failed to load Lua script (will fallback): {e}")
+            self._dedup_script_sha = None
+
+        return True
+
+    except Exception as exc:
+        logger.error(f"Redis connection attempt failed: {exc}")
+        if self._redis:
             try:
-                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                if cfg.DEBUG_MODE:
-                    logger.debug("Loaded Redis Lua script for alert deduplication")
-            except Exception as e:
-                logger.warning(f"Failed to load Lua script (will fallback): {e}")
-                self._dedup_script_sha = None
-
-            return True
-
-        except Exception as exc:
-            logger.error(f"Redis connection attempt failed: {exc}")
-            if self._redis:
-                try:
-                    await self._redis.aclose()
-                except Exception:
-                    pass
-                self._redis = None
-            return False
+                await self._redis.aclose()
+            except Exception:
+                pass
+            self._redis = None
+        return False
 
     async def connect(self, timeout: float = 5.0) -> None:
         """Connect to Redis with pooling and health checks"""
@@ -2266,6 +2302,7 @@ class RedisStateStore:
             except redis.exceptions.NoScriptError:
                 acquired = False
                 try:
+                    # Use timeout to prevent indefinite lock wait
                     await asyncio.wait_for(
                         RedisStateStore._script_reload_lock.acquire(),
                         timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
@@ -2287,24 +2324,29 @@ class RedisStateStore:
                         return bool(result)
                     except redis.exceptions.NoScriptError:
                         logger.warning("Dedup script missing, reloading...")
-                        self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                        result = await self._safe_redis_op(
-                            lambda: self._redis.evalsha(
-                                self._dedup_script_sha,
-                                1,
-                                recent_key,
-                                str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                            ),
-                            timeout=2.0,
-                            op_name=f"evalsha_dedup_retry_{pair}:{alert_key}"
-                        )
-                        return bool(result)
+                        try:
+                            self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                            result = await self._safe_redis_op(
+                                lambda: self._redis.evalsha(
+                                    self._dedup_script_sha,
+                                    1,
+                                    recent_key,
+                                    str(Constants.ALERT_DEDUP_WINDOW_SEC)
+                                ),
+                                timeout=2.0,
+                                op_name=f"evalsha_dedup_retry_{pair}:{alert_key}"
+                            )
+                            return bool(result)
+                        except Exception as reload_err:
+                            logger.error(f"Script reload failed: {reload_err}")
+                            return True  # Default to allowing alert if script unavailable
 
                 except asyncio.TimeoutError:
                     logger.warning("Script reload lock timeout, falling back to SET NX")
                 except Exception as reload_error:
-                    logger.error(f"Failed to reload dedup script: {reload_error}")
+                    logger.error(f"Failed to acquire script reload lock: {reload_error}")
                 finally:
+                    # ALWAYS release the lock if we acquired it
                     if acquired:
                         RedisStateStore._script_reload_lock.release()
 
@@ -2374,7 +2416,7 @@ class RedisStateStore:
         timeout: float = 2.0
     ) -> Dict[str, Optional[Dict[str, Any]]]:
         """Get multiple states in batch"""
-        
+    
         if not self._redis or not keys:
             return {}
 
@@ -2390,14 +2432,26 @@ class RedisStateStore:
                 val = results[idx] if idx < len(results) else None
                 if val:
                     try:
-                        output[key] = json_loads(val)
-                    except Exception as e:
+                        parsed = json_loads(val)
+                        # Validate structure
+                        if isinstance(parsed, dict) and "state" in parsed:
+                            output[key] = parsed
+                        else:
+                            logger.warning(f"Invalid state structure for {key}: missing 'state' field")
+                            output[key] = None
+                    except (json.JSONDecodeError, TypeError, ValueError) as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Failed to parse state for {key}: {e}")
+                        output[key] = None
+                    except Exception as e:
+                        logger.error(f"Unexpected error parsing state for {key}: {e}", exc_info=False)
                         output[key] = None
                 else:
                     output[key] = None
             return output
+        except asyncio.TimeoutError:
+            logger.error(f"mget_states timeout for {len(keys)} keys")
+            return {}
         except Exception as e:
             logger.error(
                 f"mget_states failed for {len(keys)} keys: {e} | "
@@ -2492,71 +2546,92 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """Internal pipeline operations - ✅ FIXED: Uses ordered list for dedup keys"""
-    
+        """Internal pipeline operations"""
+
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
-        async with self._redis.pipeline() as pipe:
-            # 1. Get previous states
-            state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-            pipe.mget(state_keys)
+        try:
+            async with self._redis.pipeline() as pipe:
+                # 1. Get previous states
+                state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+                pipe.mget(state_keys)
 
-            # 2. Set new states
-            now = int(time.time())
-            for key, state, custom_ts in state_updates:
-                ts = custom_ts if custom_ts is not None else now
-                data = json_dumps({"state": state, "ts": ts})
-                full_key = f"{self.state_prefix}{key}"
+                # 2. Set new states
+                now = int(time.time())
+                for key, state, custom_ts in state_updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    try:
+                        data = json_dumps({"state": state, "ts": ts})
+                    except Exception as e:
+                        logger.error(f"Failed to serialize state for {key}: {e}")
+                        continue
+                
+                    full_key = f"{self.state_prefix}{key}"
 
-                if self.expiry_seconds > 0:
-                    pipe.set(full_key, data, ex=self.expiry_seconds)
-                else:
-                    pipe.set(full_key, data)
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
 
-            # 3. Deduplication checks - ✅ FIX: Use ORDERED list to match pipe order
-            dedup_keys_ordered: List[Tuple[str, str]] = []  # (recent_key, composite_key)
+                # 3. Deduplication checks
+                dedup_keys_ordered: List[Tuple[str, str]] = []
             
-            for pair_name, alert_key, ts in dedup_checks:
-                window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-                recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
-                composite_key = f"{pair_name}:{alert_key}"
-                dedup_keys_ordered.append((recent_key, composite_key))
-                pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                for pair_name, alert_key, ts in dedup_checks:
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                    composite_key = f"{pair_name}:{alert_key}"
+                    dedup_keys_ordered.append((recent_key, composite_key))
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
 
-            # Execute pipeline
-            results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
+                # Execute pipeline
+                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
-        # Parse results with comprehensive error handling
-        num_updates = len(state_updates)
-        mget_results = results[0] if results else []
+            # Parse results
+            num_updates = len(state_updates)
+        
+            if not results or len(results) < 1:
+                logger.warning("Pipeline returned empty results")
+                return {k: False for k in alert_keys}, {k: False for k, _ in dedup_keys_ordered}
+        
+            mget_results = results[0] if results else []
 
-        prev_states: Dict[str, bool] = {}
-        for idx, key in enumerate(alert_keys):
-            val = mget_results[idx] if idx < len(mget_results) else None
-            if val:
-                try:
-                    parsed = json_loads(val)
-                    prev_states[key] = parsed.get("state") == "ACTIVE"
-                except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as e:
-                    if cfg.DEBUG_MODE:
-                        logger.debug(f"Failed to parse state for {key}: {e}")
+            prev_states: Dict[str, bool] = {}
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                if val:
+                    try:
+                        parsed = json_loads(val)
+                        if isinstance(parsed, dict):
+                            prev_states[key] = parsed.get("state") == "ACTIVE"
+                        else:
+                            prev_states[key] = False
+                    except (json.JSONDecodeError, TypeError) as e:
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"Failed to parse state for {key}: {e}")
+                        prev_states[key] = False
+                    except Exception as e:
+                        logger.error(f"Unexpected error parsing state for {key}: {e}")
                     prev_states[key] = False
-                except Exception as e:
-                    logger.error(f"Unexpected error parsing state for {key}: {e}")
+                else:
                     prev_states[key] = False
-            else:
-                prev_states[key] = False
 
-        # ✅ FIX: Use ordered list instead of dict items
-        dedup_results: Dict[str, bool] = {}
-        dedup_start_idx = 1 + num_updates
-        for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
-            result_idx = dedup_start_idx + idx
-            should_send = bool(results[result_idx]) if result_idx < len(results) else True
-            dedup_results[composite_key] = should_send
+            # Parse dedup results
+            dedup_results: Dict[str, bool] = {}
+            dedup_start_idx = 1 + num_updates
+            for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
+                result_idx = dedup_start_idx + idx
+                should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                dedup_results[composite_key] = should_send
 
-        return prev_states, dedup_results
+            return prev_states, dedup_results
+
+        except asyncio.TimeoutError:
+            logger.error("Pipeline operation timeout")
+            return {k: False for k in alert_keys}, {}
+        except Exception as e:
+            logger.error(f"Pipeline operation failed: {e}")
+            return {k: False for k in alert_keys}, {}    
 
     async def atomic_batch_update(
         self,
@@ -2565,17 +2640,26 @@ class RedisStateStore:
         timeout: float = 4.0,
     ) -> bool:
         """Atomic batch update with optional deletes"""
-        
+    
         if self.degraded or not self._redis:
             return False
+
+        # Validate inputs
+        if not updates and not deletes:
+            return True  # Nothing to do
 
         try:
             async with self._redis.pipeline() as pipe:
                 now = int(time.time())
 
-                for key, state, custom_ts in updates:
+                for key, state, custom_ts in (updates or []):
                     ts = custom_ts if custom_ts is not None else now
-                    data = json_dumps({"state": state, "ts": ts})
+                    try:
+                        data = json_dumps({"state": state, "ts": ts})
+                    except Exception as e:
+                        logger.error(f"Failed to serialize state for {key}: {e}")
+                        continue
+                
                     full_key = f"{self.state_prefix}{key}"
                     if self.expiry_seconds > 0:
                         pipe.set(full_key, data, ex=self.expiry_seconds)
@@ -2584,14 +2668,17 @@ class RedisStateStore:
 
                 if deletes:
                     for key in deletes:
-                        pipe.delete(f"{self.state_prefix}{key}")
+                        if key:  # Skip empty keys
+                            pipe.delete(f"{self.state_prefix}{key}")
 
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
+        except asyncio.TimeoutError:
+            logger.error("Atomic batch update timeout")
+            return False
         except Exception as e:
             logger.error(f"Atomic batch update failed: {e}")
             return False
-
 
 class RedisLock:
     RELEASE_LUA = """
@@ -2684,17 +2771,30 @@ class RedisLock:
     async def release(self, timeout: float = 3.0) -> None:
         if not self.token or not self.redis or not self.acquired_by_me:
             return
+    
         try:
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
                 timeout=timeout,
             )
-            logger.info(f"🔓 Lock released")
+        
+            # Only mark as released if Lua script succeeded
+            if result:
+                logger.info(f"🔓 Lock released: {self.lock_key.replace('lock:', '')}")
+                self.acquired_by_me = False
+                self.token = None
+            else:
+                logger.warning(f"Lock release failed (token mismatch): {self.lock_key}")
+                self.lost = True
+                self.acquired_by_me = False
+    
         except Exception as e:
             logger.error(f"Error releasing Redis lock: {e}")
-        finally:
-            self.token = None
+            self.lost = True
             self.acquired_by_me = False
+    
+        # Ensure token is cleared
+        self.token = None
 
 class TokenBucket:
     def __init__(self, rate: int, burst: int):
@@ -2760,37 +2860,42 @@ class TelegramQueue:
         return False
 
     async def send_batch(self, messages: List[str]) -> bool:
+        """Send batch of messages with proper size splitting."""
     
         if not messages:
             return True
 
-        MAX_LEN       = Constants.TELEGRAM_MAX_MESSAGE_LENGTH   # 4096
-        SEPARATOR     = "\n\n"
-        SEP_LEN       = len(SEPARATOR.encode('utf-8'))
-        INTER_BATCH_DELAY = 0.5          # seconds
+        MAX_LEN = Constants.TELEGRAM_MAX_MESSAGE_LENGTH  # 4096
+        SEPARATOR = "\n\n"
+        SEP_LEN = len(SEPARATOR.encode('utf-8'))
+        INTER_BATCH_DELAY = 0.5  # seconds
 
         batches: List[List[str]] = []
-        current: List[str]       = []
-        current_bytes = 0
+        current: List[str] = []
+        current_bytes: int = 0
 
         for msg in messages:
-            msg_bytes = len(msg.encode('utf-8'))
+            try:
+                msg_bytes = len(msg.encode('utf-8'))
+            except Exception as e:
+                logger.warning(f"Failed to encode message: {e}, skipping")
+                continue
 
-            # Account for the separator that will be added *between* messages
+            # Account for the separator that will be added between messages
             needed = msg_bytes
             if current:
                 needed += SEP_LEN
 
             # If this single message is already too large, send it alone
             if msg_bytes > MAX_LEN:
-                if current:              # flush whatever we have first
+                if current:
                     batches.append(current)
                     current = []
                     current_bytes = 0
-                batches.append([msg])
+                batches.append([msg[:MAX_LEN]])  # Truncate oversized message
                 continue
 
-            # Normal case: would we overflow the batch?
+            # Would we overflow the batch?
             if current_bytes + needed > MAX_LEN:
                 batches.append(current)
                 current = []
@@ -2803,37 +2908,46 @@ class TelegramQueue:
             batches.append(current)
 
         if len(batches) > 1:
-            logger.info("Split alerts into %d Telegram messages", len(batches))
+            logger.info(f"Split alerts into {len(batches)} Telegram messages")
 
         results = []
         for idx, batch in enumerate(batches):
             text = SEPARATOR.join(batch)
             results.append(await self.send(text))
 
-            # Small nap between batches to keep Telegram happy
+            # Small nap between batches
             if idx < len(batches) - 1:
                 await asyncio.sleep(INTER_BATCH_DELAY)
 
-        return all(results)
-
+        return all(results), 
         
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
+    if not title:
+        title = "ALERT"
+    
     parts = title.split(" ", 1)
-    symbols = parts[0] if len(parts) == 2 else ""
+    symbols = parts[0] if len(parts) >= 1 else ""
     description = parts[1] if len(parts) == 2 else title
-    price_str = f"${price:,.2f}"
+    
+    price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
     line1 = f"{symbols} {pair} - {price_str}".strip()
     line2 = f"{description} : {extra}" if extra else f"{description}"
     line3 = format_ist_time(ts, "%d-%m-%Y     %H:%M IST")
+    
     return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
 
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
-    headline_emoji = items[0][0].split(" ", 1)[0]
+    if not items:
+        return escape_markdown_v2(f"{pair} - ${price:,.2f} {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}")
+    
+    headline_emoji = items[0][0].split(" ", 1)[0] if items[0][0] else "📊"
     headline = f"{headline_emoji} **{pair}** • ${price:,.2f}  {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}"
+    
     bullets = []
     for idx, (title, extra) in enumerate(items):
         prefix = "└➤" if idx == len(items) - 1 else "├➤"
         bullets.append(f"{prefix} {title} | {extra}")
+    
     body = "\n".join(bullets)
     return escape_markdown_v2(f"{headline}\n{body}")
 
@@ -2848,20 +2962,19 @@ class AlertDefinition(TypedDict):
 # CORRECTED ALERT DEFINITIONS - Replace in macd_unified.py
 # ============================================================================
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["buy_common"] and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo["prev"]<=ppo_sig["prev"]) and (ppo["curr"]>ppo_sig["curr"]) and (ppo["curr"]<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["sell_common"] and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo["prev"]>=ppo_sig["prev"]) and (ppo["curr"]<ppo_sig["curr"]) and (ppo["curr"]>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo['curr']:.2f} vs Sig {ppo_sig['curr']:.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["buy_common"] and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo["prev"]<=0.0) and (ppo["curr"]>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo['curr']:.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo"]},
-    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["sell_common"] and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo["prev"]>=0.0) and (ppo["curr"]<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo['curr']:.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["buy_common"] and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo["prev"]<=Constants.PPO_011_THRESHOLD) and (ppo["curr"]>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo['curr']:.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["sell_common"] and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo["prev"]>=Constants.PPO_011_THRESHOLD_SELL) and (ppo["curr"]<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo['curr']:.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo"]},
-    {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["buy_common"] and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (rsi["prev"]<=Constants.RSI_THRESHOLD) and (rsi["curr"]>Constants.RSI_THRESHOLD) and (ppo["curr"]<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo","rsi"]},
-    {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["sell_common"] and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (rsi["prev"]>=Constants.RSI_THRESHOLD) and (rsi["curr"]<Constants.RSI_THRESHOLD) and (ppo["curr"]>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi['curr']:.2f} | PPO {ppo['curr']:.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["ppo","rsi"]},
-    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["buy_common"] and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx["close_prev"]<=ctx["vwap_prev"]) and (ctx["close_curr"]>ctx["vwap_curr"])),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx['vwap_curr']:.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["sell_common"] and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx["close_prev"]>=ctx["vwap_prev"]) and (ctx["close_curr"]<ctx["vwap_curr"])),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx['vwap_curr']:.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx['mmh_curr']:.2f})","requires":["vwap"]},
-    {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["buy_common"] and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx["mmh_reversal_buy"]),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx['mmh_curr']:.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"mmh_sell","title":"🟣⬇ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx["sell_common"] and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx["mmh_reversal_sell"]),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx['mmh_curr']:.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
+    {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
+    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
+    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
+    {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
-
 def _validate_pivot_cross(
     ctx: Dict[str, Any],
     level: str,
@@ -2894,18 +3007,16 @@ def _validate_pivot_cross(
 
 def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     """
-    Optimized wrapper for pivot validation. Caches results in 'ctx' to avoid 
-    re-calculating the same level multiple times during a single pair evaluation.
+    Validates pivot levels with caching to avoid redundant calculations.
     """
-    # Create a unique key for this level and direction
-    cache_key = f"cache_pivot_{'buy' if is_buy else 'sell'}_{level}"
+    # Use immutable cache key based on level and direction
+    cache_key = f"_pivot_cache_{level}_{'buy' if is_buy else 'sell'}"
     
+    # Check if we've already validated this level this call
     if cache_key not in ctx:
-        # Use the existing _validate_pivot_cross from your script
         ctx[cache_key] = _validate_pivot_cross(ctx, level, is_buy)
-        
+    
     return ctx[cache_key]
-
 # ============================================================================
 # OPTIMIZED PIVOT DEFINITIONS
 # ============================================================================
@@ -3115,15 +3226,13 @@ async def evaluate_pair_and_alert(
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
     Evaluate all indicators for a pair and send alerts if conditions met.
-    ✅ CORRECTED: Proper wick ratio handling, error logging, and validation
+    ✅ CORRECTED: Proper null safety, error handling, and validation
     """
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
-    ctx: Dict[str, Any] = {}
-    
-    # Pre-declare variables for safe cleanup
+    # Pre-declare all variables for safe cleanup
     close_15m = None
     open_15m = None
     timestamps_15m = None
@@ -3138,16 +3247,19 @@ async def evaluate_pair_and_alert(
     rma50_15 = None
     rma200_5 = None
     piv = None
+    context = None
 
     try:
         # Get last closed candle indices
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
         
-        if i15 is None or i15 < 3 or i5 is None:
-            logger_pair.warning(
-                f"Insufficient data for {pair_name}: i15={i15}, i5={i5}"
-            )
+        # CRITICAL: Need at least 4 candles for MMH lookback
+        if i15 is None or i15 < 4 or i5 is None or i5 < 2:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Insufficient indices for {pair_name}: i15={i15} (need ≥4), i5={i5} (need ≥2)"
+                )
             return None
         
         # Extract basic candle data
@@ -3201,7 +3313,7 @@ async def evaluate_pair_and_alert(
         rma200_5_val = rma200_5[i5]
 
         # ============================================================================
-        # ✅ FIX 1: Calculate ACTUAL wick ratios from current candle (NOT from precompute)
+        # Calculate ACTUAL wick ratios from current candle
         # ============================================================================
         i15_open = float(open_15m[i15])
         i15_high = float(data_15m["high"][i15])
@@ -3236,9 +3348,8 @@ async def evaluate_pair_and_alert(
        
         # Validate candle timestamp
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            debug_if(cfg.DEBUG_MODE, logger, lambda: (
-                f"Skipping {pair_name} - 15m candle not confirmed closed"
-            ))
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
 
         # Daily reset logic for pivot/VWAP alerts
@@ -3259,20 +3370,24 @@ async def evaluate_pair_and_alert(
                         delete_keys = []
             
                         if cfg.ENABLE_VWAP:
-                            if "vwap_up" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_up']}")
-                            if "vwap_down" in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
+                            if "vwap_up" in ALERT_KEYS: 
+                                delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_up']}")
+                            if "vwap_down" in ALERT_KEYS: 
+                                delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
 
                         if cfg.ENABLE_PIVOT and piv:
                             for level in ["P","S1","S2","S3","R1","R2"]:
                                 k = f"pivot_up_{level}"
-                                if k in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
+                                if k in ALERT_KEYS: 
+                                    delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
                             for level in ["P","S1","S2","R1","R2","R3"]:
                                 k = f"pivot_down_{level}"
-                                if k in ALERT_KEYS: delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
+                                if k in ALERT_KEYS: 
+                                    delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
 
                         if delete_keys:
                             await sdb.atomic_batch_update([], deletes=delete_keys)
-                            logger_pair.info(f"🔄 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts ...")
+                            logger_pair.info(f"🔄 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts")
 
                         await sdb.set_metadata(day_tracker_key, str(current_day))
             
@@ -3287,29 +3402,32 @@ async def evaluate_pair_and_alert(
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1]
         
-        # ✅ FIX 2: Better VWAP handling with None checks
+        # VWAP handling with None checks
         vwap_curr = None
         vwap_prev = None
-        vwap_unavailable = False
-        vwap_disabled = False
 
         if not cfg.ENABLE_VWAP:
-            vwap_disabled = True
+            vwap_curr = close_curr
+            vwap_prev = close_prev
         elif vwap is None or len(vwap) == 0:
-            vwap_unavailable = True
             logger_pair.warning("VWAP enabled but vwap array is None or empty")
+            vwap_curr = close_curr
+            vwap_prev = close_prev
         elif len(vwap) <= i15:
-            vwap_unavailable = True
             logger_pair.warning(
                 f"VWAP enabled but insufficient data "
                 f"(len(vwap)={len(vwap)} ≤ i15={i15}) – VWAP alerts skipped"
             )
+            vwap_curr = close_curr
+            vwap_prev = close_prev
         else:
             vwap_curr = vwap[i15]
             vwap_prev = vwap[i15 - 1]
 
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
+        mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
+        mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
       
         # Cloud state
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
@@ -3325,7 +3443,7 @@ async def evaluate_pair_and_alert(
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
    
-        # ✅ FIX 3: Use corrected precompute (only returns 2 values, not 4)
+        # Use corrected precompute
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
@@ -3352,9 +3470,6 @@ async def evaluate_pair_and_alert(
         mmh_reversal_sell = False
         
         if i15 >= 3:
-            mmh_m3 = float(mmh[i15 - 3])
-            mmh_m2 = float(mmh[i15 - 2])
-            
             mmh_reversal_buy = (
                 buy_common and 
                 mmh_curr > 0 and
@@ -3370,58 +3485,43 @@ async def evaluate_pair_and_alert(
             )
  
         # ============================================================================
-        # ✅ FIX 4: Build context with ACTUAL wick ratios (not defaults!)
+        # Build context with ALL required keys and safe defaults
         # ============================================================================
         context = {
             "buy_common": buy_common,
             "sell_common": sell_common,
-    
-            # Price data
             "close_curr": close_curr,
             "close_prev": close_prev,
             "close_5m_val": close_5m_val,
             "ts_curr": ts_curr,
-    
-            # PPO values (as dict for alert checks)
             "ppo_curr": ppo_curr,
             "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr,
             "ppo_sig_prev": ppo_sig_prev,
-    
-            # RSI values
             "rsi_curr": rsi_curr,
             "rsi_prev": rsi_prev,
-    
-            # VWAP values
             "vwap_curr": vwap_curr,
-            "vwap_prev": vwap_prev, 
-    
-            # MMH values
+            "vwap_prev": vwap_prev,
+            "vwap_available": vwap_curr is not None and vwap_prev is not None,
             "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1, 
+            "mmh_m1": mmh_m1,
+            "mmh_m2": mmh_m2,
+            "mmh_m3": mmh_m3,
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
-    
-            # Trend indicators
             "rma50_15_val": rma50_15_val,
             "rma200_5_val": rma200_5_val,
             "cloud_up": cloud_up,
             "cloud_down": cloud_down,
-    
-            # Other indicators
-            "pivots": piv,
-            "vwap": cfg.ENABLE_VWAP,
-
-            # ✅ Use ACTUAL calculated ratios (not defaults of 1.0!)
+            "pivots": piv if piv else {},
+            "vwap_enabled": cfg.ENABLE_VWAP,
             "buy_wick_ratio": actual_buy_wick_ratio,
             "sell_wick_ratio": actual_sell_wick_ratio,
-
-            # Quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
             "is_green": is_green,
             "is_red": is_red,
-            "pivot_suppressions": []
+            "pivot_suppressions": [],
         }
         
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
@@ -3430,6 +3530,7 @@ async def evaluate_pair_and_alert(
         
         raw_alerts = []
 
+        # Determine which alerts to check
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
@@ -3456,6 +3557,7 @@ async def evaluate_pair_and_alert(
             sdb, pair_name, redis_alert_keys
         )
 
+        # Process each alert
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
@@ -3465,16 +3567,10 @@ async def evaluate_pair_and_alert(
             trigger = False
     
             # Determine if this is a BUY or SELL signal
-            is_buy_signal = (
-                "up" in alert_key or 
-                alert_key in ["vwap_up", "mmh_buy", "ppo_zero_up", "ppo_011_up", "rsi_50_up"]
-            )
-            is_sell_signal = (
-                "down" in alert_key or 
-                alert_key in ["vwap_down", "mmh_sell", "ppo_zero_down", "ppo_011_down", "rsi_50_down"]
-            )
+            is_buy_signal = any(x in alert_key for x in ["up", "buy"])
+            is_sell_signal = any(x in alert_key for x in ["down", "sell"])
     
-            # ✅ FIX 5: Block BUY/SELL signals based on ACTUAL wick ratios
+            # Block on wick ratios BEFORE evaluation
             if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(
@@ -3494,60 +3590,67 @@ async def evaluate_pair_and_alert(
                 level = alert_key.split("_")[-1]
                 is_buy = alert_key.startswith("pivot_up_")
                 
-                valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                
-                if not valid_cross and reason and piv:
-                    context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-                
-                trigger = (
-                    (is_buy and buy_common) or (not is_buy and sell_common)
-                ) and valid_cross
+                try:
+                    valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
+                    
+                    if not valid_cross and reason and piv:
+                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
+                    
+                    trigger = (
+                        (is_buy and buy_common) or (not is_buy and sell_common)
+                    ) and valid_cross
+                except Exception as e:
+                    logger_pair.error(
+                        f"Pivot alert check failed for {alert_key}: {e}",
+                        exc_info=True
+                    )
+                    trigger = False
             else:
-                # Standard alert evaluation
+                # Standard alert evaluation with full error handling
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except Exception as e:
-                    # ✅ FIX 6: Improved error logging with full context
+                except KeyError as e:
                     logger_pair.error(
-                        f"Alert check failed for {alert_key}: {e} | "
-                        f"Type: {type(e).__name__} | "
-                        f"Available context keys: {sorted(context.keys())}",
+                        f"Missing context key for {alert_key}: {e} | "
+                        f"Available: {sorted(context.keys())}",
+                        exc_info=False
+                    )
+                    trigger = False
+                except TypeError as e:
+                    logger_pair.error(
+                        f"Type error in {alert_key}: {e}",
+                        exc_info=False
+                    )
+                    trigger = False
+                except Exception as e:
+                    logger_pair.error(
+                        f"Alert check failed for {alert_key}: {e}",
                         exc_info=True
                     )
                     trigger = False
 
-            # ============================================================================
-            # ✅ FIX 7: SECONDARY VALIDATION - Verify common conditions
-            # ============================================================================
+            # Secondary validation
             if trigger:
-                # Verify buy_common for BUY signals
                 if is_buy_signal and not buy_common:
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(
-                            f"❌ BLOCKED {alert_key}: buy_common=False "
-                            f"(base_buy_trend={base_buy_trend}, buy_candle_passed={buy_candle_passed}, is_green={is_green})"
-                        )
+                        logger_pair.debug(f"❌ BLOCKED {alert_key}: buy_common=False")
                     continue
-        
-                # Verify sell_common for SELL signals
+
                 if is_sell_signal and not sell_common:
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(
-                            f"❌ BLOCKED {alert_key}: sell_common=False "
-                            f"(base_sell_trend={base_sell_trend}, sell_candle_passed={sell_candle_passed}, is_red={is_red})"
-                        )
+                        logger_pair.debug(f"❌ BLOCKED {alert_key}: sell_common=False")
                     continue
-    
-            # Generate alert if triggered and not previously active
+
+            # Generate alert if triggered
             if trigger and not previous_states.get(key, False):
                 try:
-                    extra = def_["extra_fn"](
-                        context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None
-                    )
+                    extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
+                    if not extra:
+                        extra = ""
                     raw_alerts.append((def_["title"], extra, def_["key"]))
-                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))          
+                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
 
-                    # ✅ FIX 8: Debug logging for successful alerts
+                    # Debug logging for successful alerts
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(
                             f"✅ Alert FIRED: {alert_key} | "
@@ -3557,11 +3660,9 @@ async def evaluate_pair_and_alert(
                         ) 
 
                 except Exception as e:
-                    # ✅ FIX 9: Improved extra_fn error logging
                     logger_pair.error(
-                        f"Alert extra_fn failed for {alert_key}: {e} | "
-                        f"Type: {type(e).__name__}",
-                        exc_info=True
+                        f"Alert extra_fn failed for {alert_key}: {e}",
+                        exc_info=False
                     )
         
         # Handle alert state resets (opposite crossovers)
@@ -3626,7 +3727,7 @@ async def evaluate_pair_and_alert(
                         f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_SELL}"
                     )
     
-        # ✅ FIX 10: VWAP reset with None checks (prevents undefined variable errors)
+        # VWAP reset with None checks
         if cfg.ENABLE_VWAP and vwap_curr is not None and vwap_prev is not None:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
@@ -3833,12 +3934,45 @@ async def evaluate_pair_and_alert(
 
     finally:
         PAIR_ID.set("")
+        
+        # Explicitly delete references to free memory
         try:
-            close_15m = open_15m = timestamps_15m = None
-            data_15m = data_5m = data_daily = None
-            ppo = ppo_signal = smooth_rsi = vwap = mmh = None
-            upw = dnw = rma50_15 = rma200_5 = piv = None
-            indicators = None
+            if 'data_15m' in locals():
+                del data_15m
+            if 'data_5m' in locals():
+                del data_5m
+            if 'data_daily' in locals():
+                del data_daily
+            if 'indicators' in locals():
+                del indicators
+            if 'close_15m' in locals():
+                del close_15m
+            if 'open_15m' in locals():
+                del open_15m
+            if 'timestamps_15m' in locals():
+                del timestamps_15m
+            if 'ppo' in locals():
+                del ppo
+            if 'ppo_signal' in locals():
+                del ppo_signal
+            if 'smooth_rsi' in locals():
+                del smooth_rsi
+            if 'vwap' in locals():
+                del vwap
+            if 'mmh' in locals():
+                del mmh
+            if 'upw' in locals():
+                del upw
+            if 'dnw' in locals():
+                del dnw
+            if 'rma50_15' in locals():
+                del rma50_15
+            if 'rma200_5' in locals():
+                del rma200_5
+            if 'piv' in locals():
+                del piv
+            if 'context' in locals():
+                del context
         except Exception:
             pass
 
@@ -3949,23 +4083,29 @@ async def run_once() -> bool:
         fetcher: Optional[DataFetcher] = None
         telegram_queue: Optional[TelegramQueue] = None
 
-    alerts_sent = 0
     MAX_ALERTS_PER_RUN = 50
 
+    alerts_sent = 0
     for _, state in all_results:
         if state.get("state") == "ALERT_SENT":
-            extra = state.get("summary", {}).get("alerts", 0)
-
-            # 1.  enforce limit BEFORE we add this chunk
-            if alerts_sent + extra > MAX_ALERTS_PER_RUN:
+            extra_alerts = state.get("summary", {}).get("alerts", 0)
+        
+            # Prevent integer overflow
+            if alerts_sent > MAX_ALERTS_PER_RUN:
                 logger_run.warning(
-                    "Alert limit reached (%d), skipping %d alerts",
-                    MAX_ALERTS_PER_RUN, extra
+                    f"Alert limit exceeded ({alerts_sent}/{MAX_ALERTS_PER_RUN}), "
+                    f"skipping remaining alerts"
                 )
                 break
-
-            alerts_sent += extra
-
+        
+            if alerts_sent + extra_alerts > MAX_ALERTS_PER_RUN:
+                logger_run.warning(
+                    f"Alert limit would be exceeded, skipping {extra_alerts} alerts"
+                )
+                break
+        
+            alerts_sent += extra_alerts
+ 
     # 2.  single log line is enough
     if alerts_sent >= MAX_ALERTS_PER_RUN:          # >= covers the edge case
         logger_run.critical(
@@ -4188,42 +4328,42 @@ async def run_once() -> bool:
 
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
-    
+
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
                 logger_run.debug("🔓 Redis lock released")
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
-    
+
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
                 logger_run.debug("✅ Redis connection closed")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
-    
+
+        # Clean up references
         try:
-            if 'all_results' in locals():
-                del all_results
-            if 'products_map' in locals():
-                del products_map
-            if 'fetcher' in locals():
-                del fetcher
-            if 'telegram_queue' in locals():
-                del telegram_queue
+            locals_to_clear = [
+                'all_results', 'products_map', 'fetcher', 
+                'telegram_queue', 'sdb', 'lock', 'process'
+            ]
+            for var_name in locals_to_clear:
+                if var_name in locals():
+                    del locals()[var_name]
 
             gc.collect()
         except Exception as e:
-            logger_run.warning(f"Memory cleanup warning (non-critical): {e}", exc_info=False)
-    
+            logger_run.warning(f"Memory cleanup warning: {e}", exc_info=False)
+
         try:
             TRACE_ID.set("")
             PAIR_ID.set("")
-        except:
+        except Exception:
             pass
 
-        logger_run.debug("🏁 Resource cleanup finished")
+        logger_run.debug("🧹 Resource cleanup finished")
 
 try:
     import uvloop
