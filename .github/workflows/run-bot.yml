@@ -1,114 +1,187 @@
-name: 🤖 Run MACD Unified Bot (Native Fast-Path)
+name: 🤖 Run MACD Unified Bot (Hybrid)
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry-run mode'
+        description: 'Dry-run mode (log alerts only)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      skip_alerts:
+        description: 'Skip Telegram alerts (test mode)'
         required: false
         default: 'false'
         type: boolean
-  # This allows Cron-jobs.org to trigger via GitHub API
-  repository_dispatch:
-    types: [trigger-bot]
 
 env:
-  PYTHON_VERSION: "3.11"
-  AOT_LIB_NAME: "macd_aot_compiled"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: manojpy/github-cron/macd-unified-aot
+  BOT_TIMEOUT: 300  # 5 minutes (sufficient for ~30–40s job)
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    permissions:
+      contents: read
+      packages: read
+
     steps:
       # ========================================================================
-      # PHASE 1: ENVIRONMENT SETUP
+      # PHASE 1: SETUP
       # ========================================================================
-      - name: 📥 Checkout Code
+      - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
-
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip' # Caches requirements.txt automatically
+          sparse-checkout: |
+            config_macd.json
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
 
-      - name: 🗄️ Cache AOT Binary
-        id: cache-aot
-        uses: actions/cache@v4
+      - name: 🔐 Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          path: ./${{ env.AOT_LIB_NAME }}.so
-          # Key changes if core logic or dependencies change
-          key: aot-${{ runner.os }}-${{ hashFiles('src/numba_functions_shared.py', 'src/aot_build.py', 'requirements.txt') }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 📦 Install Dependencies
+      - name: 🐳 Pull Latest AOT Image (BuildKit)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "📦 Pulling AOT image with BuildKit..."
+          START_TIME=$(date +%s)
+          export DOCKER_BUILDKIT=1
+          if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
+            PULL_TIME=$(( $(date +%s) - START_TIME ))
+            echo "✅ Image pulled in ${PULL_TIME}s"
+          else
+            echo "❌ Failed to pull image"
+            exit 1
+          fi
+
+      - name: 🔑 Verify Secrets
+        run: |
+          MISSING=()
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
+          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
+          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "❌ Missing required secrets: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "✅ All secrets configured"
 
       # ========================================================================
-      # PHASE 2: AOT COMPILATION (Skips if Cache Hit)
+      # PHASE 2: BOT EXECUTION
       # ========================================================================
-      - name: 🔨 Build AOT Binary
-        if: steps.cache-aot.outputs.cache-hit != 'true'
-        run: python src/aot_build.py --output-dir . --module-name ${{ env.AOT_LIB_NAME }}
-
-      # ========================================================================
-      # PHASE 3: BOT EXECUTION
-      # ========================================================================
-      - name: 🚀 Run MACD Bot
-        id: bot-run
+      - name: 🚀 Execute MACD Bot
+        id: bot_run
+        timeout-minutes: 6
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          PYTHONPATH: ./src
-          PYTHONOPTIMIZE: 2
-          AOT_STRICT: 1
-          # Pass dry-run input if it exists, else default to false
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
-          # Run bot and pipe all output to log file
-          python src/macd_unified.py --skip-warmup 2>&1 | tee logs/bot.log
-          
-          # FIXED LOG PARSING:
-          # Your bot logs: "✅ RUN COMPLETE | Duration: 8.0s | Pairs: 12/12 | Alerts: 2"
-          SUMMARY_LINE=$(tail -n 15 logs/bot.log | grep "RUN COMPLETE")
-          
-          # Extract values using regex that matches your specific log format
-          DURATION=$(echo "$SUMMARY_LINE" | grep -oP 'Duration: \K[0-9.]+' || echo "0")
-          ALERTS=$(echo "$SUMMARY_LINE" | grep -oP 'Alerts: \K[0-9]+' || echo "0")
-          PAIRS=$(echo "$SUMMARY_LINE" | grep -oP 'Pairs: \K[0-9/]+' || echo "N/A")
-          
-          # Save to environment for the summary step
-          echo "BOT_DURATION=$DURATION" >> $GITHUB_ENV
-          echo "BOT_ALERTS=$ALERTS" >> $GITHUB_ENV
-          echo "BOT_PAIRS=$PAIRS" >> $GITHUB_ENV
+          echo "::group::🔥 Launch Macd-Unified...🔥 "
+          echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
+          echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "🧪 Dry Run: $DRY_RUN"
+          echo "::endgroup::"
+
+          START_TIME=$(date +%s)
+          timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
+            --rm \
+            --name macd_bot_runner \
+            --platform linux/amd64 \
+            --network host \
+            --memory="900m" \
+            --memory-swap="900m" \
+            --cpus="2.0" \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
+            -e TZ=Asia/Kolkata \
+            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e DRY_RUN_MODE="$DRY_RUN" \
+            -e PYTHONUNBUFFERED=1 \
+            -e NUMBA_NUM_THREADS=2 \
+            -e OMP_NUM_THREADS=2 \
+            -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          DURATION=$(( $(date +%s) - START_TIME ))
+          echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
+          echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+
+          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
+            echo "⚠️ Bot execution timed out after ${DURATION}s"
+            exit 1
+          elif [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Bot exited with code $EXIT_CODE"
+            exit 1
+          fi
+          echo "✅ Bot completed successfully in ${DURATION}s"
 
       # ========================================================================
-      # PHASE 4: RESULTS SUMMARY
+      # PHASE 3: RESULTS ANALYSIS
       # ========================================================================
+      - name: 📊 Parse Execution Results
+        if: always()
+        id: results
+        run: |
+          LOG_FILE="logs/bot_output.log"
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "message=Log file not found" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
+            STATUS="success"
+            DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
+            ALERTS=$(grep -oP "Alerts:\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
+            PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
+            MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
+            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
+          else
+            STATUS="failed"
+            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed" "$LOG_FILE" | head -1 | cut -c1-100)
+          fi
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
+          echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
+          echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
+          echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
+          echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
+          echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
+
       - name: 📝 Generate Summary Report
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
-          | Metric | Value |
-          | :--- | :--- |
-          | **Execution Status** | ${{ steps.bot-run.outcome == 'success' && '✅ Success' || '❌ Failed' }} |
-          | **Bot Logic Time** | ${{ env.BOT_DURATION }}s |
-          | **Alerts Sent** | ${{ env.BOT_ALERTS }} |
-          | **Pairs Processed** | ${{ env.BOT_PAIRS }} |
-          | **Optimization** | ⚡ AOT-Compiled (Native) |
-          | **AOT Library** | ${{ steps.cache-aot.outputs.cache-hit == 'true' && '🎯 From Cache' || '🔨 Freshly Built' }} |
+          | Status | Duration | Alerts | Pairs | Mem | Redis |
+          |---|---|---|---|---|---|
+          | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
           EOF
+          if [ "${{ steps.results.outputs.status }}" != "success" ]; then
+            echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
+          fi
 
-      - name: 📦 Upload Logs on Failure
+      # ========================================================================
+      # PHASE 4: ARTIFACT UPLOAD
+      # ========================================================================
+      - name: 📦 Upload Execution Logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-error-logs
+          name: bot-execution-logs-${{ github.run_number }}
           path: logs/
-          retention-days: 3
+          retention-days: 2
