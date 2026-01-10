@@ -3973,6 +3973,9 @@ async def run_once() -> bool:
         ) 
 
     try:
+
+        all_results: List[Tuple[str, Dict[str, Any]]] = []
+
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
