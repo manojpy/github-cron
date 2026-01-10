@@ -44,167 +44,103 @@ def sanitize_array_numba_parallel(arr, default):
 # STATISTICAL
 # ============================================================================
 
+# ============================================================================
+# 1.  rolling_std  (serial)
+# ============================================================================
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    
     n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
+    sd = np.zeros(n, dtype=np.float64)
+    if n < period:
+        return sd
 
+    sum_val  = 0.0
+    sq_sum   = 0.0
     for i in range(n):
-        if i < period - 1:
-            sd[i] = 0.0
-            continue
+        val = close[i]
+        sum_val += val
+        sq_sum += val * val
 
-        window_sum = 0.0
-        window_count = 0
-        has_nan = False
+        if i >= period:
+            old_val = close[i - period]
+            sum_val -= old_val
+            sq_sum -= old_val * old_val
 
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = close[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-            window_count += 1
-
-        if has_nan or window_count == 0:
-            sd[i] = 0.0
-            continue
-
-        mean = window_sum / window_count
-
-        variance_sum = 0.0
-        for j in range(start, i + 1):
-            val = close[j]
-            diff = val - mean
-            variance_sum += diff * diff
-
-        variance = variance_sum / period
-        sd[i] = np.sqrt(variance) * resp
-
+        if i >= period - 1:
+            mean = sum_val / period
+            var  = (sq_sum / period) - (mean * mean)
+            sd[i] = np.sqrt(max(0.0, var)) * responsiveness
     return sd
 
 
-@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
+# ============================================================================
+# 2.  rolling_std_parallel
+# ============================================================================
+@njit("f8[:](f8[:], i4, f8)", nogil=True, parallel=True, cache=True)
 def rolling_std_parallel(close, period, responsiveness):
-   
     n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
+    sd = np.zeros(n, dtype=np.float64)
+    if n < period:
+        return sd
 
     for i in prange(n):
+        # local per-thread accumulators
+        s  = 0.0
+        s2 = 0.0
         if i < period - 1:
             sd[i] = 0.0
             continue
 
-        window_sum = 0.0
-        window_count = 0
-        has_nan = False
-
-        start = i - period + 1
-        for j in range(start, i + 1):
+        for j in range(i - period + 1, i + 1):
             val = close[j]
-            if np.isnan(val):
-                has_nan = True
-                break
-            window_sum += val
-            window_count += 1
+            s  += val
+            s2 += val * val
 
-        if has_nan or window_count == 0:
-            sd[i] = 0.0
-            continue
-
-        mean = window_sum / window_count
-
-        variance_sum = 0.0
-        for j in range(start, i + 1):
-            val = close[j]
-            diff = val - mean
-            variance_sum += diff * diff
-
-        variance = variance_sum / period
-        sd[i] = np.sqrt(variance) * resp
-
+        mean = s / period
+        var  = (s2 / period) - (mean * mean)
+        sd[i] = np.sqrt(max(0.0, var)) * responsiveness
     return sd
 
 
 # ============================================================================
-# FIXED MMH IMPLEMENTATION - Replace in numba_functions_shared.py
+# 3.  rolling_mean_numba  (serial)
 # ============================================================================
-
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    
     n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    
-    # Phase 1: Warmup period (bars 0 to period-2)
-    cum_sum = 0.0
-    count = 0
-    for i in range(min(period - 1, n)):
-        if not np.isnan(data[i]):
-            cum_sum += data[i]
-            count += 1
-        out[i] = cum_sum / count if count > 0 else 0.0
-    
-    # Phase 2: Full rolling SMA (skips NaN)
-    for i in range(period - 1, n):
-        window_sum = 0.0
-        valid_count = 0
-        
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = data[j]
-            if not np.isnan(val):
-                window_sum += val
-                valid_count += 1
-        
-        # Pine: if all NaN → previous value
-        out[i] = window_sum / valid_count if valid_count > 0 else out[i-1]
-    
+    out = np.zeros(n, dtype=np.float64)
+    if n < period:
+        return out
+
+    current_sum = 0.0
+    for i in range(n):
+        current_sum += data[i]
+        if i >= period:
+            current_sum -= data[i - period]
+        if i >= period - 1:
+            out[i] = current_sum / period
     return out
 
 
+# ============================================================================
+# 4.  rolling_mean_numba_parallel
+# ============================================================================
 @njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_mean_numba_parallel(data, period):
-    
     n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    
-    # Phase 1: Warmup period (sequential - cannot parallelize due to dependencies)
-    cum_sum = 0.0
-    count = 0
-    warmup_end = min(period - 1, n)
-    
-    for i in range(warmup_end):
-        if not np.isnan(data[i]):
-            cum_sum += data[i]
-            count += 1
-        out[i] = cum_sum / count if count > 0 else 0.0
-    
-    # Phase 2: Full rolling SMA (parallel - each iteration independent)
-    for i in prange(period - 1, n):
-        window_sum = 0.0
-        valid_count = 0
-        
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = data[j]
-            if not np.isnan(val):
-                window_sum += val
-                valid_count += 1
-        
-        # Fallback: if all NaN in window, use previous value
-        # NOTE: This is safe because warmup guarantees out[period-2] exists
-        if valid_count > 0:
-            out[i] = window_sum / valid_count
-        else:
-            # For parallel safety, we cannot reference out[i-1] here
-            # So we use the last warmup value as fallback
-            out[i] = out[warmup_end - 1] if warmup_end > 0 else 0.0
-    
+    out = np.zeros(n, dtype=np.float64)
+    if n < period:
+        return out
+
+    for i in prange(n):
+        if i < period - 1:
+            out[i] = 0.0
+            continue
+
+        s = 0.0
+        for j in range(i - period + 1, i + 1):
+            s += data[j]
+        out[i] = s / period
     return out
 
 
@@ -286,9 +222,17 @@ def ema_loop(data, alpha_or_period):
     alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
 
     out = np.empty(n, dtype=np.float64)
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
+    # Find first non-NaN value
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(data[i]):
+            first_valid_idx = i
+            break
+    if first_valid_idx == -1:
+        return out  # All NaN
+    out[first_valid_idx] = data[first_valid_idx]
 
-    for i in range(1, n):
+    for i in range(first_valid_idx + 1, n):
         curr = data[i]
         out[i] = out[i - 1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i - 1])
 
@@ -300,9 +244,15 @@ def ema_loop_alpha(data, alpha):
     """Exponential Moving Average with explicit alpha parameter"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-
-    for i in range(1, n):
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(data[i]):
+            first_valid_idx = i
+            break
+    if first_valid_idx == -1:
+        return out
+    out[first_valid_idx] = data[first_valid_idx]
+    for i in range(first_valid_idx + 1, n):  
         curr = data[i]
         out[i] = out[i - 1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i - 1])
 
@@ -315,21 +265,26 @@ def ema_loop_alpha(data, alpha):
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    
+    """Range filter with NaN-safe seed"""
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
 
-    # Pine: rngfiltx1x1 = x (initial assignment)
-    filt[0] = 0.0 if np.isnan(x[0]) else x[0]
+    # find first valid x[i]
+    first_valid = -1
+    for i in range(n):
+        if not np.isnan(x[i]):
+            first_valid = i
+            break
+    if first_valid == -1:          # all NaN
+        filt.fill(0.0)
+        return filt
 
-    for i in range(1, n):
+    filt[first_valid] = x[first_valid]
+
+    for i in range(first_valid + 1, n):
         curr_x = x[i]
         curr_r = r[i]
-
-        # Pine nz()
         prev = filt[i - 1]
-        if np.isnan(prev):
-            prev = 0.0
 
         if np.isnan(curr_x) or np.isnan(curr_r):
             filt[i] = prev
@@ -342,41 +297,50 @@ def rng_filter_loop(x, r):
             candidate = curr_x + curr_r
             filt[i] = prev if candidate > prev else candidate
 
+    # zero-fill leading invalid bars
+    filt[:first_valid] = 0.0
     return filt
-
 
 @njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
 def smooth_range(close, t, m):
-    """Calculate smoothed range with double EMA"""
+    """Calculate smoothed range with double EMA – NaN-safe seed"""
     n = len(close)
 
-    # Step 1: Calculate absolute differences
+    # Step 1: absolute differences
     diff = np.empty(n, dtype=np.float64)
     diff[0] = 0.0
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i - 1])
 
-    # Step 2: First EMA (average range)
+    # Step 2: find first valid diff (i ≥ 1)
+    first_valid = -1
+    for i in range(1, n):
+        if not np.isnan(diff[i]):
+            first_valid = i
+            break
+    if first_valid == -1:          # all NaN
+        return np.zeros(n, dtype=np.float64)
+
+    # Step 3: first EMA (average range)
     alpha_t = 2.0 / (t + 1.0)
     avrng = np.empty(n, dtype=np.float64)
-    avrng[0] = diff[0]
+    avrng[first_valid] = diff[first_valid]
+    for i in range(first_valid + 1, n):
+        d = diff[i]
+        avrng[i] = avrng[i - 1] if np.isnan(d) else (alpha_t * d + (1.0 - alpha_t) * avrng[i - 1])
 
-    for i in range(1, n):
-        curr = diff[i]
-        avrng[i] = avrng[i - 1] if np.isnan(curr) else (alpha_t * curr + (1.0 - alpha_t) * avrng[i - 1])
-
-    # Step 3: Second EMA (smoothed range)
+    # Step 4: second EMA (smoothed range)
     wper = t * 2 - 1
     alpha_w = 2.0 / (wper + 1.0)
     smoothrng = np.empty(n, dtype=np.float64)
-    smoothrng[0] = avrng[0]
+    smoothrng[first_valid] = avrng[first_valid]
+    for i in range(first_valid + 1, n):
+        a = avrng[i]
+        smoothrng[i] = smoothrng[i - 1] if np.isnan(a) else (alpha_w * a + (1.0 - alpha_w) * smoothrng[i - 1])
 
-    for i in range(1, n):
-        curr = avrng[i]
-        smoothrng[i] = smoothrng[i - 1] if np.isnan(curr) else (alpha_w * curr + (1.0 - alpha_w) * smoothrng[i - 1])
-
+    # zero-fill leading invalid bars
+    smoothrng[:first_valid] = 0.0
     return smoothrng * float(m)
-
 
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):
@@ -414,13 +378,20 @@ def kalman_loop(src, length, R, Q):
     """Kalman filter implementation"""
     n = len(src)
     result = np.empty(n, dtype=np.float64)
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(src[i]):
+            first_valid_idx = i
+            break
+    if first_valid_idx == -1:
+        return result
+    estimate = src[first_valid_idx]
 
-    estimate = src[0] if not np.isnan(src[0]) else 0.0
     error_est = 1.0
     error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
     Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
 
-    for i in range(n):
+    for i in range(first_valid_idx + 1, n):, 
         current = src[i]
 
         if np.isnan(current):
