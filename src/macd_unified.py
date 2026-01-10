@@ -3865,6 +3865,7 @@ async def run_once() -> bool:
         all_results: List[Tuple[str, Dict[str, Any]]] = [] 
         correlation_id = uuid.uuid4().hex[:8]
         TRACE_ID.set(correlation_id)
+        pairs_to_process: List[str] = [] 
         logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
         start_time = time.time()
 
