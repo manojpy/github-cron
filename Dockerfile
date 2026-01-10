@@ -1,5 +1,5 @@
 # =============================================================================
-# MULTI-STAGE BUILD: Aggressive Caching + UV + AOT Compilation (HYBRID BEST-OF)
+# MULTI-STAGE BUILD: Aggressive Caching + UV + AOT Compilation (HYBRID OPTIMIZED)
 # =============================================================================
 
 # ---------- STAGE 1: UV INSTALLER ----------
@@ -19,6 +19,7 @@ COPY --from=uv-installer /usr/local/lib/python3.11/site-packages /usr/local/lib/
 # ✅ Minimal build dependencies
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /build
@@ -72,6 +73,9 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
+# ✅ Copy UV binary
+COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
+
 # ✅ Security - Non-root user
 RUN useradd --uid 1000 --no-log-init -m appuser && \
     mkdir -p /app/src && \
@@ -91,8 +95,8 @@ COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/aot_build.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
-# ✅ Config copied at runtime
-COPY --chown=appuser:appuser config_macd.json ./
+# ⚠️ NOTE: config_macd.json is NOT copied here - mounted at runtime via run-bot.yml
+# This allows config changes without rebuilding the entire image
 
 USER appuser
 
