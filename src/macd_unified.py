@@ -1282,10 +1282,14 @@ async def async_fetch_json(
         except asyncio.TimeoutError as e:
             last_error = e
             retry_stats[RetryCategory.TIMEOUT] += 1
-            
             logger.warning(
                 f"Timeout (attempt {attempt}/{retries}) | "
-                f"URL: {url[:80]} | Timeout: {timeout}s"
+                f"URL: {url[:80]} | Timeout configured: {timeout}s"
+            )
+            # ✅ Add slight extra backoff for timeouts to give server breathing room
+            base_delay = min(
+                Constants.CIRCUIT_BREAKER_MAX_WAIT / 5,
+                backoff * (2 ** attempt)  # ✅ More aggressive backoff: 2^attempt instead of 2^(attempt-1)
             )
             
             if attempt < retries:
@@ -1435,6 +1439,8 @@ class APICircuitBreaker:
         return True, None
 
 class DataFetcher:
+    """Drop-in replacement for DataFetcher with corrected stats tracking"""
+    
     def __init__(self, api_base: str, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
@@ -1449,17 +1455,13 @@ class DataFetcher:
             recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
         )
         
-        # ✅ FIXED: Complete stats dict with ALL required keys
+        # ✅ CLEAN NESTED DICT - Single source of truth
         self.fetch_stats = {
             "products": {"success": 0, "failed": 0},
             "candles": {"success": 0, "failed": 0},
-            "products_success": 0,
-            "products_failed": 0,
-            "candles_success": 0,
-            "candles_failed": 0, 
             "circuit_breaker_blocks": 0,
+            "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
-            "rate_limit_hits": 0,
         }
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -1476,7 +1478,7 @@ class DataFetcher:
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked products fetch: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
-            self.fetch_stats["products_failed"] += 1
+            self.fetch_stats["products"]["failed"] += 1
             return None
         
         async with self.semaphore:
@@ -1488,16 +1490,14 @@ class DataFetcher:
                 timeout=self.timeout
             )
             
-            # ✅ Safe stats updates
+            # ✅ Clean stats updates
             if result:
                 self.fetch_stats["products"]["success"] += 1
-                self.fetch_stats["products_success"] += 1
                 self.circuit_breaker.record_success()
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Products fetch successful | Count: {len(result.get('result', []))}")
             else:
                 self.fetch_stats["products"]["failed"] += 1
-                self.fetch_stats["products_failed"] += 1
                 self.circuit_breaker.record_failure()
                 logger.warning(f"Products fetch failed | URL: {url}")
             
@@ -1515,7 +1515,7 @@ class DataFetcher:
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
-            self.fetch_stats["candles_failed"] += 1
+            self.fetch_stats["candles"]["failed"] += 1
             return None
         
         if reference_time is None:
@@ -1547,13 +1547,12 @@ class DataFetcher:
                 timeout=self.timeout
             )
             
-            # ✅ Safe stats updates
+            # ✅ Clean stats updates
             if data:
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                     self.circuit_breaker.record_success()
                     self.fetch_stats["candles"]["success"] += 1
-                    self.fetch_stats["candles_success"] += 1
                     
                     num_candles = len(result.get("t", []))
                     if num_candles > 0:
@@ -1574,34 +1573,44 @@ class DataFetcher:
                         else:
                             if logger.isEnabledFor(logging.DEBUG):
                                 logger.debug(
-                                    f"��� Scanned {symbol} {resolution} | "
+                                    f"✅ Scanned {symbol} {resolution} | "
                                     f"Latest: {format_ist_time(last_candle_open_ts)} | "
                                     f"Candles: {num_candles}"
                                 )
                     return data
                 else:
                     logger.warning(f"Candles response missing fields | Symbol: {symbol}")
+                    self.fetch_stats["candles"]["failed"] += 1
+                    self.circuit_breaker.record_failure()
             else:
                 logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+                self.fetch_stats["candles"]["failed"] += 1
+                self.circuit_breaker.record_failure()
             
-            # Failure case
-            self.fetch_stats["candles"]["failed"] += 1
-            self.fetch_stats["candles_failed"] += 1
-            self.circuit_breaker.record_failure()
             return None
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get comprehensive fetch statistics"""
-        stats = self.fetch_stats.copy()
-        stats["rate_limiter"] = self.rate_limiter.get_stats()
+        """Get comprehensive fetch statistics with clean nested structure"""
+        stats = {
+            "products": self.fetch_stats["products"].copy(),
+            "candles": self.fetch_stats["candles"].copy(),
+            "circuit_breaker_blocks": self.fetch_stats["circuit_breaker_blocks"],
+            "rate_limiter": self.rate_limiter.get_stats(),
+        }
         
-        total_products = stats["products_success"] + stats["products_failed"]
-        total_candles = stats["candles_success"] + stats["candles_failed"]
+        # Calculate success rates
+        total_products = stats["products"]["success"] + stats["products"]["failed"]
+        total_candles = stats["candles"]["success"] + stats["candles"]["failed"]
         
         if total_products > 0:
-            stats["products_success_rate"] = round(stats["products_success"] / total_products * 100, 1)
+            stats["products"]["success_rate"] = round(
+                stats["products"]["success"] / total_products * 100, 1
+            )
+        
         if total_candles > 0:
-            stats["candles_success_rate"] = round(stats["candles_success"] / total_candles * 100, 1)
+            stats["candles"]["success_rate"] = round(
+                stats["candles"]["success"] / total_candles * 100, 1
+            )
         
         return stats
 
@@ -2474,14 +2483,16 @@ class RedisStateStore:
 
             # 3. Deduplication checks
             dedup_key_mapping: Dict[str, str] = {}
+
+            dedup_keys_ordered: List[Tuple[str, str]] = []  # (recent_key, composite_key)
+    
             for pair_name, alert_key, ts in dedup_checks:
                 window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                 recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                 composite_key = f"{pair_name}:{alert_key}"
-                dedup_key_mapping[recent_key] = composite_key
+                dedup_keys_ordered.append((recent_key, composite_key))  # ✅ Append in order
                 pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-
-            # Execute pipeline
+    
             results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
         # Parse results with comprehensive error handling
@@ -2507,12 +2518,11 @@ class RedisStateStore:
 
         dedup_results: Dict[str, bool] = {}
         dedup_start_idx = 1 + num_updates
-        dedup_keys = list(dedup_key_mapping.items())  # freeze insertion order explicitly
-        for idx, (recent_key, composite_key) in enumerate(dedup_keys):
+        for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):  # ✅ Use ordered list
             result_idx = dedup_start_idx + idx
             should_send = bool(results[result_idx]) if result_idx < len(results) else True
             dedup_results[composite_key] = should_send
-
+    
         return prev_states, dedup_results
 
     async def atomic_batch_update(
