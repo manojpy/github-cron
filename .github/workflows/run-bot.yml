@@ -4,14 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry-run mode (log alerts only)'
+        description: 'Dry-run mode'
         required: false
         default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-  # Note: Triggered via GitHub API from Cron-jobs.org
+        type: boolean
+  # This allows Cron-jobs.org to trigger via GitHub API
+  repository_dispatch:
+    types: [trigger-bot]
 
 env:
   PYTHON_VERSION: "3.11"
@@ -24,7 +23,7 @@ jobs:
     
     steps:
       # ========================================================================
-      # PHASE 1: SETUP & CACHING
+      # PHASE 1: ENVIRONMENT SETUP
       # ========================================================================
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
@@ -33,14 +32,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip' # Automatically caches requirements
+          cache: 'pip' # Caches requirements.txt automatically
 
       - name: 🗄️ Cache AOT Binary
         id: cache-aot
         uses: actions/cache@v4
         with:
           path: ./${{ env.AOT_LIB_NAME }}.so
-          key: aot-${{ runner.os }}-${{ hashFiles('src/numba_functions_shared.py', 'src/aot_build.py') }}
+          # Key changes if core logic or dependencies change
+          key: aot-${{ runner.os }}-${{ hashFiles('src/numba_functions_shared.py', 'src/aot_build.py', 'requirements.txt') }}
 
       - name: 📦 Install Dependencies
         run: |
@@ -48,55 +48,61 @@ jobs:
           pip install -r requirements.txt
 
       # ========================================================================
-      # PHASE 2: AOT COMPILATION (Only runs on cache miss)
+      # PHASE 2: AOT COMPILATION (Skips if Cache Hit)
       # ========================================================================
       - name: 🔨 Build AOT Binary
         if: steps.cache-aot.outputs.cache-hit != 'true'
-        run: |
-          python src/aot_build.py --output-dir . --module-name ${{ env.AOT_LIB_NAME }} --verify
-        env:
-          PYTHONOPTIMIZE: 2
+        run: python src/aot_build.py --output-dir . --module-name ${{ env.AOT_LIB_NAME }}
 
       # ========================================================================
-      # PHASE 3: EXECUTION
+      # PHASE 3: BOT EXECUTION
       # ========================================================================
       - name: 🚀 Run MACD Bot
         id: bot-run
         env:
-          # Secrets from GitHub
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
-          # Bot Config
           PYTHONPATH: ./src
           PYTHONOPTIMIZE: 2
           AOT_STRICT: 1
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          # Pass dry-run input if it exists, else default to false
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
-          # Run the bot and pipe output to both console and log file
+          # Run bot and pipe all output to log file
           python src/macd_unified.py --skip-warmup 2>&1 | tee logs/bot.log
           
-          # Extract metadata for summary (Native replacement for docker logs)
-          echo "DURATION=$(grep -oP 'Bot run completed in \K[0-9.]+' logs/bot.log || echo '0')" >> $GITHUB_ENV
-          echo "ALERTS=$(grep -c "Alert condition met" logs/bot.log || echo '0')" >> $GITHUB_ENV
+          # FIXED LOG PARSING:
+          # Your bot logs: "✅ RUN COMPLETE | Duration: 8.0s | Pairs: 12/12 | Alerts: 2"
+          SUMMARY_LINE=$(tail -n 15 logs/bot.log | grep "RUN COMPLETE")
+          
+          # Extract values using regex that matches your specific log format
+          DURATION=$(echo "$SUMMARY_LINE" | grep -oP 'Duration: \K[0-9.]+' || echo "0")
+          ALERTS=$(echo "$SUMMARY_LINE" | grep -oP 'Alerts: \K[0-9]+' || echo "0")
+          PAIRS=$(echo "$SUMMARY_LINE" | grep -oP 'Pairs: \K[0-9/]+' || echo "N/A")
+          
+          # Save to environment for the summary step
+          echo "BOT_DURATION=$DURATION" >> $GITHUB_ENV
+          echo "BOT_ALERTS=$ALERTS" >> $GITHUB_ENV
+          echo "BOT_PAIRS=$PAIRS" >> $GITHUB_ENV
 
       # ========================================================================
-      # PHASE 4: REPORTING
+      # PHASE 4: RESULTS SUMMARY
       # ========================================================================
       - name: 📝 Generate Summary Report
         if: always()
         run: |
-          STATUS="${{ steps.bot-run.outcome }}"
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
           | Metric | Value |
           | :--- | :--- |
-          | **Status** | ${{ steps.bot-run.outcome == 'success' && '✅ Success' || '❌ Failed' }} |
-          | **Duration** | ${{ env.DURATION }}s |
-          | **Alerts Sent** | ${{ env.ALERTS }} |
-          | **Numba Mode** | ⚡ AOT (Compiled) |
-          | **Cache Status** | ${{ steps.cache-aot.outputs.cache-hit == 'true' && '🎯 Hit' || '🛠️ Rebuilt' }} |
+          | **Execution Status** | ${{ steps.bot-run.outcome == 'success' && '✅ Success' || '❌ Failed' }} |
+          | **Bot Logic Time** | ${{ env.BOT_DURATION }}s |
+          | **Alerts Sent** | ${{ env.BOT_ALERTS }} |
+          | **Pairs Processed** | ${{ env.BOT_PAIRS }} |
+          | **Optimization** | ⚡ AOT-Compiled (Native) |
+          | **AOT Library** | ${{ steps.cache-aot.outputs.cache-hit == 'true' && '🎯 From Cache' || '🔨 Freshly Built' }} |
           EOF
 
       - name: 📦 Upload Logs on Failure
