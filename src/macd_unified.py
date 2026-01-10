@@ -3924,6 +3924,7 @@ async def process_pairs_with_workers(
 
 async def run_once() -> bool:
     async with gc_control():
+        all_results: List[Tuple[str, Dict[str, Any]]] = [] 
         correlation_id = uuid.uuid4().hex[:8]
         TRACE_ID.set(correlation_id)
         logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
@@ -3973,9 +3974,6 @@ async def run_once() -> bool:
         ) 
 
     try:
-
-        all_results: List[Tuple[str, Dict[str, Any]]] = []
-
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
