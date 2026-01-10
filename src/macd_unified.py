@@ -1961,64 +1961,64 @@ class RedisStateStore:
             )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
-    """Attempt to establish Redis connection with health checks."""
-    try:
-        self._redis = redis.from_url(
-            self.redis_url,
-            socket_connect_timeout=timeout,
-            socket_timeout=timeout,
-            retry_on_timeout=True,
-            max_connections=32,
-            decode_responses=True,
-        )
-
-        ok = await self._ping_with_retry(timeout)
-        if not ok:
-            raise RedisConnectionError("ping failed after retries")
-
-        logger.info("Redis connected")
-        self.degraded = False
-        self.degraded_alerted = False
-        self._connection_attempts = 0
-
-        # MOVED INSIDE LOCK to prevent race condition
-        async with RedisStateStore._pool_lock:
-            # Check if another coroutine already saved a pool
-            existing_pool = RedisStateStore._global_pools.get(self.redis_url)
-            if existing_pool and not existing_pool.closed:
-                # Another coroutine won the race, use theirs
-                await self._redis.aclose()
-                self._redis = existing_pool
-                logger.debug("Using pool created by another coroutine")
-            else:
-                # We won, save our pool
-                RedisStateStore._global_pools[self.redis_url] = self._redis
-                RedisStateStore._pool_healthy[self.redis_url] = True
-                RedisStateStore._pool_created_at[self.redis_url] = time.time()
-                RedisStateStore._pool_reuse_count[self.redis_url] = 0
-                if cfg.DEBUG_MODE:
-                    logger.debug("Redis connection saved to per-URL pool")
-
-        # Load Lua deduplication script
+        """Attempt to establish Redis connection with health checks."""
         try:
-            self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-            if cfg.DEBUG_MODE:
-                logger.debug("Loaded Redis Lua script for alert deduplication")
-        except Exception as e:
-            logger.warning(f"Failed to load Lua script (will fallback): {e}")
-            self._dedup_script_sha = None
+            self._redis = redis.from_url(
+                self.redis_url,
+                socket_connect_timeout=timeout,
+                socket_timeout=timeout,
+                retry_on_timeout=True,
+                max_connections=32,
+                decode_responses=True,
+            )
 
-        return True
+            ok = await self._ping_with_retry(timeout)
+            if not ok:
+                raise RedisConnectionError("ping failed after retries")
 
-    except Exception as exc:
-        logger.error(f"Redis connection attempt failed: {exc}")
-        if self._redis:
+            logger.info("Redis connected")
+            self.degraded = False
+            self.degraded_alerted = False
+            self._connection_attempts = 0
+
+            # MOVED INSIDE LOCK to prevent race condition
+            async with RedisStateStore._pool_lock:
+                # Check if another coroutine already saved a pool
+                existing_pool = RedisStateStore._global_pools.get(self.redis_url)
+                if existing_pool and not existing_pool.closed:
+                    # Another coroutine won the race, use theirs
+                    await self._redis.aclose()
+                    self._redis = existing_pool
+                    logger.debug("Using pool created by another coroutine")
+                else:
+                    # We won, save our pool
+                    RedisStateStore._global_pools[self.redis_url] = self._redis
+                    RedisStateStore._pool_healthy[self.redis_url] = True
+                    RedisStateStore._pool_created_at[self.redis_url] = time.time()
+                    RedisStateStore._pool_reuse_count[self.redis_url] = 0
+                    if cfg.DEBUG_MODE:
+                        logger.debug("Redis connection saved to per-URL pool")
+
+            # Load Lua deduplication script
             try:
-                await self._redis.aclose()
-            except Exception:
-                pass
-            self._redis = None
-        return False
+                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                if cfg.DEBUG_MODE:
+                    logger.debug("Loaded Redis Lua script for alert deduplication")
+            except Exception as e:
+                logger.warning(f"Failed to load Lua script (will fallback): {e}")
+                self._dedup_script_sha = None
+
+            return True
+
+        except Exception as exc:
+            logger.error(f"Redis connection attempt failed: {exc}")
+            if self._redis:
+                try:
+                    await self._redis.aclose()
+                except Exception:
+                    pass
+                self._redis = None
+            return False
 
     async def connect(self, timeout: float = 5.0) -> None:
         """Connect to Redis with pooling and health checks"""
