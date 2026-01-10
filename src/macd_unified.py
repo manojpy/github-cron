@@ -1879,6 +1879,7 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     return products_map
 
 class RedisStateStore:
+    """Complete corrected RedisStateStore with fixed dedup key ordering and better logic"""
     
     # Lua script for atomic deduplication
     DEDUP_LUA: ClassVar[str] = """
@@ -1980,6 +1981,7 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
+        """Connect to Redis with pooling and health checks"""
         
         pool_reused = False
 
@@ -2015,23 +2017,17 @@ class RedisStateStore:
 
                         self.degraded = False
 
-                        # Quick smoke test while holding lock (prevents race condition)
-                        test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
-                        try:
-                            await asyncio.wait_for(self._redis.set(test_key, "ok", ex=10), timeout=1.0)
-                            await asyncio.wait_for(self._redis.delete(test_key), timeout=1.0)
-                            pool_reused = True
-                            return  # Success - exit while holding lock
-                        except Exception as smoke_error:
-                            logger.warning(f"Pool smoke test failed: {smoke_error}")
-                            RedisStateStore._pool_healthy[self.redis_url] = False
-                            pool_reused = False
+                        pool_reused = True
+                        # Early return while holding lock is safe (fast path)
+                        return  # Success - exit while holding lock
 
                     except Exception as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
                         RedisStateStore._pool_healthy[self.redis_url] = False
                         pool_reused = False
+
+        # If we reach here without pool_reused=True, need to create new connection
         if pool_reused:
             return
 
@@ -2042,40 +2038,60 @@ class RedisStateStore:
                 logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
 
             if await self._attempt_connect(timeout):
-                # Perform smoke test
+                # Perform smoke test OUTSIDE the lock with shorter timeout
                 test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
                 test_val = "ok"
 
-                set_ok = await self._safe_redis_op(
-                    lambda: self._redis.set(test_key, test_val, ex=10),
-                    2.0, "smoke_set"
-                )
-                get_ok = await self._safe_redis_op(
-                    lambda: self._redis.get(test_key),
-                    2.0, "smoke_get",
-                    parser=lambda r: r == test_val
-                )
-
-                if set_ok and get_ok:
-                    await self._safe_redis_op(lambda: self._redis.delete(test_key), 1.0, "smoke_cleanup")
-
-                    expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
-                    logger.info(
-                        f"✅ Redis connected "
-                        f"({self._redis.connection_pool.max_connections} connections, "
-                        f"{expiry_mode} expiry)"
+                try:
+                    set_ok = await asyncio.wait_for(
+                        self._redis.set(test_key, test_val, ex=10),
+                        timeout=0.5
                     )
+                    if set_ok:
+                        get_result = await asyncio.wait_for(
+                            self._redis.get(test_key),
+                            timeout=0.5
+                        )
+                        get_ok = get_result == test_val
+                        
+                        if get_ok:
+                            try:
+                                await asyncio.wait_for(
+                                    self._redis.delete(test_key),
+                                    timeout=0.5
+                                )
+                            except Exception:
+                                pass  # Cleanup failure is non-critical
 
-                    info = await self._safe_redis_op(lambda: self._redis.info("memory"), 3.0, "info_memory")
-                    if info and cfg.DEBUG_MODE:
-                        policy = info.get("maxmemory_policy", "unknown")
-                        logger.debug(f"Redis memory policy: {policy}")
+                            expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
+                            logger.info(
+                                f"✅ Redis connected "
+                                f"({self._redis.connection_pool.max_connections} connections, "
+                                f"{expiry_mode} expiry)"
+                            )
 
-                    self.degraded = False
-                    self.degraded_alerted = False
-                    return
-                else:
-                    logger.warning("Redis smoke test failed, marking degraded")
+                            try:
+                                info = await asyncio.wait_for(
+                                    self._redis.info("memory"),
+                                    timeout=3.0
+                                )
+                                if info and cfg.DEBUG_MODE:
+                                    policy = info.get("maxmemory_policy", "unknown")
+                                    logger.debug(f"Redis memory policy: {policy}")
+                            except Exception:
+                                pass  # Info retrieval is non-critical
+
+                            self.degraded = False
+                            self.degraded_alerted = False
+                            return
+                        else:
+                            logger.warning("Redis get() failed, marking degraded")
+                    else:
+                        logger.warning("Redis set() failed, marking degraded")
+                except asyncio.TimeoutError:
+                    logger.warning("Redis smoke test timeout")
+                except Exception as e:
+                    logger.warning(f"Redis smoke test failed: {e}")
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
                 delay = cfg.REDIS_RETRY_DELAY * attempt
@@ -2104,6 +2120,7 @@ class RedisStateStore:
 
     @classmethod
     async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
+        """Shutdown global Redis connection pool"""
         
         async with cls._pool_lock:
             urls = [redis_url] if redis_url else list(cls._global_pools.keys())
@@ -2150,6 +2167,7 @@ class RedisStateStore:
         op_name: str,
         parser: Optional[Callable[[Any], Any]] = None,
     ):
+        """Safe Redis operation with timeout and error handling"""
         
         if not self._redis:
             return None
@@ -2220,6 +2238,7 @@ class RedisStateStore:
         )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
+        """Check if alert was recently sent (deduplication)"""
         if self.degraded:
             return True
 
@@ -2243,14 +2262,12 @@ class RedisStateStore:
                     logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
                 return should_send
 
-            # In check_recent_alert() method, REPLACE:
             except redis.exceptions.NoScriptError:
                 acquired = False
                 try:
-                    # ← INCREASE timeout to prevent deadlock
                     await asyncio.wait_for(
                         RedisStateStore._script_reload_lock.acquire(),
-                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT + 2.0  # ← Add buffer
+                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
                     )
                     acquired = True
 
@@ -2314,6 +2331,7 @@ class RedisStateStore:
     async def batch_check_recent_alerts(
         self, checks: List[Tuple[str, str, int]]
     ) -> Dict[str, bool]:
+        """Check multiple recent alerts in batch"""
         
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
@@ -2354,6 +2372,7 @@ class RedisStateStore:
         keys: List[str],
         timeout: float = 2.0
     ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Get multiple states in batch"""
         
         if not self._redis or not keys:
             return {}
@@ -2390,6 +2409,7 @@ class RedisStateStore:
         updates: List[Tuple[str, Any, Optional[int]]],
         timeout: float = 4.0,
     ) -> None:
+        """Set multiple states in batch"""
         
         if self.degraded or not updates or not self._redis:
             return
@@ -2421,6 +2441,7 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """Atomic batch evaluation with state updates and dedup checks"""
         
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
@@ -2442,14 +2463,14 @@ class RedisStateStore:
             # Fallback with timeout protection
             try:
                 # FIX: Correct key format - mget_states adds prefix internally
+                composite_keys = [f"{pair}:{k}" for k in alert_keys]
+                prev_raw = await asyncio.wait_for(self.mget_states(composite_keys), timeout=2.0)
 
-                state_keys = [f"{pair}:{ALERT_KEYS[k]}" for k in alert_keys]
-                prev_raw = await asyncio.wait_for(self.mget_states(state_keys), timeout=2.0)
-
+                # Normalize to {alert_key: is_active}
                 prev_states: Dict[str, bool] = {}
-                for idx, k in enumerate(alert_keys):
-                    state_key = state_keys[idx]
-                    env = prev_raw.get(state_key)
+                for k in alert_keys:
+                    ck = f"{pair}:{k}"
+                    env = prev_raw.get(ck)
                     prev_states[k] = bool(env and env.get("state") == "ACTIVE")
 
                 await asyncio.wait_for(self.batch_set_states(state_updates), timeout=2.0)
@@ -2470,7 +2491,8 @@ class RedisStateStore:
         state_updates: List[Tuple[str, Any, Optional[int]]],
         dedup_checks: List[Tuple[str, str, int]]
     ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-   
+        """Internal pipeline operations - ✅ FIXED: Uses ordered list for dedup keys"""
+    
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
@@ -2491,18 +2513,17 @@ class RedisStateStore:
                 else:
                     pipe.set(full_key, data)
 
-            # 3. Deduplication checks
-            dedup_key_mapping: Dict[str, str] = {}
-
+            # 3. Deduplication checks - ✅ FIX: Use ORDERED list to match pipe order
             dedup_keys_ordered: List[Tuple[str, str]] = []  # (recent_key, composite_key)
-    
+            
             for pair_name, alert_key, ts in dedup_checks:
                 window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                 recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
                 composite_key = f"{pair_name}:{alert_key}"
-                dedup_keys_ordered.append((recent_key, composite_key))  # ✅ Append in order
+                dedup_keys_ordered.append((recent_key, composite_key))
                 pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-    
+
+            # Execute pipeline
             results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
         # Parse results with comprehensive error handling
@@ -2526,13 +2547,14 @@ class RedisStateStore:
             else:
                 prev_states[key] = False
 
+        # ✅ FIX: Use ordered list instead of dict items
         dedup_results: Dict[str, bool] = {}
         dedup_start_idx = 1 + num_updates
-        for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):  # ✅ Use ordered list
+        for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
             result_idx = dedup_start_idx + idx
             should_send = bool(results[result_idx]) if result_idx < len(results) else True
             dedup_results[composite_key] = should_send
-    
+
         return prev_states, dedup_results
 
     async def atomic_batch_update(
@@ -2541,6 +2563,7 @@ class RedisStateStore:
         deletes: Optional[List[str]] = None,
         timeout: float = 4.0,
     ) -> bool:
+        """Atomic batch update with optional deletes"""
         
         if self.degraded or not self._redis:
             return False
@@ -3039,6 +3062,10 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """
+    Evaluate all indicators for a pair and send alerts if conditions met.
+    ✅ CORRECTED: Proper wick ratio handling, error logging, and validation
+    """
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
@@ -3123,9 +3150,8 @@ async def evaluate_pair_and_alert(
         rma200_5_val = rma200_5[i5]
 
         # ============================================================================
-        # ✅ FIX 1: Calculate ACTUAL wick ratios from current candle
+        # ✅ FIX 1: Calculate ACTUAL wick ratios from current candle (NOT from precompute)
         # ============================================================================
-        # Extract current candle OHLC
         i15_open = float(open_15m[i15])
         i15_high = float(data_15m["high"][i15])
         i15_low = float(data_15m["low"][i15])
@@ -3164,6 +3190,7 @@ async def evaluate_pair_and_alert(
             ))
             return None
 
+        # Daily reset logic for pivot/VWAP alerts
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
             current_utc_hour = current_utc_dt.hour
@@ -3208,6 +3235,8 @@ async def evaluate_pair_and_alert(
         ppo_sig_prev = ppo_signal[i15 - 1]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1]
+        
+        # ✅ FIX 2: Better VWAP handling with None checks
         vwap_curr = None
         vwap_prev = None
         vwap_unavailable = False
@@ -3215,27 +3244,18 @@ async def evaluate_pair_and_alert(
 
         if not cfg.ENABLE_VWAP:
             vwap_disabled = True
-            # VWAP intentionally disabled, no alerts expected
-
-        elif vwap is None:
+        elif vwap is None or len(vwap) == 0:
             vwap_unavailable = True
-            logger_pair.warning("VWAP enabled but vwap array is None")
-
+            logger_pair.warning("VWAP enabled but vwap array is None or empty")
         elif len(vwap) <= i15:
             vwap_unavailable = True
             logger_pair.warning(
                 f"VWAP enabled but insufficient data "
-                f"(len(vwap)={len(vwap)} ≤ i15={i15}) — VWAP alerts skipped"
+                f"(len(vwap)={len(vwap)} ≤ i15={i15}) – VWAP alerts skipped"
             )
-
         else:
             vwap_curr = vwap[i15]
             vwap_prev = vwap[i15 - 1]
-
-        ctx["vwap_curr"] = vwap_curr
-        ctx["vwap_prev"] = vwap_prev
-        ctx["vwap_unavailable"] = vwap_unavailable
-        ctx["vwap_disabled"] = vwap_disabled
 
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1]
@@ -3253,44 +3273,12 @@ async def evaluate_pair_and_alert(
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-
-       
-        # ✅ SINGLE PASS: Compute quality once
+   
+        # ✅ FIX 3: Use corrected precompute (only returns 2 values, not 4)
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-
-        # ✅ Extract actual wick ratios from current candle ONLY (what matters for alerts)
-        i15_open = float(open_15m[i15])
-        i15_high = float(data_15m["high"][i15])
-        i15_low = float(data_15m["low"][i15])
-        i15_close = close_curr
-
-        candle_range = i15_high - i15_low
-        if candle_range < 1e-8:
-            actual_buy_wick_ratio = 1.0
-            actual_sell_wick_ratio = 1.0
-        else:
-            # Buy (green candle) - check upper wick
-            body_top = max(i15_open, i15_close)
-            upper_wick = i15_high - body_top
-            actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
-
-            # Sell (red candle) - check lower wick
-            body_bottom = min(i15_open, i15_close)
-            lower_wick = body_bottom - i15_low
-            actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
-
-        # ✅ Debug logging
-        if cfg.DEBUG_MODE:
-            logger_pair.debug(
-                f"Wick validation | {pair_name} | "
-                f"Buy: {actual_buy_wick_ratio*100:.1f}% | "
-                f"Sell: {actual_sell_wick_ratio*100:.1f}% | "
-                f"Range: {candle_range:.5f} | "
-                f"Candle: O={i15_open:.2f} H={i15_high:.2f} L={i15_low:.2f} C={i15_close:.2f}"
-            )
-
+        
         buy_candle_reason = None
         sell_candle_reason = None
         
@@ -3330,7 +3318,9 @@ async def evaluate_pair_and_alert(
                 mmh_curr < mmh_m1
             )
  
-        # Build context for alert evaluation
+        # ============================================================================
+        # ✅ FIX 4: Build context with ACTUAL wick ratios (not defaults!)
+        # ============================================================================
         context = {
             "buy_common": buy_common,
             "sell_common": sell_common,
@@ -3371,8 +3361,7 @@ async def evaluate_pair_and_alert(
             "pivots": piv,
             "vwap": cfg.ENABLE_VWAP,
 
-
-            # ✅ Use ACTUAL calculated ratios (not precomputed)
+            # ✅ Use ACTUAL calculated ratios (not defaults of 1.0!)
             "buy_wick_ratio": actual_buy_wick_ratio,
             "sell_wick_ratio": actual_sell_wick_ratio,
 
@@ -3434,7 +3423,7 @@ async def evaluate_pair_and_alert(
                 alert_key in ["vwap_down", "mmh_sell", "ppo_zero_down", "ppo_011_down", "rsi_50_down"]
             )
     
-            # Block BUY signals if upper wick too large
+            # ✅ FIX 5: Block BUY/SELL signals based on ACTUAL wick ratios
             if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(
@@ -3442,7 +3431,6 @@ async def evaluate_pair_and_alert(
                     )
                 continue
     
-            # Block SELL signals if lower wick too large
             if is_sell_signal and actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(
@@ -3450,7 +3438,7 @@ async def evaluate_pair_and_alert(
                     )
                 continue 
     
-          # Special handling for pivot alerts
+            # Special handling for pivot alerts
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                 level = alert_key.split("_")[-1]
                 is_buy = alert_key.startswith("pivot_up_")
@@ -3463,25 +3451,23 @@ async def evaluate_pair_and_alert(
                 trigger = (
                     (is_buy and buy_common) or (not is_buy and sell_common)
                 ) and valid_cross
-                pass
             else:
                 # Standard alert evaluation
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
-                    # ✅ IMPROVED: Show full details of what failed
+                    # ✅ FIX 6: Improved error logging with full context
                     logger_pair.error(
                         f"Alert check failed for {alert_key}: {e} | "
                         f"Type: {type(e).__name__} | "
                         f"Available context keys: {sorted(context.keys())}",
-                        exc_info=True  # ✅ CHANGED: Show full traceback
+                        exc_info=True
                     )
                     trigger = False
 
-
-    # ============================================================================
-    # ✅ FIX 3: SECONDARY VALIDATION - Verify common conditions
-    # ============================================================================
+            # ============================================================================
+            # ✅ FIX 7: SECONDARY VALIDATION - Verify common conditions
+            # ============================================================================
             if trigger:
                 # Verify buy_common for BUY signals
                 if is_buy_signal and not buy_common:
@@ -3510,7 +3496,7 @@ async def evaluate_pair_and_alert(
                     raw_alerts.append((def_["title"], extra, def_["key"]))
                     all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))          
 
-                    # ✅ FIX 4: Debug logging for successful alerts
+                    # ✅ FIX 8: Debug logging for successful alerts
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(
                             f"✅ Alert FIRED: {alert_key} | "
@@ -3520,11 +3506,11 @@ async def evaluate_pair_and_alert(
                         ) 
 
                 except Exception as e:
-                    # ✅ IMPROVED: Show which extra_fn failed
+                    # ✅ FIX 9: Improved extra_fn error logging
                     logger_pair.error(
                         f"Alert extra_fn failed for {alert_key}: {e} | "
                         f"Type: {type(e).__name__}",
-                        exc_info=True  # ✅ Show full traceback
+                        exc_info=True
                     )
         
         # Handle alert state resets (opposite crossovers)
@@ -3537,13 +3523,12 @@ async def evaluate_pair_and_alert(
    
         if ppo_prev > 0 and ppo_curr <= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-        elif not buy_common:  # ✅ NEW: Reset when trend invalidates
+        elif not buy_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_zero_up']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_zero_up: buy_common=False")
     
-        # Reset PPO zero down
         if ppo_prev < 0 and ppo_curr >= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
         elif not sell_common:
@@ -3552,7 +3537,6 @@ async def evaluate_pair_and_alert(
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_zero_down: sell_common=False")
     
- 
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
         elif not buy_common:
@@ -3569,11 +3553,9 @@ async def evaluate_pair_and_alert(
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_011_down: sell_common=False")
     
- 
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
-            # Reset if buy conditions fail OR PPO exceeds guard
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['rsi_50_up']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
                 if cfg.DEBUG_MODE:
@@ -3593,8 +3575,8 @@ async def evaluate_pair_and_alert(
                         f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_SELL}"
                     )
     
-    
-        if cfg.ENABLE_VWAP:
+        # ✅ FIX 10: VWAP reset with None checks (prevents undefined variable errors)
+        if cfg.ENABLE_VWAP and vwap_curr is not None and vwap_prev is not None:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
             elif not buy_common:
@@ -3602,7 +3584,6 @@ async def evaluate_pair_and_alert(
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Reset vwap_up: buy_common=False")
-    
     
             if close_prev < vwap_prev and close_curr >= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
@@ -3612,6 +3593,7 @@ async def evaluate_pair_and_alert(
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Reset vwap_down: sell_common=False")
     
+        # Pivot level resets
         if piv:
             for level_name, level_value in piv.items():
                 # Reset buy-side pivot alerts only if the key exists
@@ -3626,6 +3608,7 @@ async def evaluate_pair_and_alert(
                     if close_prev < level_value and close_curr >= level_value:
                         resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
 
+        # MMH reversal resets
         if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
@@ -3634,7 +3617,6 @@ async def evaluate_pair_and_alert(
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
     
         # Apply all state changes in batch
-
         all_state_changes = all_state_changes + resets_to_apply
         if all_state_changes:
             await sdb.batch_set_states(all_state_changes)
@@ -3697,6 +3679,7 @@ async def evaluate_pair_and_alert(
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
 
+        # Build suppression/failure reasons
         reasons = []
 
         # Common trend/candle gates
@@ -3712,7 +3695,7 @@ async def evaluate_pair_and_alert(
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
 
-        # ✅ Cross detection logging
+        # Cross detection logging
         if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
             if not base_buy_trend:
                 reasons.append("PPO>0 blocked: base_buy_trend=False")
@@ -3750,7 +3733,7 @@ async def evaluate_pair_and_alert(
                 reasons.append("RSI<50 blocked: sell_common=False")
 
         # VWAP crosses
-        if cfg.ENABLE_VWAP:
+        if cfg.ENABLE_VWAP and vwap_curr is not None and vwap_prev is not None:
             if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
                 reasons.append("VWAP up-cross blocked: buy_common=False")
             if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
@@ -3768,7 +3751,7 @@ async def evaluate_pair_and_alert(
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
             logger_pair.debug(
-                f"✓ {pair_name} | "
+                f"✅ {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
