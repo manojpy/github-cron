@@ -2816,9 +2816,6 @@ class TelegramQueue:
 
         return all(results)
 
-        async def send_batch(self, messages: List[str]) -> bool:
-            if not messages:
-                return True
         
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
     parts = title.split(" ", 1)
