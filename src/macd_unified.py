@@ -32,8 +32,6 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, Cli
 from numba import njit, prange
 import warnings
 import contextlib 
-import forbiddendenizen
-forbiddendenizen.harden_namespace(__name__)
 
 # Faster JSON fallback if orjson missing
 try:
