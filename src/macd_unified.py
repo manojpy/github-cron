@@ -627,7 +627,8 @@ def calculate_vwap_numpy(
         return vwap
 
     except Exception:
-        return np.zeros_like(close) if close is not None else np.array([0.0])
+        return np.full_like(close, np.nan) if close is not None else np.array([np.nan])
+
 
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
@@ -987,19 +988,17 @@ def calculate_all_indicators_numpy(
             'pivots': {}
         }
 
-def precompute_candle_quality(
-    data_15m: Dict[str, np.ndarray]
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def precompute_candle_quality(data_15m: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """Only compute what's needed - quality checks"""
     buy_quality = vectorized_wick_check_buy(
-        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], Constants.MIN_WICK_RATIO
+        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], 
+        Constants.MIN_WICK_RATIO
     )
     sell_quality = vectorized_wick_check_sell(
-        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], Constants.MIN_WICK_RATIO
+        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], 
+        Constants.MIN_WICK_RATIO
     )
-    buy_ratios, sell_ratios = vectorized_wick_ratios(
-        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"]
-    )
-    return buy_quality, sell_quality, buy_ratios, sell_ratios
+    return buy_quality, sell_quality
 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
@@ -1087,6 +1086,14 @@ class SessionManager:
     @classmethod
     def track_request(cls) -> None:
         cls._request_count += 1
+    
+        # ✅ Log when approaching recreation threshold (warning at 80%)
+        threshold_warning = cls._session_reuse_limit * 0.8
+        if cls._request_count == int(threshold_warning):
+            logger.debug(
+                f"Session approaching recreation threshold: "
+                f"{cls._request_count}/{cls._session_reuse_limit} requests"
+            )
 
     @classmethod
     async def close_session(cls) -> None:
@@ -3226,11 +3233,44 @@ async def evaluate_pair_and_alert(
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-   
-        buy_quality_arr, sell_quality_arr, buy_ratios_arr, sell_ratios_arr = precompute_candle_quality(data_15m)
+
+       
+        # ✅ SINGLE PASS: Compute quality once
+        buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-        
+
+        # ✅ Extract actual wick ratios from current candle ONLY (what matters for alerts)
+        i15_open = float(open_15m[i15])
+        i15_high = float(data_15m["high"][i15])
+        i15_low = float(data_15m["low"][i15])
+        i15_close = close_curr
+
+        candle_range = i15_high - i15_low
+        if candle_range < 1e-8:
+            actual_buy_wick_ratio = 1.0
+            actual_sell_wick_ratio = 1.0
+        else:
+            # Buy (green candle) - check upper wick
+            body_top = max(i15_open, i15_close)
+            upper_wick = i15_high - body_top
+            actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
+
+            # Sell (red candle) - check lower wick
+            body_bottom = min(i15_open, i15_close)
+            lower_wick = body_bottom - i15_low
+            actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
+
+        # ✅ Debug logging
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                f"Wick validation | {pair_name} | "
+                f"Buy: {actual_buy_wick_ratio*100:.1f}% | "
+                f"Sell: {actual_sell_wick_ratio*100:.1f}% | "
+                f"Range: {candle_range:.5f} | "
+                f"Candle: O={i15_open:.2f} H={i15_high:.2f} L={i15_low:.2f} C={i15_close:.2f}"
+            )
+
         buy_candle_reason = None
         sell_candle_reason = None
         
