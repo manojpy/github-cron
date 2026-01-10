@@ -33,13 +33,6 @@ from numba import njit, prange
 import warnings
 import contextlib 
 
-# Faster JSON fallback if orjson missing
-try:
-    import ujson as json_fallback
-except ModuleNotFoundError:
-    json_fallback = json
-
-
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
@@ -254,15 +247,6 @@ class BotConfig(BaseModel):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
 
-    @field_validator("MEMORY_LIMIT_BYTES")
-    def memory_cap(cls, v: int) -> int:
-        return min(v, 1_000_000_000)
-
-    @field_validator("MAX_PARALLEL_FETCH")
-    def clamp_workers(cls, v: int) -> int:
-        return min(v, (os.cpu_count() or 4) + 2)
-
-
     @model_validator(mode='after')
     def validate_logic(self) -> 'BotConfig':
         if self.PPO_FAST >= self.PPO_SLOW:
@@ -342,17 +326,22 @@ class TraceContextFilter(logging.Filter):
         return True
 
 class SafeFormatter(logging.Formatter):
-    _SECRETS = (
-        (re.compile(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b'), '[TELEGRAM_TOKEN]'),
-        (re.compile(r'chat_id=\d+\b'), '[CHAT_ID]'),
-        (re.compile(r'(redis://)[^@]+@'), r'\1[REDACTED]@'),
-    )
-
     def format(self, record: logging.LogRecord) -> str:
-        msg = super().format(record)
-        for pat, repl in self._SECRETS:
-            msg = pat.sub(repl, msg)
-        return msg
+        if hasattr(record, 'msg') and record.msg:
+            msg_str = str(record.msg)
+            msg_str = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", msg_str)
+            msg_str = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", msg_str)
+            msg_str = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", msg_str)
+            record.msg = msg_str
+        record.args = None
+        
+        formatted = super().format(record)
+        
+        formatted = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", formatted)
+        formatted = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", formatted)
+        formatted = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", formatted)
+        
+        return formatted
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("macd_bot")
@@ -718,12 +707,14 @@ def calculate_magical_momentum_hist(
         min_med, max_med = (rolling_min_max_numba_parallel(raw, period) if use_parallel and rows >= 250
                             else rolling_min_max_numba(raw, period))
 
-        denom = max_med[i] - min_med[i]
-        if np.abs(denom) < 1e-10 or np.isnan(denom):
-            temp[i] = 0.5
-        else:
-            temp[i] = (raw[i] - min_med[i]) / denom
-
+        denom = max_med - min_med
+        temp = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            if np.abs(denom[i]) < 1e-10 or np.isnan(raw[i]) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
+                temp[i] = 0.5
+            else:
+                temp[i] = (raw[i] - min_med[i]) / denom[i]
+       
         value_arr = calc_mmh_value_loop(temp, rows)
 
         momentum = np.empty(rows, dtype=np.float64)
@@ -851,10 +842,6 @@ def calculate_pivot_levels_numpy(
         H_prev = float(np.max(yesterday_high))
         L_prev = float(np.min(yesterday_low))
         C_prev = float(yesterday_close[-1])
-
-        if not (np.isfinite(H_prev) and np.isfinite(L_prev) and np.isfinite(C_prev)):
-            logger.warning("Pivot: NaN/Inf in H/L/C – skipping")
-            return piv
 
         rng_prev = H_prev - L_prev
         if rng_prev < 1e-8:
@@ -1113,14 +1100,24 @@ class SessionManager:
         async with cls._lock:
             if cls._session and not cls._session.closed:
                 try:
-                    # Give the pool 250 ms to drain gracefully
-                    await asyncio.wait_for(cls._session.close(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    # Force-close if slow
-                    await cls._session.connector.close()
-                cls._session = None
-                cls._request_count = 0
-                cls._creation_time = 0.0
+                    session_age = time.time() - cls._creation_time
+
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"Closing HTTP session | "
+                            f"Age: {session_age:.1f}s | Requests served: {cls._request_count}"
+                        )
+                    await cls._session.close()
+                    await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
+                    logger.info("HTTP session closed successfully")
+                except Exception as e:
+                    logger.warning(f"Error closing session: {e}")
+                finally:
+                    cls._session = None
+                    cls._request_count = 0
+                    cls._creation_time = 0.0
+            else:
+                logger.debug("Session already closed or not created")
 
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
@@ -1212,58 +1209,131 @@ async def async_fetch_json(
     backoff: float = 1.5,
     timeout: int = 15
 ) -> Optional[Dict[str, Any]]:
-    """
-    Fetch JSON with robust retry, rate-limit respect, and shutdown awareness.
-    Returns parsed dict or None on final failure.
-    """
+    
     session = await SessionManager.get_session()
-    last_error: Optional[Exception] = None
-
+    last_error = None
+    retry_stats = {
+        RetryCategory.NETWORK: 0,
+        RetryCategory.RATE_LIMIT: 0,
+        RetryCategory.API_ERROR: 0,
+        RetryCategory.TIMEOUT: 0,
+        RetryCategory.UNKNOWN: 0
+    }
+    
     for attempt in range(1, retries + 1):
         if shutdown_event.is_set():
-            logger.debug("Shutdown requested – aborting fetch: %s", url[:80])
+            logger.debug(f"Shutdown requested, aborting fetch: {url[:80]}")
             return None
-
+        
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
-                # 429 rate-limit handling
                 if resp.status == 429:
-                    retry_after = float(resp.headers.get("Retry-After", 1.5))
-                    sleep_sec = min(retry_after, Constants.CIRCUIT_BREAKER_MAX_WAIT)
-                    jitter    = random.uniform(0.1, 0.5)
-                    await asyncio.sleep(sleep_sec + jitter)
+                    retry_after = resp.headers.get('Retry-After')
+                    wait_sec = min(int(retry_after) if retry_after else 2, Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                    jitter = random.uniform(0.1, 0.5)
+                    total_wait = wait_sec + jitter
+                    
+                    retry_stats[RetryCategory.RATE_LIMIT] += 1
+                    logger.warning(
+                        f"Rate limited (429) | URL: {url[:80]} | "
+                        f"Retry-After: {retry_after}s | Waiting: {total_wait:.2f}s | "
+                        f"Attempt: {attempt}/{retries}"
+                    )
+                    
+                    await asyncio.sleep(total_wait)
                     continue
-
-                # 5xx server errors – retry with exponential cap
-                if 500 <= resp.status < 600:
-                    if attempt == retries:
-                        break
-                    delay = min(backoff * (2 ** (attempt - 1)), 30)
-                    await asyncio.sleep(delay + random.uniform(0.1, 0.5))
+                
+                if resp.status >= 500:
+                    retry_stats[RetryCategory.API_ERROR] += 1
+                    logger.warning(
+                        f"Server error {resp.status} | URL: {url[:80]} | "
+                        f"Attempt: {attempt}/{retries}"
+                    )
+                    
+                    if attempt < retries:
+                        base_delay = min(
+                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                            backoff * (2 ** (attempt - 1))
+                        )
+                        jitter = base_delay * random.uniform(0.1, 0.5)
+                        total_delay = base_delay + jitter
+                        
+                        await asyncio.sleep(total_delay)
                     continue
-
-                # 4xx client errors – do NOT retry
-                if 400 <= resp.status < 500:
-                    logger.warning("Client error %s – not retrying: %s", resp.status, url[:80])
+                
+                if resp.status >= 400:
+                    logger.error(
+                        f"Client error {resp.status} for {url[:80]} | "
+                        f"This usually indicates invalid request - not retrying"
+                    )
                     return None
-
-                # Success path
                 data = await resp.json(loads=json_loads)
+                
                 SessionManager.track_request()
+                
+                if any(retry_stats.values()):
+                    logger.info(
+                        f"Fetch succeeded after retries | URL: {url[:80]} | "
+                        f"Attempts: {attempt} | Stats: {retry_stats}"
+                    )
+                
                 return data
-
+                
         except asyncio.TimeoutError as e:
             last_error = e
-            await asyncio.sleep(min(backoff * (2 ** attempt), 15))
+            retry_stats[RetryCategory.TIMEOUT] += 1
+            logger.warning(
+                f"Timeout (attempt {attempt}/{retries}) | "
+                f"URL: {url[:80]} | Timeout configured: {timeout}s"
+            )
+            # ✅ Add slight extra backoff for timeouts to give server breathing room
+            base_delay = min(
+                Constants.CIRCUIT_BREAKER_MAX_WAIT / 5,
+                backoff * (2 ** attempt)  # ✅ More aggressive backoff: 2^attempt instead of 2^(attempt-1)
+            )
+            
+            if attempt < retries:
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                total_delay = base_delay + jitter
+                
+                logger.debug(f"Retrying after {total_delay:.2f}s...")
+                await asyncio.sleep(total_delay)
+        
         except (ClientConnectorError, ClientError, ClientResponseError) as e:
             last_error = e
-            await asyncio.sleep(min(backoff * (2 ** attempt), 15))
+            category = categorize_exception(e)
+            retry_stats[category] = retry_stats.get(category, 0) + 1
+            
+            logger.warning(
+                f"Network error (attempt {attempt}/{retries}) | "
+                f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
+            )
+            
+            if attempt < retries:
+                base_delay = min(
+                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
+                    backoff * (2 ** (attempt - 1))
+                )
+                jitter = base_delay * random.uniform(0.1, 0.5)
+                total_delay = base_delay + jitter
+                
+                logger.debug(f"Retrying after {total_delay:.2f}s...")
+                await asyncio.sleep(total_delay)
+        
         except Exception as e:
             last_error = e
-            logger.exception("Unexpected fetch error for %s: %s", url[:80], e)
+            retry_stats[RetryCategory.UNKNOWN] += 1
+            logger.exception(f"Unexpected fetch error for {url[:80]}: {e}")
             break
-
-    logger.error("Fetch failed after %d attempts: %s", retries, last_error)
+    
+    logger.error(
+        f"Failed to fetch after {retries} attempts | URL: {url[:80]} | "
+        f"Stats: {retry_stats} | Last error: {last_error}"
+    )
     return None
 
 class RateLimitedFetcher:
@@ -1393,13 +1463,13 @@ class DataFetcher:
             recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
         )
         # ✅ CLEAN NESTED DICT - Single source of truth
-
-        self.fetch_stats = defaultdict(lambda: defaultdict(int))
-        self.fetch_stats.update({
+        self.fetch_stats = {
+            "products": {"success": 0, "failed": 0},
+            "candles": {"success": 0, "failed": 0},
             "circuit_breaker_blocks": 0,
             "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
-        })
+        }
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Return the injected session or obtain a fresh one."""
@@ -1911,10 +1981,9 @@ class RedisStateStore:
                 self._redis = None
             return False
 
-    
     async def connect(self, timeout: float = 5.0) -> None:
         """Connect to Redis with pooling and health checks"""
-
+        
         pool_reused = False
 
         async with RedisStateStore._pool_lock:
@@ -1937,11 +2006,6 @@ class RedisStateStore:
                     # Pool is fresh, try to reuse it
                     try:
                         await asyncio.wait_for(pool.ping(), timeout=1.0)
-
-                        # 5 % chance to force pool refresh (thundering-herd protection)
-                        if random.random() < 0.05:
-                            RedisStateStore._pool_healthy[self.redis_url] = False
-
                         self._redis = pool
                         RedisStateStore._pool_reuse_count[self.redis_url] = \
                             RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
@@ -1953,15 +2017,17 @@ class RedisStateStore:
                                 logger.warning(f"Lua script load failed: {e}")
 
                         self.degraded = False
+
                         pool_reused = True
-                        return  # fast-path exit
+                        # Early return while holding lock is safe (fast path)
+                        return  # Success - exit while holding lock
 
                     except Exception as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
                         RedisStateStore._pool_healthy[self.redis_url] = False
                         pool_reused = False
-      
+
         # If we reach here without pool_reused=True, need to create new connection
         if pool_reused:
             return
@@ -2573,30 +2639,33 @@ class RedisLock:
             return False
 
     async def extend(self, timeout: float = 3.0) -> bool:
-        if not self.token or not self.redis or not self.acquired_by_me or self.lost:
-            return False
-        try:
-            # Lua script guarantees atomicity
-            lua = """
-            if redis.call("GET", KEYS[1]) == ARGV[1] then
-                return redis.call("EXPIRE", KEYS[1], ARGV[2])
-            else
-                return 0
-            end
-            """
-            ok = await asyncio.wait_for(
-                self.redis.eval(lua, 1, self.lock_key, self.token, self.expire),
-                timeout=timeout
-            )
-            if ok:
-                self.last_extend_time = time.time()
-                return True
-            # Token mismatch – we lost the lock
+        if not self.token or not self.redis or not self.acquired_by_me:
             self.lost = True
-            self.acquired_by_me = False
             return False
+
+        try:
+            raw_val = await asyncio.wait_for(self.redis.get(self.lock_key), timeout=timeout)
+            if raw_val is None:
+                logger.warning("Lock lost during extend (key missing)")
+                self.lost = True
+                self.acquired_by_me = False
+                return False
+
+            current_token = str(raw_val)
+            if current_token != self.token:
+                logger.warning("Lock token mismatch on extend")
+                self.lost = True
+                self.acquired_by_me = False
+                return False
+
+            await asyncio.wait_for(
+                self.redis.expire(self.lock_key, self.expire), timeout=timeout
+            )
+            self.last_extend_time = time.time()
+            logger.debug(f"Extended Redis lock: {self.lock_key}")
+            return True
         except Exception as e:
-            logger.error("Lock extend failed: %s", e)
+            logger.error(f"Error extending Redis lock: {e}")
             self.lost = True
             self.acquired_by_me = False
             return False
@@ -2747,6 +2816,9 @@ class TelegramQueue:
 
         return all(results)
 
+        async def send_batch(self, messages: List[str]) -> bool:
+            if not messages:
+                return True
         
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
     parts = title.split(" ", 1)
@@ -3865,7 +3937,6 @@ async def run_once() -> bool:
         all_results: List[Tuple[str, Dict[str, Any]]] = [] 
         correlation_id = uuid.uuid4().hex[:8]
         TRACE_ID.set(correlation_id)
-        pairs_to_process: List[str] = [] 
         logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
         start_time = time.time()
 
@@ -3881,17 +3952,21 @@ async def run_once() -> bool:
         fetcher: Optional[DataFetcher] = None
         telegram_queue: Optional[TelegramQueue] = None
 
-
     alerts_sent = 0
-    MAX_ALERTS_PER_RUN = cfg.MAX_ALERTS_PER_PAIR * len(pairs_to_process)
-    MAX_ALERTS_PER_RUN = min(MAX_ALERTS_PER_RUN, 50)  # hard global ceiling
+    MAX_ALERTS_PER_RUN = 50
 
     for _, state in all_results:
         if state.get("state") == "ALERT_SENT":
             extra = state.get("summary", {}).get("alerts", 0)
+
+            # 1.  enforce limit BEFORE we add this chunk
             if alerts_sent + extra > MAX_ALERTS_PER_RUN:
-                logger.critical("Alert storm protection triggered – dropping %d alerts", extra)
+                logger_run.warning(
+                    "Alert limit reached (%d), skipping %d alerts",
+                    MAX_ALERTS_PER_RUN, extra
+                )
                 break
+
             alerts_sent += extra
 
     # 2.  single log line is enough
@@ -4161,12 +4236,6 @@ except ImportError:
     logger.info(f"��️ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
-
-    # Prevent run-away memory growth in asyncio
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-    if hasattr(asyncio, "set_event_loop"):
-        asyncio.get_event_loop().set_exception_handler(lambda loop, ctx: logger.error("Asyncio: %s", ctx))
-
     # Initialize AOT/JIT bridge first
     aot_bridge.ensure_initialized()
     
