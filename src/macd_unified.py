@@ -700,14 +700,15 @@ def calculate_magical_momentum_hist(
     responsiveness: float = 0.9
 ) -> np.ndarray:
     """
-    Corrected Pine-accurate MMH implementation
+    Calculate Magical Momentum Histogram - Pine-accurate version
     
-    Key fixes:
-    1. Worm initialization with first close value (not first valid)
-    2. Proper raw momentum calculation with division handling
-    3. Correct normalization order (temp first, then value transformation)
-    4. Exact momentum smoothing application
-    5. Better NaN/inf handling throughout
+    Args:
+        close: Close prices array (float64)
+        period: Momentum period (default 144)
+        responsiveness: Responsiveness factor 0-1 (default 0.9)
+    
+    Returns:
+        Momentum histogram array
     """
     try:
         if close is None or len(close) < period:
@@ -718,15 +719,19 @@ def calculate_magical_momentum_hist(
         close_c = np.ascontiguousarray(close, dtype=np.float64)
 
         # Step 1: Rolling standard deviation (50-period)
+        print(f"[MMH-DEBUG] Step 1: Computing rolling_std(period=50, responsiveness={resp_clamped})")
         sd = rolling_std(close_c, 50, resp_clamped)
 
         # Step 2: Worm calculation
+        print(f"[MMH-DEBUG] Step 2: Computing worm")
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
         # Step 3: Moving average
+        print(f"[MMH-DEBUG] Step 3: Computing SMA(period={period})")
         ma = rolling_mean_numba(close_c, period)
 
         # Step 4: Raw momentum (worm - ma) / worm
+        print(f"[MMH-DEBUG] Step 4: Computing raw momentum")
         raw = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             if np.abs(worm_arr[i]) < 1e-10:
@@ -735,20 +740,27 @@ def calculate_magical_momentum_hist(
                 raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
 
         # Step 5: Min/max of raw momentum over period
+        print(f"[MMH-DEBUG] Step 5: Computing rolling min/max(period={period})")
         min_med, max_med = rolling_min_max_numba(raw, period)
 
-        # Step 6: Normalize to [0, 1] - THIS IS CRITICAL
+        # Step 6: Normalize and transform to value - CORRECTED SIGNATURE
+        # calc_mmh_value_loop NOW takes (raw, min_med, max_med, rows)
+        print(f"[MMH-DEBUG] Step 6: Computing value array with normalization")
         value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
 
         # Step 7: Transform to log-odds momentum
+        print(f"[MMH-DEBUG] Step 7: Computing momentum via log transformation")
         momentum = calc_mmh_momentum_loop(value_arr, rows)
 
         # Step 8: Smooth momentum
+        print(f"[MMH-DEBUG] Step 8: Smoothing momentum")
         momentum = calc_mmh_momentum_smoothing(momentum, rows)
 
-        # Clean up any inf/nan artifacts
+        # Step 9: Clean up any inf/nan artifacts
+        print(f"[MMH-DEBUG] Step 9: Sanitizing array")
         momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
 
+        print(f"[MMH-DEBUG] ✅ Calculation complete. Result shape: {momentum.shape}, dtype: {momentum.dtype}")
         return momentum
 
     except Exception as e:
