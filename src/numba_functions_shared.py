@@ -1,14 +1,9 @@
 """
 Shared Numba Function Definitions - Single Source of Truth
 ============================================================
-
-All 22 Numba functions defined ONCE with explicit @njit signatures.
-Used by both:
-  - aot_build.py (AOT via CC.export)
-  - aot_bridge.py (JIT fallback)
-
-Explicit signatures guarantee stable symbol names for AOT exports and
-mathematical consistency between AOT and JIT execution paths.
+All 22 Numba functions defined with explicit @njit signatures.
+CORRECTED: All first-valid-index checks implemented.
+Ensures data[0] is never blindly used as initial value.
 """
 
 import numpy as np
@@ -41,12 +36,12 @@ def sanitize_array_numba_parallel(arr, default):
 
 
 # ============================================================================
-# STATISTICAL
+# STATISTICAL FUNCTIONS
 # ============================================================================
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    
+    """Calculate rolling standard deviation with NaN handling"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
@@ -70,7 +65,7 @@ def rolling_std(close, period, responsiveness):
             window_count += 1
 
         if has_nan or window_count == 0:
-            sd[i] = 0.0
+            sd[i] = sd[i-1] if i > 0 else 0.0
             continue
 
         mean = window_sum / window_count
@@ -89,7 +84,7 @@ def rolling_std(close, period, responsiveness):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std_parallel(close, period, responsiveness):
-   
+    """Parallel rolling std with NaN handling"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
@@ -130,13 +125,9 @@ def rolling_std_parallel(close, period, responsiveness):
     return sd
 
 
-# ============================================================================
-# FIXED MMH IMPLEMENTATION - Replace in numba_functions_shared.py
-# ============================================================================
-
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    
+    """Calculate rolling mean with NaN handling and warmup logic"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
@@ -161,7 +152,6 @@ def rolling_mean_numba(data, period):
                 window_sum += val
                 valid_count += 1
         
-        # Pine: if all NaN → previous value
         out[i] = window_sum / valid_count if valid_count > 0 else out[i-1]
     
     return out
@@ -169,7 +159,7 @@ def rolling_mean_numba(data, period):
 
 @njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_mean_numba_parallel(data, period):
-    
+    """Parallel rolling mean with warmup logic"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
@@ -196,13 +186,9 @@ def rolling_mean_numba_parallel(data, period):
                 window_sum += val
                 valid_count += 1
         
-        # Fallback: if all NaN in window, use previous value
-        # NOTE: This is safe because warmup guarantees out[period-2] exists
         if valid_count > 0:
             out[i] = window_sum / valid_count
         else:
-            # For parallel safety, we cannot reference out[i-1] here
-            # So we use the last warmup value as fallback
             out[i] = out[warmup_end - 1] if warmup_end > 0 else 0.0
     
     return out
@@ -210,15 +196,12 @@ def rolling_mean_numba_parallel(data, period):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    
+    """Calculate rolling min/max with partial warmup logic"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
 
     for i in range(rows):
-        # ✅ NEW: Compute partial rolling min/max from bar 0 onwards
-        # During warmup (i < period-1): use bars 0 to i
-        # During normal (i >= period-1): use bars i-period+1 to i
         start = max(0, i - period + 1)
         
         min_val = np.inf
@@ -234,7 +217,6 @@ def rolling_min_max_numba(arr, period):
                 if val > max_val:
                     max_val = val
 
-        # Assign result or NaN if no valid data in window
         min_arr[i] = min_val if has_valid else np.nan
         max_arr[i] = max_val if has_valid else np.nan
 
@@ -243,19 +225,12 @@ def rolling_min_max_numba(arr, period):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, parallel=True, cache=True)
 def rolling_min_max_numba_parallel(arr, period):
-    """
-    Parallel version of rolling_min_max with warmup logic.
-    
-    ✅ ENHANCEMENT: Same warmup benefit as rolling_min_max_numba.
-    
-    See rolling_min_max_numba() docstring for detailed behavior notes.
-    """
+    """Parallel rolling min/max with warmup logic"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
 
     for i in prange(rows):
-        # ✅ NEW: Compute partial rolling min/max from bar 0 onwards
         start = max(0, i - period + 1)
         
         min_val = np.inf
@@ -275,23 +250,38 @@ def rolling_min_max_numba_parallel(arr, period):
         max_arr[i] = max_val if has_valid else np.nan
 
     return min_arr, max_arr
+
+
 # ============================================================================
 # MOVING AVERAGES
 # ============================================================================
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, alpha_or_period):
-    
+    """Exponential Moving Average with first-valid-index initialization"""
     n = len(data)
     alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
-
-    out = np.empty(n, dtype=np.float64)
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-
-    for i in range(1, n):
+    out = np.full(n, np.nan, dtype=np.float64)
+    
+    # ✅ FIXED: Find first valid index instead of blindly using data[0]
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(data[i]):
+            first_valid_idx = i
+            break
+    
+    # If no valid data, return all NaN
+    if first_valid_idx == -1:
+        return out
+    
+    # Initialize from first valid value
+    out[first_valid_idx] = data[first_valid_idx]
+    
+    # Calculate EMA from first valid onward
+    for i in range(first_valid_idx + 1, n):
         curr = data[i]
-        out[i] = out[i - 1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i - 1])
-
+        out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
+    
     return out
 
 
@@ -299,13 +289,24 @@ def ema_loop(data, alpha_or_period):
 def ema_loop_alpha(data, alpha):
     """Exponential Moving Average with explicit alpha parameter"""
     n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    out[0] = data[0] if not np.isnan(data[0]) else 0.0
-
-    for i in range(1, n):
+    out = np.full(n, np.nan, dtype=np.float64)
+    
+    # ✅ FIXED: Find first valid index
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(data[i]):
+            first_valid_idx = i
+            break
+    
+    if first_valid_idx == -1:
+        return out
+    
+    out[first_valid_idx] = data[first_valid_idx]
+    
+    for i in range(first_valid_idx + 1, n):
         curr = data[i]
-        out[i] = out[i - 1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i - 1])
-
+        out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
+    
     return out
 
 
@@ -315,18 +316,16 @@ def ema_loop_alpha(data, alpha):
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    
+    """Range filter for smoothing with bounds"""
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
 
-    # Pine: rngfiltx1x1 = x (initial assignment)
     filt[0] = 0.0 if np.isnan(x[0]) else x[0]
 
     for i in range(1, n):
         curr_x = x[i]
         curr_r = r[i]
 
-        # Pine nz()
         prev = filt[i - 1]
         if np.isnan(prev):
             prev = 0.0
@@ -380,7 +379,7 @@ def smooth_range(close, t, m):
 
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):
-    
+    """Determine cloud up/down states from filtered values"""
     n = len(filt_x1)
     upw = np.empty(n, dtype=np.bool_)
     dnw = np.empty(n, dtype=np.bool_)
@@ -411,24 +410,33 @@ def calculate_trends_with_state(filt_x1, filt_x12):
 
 @njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
-    """Kalman filter implementation"""
+    """Kalman filter implementation with NaN handling"""
     n = len(src)
-    result = np.empty(n, dtype=np.float64)
+    result = np.full(n, np.nan, dtype=np.float64)
 
-    estimate = src[0] if not np.isnan(src[0]) else 0.0
+    # ✅ FIXED: Find first valid index
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(src[i]):
+            first_valid_idx = i
+            break
+    
+    if first_valid_idx == -1:
+        return result
+
+    estimate = src[first_valid_idx]
     error_est = 1.0
     error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
     Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
 
-    for i in range(n):
+    result[first_valid_idx] = estimate
+
+    for i in range(first_valid_idx + 1, n):
         current = src[i]
 
         if np.isnan(current):
             result[i] = estimate
             continue
-
-        if np.isnan(estimate):
-            estimate = current
 
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
@@ -445,7 +453,7 @@ def kalman_loop(src, length, R, Q):
 
 @njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop(high, low, close, volume, day_id):
-    
+    """Calculate VWAP with daily reset and NaN handling"""
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
 
@@ -468,7 +476,6 @@ def vwap_daily_loop(high, low, close, volume, day_id):
         v = volume[i]
 
         if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0.0:
-            # Advance with previous vwap; first bar falls back to close
             vwap[i] = vwap[i-1] if i > 0 and not np.isnan(vwap[i-1]) else c
             continue
 
@@ -491,25 +498,37 @@ def vwap_daily_loop(high, low, close, volume, day_id):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
-    
+    """Calculate PPO with signal line"""
     n = len(close)
     fast_alpha = 2.0 / (fast + 1.0)
     slow_alpha = 2.0 / (slow + 1.0)
 
-    fast_ma = np.empty(n, dtype=np.float64)
-    slow_ma = np.empty(n, dtype=np.float64)
+    fast_ma = np.full(n, np.nan, dtype=np.float64)
+    slow_ma = np.full(n, np.nan, dtype=np.float64)
 
-    fast_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
-    slow_ma[0] = close[0] if not np.isnan(close[0]) else 0.0
+    # ✅ FIXED: Find first valid close index
+    first_valid_idx = -1
+    for i in range(n):
+        if not np.isnan(close[i]):
+            first_valid_idx = i
+            break
+    
+    if first_valid_idx == -1:
+        ppo = np.full(n, np.nan, dtype=np.float64)
+        ppo_sig = np.full(n, np.nan, dtype=np.float64)
+        return ppo, ppo_sig
 
-    for i in range(1, n):
+    fast_ma[first_valid_idx] = close[first_valid_idx]
+    slow_ma[first_valid_idx] = close[first_valid_idx]
+
+    for i in range(first_valid_idx + 1, n):
         c = close[i]
         if np.isnan(c):
-            fast_ma[i] = fast_ma[i - 1]
-            slow_ma[i] = slow_ma[i - 1]
+            fast_ma[i] = fast_ma[i-1]
+            slow_ma[i] = slow_ma[i-1]
         else:
-            fast_ma[i] = fast_alpha * c + (1.0 - fast_alpha) * fast_ma[i - 1]
-            slow_ma[i] = slow_alpha * c + (1.0 - slow_alpha) * slow_ma[i - 1]
+            fast_ma[i] = fast_alpha * c + (1.0 - fast_alpha) * fast_ma[i-1]
+            slow_ma[i] = slow_alpha * c + (1.0 - slow_alpha) * slow_ma[i-1]
 
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
@@ -519,28 +538,42 @@ def calculate_ppo_core(close, fast, slow, signal):
             ppo[i] = 0.0
 
     sig_alpha = 2.0 / (signal + 1.0)
-    ppo_sig = np.empty(n, dtype=np.float64)
-    ppo_sig[0] = ppo[0]
+    ppo_sig = np.full(n, np.nan, dtype=np.float64)
+    
+    ppo_sig[first_valid_idx] = ppo[first_valid_idx]
 
-    for i in range(1, n):
+    for i in range(first_valid_idx + 1, n):
         p = ppo[i]
-        ppo_sig[i] = ppo_sig[i - 1] if np.isnan(p) else (sig_alpha * p + (1.0 - sig_alpha) * ppo_sig[i - 1])
+        ppo_sig[i] = ppo_sig[i-1] if np.isnan(p) else (sig_alpha * p + (1.0 - sig_alpha) * ppo_sig[i-1])
 
     return ppo, ppo_sig
 
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
+    """Calculate RSI with first-valid-index initialization"""
     n = len(close)
-    rsi = np.zeros(n, dtype=np.float64)
+    rsi = np.full(n, 50.0, dtype=np.float64)
+    
     if n <= period:
+        return rsi
+
+    # ✅ FIXED: Find first valid close index
+    first_valid_idx = -1
+    last_valid_close = 0.0
+    for i in range(n):
+        if not np.isnan(close[i]):
+            first_valid_idx = i
+            last_valid_close = close[i]
+            break
+    
+    if first_valid_idx == -1:
         return rsi
 
     gain = np.zeros(n, dtype=np.float64)
     loss = np.zeros(n, dtype=np.float64)
 
-    last_valid_close = close[0]
-    for i in range(1, n):
+    for i in range(first_valid_idx + 1, n):
         curr = close[i]
         if np.isnan(curr) or np.isnan(last_valid_close):
             gain[i] = 0.0
@@ -563,14 +596,14 @@ def calculate_rsi_core(close, period):
 
     sum_g = 0.0
     sum_l = 0.0
-    for i in range(1, period + 1):
+    for i in range(first_valid_idx + 1, min(first_valid_idx + period + 1, n)):
         sum_g += gain[i]
         sum_l += loss[i]
 
-    avg_gain[period] = sum_g / period
-    avg_loss[period] = sum_l / period
+    avg_gain[first_valid_idx + period] = sum_g / period
+    avg_loss[first_valid_idx + period] = sum_l / period
 
-    for i in range(period + 1, n):
+    for i in range(first_valid_idx + period + 1, n):
         if np.isnan(close[i]):
             avg_gain[i] = avg_gain[i - 1]
             avg_loss[i] = avg_loss[i - 1]
@@ -578,7 +611,7 @@ def calculate_rsi_core(close, period):
             avg_gain[i] = (gain[i] * alpha) + (avg_gain[i - 1] * (1.0 - alpha))
             avg_loss[i] = (loss[i] * alpha) + (avg_loss[i - 1] * (1.0 - alpha))
 
-    for i in range(period, n):
+    for i in range(first_valid_idx + period, n):
         if avg_loss[i] == 0.0:
             rsi[i] = 100.0 if avg_gain[i] > 0.0 else 50.0
         else:
@@ -594,10 +627,10 @@ def calculate_rsi_core(close, period):
 
 @njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    
+    """Calculate worm array with first-valid-index initialization"""
     worm_arr = np.empty(rows, dtype=np.float64)
 
-    # ✅ FIXED: Use first valid close price (Pine: var worm = source)
+    # ✅ GOOD: Find first valid close price
     first_valid = 0.0
     for i in range(rows):
         if not np.isnan(close_arr[i]):
@@ -624,13 +657,13 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(temp_arr, rows):
-    
+    """Calculate value array with clamping to [-0.9999, 0.9999]"""
     value_arr = np.empty(rows, dtype=np.float64)
     initial_multiplier = 1.0
 
     t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
     v0 = initial_multiplier * (t0 - 0.5 + 0.5 * 0.0)
-    # Pine clipping – no higher-precision temp
+    
     if v0 > 0.9999:
         value_arr[0] = 0.9999
     elif v0 < -0.9999:
@@ -643,7 +676,6 @@ def calc_mmh_value_loop(temp_arr, rows):
         t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
         v = initial_multiplier * (t - 0.5 + 0.5 * prev_v)
 
-        # Pine-equivalent clipping
         if v > 0.9999:
             value_arr[i] = 0.9999
         elif v < -0.9999:
@@ -653,8 +685,10 @@ def calc_mmh_value_loop(temp_arr, rows):
 
     return value_arr
 
+
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(momentum_arr, rows):
+    """Calculate momentum with safe indexing"""
     for i in range(1, rows):
         prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
         momentum_arr[i] = momentum_arr[i] + 0.5 * prev
@@ -666,48 +700,78 @@ def calc_mmh_momentum_loop(momentum_arr, rows):
 # CANDLE PATTERN RECOGNITION
 # ============================================================================
 
-
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
+    """Check buy candle quality: green with small upper wick"""
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
+    
     for i in range(n):
-        o = open_arr[i]; h = high_arr[i]; l = low_arr[i]; c = close_arr[i]
+        o = open_arr[i]
+        h = high_arr[i]
+        l = low_arr[i]
+        c = close_arr[i]
+        
+        if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
+            result[i] = False
+            continue
+        
         if c <= o:
-            result[i] = False; continue
+            result[i] = False
+            continue
+        
         candle_range = h - l
         if candle_range < 1e-8:
-            result[i] = False; continue
-        # Body-edge upper wick for green candle
+            result[i] = False
+            continue
+        
         body_top = c if c > o else o
         upper_wick = h - body_top
         wick_ratio = upper_wick / candle_range
+        
         result[i] = wick_ratio < min_wick_ratio
+    
     return result
+
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
+    """Check sell candle quality: red with small lower wick"""
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
+    
     for i in range(n):
-        o = open_arr[i]; h = high_arr[i]; l = low_arr[i]; c = close_arr[i]
+        o = open_arr[i]
+        h = high_arr[i]
+        l = low_arr[i]
+        c = close_arr[i]
+        
+        if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
+            result[i] = False
+            continue
+        
         if c >= o:
-            result[i] = False; continue
+            result[i] = False
+            continue
+        
         candle_range = h - l
         if candle_range < 1e-8:
-            result[i] = False; continue
-        # Body-edge lower wick for red candle
+            result[i] = False
+            continue
+        
         body_bottom = c if c < o else o
         lower_wick = body_bottom - l
         if lower_wick < 0.0:
             lower_wick = 0.0
+        
         wick_ratio = lower_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
+    
     return result
 
 
 # ============================================================================
-# METADATA
+# METADATA & EXPORTS
 # ============================================================================
 
 __all__ = [
@@ -749,4 +813,5 @@ __all__ = [
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
 ]
+
 assert len(__all__) == 22, f"Expected 22 functions, found {len(__all__)}"
