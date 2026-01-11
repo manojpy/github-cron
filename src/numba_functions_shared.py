@@ -394,7 +394,7 @@ def calculate_trends_with_state(filt_x1, filt_x12):
 
 @njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
-    """Kalman filter in O(n) - single pass with state tracking"""
+    """Kalman filter in O(n) - FIXED: applies formula on first valid bar"""
     n = len(src)
     result = np.full(n, np.nan, dtype=np.float64)
 
@@ -408,14 +408,20 @@ def kalman_loop(src, length, R, Q):
     if first_valid_idx == -1:
         return result
 
+    # Initialize estimate with first valid value
     estimate = src[first_valid_idx]
     error_est = 1.0
     error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
     Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
 
+    # ✅ FIX: Apply Kalman formula EVEN on first bar (like Pine does)
+    prediction = estimate
+    kalman_gain = error_est / (error_est + error_meas)
+    estimate = prediction + kalman_gain * (src[first_valid_idx] - prediction)
+    error_est = (1.0 - kalman_gain) * error_est + Q_div_length
     result[first_valid_idx] = estimate
 
-    # Single pass Kalman - O(n)
+    # Continue for remaining bars - O(n)
     for i in range(first_valid_idx + 1, n):
         current = src[i]
 
@@ -423,8 +429,9 @@ def kalman_loop(src, length, R, Q):
             result[i] = estimate
             continue
 
+        prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
-        estimate = estimate + kalman_gain * (current - estimate)
+        estimate = prediction + kalman_gain * (current - estimate)
         error_est = (1.0 - kalman_gain) * error_est + Q_div_length
         result[i] = estimate
 

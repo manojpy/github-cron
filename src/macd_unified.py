@@ -171,6 +171,7 @@ class BotConfig(BaseModel):
     X4: int = 5
     SRSI_RSI_LEN: int = 21
     SRSI_KALMAN_LEN: int = 5
+    SRSI_EMA_LEN: int = 5
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 6
@@ -565,6 +566,7 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
+    """CORRECTED: RSI → Kalman Filter → EMA (3 stages like Pine)"""
     try:
         if close is None:
             logger.warning("Smooth RSI: Input close array is None")
@@ -577,9 +579,17 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
             )
             return np.full(len(close), 50.0, dtype=np.float64)
 
+        # Stage 1: Calculate RSI
         rsi = calculate_rsi_core(close, rsi_len)
+        
+        # Stage 2: Apply Kalman filter to RSI
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
         
+        # Stage 3: Apply EMA to Kalman output (THIS WAS MISSING!)
+        # Pine uses emaLen=5 by default
+        smooth_rsi = ema_loop(smooth_rsi, float(cfg.SRSI_EMA_LEN))
+        
+        # Sanitize (handle NaN/Inf)
         if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
             smooth_rsi = sanitize_array_numba_parallel(smooth_rsi, 50.0)
         else:
@@ -591,6 +601,7 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
         logger.error(f"Smooth RSI calculation failed: {e}")
         default_len = len(close) if close is not None else 1
         return np.full(default_len, 50.0, dtype=np.float64)
+
 
 def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
