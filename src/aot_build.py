@@ -109,7 +109,7 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
         ('rng_filter_loop', 'f8[:](f8[:], f8[:])', rng_filter_loop),
         ('smooth_range', 'f8[:](f8[:], i4, i4)', smooth_range),
         ('calculate_trends_with_state', 'Tuple((b1[:], b1[:]))(f8[:], f8[:])', calculate_trends_with_state),
-        ('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i8)', calc_mmh_worm_loop),
+        ('calc_mmh_worm_loop', 'f8[:](f8[:], f8[:], i8)', calc_mmh_worm_loop), 
         ('calc_mmh_value_loop', 'f8[:](f8[:], f8[:], f8[:], i8)', calc_mmh_value_loop),
         ('calc_mmh_momentum_loop', 'f8[:](f8[:], i8)', calc_mmh_momentum_loop),
         ('calc_mmh_momentum_smoothing', 'f8[:](f8[:], i8)', calc_mmh_momentum_smoothing),

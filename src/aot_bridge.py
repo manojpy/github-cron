@@ -270,11 +270,11 @@ def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> 
     return _jit_calc_mmh_worm_loop(close_arr, sd_arr, rows)
 
 
-def calc_mmh_value_loop(temp_arr: np.ndarray, rows: int) -> np.ndarray:
+def calc_mmh_value_loop(temp_arr: np.ndarray, min_med: np.ndarray, max_med: np.ndarray, rows: int) -> np.ndarray:
+    """Calculate value array with proper normalization"""
     if _using_aot:
-        return _aot_module.calc_mmh_value_loop(temp_arr, rows)
-    return _jit_calc_mmh_value_loop(temp_arr, rows)
-
+        return _aot_module.calc_mmh_value_loop(temp_arr, min_med, max_med, rows)
+    return _jit_calc_mmh_value_loop(temp_arr, min_med, max_med, rows)
 
 def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
     if _using_aot:
