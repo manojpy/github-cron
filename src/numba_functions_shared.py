@@ -303,7 +303,7 @@ def ema_loop_alpha(data, alpha):
 # ============================================================================
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
-def rng_filter_loop_(x, r):
+def rng_filter_loop(x, r):
     """Range filter - with proper initialization"""
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
