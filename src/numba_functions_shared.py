@@ -1,7 +1,7 @@
 """
 Shared Numba Function Definitions - Single Source of Truth
 ============================================================
-All 22 Numba functions with:
+All 20 Numba functions with:
   - First-valid-index checks (bulletproof NaN handling)
   - O(n) complexity where possible (no nested loops)
   - Explicit @njit signatures for AOT compatibility
@@ -48,18 +48,15 @@ def rolling_std(close, period, responsiveness):
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
 
-    # Initialize window
     window_sum = 0.0
     window_sq_sum = 0.0
     window_count = 0
     queue = np.zeros(period, dtype=np.float64)
     queue_idx = 0
-    has_nan = False
 
     for i in range(n):
         curr = close[i]
         
-        # Add new value to window
         if i >= period:
             old_val = queue[queue_idx]
             if not np.isnan(old_val):
@@ -71,49 +68,10 @@ def rolling_std(close, period, responsiveness):
             window_sum += curr
             window_sq_sum += curr * curr
             window_count += 1
-            has_nan = False
-        else:
-            has_nan = True
         
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
         
-        # Calculate std
-        if has_nan or window_count == 0:
-            sd[i] = sd[i-1] if i > 0 else 0.0
-        else:
-            mean = window_sum / window_count
-            variance = (window_sq_sum / window_count) - (mean * mean)
-            sd[i] = np.sqrt(max(0.0, variance)) * resp
-
-    return sd
-
-
-@njit("f8[:](f8[:], i4, f8)", nogil=True, parallel=True, cache=True)
-def rolling_std_parallel(close, period, responsiveness):
-    """Parallel rolling std in O(n) - each iteration independent"""
-    n = len(close)
-    sd = np.empty(n, dtype=np.float64)
-    resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
-
-    for i in prange(n):
-        if i < period - 1:
-            sd[i] = 0.0
-            continue
-
-        # Window: [i - period + 1, i]
-        window_sum = 0.0
-        window_sq_sum = 0.0
-        window_count = 0
-
-        start = i - period + 1
-        for j in range(start, i + 1):
-            val = close[j]
-            if not np.isnan(val):
-                window_sum += val
-                window_sq_sum += val * val
-                window_count += 1
-
         if window_count == 0:
             sd[i] = 0.0
         else:
@@ -130,7 +88,6 @@ def rolling_mean_numba(data, period):
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
-    # Phase 1: Build initial window [0, period-1]
     window_sum = 0.0
     window_count = 0
     queue = np.zeros(period, dtype=np.float64)
@@ -144,21 +101,17 @@ def rolling_mean_numba(data, period):
         queue_idx = (queue_idx + 1) % period
         out[i] = window_sum / window_count if window_count > 0 else 0.0
     
-    # Phase 2: Slide window O(n) - remove old, add new
     for i in range(period, n):
-        # Remove oldest value
         old_val = queue[queue_idx]
         if not np.isnan(old_val):
             window_sum -= old_val
             window_count -= 1
         
-        # Add new value
         curr = data[i]
         if not np.isnan(curr):
             window_sum += curr
             window_count += 1
         
-        # Store and advance queue pointer
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
         
@@ -167,44 +120,13 @@ def rolling_mean_numba(data, period):
     return out
 
 
-@njit("f8[:](f8[:], i4)", nogil=True, parallel=True, cache=True)
-def rolling_mean_numba_parallel(data, period):
-    """Parallel rolling mean in O(n) - each iteration independent"""
-    n = len(data)
-    out = np.empty(n, dtype=np.float64)
-    
-    for i in prange(n):
-        if i < period - 1:
-            # Warmup: average from 0 to i
-            window_sum = 0.0
-            window_count = 0
-            for j in range(i + 1):
-                if not np.isnan(data[j]):
-                    window_sum += data[j]
-                    window_count += 1
-            out[i] = window_sum / window_count if window_count > 0 else 0.0
-        else:
-            # Normal: average from i-period+1 to i
-            window_sum = 0.0
-            window_count = 0
-            start = i - period + 1
-            for j in range(start, i + 1):
-                if not np.isnan(data[j]):
-                    window_sum += data[j]
-                    window_count += 1
-            out[i] = window_sum / window_count if window_count > 0 else 0.0
-    
-    return out
-
-
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    """Calculate rolling min/max in O(n) using deque-like algorithm"""
+    """Calculate rolling min/max in O(n)"""
     rows = len(arr)
     min_arr = np.empty(rows, dtype=np.float64)
     max_arr = np.empty(rows, dtype=np.float64)
 
-    # Simple O(n) version: check each window
     for i in range(rows):
         start = max(0, i - period + 1)
         
@@ -227,34 +149,97 @@ def rolling_min_max_numba(arr, period):
     return min_arr, max_arr
 
 
-@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, parallel=True, cache=True)
-def rolling_min_max_numba_parallel(arr, period):
-    """Parallel rolling min/max in O(n) - each iteration independent"""
-    rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
+@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
+def calc_mmh_worm_loop(close_arr, sd_arr, rows):
+    """Calculate worm array - Pine's exact logic"""
+    worm_arr = np.empty(rows, dtype=np.float64)
+    
+    # Initialize with first close value
+    worm_arr[0] = close_arr[0]
 
-    for i in prange(rows):
-        start = max(0, i - period + 1)
+    for i in range(1, rows):
+        src = close_arr[i]
+        prev_worm = worm_arr[i - 1]
+        diff = src - prev_worm
+        sd_i = sd_arr[i]
+
+        # Pine: delta = math.abs(diff) > sd ? math.sign(diff) * sd : diff
+        if np.abs(diff) > sd_i:
+            delta = np.sign(diff) * sd_i
+        else:
+            delta = diff
+
+        worm_arr[i] = prev_worm + delta
+
+    return worm_arr
+
+
+@njit("f8[:](f8[:], f8[:], f8[:], i8)", nogil=True, cache=True)
+def calc_mmh_value_loop(temp_arr, min_med, max_med, rows):
+    """Calculate value array - exact Pine logic with proper normalization"""
+    value_arr = np.empty(rows, dtype=np.float64)
+    initial_multiplier = 1.0
+
+    for i in range(rows):
+        # Get normalized temp - handle division by zero
+        denom = max_med[i] - min_med[i]
+        if np.abs(denom) < 1e-10:
+            temp_val = 0.5
+        else:
+            raw_val = temp_arr[i]
+            if np.isnan(raw_val) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
+                temp_val = 0.5
+            else:
+                temp_val = (raw_val - min_med[i]) / denom
         
-        min_val = np.inf
-        max_val = -np.inf
-        has_valid = False
+        # Pine: value = 0.5 * 2 = 1.0
+        # value := value * (temp - 0.5 + 0.5 * nz(value[1]))
+        if i == 0:
+            v = initial_multiplier * (temp_val - 0.5)
+        else:
+            prev_v = value_arr[i - 1]
+            v = initial_multiplier * (temp_val - 0.5 + 0.5 * prev_v)
+        
+        # Clamp to [-0.9999, 0.9999]
+        value_arr[i] = max(-0.9999, min(0.9999, v))
 
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                has_valid = True
-                if val < min_val:
-                    min_val = val
-                if val > max_val:
-                    max_val = val
+    return value_arr
 
-        min_arr[i] = min_val if has_valid else np.nan
-        max_arr[i] = max_val if has_valid else np.nan
 
-    return min_arr, max_arr
+@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
+def calc_mmh_momentum_loop(value_arr, rows):
+    """Calculate momentum array - exact Pine transformation"""
+    momentum = np.empty(rows, dtype=np.float64)
 
+    for i in range(rows):
+        val = value_arr[i]
+        
+        # Pine: temp2 = (1 + value) / (1 - value); momentum = 0.25 * math.log(temp2)
+        if np.abs(val) >= 0.9999:
+            # Handle edge case - approaching singularity
+            if val > 0:
+                temp2 = (1.0 + 0.9999) / (1.0 - 0.9999)
+            else:
+                temp2 = (1.0 - 0.9999) / (1.0 + 0.9999)
+            momentum[i] = 0.25 * np.log(temp2) * np.sign(val)
+        else:
+            temp2 = (1.0 + val) / (1.0 - val)
+            momentum[i] = 0.25 * np.log(temp2)
+
+    return momentum
+
+
+@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
+def calc_mmh_momentum_smoothing(momentum, rows):
+    """Apply momentum smoothing - Pine: momentum := momentum + 0.5 * nz(momentum[1])"""
+    result = momentum.copy()
+    
+    for i in range(1, rows):
+        prev_momentum = result[i - 1]
+        if not np.isnan(prev_momentum):
+            result[i] = result[i] + 0.5 * prev_momentum
+
+    return result
 
 # ============================================================================
 # MOVING AVERAGES - O(n)
@@ -611,73 +596,6 @@ def calculate_rsi_core(close, period):
 
 
 # ============================================================================
-# MMH COMPONENTS - O(n)
-# ============================================================================
-
-@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    """Calculate worm array in O(n) - single pass"""
-    worm_arr = np.empty(rows, dtype=np.float64)
-
-    # Find first valid - O(n)
-    first_valid = 0.0
-    for i in range(rows):
-        if not np.isnan(close_arr[i]):
-            first_valid = close_arr[i]
-            break
-    
-    worm_arr[0] = first_valid
-
-    # Single pass worm calculation - O(n)
-    for i in range(1, rows):
-        src = close_arr[i] if not np.isnan(close_arr[i]) else worm_arr[i - 1]
-        prev_worm = worm_arr[i - 1]
-        diff = src - prev_worm
-        sd_i = sd_arr[i]
-
-        if np.isnan(sd_i) or sd_i == 0.0:
-            delta = diff
-        else:
-            delta = (np.sign(diff) * sd_i) if np.abs(diff) > sd_i else diff
-
-        worm_arr[i] = prev_worm + delta
-
-    return worm_arr
-
-
-@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_value_loop(temp_arr, rows):
-    """Calculate value array in O(n) - single pass with clamping"""
-    value_arr = np.empty(rows, dtype=np.float64)
-    initial_multiplier = 1.0
-
-    # First value - O(1)
-    t0 = temp_arr[0] if not np.isnan(temp_arr[0]) else 0.5
-    v0 = initial_multiplier * (t0 - 0.5)
-    value_arr[0] = max(-0.9999, min(0.9999, v0))
-
-    # Single pass - O(n)
-    for i in range(1, rows):
-        prev_v = value_arr[i - 1]
-        t = temp_arr[i] if not np.isnan(temp_arr[i]) else 0.5
-        v = initial_multiplier * (t - 0.5 + 0.5 * prev_v)
-        value_arr[i] = max(-0.9999, min(0.9999, v))
-
-    return value_arr
-
-
-@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_momentum_loop(momentum_arr, rows):
-    """Calculate momentum in O(n) - single pass"""
-    # Single pass momentum smoothing - O(n)
-    for i in range(1, rows):
-        prev = momentum_arr[i - 1] if not np.isnan(momentum_arr[i - 1]) else 0.0
-        momentum_arr[i] = momentum_arr[i] + 0.5 * prev
-
-    return momentum_arr
-
-
-# ============================================================================
 # CANDLE PATTERN RECOGNITION - O(n)
 # ============================================================================
 
@@ -771,11 +689,9 @@ __all__ = [
 
     # Statistical
     'rolling_std',
-    'rolling_std_parallel',
+    'calc_mmh_momentum_smoothing',
     'rolling_mean_numba',
-    'rolling_mean_numba_parallel',
     'rolling_min_max_numba',
-    'rolling_min_max_numba_parallel',
 
     # Oscillators
     'calculate_ppo_core',
@@ -791,4 +707,4 @@ __all__ = [
     'vectorized_wick_check_sell',
 ]
 
-assert len(__all__) == 22, f"Expected 22 functions, found {len(__all__)}"
+assert len(__all__) == 20, f"Expected 20 functions, found {len(__all__)}"

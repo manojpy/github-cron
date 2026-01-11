@@ -2,7 +2,7 @@
 AOT Build Script - Compiles Numba functions to native .so libraries
 ====================================================================
 
-Compiles all 22 shared Numba functions to platform-specific shared libraries
+Compiles all 20 shared Numba functions to platform-specific shared libraries
 using Numba's CC (compile cache) export mechanism.
 
 Usage:
@@ -47,12 +47,10 @@ try:
         calc_mmh_worm_loop,
         calc_mmh_value_loop,
         calc_mmh_momentum_loop,
+        calc_mmh_momentum_smoothing,
         rolling_std,
-        rolling_std_parallel,
         rolling_mean_numba,
-        rolling_mean_numba_parallel,
         rolling_min_max_numba,
-        rolling_min_max_numba_parallel,
         calculate_ppo_core,
         calculate_rsi_core,
         vectorized_wick_check_buy,
@@ -177,6 +175,11 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     print("  [12/22] calc_mmh_momentum_loop")
     cc.export('calc_mmh_momentum_loop', 'f8[:](f8[:], i8)')(calc_mmh_momentum_loop)
     signatures['calc_mmh_momentum_loop'] = (f64_1d, types.int64)
+
+    print("  [12.5/23] calc_mmh_momentum_smoothing")
+    cc.export('calc_mmh_momentum_smoothing', 'f8[:](f8[:], i8)')(calc_mmh_momentum_smoothing)
+    signatures['calc_mmh_momentum_smoothing'] = (f64_1d, types.int64)
+
     
     # ========================================================================
     # 13-14. ROLLING STANDARD DEVIATION
@@ -186,9 +189,6 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     cc.export('rolling_std', 'f8[:](f8[:], i4, f8)')(rolling_std)
     signatures['rolling_std'] = (f64_1d, i32, f64)
     
-    print("  [14/22] rolling_std_parallel")
-    cc.export('rolling_std_parallel', 'f8[:](f8[:], i4, f8)')(rolling_std_parallel)
-    signatures['rolling_std_parallel'] = (f64_1d, i32, f64)
     
     # ========================================================================
     # 15-16. ROLLING MEAN
@@ -198,9 +198,6 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     cc.export('rolling_mean_numba', 'f8[:](f8[:], i4)')(rolling_mean_numba)
     signatures['rolling_mean_numba'] = (f64_1d, i32)
     
-    print("  [16/22] rolling_mean_numba_parallel")
-    cc.export('rolling_mean_numba_parallel', 'f8[:](f8[:], i4)')(rolling_mean_numba_parallel)
-    signatures['rolling_mean_numba_parallel'] = (f64_1d, i32)
     
     # ========================================================================
     # 17-18. ROLLING MIN/MAX (TUPLE RETURNS)
@@ -210,11 +207,6 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     # Returns tuple: (float64[:], float64[:])
     cc.export('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)')(rolling_min_max_numba)
     signatures['rolling_min_max_numba'] = (f64_1d, i32)
-    
-    print("  [18/22] rolling_min_max_numba_parallel")
-    # Returns tuple: (float64[:], float64[:])
-    cc.export('rolling_min_max_numba_parallel', 'Tuple((f8[:], f8[:]))(f8[:], i4)')(rolling_min_max_numba_parallel)
-    signatures['rolling_min_max_numba_parallel'] = (f64_1d, i32)
     
     # ========================================================================
     # 19-20. OSCILLATORS (TUPLE RETURNS)
@@ -241,7 +233,7 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
     cc.export('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)')(vectorized_wick_check_sell)
     signatures['vectorized_wick_check_sell'] = (f64_1d, f64_1d, f64_1d, f64_1d, f64)
 
-    print(f"✅ All 22 functions exported successfully\n")
+    print(f"✅ All 20 functions exported successfully\n")
     
     return signatures
 

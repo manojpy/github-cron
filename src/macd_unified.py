@@ -50,11 +50,9 @@ from aot_bridge import (
     calc_mmh_value_loop,
     calc_mmh_momentum_loop,
     rolling_std,
-    rolling_std_parallel,
+    calc_mmh_momentum_smoothing,
     rolling_mean_numba,
-    rolling_mean_numba_parallel,
     rolling_min_max_numba,
-    rolling_min_max_numba_parallel,
     calculate_ppo_core,
     calculate_rsi_core,
     vectorized_wick_check_buy,
@@ -699,11 +697,17 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
 def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
-    responsiveness: float = 0.9,
-    use_parallel: bool = False
+    responsiveness: float = 0.9
 ) -> np.ndarray:
     """
-    Pine-accurate MMH – final corrected version
+    Corrected Pine-accurate MMH implementation
+    
+    Key fixes:
+    1. Worm initialization with first close value (not first valid)
+    2. Proper raw momentum calculation with division handling
+    3. Correct normalization order (temp first, then value transformation)
+    4. Exact momentum smoothing application
+    5. Better NaN/inf handling throughout
     """
     try:
         if close is None or len(close) < period:
@@ -713,56 +717,46 @@ def calculate_magical_momentum_hist(
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close, dtype=np.float64)
 
-        sd = (rolling_std_parallel(close_c, 50, resp_clamped) if use_parallel and rows >= 250
-              else rolling_std(close_c, 50, resp_clamped))
+        # Step 1: Rolling standard deviation (50-period)
+        sd = rolling_std(close_c, 50, resp_clamped)
 
+        # Step 2: Worm calculation
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-        ma = (rolling_mean_numba_parallel(close_c, period) if use_parallel and rows >= 250
-              else rolling_mean_numba(close_c, period))
+        # Step 3: Moving average
+        ma = rolling_mean_numba(close_c, period)
 
+        # Step 4: Raw momentum (worm - ma) / worm
         raw = np.empty(rows, dtype=np.float64)
         for i in range(rows):
-            raw[i] = np.nan if abs(worm_arr[i]) < 1e-6 else (worm_arr[i] - ma[i]) / worm_arr[i]
-
-        min_med, max_med = (rolling_min_max_numba_parallel(raw, period) if use_parallel and rows >= 250
-                            else rolling_min_max_numba(raw, period))
-
-        denom = max_med - min_med
-        temp = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            if np.abs(denom[i]) < 1e-10 or np.isnan(raw[i]) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
-                temp[i] = 0.5
+            if np.abs(worm_arr[i]) < 1e-10:
+                raw[i] = np.nan
             else:
-                temp[i] = (raw[i] - min_med[i]) / denom[i]
-       
-        value_arr = calc_mmh_value_loop(temp, rows)
+                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
 
-        momentum = np.empty(rows, dtype=np.float64)
-        pine_max = 0.25 * np.log((1.0 + 0.9999) / (1.0 - 0.9999))
-        pine_min = 0.25 * np.log((1.0 - 0.9999) / (1.0 + 0.9999))
-        for i in range(rows):
-            val = value_arr[i]
-            if val >= 0.9999:
-                momentum[i] = pine_max
-            elif val <= -0.9999:
-                momentum[i] = pine_min
-            else:
-                temp2 = (1.0 + val) / (1.0 - val)
-                momentum[i] = 0.25 * np.log(temp2)
+        # Step 5: Min/max of raw momentum over period
+        min_med, max_med = rolling_min_max_numba(raw, period)
 
-        momentum_arr = calc_mmh_momentum_loop(momentum, rows)
+        # Step 6: Normalize to [0, 1] - THIS IS CRITICAL
+        value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
 
-        momentum_arr = sanitize_array_numba(momentum_arr, 0.0)
+        # Step 7: Transform to log-odds momentum
+        momentum = calc_mmh_momentum_loop(value_arr, rows)
 
-        return momentum_arr
+        # Step 8: Smooth momentum
+        momentum = calc_mmh_momentum_smoothing(momentum, rows)
+
+        # Clean up any inf/nan artifacts
+        momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return momentum
 
     except Exception as e:
         print(f"[MMH-ERROR] {e}")
         import traceback
         traceback.print_exc()
         return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
-        
+
 def warmup_if_needed() -> None:
     if not aot_bridge.requires_warmup():
         logger.info("✅ AOT active – no warmup needed")
@@ -787,11 +781,8 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_rsi_core(test_data, 21)
         _ = aot_bridge.sanitize_array_numba(test_data, 0.0)
         _ = aot_bridge.rolling_mean_numba(test_data, test_int)
-        _ = aot_bridge.rolling_mean_numba_parallel(test_data, test_int)
         _ = aot_bridge.rolling_std(test_data, test_int, 0.5)
-        _ = aot_bridge.rolling_std_parallel(test_data, test_int, 0.5)
         _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
-        _ = aot_bridge.rolling_min_max_numba_parallel(test_data, test_int)
         _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
         _ = aot_bridge.rng_filter_loop(test_data, test_data2)
         _ = aot_bridge.smooth_range(test_data, 10, 2)
@@ -800,8 +791,10 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
         _ = aot_bridge.calc_mmh_value_loop(test_data2, len(test_data2))
         _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
+        _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))  # ADD THIS LINE
         _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
         _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+        _ = aot_bridge.sanitize_array_numba_parallel(test_data, 0.0)
 
         warmup_elapsed = time.time() - warmup_start
         logger.info("✅ JIT warmup complete (%.2f s)", warmup_elapsed)
@@ -809,7 +802,7 @@ def warmup_if_needed() -> None:
     except Exception as e:
         warmup_elapsed = time.time() - warmup_start
         logger.warning("Warmup failed (non-fatal, elapsed %.2f s): %s", warmup_elapsed, e)
-        
+
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 

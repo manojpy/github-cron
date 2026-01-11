@@ -86,7 +86,6 @@ def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") 
 
 
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
-   
     global _aot_module, _using_aot, _fallback_reason
 
     library_path = find_aot_library(module_name)
@@ -102,6 +101,7 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
         'sanitize_array_numba',
         'ema_loop',
         'calculate_ppo_core',
+        'calc_mmh_momentum_smoothing',  # ADD THIS LINE
     ]
 
     missing = [fn for fn in critical_functions if not hasattr(_aot_module, fn)]
@@ -110,7 +110,6 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
 
     _using_aot = True
     return True, None
-
 
 def initialize_jit_fallback() -> None:
    
@@ -131,11 +130,9 @@ def initialize_jit_fallback() -> None:
             calc_mmh_value_loop,
             calc_mmh_momentum_loop,
             rolling_std,
-            rolling_std_parallel,
             rolling_mean_numba,
-            rolling_mean_numba_parallel,
+            calc_mmh_momentum_smoothing,
             rolling_min_max_numba,
-            rolling_min_max_numba_parallel,
             calculate_ppo_core,
             calculate_rsi_core,
             vectorized_wick_check_buy,
@@ -155,11 +152,9 @@ def initialize_jit_fallback() -> None:
         globals()['_jit_calc_mmh_value_loop'] = calc_mmh_value_loop
         globals()['_jit_calc_mmh_momentum_loop'] = calc_mmh_momentum_loop
         globals()['_jit_rolling_std'] = rolling_std
-        globals()['_jit_rolling_std_parallel'] = rolling_std_parallel
         globals()['_jit_rolling_mean_numba'] = rolling_mean_numba
-        globals()['_jit_rolling_mean_numba_parallel'] = rolling_mean_numba_parallel
+        globals()['_jit_calc_mmh_momentum_smoothing'] = calc_mmh_momentum_smoothing
         globals()['_jit_rolling_min_max_numba'] = rolling_min_max_numba
-        globals()['_jit_rolling_min_max_numba_parallel'] = rolling_min_max_numba_parallel
         globals()['_jit_calculate_ppo_core'] = calculate_ppo_core
         globals()['_jit_calculate_rsi_core'] = calculate_rsi_core
         globals()['_jit_vectorized_wick_check_buy'] = vectorized_wick_check_buy
@@ -286,42 +281,26 @@ def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
         return _aot_module.calc_mmh_momentum_loop(momentum_arr, rows)
     return _jit_calc_mmh_momentum_loop(momentum_arr, rows)
 
+def calc_mmh_momentum_smoothing(momentum: np.ndarray, rows: int) -> np.ndarray:
+    """Apply momentum smoothing: momentum := momentum + 0.5 * nz(momentum[1])"""
+    if _using_aot:
+        return _aot_module.calc_mmh_momentum_smoothing(momentum, rows)
+    return _jit_calc_mmh_momentum_smoothing(momentum, rows)
 
 def rolling_std(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
     if _using_aot:
         return _aot_module.rolling_std(close, period, responsiveness)
     return _jit_rolling_std(close, period, responsiveness)
 
-
-def rolling_std_parallel(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    if _using_aot:
-        return _aot_module.rolling_std_parallel(close, period, responsiveness)
-    return _jit_rolling_std_parallel(close, period, responsiveness)
-
-
 def rolling_mean_numba(data: np.ndarray, period: int) -> np.ndarray:
     if _using_aot:
         return _aot_module.rolling_mean_numba(data, period)
     return _jit_rolling_mean_numba(data, period)
 
-
-def rolling_mean_numba_parallel(data: np.ndarray, period: int) -> np.ndarray:
-    if _using_aot:
-        return _aot_module.rolling_mean_numba_parallel(data, period)
-    return _jit_rolling_mean_numba_parallel(data, period)
-
-
 def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
     if _using_aot:
         return _aot_module.rolling_min_max_numba(arr, period)
     return _jit_rolling_min_max_numba(arr, period)
-
-
-def rolling_min_max_numba_parallel(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.ndarray]:
-    if _using_aot:
-        return _aot_module.rolling_min_max_numba_parallel(arr, period)
-    return _jit_rolling_min_max_numba_parallel(arr, period)
-
 
 def calculate_ppo_core(
     close: np.ndarray,
@@ -338,7 +317,6 @@ def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
     if _using_aot:
         return _aot_module.calculate_rsi_core(close, period)
     return _jit_calculate_rsi_core(close, period)
-
 
 def vectorized_wick_check_buy(
     open_arr: np.ndarray,
@@ -401,11 +379,9 @@ __all__ = [
 
     # Statistical
     'rolling_std',
-    'rolling_std_parallel',
     'rolling_mean_numba',
-    'rolling_mean_numba_parallel',
+    'calc_mmh_momentum_smoothing',
     'rolling_min_max_numba',
-    'rolling_min_max_numba_parallel',
 
     # Oscillators
     'calculate_ppo_core',
