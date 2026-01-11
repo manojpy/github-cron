@@ -303,61 +303,61 @@ def ema_loop_alpha(data, alpha):
 # ============================================================================
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
-def rng_filter_loop(x, r):
-    """Range filter in O(n) - single pass"""
+def rng_filter_loop_(x, r):
+    """Range filter - with proper initialization"""
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
 
-    filt[0] = 0.0 if np.isnan(x[0]) else x[0]
+    # Initialize with first value (not 0.0)
+    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
 
-    # Single pass O(n)
     for i in range(1, n):
         curr_x = x[i]
         curr_r = r[i]
-        prev = filt[i - 1] if not np.isnan(filt[i-1]) else 0.0
+        prev = filt[i - 1]
 
         if np.isnan(curr_x) or np.isnan(curr_r):
             filt[i] = prev
             continue
 
         if curr_x > prev:
-            filt[i] = max(prev, curr_x - curr_r)
+            new_val = curr_x - curr_r
+            filt[i] = prev if new_val < prev else new_val
         else:
-            filt[i] = min(prev, curr_x + curr_r)
+            new_val = curr_x + curr_r
+            filt[i] = prev if new_val > prev else new_val
 
     return filt
 
-
 @njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
 def smooth_range(close, t, m):
-    """Calculate smoothed range in O(n) - two EMA passes"""
+    """Calculate smoothed range - with explicit type handling"""
     n = len(close)
 
-    # Step 1: Calculate differences - O(n)
+    # Step 1: Absolute differences
     diff = np.empty(n, dtype=np.float64)
     diff[0] = 0.0
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i - 1])
 
-    # Step 2: First EMA pass - O(n)
-    alpha_t = 2.0 / (t + 1.0)
+    # Step 2: First EMA (period t)
+    alpha_t = 2.0 / (float(t) + 1.0)
     avrng = np.empty(n, dtype=np.float64)
     avrng[0] = diff[0]
     for i in range(1, n):
         curr = diff[i]
-        avrng[i] = avrng[i-1] if np.isnan(curr) else (alpha_t * curr + (1.0 - alpha_t) * avrng[i-1])
+        avrng[i] = (alpha_t * curr + (1.0 - alpha_t) * avrng[i-1]) if not np.isnan(curr) else avrng[i-1]
 
-    # Step 3: Second EMA pass - O(n)
+    # Step 3: Second EMA (period wper = t*2-1)
     wper = t * 2 - 1
-    alpha_w = 2.0 / (wper + 1.0)
+    alpha_w = 2.0 / (float(wper) + 1.0)
     smoothrng = np.empty(n, dtype=np.float64)
     smoothrng[0] = avrng[0]
     for i in range(1, n):
         curr = avrng[i]
-        smoothrng[i] = smoothrng[i-1] if np.isnan(curr) else (alpha_w * curr + (1.0 - alpha_w) * smoothrng[i-1])
+        smoothrng[i] = (alpha_w * curr + (1.0 - alpha_w) * smoothrng[i-1]) if not np.isnan(curr) else smoothrng[i-1]
 
     return smoothrng * float(m)
-
 
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):

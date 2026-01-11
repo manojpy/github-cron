@@ -672,9 +672,12 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
                 np.zeros(default_len, dtype=np.float64)
             )
         close = np.asarray(close, dtype=np.float64)
+        
+        # Use corrected smooth_range
         smrng_x1 = smooth_range(close, cfg.X1, cfg.X2)
         smrng_x2 = smooth_range(close, cfg.X3, cfg.X4)
         
+        # Use corrected range filter
         filt_x1 = rng_filter_loop(close, smrng_x1)
         filt_x12 = rng_filter_loop(close, smrng_x2)
           
@@ -689,7 +692,6 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64),
             np.zeros(default_len, dtype=np.float64)
         )
-
 # ============================================================================
 # REPLACE calculate_magical_momentum_hist in macd_unified.py
 # ============================================================================
