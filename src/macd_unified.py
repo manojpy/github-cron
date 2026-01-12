@@ -1874,7 +1874,10 @@ def validate_candle_data(
     data: Optional[Dict[str, np.ndarray]],
     required_len: int = 0,
 ) -> Tuple[bool, Optional[str]]:
-    
+    """
+    Validate candle data for OHLC integrity and staleness
+    CORRECTED: Added strict OHLC validation
+    """
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -1913,30 +1916,103 @@ def validate_candle_data(
         if len(close) < required_len:
             return False, f"Insufficient data: {len(close)} < {required_len}"
 
+        # ===================================================================
+        # NEW: STRICT OHLC INTEGRITY VALIDATION
+        # ===================================================================
+        open_arr = data.get("open")
+        high_arr = data.get("high")
+        low_arr = data.get("low")
+        
+        if open_arr is None or high_arr is None or low_arr is None:
+            return False, "Missing OHLC data (open, high, or low)"
+        
+        if len(open_arr) == 0 or len(high_arr) == 0 or len(low_arr) == 0:
+            return False, "OHLC arrays are empty"
+        
+        # Check for NaN/Inf in OHLC
+        nan_mask = (
+            np.isnan(open_arr) | np.isnan(high_arr) |
+            np.isnan(low_arr) | np.isnan(close)
+        )
+        if np.any(nan_mask):
+            nan_count = np.sum(nan_mask)
+            nan_indices = np.where(nan_mask)[0]
+            return False, f"Found {nan_count} candles with NaN in OHLC (indices: {nan_indices[:3].tolist()})"
+        
+        inf_mask = (
+            np.isinf(open_arr) | np.isinf(high_arr) |
+            np.isinf(low_arr) | np.isinf(close)
+        )
+        if np.any(inf_mask):
+            inf_count = np.sum(inf_mask)
+            inf_indices = np.where(inf_mask)[0]
+            return False, f"Found {inf_count} candles with Inf in OHLC (indices: {inf_indices[:3].tolist()})"
+        
+        # Check OHLC structure: Low <= Open <= High and Low <= Close <= High
+        valid_low_open = low_arr <= open_arr
+        valid_open_high = open_arr <= high_arr
+        valid_low_close = low_arr <= close
+        valid_close_high = close <= high_arr
+        valid_low_high = low_arr <= high_arr
+        
+        invalid_mask = ~(valid_low_open & valid_open_high & valid_low_close & valid_close_high & valid_low_high)
+        
+        if np.any(invalid_mask):
+            invalid_count = np.sum(invalid_mask)
+            invalid_indices = np.where(invalid_mask)[0]
+            
+            # Log detailed information about first few invalid candles
+            error_details = f"Found {invalid_count} invalid OHLC candles. Examples:\n"
+            for idx in invalid_indices[:3]:
+                error_details += (
+                    f"  Index {idx}: O={open_arr[idx]:.2f} H={high_arr[idx]:.2f} "
+                    f"L={low_arr[idx]:.2f} C={close[idx]:.2f} "
+                    f"[L≤O={valid_low_open[idx]} O≤H={valid_open_high[idx]} "
+                    f"L≤C={valid_low_close[idx]} C≤H={valid_close_high[idx]} L≤H={valid_low_high[idx]}]\n"
+                )
+            
+            return False, error_details.strip()
+        
+        # Check that last candle (most critical) is valid
+        if not (valid_low_open[-1] and valid_open_high[-1] and 
+                valid_low_close[-1] and valid_close_high[-1] and valid_low_high[-1]):
+            return False, (
+                f"Last candle (most critical) is invalid! "
+                f"O={open_arr[-1]:.2f} H={high_arr[-1]:.2f} "
+                f"L={low_arr[-1]:.2f} C={close[-1]:.2f}"
+            )
+        
+        # Check for non-positive prices
+        if np.any(open_arr <= 0) or np.any(high_arr <= 0) or \
+           np.any(low_arr <= 0) or np.any(close <= 0):
+            return False, "Found non-positive prices in OHLC"
+        
+        # Check for extreme price movements (sanity check)
+        if len(close) >= 2:
+            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
+            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
+            if len(extreme_changes) > 0:
+                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
+        
+        # Check for suspicious candle gaps
         if len(close) >= 2:
             time_diffs = np.diff(timestamp)
             if len(time_diffs) > 0:
                 median_diff = np.median(time_diffs)
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > 0:
-                    pass    
-
-        if len(close) >= 2:
-            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
-            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-            if len(extreme_changes) > 0:
-                logger.warning(
-                    f"Detected {len(extreme_changes)} extreme price changes "
-                    f"(max: {extreme_changes.max():.2f}%)"
-                )
-                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
-
+                if len(gaps) > len(time_diffs) * 0.1:  # More than 10% gaps
+                    return False, f"Too many suspicious candle gaps detected ({len(gaps)}/{len(time_diffs)})"
+        
+        # ===================================================================
+        # END OHLC VALIDATION
+        # ===================================================================
+        
         return True, None
+    
     except Exception as e:
-        logger.error(f"Data validation failed: {e}")
+        logger.error(f"Data validation exception: {e}", exc_info=True)
         return False, f"Validation error: {str(e)}"
-
 def get_last_closed_index_from_array(
     timestamps: np.ndarray,
     interval_minutes: int,
