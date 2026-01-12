@@ -1727,17 +1727,24 @@ class DataFetcher:
 def parse_candles_to_numpy(
     result: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Parse API candle response to NumPy arrays with strict OHLC validation
+    CORRECTED: Validates data integrity before returning
+    """
     if not result or not isinstance(result, dict):
+        logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
 
     res = result.get("result", {}) or {}
     required = ("t", "o", "h", "l", "c", "v")
     if not all(k in res for k in required):
+        logger.warning(f"parse_candles_to_numpy: missing required fields. Have: {list(res.keys())}")
         return None
 
     try:
         n = len(res["t"])
         if n == 0:
+            logger.warning("parse_candles_to_numpy: empty candle array")
             return None
 
         data = {
@@ -1756,84 +1763,113 @@ def parse_candles_to_numpy(
         data["close"][:] = res["c"]
         data["volume"][:] = res["v"]
 
+        # Convert milliseconds to seconds if needed
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
 
-        if np.isnan(data["close"][-1]) or data["close"][-1] <= 0:
+        # ===================================================================
+        # STRICT OHLC VALIDATION - NEW
+        # ===================================================================
+        
+        # Check for NaN/Inf in OHLC
+        nan_mask = (
+            np.isnan(data["open"]) | np.isnan(data["high"]) |
+            np.isnan(data["low"]) | np.isnan(data["close"])
+        )
+        if np.any(nan_mask):
+            nan_count = np.sum(nan_mask)
+            logger.warning(
+                f"parse_candles_to_numpy: Found {nan_count} candles with NaN values. "
+                f"Indices: {np.where(nan_mask)[0][:10]}"
+            )
             return None
-
+        
+        inf_mask = (
+            np.isinf(data["open"]) | np.isinf(data["high"]) |
+            np.isinf(data["low"]) | np.isinf(data["close"])
+        )
+        if np.any(inf_mask):
+            inf_count = np.sum(inf_mask)
+            logger.warning(
+                f"parse_candles_to_numpy: Found {inf_count} candles with Inf values. "
+                f"Indices: {np.where(inf_mask)[0][:10]}"
+            )
+            return None
+        
+        # Check basic OHLC structure: Low <= Open <= High and Low <= Close <= High
+        valid_low_open = data["low"] <= data["open"]
+        valid_open_high = data["open"] <= data["high"]
+        valid_low_close = data["low"] <= data["close"]
+        valid_close_high = data["close"] <= data["high"]
+        valid_low_high = data["low"] <= data["high"]
+        
+        invalid_mask = ~(valid_low_open & valid_open_high & valid_low_close & valid_close_high & valid_low_high)
+        
+        if np.any(invalid_mask):
+            invalid_count = np.sum(invalid_mask)
+            invalid_indices = np.where(invalid_mask)[0]
+            
+            # Log detailed information about invalid candles
+            logger.error(
+                f"parse_candles_to_numpy: Found {invalid_count} invalid OHLC candles. "
+                f"Examples:"
+            )
+            for idx in invalid_indices[:5]:  # Show first 5 invalid candles
+                logger.error(
+                    f"  Index {idx}: O={data['open'][idx]:.2f} H={data['high'][idx]:.2f} "
+                    f"L={data['low'][idx]:.2f} C={data['close'][idx]:.2f} "
+                    f"Valid: L≤O={valid_low_open[idx]} O≤H={valid_open_high[idx]} "
+                    f"L≤C={valid_low_close[idx]} C≤H={valid_close_high[idx]} L≤H={valid_low_high[idx]}"
+                )
+            
+            logger.error(
+                f"parse_candles_to_numpy: Rejecting entire candle set due to {invalid_count} invalid candles"
+            )
+            return None
+        
+        # Check that at least the last candle is valid (most critical for alerts)
+        if not (valid_low_open[-1] and valid_open_high[-1] and 
+                valid_low_close[-1] and valid_close_high[-1] and valid_low_high[-1]):
+            logger.error(
+                f"parse_candles_to_numpy: Last candle is invalid! "
+                f"O={data['open'][-1]:.2f} H={data['high'][-1]:.2f} "
+                f"L={data['low'][-1]:.2f} C={data['close'][-1]:.2f}"
+            )
+            return None
+        
+        # Check for positive prices
+        if np.any(data["close"] <= 0) or np.any(data["open"] <= 0) or \
+           np.any(data["high"] <= 0) or np.any(data["low"] <= 0):
+            logger.error("parse_candles_to_numpy: Found non-positive prices")
+            return None
+        
+        # Additional check: Close should not be suspiciously far from High/Low
+        hl_mid = (data["high"] + data["low"]) / 2.0
+        close_deviation = np.abs(data["close"] - hl_mid) / hl_mid
+        if np.any(close_deviation > 0.5):  # Close deviates >50% from HL midpoint
+            deviation_count = np.sum(close_deviation > 0.5)
+            logger.warning(
+                f"parse_candles_to_numpy: Found {deviation_count} candles with "
+                f"Close deviating >50% from High-Low midpoint (potential data anomaly)"
+            )
+            # Don't reject for this, just warn
+        
+        # ===================================================================
+        # END VALIDATION
+        # ===================================================================
+        
+        logger.debug(
+            f"parse_candles_to_numpy: âœ… Parsed {n} valid candles. "
+            f"Range: {data['close'].min():.2f}-{data['close'].max():.2f} | "
+            f"Latest: O={data['open'][-1]:.2f} H={data['high'][-1]:.2f} "
+            f"L={data['low'][-1]:.2f} C={data['close'][-1]:.2f}"
+        )
+        
         return data
 
     except Exception as e:
-        logger.error(f"Failed to parse candles: {e}")
+        logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
-
-def validate_candle_data(
-    data: Optional[Dict[str, np.ndarray]],
-    required_len: int = 0,
-) -> Tuple[bool, Optional[str]]:
-    
-    try:
-        if data is None or not data:
-            return False, "Data is None or empty"
-        
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-        
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
-        
-        current_time = get_trigger_timestamp()
-        last_candle_time = int(timestamp[-1])
-        staleness = current_time - last_candle_time
-
-        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
-        
-        if staleness > MAX_STALENESS:
-            return False, (
-                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
-                f"Last candle: {format_ist_time(last_candle_time)} | "
-                f"Current: {format_ist_time(current_time)}"
-            )
-        
-        if close is None or len(close) == 0:
-            return False, "Close array is empty"
-
-        if np.any(np.isnan(close)) or np.any(close <= 0):
-            return False, "Invalid close prices (NaN or <= 0)"
-
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
-            
-        if not np.all(timestamp[1:] >= timestamp[:-1]):
-            return False, "Timestamps not monotonic increasing"
-
-        if len(close) < required_len:
-            return False, f"Insufficient data: {len(close)} < {required_len}"
-
-        if len(close) >= 2:
-            time_diffs = np.diff(timestamp)
-            if len(time_diffs) > 0:
-                median_diff = np.median(time_diffs)
-                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
-                gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > 0:
-                    pass    
-
-        if len(close) >= 2:
-            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
-            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-            if len(extreme_changes) > 0:
-                logger.warning(
-                    f"Detected {len(extreme_changes)} extreme price changes "
-                    f"(max: {extreme_changes.max():.2f}%)"
-                )
-                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
-
-        return True, None
-    except Exception as e:
-        logger.error(f"Data validation failed: {e}")
-        return False, f"Validation error: {str(e)}"
 
 def get_last_closed_index_from_array(
     timestamps: np.ndarray,

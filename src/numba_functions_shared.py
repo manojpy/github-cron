@@ -601,14 +601,16 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
-
 # ============================================================================
-# CANDLE PATTERN RECOGNITION - O(n)
+# CORRECTED: Numba Vectorized Wick Check Functions with Strict Validation
 # ============================================================================
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
-    """Check buy candle quality in O(n) - single pass"""
+    """
+    Check buy candle quality in O(n) - single pass
+    CORRECTED: Validates OHLC integrity and rejects invalid wicks
+    """
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
     
@@ -619,20 +621,43 @@ def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_r
         l = low_arr[i]
         c = close_arr[i]
         
+        # VALIDATION: Reject if any OHLC values are NaN/Inf
         if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
             continue
+        if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
+            continue
         
+        # VALIDATION: Check OHLC integrity (High >= Open, High >= Close, Low <= Open, Low <= Close)
+        if not (l <= o <= h and l <= c <= h and l <= h):
+            # Invalid OHLC structure - reject this candle
+            continue
+        
+        # Check if green candle (Close > Open)
         if c <= o:
             continue
         
         candle_range = h - l
+        # Reject if candle range is too small (avoid division issues)
         if candle_range < 1e-8:
             continue
         
-        body_top = c if c > o else o
+        # For BUY (green candle): check upper wick
+        # Body top is the close (since close > open for green)
+        body_top = c
         upper_wick = h - body_top
+        
+        # VALIDATION: Reject if wick calculation produced negative value
+        # (This indicates data corruption since High should be >= Close)
+        if upper_wick < 0.0:
+            continue
+        
         wick_ratio = upper_wick / candle_range
         
+        # VALIDATION: Reject if wick_ratio is invalid (negative or > 1.0)
+        if wick_ratio < 0.0 or wick_ratio > 1.0:
+            continue
+        
+        # Only pass if wick ratio is LESS than threshold
         result[i] = wick_ratio < min_wick_ratio
     
     return result
@@ -640,7 +665,10 @@ def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_r
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
-    """Check sell candle quality in O(n) - single pass"""
+    """
+    Check sell candle quality in O(n) - single pass
+    CORRECTED: Validates OHLC integrity and rejects invalid wicks
+    """
     n = len(close_arr)
     result = np.zeros(n, dtype=np.bool_)
     
@@ -651,26 +679,46 @@ def vectorized_wick_check_sell(open_arr, high_arr, low_arr, close_arr, min_wick_
         l = low_arr[i]
         c = close_arr[i]
         
+        # VALIDATION: Reject if any OHLC values are NaN/Inf
         if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
             continue
+        if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
+            continue
         
+        # VALIDATION: Check OHLC integrity (High >= Open, High >= Close, Low <= Open, Low <= Close)
+        if not (l <= o <= h and l <= c <= h and l <= h):
+            # Invalid OHLC structure - reject this candle
+            continue
+        
+        # Check if red candle (Close < Open)
         if c >= o:
             continue
         
         candle_range = h - l
+        # Reject if candle range is too small (avoid division issues)
         if candle_range < 1e-8:
             continue
         
-        body_bottom = c if c < o else o
+        # For SELL (red candle): check lower wick
+        # Body bottom is the close (since close < open for red)
+        body_bottom = c
         lower_wick = body_bottom - l
+        
+        # VALIDATION: Reject if wick calculation produced negative value
+        # (This indicates data corruption since Low should be <= Close)
         if lower_wick < 0.0:
-            lower_wick = 0.0
+            continue
         
         wick_ratio = lower_wick / candle_range
+        
+        # VALIDATION: Reject if wick_ratio is invalid (negative or > 1.0)
+        if wick_ratio < 0.0 or wick_ratio > 1.0:
+            continue
+        
+        # Only pass if wick ratio is LESS than threshold
         result[i] = wick_ratio < min_wick_ratio
     
     return result
-
 
 # ============================================================================
 # METADATA & EXPORTS
