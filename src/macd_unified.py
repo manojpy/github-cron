@@ -132,24 +132,30 @@ PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 _IST_TZ = ZoneInfo("Asia/Kolkata")
 
 def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> str:
+    """Format datetime/timestamp to IST timezone"""
     try:
         if dt_or_ts is None:
             dt = datetime.now(timezone.utc)
-        elif isinstance(dt_or_ts, (int, float)) or (isinstance(dt_or_ts, str) and dt_or_ts.isdigit()):
-            # Handle numeric epoch values (int, float, or digit-only string)
+        elif isinstance(dt_or_ts, str):
+            # For strings: try numeric first, then ISO format
+            try:
+                ts = float(dt_or_ts)
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            except ValueError:
+                # Not numeric, try ISO format
+                dt = datetime.fromisoformat(dt_or_ts).replace(tzinfo=timezone.utc)
+        elif isinstance(dt_or_ts, (int, float)):
+            # Numeric types: treat as epoch timestamp
             dt = datetime.fromtimestamp(float(dt_or_ts), tz=timezone.utc)
         else:
-            # Handle ISO-8601 strings
+            # Try parsing as ISO string
             dt = datetime.fromisoformat(str(dt_or_ts)).replace(tzinfo=timezone.utc)
+        
         return dt.astimezone(_IST_TZ).strftime(fmt)
     except (ValueError, TypeError, OSError, AttributeError) as e:
         logger.debug(f"format_ist_time parsing failed for input '{dt_or_ts}': {e}")
-        try:
-            ts = float(dt_or_ts)
-            return datetime.fromtimestamp(ts, tz=_IST_TZ).strftime(fmt)
-        except (ValueError, TypeError, OSError):
-            return str(dt_or_ts)
-
+        # Final fallback: return as string
+        return str(dt_or_ts)
 
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
