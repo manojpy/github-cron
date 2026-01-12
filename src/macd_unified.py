@@ -135,20 +135,21 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
     try:
         if dt_or_ts is None:
             dt = datetime.now(timezone.utc)
-        elif isinstance(dt_or_ts, (int, float)):
+        elif isinstance(dt_or_ts, (int, float)) or (isinstance(dt_or_ts, str) and dt_or_ts.isdigit()):
+            # Handle numeric epoch values (int, float, or digit-only string)
             dt = datetime.fromtimestamp(float(dt_or_ts), tz=timezone.utc)
         else:
+            # Handle ISO-8601 strings
             dt = datetime.fromisoformat(str(dt_or_ts)).replace(tzinfo=timezone.utc)
         return dt.astimezone(_IST_TZ).strftime(fmt)
     except (ValueError, TypeError, OSError, AttributeError) as e:
-        # Log the specific error for debugging
         logger.debug(f"format_ist_time parsing failed for input '{dt_or_ts}': {e}")
         try:
-            # Fallback: try direct timestamp conversion
             ts = float(dt_or_ts)
             return datetime.fromtimestamp(ts, tz=_IST_TZ).strftime(fmt)
         except (ValueError, TypeError, OSError):
             return str(dt_or_ts)
+
 
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
