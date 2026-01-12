@@ -1480,7 +1480,6 @@ class APICircuitBreaker:
         
         return True, None
 
-
 class DataFetcher:
     def __init__(
         self,
@@ -1870,6 +1869,73 @@ def parse_candles_to_numpy(
     except Exception as e:
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
+
+def validate_candle_data(
+    data: Optional[Dict[str, np.ndarray]],
+    required_len: int = 0,
+) -> Tuple[bool, Optional[str]]:
+    
+    try:
+        if data is None or not data:
+            return False, "Data is None or empty"
+        
+        close = data.get("close")
+        timestamp = data.get("timestamp")
+        
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
+        
+        current_time = get_trigger_timestamp()
+        last_candle_time = int(timestamp[-1])
+        staleness = current_time - last_candle_time
+
+        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
+        
+        if staleness > MAX_STALENESS:
+            return False, (
+                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
+                f"Last candle: {format_ist_time(last_candle_time)} | "
+                f"Current: {format_ist_time(current_time)}"
+            )
+        
+        if close is None or len(close) == 0:
+            return False, "Close array is empty"
+
+        if np.any(np.isnan(close)) or np.any(close <= 0):
+            return False, "Invalid close prices (NaN or <= 0)"
+
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
+            
+        if not np.all(timestamp[1:] >= timestamp[:-1]):
+            return False, "Timestamps not monotonic increasing"
+
+        if len(close) < required_len:
+            return False, f"Insufficient data: {len(close)} < {required_len}"
+
+        if len(close) >= 2:
+            time_diffs = np.diff(timestamp)
+            if len(time_diffs) > 0:
+                median_diff = np.median(time_diffs)
+                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
+                gaps = time_diffs[time_diffs > max_expected_gap]
+                if len(gaps) > 0:
+                    pass    
+
+        if len(close) >= 2:
+            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
+            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
+            if len(extreme_changes) > 0:
+                logger.warning(
+                    f"Detected {len(extreme_changes)} extreme price changes "
+                    f"(max: {extreme_changes.max():.2f}%)"
+                )
+                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
+
+        return True, None
+    except Exception as e:
+        logger.error(f"Data validation failed: {e}")
+        return False, f"Validation error: {str(e)}"
 
 def get_last_closed_index_from_array(
     timestamps: np.ndarray,
