@@ -4077,7 +4077,7 @@ async def evaluate_pair_and_alert(
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
                 logger_pair.info(
-                    f"🔵🎯🟢  Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                    f"🔵🎯🟠  Sent {len(alerts_to_send)} alerts for {pair_name} | "
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:
