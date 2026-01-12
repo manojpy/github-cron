@@ -41,11 +41,12 @@ def sanitize_array_numba_parallel(arr, default):
 # STATISTICAL FUNCTIONS - OPTIMIZED TO O(n)
 # ============================================================================
 
-@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
+njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """Calculate rolling std in O(n) using Welford's online algorithm"""
+    """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
+    # Clamp responsiveness as per logic [cite: 1]
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
 
     window_sum = 0.0
@@ -57,13 +58,15 @@ def rolling_std(close, period, responsiveness):
     for i in range(n):
         curr = close[i]
         
+        # Remove old value from window [cite: 2]
         if i >= period:
             old_val = queue[queue_idx]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 window_sq_sum -= old_val * old_val
-                window_count -= 1
+                window_count -= 1 # [cite: 3]
         
+        # Add current value [cite: 3]
         if not np.isnan(curr):
             window_sum += curr
             window_sq_sum += curr * curr
@@ -71,13 +74,17 @@ def rolling_std(close, period, responsiveness):
         
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-        
-        if window_count == 0:
-            sd[i] = 0.0
+     
+        # Calculate Sample SD (n-1)
+        if window_count < 2:
+            sd[i] = 0.0 # [cite: 4]
         else:
             mean = window_sum / window_count
-            variance = (window_sq_sum / window_count) - (mean * mean)
-            sd[i] = np.sqrt(max(0.0, variance)) * resp
+            # Population variance formula from source [cite: 4]
+            pop_variance = (window_sq_sum / window_count) - (mean * mean)
+            # Convert to Sample Variance: pop_var * (n / (n-1))
+            sample_variance = pop_variance * (window_count / (window_count - 1))
+            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp # [cite: 4]
 
     return sd
 
