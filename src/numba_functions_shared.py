@@ -175,32 +175,45 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 
 @njit("f8[:](f8[:], f8[:], f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_value_loop(temp_arr, min_med, max_med, rows):
-    """Calculate value array - exact Pine logic with proper normalization"""
+def calc_mmh_value_loop(raw_momentum, min_med, max_med, rows):
+    """
+    Calculate value array - Pine-accurate version with proper initialization
+    FIXED: Now correctly implements Pine's value calculation with proper NaN handling
+    """
     value_arr = np.empty(rows, dtype=np.float64)
-    initial_multiplier = 1.0
 
     for i in range(rows):
-        # Get normalized temp - handle division by zero
-        denom = max_med[i] - min_med[i]
-        if np.abs(denom) < 1e-10:
-            temp_val = 0.5
-        else:
-            raw_val = temp_arr[i]
-            if np.isnan(raw_val) or np.isnan(min_med[i]) or np.isnan(max_med[i]):
-                temp_val = 0.5
-            else:
-                temp_val = (raw_val - min_med[i]) / denom
+        raw = raw_momentum[i]
+        mn = min_med[i]
+        mx = max_med[i]
         
-        # Pine: value = 0.5 * 2 = 1.0
+        # Handle NaN/invalid cases - return NaN to preserve warmup period
+        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx):
+            value_arr[i] = np.nan
+            continue
+        
+        # Normalize temp between min and max
+        denom = mx - mn
+        if np.abs(denom) < 1e-10:
+            # When min == max, temp = 0.5 (middle)
+            temp = 0.5
+        else:
+            temp = (raw - mn) / denom
+            # Clamp temp to [0, 1] range
+            temp = max(0.0, min(1.0, temp))
+        
+        # Pine: value = 0.5 * 2 = 1.0 initially
         # value := value * (temp - 0.5 + 0.5 * nz(value[1]))
         if i == 0:
-            v = initial_multiplier * (temp_val - 0.5)
+            # First bar: nz(value[-1]) = 0
+            v = 1.0 * (temp - 0.5 + 0.0)
         else:
             prev_v = value_arr[i - 1]
-            v = initial_multiplier * (temp_val - 0.5 + 0.5 * prev_v)
+            # If previous is NaN, treat as 0 (nz behavior)
+            prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
+            v = 1.0 * (temp - 0.5 + 0.5 * prev_v_safe)
         
-        # Clamp to [-0.9999, 0.9999]
+        # Clamp to [-0.9999, 0.9999] to prevent division by zero in log
         value_arr[i] = max(-0.9999, min(0.9999, v))
 
     return value_arr
@@ -208,36 +221,63 @@ def calc_mmh_value_loop(temp_arr, min_med, max_med, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(value_arr, rows):
-    """Calculate momentum array - exact Pine transformation"""
+    """
+    Calculate momentum array - Pine's exact log-odds transformation
+    FIXED: Now correctly preserves NaN and handles edge cases
+    """
     momentum = np.empty(rows, dtype=np.float64)
 
     for i in range(rows):
         val = value_arr[i]
         
+        # Preserve NaN through calculation
+        if np.isnan(val):
+            momentum[i] = np.nan
+            continue
+        
         # Pine: temp2 = (1 + value) / (1 - value); momentum = 0.25 * math.log(temp2)
-        if np.abs(val) >= 0.9999:
-            # Handle edge case - approaching singularity
-            if val > 0:
-                temp2 = (1.0 + 0.9999) / (1.0 - 0.9999)
-            else:
-                temp2 = (1.0 - 0.9999) / (1.0 + 0.9999)
-            momentum[i] = 0.25 * np.log(temp2) * np.sign(val)
-        else:
-            temp2 = (1.0 + val) / (1.0 - val)
-            momentum[i] = 0.25 * np.log(temp2)
+        # Clamp value to safe range to prevent division issues
+        val = max(-0.99999, min(0.99999, val))
+        
+        denominator = 1.0 - val
+        if np.abs(denominator) < 1e-10:
+            # Would cause division by zero - shouldn't happen with clamping
+            momentum[i] = np.nan
+            continue
+        
+        numerator = 1.0 + val
+        if numerator <= 0:
+            # Log of negative/zero undefined
+            momentum[i] = np.nan
+            continue
+        
+        temp2 = numerator / denominator
+        momentum[i] = 0.25 * np.log(temp2)
 
     return momentum
 
-
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_momentum_smoothing(momentum, rows):
-    """Apply momentum smoothing - Pine: momentum := momentum + 0.5 * nz(momentum[1])"""
-    result = momentum.copy()
+def calc_mmh_momentum_smoothing(momentum_in, rows):
+    """
+    Apply momentum smoothing - Pine: momentum := momentum + 0.5 * nz(momentum[1])
+    FIXED: Now correctly handles NaN and maintains warmup period
+    """
+    result = momentum_in.copy()
     
     for i in range(1, rows):
+        curr_momentum = result[i]
         prev_momentum = result[i - 1]
-        if not np.isnan(prev_momentum):
-            result[i] = result[i] + 0.5 * prev_momentum
+        
+        # Preserve NaN in current bar
+        if np.isnan(curr_momentum):
+            # Don't apply smoothing to NaN bars
+            continue
+        
+        # If previous is NaN, nz() returns 0
+        prev_momentum_safe = 0.0 if np.isnan(prev_momentum) else prev_momentum
+        
+        # Pine: momentum := momentum + 0.5 * nz(momentum[1])
+        result[i] = curr_momentum + 0.5 * prev_momentum_safe
 
     return result
 

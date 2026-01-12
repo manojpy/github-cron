@@ -713,71 +713,51 @@ def calculate_magical_momentum_hist(
     period: int = 144,
     responsiveness: float = 0.9
 ) -> np.ndarray:
-    """
-    Calculate Magical Momentum Histogram - Pine-accurate version
     
-    Args:
-        close: Close prices array (float64)
-        period: Momentum period (default 144)
-        responsiveness: Responsiveness factor 0-1 (default 0.9)
-    
-    Returns:
-        Momentum histogram array
-    """
     try:
         if close is None or len(close) < period:
-            return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+            return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
         rows = len(close)
         resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
         close_c = np.ascontiguousarray(close, dtype=np.float64)
 
         # Step 1: Rolling standard deviation (50-period)
-      
         sd = rolling_std(close_c, 50, resp_clamped)
 
         # Step 2: Worm calculation
-       
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-        # Step 3: Moving average
-       
+        # Step 3: Simple moving average (period-period)
         ma = rolling_mean_numba(close_c, period)
 
         # Step 4: Raw momentum (worm - ma) / worm
-        
         raw = np.empty(rows, dtype=np.float64)
         for i in range(rows):
             if np.abs(worm_arr[i]) < 1e-10:
-                raw[i] = np.nan
+                raw[i] = np.nan  # ← CRITICAL: Return NaN, don't force 0
             else:
                 raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
 
         # Step 5: Min/max of raw momentum over period
-        
         min_med, max_med = rolling_min_max_numba(raw, period)
 
-        # Step 6: Normalize and transform to value - CORRECTED SIGNATURE
-        
+        # Step 6: Normalize and transform to value
         value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
 
-        # Step 7: Transform to log-odds 
+        # Step 7: Transform to log-odds (momentum)
         momentum = calc_mmh_momentum_loop(value_arr, rows)
 
         # Step 8: Smooth momentum
-        
         momentum = calc_mmh_momentum_smoothing(momentum, rows)
 
-        # Step 9: Clean up any inf/nan artifacts
-       
-        momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
-
+        
         return momentum
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return np.zeros(len(close) if close is not None else 1, dtype=np.float64)
+        return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
 def warmup_if_needed() -> None:
     if not aot_bridge.requires_warmup():
@@ -948,9 +928,9 @@ def calculate_all_indicators_numpy(
         else:
             results["vwap"] = close_15m.copy()
 
-        # MMH
-        mmh = calculate_magical_momentum_hist(close_15m)
-        results['mmh'] = np.nan_to_num(mmh, nan=0.0, posinf=0.0, neginf=0.0)
+        # MMH - CORRECTED HANDLING
+        mmh = calculate_magical_momentum_hist(close_15m)       
+        results['mmh'] = mmh
         
         # Cirrus Cloud
         if cfg.CIRRUS_CLOUD_ENABLED:
@@ -3550,6 +3530,22 @@ async def evaluate_pair_and_alert(
         mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
+        
+        # NEW: Handle NaN values - they indicate warmup period
+        # Only process MMH alerts if we have valid (non-NaN) values
+        has_valid_mmh = (
+            not np.isnan(mmh_curr) and 
+            not np.isnan(mmh_m1) and 
+            not np.isnan(mmh_m2) and 
+            not np.isnan(mmh_m3)
+        )
+        
+        if not has_valid_mmh:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Skipping MMH alerts for {pair_name}: "
+                    f"warmup period (NaN values detected)"
+                )
 
         # Moving averages from i15 and i5
         rma50_15_val = rma50_15[i15]
@@ -3673,24 +3669,12 @@ async def evaluate_pair_and_alert(
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
 
-        # MMH reversal detection from i15
         mmh_reversal_buy = False
         mmh_reversal_sell = False
-
-        if i15 >= 3:
-            mmh_reversal_buy = (
-                buy_common and
-                mmh_curr > 0 and
-                mmh_m3 > mmh_m2 > mmh_m1 and
-                mmh_curr > mmh_m1
-            )
-
-            mmh_reversal_sell = (
-                sell_common and
-                mmh_curr < 0 and
-                mmh_m3 < mmh_m2 < mmh_m1 and
-                mmh_curr < mmh_m1
-            )
+    else:
+        # Now safe to evaluate reversals (existing logic) 
+        mmh_reversal_buy = buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
+        mmh_reversal_sell = sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
 
         # ============================================================================
         # Build context with ALL required keys and CONSISTENT candle data from i15
@@ -4154,7 +4138,7 @@ async def evaluate_pair_and_alert(
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
-            logger_pair.debug(
+            logger_pair.info(
                 f"✅ {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
@@ -4645,7 +4629,7 @@ async def run_once() -> bool:
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
-                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
+                    f"��� {cfg.BOT_NAME} - FATAL ERROR\n"
                     f"Error: {str(e)[:200]}\n"
                     f"Correlation ID: {correlation_id}\n"
                     f"Time: {format_ist_time()}"
