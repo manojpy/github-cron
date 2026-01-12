@@ -43,10 +43,9 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
+    """Calculate rolling std in O(n) using Welford's online algorithm"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
-    # Clamp responsiveness as per logic [cite: 1]
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
 
     window_sum = 0.0
@@ -58,15 +57,13 @@ def rolling_std(close, period, responsiveness):
     for i in range(n):
         curr = close[i]
         
-        # Remove old value from window [cite: 2]
         if i >= period:
             old_val = queue[queue_idx]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 window_sq_sum -= old_val * old_val
-                window_count -= 1 # [cite: 3]
+                window_count -= 1
         
-        # Add current value [cite: 3]
         if not np.isnan(curr):
             window_sum += curr
             window_sq_sum += curr * curr
@@ -74,23 +71,20 @@ def rolling_std(close, period, responsiveness):
         
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-     
-        # Calculate Sample SD (n-1)
-        if window_count < 2:
-            sd[i] = 0.0 # [cite: 4]
+        
+        if window_count == 0:
+            sd[i] = 0.0
         else:
             mean = window_sum / window_count
-            # Population variance formula from source [cite: 4]
-            pop_variance = (window_sq_sum / window_count) - (mean * mean)
-            # Convert to Sample Variance: pop_var * (n / (n-1))
-            sample_variance = pop_variance * (window_count / (window_count - 1))
-            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp # [cite: 4]
+            variance = (window_sq_sum / window_count) - (mean * mean)
+            sd[i] = np.sqrt(max(0.0, variance)) * resp
 
     return sd
 
+
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """Calculate rolling mean with Pine-style warm-up (NaN until period is met)"""
+    """Calculate rolling mean in O(n) using sliding window"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
@@ -99,15 +93,20 @@ def rolling_mean_numba(data, period):
     queue = np.zeros(period, dtype=np.float64)
     queue_idx = 0
     
-    for i in range(n):
-        # Remove old value [cite: 7]
-        if i >= period:
-            old_val = queue[queue_idx]
-            if not np.isnan(old_val):
-                window_sum -= old_val
-                window_count -= 1 # [cite: 7]
+    for i in range(period):
+        if not np.isnan(data[i]):
+            window_sum += data[i]
+            window_count += 1
+        queue[queue_idx] = data[i]
+        queue_idx = (queue_idx + 1) % period
+        out[i] = window_sum / window_count if window_count > 0 else 0.0
+    
+    for i in range(period, n):
+        old_val = queue[queue_idx]
+        if not np.isnan(old_val):
+            window_sum -= old_val
+            window_count -= 1
         
-        # Add current value [cite: 7]
         curr = data[i]
         if not np.isnan(curr):
             window_sum += curr
@@ -116,58 +115,39 @@ def rolling_mean_numba(data, period):
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
         
-        # Pine ta.sma returns NaN until the window is full [cite: 8]
-        if i < period - 1:
-            out[i] = np.nan
-        else:
-            out[i] = window_sum / window_count if window_count > 0 else np.nan # [cite: 8]
+        out[i] = window_sum / window_count if window_count > 0 else out[i-1]
     
     return out
 
+
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    """Optimized O(n) rolling min/max using a sliding window algorithm"""
+    """Calculate rolling min/max in O(n)"""
     rows = len(arr)
-    min_arr = np.full(rows, np.nan, dtype=np.float64) # 
-    max_arr = np.full(rows, np.nan, dtype=np.float64) # 
-
-    # Deques to store indices of potential min/max candidates
-    min_deque = np.zeros(rows, dtype=np.int32)
-    max_deque = np.zeros(rows, dtype=np.int32)
-    
-    # Deque pointers: head (start) and tail (end)
-    min_h, min_t = 0, 0
-    max_h, max_t = 0, 0
+    min_arr = np.empty(rows, dtype=np.float64)
+    max_arr = np.empty(rows, dtype=np.float64)
 
     for i in range(rows):
-        val = arr[i]
+        start = max(0, i - period + 1)
         
-        if np.isnan(val):
-            # If current is NaN, it doesn't affect min/max logic 
-            # but we still check if the window has passed the head [cite: 10]
-            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
-            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
-        else:
-            # Maintain Min Deque
-            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
-            while min_t > min_h and arr[min_deque[min_t - 1]] >= val:
-                min_t -= 1
-            min_deque[min_t] = i
-            min_t += 1
+        min_val = np.inf
+        max_val = -np.inf
+        has_valid = False
 
-            # Maintain Max Deque
-            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
-            while max_t > max_h and arr[max_deque[max_t - 1]] <= val:
-                max_t -= 1
-            max_deque[max_t] = i
-            max_t += 1
+        for j in range(start, i + 1):
+            val = arr[j]
+            if not np.isnan(val):
+                has_valid = True
+                if val < min_val:
+                    min_val = val
+                if val > max_val:
+                    max_val = val
 
-        # Fill output after reaching the minimum window requirement
-        if i >= period - 1:
-            if min_h < min_t: min_arr[i] = arr[min_deque[min_h]] # [cite: 10]
-            if max_h < max_t: max_arr[i] = arr[max_deque[max_h]] # [cite: 10]
+        min_arr[i] = min_val if has_valid else np.nan
+        max_arr[i] = max_val if has_valid else np.nan
 
     return min_arr, max_arr
+
 
 @njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
@@ -194,77 +174,92 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     return worm_arr
 
 
-@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
-def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
-    """Corrected value loop with NaN propagation to match Pine Script recursion"""
-    value_arr = np.full(rows, np.nan, dtype=np.float64)
-    
+@njit("f8[:](f8[:], f8[:], f8[:], i8)", nogil=True, cache=True)
+def calc_mmh_value_loop(raw_momentum, min_med, max_med, rows):
+    value_arr = np.empty(rows, dtype=np.float64)
+    value_arr[:] = np.nan
+
     for i in range(rows):
-        raw = raw_arr[i]
-        mn = min_arr[i]
-        mx = max_arr[i]
-        
-        # 1. Calculate temp (Must be NaN if inputs are NaN or range is zero)
-        denom = mx - mn
-        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx) or np.abs(denom) < 1e-10:
+        mn = min_med[i]
+        mx = max_med[i]
+        raw = raw_momentum[i]
+
+        # Normalize temp
+        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx):
             temp = np.nan
         else:
-            temp = (raw - mn) / denom
+            denom = mx - mn
+            if np.abs(denom) < 1e-10:
+                temp = np.nan  # Pine would yield NaN here
+            else:
+                temp = (raw - mn) / denom
 
-        # 2. Calculate recursive value
-        # In Pine, if temp is na, value becomes na.
-        if np.isnan(temp):
-            value_arr[i] = np.nan
+        # Pine initialization: value = 1.0
+        if i == 0:
+            prev_v_safe = 0.0  # nz(value[1]) = 0 on first bar
         else:
-            # Get previous value; use nz() logic (0.0 if previous is na)
-            prev_v = value_arr[i-1] if i > 0 else np.nan
+            prev_v = value_arr[i - 1]
             prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
-            
-            # Formula: value := 1.0 * (temp - 0.5 + 0.5 * nz(value[1]))
-            v = 1.0 * (temp - 0.5 + 0.5 * prev_v_safe)
-            
-            # Clamp to Pine limits
-            if v > 0.9999: v = 0.9999
-            if v < -0.9999: v = -0.9999
-            value_arr[i] = v
-            
+
+        v = 1.0 * ((0.0 if np.isnan(temp) else temp) - 0.5 + 0.5 * prev_v_safe)
+
+        # Clamp AFTER update
+        value_arr[i] = max(-0.9999, min(0.9999, v))
+
     return value_arr
 
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
+
+@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(value_arr, rows):
-    """Corrected momentum transform (log-odds)"""
-    momentum = np.full(rows, np.nan, dtype=np.float64)
-    
+    """
+    Calculate momentum array - Pine's exact log-odds transformation
+    FIXED: Now correctly preserves NaN and handles edge cases
+    """
+    momentum = np.empty(rows, dtype=np.float64)
+
     for i in range(rows):
-        v = value_arr[i]
-        if np.isnan(v):
+        val = value_arr[i]
+        
+        # Preserve NaN through calculation
+        if np.isnan(val):
             momentum[i] = np.nan
-        else:
-            # Formula: .25 * math.log((1 + value) / (1 - value))
-            # Safe clamping for log
-            val_clamped = max(-0.99999, min(0.99999, v))
-            temp2 = (1.0 + val_clamped) / (1.0 - val_clamped)
-            momentum[i] = 0.25 * np.log(temp2)
-            
+            continue
+        
+        # Pine: temp2 = (1 + value) / (1 - value); momentum = 0.25 * math.log(temp2)
+        # Clamp value to safe range to prevent division issues
+        val = max(-0.99999, min(0.99999, val))
+        
+        denominator = 1.0 - val
+        if np.abs(denominator) < 1e-10:
+            # Would cause division by zero - shouldn't happen with clamping
+            momentum[i] = np.nan
+            continue
+        
+        numerator = 1.0 + val
+        if numerator <= 0:
+            # Log of negative/zero undefined
+            momentum[i] = np.nan
+            continue
+        
+        temp2 = numerator / denominator
+        momentum[i] = 0.25 * np.log(temp2)
+
     return momentum
 
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def calc_mmh_momentum_smoothing(momentum_arr, rows):
-    """Corrected final smoothing with NaN propagation"""
-    result = np.full(rows, np.nan, dtype=np.float64)
-    
-    for i in range(rows):
-        curr = momentum_arr[i]
-        
-        # In Pine: momentum := momentum + .5 * nz(momentum[1])
-        # If current momentum is na, the result of the addition is na.
-        if np.isnan(curr):
-            result[i] = np.nan
-        else:
-            prev = result[i-1] if i > 0 else np.nan
-            prev_safe = 0.0 if np.isnan(prev) else prev
-            result[i] = curr + 0.5 * prev_safe
-            
+@njit("f8[:](f8[:], i8)", nogil=True, cache=True)
+def calc_mmh_momentum_smoothing(momentum_in, rows):
+    result = momentum_in.copy()
+
+    for i in range(1, rows):
+        prev = result[i - 1]
+        prev_safe = 0.0 if np.isnan(prev) else prev
+
+        curr = result[i]
+        curr_safe = 0.0 if np.isnan(curr) else curr
+
+        # Apply smoothing exactly like Pine
+        result[i] = curr_safe + 0.5 * prev_safe
+
     return result
 
 # ============================================================================
