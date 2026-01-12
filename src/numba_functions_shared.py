@@ -176,12 +176,6 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_value_loop(raw_momentum, min_med, max_med, rows):
-    """
-    Pine-accurate value calculation:
-    - Initial value = 1.0 (0.5*2)
-    - Recursive update with nz(value[1]) semantics
-    - Clamp AFTER update
-    """
     value_arr = np.empty(rows, dtype=np.float64)
     value_arr[:] = np.nan
 
@@ -202,12 +196,12 @@ def calc_mmh_value_loop(raw_momentum, min_med, max_med, rows):
 
         # Pine initialization: value = 1.0
         if i == 0:
-            prev_v = 0.0  # nz(value[1]) = 0 on first bar
-            v = 1.0 * ( (0.0 if np.isnan(temp) else temp) - 0.5 + 0.5 * prev_v )
+            prev_v_safe = 0.0  # nz(value[1]) = 0 on first bar
         else:
             prev_v = value_arr[i - 1]
             prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
-            v = 1.0 * ( (0.0 if np.isnan(temp) else temp) - 0.5 + 0.5 * prev_v_safe )
+
+        v = 1.0 * ((0.0 if np.isnan(temp) else temp) - 0.5 + 0.5 * prev_v_safe)
 
         # Clamp AFTER update
         value_arr[i] = max(-0.9999, min(0.9999, v))
@@ -254,12 +248,6 @@ def calc_mmh_momentum_loop(value_arr, rows):
 
 @njit("f8[:](f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_momentum_smoothing(momentum_in, rows):
-    """
-    Pine-accurate momentum smoothing:
-    momentum := momentum + 0.5 * nz(momentum[1])
-    - Always apply smoothing, even if current is NaN
-    - nz(prev) = 0 if NaN
-    """
     result = momentum_in.copy()
 
     for i in range(1, rows):
