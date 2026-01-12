@@ -3420,7 +3420,7 @@ async def evaluate_pair_and_alert(
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
     Evaluate all indicators for a pair and send alerts if conditions met.
-    ✅ CORRECTED: Proper null safety, error handling, and validation
+    ✅ CORRECTED: Proper null safety, error handling, validation, and consistent candle data
     """
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
@@ -3495,49 +3495,99 @@ async def evaluate_pair_and_alert(
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
         
-        # Extract current candle values
+        # ============================================================================
+        # CONSISTENCY CHECK: Extract ALL candle data from i15 (closed candle)
+        # CRITICAL: All values must come from the SAME candle index
+        # ============================================================================
+        
+        # Current closed candle (i15) values
         close_curr = close_15m[i15]
         close_prev = close_15m[i15 - 1]
-        close_5m_val = data_5m["close"][i5]
-        ts_curr = int(timestamps_15m[i15])
         open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
-        low_curr = data_15m["low"][i15]   
+        low_curr = data_15m["low"][i15]
+        ts_curr = int(timestamps_15m[i15])
+        
+        # Previous candle values
+        open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
+        high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
+        low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
+        
+        # 5-minute candle data (from i5 index)
+        close_5m_val = data_5m["close"][i5]
+        
+        # Indicator values from i15
+        ppo_curr = ppo[i15]
+        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
+        ppo_sig_curr = ppo_signal[i15]
+        ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
+        rsi_curr = smooth_rsi[i15]
+        rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
+        
+        # VWAP from i15 (with previous value from i15-1)
+        if not cfg.ENABLE_VWAP:
+            vwap_curr = close_curr
+            vwap_prev = close_prev
+        elif vwap is None or len(vwap) == 0:
+            logger_pair.warning("VWAP enabled but vwap array is None or empty")
+            vwap_curr = close_curr
+            vwap_prev = close_prev
+        elif len(vwap) <= i15:
+            logger_pair.warning(
+                f"VWAP enabled but insufficient data "
+                f"(len(vwap)={len(vwap)} ≤ i15={i15}) – VWAP alerts skipped"
+            )
+            vwap_curr = close_curr
+            vwap_prev = close_prev
+        else:
+            vwap_curr = vwap[i15]
+            vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
+        
+        # MMH from i15
+        mmh_curr = mmh[i15]
+        mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
+        mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
+        mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
+        
+        # Moving averages from i15 and i5
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-
+        
+        # Cloud state from i15
+        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
+        
         # ============================================================================
-        # Calculate ACTUAL wick ratios from current candle
+        # WICK RATIO CALCULATIONS - From i15 candle OHLC
+        # These MUST match the OHLC data displayed in the alert message
         # ============================================================================
-        i15_open = float(open_15m[i15])
-        i15_high = float(data_15m["high"][i15])
-        i15_low = float(data_15m["low"][i15])
-        i15_close = close_curr
-
-        # Calculate actual wick ratios for current candle
-        candle_range = i15_high - i15_low
+        
+        candle_range = high_curr - low_curr
+        
         if candle_range < 1e-8:
+            # Avoid division by zero for very small ranges
             actual_buy_wick_ratio = 1.0
             actual_sell_wick_ratio = 1.0
         else:
-            # Buy (green candle) - check upper wick
-            body_top = max(i15_open, i15_close)
-            upper_wick = i15_high - body_top
+            # BUY (green candle): Upper wick is from close to high
+            body_top_buy = close_curr  # For green candle, close is body top
+            upper_wick = high_curr - body_top_buy
             actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
-    
-            # Sell (red candle) - check lower wick
-            body_bottom = min(i15_open, i15_close)
-            lower_wick = body_bottom - i15_low
+            
+            # SELL (red candle): Lower wick is from low to close
+            body_bottom_sell = close_curr  # For red candle, close is body bottom
+            lower_wick = body_bottom_sell - low_curr
             actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
-
+        
         # Debug logging for wick validation
         if cfg.DEBUG_MODE:
             logger_pair.debug(
                 f"Wick validation | {pair_name} | "
-                f"Buy: {actual_buy_wick_ratio*100:.1f}% | "
-                f"Sell: {actual_sell_wick_ratio*100:.1f}% | "
-                f"Range: {candle_range:.5f} | "
-                f"Candle: O={i15_open:.2f} H={i15_high:.2f} L={i15_low:.2f} C={i15_close:.2f}"
+                f"Candle i15={i15} | "
+                f"O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f} | "
+                f"Range={candle_range:.5f} | "
+                f"Buy wick: {actual_buy_wick_ratio*100:.2f}% | "
+                f"Sell wick: {actual_sell_wick_ratio*100:.2f}%"
             )
        
         # Validate candle timestamp
@@ -3581,53 +3631,14 @@ async def evaluate_pair_and_alert(
 
                         if delete_keys:
                             await sdb.atomic_batch_update([], deletes=delete_keys)
-                            logger_pair.info(f"🔄 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts")
+                            logger_pair.info(f"📅 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts")
 
                         await sdb.set_metadata(day_tracker_key, str(current_day))
             
                 except Exception as e:
                     logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
-                    
-        # Extract indicator values
-        ppo_curr = ppo[i15]
-        ppo_prev = ppo[i15 - 1]
-        ppo_sig_curr = ppo_signal[i15]
-        ppo_sig_prev = ppo_signal[i15 - 1]
-        rsi_curr = smooth_rsi[i15]
-        rsi_prev = smooth_rsi[i15 - 1]
         
-        # VWAP handling with None checks
-        vwap_curr = None
-        vwap_prev = None
-
-        if not cfg.ENABLE_VWAP:
-            vwap_curr = close_curr
-            vwap_prev = close_prev
-        elif vwap is None or len(vwap) == 0:
-            logger_pair.warning("VWAP enabled but vwap array is None or empty")
-            vwap_curr = close_curr
-            vwap_prev = close_prev
-        elif len(vwap) <= i15:
-            logger_pair.warning(
-                f"VWAP enabled but insufficient data "
-                f"(len(vwap)={len(vwap)} ≤ i15={i15}) – VWAP alerts skipped"
-            )
-            vwap_curr = close_curr
-            vwap_prev = close_prev
-        else:
-            vwap_curr = vwap[i15]
-            vwap_prev = vwap[i15 - 1]
-
-        mmh_curr = mmh[i15]
-        mmh_m1 = mmh[i15 - 1]
-        mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
-        mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
-      
-        # Cloud state
-        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
-        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-        
-        # Base trend filters
+        # Base trend filters with RMA checks
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
         
@@ -3636,12 +3647,13 @@ async def evaluate_pair_and_alert(
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-   
-        # Use corrected precompute
+        
+        # Get precomputed candle quality
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
         
+        # Get candle quality reasons for logging
         buy_candle_reason = None
         sell_candle_reason = None
         
@@ -3659,7 +3671,7 @@ async def evaluate_pair_and_alert(
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
         
-        # MMH reversal detection
+        # MMH reversal detection from i15
         mmh_reversal_buy = False
         mmh_reversal_sell = False
         
@@ -3677,44 +3689,68 @@ async def evaluate_pair_and_alert(
                 mmh_m3 < mmh_m2 < mmh_m1 and 
                 mmh_curr < mmh_m1
             )
- 
+        
         # ============================================================================
-        # Build context with ALL required keys and safe defaults
+        # Build context with ALL required keys and CONSISTENT candle data from i15
         # ============================================================================
         context = {
-            "buy_common": buy_common,
-            "sell_common": sell_common,
+            # Price data from i15 candle (CLOSED candle)
             "close_curr": close_curr,
             "close_prev": close_prev,
-            "close_5m_val": close_5m_val,
+            "open_curr": open_curr,
+            "high_curr": high_curr,
+            "low_curr": low_curr,
             "ts_curr": ts_curr,
+            "close_5m_val": close_5m_val,
+            
+            # Indicators from i15
             "ppo_curr": ppo_curr,
             "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr,
             "ppo_sig_prev": ppo_sig_prev,
             "rsi_curr": rsi_curr,
             "rsi_prev": rsi_prev,
+            
+            # VWAP from i15
             "vwap_curr": vwap_curr,
             "vwap_prev": vwap_prev,
             "vwap_available": vwap_curr is not None and vwap_prev is not None,
+            "vwap_enabled": cfg.ENABLE_VWAP,
+            
+            # MMH from i15
             "mmh_curr": mmh_curr,
             "mmh_m1": mmh_m1,
             "mmh_m2": mmh_m2,
             "mmh_m3": mmh_m3,
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
+            
+            # Moving averages
             "rma50_15_val": rma50_15_val,
             "rma200_5_val": rma200_5_val,
+            
+            # Cloud state
             "cloud_up": cloud_up,
             "cloud_down": cloud_down,
-            "pivots": piv if piv else {},
-            "vwap_enabled": cfg.ENABLE_VWAP,
+            
+            # WICK RATIOS - From i15 OHLC
             "buy_wick_ratio": actual_buy_wick_ratio,
             "sell_wick_ratio": actual_sell_wick_ratio,
+            
+            # Candle quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
             "is_green": is_green,
             "is_red": is_red,
+            
+            # Common conditions
+            "buy_common": buy_common,
+            "sell_common": sell_common,
+            
+            # Pivot levels
+            "pivots": piv if piv else {},
+            
+            # Tracking
             "pivot_suppressions": [],
         }
         
@@ -3850,7 +3886,7 @@ async def evaluate_pair_and_alert(
                             f"✅ Alert FIRED: {alert_key} | "
                             f"buy_common={buy_common} sell_common={sell_common} | "
                             f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
-                            f"Candle: O={i15_open:.2f} H={i15_high:.2f} L={i15_low:.2f} C={i15_close:.2f}"
+                            f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                         ) 
 
                 except Exception as e:
@@ -4019,7 +4055,7 @@ async def evaluate_pair_and_alert(
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
                 
                 logger_pair.info(
-                    f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                    f"🔵🎯🟢  Sent {len(alerts_to_send)} alerts for {pair_name} | "
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:
