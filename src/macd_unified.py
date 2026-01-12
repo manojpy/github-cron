@@ -134,27 +134,39 @@ _IST_TZ = ZoneInfo("Asia/Kolkata")
 def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> str:
     """Format datetime/timestamp to IST timezone"""
     try:
+        # 1. Handle None (Current Time)
         if dt_or_ts is None:
             dt = datetime.now(timezone.utc)
-        elif isinstance(dt_or_ts, str):
-            # For strings: try numeric first, then ISO format
-            try:
-                ts = float(dt_or_ts)
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            except ValueError:
-                # Not numeric, try ISO format
-                dt = datetime.fromisoformat(dt_or_ts).replace(tzinfo=timezone.utc)
-        elif isinstance(dt_or_ts, (int, float)):
-            # Numeric types: treat as epoch timestamp
-            dt = datetime.fromtimestamp(float(dt_or_ts), tz=timezone.utc)
+
+        # 2. Handle Datetime Objects
+        elif isinstance(dt_or_ts, datetime):
+            dt = dt_or_ts
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
         else:
-            # Try parsing as ISO string
-            dt = datetime.fromisoformat(str(dt_or_ts)).replace(tzinfo=timezone.utc)
-        
+            # 3. Try Numeric Timestamp (Handles str, int, float, numpy types)
+            try:
+                # This catches numpy.int64, "1768238100", 1768238100.0, etc.
+                ts = float(dt_or_ts)
+                # Check for millisecond timestamps and convert to seconds
+                if ts > 1_000_000_000_000:
+                    ts /= 1000
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+            except (ValueError, TypeError):
+                # 4. Fallback: Not numeric, try ISO format string
+                dt = datetime.fromisoformat(str(dt_or_ts))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+
+        # Convert to IST and format
         return dt.astimezone(_IST_TZ).strftime(fmt)
-    except (ValueError, TypeError, OSError, AttributeError) as e:
+
+    except Exception as e:
+        # Logs the error but doesn't crash the bot
         logger.debug(f"format_ist_time parsing failed for input '{dt_or_ts}': {e}")
-        # Final fallback: return as string
+        # Final fallback: return the input as a string so logs aren't empty
         return str(dt_or_ts)
 
 class BotConfig(BaseModel):
