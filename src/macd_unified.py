@@ -3540,23 +3540,6 @@ async def evaluate_pair_and_alert(
             not np.isnan(mmh_m3)
         )
         
-        if not has_valid_mmh:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping MMH alerts for {pair_name}: "
-                    f"warmup period (NaN values detected)"
-                )
-            mmh_reversal_buy = False
-            mmh_reversal_sell = False
-        else:
-            # Now safe to evaluate reversals (existing logic) 
-            mmh_reversal_buy = buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
-            mmh_reversal_sell = sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
-
-
-
-
-
         # Moving averages from i15 and i5
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
@@ -3679,7 +3662,20 @@ async def evaluate_pair_and_alert(
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
 
-        
+        if not has_valid_mmh:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Skipping MMH alerts for {pair_name}: "
+                    f"warmup period (NaN values detected)"
+                )
+
+            mmh_reversal_buy = False
+            mmh_reversal_sell = False
+        else:
+            # Now safe to evaluate reversals (existing logic) 
+            mmh_reversal_buy = buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
+            mmh_reversal_sell = sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
+   
         # ============================================================================
         # Build context with ALL required keys and CONSISTENT candle data from i15
         # ============================================================================
