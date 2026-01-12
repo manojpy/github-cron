@@ -43,9 +43,10 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """Calculate rolling std in O(n) using Welford's online algorithm"""
+    """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
+    # Clamp responsiveness as per logic [cite: 1]
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
 
     window_sum = 0.0
@@ -57,13 +58,15 @@ def rolling_std(close, period, responsiveness):
     for i in range(n):
         curr = close[i]
         
+        # Remove old value from window [cite: 2]
         if i >= period:
             old_val = queue[queue_idx]
             if not np.isnan(old_val):
                 window_sum -= old_val
                 window_sq_sum -= old_val * old_val
-                window_count -= 1
+                window_count -= 1 # [cite: 3]
         
+        # Add current value [cite: 3]
         if not np.isnan(curr):
             window_sum += curr
             window_sq_sum += curr * curr
@@ -71,20 +74,23 @@ def rolling_std(close, period, responsiveness):
         
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-        
-        if window_count == 0:
-            sd[i] = 0.0
+     
+        # Calculate Sample SD (n-1)
+        if window_count < 2:
+            sd[i] = 0.0 # [cite: 4]
         else:
             mean = window_sum / window_count
-            variance = (window_sq_sum / window_count) - (mean * mean)
-            sd[i] = np.sqrt(max(0.0, variance)) * resp
+            # Population variance formula from source [cite: 4]
+            pop_variance = (window_sq_sum / window_count) - (mean * mean)
+            # Convert to Sample Variance: pop_var * (n / (n-1))
+            sample_variance = pop_variance * (window_count / (window_count - 1))
+            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp # [cite: 4]
 
     return sd
 
-
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """Calculate rolling mean in O(n) using sliding window"""
+    """Calculate rolling mean with Pine-style warm-up (NaN until period is met)"""
     n = len(data)
     out = np.empty(n, dtype=np.float64)
     
@@ -93,20 +99,15 @@ def rolling_mean_numba(data, period):
     queue = np.zeros(period, dtype=np.float64)
     queue_idx = 0
     
-    for i in range(period):
-        if not np.isnan(data[i]):
-            window_sum += data[i]
-            window_count += 1
-        queue[queue_idx] = data[i]
-        queue_idx = (queue_idx + 1) % period
-        out[i] = window_sum / window_count if window_count > 0 else 0.0
-    
-    for i in range(period, n):
-        old_val = queue[queue_idx]
-        if not np.isnan(old_val):
-            window_sum -= old_val
-            window_count -= 1
+    for i in range(n):
+        # Remove old value [cite: 7]
+        if i >= period:
+            old_val = queue[queue_idx]
+            if not np.isnan(old_val):
+                window_sum -= old_val
+                window_count -= 1 # [cite: 7]
         
+        # Add current value [cite: 7]
         curr = data[i]
         if not np.isnan(curr):
             window_sum += curr
@@ -115,10 +116,13 @@ def rolling_mean_numba(data, period):
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
         
-        out[i] = window_sum / window_count if window_count > 0 else out[i-1]
+        # Pine ta.sma returns NaN until the window is full [cite: 8]
+        if i < period - 1:
+            out[i] = np.nan
+        else:
+            out[i] = window_sum / window_count if window_count > 0 else np.nan # [cite: 8]
     
     return out
-
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
