@@ -129,32 +129,48 @@ def rolling_mean_numba(data, period):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    """Calculate rolling min/max in O(n)"""
+    """Optimized O(n) rolling min/max using a sliding window algorithm"""
     rows = len(arr)
-    min_arr = np.empty(rows, dtype=np.float64)
-    max_arr = np.empty(rows, dtype=np.float64)
+    min_arr = np.full(rows, np.nan, dtype=np.float64) # 
+    max_arr = np.full(rows, np.nan, dtype=np.float64) # 
+
+    # Deques to store indices of potential min/max candidates
+    min_deque = np.zeros(rows, dtype=np.int32)
+    max_deque = np.zeros(rows, dtype=np.int32)
+    
+    # Deque pointers: head (start) and tail (end)
+    min_h, min_t = 0, 0
+    max_h, max_t = 0, 0
 
     for i in range(rows):
-        start = max(0, i - period + 1)
+        val = arr[i]
         
-        min_val = np.inf
-        max_val = -np.inf
-        has_valid = False
+        if np.isnan(val):
+            # If current is NaN, it doesn't affect min/max logic 
+            # but we still check if the window has passed the head [cite: 10]
+            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
+            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
+        else:
+            # Maintain Min Deque
+            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
+            while min_t > min_h and arr[min_deque[min_t - 1]] >= val:
+                min_t -= 1
+            min_deque[min_t] = i
+            min_t += 1
 
-        for j in range(start, i + 1):
-            val = arr[j]
-            if not np.isnan(val):
-                has_valid = True
-                if val < min_val:
-                    min_val = val
-                if val > max_val:
-                    max_val = val
+            # Maintain Max Deque
+            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
+            while max_t > max_h and arr[max_deque[max_t - 1]] <= val:
+                max_t -= 1
+            max_deque[max_t] = i
+            max_t += 1
 
-        min_arr[i] = min_val if has_valid else np.nan
-        max_arr[i] = max_val if has_valid else np.nan
+        # Fill output after reaching the minimum window requirement
+        if i >= period - 1:
+            if min_h < min_t: min_arr[i] = arr[min_deque[min_h]] # [cite: 10]
+            if max_h < max_t: max_arr[i] = arr[max_deque[max_h]] # [cite: 10]
 
     return min_arr, max_arr
-
 
 @njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
