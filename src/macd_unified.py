@@ -98,7 +98,8 @@ class Constants:
     CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
-    MAX_PIVOT_DISTANCE_PCT = 100.0
+    VWAP_MAX_DISTANCE_PCT = 1.0
+    PIVOT_MAX_DISTANCE_PCT = 0.5
     
 STATIC_PRODUCTS_MAP = {
     "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
@@ -3422,7 +3423,7 @@ async def evaluate_pair_and_alert(
     Evaluate all indicators for a pair and send alerts if conditions met.
     ✅ CORRECTED: Proper null safety, error handling, validation, and consistent candle data
     """
-    
+
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
@@ -3447,7 +3448,7 @@ async def evaluate_pair_and_alert(
         # Get last closed candle indices
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
-        
+
         # CRITICAL: Need at least 4 candles for MMH lookback
         if i15 is None or i15 < 4 or i5 is None or i5 < 2:
             if cfg.DEBUG_MODE:
@@ -3455,17 +3456,17 @@ async def evaluate_pair_and_alert(
                     f"Insufficient indices for {pair_name}: i15={i15} (need ≥4), i5={i5} (need ≥2)"
                 )
             return None
-        
+
         # Extract basic candle data
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
-        
+
         close_curr_quick = close_15m[i15]
         open_curr_quick = open_15m[i15]
         is_green = close_curr_quick > open_curr_quick
         is_red = close_curr_quick < open_curr_quick
-        
+
         # Skip doji/neutral candles early
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
@@ -3474,15 +3475,15 @@ async def evaluate_pair_and_alert(
                     f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
                 )
             return None
-        
+
         # Calculate all indicators in separate thread
         indicators = await asyncio.to_thread(
-            calculate_all_indicators_numpy, 
-            data_15m, 
-            data_5m, 
+            calculate_all_indicators_numpy,
+            data_15m,
+            data_5m,
             data_daily
         )
-        
+
         # Extract indicators
         ppo = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
@@ -3494,12 +3495,12 @@ async def evaluate_pair_and_alert(
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
-        
+
         # ============================================================================
         # CONSISTENCY CHECK: Extract ALL candle data from i15 (closed candle)
         # CRITICAL: All values must come from the SAME candle index
         # ============================================================================
-        
+
         # Current closed candle (i15) values
         close_curr = close_15m[i15]
         close_prev = close_15m[i15 - 1]
@@ -3507,15 +3508,15 @@ async def evaluate_pair_and_alert(
         high_curr = data_15m["high"][i15]
         low_curr = data_15m["low"][i15]
         ts_curr = int(timestamps_15m[i15])
-        
+
         # Previous candle values
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
-        
+
         # 5-minute candle data (from i5 index)
         close_5m_val = data_5m["close"][i5]
-        
+
         # Indicator values from i15
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
@@ -3523,47 +3524,48 @@ async def evaluate_pair_and_alert(
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
-        
+
         # VWAP from i15 (with previous value from i15-1)
+        # CORRECTED: Do NOT fallback to close/prev when unavailable; set to None
         if not cfg.ENABLE_VWAP:
-            vwap_curr = close_curr
-            vwap_prev = close_prev
+            vwap_curr = None
+            vwap_prev = None
         elif vwap is None or len(vwap) == 0:
             logger_pair.warning("VWAP enabled but vwap array is None or empty")
-            vwap_curr = close_curr
-            vwap_prev = close_prev
+            vwap_curr = None
+            vwap_prev = None
         elif len(vwap) <= i15:
             logger_pair.warning(
                 f"VWAP enabled but insufficient data "
                 f"(len(vwap)={len(vwap)} ≤ i15={i15}) – VWAP alerts skipped"
             )
-            vwap_curr = close_curr
-            vwap_prev = close_prev
+            vwap_curr = None
+            vwap_prev = None
         else:
             vwap_curr = vwap[i15]
             vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
-        
+
         # MMH from i15
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
-        
+
         # Moving averages from i15 and i5
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-        
+
         # Cloud state from i15
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-        
+
         # ============================================================================
         # WICK RATIO CALCULATIONS - From i15 candle OHLC
         # These MUST match the OHLC data displayed in the alert message
         # ============================================================================
-        
+
         candle_range = high_curr - low_curr
-        
+
         if candle_range < 1e-8:
             # Avoid division by zero for very small ranges
             actual_buy_wick_ratio = 1.0
@@ -3573,12 +3575,12 @@ async def evaluate_pair_and_alert(
             body_top_buy = close_curr  # For green candle, close is body top
             upper_wick = high_curr - body_top_buy
             actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
-            
+
             # SELL (red candle): Lower wick is from low to close
             body_bottom_sell = close_curr  # For red candle, close is body bottom
             lower_wick = body_bottom_sell - low_curr
             actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
-        
+
         # Debug logging for wick validation
         if cfg.DEBUG_MODE:
             logger_pair.debug(
@@ -3589,7 +3591,7 @@ async def evaluate_pair_and_alert(
                 f"Buy wick: {actual_buy_wick_ratio*100:.2f}% | "
                 f"Sell wick: {actual_sell_wick_ratio*100:.2f}%"
             )
-       
+
         # Validate candle timestamp
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             if cfg.DEBUG_MODE:
@@ -3605,28 +3607,28 @@ async def evaluate_pair_and_alert(
             if current_utc_hour == 0 and current_utc_minute <= 15:
                 current_day = current_utc_dt.toordinal()
                 day_tracker_key = f"{pair_name}:day_tracker"
-    
+
                 try:
                     last_day_str = await sdb.get_metadata(day_tracker_key)
                     last_day = int(last_day_str) if last_day_str else None
-        
+
                     if last_day != current_day:
                         delete_keys = []
-            
+
                         if cfg.ENABLE_VWAP:
-                            if "vwap_up" in ALERT_KEYS: 
+                            if "vwap_up" in ALERT_KEYS:
                                 delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_up']}")
-                            if "vwap_down" in ALERT_KEYS: 
+                            if "vwap_down" in ALERT_KEYS:
                                 delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
 
                         if cfg.ENABLE_PIVOT and piv:
                             for level in ["P","S1","S2","S3","R1","R2"]:
                                 k = f"pivot_up_{level}"
-                                if k in ALERT_KEYS: 
+                                if k in ALERT_KEYS:
                                     delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
                             for level in ["P","S1","S2","R1","R2","R3"]:
                                 k = f"pivot_down_{level}"
-                                if k in ALERT_KEYS: 
+                                if k in ALERT_KEYS:
                                     delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
 
                         if delete_keys:
@@ -3634,62 +3636,62 @@ async def evaluate_pair_and_alert(
                             logger_pair.info(f"📅 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts")
 
                         await sdb.set_metadata(day_tracker_key, str(current_day))
-            
+
                 except Exception as e:
                     logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
-        
+
         # Base trend filters with RMA checks
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
-        
+
         # Additional trend confirmation
         if base_buy_trend:
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-        
+
         # Get precomputed candle quality
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-        
+
         # Get candle quality reasons for logging
         buy_candle_reason = None
         sell_candle_reason = None
-        
+
         if base_buy_trend and not buy_candle_passed:
             _, buy_candle_reason = check_candle_quality_with_reason(
                 open_curr, high_curr, low_curr, close_curr, is_buy=True
             )
-        
+
         if base_sell_trend and not sell_candle_passed:
             _, sell_candle_reason = check_candle_quality_with_reason(
                 open_curr, high_curr, low_curr, close_curr, is_buy=False
             )
-        
+
         # Final common conditions
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
-        
+
         # MMH reversal detection from i15
         mmh_reversal_buy = False
         mmh_reversal_sell = False
-        
+
         if i15 >= 3:
             mmh_reversal_buy = (
-                buy_common and 
+                buy_common and
                 mmh_curr > 0 and
-                mmh_m3 > mmh_m2 > mmh_m1 and 
+                mmh_m3 > mmh_m2 > mmh_m1 and
                 mmh_curr > mmh_m1
             )
-            
+
             mmh_reversal_sell = (
-                sell_common and 
+                sell_common and
                 mmh_curr < 0 and
-                mmh_m3 < mmh_m2 < mmh_m1 and 
+                mmh_m3 < mmh_m2 < mmh_m1 and
                 mmh_curr < mmh_m1
             )
-        
+
         # ============================================================================
         # Build context with ALL required keys and CONSISTENT candle data from i15
         # ============================================================================
@@ -3702,7 +3704,7 @@ async def evaluate_pair_and_alert(
             "low_curr": low_curr,
             "ts_curr": ts_curr,
             "close_5m_val": close_5m_val,
-            
+
             # Indicators from i15
             "ppo_curr": ppo_curr,
             "ppo_prev": ppo_prev,
@@ -3710,13 +3712,13 @@ async def evaluate_pair_and_alert(
             "ppo_sig_prev": ppo_sig_prev,
             "rsi_curr": rsi_curr,
             "rsi_prev": rsi_prev,
-            
+
             # VWAP from i15
             "vwap_curr": vwap_curr,
             "vwap_prev": vwap_prev,
             "vwap_available": vwap_curr is not None and vwap_prev is not None,
             "vwap_enabled": cfg.ENABLE_VWAP,
-            
+
             # MMH from i15
             "mmh_curr": mmh_curr,
             "mmh_m1": mmh_m1,
@@ -3724,40 +3726,40 @@ async def evaluate_pair_and_alert(
             "mmh_m3": mmh_m3,
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
-            
+
             # Moving averages
             "rma50_15_val": rma50_15_val,
             "rma200_5_val": rma200_5_val,
-            
+
             # Cloud state
             "cloud_up": cloud_up,
             "cloud_down": cloud_down,
-            
+
             # WICK RATIOS - From i15 OHLC
             "buy_wick_ratio": actual_buy_wick_ratio,
             "sell_wick_ratio": actual_sell_wick_ratio,
-            
+
             # Candle quality flags
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
             "is_green": is_green,
             "is_red": is_red,
-            
+
             # Common conditions
             "buy_common": buy_common,
             "sell_common": sell_common,
-            
+
             # Pivot levels
             "pivots": piv if piv else {},
-            
+
             # Tracking
             "pivot_suppressions": [],
         }
-        
+
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
-        
+
         raw_alerts = []
 
         # Determine which alerts to check
@@ -3765,7 +3767,7 @@ async def evaluate_pair_and_alert(
             d["key"] for d in ALERT_DEFINITIONS
             if not (
                 ("pivots" in d["requires"] and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values()))) or
-                ("vwap" in d["requires"] and not cfg.ENABLE_VWAP) or
+                ("vwap" in d["requires"] and (not cfg.ENABLE_VWAP or not (vwap_curr is not None and vwap_prev is not None))) or
                 ("ppo" in d["requires"] and (ppo_ctx is None)) or
                 ("ppo_signal" in d["requires"] and (ppo_sig_ctx is None)) or
                 ("rsi" in d["requires"] and (rsi_ctx is None))
@@ -3775,13 +3777,13 @@ async def evaluate_pair_and_alert(
         # Remove pivot alerts if no valid pivots
         if not piv or not any(piv.values()):
             alert_keys_to_check = [
-                k for k in alert_keys_to_check 
+                k for k in alert_keys_to_check
                 if not k.startswith("pivot_")
             ]
-        
+
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
         all_state_changes = []
-        
+
         # Get previous alert states
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, redis_alert_keys
@@ -3792,14 +3794,14 @@ async def evaluate_pair_and_alert(
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
                 continue
-    
+
             key = ALERT_KEYS[alert_key]
             trigger = False
-    
+
             # Determine if this is a BUY or SELL signal
             is_buy_signal = any(x in alert_key for x in ["up", "buy"])
             is_sell_signal = any(x in alert_key for x in ["down", "sell"])
-    
+
             # Block on wick ratios BEFORE evaluation
             if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
                 if cfg.DEBUG_MODE:
@@ -3807,25 +3809,25 @@ async def evaluate_pair_and_alert(
                         f"❌ BLOCKED {alert_key}: Upper wick {actual_buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%"
                     )
                 continue
-    
+
             if is_sell_signal and actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(
                         f"❌ BLOCKED {alert_key}: Lower wick {actual_sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%"
                     )
-                continue 
-    
+                continue
+
             # Special handling for pivot alerts
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                 level = alert_key.split("_")[-1]
                 is_buy = alert_key.startswith("pivot_up_")
-                
+
                 try:
                     valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                    
+
                     if not valid_cross and reason and piv:
                         context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-                    
+
                     trigger = (
                         (is_buy and buy_common) or (not is_buy and sell_common)
                     ) and valid_cross
@@ -3835,6 +3837,26 @@ async def evaluate_pair_and_alert(
                         exc_info=True
                     )
                     trigger = False
+
+            # Special handling for VWAP alerts (fresh cross + proximity guard)
+            elif alert_key in ("vwap_up", "vwap_down"):
+                try:
+                    is_buy = alert_key == "vwap_up"
+                    valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
+
+                    if not valid_cross and reason:
+                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
+
+                    trigger = (
+                        (is_buy and buy_common) or ((not is_buy) and sell_common)
+                    ) and valid_cross
+                except Exception as e:
+                    logger_pair.error(
+                        f"VWAP alert check failed for {alert_key}: {e}",
+                        exc_info=True
+                    )
+                    trigger = False
+
             else:
                 # Standard alert evaluation with full error handling
                 try:
@@ -3874,10 +3896,10 @@ async def evaluate_pair_and_alert(
             # Generate alert if triggered
             if trigger and not previous_states.get(key, False):
                 try:
-                    extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
+                    extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) if def_ else ""
                     if not extra:
                         extra = ""
-                    raw_alerts.append((def_["title"], extra, def_["key"]))
+                    raw_alerts.append((def_["title"] if def_ else alert_key, extra, def_["key"] if def_ else alert_key))
                     all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
 
                     # Debug logging for successful alerts
@@ -3887,22 +3909,22 @@ async def evaluate_pair_and_alert(
                             f"buy_common={buy_common} sell_common={sell_common} | "
                             f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
                             f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
-                        ) 
+                        )
 
                 except Exception as e:
                     logger_pair.error(
                         f"Alert extra_fn failed for {alert_key}: {e}",
                         exc_info=False
                     )
-        
+
         # Handle alert state resets (opposite crossovers)
         resets_to_apply = []
-    
+
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-   
+
         if ppo_prev > 0 and ppo_curr <= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
         elif not buy_common:
@@ -3910,7 +3932,7 @@ async def evaluate_pair_and_alert(
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_zero_up: buy_common=False")
-    
+
         if ppo_prev < 0 and ppo_curr >= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
         elif not sell_common:
@@ -3918,7 +3940,7 @@ async def evaluate_pair_and_alert(
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_zero_down: sell_common=False")
-    
+
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
         elif not buy_common:
@@ -3926,7 +3948,7 @@ async def evaluate_pair_and_alert(
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_011_up: buy_common=False")
-    
+
         if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
         elif not sell_common:
@@ -3934,7 +3956,7 @@ async def evaluate_pair_and_alert(
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(f"Reset ppo_011_down: sell_common=False")
-    
+
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
@@ -3945,7 +3967,7 @@ async def evaluate_pair_and_alert(
                         f"Reset rsi_50_up: buy_common={buy_common}, "
                         f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_BUY}"
                     )
-    
+
         if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
         elif not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
@@ -3956,7 +3978,7 @@ async def evaluate_pair_and_alert(
                         f"Reset rsi_50_down: sell_common={sell_common}, "
                         f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_SELL}"
                     )
-    
+
         # VWAP reset with None checks
         if cfg.ENABLE_VWAP and vwap_curr is not None and vwap_prev is not None:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
@@ -3966,7 +3988,7 @@ async def evaluate_pair_and_alert(
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Reset vwap_up: buy_common=False")
-    
+
             if close_prev < vwap_prev and close_curr >= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
             elif not sell_common:
@@ -3974,7 +3996,7 @@ async def evaluate_pair_and_alert(
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Reset vwap_down: sell_common=False")
-    
+
         # Pivot level resets
         if piv:
             for level_name, level_value in piv.items():
@@ -3997,36 +4019,36 @@ async def evaluate_pair_and_alert(
         if (mmh_curr < 0) and (mmh_curr >= mmh_m1):
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
-    
+
         # Apply all state changes in batch
         all_state_changes = all_state_changes + resets_to_apply
         if all_state_changes:
             await sdb.batch_set_states(all_state_changes)
-      
+
         # Prepare deduplication checks
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-        
+
         # Execute atomic Redis operations
         if all_state_changes or dedup_checks:
             previous_states, dedup_results = await sdb.atomic_eval_batch(
-                pair_name, 
-                redis_alert_keys, 
-                all_state_changes, 
+                pair_name,
+                redis_alert_keys,
+                all_state_changes,
                 dedup_checks
             )
         else:
             dedup_results = {}
-        
+
         # Filter alerts based on deduplication
         alerts_to_send = []
         if raw_alerts:
             for title, extra, ak in raw_alerts:
                 if dedup_results.get(f"{pair_name}:{ak}", True):
                     alerts_to_send.append((title, extra, ak))
-        
+
         # Limit total alerts per pair
         alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
-        
+
         # Limit pivot alerts to prevent spam
         pivot_count = sum(1 for _, _, k in alerts_to_send if k.startswith("pivot_"))
         if pivot_count > 3:
@@ -4036,7 +4058,7 @@ async def evaluate_pair_and_alert(
             pivot_alerts = [(t, e, k) for t, e, k in alerts_to_send if k.startswith("pivot_")][:3]
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
-        
+
         # Send alerts via Telegram
         if alerts_to_send:
             try:
@@ -4046,14 +4068,14 @@ async def evaluate_pair_and_alert(
                 else:
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
                     msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
-                
+
                 if not cfg.DRY_RUN_MODE:
                     send_success = await telegram_queue.send(msg)
                     if not send_success:
                         logger.error(f"Alert dispatch failed | {pair_name}")
                 else:
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
-                
+
                 logger_pair.info(
                     f"🔵🎯🟢  Sent {len(alerts_to_send)} alerts for {pair_name} | "
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
@@ -4149,11 +4171,11 @@ async def evaluate_pair_and_alert(
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
-    
+
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
-    
+
     except Exception as e:
         logger_pair.exception(
             f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e} | "
@@ -4164,7 +4186,7 @@ async def evaluate_pair_and_alert(
 
     finally:
         PAIR_ID.set("")
-        
+
         # Explicitly delete references to free memory
         try:
             if 'data_15m' in locals():
@@ -4207,6 +4229,83 @@ async def evaluate_pair_and_alert(
             pass
 
         gc.collect()
+
+
+def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
+    """
+    Validate VWAP cross with distance check and fresh-cross gating.
+    Prevents false alerts when VWAP data is missing or price is far away.
+    """
+    if not ctx.get("vwap_enabled") or not ctx.get("vwap_available"):
+        return False, "VWAP unavailable"
+
+    close_prev = ctx["close_prev"]
+    close_curr = ctx["close_curr"]
+    vwap_prev = ctx["vwap_prev"]
+    vwap_curr = ctx["vwap_curr"]
+
+    if is_buy:
+        crossed = close_prev <= vwap_prev < close_curr
+        alert_key = ALERT_KEYS["vwap_up"]
+    else:
+        crossed = close_prev >= vwap_prev > close_curr
+        alert_key = ALERT_KEYS["vwap_down"]
+
+    if not crossed:
+        return False, "No VWAP cross"
+
+    # Fresh cross only: skip if alert already active
+    if previous_states.get(alert_key, False):
+        return False, "VWAP alert already active"
+
+    # Distance guard
+    try:
+        distance_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
+    except ZeroDivisionError:
+        return False, "VWAP invalid (zero)"
+
+    if distance_pct > Constants.VWAP_MAX_DISTANCE_PCT:
+        return False, (
+            f"VWAP too far: price {close_curr:.2f} is {distance_pct:.2f}% "
+            f"away from VWAP {vwap_curr:.2f}"
+        )
+
+    return True, None
+
+
+def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
+    """
+    Validate pivot cross with distance check.
+    Prevents false alerts when price is far from pivot level.
+    """
+    pivots = ctx.get("pivots")
+    if not pivots or level not in pivots or pivots[level] == 0:
+        return False, "No pivot data"
+
+    level_value = pivots[level]
+    close_curr = ctx["close_curr"]
+    close_prev = ctx["close_prev"]
+
+    if is_buy:
+        crossed = close_prev <= level_value < close_curr
+    else:
+        crossed = close_prev >= level_value > close_curr
+
+    if not crossed:
+        return False, "No pivot cross"
+
+    try:
+        distance_pct = abs(level_value - close_curr) / level_value * 100
+    except ZeroDivisionError:
+        return False, "Pivot invalid (zero)"
+
+    if distance_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
+        return False, (
+            f"Pivot too far: price {close_curr:.2f} is {distance_pct:.2f}% "
+            f"away from {level} pivot {level_value:.2f}"
+        )
+
+    return True, None
 
 async def process_pairs_with_workers(
     fetcher: DataFetcher,
