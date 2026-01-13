@@ -3114,7 +3114,7 @@ class TelegramQueue:
             if idx < len(batches) - 1:
                 await asyncio.sleep(INTER_BATCH_DELAY)
 
-        return all(results), 
+        return all(results)
         
 def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
     if not title:
