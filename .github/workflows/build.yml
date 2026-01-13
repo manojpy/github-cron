@@ -85,7 +85,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             AOT_STRICT=1
-            PYTHONOPTIMIZE=2   # ✅ Explicit optimization flag
           cache-from: |
             type=gha,scope=macd-aot-deps
             type=gha,scope=macd-aot-build
