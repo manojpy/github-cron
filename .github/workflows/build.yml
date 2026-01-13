@@ -55,7 +55,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 📋 Extract Docker metadata
+      - name: 🏷️ Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -64,7 +64,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
-            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=schedule,pattern={{date 'YYYYMMDD-HHmm'}},enable=true
           labels: |
             org.opencontainers.image.title=MACD Unified Bot
             org.opencontainers.image.description=AOT-compiled trading alert bot
@@ -118,7 +118,7 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
-          timeout: '6m'  # ✅ Balanced timeout
+          timeout: '6m'
           scanners: 'vuln,secret'
 
       - name: 📤 Upload Trivy Results to GitHub Security
@@ -153,7 +153,7 @@ jobs:
       # ========================================================================
       # PHASE 4: BUILD SUMMARY
       # ========================================================================
-      - name: 📝 Generate Build Summary
+      - name: 📋 Generate Build Summary
         if: always()
         run: |
           echo "## 🔨 Build Summary" >> $GITHUB_STEP_SUMMARY

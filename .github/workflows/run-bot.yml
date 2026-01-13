@@ -20,12 +20,12 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 300  # 5 minutes (sufficient for ~30–40s job)
+  BOT_TIMEOUT: 330
 
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 7
+    timeout-minutes: 8
     permissions:
       contents: read
       packages: read
@@ -80,14 +80,14 @@ jobs:
       # ========================================================================
       - name: 🚀 Execute MACD Bot
         id: bot_run
-        timeout-minutes: 6
+        timeout-minutes: 7
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
-          echo "::group::🔥 Launch Macd-Unified...🔥 "
-          echo "📅 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "::group::📥 Launch Macd-Unified...📥"
+          echo "📍 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
+          echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
 
@@ -98,7 +98,7 @@ jobs:
             --platform linux/amd64 \
             --network host \
             --memory="900m" \
-            --memory-swap="900m" \
+            --memory-swap="1800m" \
             --cpus="2.0" \
             --security-opt=no-new-privileges \
             --read-only \
@@ -142,17 +142,19 @@ jobs:
             echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
+          
           if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
             STATUS="success"
-            DURATION=$(grep -oP "Duration:\s*\K[\d.]+" "$LOG_FILE" | head -1 || echo "N/A")
-            ALERTS=$(grep -oP "Alerts:\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
+            DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
+            ALERTS=$(grep -oP "(?:Alerts|Sent):\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
             PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
             MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
             REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
           else
             STATUS="failed"
-            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed" "$LOG_FILE" | head -1 | cut -c1-100)
+            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
           fi
+          
           echo "status=${STATUS}" >> $GITHUB_OUTPUT
           echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
           echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
@@ -161,18 +163,23 @@ jobs:
           echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
           echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
-      - name: 📝 Generate Summary Report
+      - name: 📋 Generate Summary Report
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
-          | Status | Duration | Alerts | Pairs | Mem | Redis |
-          |---|---|---|---|---|---|
+          
+          | Status | Duration | Alerts | Pairs | Memory | Redis |
+          |--------|----------|--------|-------|--------|-------|
           | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
+          
           EOF
+          
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           fi
 
       # ========================================================================
