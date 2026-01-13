@@ -1,4 +1,3 @@
-from __future__ import annotations         
 import logging
 import aot_bridge
 import os
