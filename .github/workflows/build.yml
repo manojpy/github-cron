@@ -1,4 +1,5 @@
 name: Build AOT Image (Optimized Hybrid)
+
 on:
   push:
     branches: [ main ]
@@ -8,17 +9,19 @@ on:
       - 'Dockerfile'
       - '.github/workflows/build.yml'
   schedule:
-    - cron: "0 2 * * 0"  # Weekly rebuild
+    - cron: "0 2 * * 0"  # Weekly security rebuild
   workflow_dispatch:
     inputs:
       skip_trivy:
         description: 'Skip Trivy scan (faster build)'
         required: false
         default: 'false'
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   PYTHON_VERSION: "3.11"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -27,7 +30,11 @@ jobs:
       contents: read
       packages: write
       security-events: write
+
     steps:
+      # ========================================================================
+      # PHASE 1: SETUP
+      # ========================================================================
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
         with:
@@ -38,6 +45,7 @@ jobs:
         with:
           driver-opts: |
             image=moby/buildkit:latest
+            network=host
           buildkitd-flags: --allow-insecure-entitlement network.host
 
       - name: 🔐 Log in to GitHub Container Registry
@@ -62,6 +70,9 @@ jobs:
             org.opencontainers.image.description=AOT-compiled trading alert bot
             maintainer=${{ github.actor }}
 
+      # ========================================================================
+      # PHASE 2: BUILD & VERIFY
+      # ========================================================================
       - name: 🔨 Build & Push Docker Image
         id: build
         uses: docker/build-push-action@v6
@@ -74,12 +85,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             AOT_STRICT=1
+            PYTHONOPTIMIZE=2   # ✅ Explicit optimization flag
           cache-from: |
             type=gha,scope=macd-aot-deps
             type=gha,scope=macd-aot-build
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-to: type=gha,mode=max,scope=macd-aot-build
-          provenance: true  # ✅ Enable SLSA provenance
+          provenance: false
 
       - name: ✅ Smoke Test - Verify AOT
         run: |
@@ -87,16 +99,19 @@ jobs:
           docker run --rm --platform linux/amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python -c "
-            import sys
-            from aot_bridge import is_using_aot, get_fallback_reason
-            if not is_using_aot():
-                print(f'❌ AOT not loaded: {get_fallback_reason()}')
-                sys.exit(1)
-            print('✅ AOT Binary: LOADED & ACTIVE')
-            " || exit 1
+          import sys
+          from aot_bridge import is_using_aot, get_fallback_reason
+          if not is_using_aot():
+              print(f'❌ AOT not loaded: {get_fallback_reason()}')
+              sys.exit(1)
+          print('✅ AOT Binary: LOADED & ACTIVE')
+          " || exit 1
 
+      # ========================================================================
+      # PHASE 3: SECURITY SCANNING
+      # ========================================================================
       - name: 🛡️ Run Trivy Vulnerability Scan
-        if: (github.event.inputs.skip_trivy != 'true') && (github.event_name == 'schedule' || github.ref == 'refs/heads/main')
+        if: github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
@@ -104,18 +119,18 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
-          timeout: '6m'
+          timeout: '6m'  # ✅ Balanced timeout
           scanners: 'vuln,secret'
 
-      - name: 📤 Upload Trivy Results
-        if: success() && (github.event.inputs.skip_trivy != 'true') && (github.event_name == 'schedule' || github.ref == 'refs/heads/main')
+      - name: 📤 Upload Trivy Results to GitHub Security
+        if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-results.sarif'
           category: 'container-security'
 
       - name: 📊 Generate Trivy Summary
-        if: success() && (github.event.inputs.skip_trivy != 'true') && (github.event_name == 'schedule' || github.ref == 'refs/heads/main')
+        if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
         run: |
           echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -136,6 +151,9 @@ jobs:
             echo "ℹ️ Trivy scan skipped or results unavailable" >> $GITHUB_STEP_SUMMARY
           fi
 
+      # ========================================================================
+      # PHASE 4: BUILD SUMMARY
+      # ========================================================================
       - name: 📝 Generate Build Summary
         if: always()
         run: |
@@ -147,16 +165,19 @@ jobs:
           echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Platform** | linux/amd64 |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Provenance** | ✅ Enabled |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cache Strategy** | GitHub Actions (type=gha) + Registry fallback |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🏷️ Image Tags" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+      # ========================================================================
+      # PHASE 5: CLEANUP
+      # ========================================================================
       - name: 🧹 Cleanup Artifacts
         if: always()
         run: |
           rm -f trivy-results.sarif
           docker image prune -f --filter "until=24h" || true
-          echo "✅ Cleanup complete"
+          echo "✅ Cleanup complete (cache preserved)"

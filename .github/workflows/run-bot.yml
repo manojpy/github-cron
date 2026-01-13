@@ -1,4 +1,5 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
+
 on:
   workflow_dispatch:
     inputs:
@@ -15,11 +16,12 @@ on:
         required: false
         default: 'false'
         type: boolean
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  # Align with config: RUN_TIMEOUT_SECONDS=300 → add 30s buffer
-  BOT_TIMEOUT: 330
+  BOT_TIMEOUT: 300  # 5 minutes (sufficient for ~30–40s job)
+
 jobs:
   run-bot:
     runs-on: ubuntu-24.04
@@ -27,7 +29,11 @@ jobs:
     permissions:
       contents: read
       packages: read
+
     steps:
+      # ========================================================================
+      # PHASE 1: SETUP
+      # ========================================================================
       - name: 📥 Checkout Config Only
         uses: actions/checkout@v4
         with:
@@ -43,11 +49,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Pull Latest AOT Image
+      - name: 🐳 Pull Latest AOT Image (BuildKit)
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          echo "📦 Pulling AOT image..."
+          echo "📦 Pulling AOT image with BuildKit..."
           START_TIME=$(date +%s)
+          export DOCKER_BUILDKIT=1
           if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             PULL_TIME=$(( $(date +%s) - START_TIME ))
             echo "✅ Image pulled in ${PULL_TIME}s"
@@ -68,6 +75,9 @@ jobs:
           fi
           echo "✅ All secrets configured"
 
+      # ========================================================================
+      # PHASE 2: BOT EXECUTION
+      # ========================================================================
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 6
@@ -80,12 +90,13 @@ jobs:
           echo "🏷️  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
+
           START_TIME=$(date +%s)
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
             --platform linux/amd64 \
-            --network none \          # 🔒 SECURITY: no host network
+            --network host \
             --memory="900m" \
             --memory-swap="900m" \
             --cpus="2.0" \
@@ -100,13 +111,15 @@ jobs:
             -e DRY_RUN_MODE="$DRY_RUN" \
             -e PYTHONUNBUFFERED=1 \
             -e NUMBA_NUM_THREADS=2 \
-            -e OMP_NUM_THREADS=1 \
+            -e OMP_NUM_THREADS=2 \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s"
             exit 1
@@ -116,6 +129,9 @@ jobs:
           fi
           echo "✅ Bot completed successfully in ${DURATION}s"
 
+      # ========================================================================
+      # PHASE 3: RESULTS ANALYSIS
+      # ========================================================================
       - name: 📊 Parse Execution Results
         if: always()
         id: results
@@ -149,16 +165,19 @@ jobs:
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
-## 🤖 MACD Bot Execution Report
-| Status | Duration | Alerts | Pairs | Mem | Redis |
-|---|---|---|---|---|---|
-| ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
-EOF
+          ## 🤖 MACD Bot Execution Report
+          | Status | Duration | Alerts | Pairs | Mem | Redis |
+          |---|---|---|---|---|---|
+          | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
+          EOF
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
           fi
 
+      # ========================================================================
+      # PHASE 4: ARTIFACT UPLOAD
+      # ========================================================================
       - name: 📦 Upload Execution Logs
         if: failure()
         uses: actions/upload-artifact@v4
