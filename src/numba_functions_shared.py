@@ -88,30 +88,33 @@ def rolling_std(close, period, responsiveness):
 
     return sd
 
+
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """Calculate rolling mean matching Pine's ta.sma behavior.
-    Returns NaN for bars < period-1 to match Pine exactly.
-    """
+    """Calculate rolling mean in O(n) using sliding window"""
     n = len(data)
-    out = np.full(n, np.nan, dtype=np.float64)
+    out = np.empty(n, dtype=np.float64)
     
     window_sum = 0.0
     window_count = 0
     queue = np.zeros(period, dtype=np.float64)
     queue_idx = 0
     
-    for i in range(n):
+    for i in range(period):
+        if not np.isnan(data[i]):
+            window_sum += data[i]
+            window_count += 1
+        queue[queue_idx] = data[i]
+        queue_idx = (queue_idx + 1) % period
+        out[i] = window_sum / window_count if window_count > 0 else 0.0
+    
+    for i in range(period, n):
+        old_val = queue[queue_idx]
+        if not np.isnan(old_val):
+            window_sum -= old_val
+            window_count -= 1
+        
         curr = data[i]
-        
-        # Remove oldest value when window is full
-        if i >= period:
-            old_val = queue[queue_idx]
-            if not np.isnan(old_val):
-                window_sum -= old_val
-                window_count -= 1
-        
-        # Add current value
         if not np.isnan(curr):
             window_sum += curr
             window_count += 1
@@ -119,9 +122,7 @@ def rolling_mean_numba(data, period):
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
         
-        # Only output after full period (Pine ta.sma returns na before)
-        if i >= period - 1 and window_count > 0:
-            out[i] = window_sum / window_count
+        out[i] = window_sum / window_count if window_count > 0 else out[i-1]
     
     return out
 
@@ -196,56 +197,40 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     return worm_arr
 
 
-@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
-def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
-    """Corrected value loop matching Pine Script's multiplicative recursion:
-    
-    Pine Script:
-        value = 0.5 * 2                                    // Initialize to 1.0
-        value := value * (temp - .5 + .5 * nz(value[1]))   // Multiplicative update
-        value := value > .9999 ? .9999 : value
-        value := value < -0.9999 ? -0.9999 : value
+@njit(float64[:](float64[:]), cache=True, fastmath=True)
+def calc_mmh_value_loop(temp: np.ndarray) -> np.ndarray:
     """
-    value_arr = np.full(rows, np.nan, dtype=np.float64)
+    Pine: value = 0.5 * 2 (=1.0 each bar)
+          value := value * (temp - .5 + .5 * nz(value[1]))
+    Simplifies to: value = (temp - 0.5) + 0.5 * prev_value
+    """
+    n = len(temp)
+    result = np.empty(n, dtype=np.float64)
     
-    for i in range(rows):
-        raw = raw_arr[i]
-        mn = min_arr[i]
-        mx = max_arr[i]
+    for i in range(n):
+        if np.isnan(temp[i]):
+            result[i] = np.nan
+            continue
         
-        # 1. Calculate temp (NaN if inputs are NaN or range is zero)
-        denom = mx - mn
-        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx) or np.abs(denom) < 1e-10:
-            temp = np.nan
+        # nz(value[1]) = 0 on first bar
+        if i == 0:
+            prev_v_safe = 0.0
         else:
-            temp = (raw - mn) / denom
-
-        # 2. Calculate recursive value (Pine's multiplicative logic)
-        if np.isnan(temp):
-            value_arr[i] = np.nan
-        else:
-            # Get previous value for nz() logic
-            if i == 0:
-                prev_v_for_nz = 0.0      # nz(value[1]) on first bar = 0.0
-                prev_v_for_mult = 1.0    # value starts at 1.0 (0.5 * 2)
-            else:
-                prev_v = value_arr[i - 1]
-                prev_v_for_nz = 0.0 if np.isnan(prev_v) else prev_v
-                prev_v_for_mult = 1.0 if np.isnan(prev_v) else prev_v
-            
-            # Pine: value := value * (temp - .5 + .5 * nz(value[1]))
-            v = prev_v_for_mult * (temp - 0.5 + 0.5 * prev_v_for_nz)
-            
-            # Clamp to Pine limits
-            if v > 0.9999:
-                v = 0.9999
-            elif v < -0.9999:
-                v = -0.9999
-            
-            value_arr[i] = v
-            
-    return value_arr
-
+            prev_v = result[i - 1]
+            prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
+        
+        # value = 1.0 * (temp - 0.5 + 0.5 * prev_value)
+        v = (temp[i] - 0.5) + 0.5 * prev_v_safe
+        
+        # Clamp ±0.9999
+        if v > 0.9999:
+            v = 0.9999
+        elif v < -0.9999:
+            v = -0.9999
+        
+        result[i] = v
+    
+    return result
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(value_arr, rows):
