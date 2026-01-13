@@ -46,13 +46,13 @@ RUN ls -la *.py && \
     test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
     test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
 
-# ✅ AOT Compilation with strict verification
+# ✅ AOT Compilation WITHOUT optimization (compiler needs full debug capability)
 ARG AOT_STRICT=1
-RUN echo "🔨 Starting AOT compilation..." && \
+RUN echo "🔨 Starting AOT compilation (unoptimized build)..." && \
     python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
     (echo "❌ AOT build script failed" && exit 1) && \
     echo "📂 Listing build outputs..." && ls -lh /build && \
-    echo "🔍 Normalizing compiled filename..." && \
+    echo "🔄 Normalizing compiled filename..." && \
     mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
     python -c "import importlib.util; \
 spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
@@ -119,5 +119,5 @@ LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
       org.opencontainers.image.memory_limit="900MB" \
       org.opencontainers.image.platform="linux/amd64"
 
-# Final stage
+# ✅ Run bot WITH optimization (-O flag for PYTHONOPTIMIZE=2)
 CMD ["python", "-O", "macd_unified.py"]
