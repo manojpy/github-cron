@@ -123,46 +123,59 @@ def rolling_mean_numba(data, period):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    """Optimized O(n) rolling min/max using a sliding window algorithm"""
-    rows = len(arr)
-    min_arr = np.full(rows, np.nan, dtype=np.float64) # 
-    max_arr = np.full(rows, np.nan, dtype=np.float64) # 
+    """Match Pine's ta.lowest/ta.highest: output na unless full window of non-nan values."""
+    n = len(arr)
+    min_arr = np.full(n, np.nan, dtype=np.float64)
+    max_arr = np.full(n, np.nan, dtype=np.float64)
 
-    # Deques to store indices of potential min/max candidates
-    min_deque = np.zeros(rows, dtype=np.int32)
-    max_deque = np.zeros(rows, dtype=np.int32)
-    
-    # Deque pointers: head (start) and tail (end)
-    min_h, min_t = 0, 0
-    max_h, max_t = 0, 0
+    # Use double-ended queue for indices (monotonic queues)
+    min_deque = np.zeros(period, dtype=np.int32)
+    max_deque = np.zeros(period, dtype=np.int32)
+    min_h = min_t = 0
+    max_h = max_t = 0
 
-    for i in range(rows):
+    # Track count of non-nan in current window
+    valid_count = 0
+    # Circular buffer to store validity (True/False) for each position
+    valid_buffer = np.zeros(period, dtype=np.bool_)
+    buf_idx = 0
+
+    for i in range(n):
         val = arr[i]
-        
-        if np.isnan(val):
-            # If current is NaN, it doesn't affect min/max logic 
-            # but we still check if the window has passed the head [cite: 10]
-            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
-            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
-        else:
-            # Maintain Min Deque
-            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
+        is_valid = not np.isnan(val)
+
+        # Remove old element if window is full
+        if i >= period:
+            old_valid = valid_buffer[buf_idx]
+            if old_valid:
+                valid_count -= 1
+                # Also remove from deques if head matches old index
+                if min_h < min_t and min_deque[min_h] == i - period:
+                    min_h += 1
+                if max_h < max_t and max_deque[max_h] == i - period:
+                    max_h += 1
+
+        # Add new element
+        valid_buffer[buf_idx] = is_valid
+        if is_valid:
+            valid_count += 1
+            # Maintain min deque (increasing)
             while min_t > min_h and arr[min_deque[min_t - 1]] >= val:
                 min_t -= 1
             min_deque[min_t] = i
             min_t += 1
-
-            # Maintain Max Deque
-            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
+            # Maintain max deque (decreasing)
             while max_t > max_h and arr[max_deque[max_t - 1]] <= val:
                 max_t -= 1
             max_deque[max_t] = i
             max_t += 1
 
-        # Fill output after reaching the minimum window requirement
-        if i >= period - 1:
-            if min_h < min_t: min_arr[i] = arr[min_deque[min_h]] # [cite: 10]
-            if max_h < max_t: max_arr[i] = arr[max_deque[max_h]] # [cite: 10]
+        buf_idx = (buf_idx + 1) % period
+
+        # Only output if we have a full window of valid data
+        if i >= period - 1 and valid_count == period:
+            min_arr[i] = arr[min_deque[min_h]]
+            max_arr[i] = arr[max_deque[max_h]]
 
     return min_arr, max_arr
 
