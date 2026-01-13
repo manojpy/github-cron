@@ -4157,7 +4157,7 @@ async def evaluate_pair_and_alert(
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
-            logger_pair.info(
+            logger_pair.debug(
                 f"✅ {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
