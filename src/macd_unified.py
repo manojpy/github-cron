@@ -4325,8 +4325,8 @@ async def process_pairs_with_workers(
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
     
-    limit_15m = max(200, cfg.RMA_200_PERIOD + 25)
-    limit_5m = max(300, cfg.RMA_200_PERIOD + 50)
+    limit_15m = max(324, cfg.RMA_200_PERIOD + 25)
+    limit_5m = max(324, cfg.RMA_200_PERIOD + 50)
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
     
     pair_requests = []
