@@ -49,12 +49,12 @@ RUN ls -la *.py && \
 # ✅ AOT Compilation with strict verification
 ARG AOT_STRICT=1
 RUN echo "🔨 Starting AOT compilation..." && \
-    python -O aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
+    python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
     (echo "❌ AOT build script failed" && exit 1) && \
     echo "📂 Listing build outputs..." && ls -lh /build && \
     echo "🔍 Normalizing compiled filename..." && \
     mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
-    python -O -c "import importlib.util; \
+    python -c "import importlib.util; \
 spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
 mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
 print('✅ AOT binary verified')" || \
@@ -119,4 +119,5 @@ LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
       org.opencontainers.image.memory_limit="900MB" \
       org.opencontainers.image.platform="linux/amd64"
 
-CMD ["python", "macd_unified.py"]
+# Final stage
+CMD ["python", "-O", "macd_unified.py"]
