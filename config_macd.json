@@ -48,7 +48,7 @@
 
   "ENABLE_VWAP": true,
   "ENABLE_PIVOT": true,
-  "PIVOT_LOOKBACK_PERIOD": 2,
+  "PIVOT_LOOKBACK_PERIOD": 15,
 
   "_comment_resilience": "✅ OPTIMIZED: Fail-fast for faster error detection",
   "FAIL_ON_REDIS_DOWN": false,
