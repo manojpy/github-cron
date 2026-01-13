@@ -811,7 +811,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data2)
         _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
         _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
-        _ = aot_bridge.calc_mmh_value_loop(test_data2, len(test_data2))
+        _ = aot_bridge.calc_mmh_value_loop(test_data2, np.zeros_like(test_data2), np.ones_like(test_data2), len(test_data2))
         _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
         _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))  # ADD THIS LINE
         _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
@@ -2796,11 +2796,12 @@ class RedisStateStore:
                 val = mget_results[idx] if idx < len(mget_results) else None
                 if val:
                     try:
-                        parsed = json_loads(val)
-                        if isinstance(parsed, dict):
-                            prev_states[key] = parsed.get("state") == "ACTIVE"
-                        else:
-                            prev_states[key] = False
+
+                    try:
+                        parsed_state = json_loads(val)
+                        prev_states[key] = parsed_state.get("state") == "ACTIVE"
+                    except Exception:
+                        prev_states[key] = False
                     except (json.JSONDecodeError, TypeError) as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Failed to parse state for {key}: {e}")
@@ -4398,6 +4399,7 @@ async def process_pairs_with_workers(
 
 async def run_once() -> bool:
     async with gc_control():
+        MAX_ALERTS_PER_RUN = 50 
         all_results: List[Tuple[str, Dict[str, Any]]] = [] 
         correlation_id = uuid.uuid4().hex[:8]
         TRACE_ID.set(correlation_id)
@@ -4415,8 +4417,6 @@ async def run_once() -> bool:
         lock_acquired = False
         fetcher: Optional[DataFetcher] = None
         telegram_queue: Optional[TelegramQueue] = None
-
-    MAX_ALERTS_PER_RUN = 50
 
     alerts_sent = 0
     for _, state in all_results:
@@ -4649,7 +4649,7 @@ async def run_once() -> bool:
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
-                    f"��� {cfg.BOT_NAME} - FATAL ERROR\n"
+                    f" {cfg.BOT_NAME} - FATAL ERROR\n"
                     f"Error: {str(e)[:200]}\n"
                     f"Correlation ID: {correlation_id}\n"
                     f"Time: {format_ist_time()}"
@@ -4681,12 +4681,14 @@ async def run_once() -> bool:
             locals_to_clear = [
                 'all_results', 'products_map', 'fetcher', 
                 'telegram_queue', 'sdb', 'lock', 'process'
-            ]
+            ]       
+            locals_to_clear = ['all_results', 'products_map', 'fetcher', 'telegram_queue', 'sdb', 'lock']
             for var_name in locals_to_clear:
-                if var_name in locals():
-                    del locals()[var_name]
-
-            gc.collect()
+                try:
+                    exec(f'del {var_name}')
+                except:
+                    pass
+            gc.collect()       
         except Exception as e:
             logger_run.warning(f"Memory cleanup warning: {e}", exc_info=False)
 
