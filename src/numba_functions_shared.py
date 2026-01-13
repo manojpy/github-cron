@@ -126,13 +126,13 @@ def rolling_mean_numba(data, period):
     
     return out
 
-
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
-    """Optimized O(n) rolling min/max using a sliding window algorithm"""
+    """Optimized O(n) rolling min/max using a sliding window algorithm
+    Now supports partial windows to exactly match Pine ta.lowest/ta.highest behavior"""
     rows = len(arr)
-    min_arr = np.full(rows, np.nan, dtype=np.float64) # 
-    max_arr = np.full(rows, np.nan, dtype=np.float64) # 
+    min_arr = np.full(rows, np.nan, dtype=np.float64)
+    max_arr = np.full(rows, np.nan, dtype=np.float64)
 
     # Deques to store indices of potential min/max candidates
     min_deque = np.zeros(rows, dtype=np.int32)
@@ -145,30 +145,31 @@ def rolling_min_max_numba(arr, period):
     for i in range(rows):
         val = arr[i]
         
-        if np.isnan(val):
-            # If current is NaN, it doesn't affect min/max logic 
-            # but we still check if the window has passed the head [cite: 10]
-            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
-            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
-        else:
-            # Maintain Min Deque
-            if min_h < min_t and min_deque[min_h] <= i - period: min_h += 1
+        # Step 1: Always remove indices that are out of the current window
+        while min_h < min_t and min_deque[min_h] <= i - period:
+            min_h += 1
+        while max_h < max_t and max_deque[max_h] <= i - period:
+            max_h += 1
+        
+        # Step 2: If current value is valid, update the deques (maintain monotonic order)
+        if not np.isnan(val):
+            # Min deque - remove from tail elements that are >= new val (keep strictly increasing)
             while min_t > min_h and arr[min_deque[min_t - 1]] >= val:
                 min_t -= 1
             min_deque[min_t] = i
             min_t += 1
 
-            # Maintain Max Deque
-            if max_h < max_t and max_deque[max_h] <= i - period: max_h += 1
+            # Max deque - remove from tail elements that are <= new val (keep strictly decreasing)
             while max_t > max_h and arr[max_deque[max_t - 1]] <= val:
                 max_t -= 1
             max_deque[max_t] = i
             max_t += 1
-
-        # Fill output after reaching the minimum window requirement
-        if i >= period - 1:
-            if min_h < min_t: min_arr[i] = arr[min_deque[min_h]] # [cite: 10]
-            if max_h < max_t: max_arr[i] = arr[max_deque[max_h]] # [cite: 10]
+        
+        # Step 3: Assign current min/max if we have any valid candidates in the window
+        if min_h < min_t:
+            min_arr[i] = arr[min_deque[min_h]]
+        if max_h < max_t:
+            max_arr[i] = arr[max_deque[max_h]]
 
     return min_arr, max_arr
 
