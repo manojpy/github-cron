@@ -2796,8 +2796,6 @@ class RedisStateStore:
                 val = mget_results[idx] if idx < len(mget_results) else None
                 if val:
                     try:
-
-                    try:
                         parsed_state = json_loads(val)
                         prev_states[key] = parsed_state.get("state") == "ACTIVE"
                     except Exception:
