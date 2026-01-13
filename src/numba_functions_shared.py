@@ -41,7 +41,7 @@ def sanitize_array_numba_parallel(arr, default):
 # STATISTICAL FUNCTIONS - OPTIMIZED TO O(n)
 # ============================================================================
 
-njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
+@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
     """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
     n = len(close)
