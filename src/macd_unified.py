@@ -731,8 +731,8 @@ def calculate_magical_momentum_hist(
     close: np.ndarray,
     period: int = 144,
     responsiveness: float = 0.9,
-    debug: bool = False,          # new flag for diagnostics
-    rows_to_print: int = 20       # how many rows to show if debug=True
+    debug: bool = False,        
+    rows_to_print: int = 20
 ) -> np.ndarray:
     
     try:
@@ -771,18 +771,6 @@ def calculate_magical_momentum_hist(
 
         # Step 8: Smooth momentum
         momentum = calc_mmh_momentum_smoothing(momentum, rows)
-
-        # === Optional diagnostics ===
-        if debug:
-            print("\n=== MMH Diagnostics ===")
-            print("Idx | Close | Raw | Min | Max | Value | Momentum")
-            for i in range(min(rows, rows_to_print)):
-                print(f"{i:3d} | {close_c[i]:.5f} | "
-                      f"{raw[i] if not np.isnan(raw[i]) else 'NaN':>6} | "
-                      f"{min_med[i] if not np.isnan(min_med[i]) else 'NaN':>6} | "
-                      f"{max_med[i] if not np.isnan(max_med[i]) else 'NaN':>6} | "
-                      f"{value_arr[i] if not np.isnan(value_arr[i]) else 'NaN':>6} | "
-                      f"{momentum[i] if not np.isnan(momentum[i]) else 'NaN':>6}")
 
         return momentum
 
@@ -3178,7 +3166,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣��� Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
+    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
     {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]

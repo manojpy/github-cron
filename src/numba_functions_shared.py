@@ -91,23 +91,30 @@ def rolling_std(close, period, responsiveness):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """Calculate rolling mean in O(n) using sliding window"""
+    """Calculate rolling mean - Pine accurate"""
     n = len(data)
-    out = np.empty(n, dtype=np.float64)
+    out = np.full(n, np.nan, dtype=np.float64)
     
     window_sum = 0.0
     window_count = 0
     queue = np.zeros(period, dtype=np.float64)
     queue_idx = 0
     
-    for i in range(period):
-        if not np.isnan(data[i]):
-            window_sum += data[i]
+    # Fill the window
+    for i in range(min(period, n)):
+        curr = data[i]
+        if not np.isnan(curr):
+            window_sum += curr
             window_count += 1
-        queue[queue_idx] = data[i]
+        queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-        out[i] = window_sum / window_count if window_count > 0 else 0.0
     
+    # Output first valid SMA at bar period-1
+    if n > period - 1:
+        out[period - 1] = window_sum / window_count if window_count > 0 else np.nan
+    
+    # Rolling mean from bar period onward
+    queue_idx = 0  # Reset to beginning of queue
     for i in range(period, n):
         old_val = queue[queue_idx]
         if not np.isnan(old_val):
@@ -121,8 +128,7 @@ def rolling_mean_numba(data, period):
         
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-        
-        out[i] = window_sum / window_count if window_count > 0 else out[i-1]
+        out[i] = window_sum / window_count if window_count > 0 else np.nan
     
     return out
 
