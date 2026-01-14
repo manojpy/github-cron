@@ -1,21 +1,12 @@
-"""
-Shared Numba Function Definitions - Single Source of Truth
-============================================================
-All 20 Numba functions with:
-  - First-valid-index checks (bulletproof NaN handling)
-  - O(n) complexity where possible (no nested loops)
-  - Explicit @njit signatures for AOT compatibility
-  - Full parallel versions where applicable
-"""
+
+# ============================================================================
+# Shared Numba Function Definitions - Single Source of Truth 
+# ============================================================================
 
 import numpy as np
 from numba import njit, prange, types
 from numba.types import Tuple
 
-
-# ============================================================================
-# SANITIZATION FUNCTIONS
-# ============================================================================
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
@@ -35,11 +26,6 @@ def sanitize_array_numba_parallel(arr, default):
         val = arr[i]
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
-
-
-# ============================================================================
-# STATISTICAL FUNCTIONS - OPTIMIZED TO O(n)
-# ============================================================================
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
@@ -277,10 +263,6 @@ def calc_mmh_momentum_smoothing(momentum_arr, rows):
             
     return result
 
-# ============================================================================
-# MOVING AVERAGES - O(n)
-# ============================================================================
-
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, alpha_or_period):
     """Exponential Moving Average in O(n) with first-valid-index init"""
@@ -333,10 +315,6 @@ def ema_loop_alpha(data, alpha):
     
     return out
 
-
-# ============================================================================
-# FILTERS - O(n)
-# ============================================================================
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
@@ -450,7 +428,6 @@ def kalman_loop(src, length, R, Q):
     error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
     Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
 
-    # ✅ FIX: Apply Kalman formula EVEN on first bar (like Pine does)
     prediction = estimate
     kalman_gain = error_est / (error_est + error_meas)
     estimate = prediction + kalman_gain * (src[first_valid_idx] - prediction)
@@ -472,11 +449,6 @@ def kalman_loop(src, length, R, Q):
         result[i] = estimate
 
     return result
-
-
-# ============================================================================
-# MARKET INDICATORS - O(n)
-# ============================================================================
 
 @njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop(high, low, close, volume, day_id):
@@ -518,11 +490,6 @@ def vwap_daily_loop(high, low, close, volume, day_id):
             vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
 
     return vwap
-
-
-# ============================================================================
-# OSCILLATORS - O(n)
-# ============================================================================
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
@@ -636,10 +603,6 @@ def calculate_rsi_core(close, period):
             rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
-
-# ============================================================================
-# CORRECTED: Numba Vectorized Wick Check Functions with Strict Validation
-# ============================================================================
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_arr, high_arr, low_arr, close_arr, min_wick_ratio):
