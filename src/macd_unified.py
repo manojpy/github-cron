@@ -293,14 +293,14 @@ class BotConfig(BaseModel):
             logger.warning(f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam')
 
         ranges = {
-        'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
-        'RMA_200_PERIOD': (self.RMA_200_PERIOD, 100, 300),
-        'SRSI_RSI_LEN': (self.SRSI_RSI_LEN, 5, 50),
-        'SRSI_KALMAN_LEN': (self.SRSI_KALMAN_LEN, 2, 20)
-    }
-    for name, (val, min_v, max_v) in ranges.items():
-        if not (min_v <= val <= max_v):
-            raise ValueError(f'{name} must be {min_v}-{max_v}')
+            'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
+            'RMA_200_PERIOD': (self.RMA_200_PERIOD, 100, 300),
+            'SRSI_RSI_LEN': (self.SRSI_RSI_LEN, 5, 50),
+            'SRSI_KALMAN_LEN': (self.SRSI_KALMAN_LEN, 2, 20)
+        }
+        for name, (val, min_v, max_v) in ranges.items():
+            if not (min_v <= val <= max_v):
+                raise ValueError(f'{name} must be {min_v}-{max_v}')
      
         return self
 
