@@ -164,9 +164,8 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         return dt.astimezone(_IST_TZ).strftime(fmt)
 
     except Exception as e:
-        # Logs the error but doesn't crash the bot
-        logger.debug(f"format_ist_time parsing failed for input '{dt_or_ts}': {e}")
-        # Final fallback: return the input as a string so logs aren't empty
+        if cfg.DEBUG_MODE:
+            logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
         return str(dt_or_ts)
 
 class BotConfig(BaseModel):
@@ -293,19 +292,16 @@ class BotConfig(BaseModel):
         if self.MAX_ALERTS_PER_PAIR > 15:
             logger.warning(f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam')
 
-    
-        if self.RMA_50_PERIOD < 20 or self.RMA_50_PERIOD > 100:
-            raise ValueError('RMA_50_PERIOD should be 20-100')
-
-        if self.RMA_200_PERIOD < 100 or self.RMA_200_PERIOD > 300:
-            raise ValueError('RMA_200_PERIOD should be 100-300')
-
-        if self.SRSI_RSI_LEN < 5 or self.SRSI_RSI_LEN > 50:
-            raise ValueError('SRSI_RSI_LEN should be 5-50')
-
-        if self.SRSI_KALMAN_LEN < 2 or self.SRSI_KALMAN_LEN > 20:
-            raise ValueError('SRSI_KALMAN_LEN should be 2-20')
-
+        ranges = {
+        'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
+        'RMA_200_PERIOD': (self.RMA_200_PERIOD, 100, 300),
+        'SRSI_RSI_LEN': (self.SRSI_RSI_LEN, 5, 50),
+        'SRSI_KALMAN_LEN': (self.SRSI_KALMAN_LEN, 2, 20)
+    }
+    for name, (val, min_v, max_v) in ranges.items():
+        if not (min_v <= val <= max_v):
+            raise ValueError(f'{name} must be {min_v}-{max_v}')
+     
         return self
 
 def load_config() -> BotConfig:
@@ -405,13 +401,6 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 shutdown_event = asyncio.Event()
 
-_missing_products = set(cfg.PAIRS) - set(STATIC_PRODUCTS_MAP.keys())
-if _missing_products:
-    logger.warning(
-        f"⚠️ Missing product mappings for: {_missing_products}. "
-        f"Add them to STATIC_PRODUCTS_MAP or remove from PAIRS config."
-    )
-
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
     if condition and logger_obj.isEnabledFor(logging.DEBUG):
         logger_obj.debug(msg_fn())
@@ -451,8 +440,7 @@ async def gc_control():
 
 def validate_runtime_config() -> None:
     global _VALIDATION_DONE
-    if _VALIDATION_DONE:
-        logger.debug("Configuration validation skipped (cached)")
+    if _VALIDATION_DONE:       
         return
     
     errors = []
@@ -571,10 +559,9 @@ def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: i
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
+
 def escape_markdown_v2(text: str) -> str:
-    if not isinstance(text, str):
-        text = str(text)
-    return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', text)
+    return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -682,8 +669,8 @@ def calculate_vwap_numpy(
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
         if data is None or len(data) < period:
-            logger.warning(f"RMA: Insufficient data (len={len(data) if data is not None else 0})")
-            return np.zeros_like(data) if data is not None else np.array([0.0])       
+            return np.zeros_like(data) if data is not None else np.array([0.0]) 
+   
         alpha = 1.0 / period
         rma = ema_loop_alpha(data, alpha)
         rma = sanitize_array_numba(rma, 0.0)
@@ -704,14 +691,11 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             )
         close = np.asarray(close, dtype=np.float64)
         
-        # Use corrected smooth_range
         smrng_x1 = smooth_range(close, cfg.X1, cfg.X2)
         smrng_x2 = smooth_range(close, cfg.X3, cfg.X4)
-        
-        # Use corrected range filter
         filt_x1 = rng_filter_loop(close, smrng_x1)
         filt_x12 = rng_filter_loop(close, smrng_x2)
-          
+
         upw, dnw = calculate_trends_with_state(filt_x1, filt_x12)   
         return upw, dnw, filt_x1, filt_x12
         
@@ -783,12 +767,12 @@ def warmup_if_needed() -> None:
     if not aot_bridge.requires_warmup():
         logger.info("✅ AOT active – no warmup needed")
         return
-
+    
     if cfg.SKIP_WARMUP:
-        logger.warning("⚠️ JIT mode + SKIP_WARMUP=true – first run will be slower")
+        logger.info("⏭️ Skipping JIT warmup (first run may be slower)")
         return
-
-    logger.info("🔥 AOT not available, warming up JIT compilation…")
+    
+    logger.info("🔥 Warming up JIT compilation…")
 
     warmup_start = time.time()
 
@@ -827,7 +811,6 @@ def warmup_if_needed() -> None:
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
-
 
 def calculate_pivot_levels_numpy(
     high: np.ndarray,
@@ -1116,9 +1099,9 @@ class SessionManager:
                 cls._creation_time = time.time()
                 cls._request_count = 0
 
-                if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
+                if cfg.DEBUG_MODE:
                     logger.debug("HTTP session created")
-
+                
             return cls._session
 
     @classmethod
@@ -1253,15 +1236,13 @@ async def async_fetch_json(
     
     session = await SessionManager.get_session()
     
-    # Local retry_stats - not persistent across calls
-    retry_stats: Dict[str, int] = {
+    retry_stats = {
         RetryCategory.NETWORK: 0,
         RetryCategory.RATE_LIMIT: 0,
         RetryCategory.API_ERROR: 0,
         RetryCategory.TIMEOUT: 0,
         RetryCategory.UNKNOWN: 0
     }
-    
     last_error: Optional[Exception] = None
     
     for attempt in range(1, retries + 1):
@@ -1727,10 +1708,7 @@ class DataFetcher:
 def parse_candles_to_numpy(
     result: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, np.ndarray]]:
-    """
-    Parse API candle response to NumPy arrays with strict OHLC validation
-    CORRECTED: Validates data integrity before returning
-    """
+    
     if not result or not isinstance(result, dict):
         logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
@@ -1766,11 +1744,7 @@ def parse_candles_to_numpy(
         # Convert milliseconds to seconds if needed
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
-
-        # ===================================================================
-        # STRICT OHLC VALIDATION - NEW
-        # ===================================================================
-        
+    
         # Check for NaN/Inf in OHLC
         nan_mask = (
             np.isnan(data["open"]) | np.isnan(data["high"]) |
@@ -1852,19 +1826,6 @@ def parse_candles_to_numpy(
                 f"parse_candles_to_numpy: Found {deviation_count} candles with "
                 f"Close deviating >50% from High-Low midpoint (potential data anomaly)"
             )
-            # Don't reject for this, just warn
-        
-        # ===================================================================
-        # END VALIDATION
-        # ===================================================================
-        
-        logger.debug(
-            f"parse_candles_to_numpy: âœ… Parsed {n} valid candles. "
-            f"Range: {data['close'].min():.2f}-{data['close'].max():.2f} | "
-            f"Latest: O={data['open'][-1]:.2f} H={data['high'][-1]:.2f} "
-            f"L={data['low'][-1]:.2f} C={data['close'][-1]:.2f}"
-        )
-        
         return data
 
     except Exception as e:
@@ -1875,10 +1836,7 @@ def validate_candle_data(
     data: Optional[Dict[str, np.ndarray]],
     required_len: int = 0,
 ) -> Tuple[bool, Optional[str]]:
-    """
-    Validate candle data for OHLC integrity and staleness
-    CORRECTED: Added strict OHLC validation
-    """
+    
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -1917,9 +1875,6 @@ def validate_candle_data(
         if len(close) < required_len:
             return False, f"Insufficient data: {len(close)} < {required_len}"
 
-        # ===================================================================
-        # NEW: STRICT OHLC INTEGRITY VALIDATION
-        # ===================================================================
         open_arr = data.get("open")
         high_arr = data.get("high")
         low_arr = data.get("low")
@@ -2002,18 +1957,15 @@ def validate_candle_data(
                 median_diff = np.median(time_diffs)
                 max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
                 gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > len(time_diffs) * 0.1:  # More than 10% gaps
+                if len(gaps) > len(time_diffs) * 0.1:
                     return False, f"Too many suspicious candle gaps detected ({len(gaps)}/{len(time_diffs)})"
-        
-        # ===================================================================
-        # END OHLC VALIDATION
-        # ===================================================================
         
         return True, None
     
     except Exception as e:
         logger.error(f"Data validation exception: {e}", exc_info=True)
         return False, f"Validation error: {str(e)}"
+
 def get_last_closed_index_from_array(
     timestamps: np.ndarray,
     interval_minutes: int,
@@ -2240,13 +2192,14 @@ class RedisStateStore:
                         self._redis = pool
                         RedisStateStore._pool_reuse_count[self.redis_url] = \
                             RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
-
+                    
                         if not self._dedup_script_sha:
                             try:
                                 self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
                             except Exception as e:
-                                logger.warning(f"Lua script load failed: {e}")
-
+                                if cfg.DEBUG_MODE:
+                                    logger.debug(f"Lua script load failed: {e}")
+            
                         self.degraded = False
 
                         pool_reused = True
@@ -2287,13 +2240,11 @@ class RedisStateStore:
                         get_ok = get_result == test_val
                         
                         if get_ok:
+
                             try:
-                                await asyncio.wait_for(
-                                    self._redis.delete(test_key),
-                                    timeout=0.5
-                                )
+                                await asyncio.wait_for(self._redis.delete(test_key), timeout=0.5)
                             except Exception:
-                                pass  # Cleanup failure is non-critical
+                                pass
 
                             expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
                             logger.info(
@@ -2600,10 +2551,6 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-
-    # ------------------------------------------------------------------
-    # Bulk state ops
-    # ------------------------------------------------------------------
 
     async def mget_states(
         self,
@@ -3114,22 +3061,16 @@ class TelegramQueue:
                 await asyncio.sleep(INTER_BATCH_DELAY)
 
         return all(results)
-        
-def build_single_msg(title: str, pair: str, price: float, ts: int, extra: Optional[str] = None) -> str:
-    if not title:
-        title = "ALERT"
-    
-    parts = title.split(" ", 1)
-    symbols = parts[0] if len(parts) >= 1 else ""
-    description = parts[1] if len(parts) == 2 else title
-    
-    price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
-    line1 = f"{symbols} {pair} - {price_str}".strip()
-    line2 = f"{description} : {extra}" if extra else f"{description}"
-    line3 = format_ist_time(ts, "%d-%m-%Y     %H:%M IST")
-    
-    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
 
+def build_single_msg(title, pair, price, ts, extra=None):
+    if not title: title = "ALERT"
+    parts = title.split(" ", 1)
+    symbols = parts[0]
+    description = parts[1] if len(parts) == 2 else title
+    price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
+    line2 = f"{description} : {extra}" if extra else description
+    return escape_markdown_v2(f"{symbols} {pair} - {price_str}\n{line2}\n{format_ist_time(ts, '%d-%m-%Y %H:%M IST')}")
+        
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
     if not items:
         return escape_markdown_v2(f"{pair} - ${price:,.2f} {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}")
@@ -3418,10 +3359,7 @@ async def evaluate_pair_and_alert(
     correlation_id: str,
     reference_time: int
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Evaluate all indicators for a pair and send alerts if conditions met.
-    ✅ CORRECTED: Proper null safety, error handling, validation, and consistent candle data
-    """
+    
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
@@ -3525,7 +3463,6 @@ async def evaluate_pair_and_alert(
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
 
         # VWAP from i15 (with previous value from i15-1)
-        # CORRECTED: Do NOT fallback to close/prev when unavailable; set to None
         if not cfg.ENABLE_VWAP:
             vwap_curr = None
             vwap_prev = None
@@ -3566,11 +3503,6 @@ async def evaluate_pair_and_alert(
         # Cloud state from i15
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-
-        # ============================================================================
-        # WICK RATIO CALCULATIONS - From i15 candle OHLC
-        # These MUST match the OHLC data displayed in the alert message
-        # ============================================================================
 
         candle_range = high_curr - low_curr
 
@@ -3805,19 +3737,9 @@ async def evaluate_pair_and_alert(
             is_buy_signal = any(x in alert_key for x in ["up", "buy"])
             is_sell_signal = any(x in alert_key for x in ["down", "sell"])
 
-            # Block on wick ratios BEFORE evaluation
             if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"❌ BLOCKED {alert_key}: Upper wick {actual_buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%"
-                    )
                 continue
-
             if is_sell_signal and actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"❌ BLOCKED {alert_key}: Lower wick {actual_sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%"
-                    )
                 continue
 
             # Special handling for pivot alerts
@@ -3933,54 +3855,38 @@ async def evaluate_pair_and_alert(
         elif not buy_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_zero_up']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"Reset ppo_zero_up: buy_common=False")
-
+                
         if ppo_prev < 0 and ppo_curr >= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
         elif not sell_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_zero_down']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"Reset ppo_zero_down: sell_common=False")
-
+                
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
         elif not buy_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_011_up']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"Reset ppo_011_up: buy_common=False")
-
+                
         if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
         elif not sell_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_011_down']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"Reset ppo_011_down: sell_common=False")
-
+                
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['rsi_50_up']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"Reset rsi_50_up: buy_common={buy_common}, "
-                        f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_BUY}"
-                    )
+                
 
         if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
         elif not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['rsi_50_down']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"Reset rsi_50_down: sell_common={sell_common}, "
-                        f"ppo_curr={ppo_curr:.2f}, guard={Constants.PPO_RSI_GUARD_SELL}"
-                    )
+                
 
         # VWAP reset with None checks
         if cfg.ENABLE_VWAP and vwap_curr is not None and vwap_prev is not None:
@@ -3989,17 +3895,13 @@ async def evaluate_pair_and_alert(
             elif not buy_common:
                 if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_up']):
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Reset vwap_up: buy_common=False")
-
+                    
             if close_prev < vwap_prev and close_curr >= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
             elif not sell_common:
                 if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_down']):
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Reset vwap_down: sell_common=False")
-
+                    
         # Pivot level resets
         if piv:
             for level_name, level_value in piv.items():
@@ -4146,13 +4048,16 @@ async def evaluate_pair_and_alert(
             if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
                 reasons.append("VWAP down-cross blocked: sell_common=False")
 
-        # Build compact failed conditions list
-        failed_conditions = []
-        if not buy_common: failed_conditions.append("buy_common")
-        if not sell_common: failed_conditions.append("sell_common")
-        if not is_green: failed_conditions.append("is_green")
-        if not is_red: failed_conditions.append("is_red")
 
+        failed_conditions = [
+            name for name, val in [
+                ("buy_common", buy_common),
+                ("sell_common", sell_common),
+                ("is_green", is_green),
+                ("is_red", is_red)
+            ] if not val
+        ]
+    
         # Suppression logging for no alerts
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
@@ -4403,6 +4308,12 @@ async def run_once() -> bool:
         TRACE_ID.set(correlation_id)
         logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
         start_time = time.time()
+        sdb: Optional[RedisStateStore] = None
+        lock: Optional[RedisLock] = None
+        fetcher: Optional[DataFetcher] = None
+        telegram_queue: Optional[TelegramQueue] = None
+        lock_acquired = False
+        alerts_sent = 0
 
         reference_time = get_trigger_timestamp()
         logger_run.info(
@@ -4410,13 +4321,6 @@ async def run_once() -> bool:
             f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
         )
 
-        sdb: Optional[RedisStateStore] = None
-        lock: Optional[RedisLock] = None
-        lock_acquired = False
-        fetcher: Optional[DataFetcher] = None
-        telegram_queue: Optional[TelegramQueue] = None
-
-    alerts_sent = 0
     for _, state in all_results:
         if state.get("state") == "ALERT_SENT":
             extra_alerts = state.get("summary", {}).get("alerts", 0)
@@ -4585,18 +4489,10 @@ async def run_once() -> bool:
             if state.get("state") == "ALERT_SENT":
                 alerts_sent += state.get("summary", {}).get("alerts", 0)
 
+
         fetcher_stats = fetcher.get_stats()
-
-        if PRODUCTS_CACHE.get("fetched_at") and fetcher_stats["products"]["success"] == 0 and fetcher_stats["products"]["failed"] == 0:
-            products_line = "cached"
-        else:
-            products_line = f"{fetcher_stats['products']['success']}✅/{fetcher_stats['products']['failed']}❌"
-
-        logger_run.info(
-            f"📡 Fetch statistics | "
-            f"Products: {products_line} | "
-            f"Candles: {fetcher_stats['candles']['success']}✅/{fetcher_stats['candles']['failed']}❌"
-        )
+        prod_str = "cached" if PRODUCTS_CACHE.get("fetched_at") else f"{fetcher_stats['products']['success']}✅"
+        logger_run.info(f"Products: {prod_str} | Candles: {fetcher_stats['candles']['success']}✅/{fetcher_stats['candles']['failed']}❌")
 
         if "rate_limiter" in fetcher_stats:
             rate_stats = fetcher_stats["rate_limiter"]
@@ -4674,21 +4570,8 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
 
-        # Clean up references
-        try:
-            locals_to_clear = [
-                'all_results', 'products_map', 'fetcher', 
-                'telegram_queue', 'sdb', 'lock', 'process'
-            ]       
-            locals_to_clear = ['all_results', 'products_map', 'fetcher', 'telegram_queue', 'sdb', 'lock']
-            for var_name in locals_to_clear:
-                try:
-                    exec(f'del {var_name}')
-                except:
-                    pass
-            gc.collect()       
-        except Exception as e:
-            logger_run.warning(f"Memory cleanup warning: {e}", exc_info=False)
+            # Garbage collection
+            gc.collect()
 
         try:
             TRACE_ID.set("")
@@ -4703,7 +4586,7 @@ try:
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
-    logger.info(f"��️ uvloop not available (using default) | {JSON_BACKEND} enabled")
+    logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 if __name__ == "__main__":
     # Initialize AOT/JIT bridge first
