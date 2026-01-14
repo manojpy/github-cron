@@ -3016,9 +3016,9 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
         return False, f"Error: {str(e)}"
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
-    data_daily: Optional[Dict[str, np.ndarray]], sdb: Redisstatestore, telegram_queue: Telegram Queue, correlation_id: str,
+    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
-    
+   
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
@@ -3759,7 +3759,7 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     return True, None
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str],
-    state_db: Redisstatestore, telegram_queue: Telegram Queue, correlation_id: str, lock: RedisLock,
+    state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock,
     reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
     
