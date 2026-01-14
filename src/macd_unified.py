@@ -606,13 +606,7 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-def calculate_vwap_numpy(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    timestamps: np.ndarray,
-) -> np.ndarray:
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     try:
         if any(x is None or len(x) == 0 for x in [high, low, close, volume, timestamps]):
             return np.zeros_like(close) if close is not None else np.array([0.0])
@@ -681,14 +675,7 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
-def calculate_magical_momentum_hist(
-    close: np.ndarray,
-    period: int = 144,
-    responsiveness: float = 0.9,
-    debug: bool = False,        
-    rows_to_print: int = 20
-) -> np.ndarray:
-    
+def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9, debug: bool = False, rows_to_print: int = 20) -> np.ndarray:  
     try:
         if close is None or len(close) < period:
             return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
@@ -769,12 +756,8 @@ def warmup_if_needed() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
-def calculate_pivot_levels_numpy(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    timestamps: np.ndarray
-) -> Dict[str, float]:
+
+def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, timestamps: np.ndarray) -> Dict[str, float]:
     piv: Dict[str, float] = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
     try:
         if len(timestamps) < 2:
@@ -835,11 +818,7 @@ def calculate_pivot_levels_numpy(
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
     return piv
        
-def calculate_all_indicators_numpy(
-    data_15m: Dict[str, np.ndarray],
-    data_5m: Dict[str, np.ndarray],
-    data_daily: Optional[Dict[str, np.ndarray]]
-) -> Dict[str, np.ndarray]:
+def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
@@ -1113,17 +1092,7 @@ def categorize_exception(exc: Exception) -> str:
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
 
-async def retry_async(
-    fn: Callable,
-    *args,
-    retries: int = 3,
-    base_backoff: float = 0.8,
-    cap: float = 30.0,
-    jitter_min: float = 0.05,
-    jitter_max: float = 0.5,
-    on_error: Optional[Callable[[Exception, int, str], None]] = None,
-    **kwargs
-):
+async def retry_async(fn: Callable, *args, retries: int = 3, base_backoff: float = 0.8, cap: float = 30.0, jitter_min: float = 0.05, jitter_max: float = 0.5, on_error: Optional[Callable[[Exception, int, str], None]] = None, **kwargs):
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, retries + 1):
@@ -1160,14 +1129,7 @@ async def retry_async(
 
     raise last_exc or RuntimeError("retry_async: unknown failure")
 
-async def async_fetch_json(
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    retries: int = 3,
-    backoff: float = 1.5,
-    timeout: int = 15
-) -> Optional[Dict[str, Any]]:
-    
+async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Optional[Dict[str, Any]]:   
     session = await SessionManager.get_session()    
     retry_stats = {
         RetryCategory.NETWORK: 0,
@@ -1387,13 +1349,7 @@ class APICircuitBreaker:
         return True, None
 
 class DataFetcher:
-    def __init__(
-        self,
-        api_base: str,
-        *,
-        session: Optional[aiohttp.ClientSession] = None,
-        max_parallel: Optional[int] = None,
-    ):
+    def __init__(self, api_base: str, *, session: Optional[aiohttp.ClientSession] = None, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         self._external_session = session
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
@@ -1451,14 +1407,7 @@ class DataFetcher:
             
             return result
 
-    async def fetch_candles(
-        self,
-        symbol: str,
-        resolution: str,
-        limit: int,
-        reference_time: int,
-        expected_open_15: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
+    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None) -> Optional[Dict[str, Any]]:
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
@@ -1554,11 +1503,7 @@ class DataFetcher:
             )        
         return stats
 
-    async def fetch_candles_batch(
-        self,
-        requests: List[Tuple[str, str, int]],
-        reference_time: Optional[int] = None
-    ) -> Dict[str, Optional[Dict[str, Any]]]:
+    async def fetch_candles_batch(self, requests: List[Tuple[str, str, int]], reference_time: Optional[int] = None) -> Dict[str, Optional[Dict[str, Any]]]:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
         
@@ -1575,11 +1520,7 @@ class DataFetcher:
             output[key] = None if isinstance(result, Exception) else result    
         return output
 
-    async def fetch_all_candles_truly_parallel(
-        self,
-        pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
-        reference_time: Optional[int] = None,
-    ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
+    async def fetch_all_candles_truly_parallel(self, pair_requests: List[Tuple[str, List[Tuple[str, int]]]], reference_time: Optional[int] = None) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1611,10 +1552,7 @@ class DataFetcher:
         logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
-def parse_candles_to_numpy(
-    result: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, np.ndarray]]:
-    
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
     if not result or not isinstance(result, dict):
         logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
@@ -1728,10 +1666,7 @@ def parse_candles_to_numpy(
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
 
-def validate_candle_data(
-    data: Optional[Dict[str, np.ndarray]],
-    required_len: int = 0,
-) -> Tuple[bool, Optional[str]]:    
+def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:    
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -1854,11 +1789,7 @@ def validate_candle_data(
         logger.error(f"Data validation exception: {e}", exc_info=True)
         return False, f"Validation error: {str(e)}"
 
-def get_last_closed_index_from_array(
-    timestamps: np.ndarray,
-    interval_minutes: int,
-    reference_time: Optional[int] = None,
-) -> Optional[int]:
+def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 2:
         logger.warning("No timestamps or insufficient data")
         return None
@@ -1890,12 +1821,7 @@ def get_last_closed_index_from_array(
     )
     return last_closed_idx
 
-def validate_candle_timestamp(
-    candle_ts: int,
-    reference_time: int,
-    interval_minutes: int,
-    tolerance_seconds: int = 120,
-) -> bool:
+def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
     current_window = reference_time // interval_seconds
     expected_open_ts = (current_window * interval_seconds) - interval_seconds
@@ -2198,14 +2124,7 @@ class RedisStateStore:
         result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
         return bool(result)
 
-    async def _safe_redis_op(
-        self,
-        fn: Callable[[], Any],
-        timeout: float,
-        op_name: str,
-        parser: Optional[Callable[[Any], Any]] = None,
-    ):
-        
+    async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):     
         if not self._redis:
             return None
         try:
@@ -2227,13 +2146,7 @@ class RedisStateStore:
             parser=lambda r: json_loads(r) if r else None,
         )
 
-    async def set(
-        self,
-        key: str,
-        state: Optional[Any],
-        ts: Optional[int] = None,
-        timeout: float = 2.0,
-    ) -> None:
+    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
@@ -2357,10 +2270,7 @@ class RedisStateStore:
             logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
         return should_send
 
-    async def batch_check_recent_alerts(
-        self, checks: List[Tuple[str, str, int]]
-    ) -> Dict[str, bool]:
-        
+    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:    
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2391,11 +2301,7 @@ class RedisStateStore:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def mget_states(
-        self,
-        keys: List[str],
-        timeout: float = 2.0
-    ) -> Dict[str, Optional[Dict[str, Any]]]: 
+    async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]: 
         if not self._redis or not keys:
             return {}
 
@@ -2437,11 +2343,7 @@ class RedisStateStore:
             )
             return {}
 
-    async def batch_set_states(
-        self,
-        updates: List[Tuple[str, Any, Optional[int]]],
-        timeout: float = 4.0,
-    ) -> None:   
+    async def batch_set_states(self, updates: List[Tuple[str, Any, Optional[int]]], timeout: float = 4.0) -> None:   
         if self.degraded or not updates or not self._redis:
             return
 
@@ -2465,14 +2367,7 @@ class RedisStateStore:
             for key, state, custom_ts in updates:
                 await self.set(key, state, custom_ts)
 
-    async def atomic_eval_batch(
-        self,
-        pair: str,
-        alert_keys: List[str],
-        state_updates: List[Tuple[str, Any, Optional[int]]],
-        dedup_checks: List[Tuple[str, str, int]]
-    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        
+    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:     
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
@@ -2510,14 +2405,7 @@ class RedisStateStore:
 
             return prev_states, dedup_results
 
-    async def _pipeline_ops(
-        self,
-        pair: str,
-        alert_keys: List[str],
-        state_updates: List[Tuple[str, Any, Optional[int]]],
-        dedup_checks: List[Tuple[str, str, int]]
-    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-
+    async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
@@ -2595,13 +2483,7 @@ class RedisStateStore:
             logger.error(f"Pipeline operation failed: {e}")
             return {k: False for k in alert_keys}, {}    
 
-    async def atomic_batch_update(
-        self,
-        updates: List[Tuple[str, Any, Optional[int]]],
-        deletes: Optional[List[str]] = None,
-        timeout: float = 4.0,
-    ) -> bool:
-    
+    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
         if self.degraded or not self._redis:
             return False
 
@@ -2918,12 +2800,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
-def _validate_pivot_cross(
-    ctx: Dict[str, Any],
-    level: str,
-    is_buy: bool
-) -> Tuple[bool, Optional[str]]:
-    
+def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:   
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots or pivots[level] == 0:
         return False, "Pivot data missing"
@@ -3102,14 +2979,7 @@ def check_common_conditions(open_val, high_val, low_val, close_val, is_buy) -> b
     except Exception:
         return False
 
-def check_candle_quality_with_reason(
-    open_val: float,
-    high_val: float,
-    low_val: float,
-    close_val: float,
-    is_buy: bool
-) -> Tuple[bool, str]:
-    
+def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: float, close_val: float, is_buy: bool) -> Tuple[bool, str]:   
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
@@ -3145,18 +3015,10 @@ def check_candle_quality_with_reason(
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-async def evaluate_pair_and_alert(
-    pair_name: str,
-    data_15m: Dict[str, np.ndarray],
-    data_5m: Dict[str, np.ndarray],
-    data_daily: Optional[Dict[str, np.ndarray]],
-    sdb: RedisStateStore,
-    telegram_queue: TelegramQueue,
-    correlation_id: str,
-    reference_time: int
-) -> Optional[Tuple[str, Dict[str, Any]]]:
+async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
+    data_daily: Optional[Dict[str, np.ndarray]], sdb: Redisstatestore, telegram_queue: Telegram Queue, correlation_id: str,
+    reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
     
-
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
@@ -3896,16 +3758,9 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-async def process_pairs_with_workers(
-    fetcher: DataFetcher,
-    products_map: Dict[str, dict],
-    pairs_to_process: List[str],
-    state_db: RedisStateStore,
-    telegram_queue: TelegramQueue,
-    correlation_id: str,
-    lock: RedisLock,
-    reference_time: int
-) -> List[Tuple[str, Dict[str, Any]]]:
+async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str],
+    state_db: Redisstatestore, telegram_queue: Telegram Queue, correlation_id: str, lock: RedisLock,
+    reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
     
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
@@ -4276,10 +4131,7 @@ if __name__ == "__main__":
     else:
         logger.info("✅ Verified: AOT artifacts loaded successfully")
 
-    parser = argparse.ArgumentParser(
-        prog="macd_unified",
-        description="Unified MACD/alerts runner with NumPy optimization"
-    )
+    parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner with NumPy optimization")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
