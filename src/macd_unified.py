@@ -3077,6 +3077,44 @@ async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ct
         logger.error(f"_evaluate_single_alert failed for {alert_key}: {e}")
         return False, ""
 
+async def evaluate_alerts_batch(alert_keys_to_check: List[str], context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
+    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str) -> List[Tuple[str, str, str]]:
+    raw_alerts: List[Tuple[str, str, str]] = []
+    batch_size = 4
+
+    batches = [
+        alert_keys_to_check[i:i + batch_size]
+        for i in range(0, len(alert_keys_to_check), batch_size)
+    ]
+
+    for batch in batches:
+        tasks = [
+            _evaluate_single_alert(
+                alert_key, context, ppo_ctx, ppo_sig_ctx, rsi_ctx,
+                previous_states, pair_name
+            )
+            for alert_key in batch
+        ]
+
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for alert_key, result in zip(batch, batch_results):
+            if isinstance(result, Exception):
+                logger.error(f"Alert eval failed for {alert_key} in pair {pair_name}: {result}")
+                continue
+
+            if not isinstance(result, tuple) or len(result) != 2:
+                logger.error(f"Unexpected result format for {alert_key}: {result}")
+                continue
+
+            trigger, extra = result
+            if trigger:
+                def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
+                if def_:
+                    raw_alerts.append((def_["title"], extra, alert_key))
+
+    return raw_alerts
+
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
