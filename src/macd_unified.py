@@ -3716,18 +3716,24 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
 
     return True, None
 
-def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
+from typing import Dict, Any, Tuple, Optional
+
+def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
     pivots = ctx.get("pivots")
-    if not pivots or level not in pivots or pivots[level] == 0:
+    if not pivots or level not in pivots:
         return False, "No pivot data"
 
     level_value = pivots[level]
     if level_value <= 0:
-    return False, "Invalid pivot level (0)"     
-        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
-    close_curr = ctx["close_curr"]
-    close_prev = ctx["close_prev"]
+        return False, "Invalid pivot value"
 
+    close_curr = ctx.get("close_curr")
+    close_prev = ctx.get("close_prev")
+
+    if close_curr is None or close_prev is None:
+        return False, "Missing close data"
+
+    # Check if price crossed the pivot
     if is_buy:
         crossed = close_prev <= level_value < close_curr
     else:
@@ -3736,14 +3742,15 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     if not crossed:
         return False, "No pivot cross"
 
+    # Safer percentage difference calculation
     try:
-        distance_pct = abs(level_value - close_curr) / level_value * 100
+        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
     except ZeroDivisionError:
         return False, "Pivot invalid (zero)"
 
-    if distance_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
+    if price_diff_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
         return False, (
-            f"Pivot too far: price {close_curr:.2f} is {distance_pct:.2f}% "
+            f"Pivot too far: price {close_curr:.2f} is {price_diff_pct:.2f}% "
             f"away from {level} pivot {level_value:.2f}"
         )
 
