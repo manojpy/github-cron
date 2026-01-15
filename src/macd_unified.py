@@ -730,17 +730,13 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
 def warmup_if_needed() -> None:
-
     if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP:
         logger.info("✅ Skipping warmup (AOT active or explicitly disabled)")
         return
-
-    logger.debug("Running warmup...")
-    warmup_if_needed()
-
-    logger.info("🔥 Warming up JIT compilation…")
+    
+    logger.info("🔥 Warming up JIT compilation...")
     warmup_start = time.time()
-    try:
+    try:       
         test_data = np.random.random(200).astype(np.float64) * 1000
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
@@ -2487,19 +2483,14 @@ class RedisStateStore:
             prev_states: Dict[str, bool] = {}
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
+                prev_states[key] = False  # Default
                 if val:
                     try:
                         parsed_state = json_loads(val)
                         prev_states[key] = parsed_state.get("state") == "ACTIVE"
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError, Exception) as e:
+                        logger.warning(f"Failed to parse state for {key}: {e}")
                         prev_states[key] = False
-                    except (json.JSONDecodeError, TypeError) as e:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"Failed to parse state for {key}: {e}")
-                        prev_states[key] = False
-                    except Exception as e:
-                        logger.error(f"Unexpected error parsing state for {key}: {e}")
-                    prev_states[key] = False
                 else:
                     prev_states[key] = False
 
@@ -3277,6 +3268,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     dnw = None
     rma50_15 = None
     rma200_5 = None
+    rma50_15_val = None
+    rma200_5_val = None
     piv = None
     context = None
     base_buy_trend = False
@@ -3322,8 +3315,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             return None
 
         # ===== STEP 4: EARLY TREND FILTER (Performance Fix #21) =====
-        rma50_15_val = None
-        rma200_5_val = None
+        
         try:
             if i15 >= cfg.RMA_50_PERIOD and i5 >= cfg.RMA_200_PERIOD:
                 rma50_15_val = calculate_rma_numpy(data_15m["close"], cfg.RMA_50_PERIOD)[i15]
