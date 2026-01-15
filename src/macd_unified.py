@@ -2180,6 +2180,7 @@ class RedisStateStore:
         self._redis = None
 
         logger.warning("""
+
 🚨 REDIS DEGRADED MODE ACTIVE:
 - Alert deduplication:  DISABLED (may get duplicates)
 - State persistence:    DISABLED (alerts reset each run)
@@ -2390,38 +2391,55 @@ class RedisStateStore:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
-
+    
         try:
             prev_states, dedup_results = await self._pipeline_ops(
                 pair, alert_keys, state_updates, dedup_checks
             )
             return prev_states, dedup_results
-
+    
         except asyncio.TimeoutError:
             logger.error(
                 f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
                 f"Degrading to individual operations"
             )
             try:
-                composite_keys = [f"{pair}:{k}" for k in alert_keys]
-                prev_raw = await asyncio.wait_for(self.mget_states(composite_keys), timeout=2.0)
-
+                # Format state_updates with pair prefix for batch_get_and_set_alerts
+                formatted_updates = [
+                    (f"{pair}:{key}", state, ts) for key, state, ts in state_updates
+                ]
+            
+                # Use batch_get_and_set_alerts to get previous states and set new ones
+                prev_raw = await asyncio.wait_for(
+                    self.batch_get_and_set_alerts(pair, alert_keys, formatted_updates),
+                    timeout=2.0
+                )
+            
+                # Parse previous states
                 prev_states: Dict[str, bool] = {}
                 for k in alert_keys:
-                    ck = f"{pair}:{k}"
-                    env = prev_raw.get(ck)
+                    env = prev_raw.get(k)
                     prev_states[k] = bool(env and env.get("state") == "ACTIVE")
-
-                await asyncio.wait_for(self.batch_set_states(state_updates), timeout=2.0)
-
-                dedup_results = await asyncio.wait_for(self.batch_check_recent_alerts(dedup_checks), timeout=2.0)
+            
+                # Check for recent alerts (deduplication)
+                dedup_results = await asyncio.wait_for(
+                    self.batch_check_recent_alerts(dedup_checks),
+                    timeout=2.0
+                )
+            
+                return prev_states, dedup_results
+        
             except asyncio.TimeoutError:
                 logger.critical(f"Redis completely unresponsive for {pair}")
                 empty_prev = {k: False for k in alert_keys}
                 empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
                 return empty_prev, empty_dedup
-
-            return prev_states, dedup_results
+        
+            except Exception as e:
+                logger.error(f"Fallback operations failed for {pair}: {e}")
+                empty_prev = {k: False for k in alert_keys}
+                empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+                return empty_prev, empty_dedup
 
     async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         if not self._redis:
@@ -2850,28 +2868,45 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
-def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:   
+
+def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
     pivots = ctx.get("pivots")
-    if not pivots or level not in pivots or pivots[level] == 0:
-        return False, "Pivot data missing"
+    if not pivots or level not in pivots:
+        return False, "No pivot data"
 
     level_value = pivots[level]
-    close_curr = ctx["close_curr"]
-    close_prev = ctx["close_prev"]
+    if level_value <= 0:
+        return False, "Invalid pivot value"
 
+    close_curr = ctx.get("close_curr")
+    close_prev = ctx.get("close_prev")
+
+    if close_curr is None or close_prev is None:
+        return False, "Missing close data"
+
+    # Check if price crossed the pivot
     if is_buy:
         crossed = close_prev <= level_value < close_curr
     else:
         crossed = close_prev >= level_value > close_curr
-    
-    if not crossed:
-        return False, None
-    
-    price_diff_pct = abs(level_value - close_curr) / close_curr * 100
-    if price_diff_pct > cfg.PIVOT_MAX_DISTANCE_PCT:
-        return False, f"Pivot too far: {price_diff_pct:.1f}%"
 
-    return True, None
+    if not crossed:
+        return False, "No pivot cross"
+
+    # Safer percentage difference calculation
+    try:
+        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
+    except ZeroDivisionError:
+        return False, "Pivot invalid (zero)"
+
+    if price_diff_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
+        return False, (
+            f"Pivot too far: price {close_curr:.2f} is {price_diff_pct:.2f}% "
+            f"away from {level} pivot {level_value:.2f}"
+        )
+
+    return True, None 
+
 
 def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     cache_key = f"_pivot_cache_{level}_{'buy' if is_buy else 'sell'}"
@@ -3093,43 +3128,6 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
 
     return True, None
 
-def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
-    pivots = ctx.get("pivots")
-    if not pivots or level not in pivots:
-        return False, "No pivot data"
-
-    level_value = pivots[level]
-    if level_value <= 0:
-        return False, "Invalid pivot value"
-
-    close_curr = ctx.get("close_curr")
-    close_prev = ctx.get("close_prev")
-
-    if close_curr is None or close_prev is None:
-        return False, "Missing close data"
-
-    # Check if price crossed the pivot
-    if is_buy:
-        crossed = close_prev <= level_value < close_curr
-    else:
-        crossed = close_prev >= level_value > close_curr
-
-    if not crossed:
-        return False, "No pivot cross"
-
-    # Safer percentage difference calculation
-    try:
-        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
-    except ZeroDivisionError:
-        return False, "Pivot invalid (zero)"
-
-    if price_diff_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
-        return False, (
-            f"Pivot too far: price {close_curr:.2f} is {price_diff_pct:.2f}% "
-            f"away from {level} pivot {level_value:.2f}"
-        )
-
-    return True, None 
 
 def log_alert_rejection_reasons(pair_name: str, pair_logger: logging.Logger, buy_common: bool, sell_common: bool,
     buy_wick_ratio: float, sell_wick_ratio: float, cloud_up: bool, cloud_down: bool, mmh_curr: float, ppo_curr: float) -> None:
@@ -3258,7 +3256,6 @@ async def evaluate_alerts_batch(alert_keys_to_check: List[str], context: Dict[st
 
     return raw_alerts
 
-
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -3288,6 +3285,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     sell_candle_passed = False
     buy_candle_reason = None
     sell_candle_reason = None
+    i15 = None
+    i5 = None
 
     try:
         # ===== STEP 2: Get Last Closed Candle Indices =====
@@ -3306,9 +3305,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
 
-        close_curr = close_15m[i15]          # ← Define here for early use
+        close_curr = close_15m[i15]
         open_curr = open_15m[i15]
-        close_5m_val = data_5m["close"][i5]  # ← Define here for early use
+        close_5m_val = data_5m["close"][i5]
 
         is_green = close_curr > open_curr
         is_red = close_curr < open_curr
@@ -3330,8 +3329,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 rma50_15_val = calculate_rma_numpy(data_15m["close"], cfg.RMA_50_PERIOD)[i15]
                 rma200_5_val = calculate_rma_numpy(data_5m["close"], cfg.RMA_200_PERIOD)[i5]
             else:
-                rma50_15_val = close_curr      # fallback
-                rma200_5_val = close_5m_val    # fallback
+                rma50_15_val = close_curr
+                rma200_5_val = close_5m_val
         except Exception as e:
             logger_pair.warning(f"RMA fallback due to error: {e}")
             rma50_15_val = close_curr
@@ -3347,7 +3346,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.debug(f"No trend for {pair_name}, skipping full indicator calculation")
             return None
 
-        # ===== STEP 5: Calculate All Indicators (Threaded) — ONLY IF NEEDED =====
+        # ===== STEP 5: Calculate All Indicators (Threaded) – ONLY IF NEEDED =====
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy,
             data_15m,
@@ -3388,10 +3387,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         low_curr = data_15m["low"][i15]
         ts_curr = int(timestamps_15m[i15])
         
-        open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
-        high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
-        low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
-        
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         ppo_sig_curr = ppo_signal[i15]
@@ -3431,13 +3426,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(mmh_m2) and 
             not np.isnan(mmh_m3)
         )
-        
-        # ===== STEP 8: Extract Moving Averages & Cloud =====
-        
-        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
-        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
-        # ===== STEP 9: Calculate Wick Ratios =====
+        # ===== STEP 11: Calculate Wick Ratios =====
         candle_range = high_curr - low_curr
 
         if candle_range < 1e-8:
@@ -3462,13 +3452,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"Sell wick: {actual_sell_wick_ratio*100:.2f}%"
             )
 
-        # ===== STEP 10: Validate Candle Timestamp =====
+        # ===== STEP 12: Validate Candle Timestamp =====
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             if cfg.DEBUG_MODE:
                 logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
 
-        # ===== STEP 11: Daily Reset at UTC Midnight =====
+        # ===== STEP 13: Daily Reset at UTC Midnight =====
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
             current_utc_hour = current_utc_dt.hour
@@ -3503,21 +3493,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                         if delete_keys:
                             await sdb.atomic_batch_update([], deletes=delete_keys)
-                            logger_pair.info(f"📅 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts")
+                            logger_pair.info(f"🔄 Daily reset at UTC midnight... Cleared {len(delete_keys)} alerts")
 
                         await sdb.set_metadata(day_tracker_key, str(current_day))
 
                 except Exception as e:
                     logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
 
-        # ===== STEP 12: Calculate Base Trends =====
-        
+        # ===== STEP 14: Calculate Base Trends (with MMH & Cloud) =====
         if base_buy_trend:
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
-        # ===== STEP 13: Check Candle Quality =====
+        # ===== STEP 15: Check Candle Quality =====
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
@@ -3532,11 +3521,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 open_curr, high_curr, low_curr, close_curr, is_buy=False
             )
 
-        # ===== STEP 14: Final Common Conditions =====
+        # ===== STEP 16: Final Common Conditions =====
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
 
-        # ===== STEP 15: Calculate MMH Reversals =====
+        # ===== STEP 17: Calculate MMH Reversals =====
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
@@ -3549,7 +3538,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             mmh_reversal_buy = buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
             mmh_reversal_sell = sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
 
-        # ===== STEP 16: Build Context Dictionary =====
+        # ===== STEP 18: Build Context Dictionary =====
         context = {
             "close_curr": close_curr,
             "close_prev": close_prev,
@@ -3595,7 +3584,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
-        # ===== STEP 17: Determine Which Alerts to Check =====
+        # ===== STEP 19: Determine Which Alerts to Check =====
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
@@ -3616,12 +3605,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
 
-        # ===== STEP 18: Get Previous Alert States =====
+        # ===== STEP 20: Get Previous Alert States =====
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, redis_alert_keys
         )
 
-        # ===== STEP 19: Evaluate Alerts in Batches (PERFORMANCE FIX) =====
+        # ===== STEP 21: Evaluate Alerts in Batches (PERFORMANCE FIX) =====
         raw_alerts = await evaluate_alerts_batch(
             alert_keys_to_check,
             context,
@@ -3633,7 +3622,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair
         )
 
-        # ===== STEP 20: Build State Changes & Resets =====
+        # ===== STEP 22: Build State Changes & Resets =====
         all_state_changes = []
         resets_to_apply = []
 
@@ -3643,7 +3632,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if key:
                 all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
 
-        # ===== STEP 21: Determine Resets (when conditions no longer met) =====
+        # ===== STEP 23: Determine Resets (when conditions no longer met) =====
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
@@ -3720,11 +3709,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # Combine all state changes
         all_state_changes.extend(resets_to_apply)
 
-        # ===== STEP 22: Apply State Changes Atomically =====
+        # ===== STEP 24: Apply State Changes Atomically =====
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
 
-        # ===== STEP 23: Filter and Limit Alerts =====
+        # ===== STEP 25: Filter and Limit Alerts =====
         alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
         # Limit pivot alerts to avoid spam
@@ -3737,7 +3726,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
 
-        # ===== STEP 24: Send Alerts via Telegram =====
+        # ===== STEP 26: Send Alerts via Telegram =====
         if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
@@ -3755,7 +3744,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
                 logger_pair.info(
-                    f"🔵🎯🟠   Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                    f"🔵🎯🟠 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:
@@ -3782,7 +3771,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "summary": {
                 "alerts": len(alerts_to_send),
                 "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                "mmh_hist": round(mmh_curr, 4),        
+                "mmh_hist": round(mmh_curr, 4),
             }
         }
 
