@@ -2039,6 +2039,18 @@ class RedisStateStore:
                 f"Metadata TTL: 7d"
             )
 
+    @staticmethod
+    def _mask_redis_url(url: str) -> str:
+        try:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(url)
+            if parsed.password:
+                safe_parsed = parsed._replace(password="***")
+                return urlunparse(safe_parsed)
+        except Exception:
+            pass
+        return "[REDACTED_URL]"
+
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
             self._redis = redis.from_url(
@@ -2083,7 +2095,8 @@ class RedisStateStore:
             return True
 
         except Exception as exc:
-            logger.error(f"Redis connection attempt failed: {exc}")
+            safe_url = self._mask_redis_url(self.redis_url)
+            logger.error(f"Redis connection attempt failed: {safe_url} - {exc}")
             if self._redis:
                 try:
                     await self._redis.aclose()
@@ -2668,6 +2681,7 @@ class TelegramQueue:
         self.token = token
         self.chat_id = chat_id
         self.token_bucket = TokenBucket(cfg.TELEGRAM_RATE_LIMIT_PER_MINUTE, cfg.TELEGRAM_BURST_SIZE)
+        self.bucket_state_key = "telegram:token_bucket:state"
 
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
@@ -2679,6 +2693,36 @@ class TelegramQueue:
                 return False
             raise
 
+    async def restore_bucket_state(self, redis_client: Optional[redis.Redis]) -> None:
+        if not redis_client:
+            return
+        try:
+            state_str = await redis_client.get(self.bucket_state_key)
+            if state_str:
+                state = json_loads(state_str)
+                self.token_bucket.tokens = state.get("tokens", float(cfg.TELEGRAM_BURST_SIZE))
+                self.token_bucket.last_update = state.get("last_update", time.monotonic())
+                logger.debug("Restored Telegram token bucket state from Redis")
+        except Exception as e:
+            logger.warning(f"Failed to restore bucket state: {e}")
+
+    async def save_bucket_state(self, redis_client: Optional[redis.Redis]) -> None:
+        if not redis_client:
+            return
+        try:
+            state = {
+                "tokens": float(self.token_bucket.tokens),
+                "last_update": self.token_bucket.last_update,
+            }
+            await redis_client.set(
+                self.bucket_state_key,
+                json_dumps(state),
+                ex=3600  # 1 hour expiry
+            )
+        except Exception as e:
+            logger.debug(f"Failed to save bucket state: {e}")
+
+    # ===== _send_impl must be at CLASS LEVEL, NOT inside another method =====
     async def _send_impl(self, message: str) -> bool:
         await self.token_bucket.acquire()
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
@@ -2706,7 +2750,6 @@ class TelegramQueue:
         return False
 
     async def send_batch(self, messages: List[str]) -> bool:
-    
         if not messages:
             return True
 
@@ -3016,6 +3059,106 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
     except Exception as e:
         return False, f"Error: {str(e)}"
 
+def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
+    
+    if not ctx.get("vwap_enabled") or not ctx.get("vwap_available"):
+        return False, "VWAP unavailable"
+
+    close_prev = ctx["close_prev"]
+    close_curr = ctx["close_curr"]
+    vwap_prev = ctx["vwap_prev"]
+    vwap_curr = ctx["vwap_curr"]
+
+    if is_buy:
+        crossed = close_prev <= vwap_prev < close_curr
+        alert_key = ALERT_KEYS["vwap_up"]
+    else:
+        crossed = close_prev >= vwap_prev > close_curr
+        alert_key = ALERT_KEYS["vwap_down"]
+
+    if not crossed:
+        return False, "No VWAP cross"
+    if previous_states.get(alert_key, False):
+        return False, "VWAP alert already active"
+    try:
+        distance_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
+    except ZeroDivisionError:
+        return False, "VWAP invalid (zero)"
+
+    if distance_pct > Constants.VWAP_MAX_DISTANCE_PCT:
+        return False, (
+            f"VWAP too far: price {close_curr:.2f} is {distance_pct:.2f}% "
+            f"away from VWAP {vwap_curr:.2f}"
+        )
+
+    return True, None
+
+def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
+    pivots = ctx.get("pivots")
+    if not pivots or level not in pivots:
+        return False, "No pivot data"
+
+    level_value = pivots[level]
+    if level_value <= 0:
+        return False, "Invalid pivot value"
+
+    close_curr = ctx.get("close_curr")
+    close_prev = ctx.get("close_prev")
+
+    if close_curr is None or close_prev is None:
+        return False, "Missing close data"
+
+    # Check if price crossed the pivot
+    if is_buy:
+        crossed = close_prev <= level_value < close_curr
+    else:
+        crossed = close_prev >= level_value > close_curr
+
+    if not crossed:
+        return False, "No pivot cross"
+
+    # Safer percentage difference calculation
+    try:
+        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
+    except ZeroDivisionError:
+        return False, "Pivot invalid (zero)"
+
+    if price_diff_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
+        return False, (
+            f"Pivot too far: price {close_curr:.2f} is {price_diff_pct:.2f}% "
+            f"away from {level} pivot {level_value:.2f}"
+        )
+
+    return True, None 
+
+def log_alert_rejection_reasons(pair_name: str, pair_logger: logging.Logger, buy_common: bool, sell_common: bool,
+    buy_wick_ratio: float, sell_wick_ratio: float, cloud_up: bool, cloud_down: bool, mmh_curr: float, ppo_curr: float) -> None:
+    suppressions = []
+    if not buy_common and not sell_common:
+        suppressions.append("No trend (buy_common=False, sell_common=False)")
+    elif not buy_common:
+        suppressions.append("buy_common=False")
+    elif not sell_common:
+        suppressions.append("sell_common=False")
+    
+    if buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+        suppressions.append(f"Buy wick too high: {buy_wick_ratio*100:.1f}%")
+    if sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+        suppressions.append(f"Sell wick too high: {sell_wick_ratio*100:.1f}%")
+    
+    if not cloud_up and not cloud_down:
+        suppressions.append("Cloud neutral (no clear up/down)")
+    
+    if buy_common and mmh_curr <= 0:
+        suppressions.append(f"MMH not positive: {mmh_curr:.2f}")
+    if sell_common and mmh_curr >= 0:
+        suppressions.append(f"MMH not negative: {mmh_curr:.2f}")
+    
+    if suppressions and cfg.DEBUG_MODE:
+        pair_logger.debug(
+            f"{pair_name} | No alerts | Reasons: {' | '.join(suppressions)}"
+        ) 
+
 async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
     rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str) -> Tuple[bool, str]:
     try:
@@ -3077,7 +3220,6 @@ async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ct
         logger.error(f"_evaluate_single_alert failed for {alert_key}: {e}")
         return False, ""
 
-
 async def evaluate_alerts_batch(alert_keys_to_check: List[str], context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
     rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str, logger_pair: logging.Logger) -> List[Tuple[str, str, str]]:
     raw_alerts: List[Tuple[str, str, str]] = []
@@ -3115,6 +3257,7 @@ async def evaluate_alerts_batch(alert_keys_to_check: List[str], context: Dict[st
                     raw_alerts.append((def_["title"], extra, alert_key))
 
     return raw_alerts
+
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
@@ -3163,21 +3306,48 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
 
-        close_curr_quick = close_15m[i15]
-        open_curr_quick = open_15m[i15]
-        is_green = close_curr_quick > open_curr_quick
-        is_red = close_curr_quick < open_curr_quick
+        close_curr = close_15m[i15]          # ← Define here for early use
+        open_curr = open_15m[i15]
+        close_5m_val = data_5m["close"][i5]  # ← Define here for early use
+
+        is_green = close_curr > open_curr
+        is_red = close_curr < open_curr
 
         # Early exit if doji/neutral candle
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
                     f"Doji/neutral candle for {pair_name} "
-                    f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
+                    f"(O={open_curr:.2f}, C={close_curr:.2f}), skipping indicators"
                 )
             return None
 
-        # ===== STEP 4: Calculate All Indicators (Threaded) =====
+        # ===== STEP 4: EARLY TREND FILTER (Performance Fix #21) =====
+        rma50_15_val = None
+        rma200_5_val = None
+        try:
+            if i15 >= cfg.RMA_50_PERIOD and i5 >= cfg.RMA_200_PERIOD:
+                rma50_15_val = calculate_rma_numpy(data_15m["close"], cfg.RMA_50_PERIOD)[i15]
+                rma200_5_val = calculate_rma_numpy(data_5m["close"], cfg.RMA_200_PERIOD)[i5]
+            else:
+                rma50_15_val = close_curr      # fallback
+                rma200_5_val = close_5m_val    # fallback
+        except Exception as e:
+            logger_pair.warning(f"RMA fallback due to error: {e}")
+            rma50_15_val = close_curr
+            rma200_5_val = close_5m_val
+
+        # Compute early trends using only RMA
+        base_buy_trend_early = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
+        base_sell_trend_early = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
+
+        # Early exit if no trend
+        if not base_buy_trend_early and not base_sell_trend_early:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"No trend for {pair_name}, skipping full indicator calculation")
+            return None
+
+        # ===== STEP 5: Calculate All Indicators (Threaded) — ONLY IF NEEDED =====
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy,
             data_15m,
@@ -3197,10 +3367,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
 
-        # ===== STEP 5: Extract Current & Previous Values =====
-        close_curr = close_15m[i15]
+        # ===== STEP 6: Re-extract accurate RMA & cloud from full indicators =====
+        rma50_15_val = rma50_15[i15]
+        rma200_5_val = rma200_5[i5]
+        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
+
+        # ===== STEP 7: Final Base Trends with Full Context (Original logic) =====
+        base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
+        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
+
+        if base_buy_trend:
+            base_buy_trend = base_buy_trend and (mmh[i15] > 0) and cloud_up
+        if base_sell_trend:
+            base_sell_trend = base_sell_trend and (mmh[i15] < 0) and cloud_down
+
+        # ===== STEP 8: Extract Current & Previous Values =====
         close_prev = close_15m[i15 - 1]
-        open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
         low_curr = data_15m["low"][i15]
         ts_curr = int(timestamps_15m[i15])
@@ -3208,8 +3391,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
-        
-        close_5m_val = data_5m["close"][i5]
         
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
@@ -3219,7 +3400,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
 
-        # ===== STEP 6: Handle VWAP Data =====
+        # ===== STEP 9: Handle VWAP Data =====
         if not cfg.ENABLE_VWAP:
             vwap_curr = None
             vwap_prev = None
@@ -3238,7 +3419,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             vwap_curr = vwap[i15]
             vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
 
-        # ===== STEP 7: Extract MMH Values =====
+        # ===== STEP 10: Extract MMH Values =====
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
@@ -3252,9 +3433,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         )
         
         # ===== STEP 8: Extract Moving Averages & Cloud =====
-        rma50_15_val = rma50_15[i15]
-        rma200_5_val = rma200_5[i5]
-
+        
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
@@ -3332,9 +3511,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
 
         # ===== STEP 12: Calculate Base Trends =====
-        base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
-        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
-
+        
         if base_buy_trend:
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
@@ -3584,37 +3761,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
 
-        # ===== STEP 25: Build Suppression Reasons (for debugging) =====
-        reasons = []
-        if not buy_common and not sell_common:
-            reasons.append("Trend filter blocked")
-
-        if context.get("candle_quality_failed_buy") and buy_candle_reason:
-            reasons.append(f"BUY quality: {buy_candle_reason}")
-
-        if context.get("candle_quality_failed_sell") and sell_candle_reason:
-            reasons.append(f"SELL quality: {sell_candle_reason}")
-
-        if context.get("pivot_suppressions"):
-            reasons.extend(context["pivot_suppressions"])
-
-        failed_conditions = [
-            name for name, val in [
-                ("buy_common", buy_common),
-                ("sell_common", sell_common),
-                ("is_green", is_green),
-                ("is_red", is_red)
-            ] if not val
-        ]
-
-        # ===== STEP 26: Log No-Signal Cases =====
         if not alerts_to_send:
-            cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-
-            logger_pair.debug(
-                f"✅ {pair_name} | "
-                f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
-                f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
+            log_alert_rejection_reasons(
+                pair_name,
+                logger_pair,
+                buy_common,
+                sell_common,
+                actual_buy_wick_ratio,
+                actual_sell_wick_ratio,
+                cloud_up,
+                cloud_down,
+                mmh_curr,
+                ppo_curr
             )
 
         # ===== STEP 27: Return Results =====
@@ -3647,90 +3805,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if indicators is not None:
             indicators = None
 
-def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
-    
-    if not ctx.get("vwap_enabled") or not ctx.get("vwap_available"):
-        return False, "VWAP unavailable"
-
-    close_prev = ctx["close_prev"]
-    close_curr = ctx["close_curr"]
-    vwap_prev = ctx["vwap_prev"]
-    vwap_curr = ctx["vwap_curr"]
-
-    if is_buy:
-        crossed = close_prev <= vwap_prev < close_curr
-        alert_key = ALERT_KEYS["vwap_up"]
-    else:
-        crossed = close_prev >= vwap_prev > close_curr
-        alert_key = ALERT_KEYS["vwap_down"]
-
-    if not crossed:
-        return False, "No VWAP cross"
-    if previous_states.get(alert_key, False):
-        return False, "VWAP alert already active"
-    try:
-        distance_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
-    except ZeroDivisionError:
-        return False, "VWAP invalid (zero)"
-
-    if distance_pct > Constants.VWAP_MAX_DISTANCE_PCT:
-        return False, (
-            f"VWAP too far: price {close_curr:.2f} is {distance_pct:.2f}% "
-            f"away from VWAP {vwap_curr:.2f}"
-        )
-
-    return True, None
-
-from typing import Dict, Any, Tuple, Optional
-
-def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
-    pivots = ctx.get("pivots")
-    if not pivots or level not in pivots:
-        return False, "No pivot data"
-
-    level_value = pivots[level]
-    if level_value <= 0:
-        return False, "Invalid pivot value"
-
-    close_curr = ctx.get("close_curr")
-    close_prev = ctx.get("close_prev")
-
-    if close_curr is None or close_prev is None:
-        return False, "Missing close data"
-
-    # Check if price crossed the pivot
-    if is_buy:
-        crossed = close_prev <= level_value < close_curr
-    else:
-        crossed = close_prev >= level_value > close_curr
-
-    if not crossed:
-        return False, "No pivot cross"
-
-    # Safer percentage difference calculation
-    try:
-        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
-    except ZeroDivisionError:
-        return False, "Pivot invalid (zero)"
-
-    if price_diff_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
-        return False, (
-            f"Pivot too far: price {close_curr:.2f} is {price_diff_pct:.2f}% "
-            f"away from {level} pivot {level_value:.2f}"
-        )
-
-    return True, None
-
-async def process_pairs_with_workers(
-    fetcher: DataFetcher,
-    products_map: Dict[str, dict],
-    pairs_to_process: List[str],
-    state_db: RedisStateStore,
-    telegram_queue: TelegramQueue,
-    correlation_id: str,
-    lock: RedisLock,
-    reference_time: int
-) -> List[Tuple[str, Dict[str, Any]]]:
+async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], state_db: RedisStateStore,
+    telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
 
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
@@ -3897,6 +3973,12 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
+        # ===== Restore Telegram rate-limit state from Redis (if available) =====
+        if sdb and not sdb.degraded and sdb._redis:
+            if telegram_queue is None:
+                telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+            await telegram_queue.restore_bucket_state(sdb._redis)
+
         # ===== STEP 3: Create HTTP Fetcher and Telegram Queue =====
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
@@ -4052,6 +4134,13 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
+        # ===== Persist Telegram token bucket state =====
+        if telegram_queue and sdb and not sdb.degraded and sdb._redis:
+            try:
+                await telegram_queue.save_bucket_state(sdb._redis)
+            except Exception as e:
+                logger_run.debug(f"Failed to persist Telegram token bucket: {e}")
+
         # ===== Clean Up Redis Connection =====
         if sdb:
             try:
@@ -4071,6 +4160,7 @@ async def run_once() -> bool:
             pass
 
         logger_run.debug("🧹 Resource cleanup finished")
+
 
 try:
     import uvloop
