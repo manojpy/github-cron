@@ -3017,7 +3017,7 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
         return False, f"Error: {str(e)}"
 
 async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
-    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str) -> Tuple[bool, str]:
+    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str, logger_pair: logging.Logger) -> Tuple[bool, str]:
     try:
         def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
         if not def_:
@@ -3077,8 +3077,9 @@ async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ct
         logger.error(f"_evaluate_single_alert failed for {alert_key}: {e}")
         return False, ""
 
+
 async def evaluate_alerts_batch(alert_keys_to_check: List[str], context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
-    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str) -> List[Tuple[str, str, str]]:
+    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str, logger_pair: logging.Logger) -> List[Tuple[str, str, str]]:
     raw_alerts: List[Tuple[str, str, str]] = []
     batch_size = 4
 
