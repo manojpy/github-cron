@@ -836,115 +836,153 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
     return piv
-       
-def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+
+def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], vwap_cache: Optional[Dict[str, Any]] = None) -> Dict[str, np.ndarray]:
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
         n_15m = len(close_15m)
         n_5m = len(close_5m)
-        
-        results = { 
-            'ppo': np.empty(n_15m, dtype=np.float64),
-            'ppo_signal': np.empty(n_15m, dtype=np.float64),
-            'smooth_rsi': np.empty(n_15m, dtype=np.float64),
-            'vwap': np.empty(n_15m, dtype=np.float64),
-            'mmh': np.empty(n_15m, dtype=np.float64),
-            'upw': np.zeros(n_15m, dtype=bool),
-            'dnw': np.zeros(n_15m, dtype=bool),
-            'rma50_15': np.empty(n_15m, dtype=np.float64),
-            'rma200_5': np.empty(n_5m, dtype=np.float64),
-            'pivots': {}
+
+        results = {
+            "ppo": np.empty(n_15m, dtype=np.float64),
+            "ppo_signal": np.empty(n_15m, dtype=np.float64),
+            "smooth_rsi": np.empty(n_15m, dtype=np.float64),
+            "vwap": np.empty(n_15m, dtype=np.float64),
+            "mmh": np.empty(n_15m, dtype=np.float64),
+            "upw": np.zeros(n_15m, dtype=bool),
+            "dnw": np.zeros(n_15m, dtype=bool),
+            "rma50_15": np.empty(n_15m, dtype=np.float64),
+            "rma200_5": np.empty(n_5m, dtype=np.float64),
+            "pivots": {}
         }
-        
+
+        # --- PPO & RSI ---
         ppo, ppo_signal = calculate_ppo_numpy(
             close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
-        results['ppo'] = ppo
-        results['ppo_signal'] = ppo_signal
-        
-        results['smooth_rsi'] = calculate_smooth_rsi_numpy(
+        results["ppo"] = ppo
+        results["ppo_signal"] = ppo_signal
+
+        results["smooth_rsi"] = calculate_smooth_rsi_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
 
+        # --- VWAP ---
         if cfg.ENABLE_VWAP:
             high_15m = data_15m["high"]
             low_15m = data_15m["low"]
             volume_15m = data_15m["volume"]
             ts_15m = data_15m["timestamp"]
-            results["vwap"] = calculate_vwap_numpy(
-                high_15m, low_15m, close_15m, volume_15m, ts_15m
-            )
+
+            current_day = int(ts_15m[-1]) // 86400
+            vwap_cache_key = f"vwap_day_{current_day}"
+
+            if vwap_cache and vwap_cache_key in vwap_cache:
+                cached_vwap = vwap_cache[vwap_cache_key]
+                if len(cached_vwap) > n_15m:
+                    logger.warning("Cached VWAP longer than current data, discarding cache")
+                    cached_vwap = None
+
+                if cached_vwap is not None and len(cached_vwap) < n_15m:
+                    new_vwap = calculate_vwap_numpy(
+                        high_15m[len(cached_vwap):],
+                        low_15m[len(cached_vwap):],
+                        close_15m[len(cached_vwap):],
+                        volume_15m[len(cached_vwap):],
+                        ts_15m[len(cached_vwap):]
+                    )
+                    results["vwap"] = np.concatenate([cached_vwap, new_vwap])
+                elif cached_vwap is not None:
+                    results["vwap"] = cached_vwap
+                else:
+                    results["vwap"] = calculate_vwap_numpy(
+                        high_15m, low_15m, close_15m, volume_15m, ts_15m
+                    )
+            else:
+                vwap = calculate_vwap_numpy(
+                    high_15m, low_15m, close_15m, volume_15m, ts_15m
+                )
+                results["vwap"] = vwap
+                if vwap_cache is not None:
+                    vwap_cache[vwap_cache_key] = vwap
         else:
+            logger.debug("VWAP disabled, using close prices as proxy")
             results["vwap"] = close_15m.copy()
 
-        mmh = calculate_magical_momentum_hist(close_15m)       
-        results['mmh'] = mmh
-        
+        # --- Magical Momentum Histogram ---
+        results["mmh"] = calculate_magical_momentum_hist(close_15m)
+
+        # --- Cirrus Cloud ---
         if cfg.CIRRUS_CLOUD_ENABLED:
             upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
-            results['upw'] = upw
-            results['dnw'] = dnw
+            results["upw"] = upw
+            results["dnw"] = dnw
         else:
-            results['upw'].fill(False)
-            results['dnw'].fill(False)
-        
-        results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
-        results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
+            results["upw"].fill(False)
+            results["dnw"].fill(False)
 
+        # --- RMA indicators ---
+        results["rma50_15"] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
+        results["rma200_5"] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
+
+        # --- Pivot levels ---
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
             daily_low = float(data_daily["low"][-1])
             daily_range = daily_high - daily_low
-            
+
             should_calculate = False
             if daily_range > 0:
                 distance_from_high = abs(last_close - daily_high)
                 distance_from_low = abs(last_close - daily_low)
                 should_calculate = (
-                    distance_from_high < daily_range * 0.5 or 
-                    distance_from_low < daily_range * 0.5
+                    distance_from_high < daily_range * 0.5
+                    or distance_from_low < daily_range * 0.5
                 )
-            
+
             if should_calculate:
-                results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"], 
+                results["pivots"] = calculate_pivot_levels_numpy(
+                    data_daily["high"],
                     data_daily["low"],
-                    data_daily["close"], 
+                    data_daily["close"],
                     data_daily["timestamp"]
                 )
             else:
-                results['pivots'] = {}
+                results["pivots"] = {}
                 if cfg.DEBUG_MODE:
                     logger.debug(
                         f"Skipped pivot calc (price {last_close:.2f} far from range "
                         f"{daily_low:.2f}-{daily_high:.2f})"
-                    )            
+                    )
         else:
-            results['pivots'] = {}
-            pass
-        
-        for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5']:
+            results["pivots"] = {}
+
+        # --- Clamp infinities ---
+        for key in ["ppo", "ppo_signal", "smooth_rsi", "mmh", "rma50_15", "rma200_5"]:
             arr = results[key]
             if np.any(np.isinf(arr)):
                 logger.warning(f"Infinity detected in {key}, clamping values")
-                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)        
-        return results        
+                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
+
+        return results
+
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
-        n = len(data_15m.get("close", [1]))
+        n15 = len((data_15m or {}).get("close", [1]))
+        n5 = len((data_5m or {}).get("close", [1]))
         return {
-            'ppo': np.zeros(n, dtype=np.float64),
-            'ppo_signal': np.zeros(n, dtype=np.float64),
-            'smooth_rsi': np.full(n, 50.0, dtype=np.float64),
-            'vwap': np.zeros(n, dtype=np.float64),
-            'mmh': np.zeros(n, dtype=np.float64),
-            'upw': np.zeros(n, dtype=bool),
-            'dnw': np.zeros(n, dtype=bool),
-            'rma50_15': np.zeros(n, dtype=np.float64),
-            'rma200_5': np.zeros(len(data_5m.get("close", [1])), dtype=np.float64),
-            'pivots': {}
+            "ppo": np.zeros(n15, dtype=np.float64),
+            "ppo_signal": np.zeros(n15, dtype=np.float64),
+            "smooth_rsi": np.full(n15, 50.0, dtype=np.float64),
+            "vwap": np.zeros(n15, dtype=np.float64),
+            "mmh": np.zeros(n15, dtype=np.float64),
+            "upw": np.zeros(n15, dtype=bool),
+            "dnw": np.zeros(n15, dtype=bool),
+            "rma50_15": np.zeros(n15, dtype=np.float64),
+            "rma200_5": np.zeros(n5, dtype=np.float64),
+            "pivots": {}
         }
 
 def precompute_candle_quality(data_15m: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -1378,8 +1416,24 @@ class APICircuitBreaker:
             return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"        
         return True, None
 
+def calculate_smart_fetch_limit(resolution: str, cache_exists: bool, last_cache_age_sec: float) -> int:
+    if not cache_exists:
+        if resolution == "15":
+            return max(324, cfg.RMA_200_PERIOD + 124)
+        elif resolution == "5":
+            return max(324, cfg.RMA_200_PERIOD + 124)
+        else:  # Daily
+            return 30
+
+    if last_cache_age_sec < 120:  # Cache < 2 minutes old
+        return 10 if resolution != "D" else 5
+    elif last_cache_age_sec < 600:  # Cache < 10 minutes old
+        return 25 if resolution != "D" else 10
+    else:
+        return 50 if resolution != "D" else 15
+
 class DataFetcher:
-    def __init__(self, api_base: str, *, session: Optional[aiohttp.ClientSession] = None, max_parallel: Optional[int] = None):
+    def __init__(self, api_base: str, *, session: Optional[aiohttp.ClientSession] = None, max_parallel: Optional[int] = None, cache_ttl: int = 60):
         self.api_base = api_base.rstrip("/")
         self._external_session = session
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
@@ -1400,6 +1454,9 @@ class DataFetcher:
             "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
         }
+        # --- NEW: caching ---
+        self.candle_cache: Dict[str, Dict[str, Any]] = {}
+        self.cache_ttl = cache_ttl
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._external_session is not None:
@@ -1408,23 +1465,21 @@ class DataFetcher:
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
-        
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked products fetch: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
             self.fetch_stats["products"]["failed"] += 1
             return None
-        
+
         async with self.semaphore:
             result = await self.rate_limiter.call(
                 async_fetch_json,
                 url,
                 retries=5,
                 backoff=2.0,
-                timeout=self.timeout
+                timeout=self.timeout,
             )
-            
             if result:
                 self.fetch_stats["products"]["success"] += 1
                 self.circuit_breaker.record_success()
@@ -1434,10 +1489,16 @@ class DataFetcher:
                 self.fetch_stats["products"]["failed"] += 1
                 self.circuit_breaker.record_failure()
                 logger.warning(f"Products fetch failed | URL: {url}")
-            
             return result
 
-    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    async def fetch_candles(
+        self,
+        symbol: str,
+        resolution: str,
+        limit: int,
+        reference_time: int,
+        expected_open_15: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
@@ -1447,14 +1508,13 @@ class DataFetcher:
 
         minutes = int(resolution) if resolution != "D" else 1440
         interval_seconds = minutes * 60
-
-        if minutes == 15 and expected_open_15 is not None:
-            expected_open_ts = expected_open_15
-        else:
-            expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
+        expected_open_ts = (
+            expected_open_15 if minutes == 15 and expected_open_15 is not None
+            else calculate_expected_candle_timestamp(reference_time, minutes)
+        )
 
         buffer_periods = 3
-        to_time   = reference_time + (interval_seconds * buffer_periods)
+        to_time = reference_time + (interval_seconds * buffer_periods)
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
@@ -1480,7 +1540,6 @@ class DataFetcher:
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                     self.circuit_breaker.record_success()
                     self.fetch_stats["candles"]["success"] += 1
-
                     num_candles = len(result.get("t", []))
                     if num_candles > 0:
                         last_open = result["t"][-1]
@@ -1508,8 +1567,44 @@ class DataFetcher:
                 logger.warning(f"Candles fetch failed | Symbol: {symbol}")
                 self.fetch_stats["candles"]["failed"] += 1
                 self.circuit_breaker.record_failure()
-
             return None
+
+    async def fetch_candles_cached(
+        self,
+        symbol: str,
+        resolution: str,
+        limit: Optional[int],
+        reference_time: int,
+        expected_open_15: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch candles with caching and smart limit calculation.
+        """
+        cache_key = f"{symbol}_{resolution}"
+        now = time.time()
+        cached_entry = self.candle_cache.get(cache_key)
+        cache_exists = cached_entry is not None
+        last_cache_age_sec = now - cached_entry["cached_at"] if cache_exists else 0
+
+        # Smart limit calculation
+        smart_limit = calculate_smart_fetch_limit(resolution, cache_exists, last_cache_age_sec)
+
+        if cache_exists and last_cache_age_sec < self.cache_ttl:
+            if cfg.DEBUG_MODE:
+                logger.debug(f"Using cached candles for {symbol} {resolution} (age: {last_cache_age_sec:.0f}s)")
+            return cached_entry.get("data")
+
+        fetch_result = await self.fetch_candles(symbol, resolution, smart_limit, reference_time, expected_open_15)
+        if fetch_result:
+            self.candle_cache[cache_key] = {"data": fetch_result, "cached_at": now}
+        return fetch_result
+
+    def clear_cache(self, symbol: Optional[str] = None):
+        """Clear cache for a specific symbol or all."""
+        if symbol:
+            self.candle_cache = {k: v for k, v in self.candle_cache.items() if not k.startswith(symbol)}
+        else:
+            self.candle_cache.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         stats = {
@@ -1518,39 +1613,45 @@ class DataFetcher:
             "circuit_breaker_blocks": self.fetch_stats["circuit_breaker_blocks"],
             "rate_limiter": self.rate_limiter.get_stats(),
         }
-        
         total_products = stats["products"]["success"] + stats["products"]["failed"]
         total_candles = stats["candles"]["success"] + stats["candles"]["failed"]
-        
+
         if total_products > 0:
             stats["products"]["success_rate"] = round(
                 stats["products"]["success"] / total_products * 100, 1
             )
-        
         if total_candles > 0:
             stats["candles"]["success_rate"] = round(
                 stats["candles"]["success"] / total_candles * 100, 1
-            )        
+            )
         return stats
 
-    async def fetch_candles_batch(self, requests: List[Tuple[str, str, int]], reference_time: Optional[int] = None) -> Dict[str, Optional[Dict[str, Any]]]:
+    async def fetch_candles_batch(
+        self,
+        requests: List[Tuple[str, str, int]],
+        reference_time: Optional[int] = None
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
-        
+
         tasks = []
         request_keys = []
         for symbol, resolution, limit in requests:
             task = self.fetch_candles(symbol, resolution, limit, reference_time)
             tasks.append(task)
             request_keys.append(f"{symbol}_{resolution}")
-        
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        output = {}
+        output: Dict[str, Optional[Dict[str, Any]]] = {}
         for key, result in zip(request_keys, results):
-            output[key] = None if isinstance(result, Exception) else result    
+            output[key] = None if isinstance(result, Exception) else result
         return output
 
-    async def fetch_all_candles_truly_parallel(self, pair_requests: List[Tuple[str, List[Tuple[str, int]]]], reference_time: Optional[int] = None) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
+    async def fetch_all_candles_truly_parallel(
+        self,
+        pair_requests: List[Tuple[str, List[Tuple[str, int]]]],
+        reference_time: Optional[int] = None
+    ) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
 
@@ -1567,19 +1668,22 @@ class DataFetcher:
                 task_metadata.append((symbol, resolution))
 
         results = await asyncio.gather(*all_tasks, return_exceptions=True)
-        output = {}
+        output: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
         success_count = 0
-        
+
         for (symbol, resolution), result in zip(task_metadata, results):
-            if symbol not in output: 
+            if symbol not in output:
                 output[symbol] = {}
             if isinstance(result, Exception):
                 output[symbol][resolution] = None
             else:
                 output[symbol][resolution] = result
-                if result: 
+                if result:
                     success_count += 1
-        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
+
+        logger.info(
+            f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}"
+        )
         return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
@@ -2912,13 +3016,75 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
     except Exception as e:
         return False, f"Error: {str(e)}"
 
+async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
+    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str) -> Tuple[bool, str]:
+    try:
+        def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
+        if not def_:
+            return False, ""
+        
+        key = ALERT_KEYS[alert_key]
+        
+        # Early exit: already active
+        if previous_states.get(key, False):
+            return False, ""
+        
+        # Check if alert triggers
+        trigger = False
+        is_buy = any(x in alert_key for x in ["up", "buy"])
+        is_sell = any(x in alert_key for x in ["down", "sell"])
+        
+        # Wick ratio checks
+        if is_buy and context.get("buy_wick_ratio", 1.0) >= Constants.MIN_WICK_RATIO:
+            return False, ""
+        if is_sell and context.get("sell_wick_ratio", 1.0) >= Constants.MIN_WICK_RATIO:
+            return False, ""
+        
+        # Pivot/VWAP special handling
+        if alert_key.startswith("pivot_"):
+            level = alert_key.split("_")[-1]
+            is_buy_pivot = alert_key.startswith("pivot_up_")
+            valid_cross, _ = _validate_pivot_cross(context, level, is_buy_pivot)
+            trigger = (
+                (is_buy_pivot and context.get("buy_common", False)) or
+                (not is_buy_pivot and context.get("sell_common", False))
+            ) and valid_cross
+        
+        elif alert_key in ("vwap_up", "vwap_down"):
+            is_buy_vwap = alert_key == "vwap_up"
+            valid_cross, _ = _validate_vwap_cross(context, is_buy_vwap, previous_states)
+            trigger = (
+                (is_buy_vwap and context.get("buy_common", False)) or
+                (not is_buy_vwap and context.get("sell_common", False))
+            ) and valid_cross
+        
+        else:
+            # Standard check_fn
+            trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+        
+        # Build extra info if triggered
+        extra = ""
+        if trigger:
+            try:
+                extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None)
+            except Exception as e:
+                logger.error(f"extra_fn failed for {alert_key}: {e}")
+                extra = ""
+        
+        return trigger, extra
+        
+    except Exception as e:
+        logger.error(f"_evaluate_single_alert failed for {alert_key}: {e}")
+        return False, ""
+
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
-   
+    
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
+    # ===== STEP 1: Initialize all variables (prevents UnboundLocalError) =====
     close_15m = None
     open_15m = None
     timestamps_15m = None
@@ -2934,8 +3100,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     rma200_5 = None
     piv = None
     context = None
+    base_buy_trend = False
+    base_sell_trend = False
+    buy_candle_passed = False
+    sell_candle_passed = False
+    buy_candle_reason = None
+    sell_candle_reason = None
 
     try:
+        # ===== STEP 2: Get Last Closed Candle Indices =====
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
@@ -2946,6 +3119,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
 
+        # ===== STEP 3: Extract Base Candle Data =====
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
@@ -2955,6 +3129,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         is_green = close_curr_quick > open_curr_quick
         is_red = close_curr_quick < open_curr_quick
 
+        # Early exit if doji/neutral candle
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
@@ -2963,6 +3138,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
 
+        # ===== STEP 4: Calculate All Indicators (Threaded) =====
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy,
             data_15m,
@@ -2970,6 +3146,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             data_daily
         )
 
+        # Extract indicator values
         ppo = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
         smooth_rsi = indicators["smooth_rsi"]
@@ -2980,23 +3157,30 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
+
+        # ===== STEP 5: Extract Current & Previous Values =====
         close_curr = close_15m[i15]
         close_prev = close_15m[i15 - 1]
         open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
         low_curr = data_15m["low"][i15]
         ts_curr = int(timestamps_15m[i15])
+        
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
+        
         close_5m_val = data_5m["close"][i5]
+        
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
+        
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
 
+        # ===== STEP 6: Handle VWAP Data =====
         if not cfg.ENABLE_VWAP:
             vwap_curr = None
             vwap_prev = None
@@ -3015,6 +3199,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             vwap_curr = vwap[i15]
             vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
 
+        # ===== STEP 7: Extract MMH Values =====
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
@@ -3027,12 +3212,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(mmh_m3)
         )
         
+        # ===== STEP 8: Extract Moving Averages & Cloud =====
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
+        # ===== STEP 9: Calculate Wick Ratios =====
         candle_range = high_curr - low_curr
 
         if candle_range < 1e-8:
@@ -3056,11 +3243,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"Buy wick: {actual_buy_wick_ratio*100:.2f}% | "
                 f"Sell wick: {actual_sell_wick_ratio*100:.2f}%"
             )
+
+        # ===== STEP 10: Validate Candle Timestamp =====
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             if cfg.DEBUG_MODE:
                 logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
 
+        # ===== STEP 11: Daily Reset at UTC Midnight =====
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
             current_utc_hour = current_utc_dt.hour
@@ -3084,11 +3274,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                                 delete_keys.append(f"{pair_name}:{ALERT_KEYS['vwap_down']}")
 
                         if cfg.ENABLE_PIVOT and piv:
-                            for level in ["P","S1","S2","S3","R1","R2"]:
+                            for level in ["P", "S1", "S2", "S3", "R1", "R2"]:
                                 k = f"pivot_up_{level}"
                                 if k in ALERT_KEYS:
                                     delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
-                            for level in ["P","S1","S2","R1","R2","R3"]:
+                            for level in ["P", "S1", "S2", "R1", "R2", "R3"]:
                                 k = f"pivot_down_{level}"
                                 if k in ALERT_KEYS:
                                     delete_keys.append(f"{pair_name}:{ALERT_KEYS[k]}")
@@ -3102,6 +3292,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 except Exception as e:
                     logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
 
+        # ===== STEP 12: Calculate Base Trends =====
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
@@ -3110,12 +3301,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
+        # ===== STEP 13: Check Candle Quality =====
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-
-        buy_candle_reason = None
-        sell_candle_reason = None
 
         if base_buy_trend and not buy_candle_passed:
             _, buy_candle_reason = check_candle_quality_with_reason(
@@ -3127,22 +3316,24 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 open_curr, high_curr, low_curr, close_curr, is_buy=False
             )
 
+        # ===== STEP 14: Final Common Conditions =====
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
 
+        # ===== STEP 15: Calculate MMH Reversals =====
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
                     f"Skipping MMH alerts for {pair_name}: "
                     f"warmup period (NaN values detected)"
                 )
-
             mmh_reversal_buy = False
             mmh_reversal_sell = False
         else:
             mmh_reversal_buy = buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
             mmh_reversal_sell = sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
 
+        # ===== STEP 16: Build Context Dictionary =====
         context = {
             "close_curr": close_curr,
             "close_prev": close_prev,
@@ -3183,12 +3374,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "pivot_suppressions": [],
         }
 
+        # Build indicator context
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
-        raw_alerts = []
-
+        # ===== STEP 17: Determine Which Alerts to Check =====
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
@@ -3200,6 +3391,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
         ]
 
+        # Filter out pivot alerts if no pivot data
         if not piv or not any(piv.values()):
             alert_keys_to_check = [
                 k for k in alert_keys_to_check
@@ -3207,123 +3399,35 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ]
 
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
-        all_state_changes = []
 
+        # ===== STEP 18: Get Previous Alert States =====
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, redis_alert_keys
         )
 
-        for alert_key in alert_keys_to_check:
-            def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-            if not def_:
-                continue
+        # ===== STEP 19: Evaluate Alerts in Batches (PERFORMANCE FIX) =====
+        raw_alerts = await evaluate_alerts_batch(
+            alert_keys_to_check,
+            context,
+            ppo_ctx,
+            ppo_sig_ctx,
+            rsi_ctx,
+            previous_states,
+            pair_name,
+            logger_pair
+        )
 
-            key = ALERT_KEYS[alert_key]
-            trigger = False
-
-            is_buy_signal = any(x in alert_key for x in ["up", "buy"])
-            is_sell_signal = any(x in alert_key for x in ["down", "sell"])
-
-            if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
-                continue
-            if is_sell_signal and actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
-                continue
-
-            if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
-                level = alert_key.split("_")[-1]
-                is_buy = alert_key.startswith("pivot_up_")
-
-                try:
-                    valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-
-                    if not valid_cross and reason and piv:
-                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-
-                    trigger = (
-                        (is_buy and buy_common) or (not is_buy and sell_common)
-                    ) and valid_cross
-                except Exception as e:
-                    logger_pair.error(
-                        f"Pivot alert check failed for {alert_key}: {e}",
-                        exc_info=True
-                    )
-                    trigger = False
-
-            elif alert_key in ("vwap_up", "vwap_down"):
-                try:
-                    is_buy = alert_key == "vwap_up"
-                    valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
-
-                    if not valid_cross and reason:
-                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-
-                    trigger = (
-                        (is_buy and buy_common) or ((not is_buy) and sell_common)
-                    ) and valid_cross
-                except Exception as e:
-                    logger_pair.error(
-                        f"VWAP alert check failed for {alert_key}: {e}",
-                        exc_info=True
-                    )
-                    trigger = False
-
-            else:
-                try:
-                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except KeyError as e:
-                    logger_pair.error(
-                        f"Missing context key for {alert_key}: {e} | "
-                        f"Available: {sorted(context.keys())}",
-                        exc_info=False
-                    )
-                    trigger = False
-                except TypeError as e:
-                    logger_pair.error(
-                        f"Type error in {alert_key}: {e}",
-                        exc_info=False
-                    )
-                    trigger = False
-                except Exception as e:
-                    logger_pair.error(
-                        f"Alert check failed for {alert_key}: {e}",
-                        exc_info=True
-                    )
-                    trigger = False
-
-            if trigger:
-                if is_buy_signal and not buy_common:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"❌ BLOCKED {alert_key}: buy_common=False")
-                    continue
-
-                if is_sell_signal and not sell_common:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"❌ BLOCKED {alert_key}: sell_common=False")
-                    continue
-
-            if trigger and not previous_states.get(key, False):
-                try:
-                    extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) if def_ else ""
-                    if not extra:
-                        extra = ""
-                    raw_alerts.append((def_["title"] if def_ else alert_key, extra, def_["key"] if def_ else alert_key))
-                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
-
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(
-                            f"✅ Alert FIRED: {alert_key} | "
-                            f"buy_common={buy_common} sell_common={sell_common} | "
-                            f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
-                            f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
-                        )
-
-                except Exception as e:
-                    logger_pair.error(
-                        f"Alert extra_fn failed for {alert_key}: {e}",
-                        exc_info=False
-                    )
+        # ===== STEP 20: Build State Changes & Resets =====
+        all_state_changes = []
         resets_to_apply = []
 
+        # Add state changes for newly fired alerts
+        for title, extra, ak in raw_alerts:
+            key = ALERT_KEYS.get(ak)
+            if key:
+                all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
+
+        # ===== STEP 21: Determine Resets (when conditions no longer met) =====
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
@@ -3357,7 +3461,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
         elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['rsi_50_up']):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))                
+                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
 
         if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
@@ -3397,23 +3501,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
+        # Combine all state changes
         all_state_changes.extend(resets_to_apply)
 
-        previous_states_before = await check_multiple_alert_states(
-            sdb, pair_name, redis_alert_keys
-        )
-
-        alerts_to_send = []
-        for title, extra, ak in raw_alerts:
-            was_already_active = previous_states_before.get(ak, False)
-            if not was_already_active:
-                alerts_to_send.append((title, extra, ak))
-
+        # ===== STEP 22: Apply State Changes Atomically =====
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
 
-        alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
+        # ===== STEP 23: Filter and Limit Alerts =====
+        alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
+        # Limit pivot alerts to avoid spam
         pivot_count = sum(1 for _, _, k in alerts_to_send if k.startswith("pivot_"))
         if pivot_count > 3:
             logger_pair.warning(
@@ -3423,6 +3521,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
 
+        # ===== STEP 24: Send Alerts via Telegram =====
         if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
@@ -3440,12 +3539,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
                 logger_pair.info(
-                    f"🔵🎯🟠  Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                    f"🔵🎯🟠   Sent {len(alerts_to_send)} alerts for {pair_name} | "
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
 
+        # ===== STEP 25: Build Suppression Reasons (for debugging) =====
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
@@ -3459,46 +3559,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
 
-        if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
-            if not base_buy_trend:
-                reasons.append("PPO>0 blocked: base_buy_trend=False")
-            elif not buy_candle_passed:
-                reasons.append("PPO>0 blocked: candle quality failed")
-            elif not is_green:
-                reasons.append(f"PPO>0 blocked: candle not green (C={close_curr:.5f}, O={open_curr:.5f})")
-
-        if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
-            if not base_sell_trend:
-                reasons.append("PPO<0 blocked: base_sell_trend=False")
-            elif not sell_candle_passed:
-                reasons.append("PPO<0 blocked: candle quality failed")
-            elif not is_red:
-                reasons.append(f"PPO<0 blocked: candle not red (C={close_curr:.5f}, O={open_curr:.5f})")
-
-        if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
-            reasons.append("PPO>+0.11 blocked: buy_common=False")
-
-        if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
-            reasons.append("PPO<-0.11 blocked: sell_common=False")
-
-        if rsi_prev <= Constants.RSI_THRESHOLD and rsi_curr > Constants.RSI_THRESHOLD:
-            if ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
-                reasons.append(f"RSI>50 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
-            elif not buy_common:
-                reasons.append("RSI>50 blocked: buy_common=False")
-
-        if rsi_prev >= Constants.RSI_THRESHOLD and rsi_curr < Constants.RSI_THRESHOLD:
-            if ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
-                reasons.append(f"RSI<50 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
-            elif not sell_common:
-                reasons.append("RSI<50 blocked: sell_common=False")
-
-        if cfg.ENABLE_VWAP and vwap_curr is not None and vwap_prev is not None:
-            if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
-                reasons.append("VWAP up-cross blocked: buy_common=False")
-            if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
-                reasons.append("VWAP down-cross blocked: sell_common=False")
-
         failed_conditions = [
             name for name, val in [
                 ("buy_common", buy_common),
@@ -3508,6 +3568,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ] if not val
         ]
 
+        # ===== STEP 26: Log No-Signal Cases =====
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
@@ -3517,6 +3578,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
 
+        # ===== STEP 27: Return Results =====
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
             "ts": int(time.time()),
@@ -3542,6 +3604,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     finally:
         PAIR_ID.set("")
+        # Explicitly clear large objects to aid GC
         if indicators is not None:
             indicators = None
 
@@ -3619,49 +3682,44 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str],
-    state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock,
-    reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
+async def process_pairs_with_workers(
+    fetcher: DataFetcher,
+    products_map: Dict[str, dict],
+    pairs_to_process: List[str],
+    state_db: RedisStateStore,
+    telegram_queue: TelegramQueue,
+    correlation_id: str,
+    lock: RedisLock,
+    reference_time: int
+) -> List[Tuple[str, Dict[str, Any]]]:
     logger_main = logging.getLogger("macd_bot.worker_pool")
-    
+
     logger_main.info(f"📡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
-    
-    limit_15m = max(324, cfg.RMA_200_PERIOD + 124)
-    limit_5m = max(324, cfg.RMA_200_PERIOD + 124)
-    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
-    
-    pair_requests = []
+
+    valid_tasks: List[Tuple[str, Dict[str, Any]]] = []
+
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
-        if not product_info: continue
-        
+        if not product_info:
+            continue
+
         symbol = product_info["symbol"]
-        resolutions = [("15", limit_15m), ("5", limit_5m)]
+        candles: Dict[str, Optional[Dict[str, Any]]] = {}
+
+        # Fetch 15m and 5m with caching + smart limits
+        candles["15"] = await fetcher.fetch_candles_cached(symbol, "15", None, reference_time)
+        candles["5"] = await fetcher.fetch_candles_cached(symbol, "5", None, reference_time)
+
+        # Daily only if pivot enabled
         if cfg.ENABLE_PIVOT:
-            resolutions.append(("D", daily_limit))
-        
-        pair_requests.append((symbol, resolutions))
-    
-    all_candles = await fetcher.fetch_all_candles_truly_parallel( 
-        pair_requests, reference_time 
-    )
-    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
-    valid_tasks = []
-    
-    for pair_name in pairs_to_process:
-        product_info = products_map.get(pair_name)
-        if not product_info: continue
-        
-        symbol = product_info["symbol"]
-        candles = all_candles.get(symbol, {})
-       
+            candles["D"] = await fetcher.fetch_candles_cached(symbol, "D", None, reference_time)
+
         valid_tasks.append((pair_name, candles))
 
+    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
-    
-    
 
     async def guarded_eval(task_data):
         p_name, candles = task_data
@@ -3686,11 +3744,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
     valid_results = [r for r in results if r is not None]
 
-    del all_candles
     del results
     del valid_tasks
-    del pair_requests
-
     gc.collect()
 
     return valid_results
