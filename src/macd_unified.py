@@ -2500,7 +2500,7 @@ class RedisLock:
             return False
 
     @classmethod
-    def get_lock_extend_interval, (cls) -> int:
+    def get_lock_extend_interval(cls) -> int:
         extend_at = int(Constants.REDIS_LOCK_EXPIRY * 0.7)
         return max(60, min(extend_at, 540))
 
