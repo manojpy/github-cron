@@ -958,15 +958,26 @@ class SessionManager:
             logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
 
+
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         async with cls._lock:
-            if (
-                cls._session
-                and not cls._session.closed
-                and cls._request_count < cls._session_reuse_limit
-            ):
-                return cls._session
+            if cls._session is None or cls._session.closed:
+                connector = TCPConnector(
+                    limit=cfg.TCP_CONN_LIMIT,
+                    limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
+                    ssl=cls._get_ssl_context(),
+                    use_dns_cache=True,  # Enable DNS caching
+                    ttl_dns_cache=3600,  # Cache DNS for 1 hour
+                    enable_cleanup_closed=True,
+                    force_close=False
+                )
+                cls._session = aiohttp.ClientSession(
+                    connector=connector,
+                    json_serialize=json_dumps,
+                    timeout=aiohttp.ClientTimeout(total=cfg.HTTP_TIMEOUT)
+                )
+            return cls._session
 
             should_recreate = False
             if cls._session is None or cls._session.closed:
@@ -2301,71 +2312,50 @@ class RedisStateStore:
             logger.error(f"Batch check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def mget_states(self, keys: List[str], timeout: float = 2.0) -> Dict[str, Optional[Dict[str, Any]]]: 
-        if not self._redis or not keys:
+    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any]]) -> Dict[str, Optional[Dict[str, Any]]]:
+        if not self._redis or self.degraded:
             return {}
 
-        redis_keys = [f"{self.state_prefix}{k}" for k in keys]
-
         try:
-            results = await asyncio.wait_for(self._redis.mget(redis_keys), timeout=timeout)
-            if not results:
-                return {}
+            async with self._redis.pipeline(transaction=True) as pipe:
+                for key in alert_keys:
+                    pipe.get(f"{pair}:{key}")
 
-            output: Dict[str, Optional[Dict[str, Any]]] = {}
-            for idx, key in enumerate(keys):
-                val = results[idx] if idx < len(results) else None
-                if val:
+                for key, state in updates:
+                    data = json_dumps({"state": state, "ts": int(time.time())})
+                    pipe.set(f"{pair}:{key}", data, ex=self.expiry_seconds)
+
+                results = await pipe.execute()
+
+                parsed: Dict[str, Optional[Dict[str, Any]]] = {}
+                for k, r in zip(alert_keys, results[:len(alert_keys)]):
+                    if r is None:
+                        parsed[k] = None
+                        continue
                     try:
-                        parsed = json_loads(val)
-                        if isinstance(parsed, dict) and "state" in parsed:
-                            output[key] = parsed
+                        if isinstance(r, bytes):
+                            val = r.decode("utf-8")
+                        elif isinstance(r, str):
+                            val = r
                         else:
-                            logger.warning(f"Invalid state structure for {key}: missing 'state' field")
-                            output[key] = None
-                    except (json.JSONDecodeError, TypeError, ValueError) as e:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"Failed to parse state for {key}: {e}")
-                        output[key] = None
-                    except Exception as e:
-                        logger.error(f"Unexpected error parsing state for {key}: {e}", exc_info=False)
-                        output[key] = None
-                else:
-                    output[key] = None
-            return output
-        except asyncio.TimeoutError:
-            logger.error(f"mget_states timeout for {len(keys)} keys")
-            return {}
+                            logger.warning(
+                                f"Unexpected Redis type for {pair}:{k} -> {type(r)}"
+                            )
+                            parsed[k] = None
+                            continue
+
+                        parsed[k] = json_loads(val)
+                    except (json.JSONDecodeError, UnicodeDecodeError, Exception) as e:
+                        logger.warning(
+                            f"Failed to parse Redis value for {pair}:{k}: {e}"
+                        )
+                        parsed[k] = None
+
+                return parsed
+
         except Exception as e:
-            logger.error(
-                f"mget_states failed for {len(keys)} keys: {e} | "
-                f"Keys sample: {keys[:5]}"
-            )
+            logger.error(f"Redis pipeline failed: {e}")
             return {}
-
-    async def batch_set_states(self, updates: List[Tuple[str, Any, Optional[int]]], timeout: float = 4.0) -> None:   
-        if self.degraded or not updates or not self._redis:
-            return
-
-        try:
-            async with self._redis.pipeline() as pipe:
-                now = int(time.time())
-                for key, state, custom_ts in updates:
-                    ts = custom_ts if custom_ts is not None else now
-                    data = json_dumps({"state": state, "ts": ts})
-                    full_key = f"{self.state_prefix}{key}"
-                    if self.expiry_seconds > 0:
-                        pipe.set(full_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(full_key, data)
-                await asyncio.wait_for(pipe.execute(), timeout=timeout)
-
-            if cfg.DEBUG_MODE:
-                logger.debug(f"Batch updated {len(updates)} states atomically")
-        except Exception as e:
-            logger.error(f"Batch state update failed (falling back to individual): {e}")
-            for key, state, custom_ts in updates:
-                await self.set(key, state, custom_ts)
 
     async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:     
         if self.degraded:
@@ -3500,28 +3490,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
+        if resets_to_apply:
+            logger_pair.debug(f"Applying {len(resets_to_apply)} state resets to Redis")
+            await sdb.atomic_batch_update(resets_to_apply)
+    
         all_state_changes = all_state_changes + resets_to_apply
-        if all_state_changes:
-            await sdb.batch_set_states(all_state_changes)
 
         dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
 
-        if all_state_changes or dedup_checks:
-            previous_states, dedup_results = await sdb.atomic_eval_batch(
-                pair_name,
-                redis_alert_keys,
-                all_state_changes,
-                dedup_checks
-            )
-        else:
-            dedup_results = {}
+        previous_states = await sdb.batch_get_and_set_alerts(
+            pair_name,
+            redis_alert_keys,                          # keys to fetch
+            [(k, v) for k, v, _ in all_state_changes]  # updates to apply
+        )
 
         alerts_to_send = []
         if raw_alerts:
             for title, extra, ak in raw_alerts:
-                if dedup_results.get(f"{pair_name}:{ak}", True):
+       
+                if previous_states.get(ak) is None or previous_states[ak].get("state") != "ACTIVE":
                     alerts_to_send.append((title, extra, ak))
-                    
+
         alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
 
         pivot_count = sum(1 for _, _, k in alerts_to_send if k.startswith("pivot_"))
@@ -3690,10 +3679,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if 'context' in locals():
                 del context
         except Exception:
-            pass
+            pass       
 
-        gc.collect()
-
+        
 def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
     
     if not ctx.get("vwap_enabled") or not ctx.get("vwap_available"):
@@ -3734,6 +3722,9 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
         return False, "No pivot data"
 
     level_value = pivots[level]
+    if level_value <= 0:
+    return False, "Invalid pivot level (0)"     
+        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
     close_curr = ctx["close_curr"]
     close_prev = ctx["close_prev"]
 
