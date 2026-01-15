@@ -346,21 +346,38 @@ class TraceContextFilter(logging.Filter):
 
 class SafeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        if hasattr(record, 'msg') and record.msg:
+        if record.msg:
             msg_str = str(record.msg)
             msg_str = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", msg_str)
             msg_str = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", msg_str)
             msg_str = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", msg_str)
-            record.msg = msg_str
-        record.args = None
-        
+            record.msg = msg_str  # optional, could skip reassigning
+
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: self._mask_secret(v) for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(self._mask_secret(v) for v in record.args)
+
         formatted = super().format(record)
-        
+
         formatted = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", formatted)
         formatted = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", formatted)
         formatted = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", formatted)
-        
+
         return formatted
+
+    @staticmethod
+    def _mask_secret(value: Any) -> Any:
+        """Mask sensitive values in log arguments"""
+        if value is None:
+            return value
+
+        value_str = str(value)
+        masked = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED]", value_str)
+        masked = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", masked)
+        masked = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", masked)
+        return masked
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("macd_bot")
@@ -713,12 +730,14 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
 def warmup_if_needed() -> None:
-    if not aot_bridge.requires_warmup():
-        logger.info("✅ AOT active – no warmup needed")
-        return    
-    if cfg.SKIP_WARMUP:
-        logger.info("⏭️ Skipping JIT warmup (first run may be slower)")
-        return    
+
+    if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP:
+        logger.info("✅ Skipping warmup (AOT active or explicitly disabled)")
+        return
+
+    logger.debug("Running warmup...")
+    warmup_if_needed()
+
     logger.info("🔥 Warming up JIT compilation…")
     warmup_start = time.time()
     try:
@@ -1578,21 +1597,15 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             logger.warning("parse_candles_to_numpy: empty candle array")
             return None
 
-        data = {
-            "timestamp": np.empty(n, dtype=np.int64),
-            "open": np.empty(n, dtype=np.float64),
-            "high": np.empty(n, dtype=np.float64),
-            "low": np.empty(n, dtype=np.float64),
-            "close": np.empty(n, dtype=np.float64),
-            "volume": np.empty(n, dtype=np.float64),
-        }
 
-        data["timestamp"][:] = res["t"]
-        data["open"][:] = res["o"]
-        data["high"][:] = res["h"]
-        data["low"][:] = res["l"]
-        data["close"][:] = res["c"]
-        data["volume"][:] = res["v"]
+        data = {
+            "timestamp": np.asarray(res["t"], dtype=np.int64),
+            "open": np.asarray(res["o"], dtype=np.float64),
+            "high": np.asarray(res["h"], dtype=np.float64),
+            "low": np.asarray(res["l"], dtype=np.float64),
+            "close": np.asarray(res["c"], dtype=np.float64),
+            "volume": np.asarray(res["v"], dtype=np.float64),
+        }
 
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
@@ -2021,70 +2034,32 @@ class RedisStateStore:
             return
 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-            self._connection_attempts = attempt
-            if cfg.DEBUG_MODE:
-                logger.debug(f"Redis connection attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}")
-
             if await self._attempt_connect(timeout):
-                test_key = f"smoke_test:{uuid.uuid4().hex[:8]}"
-                test_val = "ok"
-
                 try:
-                    set_ok = await asyncio.wait_for(
-                        self._redis.set(test_key, test_val, ex=10),
-                        timeout=0.5
-                    )
-                    if set_ok:
-                        get_result = await asyncio.wait_for(
-                            self._redis.get(test_key),
-                            timeout=0.5
-                        )
-                        get_ok = get_result == test_val
-                        
-                        if get_ok:
-
-                            try:
-                                await asyncio.wait_for(self._redis.delete(test_key), timeout=0.5)
-                            except Exception:
-                                pass
-
-                            expiry_mode = "TTL-based" if self.expiry_seconds > 0 else "manual"
-                            logger.info(
-                                f"✅ Redis connected "
-                                f"({self._redis.connection_pool.max_connections} connections, "
-                                f"{expiry_mode} expiry)"
-                            )
-
-                            try:
-                                info = await asyncio.wait_for(
-                                    self._redis.info("memory"),
-                                    timeout=3.0
-                                )
-                                if info and cfg.DEBUG_MODE:
-                                    policy = info.get("maxmemory_policy", "unknown")
-                                    logger.debug(f"Redis memory policy: {policy}")
-                            except Exception:
-                                pass
-
-                            self.degraded = False
-                            self.degraded_alerted = False
-                            return
-                        else:
-                            logger.warning("Redis get() failed, marking degraded")
-                    else:
-                        logger.warning("Redis set() failed, marking degraded")
+                    ping_ok = await asyncio.wait_for(self._redis.ping(), timeout=1.0)
+                    if ping_ok:
+                        max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
+                        logger.info(f"✅ Redis connected ({max_conn} max)")
+                        self.degraded = False
+                        self.degraded_alerted = False
+                        return
                 except asyncio.TimeoutError:
-                    logger.warning("Redis smoke test timeout")
+                    logger.warning("Redis ping timeout, retrying...")
+                    self._redis = None
                 except Exception as e:
-                    logger.warning(f"Redis smoke test failed: {e}")
+                    logger.warning(f"Redis ping failed: {e}")
+                    self._redis = None
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
-                delay = cfg.REDIS_RETRY_DELAY * attempt
+                delay = cfg.REDIS_RETRY_DELAY * attempt  # or exponential backoff
                 logger.warning(f"Retrying Redis connection in {delay}s...")
                 await asyncio.sleep(delay)
 
+        # All retries failed
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
+        if self._redis:
+            await self._redis.close()
         self._redis = None
 
         logger.warning("""
@@ -2190,6 +2165,7 @@ class RedisStateStore:
             f"set_metadata {key}",
         )
 
+
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
         if self.degraded:
             return True
@@ -2197,89 +2173,24 @@ class RedisStateStore:
         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
 
-        if self._dedup_script_sha:
-            try:
-                result = await self._safe_redis_op(
-                    lambda: self._redis.evalsha(
-                        self._dedup_script_sha,
-                        1,
-                        recent_key,
-                        str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                    ),
-                    timeout=2.0,
-                    op_name=f"evalsha_dedup_{pair}:{alert_key}",
-                )
-                should_send = bool(result)
-                if cfg.DEBUG_MODE and not should_send:
-                    logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
-                return should_send
+        try:
+            result = await asyncio.wait_for(
+                self._redis.set(
+                    recent_key,
+                    "1",
+                    nx=True,
+                    ex=Constants.ALERT_DEDUP_WINDOW_SEC
+                ),
+                timeout=1.0
+            )
+            should_send = bool(result)
+            if cfg.DEBUG_MODE and not should_send:
+                logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
+            return should_send
 
-            except redis.exceptions.NoScriptError:
-                acquired = False
-                try:
-                    await asyncio.wait_for(
-                        RedisStateStore._script_reload_lock.acquire(),
-                        timeout=self.SCRIPT_RELOAD_LOCK_TIMEOUT
-                    )
-                    acquired = True
-                    try:
-                        result = await self._safe_redis_op(
-                            lambda: self._redis.evalsha(
-                                self._dedup_script_sha,
-                                1,
-                                recent_key,
-                                str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                            ),
-                            timeout=2.0,
-                            op_name=f"evalsha_dedup_recheck_{pair}:{alert_key}"
-                        )
-                        return bool(result)
-                    except redis.exceptions.NoScriptError:
-                        logger.warning("Dedup script missing, reloading...")
-                        try:
-                            self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                            result = await self._safe_redis_op(
-                                lambda: self._redis.evalsha(
-                                    self._dedup_script_sha,
-                                    1,
-                                    recent_key,
-                                    str(Constants.ALERT_DEDUP_WINDOW_SEC)
-                                ),
-                                timeout=2.0,
-                                op_name=f"evalsha_dedup_retry_{pair}:{alert_key}"
-                            )
-                            return bool(result)
-                        except Exception as reload_err:
-                            logger.error(f"Script reload failed: {reload_err}")
-                            return True
-
-                except asyncio.TimeoutError:
-                    logger.warning("Script reload lock timeout, falling back to SET NX")
-                except Exception as reload_error:
-                    logger.error(f"Failed to acquire script reload lock: {reload_error}")
-                finally:
-                    if acquired:
-                        RedisStateStore._script_reload_lock.release()
-
-            except Exception as e:
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"Lua script failed, fallback to SET NX: {e}")
-                    
-        result = await self._safe_redis_op(
-            lambda: self._redis.set(
-                recent_key,
-                "1",
-                nx=True,
-                ex=Constants.ALERT_DEDUP_WINDOW_SEC
-            ),
-            timeout=2.0,
-            op_name=f"check_recent_alert {pair}:{alert_key}",
-            parser=lambda r: bool(r),
-        )
-        should_send = bool(result)
-        if cfg.DEBUG_MODE and not should_send:
-            logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
-        return should_send
+        except Exception as e:
+            logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
+            return True
 
     async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:    
         if self.degraded or not checks or not self._redis:
@@ -2588,9 +2499,18 @@ class RedisLock:
             self.acquired_by_me = False
             return False
 
+    @classmethod
+    def get_lock_extend_interval, (cls) -> int:
+        extend_at = int(Constants.REDIS_LOCK_EXPIRY * 0.7)
+        return max(60, min(extend_at, 540))
+
     def should_extend(self) -> bool:
         if not self.acquired_by_me or self.lost:
             return False
+
+        extend_threshold = self.__class__.get_lock_extend_interval()
+        elapsed = max(0, time.time() - self.last_extend_time)
+        return elapsed >= extend_threshold
 
         base_interval = Constants.LOCK_EXTEND_INTERVAL
         jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
@@ -2923,7 +2843,24 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
     st = await sdb.get(state_key)
     return st is not None and st.get("state") == "ACTIVE"
 
-async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:   
+
+async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
+    if sdb.degraded or not keys:
+        return {k: False for k in keys}
+
+    try:
+        results = await sdb.batch_get_and_set_alerts(pair, keys, [])
+        output: Dict[str, bool] = {}
+        for key in keys:
+            st = results.get(key)
+            output[key] = isinstance(st, dict) and st.get("state") == "ACTIVE"
+        return output
+    except Exception as e:
+        logger.error(f"check_multiple_alert_states failed for {pair} | keys={keys} | error={e}")
+        return {k: False for k in keys}
+
+
+async def check_multiple_alert_states(sdb: Redisstatestore, pair: str, keys: List[str]) -> Dict[str, bool]:   
     if sdb.degraded or not keys:
         return {k: False for k in keys}
 
@@ -3486,26 +3423,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        if resets_to_apply:
-            logger_pair.debug(f"Applying {len(resets_to_apply)} state resets to Redis")
-            await sdb.atomic_batch_update(resets_to_apply)
-    
-        all_state_changes = all_state_changes + resets_to_apply
+        all_state_changes.extend(resets_to_apply)
 
-        dedup_checks = [(pair_name, ak, ts_curr) for _, _, ak in raw_alerts]
-
-        previous_states = await sdb.batch_get_and_set_alerts(
-            pair_name,
-            redis_alert_keys,                          # keys to fetch
-            [(k, v) for k, v, _ in all_state_changes]  # updates to apply
+        previous_states_before = await check_multiple_alert_states(
+            sdb, pair_name, redis_alert_keys
         )
 
         alerts_to_send = []
-        if raw_alerts:
-            for title, extra, ak in raw_alerts:
-       
-                if previous_states.get(ak) is None or previous_states[ak].get("state") != "ACTIVE":
-                    alerts_to_send.append((title, extra, ak))
+        for title, extra, ak in raw_alerts:
+            was_already_active = previous_states_before.get(ak, False)
+            if not was_already_active:
+                alerts_to_send.append((title, extra, ak))
+
+        if all_state_changes:
+            await sdb.atomic_batch_update(all_state_changes)
 
         alerts_to_send = alerts_to_send[:cfg.MAX_ALERTS_PER_PAIR]
 
@@ -3637,47 +3568,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     finally:
         PAIR_ID.set("")
-        try:
-            if 'data_15m' in locals():
-                del data_15m
-            if 'data_5m' in locals():
-                del data_5m
-            if 'data_daily' in locals():
-                del data_daily
-            if 'indicators' in locals():
-                del indicators
-            if 'close_15m' in locals():
-                del close_15m
-            if 'open_15m' in locals():
-                del open_15m
-            if 'timestamps_15m' in locals():
-                del timestamps_15m
-            if 'ppo' in locals():
-                del ppo
-            if 'ppo_signal' in locals():
-                del ppo_signal
-            if 'smooth_rsi' in locals():
-                del smooth_rsi
-            if 'vwap' in locals():
-                del vwap
-            if 'mmh' in locals():
-                del mmh
-            if 'upw' in locals():
-                del upw
-            if 'dnw' in locals():
-                del dnw
-            if 'rma50_15' in locals():
-                del rma50_15
-            if 'rma200_5' in locals():
-                del rma200_5
-            if 'piv' in locals():
-                del piv
-            if 'context' in locals():
-                del context
-        except Exception:
-            pass       
+        if indicators is not None:
+            indicators = None
 
-        
 def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
     
     if not ctx.get("vwap_enabled") or not ctx.get("vwap_available"):
@@ -3794,28 +3687,27 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
-    semaphore = asyncio.Semaphore(cfg.MAX_PARALLEL_FETCH)
     
+
     async def guarded_eval(task_data):
-        async with semaphore:
-            p_name, candles = task_data
-            try:
-                data_15m = parse_candles_to_numpy(candles.get("15"))
-                data_5m = parse_candles_to_numpy(candles.get("5"))
-                data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-                
-                v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
-                if not v15:
-                    logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
-                    return None
-                
-                return await evaluate_pair_and_alert(
-                    p_name, data_15m, data_5m, data_daily, state_db, 
-                    telegram_queue, correlation_id, reference_time
-                )
-            except Exception as e:
-                logger_main.error(f"Error in {p_name} evaluation: {e}")
+        p_name, candles = task_data
+        try:
+            data_15m = parse_candles_to_numpy(candles.get("15"))
+            data_5m = parse_candles_to_numpy(candles.get("5"))
+            data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+
+            v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
+            if not v15:
+                logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
                 return None
+
+            return await evaluate_pair_and_alert(
+                p_name, data_15m, data_5m, data_daily,
+                state_db, telegram_queue, correlation_id, reference_time
+            )
+        except Exception as e:
+            logger_main.error(f"Error in {p_name} evaluation: {e}")
+            return None
 
     results = await asyncio.gather(*[guarded_eval(t) for t in valid_tasks])
     valid_results = [r for r in results if r is not None]
@@ -3830,43 +3722,53 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     return valid_results
 
 async def run_once() -> bool:
-    async with gc_control():
-        MAX_ALERTS_PER_RUN = 50 
-        all_results: List[Tuple[str, Dict[str, Any]]] = [] 
-        correlation_id = uuid.uuid4().hex[:8]
-        TRACE_ID.set(correlation_id)
-        logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
-        start_time = time.time()
-        sdb: Optional[RedisStateStore] = None
-        lock: Optional[RedisLock] = None
-        fetcher: Optional[DataFetcher] = None
-        telegram_queue: Optional[TelegramQueue] = None
-        lock_acquired = False
-        alerts_sent = 0
+    MAX_ALERTS_PER_RUN = 50
+    all_results: List[Tuple[str, Dict[str, Any]]] = []
+    correlation_id = uuid.uuid4().hex[:8]
+    TRACE_ID.set(correlation_id)
+    logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
+    start_time = time.time()
+    sdb: Optional[RedisStateStore] = None
+    lock: Optional[RedisLock] = None
+    fetcher: Optional[DataFetcher] = None
+    telegram_queue: Optional[TelegramQueue] = None
+    lock_acquired = False
+    alerts_sent = 0
 
-        reference_time = get_trigger_timestamp()
-        logger_run.info(
-            f"🚀 Run started | Correlation ID: {correlation_id} | "
-            f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
+    reference_time = get_trigger_timestamp()
+    logger_run.info(
+        f"🚀 Run started | Correlation ID: {correlation_id} | "
+        f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
+    )
+
+    logger_run.info("Starting evaluation phase...")
+    logger_run.debug("GC disabled during evaluation loop...")
+    async with gc_control():
+        all_results = await process_pairs_with_workers(
+            fetcher, products_map, pairs_to_process,
+            sdb, telegram_queue, correlation_id,
+            lock, reference_time
         )
+
+    logger_run.debug("Cleanup phase with normal GC...")
 
     for _, state in all_results:
         if state.get("state") == "ALERT_SENT":
             extra_alerts = state.get("summary", {}).get("alerts", 0)
-        
+
             if alerts_sent > MAX_ALERTS_PER_RUN:
                 logger_run.warning(
                     f"Alert limit exceeded ({alerts_sent}/{MAX_ALERTS_PER_RUN}), "
                     f"skipping remaining alerts"
                 )
                 break
-        
+
             if alerts_sent + extra_alerts > MAX_ALERTS_PER_RUN:
                 logger_run.warning(
                     f"Alert limit would be exceeded, skipping {extra_alerts} alerts"
                 )
                 break
-        
+
             alerts_sent += extra_alerts
 
     if alerts_sent >= MAX_ALERTS_PER_RUN:          # >= covers the edge case
