@@ -2508,15 +2508,8 @@ class RedisLock:
         if not self.acquired_by_me or self.lost:
             return False
 
-        extend_threshold = self.__class__.get_lock_extend_interval()
+        extend_threshold = self.__class__.get_lock_extend_interval()   
         elapsed = max(0, time.time() - self.last_extend_time)
-        return elapsed >= extend_threshold
-
-        base_interval = Constants.LOCK_EXTEND_INTERVAL
-        jitter = random.uniform(0, Constants.LOCK_EXTEND_JITTER_MAX)
-        extend_threshold = base_interval + jitter
-
-        elapsed = time.time() - self.last_extend_time
         return elapsed >= extend_threshold
 
     async def release(self, timeout: float = 3.0) -> None:
@@ -2843,39 +2836,20 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
     st = await sdb.get(state_key)
     return st is not None and st.get("state") == "ACTIVE"
 
-
 async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
     if sdb.degraded or not keys:
         return {k: False for k in keys}
-
     try:
         results = await sdb.batch_get_and_set_alerts(pair, keys, [])
-        output: Dict[str, bool] = {}
+        output: Dict[str, bool] = {}       
         for key in keys:
             st = results.get(key)
             output[key] = isinstance(st, dict) and st.get("state") == "ACTIVE"
-        return output
-    except Exception as e:
-        logger.error(f"check_multiple_alert_states failed for {pair} | keys={keys} | error={e}")
-        return {k: False for k in keys}
-
-
-async def check_multiple_alert_states(sdb: Redisstatestore, pair: str, keys: List[str]) -> Dict[str, bool]:   
-    if sdb.degraded or not keys:
-        return {k: False for k in keys}
-
-    try:
-        results = await sdb.batch_get_and_set_alerts(pair, keys, [])
-
-        output: Dict[str, bool] = {}
-        for key in keys:
-            st = results.get(key)
-            output[key] = st is not None and st.get("state") == "ACTIVE"
 
         return output
 
     except Exception as e:
-        logger.error(f"check_multiple_alert_states failed for {pair}: {e}")
+        logger.error(f"check_multiple_alert_states failed for {pair} | keys={len(keys)} | error={e}")
         return {k: False for k in keys}
 
 def check_common_conditions(open_val, high_val, low_val, close_val, is_buy) -> bool:
@@ -3721,69 +3695,32 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     return valid_results
 
-async def run_once() -> bool:
+async def run_once() -> bool:   
     MAX_ALERTS_PER_RUN = 50
     all_results: List[Tuple[str, Dict[str, Any]]] = []
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
+    
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     fetcher: Optional[DataFetcher] = None
     telegram_queue: Optional[TelegramQueue] = None
     lock_acquired = False
     alerts_sent = 0
-
+    
+    products_map: Optional[Dict[str, dict]] = None
+    pairs_to_process: List[str] = []
+    
     reference_time = get_trigger_timestamp()
     logger_run.info(
         f"🚀 Run started | Correlation ID: {correlation_id} | "
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
 
-    logger_run.info("Starting evaluation phase...")
-    logger_run.debug("GC disabled during evaluation loop...")
-    async with gc_control():
-        all_results = await process_pairs_with_workers(
-            fetcher, products_map, pairs_to_process,
-            sdb, telegram_queue, correlation_id,
-            lock, reference_time
-        )
-
-    logger_run.debug("Cleanup phase with normal GC...")
-
-    for _, state in all_results:
-        if state.get("state") == "ALERT_SENT":
-            extra_alerts = state.get("summary", {}).get("alerts", 0)
-
-            if alerts_sent > MAX_ALERTS_PER_RUN:
-                logger_run.warning(
-                    f"Alert limit exceeded ({alerts_sent}/{MAX_ALERTS_PER_RUN}), "
-                    f"skipping remaining alerts"
-                )
-                break
-
-            if alerts_sent + extra_alerts > MAX_ALERTS_PER_RUN:
-                logger_run.warning(
-                    f"Alert limit would be exceeded, skipping {extra_alerts} alerts"
-                )
-                break
-
-            alerts_sent += extra_alerts
-
-    if alerts_sent >= MAX_ALERTS_PER_RUN:          # >= covers the edge case
-        logger_run.critical(
-            "ALERT VOLUME EXCEEDED: %d/%d", alerts_sent, MAX_ALERTS_PER_RUN
-        )
-
-        await telegram_queue.send(
-            f"⚠️ HIGH ALERT VOLUME\n"
-            f"Alerts sent: {alerts_sent} (limit: {MAX_ALERTS_PER_RUN})\n"
-            f"Please review configuration for excessive signals.\n"
-            f"Time: {format_ist_time()}",
-            parse_mode=None
-        ) 
     try:
+        # ===== STEP 1: Load/Cache Products =====
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
@@ -3795,25 +3732,9 @@ async def run_once() -> bool:
             )
             return False
 
-        products_map = None
-        pairs_to_process = []
         USE_STATIC_MAP = True
         STATIC_MAP_REFRESH_DAYS = 7
-
         now = time.time()
-
-        def should_refresh_products(cache_dict, static_enabled, days_threshold):
-            if not static_enabled:
-                return True
-    
-            expires_at = cache_dict.get("until", 0.0)
-            if expires_at <= 0:
-                return True
-
-            fetched_at = expires_at - cfg.PRODUCTS_CACHE_TTL
-            days_since_fetch = (time.time() - fetched_at) / 86400
-    
-            return days_since_fetch >= days_threshold
 
         last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
         days_since_check = (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400 if last_check_ts else 9999
@@ -3824,14 +3745,9 @@ async def run_once() -> bool:
 
         elif not PRODUCTS_CACHE.get("data"):
             last_fetch_ts = PRODUCTS_CACHE.get("fetched_at", 0.0)
-            if last_fetch_ts <= 0:
-                reason = "never checked"
-            else:
-                days_since_check = (now - last_fetch_ts) / 86400
-                reason = f"last checked {days_since_check:.1f}d ago"
+            reason = "never checked" if last_fetch_ts <= 0 else f"last checked {(now - last_fetch_ts) / 86400:.1f}d ago"
 
-            logger_run.debug(f"🔄 Fetching products from API ({reason})")
-            USE_STATIC_MAP = False
+            logger_run.debug(f"📢 Fetching products from API ({reason})")
 
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
@@ -3855,6 +3771,11 @@ async def run_once() -> bool:
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
 
+        # Validate products_map (CRITICAL: must exist at this point)
+        if products_map is None:
+            logger_run.error("❌ Products map is None after initialization")
+            return False
+
         pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
 
         if len(pairs_to_process) < len(cfg.PAIRS):
@@ -3865,6 +3786,7 @@ async def run_once() -> bool:
             logger_run.error("❌ No valid pairs to process - aborting run")
             return False
 
+        # ===== STEP 2: Connect to Redis =====
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
@@ -3881,10 +3803,12 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
+        # ===== STEP 3: Create HTTP Fetcher and Telegram Queue =====
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
+        # ===== STEP 4: Acquire Redis Lock =====
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
 
@@ -3894,6 +3818,7 @@ async def run_once() -> bool:
             )
             return False
 
+        # ===== STEP 5: Send Test Message =====
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -3903,22 +3828,66 @@ async def run_once() -> bool:
             ))
 
         logger_run.debug(
-            f"📊 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
+            f"🔔 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
-        all_results = await process_pairs_with_workers(
-            fetcher, products_map, pairs_to_process,
-            sdb, telegram_queue, correlation_id,
-            lock, reference_time
-        )
+        # ===== STEP 6: Process Pairs with GC Control =====
+        logger_run.info("Starting evaluation phase...")
+        logger_run.debug("GC disabled during evaluation loop...")
+        
+        async with gc_control():
+            all_results = await process_pairs_with_workers(
+                fetcher, products_map, pairs_to_process,
+                sdb, telegram_queue, correlation_id,
+                lock, reference_time
+            )
 
+        logger_run.debug("Cleanup phase with normal GC...")
+
+        # ===== STEP 7: Aggregate Alert Results =====
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
-                alerts_sent += state.get("summary", {}).get("alerts", 0)
+                extra_alerts = state.get("summary", {}).get("alerts", 0)
+
+                if alerts_sent > MAX_ALERTS_PER_RUN:
+                    logger_run.warning(
+                        f"Alert limit exceeded ({alerts_sent}/{MAX_ALERTS_PER_RUN}), "
+                        f"skipping remaining alerts"
+                    )
+                    break
+
+                if alerts_sent + extra_alerts > MAX_ALERTS_PER_RUN:
+                    logger_run.warning(
+                        f"Alert limit would be exceeded, skipping {extra_alerts} alerts"
+                    )
+                    break
+
+                alerts_sent += extra_alerts
+
+        if alerts_sent >= MAX_ALERTS_PER_RUN:
+            logger_run.critical(
+                "ALERT VOLUME EXCEEDED: %d/%d", alerts_sent, MAX_ALERTS_PER_RUN
+            )
+            await telegram_queue.send(
+                escape_markdown_v2(
+                    f"⚠️ HIGH ALERT VOLUME\n"
+                    f"Alerts sent: {alerts_sent} (limit: {MAX_ALERTS_PER_RUN})\n"
+                    f"Please review configuration for excessive signals.\n"
+                    f"Time: {format_ist_time()}"
+                )
+            )
+
+        # ===== STEP 8: Log Statistics =====
+        if fetcher is None:
+            logger_run.error("❌ Fetcher is None - cannot get stats")
+            return False
 
         fetcher_stats = fetcher.get_stats()
         prod_str = "cached" if PRODUCTS_CACHE.get("fetched_at") else f"{fetcher_stats['products']['success']}✅"
-        logger_run.info(f"Products: {prod_str} | Candles: {fetcher_stats['candles']['success']}✅/{fetcher_stats['candles']['failed']}❌")
+        logger_run.info(
+            f"Products: {prod_str} | "
+            f"Candles: {fetcher_stats['candles']['success']}✅/{fetcher_stats['candles']['failed']}❌"
+        )
 
         if "rate_limiter" in fetcher_stats:
             rate_stats = fetcher_stats["rate_limiter"]
@@ -3931,9 +3900,8 @@ async def run_once() -> bool:
 
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
-
         run_duration = time.time() - start_time
-        redis_status = "OK" if not sdb.degraded else "DEGRADED"
+        redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
         summary = (
             f"✅ RUN COMPLETE | "
@@ -3969,7 +3937,7 @@ async def run_once() -> bool:
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
-                    f" {cfg.BOT_NAME} - FATAL ERROR\n"
+                    f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
                     f"Error: {str(e)[:200]}\n"
                     f"Correlation ID: {correlation_id}\n"
                     f"Time: {format_ist_time()}"
@@ -3982,6 +3950,7 @@ async def run_once() -> bool:
     finally:
         logger_run.debug("🧹 Starting resource cleanup...")
 
+        # ===== Clean Up Lock =====
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
@@ -3989,6 +3958,7 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
+        # ===== Clean Up Redis Connection =====
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
@@ -3996,8 +3966,10 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
 
-            gc.collect()
+        # Force garbage collection after Redis
+        gc.collect()
 
+        # ===== Clean Up Context Variables =====
         try:
             TRACE_ID.set("")
             PAIR_ID.set("")
