@@ -2923,7 +2923,7 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
     st = await sdb.get(state_key)
     return st is not None and st.get("state") == "ACTIVE"
 
-async def check_multiple_alert_states(sdb: Redisstatestore, pair: str, keys: List[str]) -> Dict[str, bool]:   
+async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:   
     if sdb.degraded or not keys:
         return {k: False for k in keys}
 
