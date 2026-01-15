@@ -3017,7 +3017,7 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
         return False, f"Error: {str(e)}"
 
 async def _evaluate_single_alert(alert_key: str, context: Dict[str, Any], ppo_ctx: Dict[str, Any], ppo_sig_ctx: Dict[str, Any], 
-    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str, logger_pair: logging.Logger) -> Tuple[bool, str]:
+    rsi_ctx: Dict[str, Any], previous_states: Dict[str, bool], pair_name: str) -> Tuple[bool, str]:
     try:
         def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
         if not def_:
