@@ -3782,8 +3782,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "summary": {
                 "alerts": len(alerts_to_send),
                 "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                "mmh_hist": round(mmh_curr, 4),
-                "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
+                "mmh_hist": round(mmh_curr, 4),        
             }
         }
 
