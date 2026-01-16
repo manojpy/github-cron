@@ -416,11 +416,10 @@ if not AOT_IMPORT_SUCCESS:
         def __getattr__(self, name):
             """Dynamically import from numba_functions_shared"""
             try:
-                from numba_functions_shared import *
-                return globals()[name]
-            except (KeyError, ImportError) as e:
-                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")
-    
+                import numba_functions_shared
+                return getattr(numba_functions_shared, name)
+            except (AttributeError, ImportError) as e:
+                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
     aot_bridge = _AotBridgeStub()
     AOT_AVAILABLE = False
     logger.info("✅ aot_bridge stub initialized - JIT fallback ready")
