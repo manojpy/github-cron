@@ -3,7 +3,7 @@
 # =============================================================================
 
 # Async Networking & Performance
-aiohttp[speedups]==3.12.14
+aiohttp[speedups]==3.13.3
 uvloop==0.22.1
 aiodns>=3.3.0
 
