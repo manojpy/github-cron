@@ -37,7 +37,6 @@ warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
 try:
-    import aot_bridge
     AOT_AVAILABLE = True
     AOT_IMPORT_SUCCESS = True
     AOT_IMPORT_ERROR = None
@@ -88,6 +87,7 @@ class Constants:
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     VWAP_MAX_DISTANCE_PCT = 1.0
     PIVOT_MAX_DISTANCE_PCT = 0.5
+    INTER_BATCH_DELAY: float = 0.5
     
 STATIC_PRODUCTS_MAP = {
     "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
@@ -116,34 +116,6 @@ class CompiledPatterns:
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 
-
-_IST_TZ = ZoneInfo("Asia/Kolkata")
-
-def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> str:
-    try:
-        if dt_or_ts is None:
-            dt = datetime.now(timezone.utc)
-
-        elif isinstance(dt_or_ts, datetime):
-            dt = dt_or_ts
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            try:
-                ts = float(dt_or_ts)
-                if ts > 1_000_000_000_000:
-                    ts /= 1000
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-
-            except (ValueError, TypeError):
-                dt = datetime.fromisoformat(str(dt_or_ts))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(_IST_TZ).strftime(fmt)
-    except Exception as e:
-        if cfg.DEBUG_MODE:
-            logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
-        return str(dt_or_ts)
 
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
@@ -266,7 +238,6 @@ class BotConfig(BaseModel):
             raise ValueError('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
 
         if self.MAX_ALERTS_PER_PAIR > 15:
-            logger.warning(f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam')
 
         ranges = {
             'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
@@ -392,6 +363,34 @@ def setup_logging() -> logging.Logger:
     return logger
 
 logger = setup_logging()
+
+_IST_TZ = ZoneInfo("Asia/Kolkata")
+
+def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> str:
+    try:
+        if dt_or_ts is None:
+            dt = datetime.now(timezone.utc)
+
+        elif isinstance(dt_or_ts, datetime):
+            dt = dt_or_ts
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            try:
+                ts = float(dt_or_ts)
+                if ts > 1_000_000_000_000:
+                    ts /= 1000
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+            except (ValueError, TypeError):
+                dt = datetime.fromisoformat(str(dt_or_ts))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_IST_TZ).strftime(fmt)
+    except Exception as e:
+        if cfg.DEBUG_MODE:
+            logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
+        return str(dt_or_ts)
 
 if not AOT_IMPORT_SUCCESS:
     logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
@@ -2238,22 +2237,34 @@ class RedisStateStore:
             return True
 
     async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
-        """Batch check multiple alerts for deduplication."""
+        
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
         try:
             async with self._redis.pipeline() as pipe:
                 keys_map: Dict[str, str] = {}
+                
+                # Queue all SET commands (NX = only if not exists)
                 for pair, alert_key, ts in checks:
                     window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                     recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
-                    composite = f"{pair}:{alert_key}"
-                    keys_map[recent_key] = composite
-                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                    composite_key = f"{pair}:{alert_key}"
+                    keys_map[recent_key] = composite_key
+                    
+                    # NX=True means "only set if key doesn't exist"
+                    # Returns True if key was set, False if key already existed
+                    pipe.set(
+                        recent_key, 
+                        "1", 
+                        nx=True, 
+                        ex=Constants.ALERT_DEDUP_WINDOW_SEC
+                    )
 
+                # Execute all SET commands atomically
                 results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
 
+            # Build output: True if SET succeeded (new key), False if already existed (duplicate)
             output: Dict[str, bool] = {}
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
                 should_send = bool(results[idx]) if idx < len(results) else True
@@ -2265,55 +2276,187 @@ class RedisStateStore:
                     logger.debug(f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered")
 
             return output
+            
+        except asyncio.TimeoutError:
+            logger.error("batch_check_recent_alerts timeout")
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+            
         except Exception as e:
-            logger.error(f"Batch check_recent_alerts failed: {e}")
+            logger.error(f"batch_check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any]]) -> Dict[str, Optional[Dict[str, Any]]]:
-        """Get current alert states and set new ones atomically."""
+    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
+        
         if not self._redis or self.degraded:
-            return {}
+            return {k: None for k in alert_keys}
 
         try:
             async with self._redis.pipeline(transaction=True) as pipe:
-                for key in alert_keys:
-                    pipe.get(f"{pair}:{key}")
+                # STEP 1: Build mget commands for all keys
+                state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+                
+                # Add all GET commands to pipeline
+                for state_key in state_keys:
+                    pipe.get(state_key)
 
-                for key, state in updates:
-                    data = json_dumps({"state": state, "ts": int(time.time())})
-                    pipe.set(f"{pair}:{key}", data, ex=self.expiry_seconds)
-
-                results = await pipe.execute()
-
-                parsed: Dict[str, Optional[Dict[str, Any]]] = {}
-                for k, r in zip(alert_keys, results[:len(alert_keys)]):
-                    if r is None:
-                        parsed[k] = None
-                        continue
+                # STEP 2: Build SET commands for all updates
+                now = int(time.time())
+                for full_key, state_value, custom_ts in updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    
                     try:
-                        if isinstance(r, bytes):
-                            val = r.decode("utf-8")
-                        elif isinstance(r, str):
-                            val = r
-                        else:
-                            logger.warning(
-                                f"Unexpected Redis type for {pair}:{k} -> {type(r)}"
-                            )
-                            parsed[k] = None
-                            continue
+                        data = json_dumps({"state": state_value, "ts": ts})
+                    except Exception as e:
+                        logger.error(f"Failed to serialize state for {full_key}: {e}")
+                        continue
+                
+                    # full_key is expected to be like "pair:alert_key"
+                    # Ensure it has the state prefix
+                    if not full_key.startswith(self.state_prefix):
+                        redis_key = f"{self.state_prefix}{full_key}"
+                    else:
+                        redis_key = full_key
 
-                        parsed[k] = json_loads(val)
-                    except (json.JSONDecodeError, UnicodeDecodeError, Exception) as e:
-                        logger.warning(
-                            f"Failed to parse Redis value for {pair}:{k}: {e}"
-                        )
-                        parsed[k] = None
+                    if self.expiry_seconds > 0:
+                        pipe.set(redis_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(redis_key, data)
 
-                return parsed
+                # STEP 3: Execute pipeline atomically
+                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
+            # STEP 4: Parse GET results (first N results are from mget)
+            num_gets = len(alert_keys)
+            mget_results = results[:num_gets] if results else []
+
+            # STEP 5: Build output dictionary
+            parsed: Dict[str, Optional[Dict[str, Any]]] = {}
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                
+                if val is None:
+                    parsed[key] = None
+                    continue
+                
+                try:
+                    # Handle both bytes and string returns
+                    if isinstance(val, bytes):
+                        val_str = val.decode("utf-8")
+                    elif isinstance(val, str):
+                        val_str = val
+                    else:
+                        logger.warning(f"Unexpected Redis type for {pair}:{key} -> {type(val)}")
+                        parsed[key] = None
+                        continue
+
+                    parsed[key] = json_loads(val_str)
+                    
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    logger.warning(f"Failed to parse Redis value for {pair}:{key}: {e}")
+                    parsed[key] = None
+                except Exception as e:
+                    logger.error(f"Unexpected error parsing {pair}:{key}: {e}")
+                    parsed[key] = None
+
+            if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"batch_get_and_set_alerts completed | pair={pair} | "
+                    f"retrieved={sum(1 for v in parsed.values() if v is not None)}/{len(alert_keys)} | "
+                    f"updated={len(updates)}"
+                )
+
+            return parsed
+
+        except asyncio.TimeoutError:
+            logger.error(f"batch_get_and_set_alerts timeout for {pair}")
+            return {k: None for k in alert_keys}
+            
         except Exception as e:
-            logger.error(f"Redis pipeline failed: {e}")
-            return {}
+            logger.error(f"batch_get_and_set_alerts failed for {pair}: {e}")
+            return {k: None for k in alert_keys}
+
+    async def mget_states(self, composite_keys: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        DEPRECATED: Use batch_get_and_set_alerts() instead.
+        
+        Get multiple alert states from Redis by composite keys.
+        Falls back to batch_get_and_set_alerts with empty updates.
+        
+        Args:
+            composite_keys: List of "pair:alert_key" strings
+        
+        Returns:
+            Dictionary mapping composite_key -> state dict or None
+        """
+        if not composite_keys or not self._redis or self.degraded:
+            return {k: None for k in composite_keys}
+
+        try:
+            async with self._redis.pipeline() as pipe:
+                redis_keys = [f"{self.state_prefix}{k}" for k in composite_keys]
+                
+                for key in redis_keys:
+                    pipe.get(key)
+
+                results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
+
+            parsed: Dict[str, Optional[Dict[str, Any]]] = {}
+            for idx, composite_key in enumerate(composite_keys):
+                val = results[idx] if idx < len(results) else None
+                
+                if val is None:
+                    parsed[composite_key] = None
+                    continue
+                
+                try:
+                    if isinstance(val, bytes):
+                        val_str = val.decode("utf-8")
+                    elif isinstance(val, str):
+                        val_str = val
+                    else:
+                        parsed[composite_key] = None
+                        continue
+
+                    parsed[composite_key] = json_loads(val_str)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    parsed[composite_key] = None
+                except Exception as e:
+                    logger.error(f"Error parsing {composite_key}: {e}")
+                    parsed[composite_key] = None
+
+            return parsed
+
+        except asyncio.TimeoutError:
+            logger.error(f"mget_states timeout")
+            return {k: None for k in composite_keys}
+        except Exception as e:
+            logger.error(f"mget_states failed: {e}")
+            return {k: None for k in composite_keys}
+
+    async def batch_set_states(self, updates: List[Tuple[str, Any, Optional[int]]]) -> bool:
+        """
+        DEPRECATED: Use atomic_batch_update() instead.
+        
+        Set multiple alert states atomically.
+        Falls back to atomic_batch_update.
+        
+        Args:
+            updates: List of (full_redis_key, state_value, optional_timestamp) tuples
+                    Example: [("pair:alert_key", "ACTIVE", 1234567890)]
+        
+        Returns:
+            True if all updates succeeded, False otherwise
+        """
+        if not updates or not self._redis or self.degraded:
+            return False
+
+        try:
+            success = await self.atomic_batch_update(updates)
+            return success
+        except Exception as e:
+            logger.error(f"batch_set_states failed: {e}")
+            return False
+
 
     async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """Atomically evaluate batch of alerts with pipeline execution."""
@@ -2331,39 +2474,52 @@ class RedisStateStore:
         except asyncio.TimeoutError:
             logger.error(
                 f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
-                f"Degrading to individual operations"
+                f"Degrading to batch_get_and_set_alerts + batch_check_recent_alerts"
             )
             try:
-                composite_keys = [f"{pair}:{k}" for k in alert_keys]
-                prev_raw = await asyncio.wait_for(self.mget_states(composite_keys), timeout=2.0)
+                # FIXED: Use batch_get_and_set_alerts for atomic get+set
+                prev_raw = await asyncio.wait_for(
+                    self.batch_get_and_set_alerts(pair, alert_keys, state_updates),
+                    timeout=2.0
+                )
 
                 prev_states: Dict[str, bool] = {}
                 for k in alert_keys:
-                    ck = f"{pair}:{k}"
-                    env = prev_raw.get(ck)
-                    prev_states[k] = bool(env and env.get("state") == "ACTIVE")
+                    env = prev_raw.get(k)
+                    prev_states[k] = isinstance(env, dict) and env.get("state") == "ACTIVE"
 
-                await asyncio.wait_for(self.batch_set_states(state_updates), timeout=2.0)
-
-                dedup_results = await asyncio.wait_for(self.batch_check_recent_alerts(dedup_checks), timeout=2.0)
+                # FIXED: Use batch_check_recent_alerts for deduplication
+                dedup_results = await asyncio.wait_for(
+                    self.batch_check_recent_alerts(dedup_checks),
+                    timeout=2.0
+                )
+                
+                return prev_states, dedup_results
+                
             except asyncio.TimeoutError:
                 logger.critical(f"Redis completely unresponsive for {pair}")
                 empty_prev = {k: False for k in alert_keys}
                 empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
                 return empty_prev, empty_dedup
 
-            return prev_states, dedup_results
+        except Exception as e:
+            logger.error(f"atomic_eval_batch failed: {e}")
+            empty_prev = {k: False for k in alert_keys}
+            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            return empty_prev, empty_dedup
 
     async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """Execute Redis pipeline operations (Fixed per Issue #5)."""
+        
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
         try:
             async with self._redis.pipeline() as pipe:
+                # ===== PHASE 1: MGET previous states =====
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
                 pipe.mget(state_keys)
 
+                # ===== PHASE 2: SET new states =====
                 now = int(time.time())
                 for key, state, custom_ts in state_updates:
                     ts = custom_ts if custom_ts is not None else now
@@ -2373,13 +2529,18 @@ class RedisStateStore:
                         logger.error(f"Failed to serialize state for {key}: {e}")
                         continue
                 
-                    full_key = f"{self.state_prefix}{key}"
+                    # Ensure key has proper prefix
+                    if not key.startswith(self.state_prefix):
+                        full_key = f"{self.state_prefix}{key}"
+                    else:
+                        full_key = key
 
                     if self.expiry_seconds > 0:
                         pipe.set(full_key, data, ex=self.expiry_seconds)
                     else:
                         pipe.set(full_key, data)
 
+                # ===== PHASE 3: SET dedup keys (NX) =====
                 dedup_keys_ordered: List[Tuple[str, str]] = []
             
                 for pair_name, alert_key, ts in dedup_checks:
@@ -2389,17 +2550,23 @@ class RedisStateStore:
                     dedup_keys_ordered.append((recent_key, composite_key))
                     pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
                 
+                # ===== EXECUTE PIPELINE ATOMICALLY =====
                 results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
-            num_updates = len(state_updates)
+            num_gets = 1  # mget returns ONE result (list of values)
+            num_sets = len(state_updates)
+            num_dedups = len(dedup_keys_ordered)
         
-            if not results or len(results) < 1:
-                logger.warning("Pipeline returned empty results")
-                return {k: False for k in alert_keys}, {k: False for k, _ in dedup_keys_ordered}
+            if not results or len(results) < (num_gets + num_sets + num_dedups):
+                logger.warning("Pipeline returned incomplete results")
+                return (
+                    {k: False for k in alert_keys},
+                    {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+                )
         
+            # ===== PARSE MGET RESULTS (first result is list of values) =====
             mget_results = results[0] if results else []
 
-            # FIXED per Issue #5: Proper exception handling (indentation & consolidation)
             prev_states: Dict[str, bool] = {}
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
@@ -2409,8 +2576,17 @@ class RedisStateStore:
                     continue
                 
                 try:
-                    parsed_state = json_loads(val)
+                    if isinstance(val, bytes):
+                        val_str = val.decode("utf-8")
+                    elif isinstance(val, str):
+                        val_str = val
+                    else:
+                        prev_states[key] = False
+                        continue
+
+                    parsed_state = json_loads(val_str)
                     prev_states[key] = parsed_state.get("state") == "ACTIVE"
+                    
                 except (json.JSONDecodeError, TypeError) as e:
                     if cfg.DEBUG_MODE:
                         logger.debug(f"Failed to parse state for {key}: {e}")
@@ -2419,21 +2595,35 @@ class RedisStateStore:
                     logger.error(f"Unexpected error parsing state for {key}: {e}")
                     prev_states[key] = False
 
+            # ===== PARSE DEDUP RESULTS =====
             dedup_results: Dict[str, bool] = {}
-            dedup_start_idx = 1 + num_updates
+            dedup_start_idx = num_gets + num_sets
+            
             for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
                 result_idx = dedup_start_idx + idx
+                # SET with NX returns True if key was set (new), False if already existed (duplicate)
                 should_send = bool(results[result_idx]) if result_idx < len(results) else True
                 dedup_results[composite_key] = should_send
+
+            if cfg.DEBUG_MODE:
+                duplicates = sum(1 for v in dedup_results.values() if not v)
+                if duplicates > 0:
+                    logger.debug(f"Pipeline dedup: {duplicates}/{len(dedup_checks)} duplicates filtered")
 
             return prev_states, dedup_results
 
         except asyncio.TimeoutError:
             logger.error("Pipeline operation timeout")
-            return {k: False for k in alert_keys}, {}
+            return (
+                {k: False for k in alert_keys},
+                {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            )
         except Exception as e:
             logger.error(f"Pipeline operation failed: {e}")
-            return {k: False for k in alert_keys}, {}
+            return (
+                {k: False for k in alert_keys},
+                {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            )
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
         """Atomically update multiple state entries."""
@@ -2835,7 +3025,7 @@ class TelegramQueue:
             results.append(await self.send(text))
 
             if idx < len(batches) - 1:
-                await asyncio.sleep(INTER_BATCH_DELAY)
+                await asyncio.sleep(Constants.INTER_BATCH_DELAY)
 
         return all(results)
 
