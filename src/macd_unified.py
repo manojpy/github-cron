@@ -1928,25 +1928,6 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     return products_map
 
 class RedisStateStore:
-    """
-    Redis-backed state store for alert deduplication and persistence.
-    
-    FIXED: Removed async context manager (__aenter__/__aexit__) to prevent
-    premature connection closure during concurrent task execution.
-    
-    Use pattern:
-        sdb = RedisStateStore(cfg.REDIS_URL)
-        await sdb.connect()
-        try:
-            # ... use sdb across multiple concurrent tasks
-        finally:
-            await sdb.close()
-    
-    NOT like this (BROKEN):
-        async with RedisStateStore(cfg.REDIS_URL) as sdb:  # ← DON'T DO THIS
-            # ... context manager exits early, closes Redis
-    """
-
     DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
     local ttl = tonumber(ARGV[1])
@@ -2048,12 +2029,7 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        """
-        Connect to Redis with connection pooling and health checks.
         
-        FIXED: Removed async context manager to allow connection to persist
-        across concurrent task execution.
-        """
         pool_reused = False
 
         async with RedisStateStore._pool_lock:
@@ -2796,7 +2772,6 @@ class TelegramQueue:
         if not messages:
             return True
 
-# AFTER (FIXED):
         def _safe_truncate_utf8(text: str, max_bytes: int) -> str:
             """Truncate UTF-8 string without breaking multi-byte chars"""
             encoded = text.encode('utf-8')
@@ -3171,34 +3146,6 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Evaluate a trading pair for alerts and send notifications.
-    
-    This is the core evaluation engine that:
-    1. Validates and parses candle data
-    2. Calculates technical indicators (PPO, RSI, VWAP, MMH, Pivots)
-    3. Checks 20+ alert conditions
-    4. Deduplicates alerts
-    5. Sends to Telegram
-    6. Persists state to Redis
-    
-    Args:
-        pair_name: Trading pair (e.g., "BTCUSD")
-        data_15m: 15-minute candle data (OHLCV + timestamp)
-        data_5m: 5-minute candle data
-        data_daily: Daily candle data (optional, for pivots)
-        sdb: Redis state store for deduplication
-        telegram_queue: Telegram message queue
-        correlation_id: Trace ID for logging
-        reference_time: Unix timestamp for candle alignment
-    
-    Returns:
-        Tuple of (pair_name, result_dict) on success, None on failure
-        result_dict contains: state, ts, summary with alerts count, cloud state, MMH value
-    
-    Raises:
-        asyncio.CancelledError: If shutdown requested
-    """
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
@@ -4255,7 +4202,7 @@ async def run_once() -> bool:
                     if lock_obj.should_extend():
                         success = await lock_obj.extend(timeout=3.0)
                         if success:
-                            logger_run.debug("✅ Lock extended successfully")
+                            logger_run.debug("��� Lock extended successfully")
                         else:
                             logger_run.warning("❌ Failed to extend lock - may lose it soon")
                 except asyncio.CancelledError:
