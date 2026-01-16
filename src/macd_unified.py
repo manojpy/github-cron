@@ -463,7 +463,7 @@ if not AOT_IMPORT_SUCCESS:
                 raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
     aot_bridge = _AotBridgeStub()
     AOT_AVAILABLE = False
-    logger.info("✅ aot_bridge stub initialized - JIT fallback ready")
+    logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
 else:
     logger.info("✅ aot_bridge imported successfully - AOT compilation active")
 
@@ -1416,7 +1416,7 @@ class APICircuitBreaker:
         if self.state == "HALF_OPEN":
             self.success_count += 1
             if self.success_count >= 2:
-                logger.info("🟢 Circuit breaker: Recovered, transitioning to CLOSED")
+                logger.info("💫 Circuit breaker: Recovered, transitioning to CLOSED")
                 self.state = "CLOSED"
                 self.failures = 0
                 self.success_count = 0
@@ -1430,7 +1430,7 @@ class APICircuitBreaker:
         
         if self.failures >= self.failure_threshold and self.state == "CLOSED":
             logger.warning(
-                f"🔴 Circuit breaker: OPENED after {self.failures} failures. "
+                f"⚠️ Circuit breaker: OPENED after {self.failures} failures. "
                 f"Blocking requests for {self.recovery_timeout}s"
             )
             self.state = "OPEN"
@@ -1650,7 +1650,7 @@ class DataFetcher:
                 output[symbol][resolution] = result
                 if result: 
                     success_count += 1
-        logger.info(f"✅ Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
+        logger.info(f"📏📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
@@ -2408,89 +2408,6 @@ class RedisStateStore:
             logger.error(f"batch_get_and_set_alerts failed for {pair}: {e}")
             return {k: None for k in alert_keys}
 
-    async def mget_states(self, composite_keys: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
-        """
-        DEPRECATED: Use batch_get_and_set_alerts() instead.
-        
-        Get multiple alert states from Redis by composite keys.
-        Falls back to batch_get_and_set_alerts with empty updates.
-        
-        Args:
-            composite_keys: List of "pair:alert_key" strings
-        
-        Returns:
-            Dictionary mapping composite_key -> state dict or None
-        """
-        if not composite_keys or not self._redis or self.degraded:
-            return {k: None for k in composite_keys}
-
-        try:
-            async with self._redis.pipeline() as pipe:
-                redis_keys = [f"{self.state_prefix}{k}" for k in composite_keys]
-                
-                for key in redis_keys:
-                    pipe.get(key)
-
-                results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
-
-            parsed: Dict[str, Optional[Dict[str, Any]]] = {}
-            for idx, composite_key in enumerate(composite_keys):
-                val = results[idx] if idx < len(results) else None
-                
-                if val is None:
-                    parsed[composite_key] = None
-                    continue
-                
-                try:
-                    if isinstance(val, bytes):
-                        val_str = val.decode("utf-8")
-                    elif isinstance(val, str):
-                        val_str = val
-                    else:
-                        parsed[composite_key] = None
-                        continue
-
-                    parsed[composite_key] = json_loads(val_str)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    parsed[composite_key] = None
-                except Exception as e:
-                    logger.error(f"Error parsing {composite_key}: {e}")
-                    parsed[composite_key] = None
-
-            return parsed
-
-        except asyncio.TimeoutError:
-            logger.error(f"mget_states timeout")
-            return {k: None for k in composite_keys}
-        except Exception as e:
-            logger.error(f"mget_states failed: {e}")
-            return {k: None for k in composite_keys}
-
-    async def batch_set_states(self, updates: List[Tuple[str, Any, Optional[int]]]) -> bool:
-        """
-        DEPRECATED: Use atomic_batch_update() instead.
-        
-        Set multiple alert states atomically.
-        Falls back to atomic_batch_update.
-        
-        Args:
-            updates: List of (full_redis_key, state_value, optional_timestamp) tuples
-                    Example: [("pair:alert_key", "ACTIVE", 1234567890)]
-        
-        Returns:
-            True if all updates succeeded, False otherwise
-        """
-        if not updates or not self._redis or self.degraded:
-            return False
-
-        try:
-            success = await self.atomic_batch_update(updates)
-            return success
-        except Exception as e:
-            logger.error(f"batch_set_states failed: {e}")
-            return False
-
-
     async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         """Atomically evaluate batch of alerts with pipeline execution."""
         if self.degraded:
@@ -2877,7 +2794,7 @@ class RedisLock:
         
             if result:
                 # Lock successfully released
-                logger.info(f"🔓 Lock released: {self.lock_key.replace('lock:', '')}")
+                logger.info(f"🔏 Lock released: {self.lock_key.replace('lock:', '')}")
                 self.acquired_by_me = False
                 self.token = None
             else:
@@ -4129,7 +4046,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
             logger_pair.debug(
-                f"✅ {pair_name} | "
+                f"😒 {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
@@ -4288,7 +4205,7 @@ async def run_once() -> bool:
     
     reference_time = get_trigger_timestamp()
     logger_run.info(
-        f"🚀 Run started | Correlation ID: {correlation_id} | "
+        f"🎯 Run started | Correlation ID: {correlation_id} | "
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
 
@@ -4600,7 +4517,7 @@ async def run_once() -> bool:
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
-                logger_run.debug("🔓 Redis lock released")
+                logger_run.debug("🔏 Redis lock released")
             except asyncio.TimeoutError:
                 logger_run.error("Timeout releasing lock")
             except Exception as e:
@@ -4710,13 +4627,14 @@ if __name__ == "__main__":
             logger.info("🧹 Shutting down persistent connections...")
             try:
                 await RedisStateStore.shutdown_global_pool()
-                logger.debug("✅ Redis pool closed")
+                logger.debug("🌈 Redis pool closed")
             except Exception as e:
                 logger.error(f"Error closing Redis pool: {e}")
 
+
             try:
                 await SessionManager.close_session()
-                logger.debug("✅ HTTP session closed")
+                logger.debug("⏰ HTTP session closed")
             except Exception as e:
                 logger.error(f"Error closing HTTP session: {e}")
 
