@@ -1883,6 +1883,25 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     return products_map
 
 class RedisStateStore:
+    """
+    Redis-backed state store for alert deduplication and persistence.
+    
+    FIXED: Removed async context manager (__aenter__/__aexit__) to prevent
+    premature connection closure during concurrent task execution.
+    
+    Use pattern:
+        sdb = RedisStateStore(cfg.REDIS_URL)
+        await sdb.connect()
+        try:
+            # ... use sdb across multiple concurrent tasks
+        finally:
+            await sdb.close()
+    
+    NOT like this (BROKEN):
+        async with RedisStateStore(cfg.REDIS_URL) as sdb:  # ← DON'T DO THIS
+            # ... context manager exits early, closes Redis
+    """
+
     DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
     local ttl = tonumber(ARGV[1])
@@ -1930,6 +1949,7 @@ class RedisStateStore:
             )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
+        """Attempt to connect to Redis with retry logic."""
         try:
             self._redis = redis.from_url(
                 self.redis_url,
@@ -1982,7 +2002,13 @@ class RedisStateStore:
                 self._redis = None
             return False
 
-    async def connect(self, timeout: float = 5.0) -> None:        
+    async def connect(self, timeout: float = 5.0) -> None:
+        """
+        Connect to Redis with connection pooling and health checks.
+        
+        FIXED: Removed async context manager to allow connection to persist
+        across concurrent task execution.
+        """
         pool_reused = False
 
         async with RedisStateStore._pool_lock:
@@ -2024,6 +2050,7 @@ class RedisStateStore:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
                         RedisStateStore._pool_healthy[self.redis_url] = False
                         pool_reused = False
+        
         if pool_reused:
             return
 
@@ -2045,7 +2072,7 @@ class RedisStateStore:
                     self._redis = None
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
-                delay = cfg.REDIS_RETRY_DELAY * attempt  # or exponential backoff
+                delay = cfg.REDIS_RETRY_DELAY * attempt
                 logger.warning(f"Retrying Redis connection in {delay}s...")
                 await asyncio.sleep(delay)
 
@@ -2053,7 +2080,10 @@ class RedisStateStore:
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
         if self._redis:
-            await self._redis.close()
+            try:
+                await self._redis.aclose()
+            except Exception:
+                pass
         self._redis = None
 
         logger.warning("""
@@ -2067,11 +2097,12 @@ class RedisStateStore:
             raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
+        """Close Redis connection (called manually in finally block)."""
         self._redis = None
 
     @classmethod
     async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
-        
+        """Shutdown global connection pool(s)."""
         async with cls._pool_lock:
             urls = [redis_url] if redis_url else list(cls._global_pools.keys())
             for url in urls:
@@ -2092,19 +2123,14 @@ class RedisStateStore:
                 cls._pool_healthy.pop(url, None)
                 cls._pool_created_at.pop(url, None)
                 cls._pool_reuse_count.pop(url, None)
-
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()
-        
+            
     async def _ping_with_retry(self, timeout: float) -> bool:
+        """Ping Redis to verify connectivity."""
         result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
         return bool(result)
 
-    async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):     
+    async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):
+        """Execute Redis operation with timeout and error handling."""
         if not self._redis:
             return None
         try:
@@ -2119,6 +2145,7 @@ class RedisStateStore:
             return None
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+        """Get state from Redis."""
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.state_prefix}{key}"),
             timeout,
@@ -2127,6 +2154,7 @@ class RedisStateStore:
         )
 
     async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
+        """Set state in Redis."""
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
@@ -2141,6 +2169,7 @@ class RedisStateStore:
         )
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
+        """Get metadata from Redis."""
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.meta_prefix}{key}"),
             timeout,
@@ -2149,6 +2178,7 @@ class RedisStateStore:
         )
 
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
+        """Set metadata in Redis."""
         await self._safe_redis_op(
             lambda: self._redis.set(
                 f"{self.meta_prefix}{key}",
@@ -2159,8 +2189,8 @@ class RedisStateStore:
             f"set_metadata {key}",
         )
 
-
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
+        """Check if alert was recently sent (deduplication)."""
         if self.degraded:
             return True
 
@@ -2186,7 +2216,8 @@ class RedisStateStore:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
 
-    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:    
+    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
+        """Batch check multiple alerts for deduplication."""
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2218,6 +2249,7 @@ class RedisStateStore:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
     async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any]]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Get current alert states and set new ones atomically."""
         if not self._redis or self.degraded:
             return {}
 
@@ -2262,7 +2294,8 @@ class RedisStateStore:
             logger.error(f"Redis pipeline failed: {e}")
             return {}
 
-    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:     
+    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """Atomically evaluate batch of alerts with pipeline execution."""
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
@@ -2301,6 +2334,7 @@ class RedisStateStore:
             return prev_states, dedup_results
 
     async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """Execute Redis pipeline operations (Fixed per Issue #5)."""
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
@@ -2333,6 +2367,7 @@ class RedisStateStore:
                     composite_key = f"{pair_name}:{alert_key}"
                     dedup_keys_ordered.append((recent_key, composite_key))
                     pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                
                 results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
             num_updates = len(state_updates)
@@ -2343,13 +2378,15 @@ class RedisStateStore:
         
             mget_results = results[0] if results else []
 
+            # FIXED per Issue #5: Proper exception handling (indentation & consolidation)
             prev_states: Dict[str, bool] = {}
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
+                
                 if val is None:
                     prev_states[key] = False
                     continue
-    
+                
                 try:
                     parsed_state = json_loads(val)
                     prev_states[key] = parsed_state.get("state") == "ACTIVE"
@@ -2375,9 +2412,10 @@ class RedisStateStore:
             return {k: False for k in alert_keys}, {}
         except Exception as e:
             logger.error(f"Pipeline operation failed: {e}")
-            return {k: False for k in alert_keys}, {}    
+            return {k: False for k in alert_keys}, {}
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+        """Atomically update multiple state entries."""
         if self.degraded or not self._redis:
             return False
 
@@ -2417,6 +2455,8 @@ class RedisStateStore:
             return False
 
 class RedisLock:
+    # Lua script for atomic lock release
+    # Prevents releasing a lock we don't own
     RELEASE_LUA = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
         return redis.call("DEL", KEYS[1])
@@ -2424,68 +2464,124 @@ class RedisLock:
         return 0
     end
     """
-    def __init__(
-        self,
-        redis_client: Optional[redis.Redis],
-        lock_key: str,
-        expire: int | None = None,
-    ):
+
+    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
+        
         self.redis = redis_client
         self.lock_key = f"lock:{lock_key}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
+        
+        # Token: unique identifier for this lock holder
         self.token: Optional[str] = None
+        
+        # lost: True if lock was stolen or expired
         self.lost = False
+        
+        # acquired_by_me: True if we currently hold the lock
         self.acquired_by_me = False
+        
+        # last_extend_time: Unix timestamp of last successful extend
         self.last_extend_time = 0.0
 
     async def acquire(self, timeout: float = 5.0) -> bool:
+        
         if not self.redis:
             logger.warning("Redis not available; cannot acquire lock")
             return False
+        
         try:
+            # Generate unique token for this lock holder
             token = str(uuid.uuid4())
+            
+            # Attempt atomic SET with NX (only if not exists) and EX (expire)
             ok = await asyncio.wait_for(
                 self.redis.set(self.lock_key, token, nx=True, ex=self.expire),
                 timeout=timeout,
             )
+            
             if ok:
+                # Lock acquired successfully
                 self.token = token
                 self.acquired_by_me = True
+                self.lost = False
                 self.last_extend_time = time.time()
-                logger.info(f"🔒 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)")
+                
+                logger.info(
+                    f"🔐 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)"
+                )
                 return True
 
+            # Another instance holds the lock
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
+            return False
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout acquiring lock {self.lock_key} after {timeout}s")
             return False
         except Exception as e:
             logger.error(f"Redis lock acquisition failed: {e}")
             return False
 
     async def extend(self, timeout: float = 3.0) -> bool:
+        
         if not self.token or not self.redis or not self.acquired_by_me:
+            # We don't own the lock
             self.lost = True
             return False
+        
         try:
-            raw_val = await asyncio.wait_for(self.redis.get(self.lock_key), timeout=timeout)
+            # Verify we still own the lock (token still matches)
+            raw_val = await asyncio.wait_for(
+                self.redis.get(self.lock_key),
+                timeout=timeout,
+            )
+            
             if raw_val is None:
+                # Key disappeared - lock expired or was deleted
                 logger.warning("Lock lost during extend (key missing)")
                 self.lost = True
                 self.acquired_by_me = False
                 return False
 
-            current_token = str(raw_val)
+            # Convert bytes to string for comparison
+            current_token = str(raw_val) if isinstance(raw_val, bytes) else str(raw_val)
+            
             if current_token != self.token:
-                logger.warning("Lock token mismatch on extend")
+                # Token mismatch - lock was stolen by another instance
+                logger.warning(
+                    f"Lock token mismatch on extend | "
+                    f"Expected: {self.token[:8]}... | "
+                    f"Got: {current_token[:8]}... | "
+                    f"Key: {self.lock_key}"
+                )
                 self.lost = True
                 self.acquired_by_me = False
                 return False
 
-            await asyncio.wait_for(
-                self.redis.expire(self.lock_key, self.expire), timeout=timeout
+            # Reset TTL on the lock key (preserves value, extends expiry)
+            expire_ok = await asyncio.wait_for(
+                self.redis.expire(self.lock_key, self.expire),
+                timeout=timeout,
             )
-            self.last_extend_time = time.time()
-            logger.debug(f"Extended Redis lock: {self.lock_key}")
-            return True
+            
+            if expire_ok:
+                # Extension successful
+                self.last_extend_time = time.time()
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"Extended Redis lock: {self.lock_key} (now {self.expire}s)")
+                return True
+            else:
+                # Key disappeared between GET and EXPIRE
+                logger.warning("Lock key disappeared during extend")
+                self.lost = True
+                self.acquired_by_me = False
+                return False
+                
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout extending lock {self.lock_key} after {timeout}s")
+            self.lost = True
+            self.acquired_by_me = False
+            return False
         except Exception as e:
             logger.error(f"Error extending Redis lock: {e}")
             self.lost = True
@@ -2494,42 +2590,98 @@ class RedisLock:
 
     @classmethod
     def get_lock_extend_interval(cls) -> int:
+        
         extend_at = int(Constants.REDIS_LOCK_EXPIRY * 0.7)
         return max(60, min(extend_at, 540))
 
     def should_extend(self) -> bool:
+        
         if not self.acquired_by_me or self.lost:
             return False
 
-        extend_threshold = self.__class__.get_lock_extend_interval()   
+        # Get recommended extension interval (e.g., 540s)
+        extend_threshold = self.__class__.get_lock_extend_interval()
+        
+        # Calculate elapsed time since last extension
         elapsed = max(0, time.time() - self.last_extend_time)
-        return elapsed >= extend_threshold
+        
+        # Should extend if threshold elapsed
+        should_extend = elapsed >= extend_threshold
+        
+        if cfg.DEBUG_MODE and should_extend:
+            logger.debug(
+                f"Lock extension eligible | "
+                f"Elapsed: {elapsed:.0f}s | "
+                f"Threshold: {extend_threshold}s"
+            )
+        
+        return should_extend
 
     async def release(self, timeout: float = 3.0) -> None:
+        
         if not self.token or not self.redis or not self.acquired_by_me:
+            # We don't own the lock or Redis unavailable
             return
     
         try:
+            # Use Lua script for atomic check-and-delete
+            # Returns 1 if deleted, 0 if token didn't match
             result = await asyncio.wait_for(
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
                 timeout=timeout,
             )
         
             if result:
+                # Lock successfully released
                 logger.info(f"🔓 Lock released: {self.lock_key.replace('lock:', '')}")
                 self.acquired_by_me = False
                 self.token = None
             else:
-                logger.warning(f"Lock release failed (token mismatch): {self.lock_key}")
+                # Token didn't match - we don't own this lock anymore
+                logger.warning(
+                    f"Lock release failed (token mismatch): {self.lock_key} | "
+                    f"Lock was stolen or lost"
+                )
                 self.lost = True
                 self.acquired_by_me = False
     
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout releasing lock {self.lock_key} after {timeout}s")
+            self.lost = True
+            self.acquired_by_me = False
         except Exception as e:
             logger.error(f"Error releasing Redis lock: {e}")
             self.lost = True
             self.acquired_by_me = False
     
-        self.token = None
+        finally:
+            # Always clear token
+            self.token = None
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get current lock status for debugging/monitoring.
+        
+        Returns:
+            Dictionary with lock state information
+        """
+        return {
+            "lock_key": self.lock_key,
+            "acquired_by_me": self.acquired_by_me,
+            "lost": self.lost,
+            "has_token": self.token is not None,
+            "token_prefix": self.token[:8] + "..." if self.token else None,
+            "last_extend_time": self.last_extend_time,
+            "time_since_extend": time.time() - self.last_extend_time if self.last_extend_time else None,
+            "expire_seconds": self.expire,
+            "redis_available": self.redis is not None,
+        }
+
+    def __repr__(self) -> str:
+        """String representation for logging."""
+        status = "HELD" if self.acquired_by_me else ("LOST" if self.lost else "RELEASED")
+        token_display = self.token[:8] + "..." if self.token else "None"
+        return f"RedisLock({self.lock_key}:{status}:{token_display})"
 
 class TokenBucket:
     def __init__(self, rate: int, burst: int):
@@ -3866,8 +4018,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
-    
-    
 
     async def guarded_eval(task_data):
         p_name, candles = task_data
@@ -3901,7 +4051,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     return valid_results
 
-async def run_once() -> bool:   
+async def run_once() -> bool:
     MAX_ALERTS_PER_RUN = 50
     all_results: List[Tuple[str, Dict[str, Any]]] = []
     correlation_id = uuid.uuid4().hex[:8]
@@ -3909,11 +4059,13 @@ async def run_once() -> bool:
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     
+    # Initialize resource references
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     fetcher: Optional[DataFetcher] = None
     telegram_queue: Optional[TelegramQueue] = None
     lock_acquired = False
+    lock_extension_task: Optional[asyncio.Task] = None
     alerts_sent = 0
     
     products_map: Optional[Dict[str, dict]] = None
@@ -3926,7 +4078,10 @@ async def run_once() -> bool:
     )
 
     try:
-        # ===== STEP 1: Load/Cache Products =====
+        # =====================================================================
+        # STEP 1: MEMORY CHECK & CONFIGURATION VALIDATION
+        # =====================================================================
+        
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
@@ -3938,6 +4093,10 @@ async def run_once() -> bool:
             )
             return False
 
+        # =====================================================================
+        # STEP 2: LOAD/CACHE PRODUCTS
+        # =====================================================================
+        
         USE_STATIC_MAP = True
         STATIC_MAP_REFRESH_DAYS = 7
         now = time.time()
@@ -3977,7 +4136,7 @@ async def run_once() -> bool:
             prod_resp = PRODUCTS_CACHE["data"]
             products_map = build_products_map_from_api_result(prod_resp)
 
-        # Validate products_map (CRITICAL: must exist at this point)
+        # Validate products_map (CRITICAL)
         if products_map is None:
             logger_run.error("❌ Products map is None after initialization")
             return False
@@ -3992,7 +4151,10 @@ async def run_once() -> bool:
             logger_run.error("❌ No valid pairs to process - aborting run")
             return False
 
-        # ===== STEP 2: Connect to Redis =====
+        # =====================================================================
+        # STEP 3: CONNECT TO REDIS (FIXED: Manual connect/close, not context manager)
+        # =====================================================================
+        
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
@@ -4009,12 +4171,18 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
-        # ===== STEP 3: Create HTTP Fetcher and Telegram Queue =====
+        # =====================================================================
+        # STEP 4: CREATE HTTP FETCHER & TELEGRAM QUEUE
+        # =====================================================================
+        
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
-        # ===== STEP 4: Acquire Redis Lock =====
+        # =====================================================================
+        # STEP 5: ACQUIRE REDIS LOCK
+        # =====================================================================
+        
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
 
@@ -4024,7 +4192,41 @@ async def run_once() -> bool:
             )
             return False
 
-        # ===== STEP 5: Send Test Message =====
+        # =====================================================================
+        # STEP 6: CREATE LOCK EXTENSION TASK (FIXED per Issue #3)
+        # =====================================================================
+        
+        async def extend_lock_periodically(lock_obj: RedisLock, interval: int = 300):
+            """
+            Extend Redis lock every N seconds to keep it alive during long runs.
+            
+            Redis lock expires after REDIS_LOCK_EXPIRY (~900s). If run takes longer,
+            another instance could acquire the lock. This task prevents that.
+            """
+            while not shutdown_event.is_set():
+                try:
+                    await asyncio.sleep(interval)
+                    
+                    if lock_obj.should_extend():
+                        success = await lock_obj.extend(timeout=3.0)
+                        if success:
+                            logger_run.debug("✅ Lock extended successfully")
+                        else:
+                            logger_run.warning("❌ Failed to extend lock - may lose it soon")
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger_run.error(f"Lock extension error: {e}")
+
+        # Launch lock extension task at 5-minute intervals
+        lock_extension_task = asyncio.create_task(
+            extend_lock_periodically(lock, interval=300)
+        )
+
+        # =====================================================================
+        # STEP 7: SEND TEST MESSAGE
+        # =====================================================================
+        
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -4037,9 +4239,12 @@ async def run_once() -> bool:
             f"🔔 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
-        # ===== STEP 6: Process Pairs with GC Control =====
+        # =====================================================================
+        # STEP 8: PROCESS PAIRS WITH GARBAGE COLLECTION CONTROL
+        # =====================================================================
+        
         logger_run.info("Starting evaluation phase...")
-        logger_run.debug("GC disabled during evaluation loop...")
+        logger_run.debug("Garbage collection disabled during evaluation loop...")
         
         async with gc_control():
             all_results = await process_pairs_with_workers(
@@ -4048,9 +4253,12 @@ async def run_once() -> bool:
                 lock, reference_time
             )
 
-        logger_run.debug("Cleanup phase with normal GC...")
+        logger_run.debug("Cleanup phase with normal garbage collection...")
 
-        # ===== STEP 7: Aggregate Alert Results =====
+        # =====================================================================
+        # STEP 9: AGGREGATE ALERT RESULTS
+        # =====================================================================
+        
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 extra_alerts = state.get("summary", {}).get("alerts", 0)
@@ -4083,7 +4291,10 @@ async def run_once() -> bool:
                 )
             )
 
-        # ===== STEP 8: Log Statistics =====
+        # =====================================================================
+        # STEP 10: LOG STATISTICS
+        # =====================================================================
+        
         if fetcher is None:
             logger_run.error("❌ Fetcher is None - cannot get stats")
             return False
@@ -4154,28 +4365,69 @@ async def run_once() -> bool:
         return False
 
     finally:
+        # =====================================================================
+        # CLEANUP PHASE: RESOURCE CLEANUP IN CORRECT ORDER
+        # =====================================================================
+        
         logger_run.debug("🧹 Starting resource cleanup...")
 
-        # ===== Clean Up Lock =====
+        # 1. Cancel lock extension task FIRST (before releasing lock)
+        if lock_extension_task:
+            try:
+                lock_extension_task.cancel()
+                await asyncio.wait_for(lock_extension_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger_run.error(f"Error cancelling lock extension task: {e}")
+
+        # 2. Release Redis lock
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
                 logger_run.debug("🔓 Redis lock released")
+            except asyncio.TimeoutError:
+                logger_run.error("Timeout releasing lock")
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
-        # ===== Clean Up Redis Connection =====
+        # 3. Close Redis connection (FIXED: manual close, not context manager exit)
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
                 logger_run.debug("✅ Redis connection closed")
+            except asyncio.TimeoutError:
+                logger_run.error("Timeout closing Redis")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
 
-        # Force garbage collection after Redis
+        # 4. Shutdown global Redis pool
+        try:
+            await asyncio.wait_for(
+                RedisStateStore.shutdown_global_pool(),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger_run.error("Timeout shutting down Redis pool")
+        except Exception as e:
+            logger_run.error(f"Error shutting down Redis pool: {e}")
+
+        # 5. Force garbage collection after Redis (frees memory)
         gc.collect()
 
-        # ===== Clean Up Context Variables =====
+        # 6. Close HTTP session
+        try:
+            await asyncio.wait_for(
+                SessionManager.close_session(),
+                timeout=5.0
+            )
+            logger_run.debug("✅ HTTP session closed")
+        except asyncio.TimeoutError:
+            logger_run.error("Timeout closing HTTP session")
+        except Exception as e:
+            logger_run.error(f"Error closing HTTP session: {e}", exc_info=False)
+
+        # 7. Clear context variables
         try:
             TRACE_ID.set("")
             PAIR_ID.set("")
