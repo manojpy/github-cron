@@ -218,38 +218,79 @@ class BotConfig(BaseModel):
 
     @model_validator(mode='after')
     def validate_logic(self) -> 'BotConfig':
+        
+        errors = []
+        warnings = []
+
+        # CRITICAL ERRORS (always fail)
         if self.PPO_FAST >= self.PPO_SLOW:
-            raise ValueError('PPO_FAST must be less than PPO_SLOW')
+            errors.append('PPO_FAST must be less than PPO_SLOW')
 
         if self.RUN_TIMEOUT_SECONDS < self.MIN_RUN_TIMEOUT:
-            raise ValueError(
-                f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s) must be >= MIN_RUN_TIMEOUT ({self.MIN_RUN_TIMEOUT}s)'
+            errors.append(
+                f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s) must be >= '
+                f'MIN_RUN_TIMEOUT ({self.MIN_RUN_TIMEOUT}s)'
             )
 
         if self.RUN_TIMEOUT_SECONDS >= Constants.REDIS_LOCK_EXPIRY:
-            raise ValueError(
-                f'REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s) must be > RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s)'
+            errors.append(
+                f'REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s) must be > '
+                f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s)'
             )
 
         if self.TELEGRAM_RATE_LIMIT_PER_MINUTE < 10 or self.TELEGRAM_RATE_LIMIT_PER_MINUTE > 30:
-            raise ValueError('TELEGRAM_RATE_LIMIT_PER_MINUTE must be 10-30')
+            errors.append('TELEGRAM_RATE_LIMIT_PER_MINUTE must be 10-30')
 
         if self.ENABLE_PIVOT and self.PIVOT_MAX_DISTANCE_PCT < 1.0:
-            raise ValueError('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
+            errors.append('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
 
-        if self.MAX_ALERTS_PER_PAIR > 15:
-            logger.warning(f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam')
-
+        # PARAMETER RANGE VALIDATION
         ranges = {
             'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
             'RMA_200_PERIOD': (self.RMA_200_PERIOD, 100, 300),
             'SRSI_RSI_LEN': (self.SRSI_RSI_LEN, 5, 50),
-            'SRSI_KALMAN_LEN': (self.SRSI_KALMAN_LEN, 2, 20)
+            'SRSI_KALMAN_LEN': (self.SRSI_KALMAN_LEN, 2, 20),
         }
+        
         for name, (val, min_v, max_v) in ranges.items():
             if not (min_v <= val <= max_v):
-                raise ValueError(f'{name} must be {min_v}-{max_v}')
-     
+                errors.append(f'{name} must be {min_v}-{max_v}, got {val}')
+
+        # WARNINGS (don't fail, but will be logged later)
+        if self.MAX_ALERTS_PER_PAIR > 15:
+            warnings.append(
+                f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam'
+            )
+
+        if self.MAX_PARALLEL_FETCH < 1 or self.MAX_PARALLEL_FETCH > 20:
+            warnings.append(
+                f'MAX_PARALLEL_FETCH={self.MAX_PARALLEL_FETCH} is outside recommended range (1-20)'
+            )
+
+        if self.HTTP_TIMEOUT < 5 or self.HTTP_TIMEOUT > 60:
+            warnings.append(
+                f'HTTP_TIMEOUT={self.HTTP_TIMEOUT}s is outside recommended range (5-60s)'
+            )
+
+        if len(self.PAIRS) > 20:
+            warnings.append(
+                f'Large number of pairs ({len(self.PAIRS)}) may exceed timeout limits'
+            )
+
+        if self.MEMORY_LIMIT_BYTES < 200_000_000:
+            warnings.append(
+                f'MEMORY_LIMIT_BYTES={self.MEMORY_LIMIT_BYTES} is very low '
+                f'(minimum recommended: 200MB)'
+            )
+
+        # FAIL ON ERRORS
+        if errors:
+            error_msg = 'Configuration validation failed:\n  ' + '\n  '.join(errors)
+            raise ValueError(error_msg)
+
+        # Store warnings for later logging
+        self._validation_warnings = warnings
+
         return self
 
 def load_config() -> BotConfig:
@@ -490,6 +531,9 @@ def validate_runtime_config() -> None:
     
     errors = []
     warnings = []
+    # ===== Log warnings from BotConfig validation =====
+    if hasattr(cfg, '_validation_warnings'):
+        warnings.extend(cfg._validation_warnings)
     
     try:
         from urllib.parse import urlparse
@@ -509,18 +553,6 @@ def validate_runtime_config() -> None:
     
     if not cfg.PAIRS or len(cfg.PAIRS) == 0:
         errors.append("PAIRS list is empty - no trading pairs configured")
-    
-    if cfg.MAX_PARALLEL_FETCH < 1 or cfg.MAX_PARALLEL_FETCH > 20:
-        warnings.append(f"MAX_PARALLEL_FETCH={cfg.MAX_PARALLEL_FETCH} is outside recommended range (1-20)")
-    
-    if cfg.HTTP_TIMEOUT < 5 or cfg.HTTP_TIMEOUT > 60:
-        warnings.append(f"HTTP_TIMEOUT={cfg.HTTP_TIMEOUT}s is outside recommended range (5-60s)")
-    
-    if len(cfg.PAIRS) > 20:
-        warnings.append(f"Large number of pairs ({len(cfg.PAIRS)}) may exceed timeout limits")
-    
-    if cfg.MEMORY_LIMIT_BYTES < 200_000_000:
-        warnings.append(f"MEMORY_LIMIT_BYTES={cfg.MEMORY_LIMIT_BYTES} is very low (minimum recommended: 200MB)")
     
     if errors:
         logger.critical("Configuration validation FAILED:")
@@ -4640,12 +4672,16 @@ if __name__ == "__main__":
     else:
         logger.info("✅ Verified: AOT artifacts loaded successfully")
 
-    parser = argparse.ArgumentParser(prog="macd_unified", description="Unified MACD/alerts runner with NumPy optimization")
+    parser = argparse.ArgumentParser(
+        prog="macd_unified",
+        description="Unified MACD/alerts runner with NumPy optimization"
+    )
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--validate-only", action="store_true", help="Validate config and exit")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     args = parser.parse_args()
 
+    # Set debug level BEFORE validation
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
