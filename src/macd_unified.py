@@ -238,6 +238,7 @@ class BotConfig(BaseModel):
             raise ValueError('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
 
         if self.MAX_ALERTS_PER_PAIR > 15:
+            logger.warning(f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam')
 
         ranges = {
             'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
