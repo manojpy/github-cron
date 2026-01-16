@@ -1650,7 +1650,7 @@ class DataFetcher:
                 output[symbol][resolution] = result
                 if result: 
                     success_count += 1
-        logger.info(f"📏📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
+        logger.info(f"📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
@@ -4432,10 +4432,14 @@ async def run_once() -> bool:
             return False
 
         fetcher_stats = fetcher.get_stats()
+
         prod_str = "cached" if PRODUCTS_CACHE.get("fetched_at") else f"{fetcher_stats['products']['success']}✅"
+
+        total_required = fetcher_stats['candles']['success'] + fetcher_stats['candles']['failed']
+
         logger_run.info(
             f"Products: {prod_str} | "
-            f"Candles: {fetcher_stats['candles']['success']}✅/{fetcher_stats['candles']['failed']}❌"
+            f"💡Candles: {fetcher_stats['candles']['success']}/{total_required}"
         )
 
         if "rate_limiter" in fetcher_stats:
