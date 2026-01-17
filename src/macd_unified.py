@@ -3439,11 +3439,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         vwap_curr = None
         vwap_prev = None
 
-        if cfg.ENABLE_VWAP and vwap is not None and len(vwap) > i15:
+        if vwap_enabled and vwap is not None and len(vwap) > i15:
             try:
                 vwap_curr = vwap[i15]
                 vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
-                
+
                 # Validate data quality
                 if not (np.isnan(vwap_curr) or np.isnan(vwap_prev) or vwap_curr <= 0 or vwap_prev <= 0):
                     vwap_available = True
@@ -3457,13 +3457,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 vwap_curr = None
                 vwap_prev = None
         else:
-            if cfg.ENABLE_VWAP:
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"VWAP unavailable: enabled={cfg.ENABLE_VWAP}, "
-                        f"vwap_is_none={vwap is None}, len={len(vwap) if vwap is not None else 0}, "
-                        f"i15={i15}"
-                    )
+            if vwap_enabled and cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"VWAP unavailable: enabled={vwap_enabled}, "
+                    f"vwap_is_none={vwap is None}, len={len(vwap) if vwap is not None else 0}, "
+                    f"i15={i15}"
+                )
 
         # =====================================================================
         # PHASE 5: MMH (MAGICAL MOMENTUM HISTOGRAM) VALIDATION
@@ -4473,7 +4472,7 @@ async def run_once() -> bool:
         # =====================================================================
         
         if fetcher is None:
-            logger_run.error("❌ Fetcher is None - cannot get stats")
+            logger_run.error("�� Fetcher is None - cannot get stats")
             return False
 
         fetcher_stats = fetcher.get_stats()
