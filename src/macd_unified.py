@@ -3479,7 +3479,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
-                f"Wick (logging): buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}%"
+                f"PHASE 7: open={open_curr:.5f} high={high_curr:.5f} low={low_curr:.5f} close={close_curr:.5f}"
+            )
+            logger_pair.debug(
+                f"Wick Calc: buy_wick={actual_buy_wick_ratio*100:.2f}% sell_wick={actual_sell_wick_ratio*100:.2f}%"
             )
 
         # =====================================================================
