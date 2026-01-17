@@ -1900,7 +1900,9 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     interval_seconds = interval_minutes * 60
     current_period_start = (reference_time // interval_seconds) * interval_seconds
 
-    valid_mask = timestamps < current_period_start
+    last_closed_period_start = current_period_start - interval_seconds
+    valid_mask = (timestamps >= last_closed_period_start) & (timestamps < current_period_start)
+
     valid_indices = np.nonzero(valid_mask)[0]
     if valid_indices.size == 0:
         logger.info(
@@ -3326,7 +3328,6 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -3725,7 +3726,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             
             # Pivots (empty dict if not available)
             "pivots": piv if piv else {},
-            "pivot_suppressions": [],  # Track why pivots were skipped
+            "pivot_suppressions": [],
         }
 
         # =====================================================================
