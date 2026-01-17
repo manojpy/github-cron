@@ -714,7 +714,7 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
             ts_adjusted = ts_adjusted // 1000
         
         day_id = (ts_adjusted.astype("int64") // 86400).astype("int64")
-        vwap = vwap_daily_loop(high, low, close, volume, ts_for_vwap.astype(np.int64))
+        vwap = vwap_daily_loop(high, low, close, volume, ts_adjusted.astype(np.int64))
 
         tail_default = (
             vwap[-2] if len(vwap) > 1 and not np.isnan(vwap[-2])
@@ -4490,7 +4490,7 @@ async def run_once() -> bool:
         return False
 
     except asyncio.CancelledError:
-        logger_run.warning("🛑 Run cancelled (shutdown signal received)")
+        logger_run.warning("�� Run cancelled (shutdown signal received)")
         return False
 
     except Exception as e:
