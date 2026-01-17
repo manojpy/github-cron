@@ -292,11 +292,11 @@ def ema_loop(data, alpha_or_period):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
-    """EMA with explicit alpha parameter - O(n)"""
+    """EMA with explicit alpha parameter - with proper SMA initialization for RMA"""
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
     
-    # Find first valid index - O(n)
+    # Find first valid index
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
@@ -306,10 +306,31 @@ def ema_loop_alpha(data, alpha):
     if first_valid_idx == -1:
         return out
     
-    out[first_valid_idx] = data[first_valid_idx]
+    # Derive period from alpha (for RMA: alpha = 1/period)
+    period = int(1.0 / alpha + 0.5)
     
-    # Single pass EMA - O(n)
-    for i in range(first_valid_idx + 1, n):
+    # Initialize with SMA of first 'period' values if possible
+    if first_valid_idx + period <= n:
+        sma_sum = 0.0
+        valid_count = 0
+        for i in range(first_valid_idx, first_valid_idx + period):
+            if not np.isnan(data[i]):
+                sma_sum += data[i]
+                valid_count += 1
+        sma_init = sma_sum / valid_count if valid_count > 0 else data[first_valid_idx]
+        
+        # Fill warmup period with SMA value
+        for i in range(first_valid_idx, first_valid_idx + period):
+            out[i] = sma_init
+        
+        start_idx = first_valid_idx + period
+    else:
+        # Not enough data for full period, fallback
+        out[first_valid_idx] = data[first_valid_idx]
+        start_idx = first_valid_idx + 1
+    
+    # Apply EMA/RMA formula
+    for i in range(start_idx, n):
         curr = data[i]
         out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
     
