@@ -710,11 +710,11 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
             return np.zeros_like(close)
 
         ts_adjusted = timestamps.copy()
-        if np.any(ts_adjusted > 1_000_000_000_000):  # Millisecond range
+        if np.any(ts_adjusted > 1_000_000_000_000):
             ts_adjusted = ts_adjusted // 1000
         
         day_id = (ts_adjusted.astype("int64") // 86400).astype("int64")
-        vwap = vwap_daily_loop(high, low, close, volume, day_id)
+        vwap = vwap_daily_loop(high, low, close, volume, ts_for_vwap.astype(np.int64))
 
         tail_default = (
             vwap[-2] if len(vwap) > 1 and not np.isnan(vwap[-2])

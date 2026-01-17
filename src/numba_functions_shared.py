@@ -315,7 +315,6 @@ def ema_loop_alpha(data, alpha):
     
     return out
 
-
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
     """Range filter - with proper initialization"""
@@ -451,44 +450,34 @@ def kalman_loop(src, length, R, Q):
     return result
 
 @njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
-def vwap_daily_loop(high, low, close, volume, day_id):
-    """Calculate VWAP in O(n) - single pass with daily reset"""
+def vwap_daily_loop(high, low, close, volume, timestamps):
+    
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
-
-    cum_vol = 0.0
     cum_pv = 0.0
-    prev_day = -1
-    last_valid_vwap = np.nan
-
-    # Single pass - O(n)
+    cum_vol = 0.0
+    last_day = -1
+    
+    # 86400 seconds in a day. 
+    # Using floor division on timestamps gives the UTC day index.
     for i in range(n):
-        day = day_id[i]
-        if day != prev_day:
-            prev_day = day
-            cum_vol = 0.0
+        current_day = timestamps[i] // 86400
+        
+        # Reset at the start of a new UTC day
+        if current_day != last_day:
             cum_pv = 0.0
-            last_valid_vwap = np.nan
-
-        h = high[i]
-        l = low[i]
-        c = close[i]
-        v = volume[i]
-
-        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0.0:
-            vwap[i] = vwap[i-1] if i > 0 and not np.isnan(vwap[i-1]) else c
-            continue
-
-        typical = (h + l + c) / 3.0
-        cum_vol += v
-        cum_pv += typical * v
-
-        if cum_vol > 0.0:
-            last_valid_vwap = cum_pv / cum_vol
-            vwap[i] = last_valid_vwap
+            cum_vol = 0.0
+            last_day = current_day
+            
+        typical_price = (high[i] + low[i] + close[i]) / 3.0
+        cum_pv += typical_price * volume[i]
+        cum_vol += volume[i]
+        
+        if cum_vol > 0:
+            vwap[i] = cum_pv / cum_vol
         else:
-            vwap[i] = last_valid_vwap if not np.isnan(last_valid_vwap) else c
-
+            vwap[i] = typical_price
+            
     return vwap
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
@@ -616,7 +605,7 @@ def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio):
     
     for i in range(n):
         candle_range = high_p[i] - low_p[i]
-        if candle_range <= 0:
+        if candle_range <= 1e-9:
             continue
             
         # The body top is the higher of Open or Close
@@ -646,7 +635,7 @@ def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio):
     
     for i in range(n):
         candle_range = high_p[i] - low_p[i]
-        if candle_range <= 0:
+        if candle_range <= 1e-9:
             continue
             
         # The body bottom is the lower of Open or Close
