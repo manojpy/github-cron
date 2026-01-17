@@ -637,7 +637,7 @@ def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: i
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
 
 def escape_markdown_v2(text: str) -> str:
-    return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
+    return _ESCAPE_RE.sub(r'\\\g<0>', str(text))
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -1772,7 +1772,17 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
         staleness = current_time - last_candle_time
 
         MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
-        
+
+        interval_minutes = 15  # or pass dynamically if needed
+        interval_seconds = interval_minutes * 60
+        current_period_start = (current_time // interval_seconds) * interval_seconds
+
+        if last_candle_time >= current_period_start:
+            return False, (
+                f"Last candle is still forming! ts={format_ist_time(last_candle_time)} "
+                f"current_period_start={format_ist_time(current_period_start)}"
+            )
+
         if staleness > MAX_STALENESS:
             return False, (
                 f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
@@ -3495,43 +3505,26 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # =====================================================================
  
         candle_range = high_curr - low_curr
-
         if candle_range <= 1e-9:
             actual_buy_wick_ratio = 1.0
             actual_sell_wick_ratio = 1.0
         else:
-            # For BUY: body top is MAX(open, close)
             body_top = open_curr if open_curr > close_curr else close_curr
             upper_wick = high_curr - body_top
-    
-            # Match numba validation: reject if negative
-            if upper_wick < 0:
-                actual_buy_wick_ratio = 1.0  # Mark as failed
-            else:
-                actual_buy_wick_ratio = upper_wick / candle_range
-    
-            # For SELL: body bottom is MIN(open, close)
+            actual_buy_wick_ratio = upper_wick / candle_range if upper_wick >= 0 else 1.0
+
             body_bottom = open_curr if open_curr < close_curr else close_curr
             lower_wick = body_bottom - low_curr
-    
-            # Match numba validation: reject if negative
-            if lower_wick < 0:
-                actual_sell_wick_ratio = 1.0  # Mark as failed
-            else:
-                actual_sell_wick_ratio = lower_wick / candle_range
+            actual_sell_wick_ratio = lower_wick / candle_range if lower_wick >= 0 else 1.0
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
-                f"PHASE 7 [15M]: open={open_curr:.5f} high={high_curr:.5f} low={low_curr:.5f} close={close_curr:.5f}"
+                f"PHASE 7 [15M]: O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f}"
             )
             logger_pair.debug(
                 f"Wick (15M): Buy={actual_buy_wick_ratio*100:.2f}% Sell={actual_sell_wick_ratio*100:.2f}% "
                 f"(threshold={Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
-            if actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
-                logger_pair.debug(f"BUY WICK REJECTED: {actual_buy_wick_ratio*100:.2f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%")
-            if actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
-                logger_pair.debug(f"SELL WICK REJECTED: {actual_sell_wick_ratio*100:.2f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%")
 
         # =====================================================================
         # PHASE 8: CANDLE TIMESTAMP VALIDATION
@@ -3618,6 +3611,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
 
+
         buy_candle_reason = None
         sell_candle_reason = None
 
@@ -3635,8 +3629,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # PHASE 12: COMMON ALERT CONDITIONS (BUY & SELL SETUP)
         # =====================================================================
         
-        buy_common = base_buy_trend and buy_candle_passed and is_green
-        sell_common = base_sell_trend and sell_candle_passed and is_red
+        buy_common = base_buy_trend and buy_candle_passed
+        sell_common = base_sell_trend and sell_candle_passed
 
         # =====================================================================
         # PHASE 13: MMH REVERSALS (Requires Valid Data)
@@ -3878,6 +3872,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.debug(
                         f"✅ Alert FIRED: {alert_key} | "
                         f"buy_common={buy_common} sell_common={sell_common} | "
+                        f"buy_passed={buy_candle_passed} sell_passed={sell_candle_passed} | "
                         f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
                         f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                     )
