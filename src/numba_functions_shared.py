@@ -451,32 +451,31 @@ def kalman_loop(src, length, R, Q):
 
 @njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop(high, low, close, volume, timestamps):
-    
     n = len(close)
     vwap = np.empty(n, dtype=np.float64)
     cum_pv = 0.0
     cum_vol = 0.0
     last_day = -1
     
-    # 86400 seconds in a day. 
-    # Using floor division on timestamps gives the UTC day index.
     for i in range(n):
         current_day = timestamps[i] // 86400
         
-        # Reset at the start of a new UTC day
         if current_day != last_day:
             cum_pv = 0.0
             cum_vol = 0.0
             last_day = current_day
-            
-        typical_price = (high[i] + low[i] + close[i]) / 3.0
-        cum_pv += typical_price * volume[i]
-        cum_vol += volume[i]
         
-        if cum_vol > 0:
-            vwap[i] = cum_pv / cum_vol
-        else:
-            vwap[i] = typical_price
+        # ✅ ADD THESE CHECKS
+        h, l, c, v = high[i], low[i], close[i], volume[i]
+        if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
+            vwap[i] = np.nan
+            continue
+        
+        typical_price = (h + l + c) / 3.0
+        cum_pv += typical_price * v
+        cum_vol += v
+        
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0 else np.nan
             
     return vwap
 
