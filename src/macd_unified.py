@@ -3460,30 +3460,45 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # =====================================================================
         # PHASE 7: CANDLE QUALITY CHECKS (Wick Ratio)
         # =====================================================================
-        
+ 
         candle_range = high_curr - low_curr
 
-        if candle_range < 1e-8:
+        if candle_range <= 1e-9:
             actual_buy_wick_ratio = 1.0
             actual_sell_wick_ratio = 1.0
         else:
-            # For BUY: body top is MAX(open, close) - the higher of the two
+            # For BUY: body top is MAX(open, close)
             body_top = open_curr if open_curr > close_curr else close_curr
             upper_wick = high_curr - body_top
-            actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
     
-            # For SELL: body bottom is MIN(open, close) - the lower of the two
+            # Match numba validation: reject if negative
+            if upper_wick < 0:
+                actual_buy_wick_ratio = 1.0  # Mark as failed
+            else:
+                actual_buy_wick_ratio = upper_wick / candle_range
+    
+            # For SELL: body bottom is MIN(open, close)
             body_bottom = open_curr if open_curr < close_curr else close_curr
             lower_wick = body_bottom - low_curr
-            actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
+    
+            # Match numba validation: reject if negative
+            if lower_wick < 0:
+                actual_sell_wick_ratio = 1.0  # Mark as failed
+            else:
+                actual_sell_wick_ratio = lower_wick / candle_range
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
-                f"PHASE 7: open={open_curr:.5f} high={high_curr:.5f} low={low_curr:.5f} close={close_curr:.5f}"
+                f"PHASE 7 [15M]: open={open_curr:.5f} high={high_curr:.5f} low={low_curr:.5f} close={close_curr:.5f}"
             )
             logger_pair.debug(
-                f"Wick Calc: buy_wick={actual_buy_wick_ratio*100:.2f}% sell_wick={actual_sell_wick_ratio*100:.2f}%"
+                f"Wick (15M): Buy={actual_buy_wick_ratio*100:.2f}% Sell={actual_sell_wick_ratio*100:.2f}% "
+                f"(threshold={Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
+            if actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger_pair.debug(f"BUY WICK REJECTED: {actual_buy_wick_ratio*100:.2f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%")
+            if actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger_pair.debug(f"SELL WICK REJECTED: {actual_sell_wick_ratio*100:.2f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%")
 
         # =====================================================================
         # PHASE 8: CANDLE TIMESTAMP VALIDATION
@@ -3666,11 +3681,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_down": cloud_down,
             
             # Candle quality
-            "buy_wick_ratio": actual_buy_wick_ratio,
-            "sell_wick_ratio": actual_sell_wick_ratio,
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
-            
+            "buy_wick_ratio": actual_buy_wick_ratio,  # From 15M candle only
+            "sell_wick_ratio": actual_sell_wick_ratio,  # From 15M candle only 
+         
             # Candle direction
             "is_green": is_green,
             "is_red": is_red,
@@ -3678,6 +3693,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             # Common conditions
             "buy_common": buy_common,
             "sell_common": sell_common,
+
+            "wick_ratio_timeframe": "15m",
             
             # Pivots (empty dict if not available)
             "pivots": piv if piv else {},
