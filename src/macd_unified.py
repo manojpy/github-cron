@@ -3467,24 +3467,19 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             actual_buy_wick_ratio = 1.0
             actual_sell_wick_ratio = 1.0
         else:
-            # For buy (green): upper wick ratio
-            body_top_buy = close_curr
-            upper_wick = high_curr - body_top_buy
+            # For BUY: body top is MAX(open, close) - the higher of the two
+            body_top = open_curr if open_curr > close_curr else close_curr
+            upper_wick = high_curr - body_top
             actual_buy_wick_ratio = max(0.0, upper_wick) / candle_range
-
-            # For sell (red): lower wick ratio
-            body_bottom_sell = close_curr
-            lower_wick = body_bottom_sell - low_curr
+    
+            # For SELL: body bottom is MIN(open, close) - the lower of the two
+            body_bottom = open_curr if open_curr < close_curr else close_curr
+            lower_wick = body_bottom - low_curr
             actual_sell_wick_ratio = max(0.0, lower_wick) / candle_range
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
-                f"Wick validation | {pair_name} | "
-                f"Candle i15={i15} | "
-                f"O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f} | "
-                f"Range={candle_range:.5f} | "
-                f"Buy wick: {actual_buy_wick_ratio*100:.2f}% | "
-                f"Sell wick: {actual_sell_wick_ratio*100:.2f}%"
+                f"Wick (logging): buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}%"
             )
 
         # =====================================================================
@@ -3740,12 +3735,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             # Classify alert type
             is_buy_signal = any(x in alert_key for x in ["up", "buy"])
             is_sell_signal = any(x in alert_key for x in ["down", "sell"])
-
-            # Skip if wick ratio too high
-            if is_buy_signal and actual_buy_wick_ratio >= Constants.MIN_WICK_RATIO:
-                continue
-            if is_sell_signal and actual_sell_wick_ratio >= Constants.MIN_WICK_RATIO:
-                continue
 
             # ===== PIVOT ALERTS =====
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
