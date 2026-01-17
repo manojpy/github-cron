@@ -3804,24 +3804,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: VWAP data unavailable")
                     continue
-    
+
                 trigger = False
                 try:
-                    is_buy = (alert_key == "vwap_up")
-                    valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
-                    trigger = valid_cross  # ✅ Simple assignment
+                    # ✅ USE THE CHECK_FN LIKE ALL OTHER ALERTS
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
         
                     if cfg.DEBUG_MODE:
-                        if valid_cross:
+                        is_buy = (alert_key == "vwap_up")
+                        valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
+                        if trigger:
                             logger_pair.debug(
                                 f"✅ {alert_key}: Close={context['close_curr']:.2f}, "
-                                f"VWAP={context['vwap_curr']:.2f}"
+                                f"VWAP={context['vwap_curr']:.2f}, "
+                                f"buy_common={context.get('buy_common', False)}, "
+                                f"sell_common={context.get('sell_common', False)}"
                             )
                         else:
-                            logger_pair.debug(f"❌ {alert_key}: {reason}")
-                
+                            logger_pair.debug(f"❌ {alert_key}: buy_common or sell_common not met")
+    
                 except Exception as e:
-                    logger_pair.error(f"VWAP check failed: {e}", exc_info=True)
+                    logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
 
             # ===== OTHER ALERTS (PPO, RSI, MMH) =====
