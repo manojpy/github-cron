@@ -700,7 +700,7 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:   
     try:
         if any(x is None or len(x) == 0 for x in [high, low, close, volume, timestamps]):
             return np.zeros_like(close) if close is not None else np.array([0.0])
@@ -709,23 +709,18 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
         if n == 0 or any(len(x) != n for x in [high, low, volume, timestamps]):
             return np.zeros_like(close)
 
-        ts_adjusted = timestamps.copy()
+        ts_adjusted = timestamps.astype(np.int64).copy()
         if np.any(ts_adjusted > 1_000_000_000_000):
-            ts_adjusted = ts_adjusted // 1000
-        
-        day_id = (ts_adjusted.astype("int64") // 86400).astype("int64")
-        vwap = vwap_daily_loop(high, low, close, volume, ts_adjusted.astype(np.int64))
+            ts_adjusted //= 1000
 
-        tail_default = (
-            vwap[-2] if len(vwap) > 1 and not np.isnan(vwap[-2])
-            else (close[-1] if len(close) > 0 else 0.0)
-        )
-        vwap = sanitize_array_numba(vwap, tail_default)
+        vwap = vwap_daily_loop(high, low, close, volume, ts_adjusted)
 
         return vwap
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"VWAP calculation failed: {e}")
         return np.full_like(close, np.nan) if close is not None else np.array([np.nan])
+
 
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
@@ -3172,39 +3167,78 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
     st = await sdb.get(state_key)
     return st is not None and st.get("state") == "ACTIVE"
 
+
 def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
-    
-    if not ctx.get("vwap_enabled") or not ctx.get("vwap_available"):
-        return False, "VWAP unavailable"
-
-    close_prev = ctx["close_prev"]
+    vwap_curr = ctx.get("vwap_curr")
+    vwap_prev = ctx.get("vwap_prev")
     close_curr = ctx["close_curr"]
-    vwap_prev = ctx["vwap_prev"]
-    vwap_curr = ctx["vwap_curr"]
-
+    close_prev = ctx["close_prev"]
+    open_curr = ctx["open_curr"]
+    high_curr = ctx["high_curr"]
+    low_curr = ctx["low_curr"]
+    
+    # Step 1: Validate VWAP data exists
+    if vwap_curr is None or np.isnan(vwap_curr) or vwap_prev is None or np.isnan(vwap_prev):
+        return False, "VWAP not available"
+    
     if is_buy:
-        crossed = close_prev <= vwap_prev < close_curr
-        alert_key = ALERT_KEYS["vwap_up"]
-    else:
-        crossed = close_prev >= vwap_prev > close_curr
-        alert_key = ALERT_KEYS["vwap_down"]
-
-    if not crossed:
-        return False, "No VWAP cross"
-    if previous_states.get(alert_key, False):
-        return False, "VWAP alert already active"
-    try:
-        distance_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
-    except ZeroDivisionError:
-        return False, "VWAP invalid (zero)"
-
-    if distance_pct > Constants.VWAP_MAX_DISTANCE_PCT:
-        return False, (
-            f"VWAP too far: price {close_curr:.2f} is {distance_pct:.2f}% "
-            f"away from VWAP {vwap_curr:.2f}"
-        )
-
-    return True, None
+        # Step 2: Verify candle is GREEN (close > open)
+        if close_curr <= open_curr:
+            return False, f"Red candle: O={open_curr:.2f}, C={close_curr:.2f}"
+        
+        if not (close_prev < vwap_prev and close_curr > vwap_curr):
+            return False, (
+                f"No cross up: "
+                f"prev={close_prev:.2f} vs vwap_prev={vwap_prev:.2f}, "
+                f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
+            )
+        
+        # Step 4: Check price distance from VWAP (prevents crossing too far away)
+        dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
+        if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
+            return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
+        
+        # Step 5: Check upper wick ratio (small upper wick = good buy signal)
+        candle_range = high_curr - low_curr
+        if candle_range > 1e-9:
+            body_top = max(open_curr, close_curr)
+            upper_wick = high_curr - body_top
+            wick_ratio = upper_wick / candle_range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Upper wick too large: {wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
+        
+        return True, None
+    
+    else:  # Sell logic
+        # Step 2: Verify candle is RED (close < open)
+        if close_curr >= open_curr:
+            return False, f"Green candle: O={open_curr:.2f}, C={close_curr:.2f}"
+        
+        # Step 3: Verify actual cross BELOW VWAP
+        # - Previous bar: close was above or at VWAP
+        # - Current bar: close is below VWAP
+        if not (close_prev > vwap_prev and close_curr < vwap_curr):
+            return False, (
+                f"No cross down: "
+                f"prev={close_prev:.2f} vs vwap_prev={vwap_prev:.2f}, "
+                f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
+            )
+        
+        # Step 4: Check price distance from VWAP
+        dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
+        if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
+            return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
+        
+        # Step 5: Check lower wick ratio (small lower wick = good sell signal)
+        candle_range = high_curr - low_curr
+        if candle_range > 1e-9:
+            body_bottom = min(open_curr, close_curr)
+            lower_wick = body_bottom - low_curr
+            wick_ratio = lower_wick / candle_range
+            if wick_ratio >= Constants.MIN_WICK_RATIO:
+                return False, f"Lower wick too large: {wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
+        
+        return True, None
 
 async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
     if sdb.degraded or not keys:
@@ -3778,28 +3812,30 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     trigger = False
 
             # ===== VWAP ALERTS (Fixed per Issue #9) =====
+
             elif alert_key in ("vwap_up", "vwap_down"):
                 if not vwap_available:
-                    # Skip VWAP alerts if data unavailable
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: VWAP data unavailable")
                     continue
-
+    
+                trigger = False
                 try:
-                    is_buy = alert_key == "vwap_up"
+                    is_buy = (alert_key == "vwap_up")
                     valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
-
-                    if not valid_cross and reason:
-                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-
-                    trigger = (
-                        (is_buy and buy_common) or ((not is_buy) and sell_common)
-                    ) and valid_cross
+                    trigger = valid_cross  # ✅ Simple assignment
+        
+                    if cfg.DEBUG_MODE:
+                        if valid_cross:
+                            logger_pair.debug(
+                                f"✅ {alert_key}: Close={context['close_curr']:.2f}, "
+                                f"VWAP={context['vwap_curr']:.2f}"
+                            )
+                        else:
+                            logger_pair.debug(f"❌ {alert_key}: {reason}")
+                
                 except Exception as e:
-                    logger_pair.error(
-                        f"VWAP alert check failed for {alert_key}: {e}",
-                        exc_info=True
-                    )
+                    logger_pair.error(f"VWAP check failed: {e}", exc_info=True)
                     trigger = False
 
             # ===== OTHER ALERTS (PPO, RSI, MMH) =====

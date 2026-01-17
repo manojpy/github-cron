@@ -449,49 +449,53 @@ def kalman_loop(src, length, R, Q):
 
     return result
 
+
 @njit("f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop(high, low, close, volume, timestamps):
     
     n = len(close)
-    vwap = np.empty(n, dtype=np.float64)
+    vwap = np.full(n, np.nan, dtype=np.float64)
     cum_pv = 0.0
     cum_vol = 0.0
     last_day = -1
     last_valid_vwap = np.nan
-    
+
+    # Handle both second and millisecond timestamps
+    ts_adj = timestamps.copy()
+    if np.any(ts_adj > 1_000_000_000_000):  # ms → s
+        ts_adj = ts_adj // 1000
+
     for i in range(n):
-        current_day = timestamps[i] // 86400
-        
-        # Reset at the start of a new UTC day
+        current_day = ts_adj[i] // 86400
+
+        # DAILY RESET
         if current_day != last_day:
             cum_pv = 0.0
             cum_vol = 0.0
             last_day = current_day
             last_valid_vwap = np.nan
-        
-        # Extract values
+
         h, l, c, v = high[i], low[i], close[i], volume[i]
-        
-        # ✅ NEW: Skip invalid candle but use last valid VWAP
+
+        # SKIP INVALID BARS
         if np.isnan(h) or np.isnan(l) or np.isnan(c) or np.isnan(v) or v <= 0:
-            # Mark this bar with last known VWAP (don't let it be NaN if we have history)
-            vwap[i] = last_valid_vwap  # Could be NaN if first candle is invalid
+            vwap[i] = last_valid_vwap
             continue
-        
-        # Calculate typical price for valid candle
+
+        # ACCUMULATE HLC3
         typical_price = (h + l + c) / 3.0
         cum_pv += typical_price * v
         cum_vol += v
-        
-        # Calculate VWAP for this valid candle
+
+        # CALCULATE VWAP
         if cum_vol > 0:
             vwap[i] = cum_pv / cum_vol
-            last_valid_vwap = vwap[i]  # ✅ Remember this valid VWAP
+            last_valid_vwap = vwap[i]
         else:
-            # Shouldn't happen since we checked v > 0, but be safe
-            vwap[i] = np.nan
-            
+            vwap[i] = last_valid_vwap
+
     return vwap
+
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
     """Calculate PPO in O(n) - three EMA passes"""
