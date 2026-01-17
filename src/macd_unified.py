@@ -1773,6 +1773,8 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
 
         MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
 
+        interval_minutes = 15
+        
         if staleness > MAX_STALENESS:
             return False, (
                 f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
