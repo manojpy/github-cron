@@ -3293,37 +3293,44 @@ def check_common_conditions(open_val, high_val, low_val, close_val, is_buy) -> b
     except Exception:
         return False
 
-def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: float, close_val: float, is_buy: bool) -> Tuple[bool, str]:   
+def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: float, close_val: float, is_buy: bool) -> Tuple[bool, str]:
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False, "Range too small"
 
-        body_bottom = min(open_val, close_val)
-        body_top = max(open_val, close_val)
-        
         if is_buy:
+            # Must be green
             if close_val <= open_val:
-                return False, f"Not green (C={close_val:.5f}≤O={open_val:.5f})"
-            
+                return False, f"Not green (C={close_val:.5f} ≤ O={open_val:.5f})"
+
+            body_top = close_val  # for green, close is top
             upper_wick = high_val - body_top
+
+            if upper_wick < 0:
+                return False, f"Corrupted data (H={high_val:.5f} < C={close_val:.5f})"
+
             wick_ratio = upper_wick / candle_range
-            
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            
+
             return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
 
         else:
+            # Must be red
             if close_val >= open_val:
-                return False, f"Not red (C={close_val:.5f}≥O={open_val:.5f})"
-            
-            lower_wick = max(body_bottom - low_val, 0.0)
+                return False, f"Not red (C={close_val:.5f} ≥ O={open_val:.5f})"
+
+            body_bottom = close_val  # for red, close is bottom
+            lower_wick = body_bottom - low_val
+
+            if lower_wick < 0:
+                return False, f"Corrupted data (L={low_val:.5f} > C={close_val:.5f})"
+
             wick_ratio = lower_wick / candle_range
-            
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            
+
             return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
 
     except Exception as e:
