@@ -1,4 +1,5 @@
 name: Build AOT Image (Optimized Hybrid)
+
 on:
   push:
     branches: [ main ]
@@ -44,7 +45,7 @@ jobs:
         with:
           driver-opts: |
             image=moby/buildkit:latest
-          network: host
+            network=host
           buildkitd-flags: --allow-insecure-entitlement network.host
 
       - name: 🔐 Log in to GitHub Container Registry
@@ -97,14 +98,13 @@ jobs:
           docker run --rm --platform linux/amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python -c "
-import sys
-try:
-    import aot_bridge
-    print('✅ AOT Binary: LOADED & ACTIVE')
-except ImportError as e:
-    print(f'❌ AOT not loaded: {e}')
-    sys.exit(1)
-" || exit 1
+          import sys
+          from aot_bridge import is_using_aot, get_fallback_reason
+          if not is_using_aot():
+              print(f'❌ AOT not loaded: {get_fallback_reason()}')
+              sys.exit(1)
+          print('✅ AOT Binary: LOADED & ACTIVE')
+          " || exit 1
 
       # ========================================================================
       # PHASE 3: SECURITY SCANNING

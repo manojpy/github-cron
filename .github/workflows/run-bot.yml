@@ -1,4 +1,5 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
+
 on:
   workflow_dispatch:
     inputs:
@@ -62,12 +63,6 @@ jobs:
             exit 1
           fi
 
-      - name: 🔍 Verify AOT Module Exists
-        run: |
-          docker run --rm --platform linux/amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ls -la /app/src/aot_bridge.so
-
       - name: 🔑 Verify Secrets
         run: |
           MISSING=()
@@ -87,7 +82,7 @@ jobs:
         id: bot_run
         timeout-minutes: 7
         env:
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
           echo "::group::📥 Launch Macd-Unified...📥"
@@ -95,6 +90,7 @@ jobs:
           echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
+
           START_TIME=$(date +%s)
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
@@ -118,10 +114,12 @@ jobs:
             -e OMP_NUM_THREADS=2 \
             -v "${{ github.workspace }}/config_macd.json:/app/src/config_macd.json:ro" \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 | tee logs/bot_output.log
+
           EXIT_CODE=${PIPESTATUS[0]}
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s"
             exit 1
@@ -144,6 +142,7 @@ jobs:
             echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
+          
           if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
             STATUS="success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
@@ -155,6 +154,7 @@ jobs:
             STATUS="failed"
             ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
           fi
+          
           echo "status=${STATUS}" >> $GITHUB_OUTPUT
           echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
           echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
@@ -167,11 +167,14 @@ jobs:
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
-## 🤖 MACD Bot Execution Report
-| Status | Duration | Alerts | Pairs | Memory | Redis |
-|--------|----------|--------|-------|--------|-------|
-| ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
-EOF
+          ## 🤖 MACD Bot Execution Report
+          
+          | Status | Duration | Alerts | Pairs | Memory | Redis |
+          |--------|----------|--------|-------|--------|-------|
+          | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
+          
+          EOF
+          
           if [ "${{ steps.results.outputs.status }}" != "success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
