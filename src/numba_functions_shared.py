@@ -647,11 +647,15 @@ def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio):
 
         # Upper wick = distance from close to high
         upper_wick = high_p[i] - close_p[i]
+
+        # Safeguard: skip corrupted data
+        if upper_wick < 0:
+            continue
+
         wick_ratio = upper_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
 
     return result
-
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio):
@@ -669,6 +673,12 @@ def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio):
 
         # Lower wick = distance from low to close
         lower_wick = close_p[i] - low_p[i]
+
+
+        # Safeguard: skip corrupted data
+        if lower_wick < 0:
+            continue
+
         wick_ratio = lower_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
 

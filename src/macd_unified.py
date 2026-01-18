@@ -88,14 +88,7 @@ class Constants:
     VWAP_MAX_DISTANCE_PCT = 1.0
     PIVOT_MAX_DISTANCE_PCT = 0.5
     INTER_BATCH_DELAY: float = 0.5
-    MAX_WICK_RATIO_BUY = 0.20
-    MAX_WICK_RATIO_SELL = 0.20
-    MIN_CANDLE_RANGE = 0.0001
-    MAX_STALENESS_SEC = 1200
-
-
-
-
+    
 STATIC_PRODUCTS_MAP = {
     "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
     "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
@@ -1764,10 +1757,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         return None
 
 def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    """
-    Validate basic data structure. 
-    Specific candle validation happens in validate_candle_data_at_index().
-    """
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -1841,7 +1830,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     return last_closed_idx
 
 def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
-    
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -3341,385 +3329,12 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-# ============================================================================
-# 🛡️ IMPENETRABLE CANDLE VALIDATION SHIELD
-# ============================================================================
-
-class CandleValidationShield:   
-    def __init__(self, pair_name: str, logger_obj: logging.Logger):
-        """Initialize shield with references to Constants"""
-        self.pair_name = pair_name
-        self.logger = logger_obj
-        self.last_validated_index = -1
-        self.last_validated_ts = 0
-        self.validation_failures = []
-        
-        # Reference Constants class for all hard limits
-        # These are immutable once set and cannot be overridden
-        self.max_wick_ratio_buy = Constants.MAX_WICK_RATIO_BUY
-        self.max_wick_ratio_sell = Constants.MAX_WICK_RATIO_SELL
-        self.min_candle_range = Constants.MIN_CANDLE_RANGE
-        self.max_staleness_sec = Constants.MAX_STALENESS_SEC
-        
-    def validate_and_shield(self, data_15m: Dict[str, np.ndarray], i15: int, reference_time: int, is_buy_alert: bool) -> Tuple[bool, Optional[str]]:
-        self.validation_failures = []
-        
-        # ===== LAYER 1: Basic Array Integrity =====
-        if not self._check_array_integrity(data_15m):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 2: Index Validity =====
-        if not self._check_index_valid(data_15m, i15):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 3: Candle Closure =====
-        if not self._check_candle_closed(data_15m["timestamp"][i15], reference_time):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 4: Candle Staleness =====
-        if not self._check_candle_staleness(data_15m["timestamp"][i15], reference_time):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 5: Candle Color =====
-        open_val = data_15m["open"][i15]
-        close_val = data_15m["close"][i15]
-        high_val = data_15m["high"][i15]
-        low_val = data_15m["low"][i15]
-        
-        if not self._check_candle_color(open_val, close_val, is_buy_alert):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 6: OHLC Integrity =====
-        if not self._check_ohlc_integrity(open_val, close_val, high_val, low_val):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 7: Wick Ratio (THE CRITICAL CHECK) =====
-        if not self._check_wick_ratio(open_val, close_val, high_val, low_val, is_buy_alert):
-            return False, self._get_combined_errors()
-        
-        # ===== LAYER 8: Prevent Duplicate Validation =====
-        if not self._check_no_duplicate_validation(i15, data_15m["timestamp"][i15]):
-            return False, self._get_combined_errors()
-        
-        # All layers passed!
-        self.last_validated_index = i15
-        self.last_validated_ts = data_15m["timestamp"][i15]
-        return True, None
-    
-    # =========================================================================
-    # LAYER 1: BASIC ARRAY INTEGRITY
-    # =========================================================================
-    
-    def _check_array_integrity(self, data_15m: Dict[str, np.ndarray]) -> bool:
-        """Verify arrays exist and have expected fields"""
-        required_fields = ["timestamp", "open", "high", "low", "close", "volume"]
-        
-        for field in required_fields:
-            if field not in data_15m:
-                self.validation_failures.append(f"Missing field: {field}")
-                return False
-            
-            arr = data_15m[field]
-            if arr is None or len(arr) == 0:
-                self.validation_failures.append(f"Empty array: {field}")
-                return False
-            
-            if not isinstance(arr, np.ndarray):
-                self.validation_failures.append(f"Not ndarray: {field}")
-                return False
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 2: INDEX VALIDITY
-    # =========================================================================
-    
-    def _check_index_valid(self, data_15m: Dict[str, np.ndarray], i15: int) -> bool:
-        """Verify index is within array bounds"""
-        if i15 is None:
-            self.validation_failures.append("Index i15 is None")
-            return False
-        
-        if i15 < 0:
-            self.validation_failures.append(f"Index i15 is negative: {i15}")
-            return False
-        
-        close_len = len(data_15m["close"])
-        if i15 >= close_len:
-            self.validation_failures.append(
-                f"Index i15={i15} exceeds array length {close_len}"
-            )
-            return False
-        
-        if i15 < 1:
-            self.validation_failures.append(f"Index i15={i15} too small (need ≥1 for prev)")
-            return False
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 3: CANDLE CLOSURE (NOT FORMING)
-    # =========================================================================
-    
-    def _check_candle_closed(self, candle_ts: int, reference_time: int) -> bool:
-        """
-        Verify candle is FULLY CLOSED.
-        
-        A 15m candle is closed when its timestamp < current period start.
-        """
-        interval_seconds = 900  # 15 minutes
-        current_period_start = (reference_time // interval_seconds) * interval_seconds
-        
-        if candle_ts >= current_period_start:
-            self.validation_failures.append(
-                f"Candle is STILL FORMING! "
-                f"ts={format_ist_time(candle_ts)} >= "
-                f"current_period_start={format_ist_time(current_period_start)}"
-            )
-            return False
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 4: CANDLE STALENESS
-    # =========================================================================
-    
-    def _check_candle_staleness(self, candle_ts: int, reference_time: int) -> bool:
-        """Verify candle is not stale (max 10 minutes old)"""
-        staleness = reference_time - candle_ts
-        
-        if staleness > self.max_staleness_sec:
-            self.validation_failures.append(
-                f"Candle is STALE: {staleness}s old > "
-                f"max {self.max_staleness_sec}s old"
-            )
-            return False
-        
-        if staleness < 0:
-            self.validation_failures.append(
-                f"Candle timestamp is in FUTURE: {staleness}s ahead of reference"
-            )
-            return False
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 5: CANDLE COLOR (GREEN OR RED ONLY)
-    # =========================================================================
-    
-    def _check_candle_color(
-        self, 
-        open_val: float, 
-        close_val: float, 
-        is_buy_alert: bool
-    ) -> bool:
-        """
-        For BUY alerts: candle MUST be GREEN (close > open)
-        For SELL alerts: candle MUST be RED (close < open)
-        DOJI/NEUTRAL candles are ALWAYS rejected
-        """
-        is_green = close_val > open_val
-        is_red = close_val < open_val
-        is_doji = close_val == open_val
-        
-        if is_doji:
-            self.validation_failures.append(
-                f"Candle is DOJI/NEUTRAL: O={open_val:.5f}, C={close_val:.5f}"
-            )
-            return False
-        
-        if is_buy_alert and not is_green:
-            self.validation_failures.append(
-                f"BUY alert requires GREEN candle but got RED: "
-                f"C={close_val:.5f} < O={open_val:.5f}"
-            )
-            return False
-        
-        if not is_buy_alert and not is_red:
-            self.validation_failures.append(
-                f"SELL alert requires RED candle but got GREEN: "
-                f"C={close_val:.5f} > O={open_val:.5f}"
-            )
-            return False
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 6: OHLC INTEGRITY
-    # =========================================================================
-    
-    def _check_ohlc_integrity(
-        self, 
-        open_val: float, 
-        close_val: float, 
-        high_val: float, 
-        low_val: float
-    ) -> bool:
-        """Verify OHLC relationships are mathematically valid"""
-        
-        # Check for NaN/Inf
-        for name, val in [("open", open_val), ("close", close_val), 
-                          ("high", high_val), ("low", low_val)]:
-            if np.isnan(val) or np.isinf(val):
-                self.validation_failures.append(f"OHLC value {name} is NaN/Inf: {val}")
-                return False
-            
-            if val <= 0:
-                self.validation_failures.append(f"OHLC value {name} is non-positive: {val}")
-                return False
-        
-        # Check OHLC relationships: L ≤ O, C ≤ H, L ≤ C, L ≤ H
-        checks = [
-            (low_val <= open_val, f"L={low_val:.5f} > O={open_val:.5f}"),
-            (low_val <= close_val, f"L={low_val:.5f} > C={close_val:.5f}"),
-            (low_val <= high_val, f"L={low_val:.5f} > H={high_val:.5f}"),
-            (open_val <= high_val, f"O={open_val:.5f} > H={high_val:.5f}"),
-            (close_val <= high_val, f"C={close_val:.5f} > H={high_val:.5f}"),
-        ]
-        
-        for check, msg in checks:
-            if not check:
-                self.validation_failures.append(f"OHLC relationship violated: {msg}")
-                return False
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 7: WICK RATIO (THE ULTIMATE SHIELD)
-    # =========================================================================
-    
-    def _check_wick_ratio(
-        self, 
-        open_val: float, 
-        close_val: float, 
-        high_val: float, 
-        low_val: float, 
-        is_buy_alert: bool
-    ) -> bool:
-        """
-        CRITICAL CHECK: Wick ratio must be < 20% for alerts to fire.
-        
-        For BUY (green candle):
-            - upper_wick = high - close
-            - wick_ratio = upper_wick / (high - low)
-        
-        For SELL (red candle):
-            - lower_wick = close - low
-            - wick_ratio = lower_wick / (high - low)
-        """
-        candle_range = high_val - low_val
-        
-        # Prevent division by zero
-        if candle_range <= self.min_candle_range:
-            self.validation_failures.append(
-                f"Candle range too small: {candle_range:.8f}"
-            )
-            return False
-        
-        if is_buy_alert:
-            # For GREEN candle: measure upper wick
-            upper_wick = high_val - close_val
-            
-            # Sanity check: wick should be positive
-            if upper_wick < 0:
-                self.validation_failures.append(
-                    f"BUY: upper_wick is negative! "
-                    f"high={high_val:.5f}, close={close_val:.5f}"
-                )
-                return False
-            
-            wick_ratio = upper_wick / candle_range
-            
-            # THE SHIELD: Upper wick must be < 20%
-            if wick_ratio >= self.max_wick_ratio_buy:
-                self.validation_failures.append(
-                    f"BUY ALERT BLOCKED: upper_wick={wick_ratio*100:.2f}% "
-                    f"exceeds max {self.max_wick_ratio_buy*100:.1f}% | "
-                    f"H={high_val:.5f}, C={close_val:.5f}, "
-                    f"range={candle_range:.5f}"
-                )
-                return False
-            
-            # Log the passing wick for verification
-            self.logger.debug(
-                f"✅ BUY WICK PASSED: {wick_ratio*100:.2f}% < {self.max_wick_ratio_buy*100:.1f}% | "
-                f"{self.pair_name}"
-            )
-        
-        else:
-            # For RED candle: measure lower wick
-            lower_wick = close_val - low_val
-            
-            # Sanity check: wick should be positive
-            if lower_wick < 0:
-                self.validation_failures.append(
-                    f"SELL: lower_wick is negative! "
-                    f"close={close_val:.5f}, low={low_val:.5f}"
-                )
-                return False
-            
-            wick_ratio = lower_wick / candle_range
-            
-            # THE SHIELD: Lower wick must be < 20%
-            if wick_ratio >= self.max_wick_ratio_sell:
-                self.validation_failures.append(
-                    f"SELL ALERT BLOCKED: lower_wick={wick_ratio*100:.2f}% "
-                    f"exceeds max {self.max_wick_ratio_sell*100:.1f}% | "
-                    f"C={close_val:.5f}, L={low_val:.5f}, "
-                    f"range={candle_range:.5f}"
-                )
-                return False
-            
-            # Log the passing wick for verification
-            self.logger.debug(
-                f"✅ SELL WICK PASSED: {wick_ratio*100:.2f}% < {self.max_wick_ratio_sell*100:.1f}% | "
-                f"{self.pair_name}"
-            )
-        
-        return True
-    
-    # =========================================================================
-    # LAYER 8: PREVENT DUPLICATE VALIDATION
-    # =========================================================================
-    
-    def _check_no_duplicate_validation(self, i15: int, candle_ts: int) -> bool:
-        """Prevent firing multiple alerts for same candle in same run"""
-        if self.last_validated_index == i15 and self.last_validated_ts == candle_ts:
-            self.validation_failures.append(
-                f"Already validated this candle (index={i15}, ts={candle_ts}). "
-                f"Cannot fire multiple alerts for same candle in same run."
-            )
-            return False
-        
-        return True
-    
-    # =========================================================================
-    # HELPER: Combine all failures into readable message
-    # =========================================================================
-    
-    def _get_combined_errors(self) -> str:
-        """Get all validation failures as formatted string"""
-        return " | ".join(self.validation_failures)
-    
-    def get_validation_status(self) -> Dict[str, Any]:
-        """Get detailed validation status for debugging"""
-        return {
-            "pair": self.pair_name,
-            "failures": self.validation_failures,
-            "last_validated_index": self.last_validated_index,
-            "last_validated_ts": self.last_validated_ts,
-            "failure_count": len(self.validation_failures),
-        }
-
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
-    
-    # ===== INITIALIZE IMPENETRABLE SHIELD =====
-    shield = CandleValidationShield(pair_name, logger_pair)
 
     # =========================================================================
     # INITIALIZE ALL VARIABLES FOR EXCEPTION SAFETY
@@ -4145,7 +3760,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # =====================================================================
         # PHASE 16: EVALUATE EACH ALERT CONDITION
         # =====================================================================
-    
+        
         all_state_changes = []
 
         for alert_key in alert_keys_to_check:
@@ -4167,15 +3782,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 try:
                     valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                
+
+                    if not valid_cross and reason and piv:
+                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
+
                     trigger = (
                         (is_buy and buy_common) or (not is_buy and sell_common)
                     ) and valid_cross
                 except Exception as e:
-                    logger_pair.error(f"Pivot alert check failed for {alert_key}: {e}")
+                    logger_pair.error(
+                        f"Pivot alert check failed for {alert_key}: {e}",
+                        exc_info=True
+                    )
                     trigger = False
 
-            # ===== VWAP ALERTS =====
+            # ===== VWAP ALERTS (Fixed per Issue #9) =====
+
             elif alert_key in ("vwap_up", "vwap_down"):
                 if not vwap_available:
                     if cfg.DEBUG_MODE:
@@ -4184,61 +3806,71 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 trigger = False
                 try:
+                    # ✅ USE THE CHECK_FN LIKE ALL OTHER ALERTS
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+        
+                    if cfg.DEBUG_MODE:
+                        is_buy = (alert_key == "vwap_up")
+                        valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
+                        if trigger:
+                            logger_pair.debug(
+                                f"✅ {alert_key}: Close={context['close_curr']:.2f}, "
+                                f"VWAP={context['vwap_curr']:.2f}, "
+                                f"buy_common={context.get('buy_common', False)}, "
+                                f"sell_common={context.get('sell_common', False)}"
+                            )
+                        else:
+                            logger_pair.debug(f"❌ {alert_key}: buy_common or sell_common not met")
+    
                 except Exception as e:
-                    logger_pair.error(f"VWAP check failed for {alert_key}: {e}")
+                    logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
 
             # ===== OTHER ALERTS (PPO, RSI, MMH) =====
             else:
                 trigger = False
-            
+                trigger_error = None
+                
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
-                    logger_pair.error(f"Alert check failed for {alert_key}: {e}")
+                    # Consolidated error handling with specific logging (Fixed per Issue #11)
+                    if isinstance(e, KeyError):
+                        logger_pair.error(f"Missing context key for {alert_key}: {e}")
+                    elif isinstance(e, TypeError):
+                        logger_pair.error(f"Type error in {alert_key}: {e}")
+                    else:
+                        logger_pair.error(f"Alert check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
+                    trigger_error = str(e)
 
             # =====================================================================
-            # 🛡️ CRITICAL: FIRE ALERT ONLY IF SHIELD PASSES
+            # PHASE 17: FIRE ALERT IF TRIGGERED & NOT ALREADY ACTIVE
             # =====================================================================
-        
+            
             if trigger and not previous_states.get(key, False):
-            
-                # Determine if this is buy or sell alert
-                is_buy_alert = is_buy_signal
-            
-                # ===== ENGAGE THE SHIELD =====
-                shield_passes, shield_reason = shield.validate_and_shield(
-                    data_15m,
-                    i15,
-                    reference_time,
-                    is_buy_alert
-                )
-            
-                if not shield_passes:
-                    # ALERT BLOCKED BY SHIELD
-                    logger_pair.warning(
-                        f"⛔ ALERT BLOCKED BY SHIELD: {alert_key} | "
-                        f"Reason: {shield_reason}"
-                    )
-                    continue  # ← Skip this alert, don't fire it
-            
-                # Shield passed - safe to fire alert
                 extra = ""
                 try:
                     extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
                 except Exception as e:
-                    logger_pair.error(f"Alert extra_fn failed for {alert_key}: {e}")
+                    # Still fire alert even if extra_fn fails (Fixed per Issue #11)
+                    logger_pair.error(
+                        f"Alert extra_fn failed for {alert_key}, firing alert without extra details: {e}",
+                        exc_info=False
+                    )
                     extra = f"(Error: {str(e)[:50]})"
 
                 raw_alerts.append((def_["title"], extra, def_["key"]))
                 all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
 
-                logger_pair.info(
-                    f"✅ ALERT FIRED (SHIELD PASSED): {alert_key} | "
-                    f"wick_ratio passed shield check"
-                )
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"✅ Alert FIRED: {alert_key} | "
+                        f"buy_common={buy_common} sell_common={sell_common} | "
+                        f"buy_passed={buy_candle_passed} sell_passed={sell_candle_passed} | "
+                        f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
+                        f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
+                    )
 
         # =====================================================================
         # PHASE 18: RESET ALERTS WHEN CONDITIONS NO LONGER MET
