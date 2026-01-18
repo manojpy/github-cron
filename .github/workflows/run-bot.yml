@@ -62,7 +62,6 @@ jobs:
             exit 1
           fi
 
-      # ✅ NEW STEP: Verify AOT module exists
       - name: 🔍 Verify AOT Module Exists
         run: |
           docker run --rm --platform linux/amd64 \
@@ -88,7 +87,7 @@ jobs:
         id: bot_run
         timeout-minutes: 7
         env:
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           mkdir -p logs
           echo "::group::📥 Launch Macd-Unified...📥"
