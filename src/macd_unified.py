@@ -91,7 +91,7 @@ class Constants:
     MAX_WICK_RATIO_BUY = 0.20
     MAX_WICK_RATIO_SELL = 0.20
     MIN_CANDLE_RANGE = 0.0001
-    MAX_CANDLE_STALENESS_SEC = 1200
+    MAX_STALENESS_SEC = 1200
 
 
 
@@ -1840,16 +1840,8 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
     return last_closed_idx
 
-def validate_candle_data_at_index(
-    data: Optional[Dict[str, np.ndarray]], 
-    selected_index: int,
-    reference_time: int,
-    interval_minutes: int = 15
-) -> Tuple[bool, Optional[str]]:
-    """
-    Validate ONLY the selected candle at selected_index.
-    Ensures the selected candle is fully closed and has valid OHLC data.
-    """
+def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
+    
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -3349,24 +3341,27 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-class CandleValidationShield:
-    
-    
+# ============================================================================
+# 🛡️ IMPENETRABLE CANDLE VALIDATION SHIELD
+# ============================================================================
+
+class CandleValidationShield:   
     def __init__(self, pair_name: str, logger_obj: logging.Logger):
+        """Initialize shield with references to Constants"""
         self.pair_name = pair_name
         self.logger = logger_obj
         self.last_validated_index = -1
         self.last_validated_ts = 0
         self.validation_failures = []
         
-        # Reference Constants class for hard limits
+        # Reference Constants class for all hard limits
+        # These are immutable once set and cannot be overridden
         self.max_wick_ratio_buy = Constants.MAX_WICK_RATIO_BUY
         self.max_wick_ratio_sell = Constants.MAX_WICK_RATIO_SELL
         self.min_candle_range = Constants.MIN_CANDLE_RANGE
-        self.max_staleness_sec = Constants.MAX_CANDLE_STALENESS_SEC
+        self.max_staleness_sec = Constants.MAX_STALENESS_SEC
         
     def validate_and_shield(self, data_15m: Dict[str, np.ndarray], i15: int, reference_time: int, is_buy_alert: bool) -> Tuple[bool, Optional[str]]:
-        
         self.validation_failures = []
         
         # ===== LAYER 1: Basic Array Integrity =====
@@ -3493,10 +3488,10 @@ class CandleValidationShield:
         """Verify candle is not stale (max 10 minutes old)"""
         staleness = reference_time - candle_ts
         
-        if staleness > self.MAX_STALENESS_SEC:
+        if staleness > self.max_staleness_sec:
             self.validation_failures.append(
                 f"Candle is STALE: {staleness}s old > "
-                f"max {self.MAX_STALENESS_SEC}s old"
+                f"max {self.max_staleness_sec}s old"
             )
             return False
         
@@ -3615,7 +3610,7 @@ class CandleValidationShield:
         candle_range = high_val - low_val
         
         # Prevent division by zero
-        if candle_range <= self.MIN_CANDLE_RANGE:
+        if candle_range <= self.min_candle_range:
             self.validation_failures.append(
                 f"Candle range too small: {candle_range:.8f}"
             )
@@ -3636,18 +3631,18 @@ class CandleValidationShield:
             wick_ratio = upper_wick / candle_range
             
             # THE SHIELD: Upper wick must be < 20%
-            if wick_ratio >= self.MAX_WICK_RATIO_BUY:
+            if wick_ratio >= self.max_wick_ratio_buy:
                 self.validation_failures.append(
                     f"BUY ALERT BLOCKED: upper_wick={wick_ratio*100:.2f}% "
-                    f"exceeds max {self.MAX_WICK_RATIO_BUY*100:.1f}% | "
+                    f"exceeds max {self.max_wick_ratio_buy*100:.1f}% | "
                     f"H={high_val:.5f}, C={close_val:.5f}, "
                     f"range={candle_range:.5f}"
                 )
                 return False
             
             # Log the passing wick for verification
-            logger.debug(
-                f"✅ BUY WICK PASSED: {wick_ratio*100:.2f}% < {self.MAX_WICK_RATIO_BUY*100:.1f}% | "
+            self.logger.debug(
+                f"✅ BUY WICK PASSED: {wick_ratio*100:.2f}% < {self.max_wick_ratio_buy*100:.1f}% | "
                 f"{self.pair_name}"
             )
         
@@ -3666,18 +3661,18 @@ class CandleValidationShield:
             wick_ratio = lower_wick / candle_range
             
             # THE SHIELD: Lower wick must be < 20%
-            if wick_ratio >= self.MAX_WICK_RATIO_SELL:
+            if wick_ratio >= self.max_wick_ratio_sell:
                 self.validation_failures.append(
                     f"SELL ALERT BLOCKED: lower_wick={wick_ratio*100:.2f}% "
-                    f"exceeds max {self.MAX_WICK_RATIO_SELL*100:.1f}% | "
+                    f"exceeds max {self.max_wick_ratio_sell*100:.1f}% | "
                     f"C={close_val:.5f}, L={low_val:.5f}, "
                     f"range={candle_range:.5f}"
                 )
                 return False
             
             # Log the passing wick for verification
-            logger.debug(
-                f"✅ SELL WICK PASSED: {wick_ratio*100:.2f}% < {self.MAX_WICK_RATIO_SELL*100:.1f}% | "
+            self.logger.debug(
+                f"✅ SELL WICK PASSED: {wick_ratio*100:.2f}% < {self.max_wick_ratio_sell*100:.1f}% | "
                 f"{self.pair_name}"
             )
         
