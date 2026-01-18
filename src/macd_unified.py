@@ -91,9 +91,11 @@ class Constants:
     MAX_WICK_RATIO_BUY = 0.20
     MAX_WICK_RATIO_SELL = 0.20
     MIN_CANDLE_RANGE = 0.0001
-    MAX_STALENESS_SEC = 1200
-    
-    
+    MAX_CANDLE_STALENESS_SEC = 1200
+
+
+
+
 STATIC_PRODUCTS_MAP = {
     "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
     "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
@@ -3361,7 +3363,7 @@ class CandleValidationShield:
         self.max_wick_ratio_buy = Constants.MAX_WICK_RATIO_BUY
         self.max_wick_ratio_sell = Constants.MAX_WICK_RATIO_SELL
         self.min_candle_range = Constants.MIN_CANDLE_RANGE
-        self.max_staleness_sec = Constants.MAX_STALENESS_SEC
+        self.max_staleness_sec = Constants.MAX_CANDLE_STALENESS_SEC
         
     def validate_and_shield(self, data_15m: Dict[str, np.ndarray], i15: int, reference_time: int, is_buy_alert: bool) -> Tuple[bool, Optional[str]]:
         
