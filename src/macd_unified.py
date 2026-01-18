@@ -3521,42 +3521,40 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             current_date = current_utc_dt.date()
             day_tracker_key = f"{pair_name}:last_reset_date"
 
+            last_reset_date = None
+            last_reset_date_str = None
             try:
                 last_reset_date_str = await sdb.get_metadata(day_tracker_key)
-                last_reset_date = (
-                    datetime.fromisoformat(last_reset_date_str).date() 
-                    if last_reset_date_str else None
-                )
-
-                if last_reset_date != current_date:
-                    delete_keys = []
-
-                    if cfg.ENABLE_VWAP:
-                        for alert_key in ["vwap_up", "vwap_down"]:
-                            if alert_key in ALERT_KEYS:
-                                delete_keys.append(f"{pair_name}:{ALERT_KEYS[alert_key]}")
-
-                    if cfg.ENABLE_PIVOT and piv:
-                        for level in ["P", "S1", "S2", "S3", "R1", "R2"]:
-                            alert_key = f"pivot_up_{level}"
-                            if alert_key in ALERT_KEYS:
-                                delete_keys.append(f"{pair_name}:{ALERT_KEYS[alert_key]}")
-                        for level in ["P", "S1", "S2", "R1", "R2", "R3"]:
-                            alert_key = f"pivot_down_{level}"
-                            if alert_key in ALERT_KEYS:
-                                delete_keys.append(f"{pair_name}:{ALERT_KEYS[alert_key]}")
-
-                    if delete_keys:
-                        await sdb.atomic_batch_update([], deletes=delete_keys)
-                        logger_pair.info(
-                            f"🔄 Daily reset on {current_date}. "
-                            f"Cleared {len(delete_keys)} alerts"
-                        )
-
-                    await sdb.set_metadata(day_tracker_key, current_date.isoformat())
-
+                if last_reset_date_str:
+                    # Safe parse of YYYY-MM-DD
+                    last_reset_date = datetime.fromisoformat(last_reset_date_str).date()
             except Exception as e:
-                logger_pair.warning(f"Daily reset check failed for {pair_name}: {e}")
+                logger_pair.warning(f"Failed to parse last_reset_date '{last_reset_date_str}': {e}")
+                last_reset_date = None
+
+            # Debug log
+            logger_pair.debug(
+                f"Daily reset check | stored='{last_reset_date_str}' | "
+                f"parsed={last_reset_date} | current={current_date} | "
+                f"needs_reset={last_reset_date != current_date}"
+            )
+
+            if last_reset_date != current_date:
+   
+                if delete_keys:
+                    await sdb.atomic_batch_update([], deletes=delete_keys)
+                    logger_pair.info(
+                        f"🔄 Daily reset on {current_date}. Cleared {len(delete_keys)} alerts"
+                    )
+                else:
+                    logger_pair.debug(f"🔄 Daily reset on {current_date} (no alerts to clear)")
+
+                # Save with error handling
+                try:
+                    await sdb.set_metadata(day_tracker_key, current_date.isoformat())
+                    logger_pair.debug(f"✅ Saved reset date: {current_date}")
+                except Exception as e:
+                    logger_pair.error(f"❌ Failed to save reset date: {e}")
 
         # =====================================================================
         # PHASE 10: TREND FILTER (BUY/SELL COMMON CONDITIONS)
