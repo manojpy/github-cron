@@ -1,5 +1,6 @@
 from __future__ import annotations         
 import logging
+import aot_bridge
 import os
 import sys
 import time
@@ -35,59 +36,15 @@ import contextlib
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
 
-# =========================================================================
-# REPLACE THE ENTIRE IMPORT BLOCK AROUND LINES 50-130 WITH THIS:
-# =========================================================================
-
-# 1. Try to import the bridge module
 try:
-    import aot_bridge
     AOT_AVAILABLE = True
+    AOT_IMPORT_SUCCESS = True
+    AOT_IMPORT_ERROR = None
 except ImportError as e:
     AOT_AVAILABLE = False
+    AOT_IMPORT_SUCCESS = False
+    AOT_IMPORT_ERROR = str(e)
     aot_bridge = None
-    # We will instantiate the stub later if needed
-
-# 2. Define the Stub Class (for when aot_bridge.py is missing)
-class _AotBridgeStub:
-    """Fallback stub when aot_bridge module is missing."""
-    @staticmethod
-    def is_using_aot(): return False
-    @staticmethod
-    def get_fallback_reason(): return "aot_bridge module missing"
-    @staticmethod
-    def ensure_initialized(): pass
-    
-    def __getattr__(self, name):
-        # Dynamically load from shared functions if bridge is missing
-        try:
-            import numba_functions_shared
-            return getattr(numba_functions_shared, name)
-        except ImportError:
-            raise AttributeError(f"Function {name} not found. Ensure 'numba_functions_shared.py' exists.")
-
-if not AOT_AVAILABLE:
-    aot_bridge = _AotBridgeStub()
-sanitize_array_numba = aot_bridge.sanitize_array_numba
-sanitize_array_numba_parallel = aot_bridge.sanitize_array_numba_parallel
-ema_loop = aot_bridge.ema_loop
-ema_loop_alpha = aot_bridge.ema_loop_alpha
-kalman_loop = aot_bridge.kalman_loop
-vwap_daily_loop = aot_bridge.vwap_daily_loop
-rng_filter_loop = aot_bridge.rng_filter_loop
-smooth_range = aot_bridge.smooth_range
-calculate_trends_with_state = aot_bridge.calculate_trends_with_state
-calc_mmh_worm_loop = aot_bridge.calc_mmh_worm_loop
-calc_mmh_value_loop = aot_bridge.calc_mmh_value_loop
-calc_mmh_momentum_loop = aot_bridge.calc_mmh_momentum_loop
-rolling_std = aot_bridge.rolling_std
-calc_mmh_momentum_smoothing = aot_bridge.calc_mmh_momentum_smoothing
-rolling_mean_numba = aot_bridge.rolling_mean_numba
-rolling_min_max_numba = aot_bridge.rolling_min_max_numba
-calculate_ppo_core = aot_bridge.calculate_ppo_core
-calculate_rsi_core = aot_bridge.calculate_rsi_core
-vectorized_wick_check_buy = aot_bridge.vectorized_wick_check_buy
-vectorized_wick_check_sell = aot_bridge.vectorized_wick_check_sell
 
 try:
     import orjson
@@ -477,6 +434,62 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
             logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
         return str(dt_or_ts)
 
+if not AOT_IMPORT_SUCCESS:
+    logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
+    logger.warning("Creating fallback stub - will use pure JIT Numba")
+    
+    # Create minimal stub
+    class _AotBridgeStub:
+        """Fallback stub when aot_bridge not installed"""
+        
+        @staticmethod
+        def is_using_aot():
+            return False
+        
+        @staticmethod
+        def get_fallback_reason():
+            return f"aot_bridge not installed: {AOT_IMPORT_ERROR}"
+        
+        @staticmethod
+        def ensure_initialized():
+            pass
+        
+        def __getattr__(self, name):
+            """Dynamically import from numba_functions_shared"""
+            try:
+                import numba_functions_shared
+                return getattr(numba_functions_shared, name)
+            except (AttributeError, ImportError) as e:
+                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
+    aot_bridge = _AotBridgeStub()
+    AOT_AVAILABLE = False
+    logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
+else:
+    logger.info("✅ aot_bridge imported successfully - AOT compilation active")
+
+from aot_bridge import (
+    sanitize_array_numba,
+    sanitize_array_numba_parallel,
+    ema_loop,
+    ema_loop_alpha,
+    kalman_loop,
+    vwap_daily_loop,
+    rng_filter_loop,
+    smooth_range,
+    calculate_trends_with_state, 
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    rolling_std,
+    calc_mmh_momentum_smoothing,
+    rolling_mean_numba,
+    rolling_min_max_numba,
+    calculate_ppo_core,
+    calculate_rsi_core,
+    vectorized_wick_check_buy,
+    vectorized_wick_check_sell
+)
+
 shutdown_event = asyncio.Event()
 
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
@@ -799,27 +812,26 @@ def warmup_if_needed() -> None:
         test_data = np.random.random(200).astype(np.float64) * 1000
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
-
-        _ = ema_loop(test_data, 7.0)
-        _ = ema_loop_alpha(test_data, 0.2)
-        _ = calculate_ppo_core(test_data, 7, 16, 5)
-        _ = calculate_rsi_core(test_data, 21)
-        _ = sanitize_array_numba(test_data, 0.0)
-        _ = rolling_mean_numba(test_data, test_int)
-        _ = rolling_std(test_data, test_int, 0.5)
-        _ = rolling_min_max_numba(test_data, test_int)
-        _ = kalman_loop(test_data, 10, 0.1, 0.01)
-        _ = rng_filter_loop(test_data, test_data2)
-        _ = smooth_range(test_data, 10, 2)
-        _ = calculate_trends_with_state(test_data, test_data2)
-        _ = vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
-        _ = calc_mmh_worm_loop(test_data, test_data2, len(test_data))
-        _ = calc_mmh_value_loop(test_data2, np.zeros_like(test_data2), np.ones_like(test_data2), len(test_data2))
-        _ = calc_mmh_momentum_loop(test_data2, len(test_data2))
-        _ = calc_mmh_momentum_smoothing(test_data2, len(test_data2))
-        _ = vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
-        _ = vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
-        _ = sanitize_array_numba_parallel(test_data, 0.0)
+        _ = aot_bridge.ema_loop(test_data, 7.0)
+        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
+        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
+        _ = aot_bridge.calculate_rsi_core(test_data, 21)
+        _ = aot_bridge.sanitize_array_numba(test_data, 0.0)
+        _ = aot_bridge.rolling_mean_numba(test_data, test_int)
+        _ = aot_bridge.rolling_std(test_data, test_int, 0.5)
+        _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
+        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
+        _ = aot_bridge.rng_filter_loop(test_data, test_data2)
+        _ = aot_bridge.smooth_range(test_data, 10, 2)
+        _ = aot_bridge.calculate_trends_with_state(test_data, test_data2)
+        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
+        _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
+        _ = aot_bridge.calc_mmh_value_loop(test_data2, np.zeros_like(test_data2), np.ones_like(test_data2), len(test_data2))
+        _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
+        _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))  # ADD THIS LINE
+        _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
+        _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
+        _ = aot_bridge.sanitize_array_numba_parallel(test_data, 0.0)
 
         warmup_elapsed = time.time() - warmup_start
         logger.info("✅ JIT warmup complete (%.2f s)", warmup_elapsed)
