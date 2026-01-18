@@ -633,60 +633,44 @@ def calculate_rsi_core(close, period):
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio):
-    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
     for i in range(n):
         candle_range = high_p[i] - low_p[i]
         if candle_range <= 1e-9:
-            continue  # Range too small, skip
+            continue  # Range too small
 
-        # ✅ CRITICAL: Must be green for buy
+        # Must be green for buy
         if close_p[i] <= open_p[i]:
-            continue  # Red or doji, skip
-
-        # Body top is max of open/close (for green, close is higher)
-        body_top = max(open_p[i], close_p[i])
-        upper_wick = high_p[i] - body_top
-        
-        # Validation: negative wick = corrupted data
-        if upper_wick < 0:
             continue
 
-        # Wick ratio test
+        # Upper wick = distance from close to high
+        upper_wick = high_p[i] - close_p[i]
         wick_ratio = upper_wick / candle_range
-        result[i] = wick_ratio < min_wick_ratio  # True if wick is small enough
+        result[i] = wick_ratio < min_wick_ratio
 
     return result
 
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio):
-    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
     for i in range(n):
         candle_range = high_p[i] - low_p[i]
         if candle_range <= 1e-9:
-            continue  # Range too small, skip
+            continue  # Range too small
 
-        # ✅ CRITICAL: Must be red for sell
+        # Must be red for sell
         if close_p[i] >= open_p[i]:
-            continue  # Green or doji, skip
-
-        # Body bottom is min of open/close (for red, close is lower)
-        body_bottom = min(open_p[i], close_p[i])
-        lower_wick = body_bottom - low_p[i]
-        
-        # Validation: negative wick = corrupted data
-        if lower_wick < 0:
             continue
 
-        # Wick ratio test
+        # Lower wick = distance from low to close
+        lower_wick = close_p[i] - low_p[i]
         wick_ratio = lower_wick / candle_range
-        result[i] = wick_ratio < min_wick_ratio  # True if wick is small enough
+        result[i] = wick_ratio < min_wick_ratio
 
     return result
 

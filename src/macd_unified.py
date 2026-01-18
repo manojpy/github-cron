@@ -3523,14 +3523,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if candle_range <= 1e-9:
             actual_buy_wick_ratio = 1.0
             actual_sell_wick_ratio = 1.0
-        else:
-            body_top = open_curr if open_curr > close_curr else close_curr
-            upper_wick = high_curr - body_top
-            actual_buy_wick_ratio = upper_wick / candle_range if upper_wick >= 0 else 1.0
+        else:        
+            upper_wick = high_curr - close_curr
+            actual_buy_wick_ratio = upper_wick / candle_range
 
-            body_bottom = open_curr if open_curr < close_curr else close_curr
-            lower_wick = body_bottom - low_curr
-            actual_sell_wick_ratio = lower_wick / candle_range if lower_wick >= 0 else 1.0
+            lower_wick = close_curr - low_curr
+            actual_sell_wick_ratio = lower_wick / candle_range
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
