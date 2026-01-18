@@ -32,7 +32,6 @@ def rolling_std(close, period, responsiveness):
     """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
-    # Clamp responsiveness as per logic [cite: 1]
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
 
     window_sum = 0.0
@@ -43,8 +42,7 @@ def rolling_std(close, period, responsiveness):
 
     for i in range(n):
         curr = close[i]
-        
-        # Remove old value from window [cite: 2]
+       
         if i >= period:
             old_val = queue[queue_idx]
             if not np.isnan(old_val):
@@ -52,7 +50,6 @@ def rolling_std(close, period, responsiveness):
                 window_sq_sum -= old_val * old_val
                 window_count -= 1 # [cite: 3]
         
-        # Add current value [cite: 3]
         if not np.isnan(curr):
             window_sum += curr
             window_sq_sum += curr * curr
@@ -63,14 +60,13 @@ def rolling_std(close, period, responsiveness):
      
         # Calculate Sample SD (n-1)
         if window_count < 2:
-            sd[i] = 0.0 # [cite: 4]
+            sd[i] = 0.0
         else:
             mean = window_sum / window_count
-            # Population variance formula from source [cite: 4]
             pop_variance = (window_sq_sum / window_count) - (mean * mean)
             # Convert to Sample Variance: pop_var * (n / (n-1))
             sample_variance = pop_variance * (window_count / (window_count - 1))
-            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp # [cite: 4]
+            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp
 
     return sd
 
@@ -79,7 +75,7 @@ def rolling_std(close, period, responsiveness):
 def rolling_mean_numba(data, period):
     """Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1) bars."""
     n = len(data)
-    out = np.full(n, np.nan, dtype=np.float64)  # Initialize all as NaN
+    out = np.full(n, np.nan, dtype=np.float64)
 
     if period <= 0:
         return out
