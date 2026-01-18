@@ -1756,121 +1756,42 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
 
-def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:    
+def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
+    """
+    Validate basic data structure. 
+    Specific candle validation happens in validate_candle_data_at_index().
+    """
     try:
         if data is None or not data:
             return False, "Data is None or empty"
         
         close = data.get("close")
         timestamp = data.get("timestamp")
-        
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
-        
-        current_time = get_trigger_timestamp()
-        last_candle_time = int(timestamp[-1])
-        staleness = current_time - last_candle_time
-
-        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
-
-        interval_minutes = 15
-        
-        if staleness > MAX_STALENESS:
-            return False, (
-                f"Data is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
-                f"Last candle: {format_ist_time(last_candle_time)} | "
-                f"Current: {format_ist_time(current_time)}"
-            )
-        
-        if close is None or len(close) == 0:
-            return False, "Close array is empty"
-
-        if np.any(np.isnan(close)) or np.any(close <= 0):
-            return False, "Invalid close prices (NaN or <= 0)"
-
-        if not np.all(timestamp[1:] >= timestamp[:-1]):
-            return False, "Timestamps not monotonic increasing"
-
-        if len(close) < required_len:
-            return False, f"Insufficient data: {len(close)} < {required_len}"
-
         open_arr = data.get("open")
         high_arr = data.get("high")
         low_arr = data.get("low")
         
+        # ===== BASIC STRUCTURE CHECKS (no content checks) =====
+        
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
+        
+        if close is None or len(close) == 0:
+            return False, "Close array is empty"
+        
         if open_arr is None or high_arr is None or low_arr is None:
             return False, "Missing OHLC data (open, high, or low)"
         
-        if len(open_arr) == 0 or len(high_arr) == 0 or len(low_arr) == 0:
-            return False, "OHLC arrays are empty"
+        if len(close) < required_len:
+            return False, f"Insufficient data: {len(close)} < {required_len}"
         
-        nan_mask = (
-            np.isnan(open_arr) | np.isnan(high_arr) |
-            np.isnan(low_arr) | np.isnan(close)
-        )
-        if np.any(nan_mask):
-            nan_count = np.sum(nan_mask)
-            nan_indices = np.where(nan_mask)[0]
-            return False, f"Found {nan_count} candles with NaN in OHLC (indices: {nan_indices[:3].tolist()})"
+        # ===== ARRAY STRUCTURE CONSISTENCY =====
         
-        inf_mask = (
-            np.isinf(open_arr) | np.isinf(high_arr) |
-            np.isinf(low_arr) | np.isinf(close)
-        )
-        if np.any(inf_mask):
-            inf_count = np.sum(inf_mask)
-            inf_indices = np.where(inf_mask)[0]
-            return False, f"Found {inf_count} candles with Inf in OHLC (indices: {inf_indices[:3].tolist()})"
+        if not np.all(timestamp[1:] >= timestamp[:-1]):
+            return False, "Timestamps not monotonic increasing"
         
-        valid_low_open = low_arr <= open_arr
-        valid_open_high = open_arr <= high_arr
-        valid_low_close = low_arr <= close
-        valid_close_high = close <= high_arr
-        valid_low_high = low_arr <= high_arr
-        
-        invalid_mask = ~(valid_low_open & valid_open_high & valid_low_close & valid_close_high & valid_low_high)
-        
-        if np.any(invalid_mask):
-            invalid_count = np.sum(invalid_mask)
-            invalid_indices = np.where(invalid_mask)[0]
-            
-            error_details = f"Found {invalid_count} invalid OHLC candles. Examples:\n"
-            for idx in invalid_indices[:3]:
-                error_details += (
-                    f"  Index {idx}: O={open_arr[idx]:.2f} H={high_arr[idx]:.2f} "
-                    f"L={low_arr[idx]:.2f} C={close[idx]:.2f} "
-                    f"[L≤O={valid_low_open[idx]} O≤H={valid_open_high[idx]} "
-                    f"L≤C={valid_low_close[idx]} C≤H={valid_close_high[idx]} L≤H={valid_low_high[idx]}]\n"
-                )
-            
-            return False, error_details.strip()
-        
-        if not (valid_low_open[-1] and valid_open_high[-1] and 
-                valid_low_close[-1] and valid_close_high[-1] and valid_low_high[-1]):
-            return False, (
-                f"Last candle (most critical) is invalid! "
-                f"O={open_arr[-1]:.2f} H={high_arr[-1]:.2f} "
-                f"L={low_arr[-1]:.2f} C={close[-1]:.2f}"
-            )
-        
-        if np.any(open_arr <= 0) or np.any(high_arr <= 0) or \
-           np.any(low_arr <= 0) or np.any(close <= 0):
-            return False, "Found non-positive prices in OHLC"
-        
-        if len(close) >= 2:
-            price_changes = np.abs(np.diff(close) / close[:-1]) * 100
-            extreme_changes = price_changes[price_changes > Constants.MAX_PRICE_CHANGE_PERCENT]
-            if len(extreme_changes) > 0:
-                return False, f"Extreme price spike detected: {extreme_changes.max():.2f}%"
-        
-        if len(close) >= 2:
-            time_diffs = np.diff(timestamp)
-            if len(time_diffs) > 0:
-                median_diff = np.median(time_diffs)
-                max_expected_gap = median_diff * Constants.MAX_CANDLE_GAP_MULTIPLIER
-                gaps = time_diffs[time_diffs > max_expected_gap]
-                if len(gaps) > len(time_diffs) * 0.1:
-                    return False, f"Too many suspicious candle gaps detected ({len(gaps)}/{len(time_diffs)})"
+        if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
+            return False, "OHLC arrays have mismatched lengths"
         
         return True, None
     
@@ -1911,6 +1832,110 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         ),
     )
     return last_closed_idx
+
+def validate_candle_data_at_index(
+    data: Optional[Dict[str, np.ndarray]], 
+    selected_index: int,
+    reference_time: int,
+    interval_minutes: int = 15
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate ONLY the selected candle at selected_index.
+    Ensures the selected candle is fully closed and has valid OHLC data.
+    """
+    try:
+        if data is None or not data:
+            return False, "Data is None or empty"
+        
+        close = data.get("close")
+        timestamp = data.get("timestamp")
+        open_arr = data.get("open")
+        high_arr = data.get("high")
+        low_arr = data.get("low")
+        
+        # Validate arrays exist
+        if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
+            return False, "Missing or empty OHLC/timestamp data"
+        
+        # Validate index is in range
+        if selected_index < 0 or selected_index >= len(close):
+            return False, f"Selected index {selected_index} out of range [0, {len(close)})"
+        
+        # =====================================================================
+        # VALIDATE THE SELECTED CANDLE IS FULLY CLOSED
+        # =====================================================================
+        
+        selected_candle_time = int(timestamp[selected_index])
+        current_time = reference_time
+        interval_seconds = interval_minutes * 60
+        current_period_start = (current_time // interval_seconds) * interval_seconds
+        
+        # Check: Selected candle must be BEFORE current period start
+        if selected_candle_time >= current_period_start:
+            return False, (
+                f"Selected candle is still forming! "
+                f"ts={format_ist_time(selected_candle_time)} "
+                f"current_period_start={format_ist_time(current_period_start)}"
+            )
+        
+        # =====================================================================
+        # VALIDATE SELECTED CANDLE IS NOT TOO STALE
+        # =====================================================================
+        
+        staleness = current_time - selected_candle_time
+        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
+        
+        if staleness > MAX_STALENESS:
+            return False, (
+                f"Selected candle is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
+                f"Candle: {format_ist_time(selected_candle_time)} | "
+                f"Current: {format_ist_time(current_time)}"
+            )
+        
+        # =====================================================================
+        # VALIDATE OHLC VALUES FOR SELECTED CANDLE
+        # =====================================================================
+        
+        o = open_arr[selected_index]
+        h = high_arr[selected_index]
+        l = low_arr[selected_index]
+        c = close[selected_index]
+        
+        # Check for NaN or Inf
+        if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
+            return False, f"Selected candle has NaN values: O={o} H={h} L={l} C={c}"
+        
+        if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
+            return False, f"Selected candle has Inf values: O={o} H={h} L={l} C={c}"
+        
+        # Check for non-positive prices
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return False, f"Selected candle has non-positive prices: O={o} H={h} L={l} C={c}"
+        
+        # Check OHLC relationships
+        if not (l <= o and o <= h and l <= c and c <= h and l <= h):
+            return False, (
+                f"Selected candle has invalid OHLC relationships! "
+                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} "
+                f"[L≤O={l<=o} O≤H={o<=h} L≤C={l<=c} C≤H={c<=h} L≤H={l<=h}]"
+            )
+        
+        # =====================================================================
+        # VALIDATE PRICE MOVEMENT (SELECTED CANDLE ONLY)
+        # =====================================================================
+        
+        if selected_index > 0:
+            prev_close = close[selected_index - 1]
+            if not np.isnan(prev_close):
+                price_change_pct = abs(c - prev_close) / prev_close * 100
+                if price_change_pct > Constants.MAX_PRICE_CHANGE_PERCENT:
+                    return False, f"Extreme price spike in selected candle: {price_change_pct:.2f}%"
+        
+        return True, None
+    
+    except Exception as e:
+        logger.error(f"Candle validation exception at index {selected_index}: {e}", exc_info=True)
+        return False, f"Validation error: {str(e)}"
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
@@ -4182,11 +4207,31 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             data_5m = parse_candles_to_numpy(candles.get("5"))
             data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
 
+            # ===== STEP 1: Basic structure validation =====
             v15, r15 = validate_candle_data(data_15m, required_len=cfg.RMA_200_PERIOD)
             if not v15:
-                logger_main.warning(f"Skipping {p_name}: 15m invalid ({r15})")
+                logger_main.warning(f"Skipping {p_name}: 15m structure invalid ({r15})")
                 return None
 
+            # ===== STEP 2: Select the closed candle =====
+            reference_time = get_trigger_timestamp()
+            i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
+            if i15 is None or i15 < 4:
+                logger_main.debug(f"Skipping {p_name}: no valid closed candle")
+                return None
+
+            # ===== STEP 3: Validate SELECTED candle only =====
+            v15_selected, r15_selected = validate_candle_data_at_index(
+                data_15m, 
+                i15, 
+                reference_time, 
+                interval_minutes=15
+            )
+            if not v15_selected:
+                logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
+                return None
+
+            # ===== STEP 4: Proceed to analysis =====
             return await evaluate_pair_and_alert(
                 p_name, data_15m, data_5m, data_daily,
                 state_db, telegram_queue, correlation_id, reference_time
