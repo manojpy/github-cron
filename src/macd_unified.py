@@ -3348,13 +3348,7 @@ def check_candle_quality_with_reason(open_val: float, high_val: float, low_val: 
         return False, f"Error: {str(e)}"
 
 class CandleValidationShield:
-    """
-    IMPENETRABLE validation shield for candle integrity.
-    Prevents ALL alerts if candle doesn't meet strict criteria.
     
-    Philosophy: If we're not 100% sure it's a valid 15m closed candle
-    with acceptable wick ratio, we don't alert. Period.
-    """
     
     def __init__(self, pair_name: str, logger_obj: logging.Logger):
         self.pair_name = pair_name
@@ -3363,20 +3357,14 @@ class CandleValidationShield:
         self.last_validated_ts = 0
         self.validation_failures = []
         
-    def validate_and_shield(
-        self,
-        data_15m: Dict[str, np.ndarray],
-        i15: int,
-        reference_time: int,
-        is_buy_alert: bool
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        FINAL gatekeeper for all alerts.
+        # Reference Constants class for hard limits
+        self.max_wick_ratio_buy = Constants.MAX_WICK_RATIO_BUY
+        self.max_wick_ratio_sell = Constants.MAX_WICK_RATIO_SELL
+        self.min_candle_range = Constants.MIN_CANDLE_RANGE
+        self.max_staleness_sec = Constants.MAX_CANDLE_STALENESS_SEC
         
-        Returns: (is_valid, error_reason)
-        - (True, None) = Alert is safe to fire
-        - (False, reason) = Alert must be blocked
-        """
+    def validate_and_shield(self, data_15m: Dict[str, np.ndarray], i15: int, reference_time: int, is_buy_alert: bool) -> Tuple[bool, Optional[str]]:
+        
         self.validation_failures = []
         
         # ===== LAYER 1: Basic Array Integrity =====
