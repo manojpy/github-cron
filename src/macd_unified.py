@@ -4150,8 +4150,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
 logger_main = logging.getLogger("macd_bot.worker_pool")
     
-async def guarded_eval(task_data):
-    
+async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time):  
     p_name, candles = task_data
     
     # ===== EXCEPTION SAFETY: Initialize all variables =====
