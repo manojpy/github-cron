@@ -3255,8 +3255,7 @@ def check_common_conditions(open_val, high_val, low_val, close_val, is_buy) -> b
     except Exception:
         return False
 
-
-def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_buy, precomputed_ratio: Optional[float] = None  # NEW PARAMETER) -> Tuple[bool, str]:
+def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_buy, precomputed_ratio: Optional[float] = None) -> Tuple[bool, str]:
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
