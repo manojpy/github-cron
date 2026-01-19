@@ -31,9 +31,7 @@ jobs:
       packages: read
 
     steps:
-      # ========================================================================
       # PHASE 1: SETUP & VALIDATION
-      # ========================================================================
       - name: 🔥 Checkout Config Only
         uses: actions/checkout@v4
         with:
@@ -66,7 +64,6 @@ jobs:
           FILE_SIZE=$(wc -c < config_macd.json)
           echo "   Size: $FILE_SIZE bytes"
           
-          # Validate JSON
           if python -m json.tool config_macd.json > /dev/null 2>&1; then
             echo "✅ Config is valid JSON"
           else
@@ -81,16 +78,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Pull Latest AOT Image (BuildKit)
+      - name: 🐳 Pull Latest AOT Image
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          echo "🔦 Pulling AOT image with BuildKit..."
+          echo "🔦 Pulling AOT image..."
           START_TIME=$(date +%s)
           export DOCKER_BUILDKIT=1
           if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             PULL_TIME=$(( $(date +%s) - START_TIME ))
             echo "✅ Image pulled in ${PULL_TIME}s"
-            docker inspect --format='Size: {{.Size | printf "%d" | div 1000000}}MB' "$IMAGE_REF"
           else
             echo "❌ Failed to pull image"
             exit 1
@@ -115,9 +111,7 @@ jobs:
           fi
           echo "✅ All required secrets configured"
 
-      # ========================================================================
       # PHASE 2: BOT EXECUTION
-      # ========================================================================
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 7
@@ -171,9 +165,7 @@ jobs:
           fi
           echo "✅ Bot completed successfully in ${DURATION}s"
 
-      # ========================================================================
       # PHASE 3: RESULTS ANALYSIS
-      # ========================================================================
       - name: 📊 Parse Execution Results
         if: always()
         id: results
@@ -237,9 +229,7 @@ jobs:
             echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
           fi
 
-      # ========================================================================
       # PHASE 4: ARTIFACT UPLOAD
-      # ========================================================================
       - name: 📦 Upload Execution Logs
         if: failure()
         uses: actions/upload-artifact@v4

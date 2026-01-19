@@ -1,7 +1,3 @@
-================================================================================
-# FILE 1: .github/workflows/build.yml
-================================================================================
-
 name: Build AOT Image (Optimized Hybrid)
 
 on:
@@ -36,9 +32,7 @@ jobs:
       security-events: write
 
     steps:
-      # ========================================================================
       # PHASE 1: SETUP
-      # ========================================================================
       - name: 🔥 Checkout repository
         uses: actions/checkout@v4
         with:
@@ -74,9 +68,7 @@ jobs:
             org.opencontainers.image.description=AOT-compiled trading alert bot
             maintainer=${{ github.actor }}
 
-      # ========================================================================
       # PHASE 2: BUILD & VERIFY
-      # ========================================================================
       - name: 🔨 Build & Push Docker Image
         id: build
         uses: docker/build-push-action@v6
@@ -147,7 +139,7 @@ jobs:
             fi
           done
           
-          # Verify aot_build.py is NOT in image (only needed for build)
+          # Verify aot_build.py is NOT in image
           if docker run --rm --platform linux/amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             test -f "/app/src/aot_build.py"; then
@@ -157,9 +149,7 @@ jobs:
             echo "✅ Correct: aot_build.py not in production image"
           fi
 
-      # ========================================================================
       # PHASE 3: SECURITY SCANNING
-      # ========================================================================
       - name: 🛡️ Run Trivy Vulnerability Scan
         if: github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
         uses: aquasecurity/trivy-action@0.28.0
@@ -201,9 +191,7 @@ jobs:
             echo "ℹ️ Trivy scan skipped or results unavailable" >> $GITHUB_STEP_SUMMARY
           fi
 
-      # ========================================================================
       # PHASE 4: BUILD SUMMARY
-      # ========================================================================
       - name: 📋 Generate Build Summary
         if: always()
         run: |
@@ -222,9 +210,7 @@ jobs:
           echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      # ========================================================================
       # PHASE 5: CLEANUP
-      # ========================================================================
       - name: 🧹 Cleanup Artifacts
         if: always()
         run: |
