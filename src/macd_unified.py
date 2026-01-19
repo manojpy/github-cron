@@ -4288,10 +4288,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
     eval_start = time.time()
     
-    
     results = await asyncio.gather(
-        *[guarded_eval(t) for t in valid_tasks],
-        return_exceptions=True  # ✅ IMPORTANT: Catch exceptions, don't crash
+        *[guarded_eval(t, state_db, telegram_queue, correlation_id, 
+        reference_time) for t in valid_tasks],
+        return_exceptions=True
     )
     
     eval_elapsed = time.time() - eval_start
