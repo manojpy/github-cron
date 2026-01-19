@@ -91,19 +91,21 @@ class Constants:
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
     
+# This is now ONLY used for offline testing/debugging
+# DO NOT rely on this for production trading
 STATIC_PRODUCTS_MAP = {
-    "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
-    "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
-    "AVAXUSD": {"id": 262, "symbol": "AVAXUSDT", "contract_type": "perpetual_futures"},
-    "BCHUSD": {"id": 186, "symbol": "BCHUSDT", "contract_type": "perpetual_futures"},
-    "XRPUSD": {"id": 141, "symbol": "XRPUSDT", "contract_type": "perpetual_futures"},
-    "BNBUSD": {"id": 275, "symbol": "BNBUSDT", "contract_type": "perpetual_futures"},
-    "LTCUSD": {"id": 163, "symbol": "LTCUSDT", "contract_type": "perpetual_futures"},
-    "DOTUSD": {"id": 228, "symbol": "DOTUSDT", "contract_type": "perpetual_futures"},
-    "ADAUSD": {"id": 142, "symbol": "ADAUSDT", "contract_type": "perpetual_futures"},
-    "SUIUSD": {"id": 666, "symbol": "SUIUSDT", "contract_type": "perpetual_futures"},
-    "AAVEUSD": {"id": 227, "symbol": "AAVEUSDT", "contract_type": "perpetual_futures"},
-    "SOLUSD": {"id": 143, "symbol": "SOLUSDT", "contract_type": "perpetual_futures"},
+    "BTCUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "ETHUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "AVAXUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "BCHUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "XRPUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "BNBUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "LTCUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "DOTUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "ADAUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "SUIUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "AAVEUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
+    "SOLUSD": {"id": 999, "symbol": "INVALID", "contract_type": "perpetual_futures"},
 }
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
@@ -1937,29 +1939,54 @@ def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minu
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
+    
     if not api_products or not api_products.get("result"):
+        logger.warning("build_products_map_from_api_result: No products in API response")
         return products_map
+    
     valid_pattern = CompiledPatterns.VALID_SYMBOL
+    
     for p in api_products["result"]:
         try:
             symbol = p.get("symbol", "")
             if not valid_pattern.match(symbol):
                 continue
+            
+            # Normalize symbol to match configured pairs
+            # e.g., "BTCUSDT" -> "BTCUSD", "BTC_USDT" -> "BTCUSD"
             symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
-            if p.get("contract_type") == "perpetual_futures":
-                for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
-                        products_map[pair_name] = {
-                            "id": p.get("id"),
-                            "symbol": p.get("symbol"),
-                            "contract_type": p.get("contract_type")
-                        }
-                        break
-        except Exception:
-            pass
+            
+            # Only include perpetual futures
+            if p.get("contract_type") != "perpetual_futures":
+                continue
+            
+            # Match to configured pairs
+            for pair_name in cfg.PAIRS:
+                if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+                    products_map[pair_name] = {
+                        "id": p.get("id"),
+                        "symbol": p.get("symbol"),
+                        "contract_type": p.get("contract_type")
+                    }
+                    if cfg.DEBUG_MODE:
+                        logger.debug(
+                            f"Mapped {pair_name}: symbol={p.get('symbol')}, id={p.get('id')}"
+                        )
+                    break
+        
+        except Exception as e:
+            logger.error(f"Error processing product {p}: {e}")
+            continue
+    
+    if not products_map:
+        logger.warning("build_products_map_from_api_result: No matching products found for configured pairs")
+    else:
+        logger.info(f"✅ Built products map: {len(products_map)} pairs matched")
+    
     return products_map
 
-class RedisStateStore:
+
+class RedisStateStore:  
     DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
     local ttl = tonumber(ARGV[1])
@@ -1971,17 +1998,8 @@ class RedisStateStore:
     end
     """
 
-    POOL_MAX_AGE_SECONDS = 3600
-    SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0
-
-    _global_pools: ClassVar[Dict[str, Optional[redis.Redis]]] = {}
-    _pool_healthy: ClassVar[Dict[str, bool]] = {}
-    _pool_created_at: ClassVar[Dict[str, float]] = {}
-    _pool_reuse_count: ClassVar[Dict[str, int]] = {}
-    _pool_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _script_reload_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-
     def __init__(self, redis_url: str):
+        
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
 
@@ -1995,7 +2013,6 @@ class RedisStateStore:
 
         self.degraded = False
         self.degraded_alerted = False
-        self._connection_attempts = 0
         self._dedup_script_sha: Optional[str] = None
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
@@ -2006,199 +2023,149 @@ class RedisStateStore:
                 f"Metadata TTL: 7d"
             )
 
-    async def _attempt_connect(self, timeout: float = 5.0) -> bool:
-        """Attempt to connect to Redis with retry logic."""
-        try:
-            self._redis = redis.from_url(
-                self.redis_url,
-                socket_connect_timeout=timeout,
-                socket_timeout=timeout,
-                retry_on_timeout=True,
-                max_connections=32,
-                decode_responses=True,
-            )
-
-            ok = await self._ping_with_retry(timeout)
-            if not ok:
-                raise RedisConnectionError("ping failed after retries")
-
-            logger.info("Redis connected")
-            self.degraded = False
-            self.degraded_alerted = False
-            self._connection_attempts = 0
-
-            async with RedisStateStore._pool_lock:
-                existing_pool = RedisStateStore._global_pools.get(self.redis_url)
-                if existing_pool and not existing_pool.closed:
-                    await self._redis.aclose()
-                    self._redis = existing_pool
-                    logger.debug("Using pool created by another coroutine")
-                else:
-                    RedisStateStore._global_pools[self.redis_url] = self._redis
-                    RedisStateStore._pool_healthy[self.redis_url] = True
-                    RedisStateStore._pool_created_at[self.redis_url] = time.time()
-                    RedisStateStore._pool_reuse_count[self.redis_url] = 0
-                    if cfg.DEBUG_MODE:
-                        logger.debug("Redis connection saved to per-URL pool")
-
-            try:
-                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                if cfg.DEBUG_MODE:
-                    logger.debug("Loaded Redis Lua script for alert deduplication")
-            except Exception as e:
-                logger.warning(f"Failed to load Lua script (will fallback): {e}")
-                self._dedup_script_sha = None
-            return True
-
-        except Exception as exc:
-            logger.error(f"Redis connection attempt failed: {exc}")
-            if self._redis:
-                try:
-                    await self._redis.aclose()
-                except Exception:
-                    pass
-                self._redis = None
-            return False
-
     async def connect(self, timeout: float = 5.0) -> None:
+        # ===== EARLY EXIT: Already connected =====
+        if self._redis is not None and not self._redis.closed:
+            logger.debug("Redis already connected")
+            return
         
-        pool_reused = False
-
-        async with RedisStateStore._pool_lock:
-            pool = RedisStateStore._global_pools.get(self.redis_url)
-            healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
-
-            if pool and healthy:
-                pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
-
-                if pool_age > self.POOL_MAX_AGE_SECONDS:
-                    logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
-                    RedisStateStore._pool_healthy[self.redis_url] = False
+        logger.debug("Connecting to Redis...")
+        
+        # ===== RETRY LOOP =====
+        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
+            try:
+                # Attempt to create connection
+                self._redis = redis.from_url(
+                    self.redis_url,
+                    socket_connect_timeout=timeout,
+                    socket_timeout=timeout,
+                    retry_on_timeout=True,
+                    max_connections=16,
+                    decode_responses=True,
+                )
+                
+                # Verify connection works with a ping
+                ping_ok = await asyncio.wait_for(self._redis.ping(), timeout=2.0)
+                
+                if ping_ok:
+                    logger.info("✅ Redis connected")
+                    self.degraded = False
+                    self.degraded_alerted = False
+                    
+                    # Try to load Lua script for alert deduplication
                     try:
-                        await pool.aclose()
+                        self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                        if cfg.DEBUG_MODE:
+                            logger.debug("✅ Loaded Redis Lua script for deduplication")
+                    except Exception as e:
+                        logger.warning(f"Failed to load Lua script (will fallback): {e}")
+                        self._dedup_script_sha = None
+                    
+                    return  # ← SUCCESS: Connected and ready
+                else:
+                    raise RedisConnectionError("Ping returned False")
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"Redis timeout (attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES})")
+                if self._redis:
+                    try:
+                        await self._redis.aclose()
                     except Exception:
                         pass
-                    RedisStateStore._global_pools[self.redis_url] = None
-                else:
-                    try:
-                        await asyncio.wait_for(pool.ping(), timeout=1.0)
-                        self._redis = pool
-                        RedisStateStore._pool_reuse_count[self.redis_url] = \
-                            RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
-                    
-                        if not self._dedup_script_sha:
-                            try:
-                                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                            except Exception as e:
-                                if cfg.DEBUG_MODE:
-                                    logger.debug(f"Lua script load failed: {e}")
+                self._redis = None
             
-                        self.degraded = False
-
-                        pool_reused = True
-                        return
-
-                    except Exception as e:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"Pool health check failed: {e}, creating new pool")
-                        RedisStateStore._pool_healthy[self.redis_url] = False
-                        pool_reused = False
-        
-        if pool_reused:
-            return
-
-        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-            if await self._attempt_connect(timeout):
-                try:
-                    ping_ok = await asyncio.wait_for(self._redis.ping(), timeout=1.0)
-                    if ping_ok:
-                        max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
-                        logger.info(f"✅ Redis connected ({max_conn} max)")
-                        self.degraded = False
-                        self.degraded_alerted = False
-                        return
-                except asyncio.TimeoutError:
-                    logger.warning("Redis ping timeout, retrying...")
-                    self._redis = None
-                except Exception as e:
-                    logger.warning(f"Redis ping failed: {e}")
-                    self._redis = None
-
+            except (RedisConnectionError, redis.ConnectionError) as e:
+                logger.warning(f"Redis connection error (attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}): {e}")
+                if self._redis:
+                    try:
+                        await self._redis.aclose()
+                    except Exception:
+                        pass
+                self._redis = None
+            
+            except Exception as e:
+                logger.error(f"Unexpected error connecting to Redis (attempt {attempt}/{cfg.REDIS_CONNECTION_RETRIES}): {e}")
+                if self._redis:
+                    try:
+                        await self._redis.aclose()
+                    except Exception:
+                        pass
+                self._redis = None
+            
+            # ===== BACKOFF BETWEEN RETRIES =====
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
                 delay = cfg.REDIS_RETRY_DELAY * attempt
                 logger.warning(f"Retrying Redis connection in {delay}s...")
                 await asyncio.sleep(delay)
-
-        # All retries failed
+        
+        # ===== ALL RETRIES FAILED =====
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
-        if self._redis:
-            try:
-                await self._redis.aclose()
-            except Exception:
-                pass
         self._redis = None
-
+        
+        self._handle_degraded_mode()
+    
+    def _handle_degraded_mode(self) -> None:
+        """
+        Handle Redis degradation gracefully.
+        
+        When Redis is down:
+        - Alert deduplication: DISABLED (may get duplicates)
+        - State persistence: DISABLED (alerts reset each run)
+        - Trading alerts: STILL ACTIVE (core functionality preserved)
+        """
         logger.warning("""
 🚨 REDIS DEGRADED MODE ACTIVE:
 - Alert deduplication:  DISABLED (may get duplicates)
 - State persistence:    DISABLED (alerts reset each run)
 - Trading alerts:       STILL ACTIVE (core functionality preserved)
-""")
-
+        """)
+        
         if cfg.FAIL_ON_REDIS_DOWN:
-            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
+            raise RedisConnectionError("Redis unavailable and FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
-        """Close Redis connection (called manually in finally block)."""
-        self._redis = None
-
-    @classmethod
-    async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
-        """Shutdown global connection pool(s)."""
-        async with cls._pool_lock:
-            urls = [redis_url] if redis_url else list(cls._global_pools.keys())
-            for url in urls:
-                pool = cls._global_pools.get(url)
-                if pool:
-                    try:
-                        pool_age = time.time() - cls._pool_created_at.get(url, 0.0)
-                        reuse_count = cls._pool_reuse_count.get(url, 0)
-                        logger.debug(f"Shutting down Redis pool | url={url} | Age: {pool_age:.1f}s | Reuses: {reuse_count}")
-
-                        await pool.aclose()
-                        await asyncio.sleep(0.25)  # Allow cleanup
-
-                    except Exception as e:
-                        logger.error(f"Error shutting down Redis pool {url}: {e}")
-
-                cls._global_pools.pop(url, None)
-                cls._pool_healthy.pop(url, None)
-                cls._pool_created_at.pop(url, None)
-                cls._pool_reuse_count.pop(url, None)
-            
+        """Close Redis connection."""
+        if self._redis and not self._redis.closed:
+            try:
+                await asyncio.wait_for(self._redis.aclose(), timeout=2.0)
+                logger.debug("✅ Redis closed")
+            except asyncio.TimeoutError:
+                logger.error("Timeout closing Redis")
+            except Exception as e:
+                logger.error(f"Error closing Redis: {e}")
+            finally:
+                self._redis = None
+       
     async def _ping_with_retry(self, timeout: float) -> bool:
         """Ping Redis to verify connectivity."""
         result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
         return bool(result)
 
     async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):
-        """Execute Redis operation with timeout and error handling."""
+        
         if not self._redis:
             return None
+        
         try:
             coro = fn()
             result = await asyncio.wait_for(coro, timeout=timeout)
             return parser(result) if parser else result
-        except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
-            logger.error(f"Redis {op_name} failed: {e}")
+        
+        except asyncio.TimeoutError as e:
+            logger.error(f"Redis {op_name} timeout: {e}")
             return None
+        
+        except (RedisConnectionError, RedisError) as e:
+            logger.error(f"Redis {op_name} error: {e}")
+            return None
+        
         except Exception as e:
-            logger.error(f"Failed to {op_name}: {e}")
+            logger.error(f"Redis {op_name} failed: {e}")
             return None
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
-        """Get state from Redis."""
+        
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.state_prefix}{key}"),
             timeout,
@@ -2206,11 +2173,18 @@ class RedisStateStore:
             parser=lambda r: json_loads(r) if r else None,
         )
 
-    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
-        """Set state in Redis."""
+    async def set(
+        self,
+        key: str,
+        state: Optional[Any],
+        ts: Optional[int] = None,
+        timeout: float = 2.0
+    ) -> None:
+        
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
+        
         await self._safe_redis_op(
             lambda: self._redis.set(
                 redis_key,
@@ -2222,7 +2196,7 @@ class RedisStateStore:
         )
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
-        """Get metadata from Redis."""
+        
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.meta_prefix}{key}"),
             timeout,
@@ -2230,8 +2204,20 @@ class RedisStateStore:
             parser=lambda r: r if r else None,
         )
 
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
-        """Set metadata in Redis."""
+    async def set_metadata(
+        self,
+        key: str,
+        value: str,
+        timeout: float = 2.0
+    ) -> None:
+        """
+        Set metadata in Redis.
+        
+        Args:
+            key: Metadata key (without prefix)
+            value: Metadata value (string)
+            timeout: Operation timeout
+        """
         await self._safe_redis_op(
             lambda: self._redis.set(
                 f"{self.meta_prefix}{key}",
@@ -2243,9 +2229,9 @@ class RedisStateStore:
         )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        """Check if alert was recently sent (deduplication)."""
+        
         if self.degraded:
-            return True
+            return True  # Dedup disabled, always send
 
         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
@@ -2261,16 +2247,29 @@ class RedisStateStore:
                 timeout=1.0
             )
             should_send = bool(result)
+            
             if cfg.DEBUG_MODE and not should_send:
                 logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
+            
             return should_send
 
         except Exception as e:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
-            return True
+            return True  # On error, send anyway
 
-    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
+    async def batch_check_recent_alerts(
+        self,
+        checks: List[Tuple[str, str, int]]
+    ) -> Dict[str, bool]:
+        """
+        Batch check multiple alerts for deduplication.
         
+        Args:
+            checks: List of (pair, alert_key, timestamp) tuples
+        
+        Returns:
+            Dict mapping "{pair}:{alert_key}" -> bool (should_send)
+        """
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2285,19 +2284,19 @@ class RedisStateStore:
                     composite_key = f"{pair}:{alert_key}"
                     keys_map[recent_key] = composite_key
                     
-                    # NX=True means "only set if key doesn't exist"
-                    # Returns True if key was set, False if key already existed
+                    # NX=True: Set only if key doesn't exist
+                    # Returns True if set (new), False if already existed (duplicate)
                     pipe.set(
-                        recent_key, 
-                        "1", 
-                        nx=True, 
+                        recent_key,
+                        "1",
+                        nx=True,
                         ex=Constants.ALERT_DEDUP_WINDOW_SEC
                     )
 
                 # Execute all SET commands atomically
                 results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
 
-            # Build output: True if SET succeeded (new key), False if already existed (duplicate)
+            # Build output: True if SET succeeded (new), False if already existed (duplicate)
             output: Dict[str, bool] = {}
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
                 should_send = bool(results[idx]) if idx < len(results) else True
@@ -2318,8 +2317,23 @@ class RedisStateStore:
             logger.error(f"batch_check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
+    async def batch_get_and_set_alerts(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        updates: List[Tuple[str, Any, Optional[int]]]
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Batch get alert states and set new ones atomically.
         
+        Args:
+            pair: Pair name
+            alert_keys: List of alert keys to retrieve
+            updates: List of (key, state, timestamp) tuples to set
+        
+        Returns:
+            Dict mapping alert_key -> previous state dict (or None)
+        """
         if not self._redis or self.degraded:
             return {k: None for k in alert_keys}
 
@@ -2343,8 +2357,7 @@ class RedisStateStore:
                         logger.error(f"Failed to serialize state for {full_key}: {e}")
                         continue
                 
-                    # full_key is expected to be like "pair:alert_key"
-                    # Ensure it has the state prefix
+                    # Ensure key has proper prefix
                     if not full_key.startswith(self.state_prefix):
                         redis_key = f"{self.state_prefix}{full_key}"
                     else:
@@ -2408,8 +2421,25 @@ class RedisStateStore:
             logger.error(f"batch_get_and_set_alerts failed for {pair}: {e}")
             return {k: None for k in alert_keys}
 
-    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """Atomically evaluate batch of alerts with pipeline execution."""
+    async def atomic_eval_batch(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        state_updates: List[Tuple[str, Any, Optional[int]]],
+        dedup_checks: List[Tuple[str, str, int]]
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """
+        Atomically evaluate batch of alerts with pipeline execution.
+        
+        Args:
+            pair: Pair name
+            alert_keys: List of alert keys
+            state_updates: List of (key, state, ts) to persist
+            dedup_checks: List of (pair, alert_key, ts) for deduplication
+        
+        Returns:
+            Tuple of (previous_states, dedup_results) dicts
+        """
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
@@ -2427,7 +2457,7 @@ class RedisStateStore:
                 f"Degrading to batch_get_and_set_alerts + batch_check_recent_alerts"
             )
             try:
-                # FIXED: Use batch_get_and_set_alerts for atomic get+set
+                # Fallback: Use batch methods instead of pipeline
                 prev_raw = await asyncio.wait_for(
                     self.batch_get_and_set_alerts(pair, alert_keys, state_updates),
                     timeout=2.0
@@ -2438,7 +2468,6 @@ class RedisStateStore:
                     env = prev_raw.get(k)
                     prev_states[k] = isinstance(env, dict) and env.get("state") == "ACTIVE"
 
-                # FIXED: Use batch_check_recent_alerts for deduplication
                 dedup_results = await asyncio.wait_for(
                     self.batch_check_recent_alerts(dedup_checks),
                     timeout=2.0
@@ -2458,8 +2487,30 @@ class RedisStateStore:
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             return empty_prev, empty_dedup
 
-    async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    async def _pipeline_ops(
+        self,
+        pair: str,
+        alert_keys: List[str],
+        state_updates: List[Tuple[str, Any, Optional[int]]],
+        dedup_checks: List[Tuple[str, str, int]]
+    ) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """
+        Execute atomic pipeline operations for alert evaluation.
         
+        Pipeline atomically:
+        1. MGET all previous alert states
+        2. SET all new alert states
+        3. SET all dedup keys (NX)
+        
+        Args:
+            pair: Pair name
+            alert_keys: List of alert keys
+            state_updates: List of (key, state, ts) updates
+            dedup_checks: List of (pair, alert_key, ts) for dedup
+        
+        Returns:
+            Tuple of (prev_states, dedup_results) dicts
+        """
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
@@ -2575,8 +2626,23 @@ class RedisStateStore:
                 {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
             )
 
-    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-        """Atomically update multiple state entries."""
+    async def atomic_batch_update(
+        self,
+        updates: List[Tuple[str, Any, Optional[int]]],
+        deletes: Optional[List[str]] = None,
+        timeout: float = 4.0
+    ) -> bool:
+        """
+        Atomically update multiple state entries.
+        
+        Args:
+            updates: List of (key, state, ts) to update
+            deletes: List of keys to delete
+            timeout: Operation timeout
+        
+        Returns:
+            bool: True if successful, False if failed
+        """
         if self.degraded or not self._redis:
             return False
 
@@ -2608,9 +2674,11 @@ class RedisStateStore:
 
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
+        
         except asyncio.TimeoutError:
             logger.error("Atomic batch update timeout")
             return False
+        
         except Exception as e:
             logger.error(f"Atomic batch update failed: {e}")
             return False
@@ -3811,7 +3879,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 trigger = False
                 try:
-                    # ✅ USE THE CHECK_FN LIKE ALL OTHER ALERTS
+                    # �� USE THE CHECK_FN LIKE ALL OTHER ALERTS
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
         
                     if cfg.DEBUG_MODE:
@@ -4149,7 +4217,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pass
 
 logger_main = logging.getLogger("macd_bot.worker_pool")
-    
+     
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time):  
     p_name, candles = task_data
     
@@ -4391,58 +4459,48 @@ async def run_once() -> bool:
         # STEP 2: LOAD/CACHE PRODUCTS
         # =====================================================================
         
-        USE_STATIC_MAP = True
-        STATIC_MAP_REFRESH_DAYS = 7
+        # ALWAYS check cache first, ALWAYS validate with fresh API data
+        PRODUCTS_CACHE_TTL = cfg.PRODUCTS_CACHE_TTL  # Use existing config
+
+        logger_run.debug("📥 Checking products cache...")
         now = time.time()
 
-        last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
-        days_since_check = (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400 if last_check_ts else 9999
+        cache_expired = PRODUCTS_CACHE.get("until", 0.0) <= now
+        cache_empty = PRODUCTS_CACHE.get("data") is None
 
-        if USE_STATIC_MAP and days_since_check < STATIC_MAP_REFRESH_DAYS:
-            products_map = STATIC_PRODUCTS_MAP.copy()
-            logger_run.info(f"⚡ Using static map (validated {days_since_check:.1f}d ago)")
-
-        elif not PRODUCTS_CACHE.get("data"):
-            last_fetch_ts = PRODUCTS_CACHE.get("fetched_at", 0.0)
-            reason = "never checked" if last_fetch_ts <= 0 else f"last checked {(now - last_fetch_ts) / 86400:.1f}d ago"
-
-            logger_run.debug(f"📢 Fetching products from API ({reason})")
-
+        if cache_empty or cache_expired:
+            logger_run.info("📡 Fetching fresh products from API...")
+    
             temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
             prod_resp = await temp_fetcher.fetch_products()
+    
             if not prod_resp:
-                logger_run.error("❌ Failed to fetch products map - aborting run")
-                return False
-
-            now = time.time()
+                logger_run.critical(
+                    "❌ FATAL: Could not fetch products from API. "
+                    "Will not fall back to stale hardcoded data to prevent trading wrong contracts."
+                )
+                return False  # Exit rather than use wrong data
+    
+            # Cache the fresh data
             PRODUCTS_CACHE["data"] = prod_resp
             PRODUCTS_CACHE["fetched_at"] = now
-            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
-            clear_stale_products_cache()
-            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
-            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
-
-            products_map = build_products_map_from_api_result(prod_resp)
-
+            PRODUCTS_CACHE["until"] = now + PRODUCTS_CACHE_TTL
+    
+            logger_run.info(f"✅ Fresh products cached for {PRODUCTS_CACHE_TTL/3600:.1f} hours")
         else:
-            cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
-            prod_resp = PRODUCTS_CACHE["data"]
-            products_map = build_products_map_from_api_result(prod_resp)
+            cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
+            logger_run.info(f"♻️ Using cached products (fetched {cache_age/3600:.1f}h ago)")
 
-        # Validate products_map (CRITICAL)
-        if products_map is None:
-            logger_run.error("❌ Products map is None after initialization")
+        # Build map from whatever source we have
+        prod_resp = PRODUCTS_CACHE.get("data")
+        if not prod_resp:
+            logger_run.critical("❌ No products data available")
             return False
 
-        pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
+        products_map = build_products_map_from_api_result(prod_resp)
 
-        if len(pairs_to_process) < len(cfg.PAIRS):
-            missing = set(cfg.PAIRS) - set(pairs_to_process)
-            logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
-
-        if not pairs_to_process:
-            logger_run.error("❌ No valid pairs to process - aborting run")
+        if not products_map:
+            logger_run.critical("❌ Failed to build products map")
             return False
 
         # =====================================================================
@@ -4694,17 +4752,6 @@ async def run_once() -> bool:
                 logger_run.error("Timeout closing Redis")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
-
-        # 4. Shutdown global Redis pool
-        try:
-            await asyncio.wait_for(
-                RedisStateStore.shutdown_global_pool(),
-                timeout=5.0
-            )
-        except asyncio.TimeoutError:
-            logger_run.error("Timeout shutting down Redis pool")
-        except Exception as e:
-            logger_run.error(f"Error shutting down Redis pool: {e}")
 
         # 5. Force garbage collection after Redis (frees memory)
         gc.collect()
