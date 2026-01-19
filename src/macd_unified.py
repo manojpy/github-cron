@@ -2136,6 +2136,12 @@ class RedisStateStore:
                 logger.error(f"Error closing Redis: {e}")
             finally:
                 self._redis = None
+
+    @classmethod
+    async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
+        
+        logger.debug("Redis pool shutdown (no global pool to shutdown)")
+        return
        
     async def _ping_with_retry(self, timeout: float) -> bool:
         """Ping Redis to verify connectivity."""
@@ -4752,6 +4758,18 @@ async def run_once() -> bool:
                 logger_run.error("Timeout closing Redis")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
+
+        # 4. Shutdown global Redis pool
+        try:
+            await asyncio.wait_for(
+                RedisStateStore.shutdown_global_pool(),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger_run.error("Timeout shutting down Redis pool")
+        except Exception as e:
+            logger_run.error(f"Error shutting down Redis pool: {e}")
+
 
         # 5. Force garbage collection after Redis (frees memory)
         gc.collect()
