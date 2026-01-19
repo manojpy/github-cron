@@ -32,15 +32,47 @@ jobs:
 
     steps:
       # ========================================================================
-      # PHASE 1: SETUP
+      # PHASE 1: SETUP & VALIDATION
       # ========================================================================
-      - name: 📥 Checkout Config Only
+      - name: 🔥 Checkout Config Only
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             config_macd.json
           sparse-checkout-cone-mode: false
           fetch-depth: 1
+
+      - name: ✅ Verify Config File Exists
+        run: |
+          if [ ! -f "config_macd.json" ]; then
+            echo "❌ ERROR: config_macd.json not found in repo root"
+            echo ""
+            echo "Please create config_macd.json with your settings and commit it."
+            echo "Example structure:"
+            cat << 'EOF'
+          {
+            "TELEGRAM_BOT_TOKEN": "your_token_here",
+            "TELEGRAM_CHAT_ID": "your_chat_id_here",
+            "REDIS_URL": "redis://user:pass@host:port",
+            "DELTA_API_BASE": "https://api.example.com",
+            "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD"],
+            "DRY_RUN_MODE": false
+          }
+          EOF
+            exit 1
+          fi
+          
+          echo "✅ Config file found"
+          FILE_SIZE=$(wc -c < config_macd.json)
+          echo "   Size: $FILE_SIZE bytes"
+          
+          # Validate JSON
+          if python -m json.tool config_macd.json > /dev/null 2>&1; then
+            echo "✅ Config is valid JSON"
+          else
+            echo "❌ Config is not valid JSON - please fix syntax errors"
+            exit 1
+          fi
 
       - name: 🔐 Log in to GHCR
         uses: docker/login-action@v3
@@ -52,12 +84,13 @@ jobs:
       - name: 🐳 Pull Latest AOT Image (BuildKit)
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          echo "📦 Pulling AOT image with BuildKit..."
+          echo "🔦 Pulling AOT image with BuildKit..."
           START_TIME=$(date +%s)
           export DOCKER_BUILDKIT=1
           if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
             PULL_TIME=$(( $(date +%s) - START_TIME ))
             echo "✅ Image pulled in ${PULL_TIME}s"
+            docker inspect --format='Size: {{.Size | printf "%d" | div 1000000}}MB' "$IMAGE_REF"
           else
             echo "❌ Failed to pull image"
             exit 1
@@ -69,11 +102,18 @@ jobs:
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
+          [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
+          
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "❌ Missing required secrets: ${MISSING[*]}"
+            echo ""
+            echo "Add these to GitHub Repository Settings > Secrets and variables > Actions:"
+            for secret in "${MISSING[@]}"; do
+              echo "  - $secret"
+            done
             exit 1
           fi
-          echo "✅ All secrets configured"
+          echo "✅ All required secrets configured"
 
       # ========================================================================
       # PHASE 2: BOT EXECUTION
@@ -85,8 +125,8 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
-          echo "::group::📥 Launch Macd-Unified...📥"
-          echo "📍 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
+          echo "::group::🔥 Launch Macd-Unified...🔥"
+          echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
           echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
@@ -105,9 +145,11 @@ jobs:
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
             -e TZ=Asia/Kolkata \
+            -e PYTHONPATH=/app/src:$PYTHONPATH \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DRY_RUN_MODE="$DRY_RUN" \
             -e PYTHONUNBUFFERED=1 \
             -e NUMBA_NUM_THREADS=2 \
@@ -169,9 +211,14 @@ jobs:
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
           
-          | Status | Duration | Alerts | Pairs | Memory | Redis |
-          |--------|----------|--------|-------|--------|-------|
-          | ${{ steps.results.outputs.status }} | ${{ steps.results.outputs.duration }}s | ${{ steps.results.outputs.alerts }} | ${{ steps.results.outputs.pairs }} | ${{ steps.results.outputs.memory }} | ${{ steps.results.outputs.redis_status }} |
+          | Metric | Value |
+          |--------|-------|
+          | **Status** | ${{ steps.results.outputs.status }} |
+          | **Duration** | ${{ steps.results.outputs.duration }}s |
+          | **Alerts** | ${{ steps.results.outputs.alerts }} |
+          | **Pairs** | ${{ steps.results.outputs.pairs }} |
+          | **Memory** | ${{ steps.results.outputs.memory }} |
+          | **Redis** | ${{ steps.results.outputs.redis_status }} |
           
           EOF
           
@@ -180,6 +227,14 @@ jobs:
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ Run Completed Successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- 📡 Duration: ${{ steps.results.outputs.duration }}s" >> $GITHUB_STEP_SUMMARY
+            echo "- 📊 Alerts Sent: ${{ steps.results.outputs.alerts }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 📈 Pairs Scanned: ${{ steps.results.outputs.pairs }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 💾 Memory Used: ${{ steps.results.outputs.memory }}" >> $GITHUB_STEP_SUMMARY
+            echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
           fi
 
       # ========================================================================
@@ -192,3 +247,4 @@ jobs:
           name: bot-execution-logs-${{ github.run_number }}
           path: logs/
           retention-days: 2
+          compression-level: 9
