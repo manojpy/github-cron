@@ -3540,7 +3540,30 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
 
             if last_reset_date != current_date:
-   
+                # ===== BUILD LIST OF KEYS TO DELETE =====
+                # Clear all alert states for this pair so they can trigger again tomorrow
+                delete_keys = []
+        
+                if cfg.ENABLE_PIVOT:
+                    # Delete pivot alert states
+                    pivot_alerts = [
+                        "pivot_up_P", "pivot_up_S1", "pivot_up_S2", "pivot_up_S3", "pivot_up_R1", "pivot_up_R2",
+                        "pivot_down_P", "pivot_down_S1", "pivot_down_S2", "pivot_down_S3", "pivot_down_R1", "pivot_down_R2", "pivot_down_R3"
+                    ]
+                    for alert_key in pivot_alerts:
+                        redis_key = ALERT_KEYS.get(alert_key)
+                        if redis_key:
+                            delete_keys.append(f"{pair_name}:{redis_key}")
+
+                if cfg.ENABLE_VWAP:
+                    # Delete VWAP alert states
+                    vwap_alerts = ["vwap_up", "vwap_down"]
+                    for alert_key in vwap_alerts:
+                        redis_key = ALERT_KEYS.get(alert_key)
+                        if redis_key:
+                            delete_keys.append(f"{pair_name}:{redis_key}")
+
+                # ===== PERFORM ATOMIC DELETE =====
                 if delete_keys:
                     await sdb.atomic_batch_update([], deletes=delete_keys)
                     logger_pair.info(
@@ -3549,12 +3572,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 else:
                     logger_pair.debug(f"🔄 Daily reset on {current_date} (no alerts to clear)")
 
+                # ===== SAVE RESET DATE =====
                 # Save with error handling
                 try:
                     await sdb.set_metadata(day_tracker_key, current_date.isoformat())
                     logger_pair.debug(f"✅ Saved reset date: {current_date}")
                 except Exception as e:
                     logger_pair.error(f"❌ Failed to save reset date: {e}")
+        else:
+            logger_pair.debug("Daily reset disabled (ENABLE_PIVOT and ENABLE_VWAP both false)")
 
         # =====================================================================
         # PHASE 10: TREND FILTER (BUY/SELL COMMON CONDITIONS)
