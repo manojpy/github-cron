@@ -4148,6 +4148,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         except Exception:
             pass
 
+logger_main = logging.getLogger("macd_bot.worker_pool")
+    
 async def guarded_eval(task_data):
     
     p_name, candles = task_data
@@ -4239,8 +4241,6 @@ async def guarded_eval(task_data):
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], 
     state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
-    
-    logger_main = logging.getLogger("macd_bot.worker_pool")
     
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
