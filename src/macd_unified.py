@@ -4532,12 +4532,7 @@ async def run_once() -> bool:
         logger_run.info("Starting evaluation phase...")
         logger_run.debug("Garbage collection disabled during evaluation loop...")
         
-        all_results = 
-            await process_pairs_with_workers(
-                fetcher, products_map, pairs_to_process,
-                sdb, telegram_queue, correlation_id,
-                lock, reference_time
-            )
+        all_results = await process_pairs_with_workers(fetcher, products_map, pairs_to_process, sdb, telegram_queue, correlation_id, lock, reference_time)
         gc.collect()
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
