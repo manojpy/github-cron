@@ -4254,7 +4254,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     
     return valid_results
 
-async def guarded_eval(task_data, logger_main):    
+logger_main = logging.getLogger("macd_bot.worker_pool")
+
+async def guarded_eval(task_data):    
     p_name, candles = task_data
     # If an exception occurs early, finally block can safely clean up
     data_15m = None
