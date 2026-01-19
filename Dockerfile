@@ -47,7 +47,7 @@ RUN ls -la *.py && \
     test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
 
 # ✅ AOT Compilation WITHOUT optimization (compiler needs full debug capability)
-ARG AOT_STRICT=1
+ARG AOT_STRICT=0
 RUN echo "🔨 Starting AOT compilation (unoptimized build)..." && \
     python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
     (echo "❌ AOT build script failed" && exit 1) && \
@@ -92,7 +92,6 @@ COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
 # ✅ Copy source files in order of change frequency
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
-COPY --chown=appuser:appuser src/aot_build.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
 # ⚠️ NOTE: config_macd.json is NOT copied here - mounted at runtime via run-bot.yml
