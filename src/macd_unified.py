@@ -4148,6 +4148,95 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         except Exception:
             pass
 
+async def guarded_eval(task_data):
+    
+    p_name, candles = task_data
+    
+    # ===== EXCEPTION SAFETY: Initialize all variables =====
+    # If an exception occurs early, finally block can safely clean up
+    data_15m = None
+    data_5m = None
+    data_daily = None
+    
+    try:
+        # ===== PHASE 1: Parse candles to numpy arrays =====
+        data_15m = parse_candles_to_numpy(candles.get("15"))
+        data_5m = parse_candles_to_numpy(candles.get("5"))
+        data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+        
+        # ===== PHASE 2: Quick validation - bail early if bad data =====
+        if data_15m is None:
+            logger_main.warning(f"Skipping {p_name}: 15m parse failed")
+            return None
+        
+        if data_5m is None:
+            logger_main.warning(f"Skipping {p_name}: 5m parse failed")
+            return None
+        
+        reference_time = get_trigger_timestamp()
+        
+        # ===== PHASE 3: Get last closed candle index =====
+        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
+        if i15 is None or i15 < 4:
+            if cfg.DEBUG_MODE:
+                logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
+            return None
+        
+        # ===== PHASE 4: Validate selected candle =====
+        v15_selected, r15_selected = validate_candle_data_at_index(
+            data_15m, i15, reference_time, interval_minutes=15
+        )
+        if not v15_selected:
+            logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
+            return None
+        
+        # ===== PHASE 5: Full evaluation =====
+        result = await evaluate_pair_and_alert(
+            p_name, data_15m, data_5m, data_daily,
+            state_db, telegram_queue, correlation_id, reference_time
+        )
+        
+        return result
+    
+    except asyncio.CancelledError:
+        # ===== CRITICAL: Re-raise cancellation =====
+        # Don't swallow shutdown signals
+        logger_main.warning(f"Evaluation cancelled for {p_name}")
+        raise
+    
+    except Exception as e:
+        # ===== CATCH ALL OTHER ERRORS =====
+        logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
+        return None
+    
+    finally:
+        
+        data_15m = None
+        data_5m = None
+        data_daily = None
+        
+        # ===== OPTIONAL: Per-pair aggressive collection =====
+        # Only if memory usage is concerning (to avoid 12× GC calls)
+        try:
+            process = psutil.Process()
+            current_rss_mb = process.memory_info().rss / 1024 / 1024
+            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+            
+            # Only if we're above 85% threshold
+            if current_rss_mb > limit_mb * 0.85:
+                gc.collect()
+                
+                if cfg.DEBUG_MODE:
+                    new_rss_mb = process.memory_info().rss / 1024 / 1024
+                    freed_mb = current_rss_mb - new_rss_mb
+                    logger_main.debug(
+                        f"[{p_name}] Per-pair GC triggered at {current_rss_mb:.0f}MB, "
+                        f"freed {freed_mb:.1f}MB"
+                    )
+        except Exception as psutil_error:
+            logger_main.debug(f"Memory check failed: {psutil_error}")
+
+
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], 
     state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
     
@@ -4256,92 +4345,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.info(f"🎯 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated")
     
     return valid_results
-
-    async def guarded_eval(task_data):
-    
-        p_name, candles = task_data
-    
-        # ===== EXCEPTION SAFETY: Initialize all variables =====
-        # If an exception occurs early, finally block can safely clean up
-        data_15m = None
-        data_5m = None
-        data_daily = None
-    
-        try:
-            # ===== PHASE 1: Parse candles to numpy arrays =====
-            data_15m = parse_candles_to_numpy(candles.get("15"))
-            data_5m = parse_candles_to_numpy(candles.get("5"))
-            data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-        
-            # ===== PHASE 2: Quick validation - bail early if bad data =====
-            if data_15m is None:
-                logger_main.warning(f"Skipping {p_name}: 15m parse failed")
-                return None
-        
-            if data_5m is None:
-                logger_main.warning(f"Skipping {p_name}: 5m parse failed")
-                return None
-        
-            reference_time = get_trigger_timestamp()
-        
-            # ===== PHASE 3: Get last closed candle index =====
-            i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-            if i15 is None or i15 < 4:
-                if cfg.DEBUG_MODE:
-                    logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
-                return None
-        
-            # ===== PHASE 4: Validate selected candle =====
-            v15_selected, r15_selected = validate_candle_data_at_index(
-                data_15m, i15, reference_time, interval_minutes=15
-            )
-            if not v15_selected:
-                logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
-                return None
-        
-            # ===== PHASE 5: Full evaluation =====
-            result = await evaluate_pair_and_alert(
-                p_name, data_15m, data_5m, data_daily,
-                state_db, telegram_queue, correlation_id, reference_time
-            )
-        
-            return result
-    
-        except asyncio.CancelledError:
-            # ===== CRITICAL: Re-raise cancellation =====
-            # Don't swallow shutdown signals
-            logger_main.warning(f"Evaluation cancelled for {p_name}")
-            raise
-    
-        except Exception as e:
-            # ===== CATCH ALL OTHER ERRORS =====
-            logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
-            return None
-    
-        finally:
-            data_15m = None
-            data_5m = None
-            data_daily = None
-        
-            # Only if memory usage is concerning (to avoid 12× GC calls)
-            try:
-                process = psutil.Process()
-                current_rss_mb = process.memory_info().rss / 1024 / 1024
-                limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-            
-                # Only if we're above 85% threshold
-                if current_rss_mb > limit_mb * 0.85:
-                    gc.collect()
-                
-                    if cfg.DEBUG_MODE:
-                        new_rss_mb = process.memory_info().rss / 1024 / 1024
-                        freed_mb = current_rss_mb - new_rss_mb
-                        logger_main.debug(
-                            f"[{p_name}] Per-pair GC triggered at {current_rss_mb:.0f}MB, "
-                            f"freed {freed_mb:.1f}MB"
-                        )
-            except Exception as psutil_error:
-                logger_main.debug(f"Memory check failed: {psutil_error}")
 
 async def run_once() -> bool:
     MAX_ALERTS_PER_RUN = 50
