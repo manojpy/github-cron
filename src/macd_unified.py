@@ -4148,188 +4148,194 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         except Exception:
             pass
 
-async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
-        logger_main = logging.getLogger("macd_bot.worker_pool")
+async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:   
+    logger_main = logging.getLogger("macd_bot.worker_pool")   
+    logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
+    fetch_start = time.time()
+    limit_15m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
+    limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
+    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
     
-        logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
-        fetch_start = time.time()
-    
-        # Calculate data requirements
-        limit_15m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
-        limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
-        daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
-    
-        # Build fetch requests
-        pair_requests = []
-        for pair_name in pairs_to_process:
-            product_info = products_map.get(pair_name)
-            if not product_info:
-                continue
+    # Build fetch requests
+    pair_requests = []
+    for pair_name in pairs_to_process:
+        product_info = products_map.get(pair_name)
+        if not product_info:
+            continue
         
-            symbol = product_info["symbol"]
-            resolutions = [("15", limit_15m), ("5", limit_5m)]
-            if cfg.ENABLE_PIVOT:
-                resolutions.append(("D", daily_limit))
+        symbol = product_info["symbol"]
+        resolutions = [("15", limit_15m), ("5", limit_5m)]
+        if cfg.ENABLE_PIVOT:
+            resolutions.append(("D", daily_limit))
         
-            pair_requests.append((symbol, resolutions))
+        pair_requests.append((symbol, resolutions))
     
-        # Fetch all candles (returns large dict)
-        all_candles = await fetcher.fetch_all_candles_truly_parallel(
-            pair_requests, reference_time
-        )
+    # Fetch all candles (returns large dict)
+    all_candles = await fetcher.fetch_all_candles_truly_parallel(
+        pair_requests, reference_time
+    )
     
-        fetch_elapsed = time.time() - fetch_start
-        logger_main.info(f"✅ Phase 1 complete: {fetch_elapsed:.1f}s")
+    fetch_elapsed = time.time() - fetch_start
+    logger_main.info(f"✅ Phase 1 complete: {fetch_elapsed:.1f}s")
     
-        logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
+    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
     
-        valid_tasks = []
-        for pair_name in pairs_to_process:
-            product_info = products_map.get(pair_name)
-            if not product_info:
-                continue
+    valid_tasks = []
+    for pair_name in pairs_to_process:
+        product_info = products_map.get(pair_name)
+        if not product_info:
+            continue
         
-            symbol = product_info["symbol"]
-            candles = all_candles.get(symbol, {})
-            valid_tasks.append((pair_name, candles))
+        symbol = product_info["symbol"]
+        candles = all_candles.get(symbol, {})
+        valid_tasks.append((pair_name, candles))
     
-        logger_main.debug(f"Ready to evaluate {len(valid_tasks)} pairs")
+    logger_main.debug(f"Ready to evaluate {len(valid_tasks)} pairs")
     
-        logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
-        eval_start = time.time()
+    logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
+    eval_start = time.time()
     
-        results = await asyncio.gather(
-            *[guarded_eval(t) for t in valid_tasks],
-            return_exceptions=True  # ✅ IMPORTANT: Catch exceptions, don't crash
-        )
+    results = await asyncio.gather(
+        *[guarded_eval(t) for t in valid_tasks],
+        return_exceptions=True  # ✅ IMPORTANT: Catch exceptions, don't crash
+    )
     
-        eval_elapsed = time.time() - eval_start
-        logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
+    eval_elapsed = time.time() - eval_start
+    logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
     
-        valid_results = []
-        for r in results:
-            if isinstance(r, Exception):
-                # asyncio.gather returned exception, skip it
-                logger_main.warning(f"Evaluation raised exception: {r}")
-                continue
-            if r is not None:
-                valid_results.append(r)
+    # Filter results (keep only successful evaluations)
+    valid_results = []
+    for r in results:
+        if isinstance(r, Exception):
+            # asyncio.gather returned exception, skip it
+            logger_main.warning(f"Evaluation raised exception: {r}")
+            continue
+        if r is not None:
+            valid_results.append(r)
     
-        logger_main.debug(f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed")
+    logger_main.debug(f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed")
     
-        results = None  # Release full results list (can be large)
-        all_candles = None  # ← THIS IS THE BIG ONE (~200MB for 12 pairs)
-        valid_tasks = None  # Release task list references
-        pair_requests = None  # Release request list
+    results = None  # Release full results list (can be large)
+    all_candles = None  # ← THIS IS THE BIG ONE (~200MB for 12 pairs)
+    valid_tasks = None  # Release task list references
+    pair_requests = None  # Release request list
     
-        logger_main.debug("🧹 Released all fetch-phase data (all_candles, results, etc)")
+    logger_main.debug("🧹 Released all fetch-phase data (all_candles, results, etc)")
     
-        gc.collect()
+    # ===== GARBAGE COLLECTION AFTER REFS FREED =====
+    # This collection is FAST because Python has already freed memory
+    # We're just compacting heaps, not waiting for objects to die
     
-        try:
-            process = psutil.Process()
-            current_memory_mb = process.memory_info().rss / 1024 / 1024
-            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-            usage_pct = (current_memory_mb / limit_mb) * 100
+    gc.collect()
+    
+    # ===== OPTIONAL: Log memory state for debugging =====
+    try:
+        process = psutil.Process()
+        current_memory_mb = process.memory_info().rss / 1024 / 1024
+        limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+        usage_pct = (current_memory_mb / limit_mb) * 100
         
-            if cfg.DEBUG_MODE:
-                logger_main.debug(
-                    f"💾 Memory after batch cleanup: {current_memory_mb:.0f}MB / {limit_mb:.0f}MB "
-                    f"({usage_pct:.0f}%)"
-                )
+        if cfg.DEBUG_MODE:
+            logger_main.debug(
+                f"💾 Memory after batch cleanup: {current_memory_mb:.0f}MB / {limit_mb:.0f}MB "
+                f"({usage_pct:.0f}%)"
+            )
         
-            # ===== WARNING: If memory still high, something else is holding refs =====
-            if current_memory_mb > limit_mb * 0.9:
-                logger_main.warning(
-                    f"⚠️ Memory still high after cleanup: {current_memory_mb:.0f}MB ({usage_pct:.0f}%). "
-                    f"Possible memory leak?"
-                )
-        except Exception as e:
-            logger_main.debug(f"Memory reporting failed: {e}")
+        # ===== WARNING: If memory still high, something else is holding refs =====
+        if current_memory_mb > limit_mb * 0.9:
+            logger_main.warning(
+                f"⚠️ Memory still high after cleanup: {current_memory_mb:.0f}MB ({usage_pct:.0f}%). "
+                f"Possible memory leak?"
+            )
+    except Exception as e:
+        logger_main.debug(f"Memory reporting failed: {e}")
     
-        logger_main.info(f"🎯 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated")
+    logger_main.info(f"🎯 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated")
     
-        return valid_results
+    return valid_results
 
-    async def guarded_eval(task_data): 
-        p_name, candles = task_data
+async def guarded_eval(task_data):    
+    p_name, candles = task_data
+    # If an exception occurs early, finally block can safely clean up
+    data_15m = None
+    data_5m = None
+    data_daily = None
     
+    try:
+        # ===== PHASE 1: Parse candles to numpy arrays =====
+        data_15m = parse_candles_to_numpy(candles.get("15"))
+        data_5m = parse_candles_to_numpy(candles.get("5"))
+        data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
+        
+        # ===== PHASE 2: Quick validation - bail early if bad data =====
+        if data_15m is None:
+            logger_main.warning(f"Skipping {p_name}: 15m parse failed")
+            return None
+        
+        if data_5m is None:
+            logger_main.warning(f"Skipping {p_name}: 5m parse failed")
+            return None
+        
+        reference_time = get_trigger_timestamp()
+        
+        # ===== PHASE 3: Get last closed candle index =====
+        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
+        if i15 is None or i15 < 4:
+            if cfg.DEBUG_MODE:
+                logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
+            return None
+        
+        # ===== PHASE 4: Validate selected candle =====
+        v15_selected, r15_selected = validate_candle_data_at_index(
+            data_15m, i15, reference_time, interval_minutes=15
+        )
+        if not v15_selected:
+            logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
+            return None
+        
+        # ===== PHASE 5: Full evaluation =====
+        result = await evaluate_pair_and_alert(
+            p_name, data_15m, data_5m, data_daily,
+            state_db, telegram_queue, correlation_id, reference_time
+        )
+        
+        return result
+    
+    except asyncio.CancelledError:
+        # Don't swallow shutdown signals
+        logger_main.warning(f"Evaluation cancelled for {p_name}")
+        raise
+    
+    except Exception as e:
+        # ===== CATCH ALL OTHER ERRORS =====
+        logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
+        return None
+    
+    finally:
+        
         data_15m = None
         data_5m = None
         data_daily = None
-    
+        
+        # Only if memory usage is concerning (to avoid 12× GC calls)
         try:
-            # ===== PHASE 1: Parse candles to numpy arrays =====
-            data_15m = parse_candles_to_numpy(candles.get("15"))
-            data_5m = parse_candles_to_numpy(candles.get("5"))
-            data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-        
-            # ===== PHASE 2: Quick validation - bail early if bad data =====
-            if data_15m is None:
-                logger_main.warning(f"Skipping {p_name}: 15m parse failed")
-                return None
-        
-            if data_5m is None:
-                logger_main.warning(f"Skipping {p_name}: 5m parse failed")
-                return None
-        
-            reference_time = get_trigger_timestamp()
-        
-            # ===== PHASE 3: Get last closed candle index =====
-            i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-            if i15 is None or i15 < 4:
-                if cfg.DEBUG_MODE:
-                    logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
-                return None
-        
-            # ===== PHASE 4: Validate selected candle =====
-            v15_selected, r15_selected = validate_candle_data_at_index(
-                data_15m, i15, reference_time, interval_minutes=15
-            )
-            if not v15_selected:
-                logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
-                return None
-        
-            # ===== PHASE 5: Full evaluation =====
-            result = await evaluate_pair_and_alert(
-                p_name, data_15m, data_5m, data_daily,
-                state_db, telegram_queue, correlation_id, reference_time
-            )
-        
-            return result
-    
-        except asyncio.CancelledError:
-            logger_main.warning(f"Evaluation cancelled for {p_name}")
-            raise
-    
-        except Exception as e:
-            # ===== CATCH ALL OTHER ERRORS =====
-            logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
-            return None
-    
-        finally:
-            data_15m = None
-            data_5m = None
-            data_daily = None
-        
-            try:
-                process = psutil.Process()
-                current_rss_mb = process.memory_info().rss / 1024 / 1024
-                limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+            process = psutil.Process()
+            current_rss_mb = process.memory_info().rss / 1024 / 1024
+            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             
-                # Only if we're above 85% threshold
-                if current_rss_mb > limit_mb * 0.85:
-                    gc.collect()
+            # Only if we're above 85% threshold
+            if current_rss_mb > limit_mb * 0.85:
+                gc.collect()
                 
-                    if cfg.DEBUG_MODE:
-                        new_rss_mb = process.memory_info().rss / 1024 / 1024
-                        freed_mb = current_rss_mb - new_rss_mb
-                        logger_main.debug(
-                            f"[{p_name}] Per-pair GC triggered at {current_rss_mb:.0f}MB, "
-                            f"freed {freed_mb:.1f}MB"
-                        )
-            except Exception as psutil_error:
-                logger_main.debug(f"Memory check failed: {psutil_error}")
+                if cfg.DEBUG_MODE:
+                    new_rss_mb = process.memory_info().rss / 1024 / 1024
+                    freed_mb = current_rss_mb - new_rss_mb
+                    logger_main.debug(
+                        f"[{p_name}] Per-pair GC triggered at {current_rss_mb:.0f}MB, "
+                        f"freed {freed_mb:.1f}MB"
+                    )
+        except Exception as psutil_error:
+            logger_main.debug(f"Memory check failed: {psutil_error}")
 
 async def run_once() -> bool:
     MAX_ALERTS_PER_RUN = 50
