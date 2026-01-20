@@ -4473,8 +4473,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], 
     state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
 
-    alignment_cache: Dict[str, int] = {}) -> List[Tuple[str, Dict[str, Any]]]:
-    
+    alignment_cache: Dict[str, int] = {}
+
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
     
