@@ -928,7 +928,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 high_15m, low_15m, close_15m, volume_15m, ts_15m
             )
         else:
-            results["vwap"] = close_15m.copy()
+            results["vwap"] = np.full(n_15m, np.nan)
 
         mmh = calculate_magical_momentum_hist(close_15m)       
         results['mmh'] = mmh
@@ -3525,8 +3525,8 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
-    
+    reference_time: int, alignment_cache: Dict[str, int]) -> Optional[Tuple[str, Dict[str, Any]]]:
+
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
@@ -3566,17 +3566,40 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
 
-        # ===== FIX: Align 5m candle to match 15m candle's timestamp =====
+        # ===== FIX: Align 5m candle to match 15m candle's timestamp (cached) =====
         ts_15m = data_15m["timestamp"][i15]
-        time_diff = np.abs(data_5m["timestamp"] - ts_15m)
-        aligned_i5 = int(np.argmin(time_diff))
+        ts_5m = data_5m["timestamp"]
 
-        if time_diff[aligned_i5] > 60:
+        cache_key = f"{pair_name}:{ts_15m}"
+
+        aligned_i5 = alignment_cache.get(cache_key)
+
+        # Safety guard (in case data length differs unexpectedly)
+        if aligned_i5 is not None and aligned_i5 >= len(ts_5m):
+            aligned_i5 = None
+
+        # Compute only if not cached
+        if aligned_i5 is None:
+            aligned_i5 = int(np.searchsorted(ts_5m, ts_15m))
+
+            # Refine to nearest candle (argmin-equivalent)
+            if aligned_i5 > 0 and (
+                aligned_i5 == len(ts_5m) or
+                abs(ts_5m[aligned_i5 - 1] - ts_15m) <
+                abs(ts_5m[min(aligned_i5, len(ts_5m) - 1)] - ts_15m)
+            ):
+                aligned_i5 -= 1
+
+            alignment_cache[cache_key] = aligned_i5
+
+        # Preserve your original misalignment protection
+        time_diff = abs(ts_5m[aligned_i5] - ts_15m)
+        if time_diff > 60:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"5m/15m timestamp misalignment: {time_diff[aligned_i5]}s. "
+                    f"5m/15m timestamp misalignment: {time_diff}s. "
                     f"15m: {format_ist_time(ts_15m)}, "
-                    f"5m closest: {format_ist_time(data_5m['timestamp'][aligned_i5])}"
+                    f"5m closest: {format_ist_time(ts_5m[aligned_i5])}"
                 )
             aligned_i5 = i5  # fallback if truly misaligned
 
@@ -3690,11 +3713,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
         
         has_valid_mmh = (
-            not np.isnan(mmh_curr) and 
-            not np.isnan(mmh_m1) and 
-            not np.isnan(mmh_m2) and 
-            not np.isnan(mmh_m3)
+            i15 >= 3 and
+            not np.isnan(mmh_curr) and
+            not np.isnan(mmh[i15-1]) and
+            not np.isnan(mmh[i15-2]) and
+            not np.isnan(mmh[i15-3])
         )
+
 
         # =====================================================================
         # PHASE 6: MOVING AVERAGES & CLOUD STATE
@@ -3742,7 +3767,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # =====================================================================
         # PHASE 9: DAILY PIVOT RESET (Fixed per Issue #10)
         # =====================================================================
-        
+      
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
             current_date = current_utc_dt.date()
@@ -3753,13 +3778,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             try:
                 last_reset_date_str = await sdb.get_metadata(day_tracker_key)
                 if last_reset_date_str:
-                    # Safe parse of YYYY-MM-DD
                     last_reset_date = datetime.fromisoformat(last_reset_date_str).date()
             except Exception as e:
                 logger_pair.warning(f"Failed to parse last_reset_date '{last_reset_date_str}': {e}")
                 last_reset_date = None
 
-            # Debug log
             logger_pair.debug(
                 f"Daily reset check | stored='{last_reset_date_str}' | "
                 f"parsed={last_reset_date} | current={current_date} | "
@@ -3767,15 +3790,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
 
             if last_reset_date != current_date:
-                # ===== BUILD LIST OF KEYS TO DELETE =====
-                # Clear all alert states for this pair so they can trigger again tomorrow
+                # 1.  SAVE RESET DATE FIRST – abort if this fails
+                try:
+                    await sdb.set_metadata(day_tracker_key, current_date.isoformat())
+                    logger_pair.debug(f"✅ Saved reset date: {current_date}")
+                except Exception as e:
+                    logger_pair.error(f"❌ Failed to save reset date – aborting daily reset: {e}")
+                    # Do NOT continue; no deletes will happen this run
+                    raise
+
+                # 2.  Only if the above succeeded, build and execute deletes
                 delete_keys = []
-        
                 if cfg.ENABLE_PIVOT:
-                    # Delete pivot alert states
                     pivot_alerts = [
-                        "pivot_up_P", "pivot_up_S1", "pivot_up_S2", "pivot_up_S3", "pivot_up_R1", "pivot_up_R2",
-                        "pivot_down_P", "pivot_down_S1", "pivot_down_S2", "pivot_down_S3", "pivot_down_R1", "pivot_down_R2", "pivot_down_R3"
+                        "pivot_up_P", "pivot_up_S1", "pivot_up_S2", "pivot_up_S3",
+                        "pivot_up_R1", "pivot_up_R2",
+                        "pivot_down_P", "pivot_down_S1", "pivot_down_S2",
+                        "pivot_down_S3", "pivot_down_R1", "pivot_down_R2", "pivot_down_R3"
                     ]
                     for alert_key in pivot_alerts:
                         redis_key = ALERT_KEYS.get(alert_key)
@@ -3783,29 +3814,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             delete_keys.append(f"{pair_name}:{redis_key}")
 
                 if cfg.ENABLE_VWAP:
-                    # Delete VWAP alert states
                     vwap_alerts = ["vwap_up", "vwap_down"]
                     for alert_key in vwap_alerts:
                         redis_key = ALERT_KEYS.get(alert_key)
                         if redis_key:
                             delete_keys.append(f"{pair_name}:{redis_key}")
 
-                # ===== PERFORM ATOMIC DELETE =====
                 if delete_keys:
                     await sdb.atomic_batch_update([], deletes=delete_keys)
-                    logger_pair.info(
-                        f"🔄 Daily reset on {current_date}. Cleared {len(delete_keys)} alerts"
-                    )
+                    logger_pair.info(f"🔄 Daily reset on {current_date}. Cleared {len(delete_keys)} alerts")
                 else:
                     logger_pair.debug(f"🔄 Daily reset on {current_date} (no alerts to clear)")
-
-                # ===== SAVE RESET DATE =====
-                # Save with error handling
-                try:
-                    await sdb.set_metadata(day_tracker_key, current_date.isoformat())
-                    logger_pair.debug(f"✅ Saved reset date: {current_date}")
-                except Exception as e:
-                    logger_pair.error(f"❌ Failed to save reset date: {e}")
         else:
             logger_pair.debug("Daily reset disabled (ENABLE_PIVOT and ENABLE_VWAP both false)")
 
@@ -3866,20 +3885,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             mmh_reversal_sell = False
         else:
             # Buy reversal: MMH crossing above zero with momentum
-            mmh_reversal_buy = (
-                buy_common and 
-                mmh_curr > 0 and 
-                mmh_m3 > mmh_m2 > mmh_m1 and 
-                mmh_curr > mmh_m1
-            )
+            mmh_reversal_buy = (buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
             
             # Sell reversal: MMH crossing below zero with momentum
-            mmh_reversal_sell = (
-                sell_common and 
-                mmh_curr < 0 and 
-                mmh_m3 < mmh_m2 < mmh_m1 and 
-                mmh_curr < mmh_m1
-            )
+            mmh_reversal_sell = (sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
 
         # =====================================================================
         # PHASE 14: BUILD EVALUATION CONTEXT (Fixed per Issue #9)
@@ -4373,7 +4382,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
 logger_main = logging.getLogger("macd_bot.worker_pool")
     
-async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time):  
+async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, alignment_cache: Dict[str, int]):  
     p_name, candles = task_data
     
     # ===== EXCEPTION SAFETY: Initialize all variables =====
@@ -4417,7 +4426,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         # ===== PHASE 5: Full evaluation =====
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
-            state_db, telegram_queue, correlation_id, reference_time
+            state_db, telegram_queue, correlation_id, reference_time, alignment_cache
         )
         
         return result
@@ -4463,6 +4472,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], 
     state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
+
+    alignment_cache: Dict[str, int] = {}) -> List[Tuple[str, Dict[str, Any]]]:
     
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
@@ -4513,7 +4524,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     
     results = await asyncio.gather(
         *[guarded_eval(t, state_db, telegram_queue, correlation_id, 
-        reference_time) for t in valid_tasks],
+        reference_time, alignment_cache) for t in valid_tasks],
         return_exceptions=True
     )
     
