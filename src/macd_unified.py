@@ -3679,44 +3679,30 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
 
-        # ===== FIX: Align 5m candle to match 15m candle's timestamp (cached) =====
         ts_15m = data_15m["timestamp"][i15]
         ts_5m = data_5m["timestamp"]
-
+    
         cache_key = f"{pair_name}:{ts_15m}"
-
         aligned_i5 = alignment_cache.get(cache_key)
-
-        # Safety guard (in case data length differs unexpectedly)
+    
+        # Safety guard (in case data length differs)
         if aligned_i5 is not None and aligned_i5 >= len(ts_5m):
             aligned_i5 = None
-
+    
         # Compute only if not cached
         if aligned_i5 is None:
-            aligned_i5 = int(np.searchsorted(ts_5m, ts_15m))
-
-            # Refine to nearest candle (argmin-equivalent)
-            if aligned_i5 > 0 and (
-                aligned_i5 == len(ts_5m) or
-                abs(ts_5m[aligned_i5 - 1] - ts_15m) <
-                abs(ts_5m[min(aligned_i5, len(ts_5m) - 1)] - ts_15m)
-            ):
-                aligned_i5 -= 1
-
+            # YOUR SIMPLER LOGIC
+            time_diff = np.abs(ts_5m - ts_15m)
+            aligned_i5 = int(np.argmin(time_diff))
+        
+            # Validate alignment quality
+            if time_diff[aligned_i5] > 60:
+                aligned_i5 = i5  # fallback
+        
+            # Cache for future use
             alignment_cache[cache_key] = aligned_i5
-
-        # Preserve your original misalignment protection
-        time_diff = abs(ts_5m[aligned_i5] - ts_15m)
-        if time_diff > 60:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"5m/15m timestamp misalignment: {time_diff}s. "
-                    f"15m: {format_ist_time(ts_15m)}, "
-                    f"5m closest: {format_ist_time(ts_5m[aligned_i5])}"
-                )
-            aligned_i5 = i5  # fallback if truly misaligned
-
-        i5 = aligned_i5  # Use aligned index for all subsequent operations
+    
+        i5 = aligned_i5
 
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
@@ -3826,13 +3812,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
         
         has_valid_mmh = (
-            i15 >= 3 and
-            not np.isnan(mmh_curr) and
-            not np.isnan(mmh[i15-1]) and
-            not np.isnan(mmh[i15-2]) and
-            not np.isnan(mmh[i15-3])
+            not np.isnan(mmh_curr) and 
+            not np.isnan(mmh_m1) and 
+            not np.isnan(mmh_m2) and 
+            not np.isnan(mmh_m3)
         )
-
 
         # =====================================================================
         # PHASE 6: MOVING AVERAGES & CLOUD STATE
