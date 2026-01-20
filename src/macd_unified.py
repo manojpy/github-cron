@@ -400,22 +400,31 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
+GLOBAL_CONFIG = {
+    "DELTA_API_BASE": "https://api.india.delta.exchange",
+    "PAIRS": [],
+}
 
 def load_config_file():
-    """Ensures PAIRS from config_macd.json are loaded into GLOBAL_CONFIG"""
     config_path = Path("config_macd.json")
     if config_path.exists():
         try:
             with open(config_path, "r") as f:
                 external_config = json.load(f)
-                # Use .update to merge your JSON pairs into the existing config
                 if "PAIRS" in external_config:
                     GLOBAL_CONFIG["PAIRS"] = external_config["PAIRS"]
-                    logger.info(f"✅ Loaded {len(GLOBAL_CONFIG['PAIRS'])} pairs from config_macd.json")
+                    # If logger is defined, use it; otherwise use print
+                    if 'logger' in globals():
+                        logger.info(f"✅ Loaded {len(GLOBAL_CONFIG['PAIRS'])} pairs from JSON")
+                    else:
+                        print(f"✅ Loaded {len(GLOBAL_CONFIG['PAIRS'])} pairs from JSON")
         except Exception as e:
-            logger.error(f"Failed to load config_macd.json: {e}")
+            print(f"Failed to load config: {e}")
 
-# IMPORTANT: Call this at the very bottom of Part 1
+# --- IMPORTANT: ONLY CALL THIS AFTER logger = setup_logging() ---
+# Search for your "logger = setup_logging()" line in Part 1.
+# Put the call IMMEDIATELY after it.
+logger = setup_logging()
 load_config_file()
 
 _IST_TZ = ZoneInfo("Asia/Kolkata")
@@ -2158,29 +2167,32 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     
     return products_map
 
+class GlobalCache:
+    products_map: Dict[str, Any] = {}
+    last_refresh: float = 0
+
 async def fetch_and_cache_products(fetcher=None, force_refresh: bool = False) -> Dict[str, Any]:
     """
-    Optimized: Accepts 'fetcher' argument to match existing Part 3 calls.
-    Only fetches the 12 pairs defined in your config.
+    1. Accepts 'fetcher' to fix the TypeError.
+    2. Uses 'GlobalCache' which is now defined above.
+    3. Only fetches the 12 pairs in config.
     """
     if not force_refresh and GlobalCache.products_map:
         return GlobalCache.products_map
 
     target_symbols = GLOBAL_CONFIG.get("PAIRS", [])
     if not target_symbols:
-        logger.error("❌ No symbols found in GLOBAL_CONFIG['PAIRS']")
-        return {}
+        # Fallback if config failed to load
+        target_symbols = ["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"]
 
-    logger.info(f"📡 Fetching only {len(target_symbols)} pairs from Delta API...")
+    logger.info(f"📡 Requesting metadata for {len(target_symbols)} pairs...")
     
     try:
-        # Pass the symbols directly to the API to avoid downloading 1000+ items
         symbols_query = ",".join(target_symbols)
         url = f"{GLOBAL_CONFIG['DELTA_API_BASE']}/v2/products?symbols={symbols_query}"
         
         async with SessionManager.get_session().get(url, timeout=30) as response:
             if response.status != 200:
-                logger.error(f"Delta API error: {response.status}")
                 return {}
             
             data = await response.json()
@@ -2199,12 +2211,11 @@ async def fetch_and_cache_products(fetcher=None, force_refresh: bool = False) ->
                         "underlying_asset": p.get("underlying_asset")
                     }
 
-            logger.info(f"✅ Product map built: {len(new_map)}/{len(target_symbols)} matched.")
             GlobalCache.products_map = new_map
+            logger.info(f"✅ Map built: {len(new_map)} pairs.")
             return new_map
-
     except Exception as e:
-        logger.error(f"fetch_and_cache_products failed: {e}")
+        logger.error(f"Fetch failed: {e}")
         return {}
 
 def validate_products_map(
