@@ -408,12 +408,14 @@ def load_config_file():
         try:
             with open(config_path, "r") as f:
                 external_config = json.load(f)
-                # This is the critical line: update our global state with your 12 pairs
-                GLOBAL_CONFIG.update(external_config)
-                logger.info(f"✅ Loaded {len(GLOBAL_CONFIG.get('PAIRS', []))} pairs from config_macd.json")
+                # Use .update to merge your JSON pairs into the existing config
+                if "PAIRS" in external_config:
+                    GLOBAL_CONFIG["PAIRS"] = external_config["PAIRS"]
+                    logger.info(f"✅ Loaded {len(GLOBAL_CONFIG['PAIRS'])} pairs from config_macd.json")
         except Exception as e:
             logger.error(f"Failed to load config_macd.json: {e}")
 
+# IMPORTANT: Call this at the very bottom of Part 1
 load_config_file()
 
 _IST_TZ = ZoneInfo("Asia/Kolkata")
@@ -2156,26 +2158,23 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     
     return products_map
 
-async def fetch_and_cache_products(force_refresh: bool = False) -> Dict[str, Any]:
+async def fetch_and_cache_products(fetcher=None, force_refresh: bool = False) -> Dict[str, Any]:
     """
-    REPLACEMENT: Only fetches the 12 pairs defined in your config.
+    Optimized: Accepts 'fetcher' argument to match existing Part 3 calls.
+    Only fetches the 12 pairs defined in your config.
     """
-    correlation_id = CORRELATION_ID.get()
-    
     if not force_refresh and GlobalCache.products_map:
         return GlobalCache.products_map
 
-    # Get the list from your config_macd.json (loaded in Part 1)
     target_symbols = GLOBAL_CONFIG.get("PAIRS", [])
-    
     if not target_symbols:
-        logger.error("❌ No symbols found in GLOBAL_CONFIG['PAIRS']. Cannot scan.")
+        logger.error("❌ No symbols found in GLOBAL_CONFIG['PAIRS']")
         return {}
 
-    logger.info(f"📡 Requesting metadata for {len(target_symbols)} pairs from Delta...")
+    logger.info(f"📡 Fetching only {len(target_symbols)} pairs from Delta API...")
     
     try:
-        # Optimization: We filter at the API level using the 'symbols' parameter
+        # Pass the symbols directly to the API to avoid downloading 1000+ items
         symbols_query = ",".join(target_symbols)
         url = f"{GLOBAL_CONFIG['DELTA_API_BASE']}/v2/products?symbols={symbols_query}"
         
@@ -2200,15 +2199,7 @@ async def fetch_and_cache_products(force_refresh: bool = False) -> Dict[str, Any
                         "underlying_asset": p.get("underlying_asset")
                     }
 
-            # Log results clearly
-            found = list(new_map.keys())
-            missing = set(target_symbols) - set(found)
-            
-            if missing:
-                logger.warning(f"⚠️ Missing from Delta API: {missing}")
-            
-            logger.info(f"✅ Product map built: {len(found)}/{len(target_symbols)} matched.")
-            
+            logger.info(f"✅ Product map built: {len(new_map)}/{len(target_symbols)} matched.")
             GlobalCache.products_map = new_map
             return new_map
 
