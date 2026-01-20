@@ -91,19 +91,11 @@ class Constants:
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
     
-STATIC_PRODUCTS_MAP = {
-    "BTCUSD": {"id": 139, "symbol": "BTCUSDT", "contract_type": "perpetual_futures"},
-    "ETHUSD": {"id": 140, "symbol": "ETHUSDT", "contract_type": "perpetual_futures"},
-    "AVAXUSD": {"id": 262, "symbol": "AVAXUSDT", "contract_type": "perpetual_futures"},
-    "BCHUSD": {"id": 186, "symbol": "BCHUSDT", "contract_type": "perpetual_futures"},
-    "XRPUSD": {"id": 141, "symbol": "XRPUSDT", "contract_type": "perpetual_futures"},
-    "BNBUSD": {"id": 275, "symbol": "BNBUSDT", "contract_type": "perpetual_futures"},
-    "LTCUSD": {"id": 163, "symbol": "LTCUSDT", "contract_type": "perpetual_futures"},
-    "DOTUSD": {"id": 228, "symbol": "DOTUSDT", "contract_type": "perpetual_futures"},
-    "ADAUSD": {"id": 142, "symbol": "ADAUSDT", "contract_type": "perpetual_futures"},
-    "SUIUSD": {"id": 666, "symbol": "SUIUSDT", "contract_type": "perpetual_futures"},
-    "AAVEUSD": {"id": 227, "symbol": "AAVEUSDT", "contract_type": "perpetual_futures"},
-    "SOLUSD": {"id": 143, "symbol": "SOLUSDT", "contract_type": "perpetual_futures"},
+PRODUCTS_CACHE: Dict[str, Any] = {
+    "data": None,
+    "until": 0.0,
+    "fetched_at": 0.0,
+    "fetch_error": None,
 }
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
@@ -1936,28 +1928,259 @@ def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minu
     return True
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+    
     products_map: Dict[str, dict] = {}
+    
     if not api_products or not api_products.get("result"):
+        logger.warning("🚨 build_products_map_from_api_result: API result is None or empty")
         return products_map
+    
+    if not isinstance(api_products["result"], list):
+        logger.error(f"❌ API result is not a list: {type(api_products['result'])}")
+        return products_map
+    
     valid_pattern = CompiledPatterns.VALID_SYMBOL
+    required_set = set(cfg.PAIRS)  # O(1) lookup instead of iterating cfg.PAIRS
+    total_checked = 0
+    total_matched = 0
+    failed_matches = []
+    
+    logger.debug(f"🔍 Starting product matching for {len(required_set)} required pairs")
+    
     for p in api_products["result"]:
         try:
-            symbol = p.get("symbol", "")
-            if not valid_pattern.match(symbol):
+            total_checked += 1
+            
+            # Extract symbol from API
+            symbol = p.get("symbol", "").strip()
+            if not symbol:
                 continue
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD")
-            if p.get("contract_type") == "perpetual_futures":
-                for pair_name in cfg.PAIRS:
-                    if symbol_norm == pair_name or symbol_norm.replace("_", "") == pair_name:
+            
+            # Validate symbol format
+            if not valid_pattern.match(symbol):
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"⏭️ Skipping invalid symbol format: {symbol}")
+                continue
+            
+            # Only process perpetual futures (skip other contract types early)
+            contract_type = p.get("contract_type", "")
+            if contract_type != "perpetual_futures":
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"⏭️ Skipping non-futures: {symbol} ({contract_type})")
+                continue
+            
+            # Get contract ID
+            contract_id = p.get("id")
+            if not contract_id:
+                logger.warning(f"⚠️ Symbol {symbol} missing ID field")
+                continue
+            
+            # Normalize symbol for matching
+            # Examples: "BTCUSDT" -> "BTCUSD", "BTC_USDT" -> "BTCUSD"
+            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD").upper()
+            symbol_no_underscore = symbol_norm.replace("_", "")
+            
+            # ===================================================================
+            # OPTIMIZATION: Early exit if symbol not in required pairs
+            # ===================================================================
+            matched = False
+            
+            # Try exact match first (fastest)
+            if symbol_norm in required_set:
+                products_map[symbol_norm] = {
+                    "id": contract_id,
+                    "symbol": symbol,
+                    "contract_type": contract_type
+                }
+                total_matched += 1
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"✅ Matched (exact): {symbol} -> {symbol_norm}")
+                matched = True
+            
+            # Try no-underscore match as fallback
+            elif not matched:
+                for pair_name in required_set:
+                    pair_no_underscore = pair_name.replace("_", "")
+                    
+                    if symbol_no_underscore == pair_no_underscore:
                         products_map[pair_name] = {
-                            "id": p.get("id"),
-                            "symbol": p.get("symbol"),
-                            "contract_type": p.get("contract_type")
+                            "id": contract_id,
+                            "symbol": symbol,
+                            "contract_type": contract_type
                         }
+                        total_matched += 1
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"✅ Matched (no_underscore): {symbol} -> {pair_name}")
+                        matched = True
                         break
-        except Exception:
-            pass
+            
+            if not matched and cfg.DEBUG_MODE:
+                failed_matches.append(symbol_norm)
+        
+        except Exception as e:
+            logger.error(f"❌ Error processing API product: {e}", exc_info=False)
+            continue
+    
+    # Log summary
+    coverage_pct = (total_matched / len(cfg.PAIRS) * 100) if cfg.PAIRS else 0
+    
+    logger.info(
+        f"📦 Product map built: {total_matched}/{len(cfg.PAIRS)} matched | "
+        f"Coverage: {coverage_pct:.0f}% | "
+        f"Checked: {total_checked} products from API"
+    )
+    
+    if failed_matches and cfg.DEBUG_MODE:
+        logger.debug(f"🔍 Checked but not matched (first 10): {failed_matches[:10]}")
+    
     return products_map
+
+
+async def fetch_and_cache_products(
+    fetcher: DataFetcher, 
+    force_refresh: bool = False
+) -> Optional[Dict[str, dict]]:
+    
+    now = time.time()
+    cache_data = PRODUCTS_CACHE.get("data")
+    cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
+    
+    # =========================================================================
+    # PHASE 1: CHECK CACHE
+    # =========================================================================
+    
+    if not force_refresh and cache_data and now < cache_expires_at:
+        cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
+        cache_remaining = cache_expires_at - now
+        logger.debug(
+            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
+            f"TTL remaining: {cache_remaining/60:.1f}m"
+        )
+        return build_products_map_from_api_result(cache_data)
+    
+    # =========================================================================
+    # PHASE 2: FETCH FROM API (Cache expired or forced refresh)
+    # =========================================================================
+    
+    logger.info("📡 Fetching products from Delta API...")
+    
+    try:
+        api_result = await fetcher.fetch_products()
+        
+        # Validation checks
+        if not api_result:
+            logger.critical("❌ API returned None for products")
+            PRODUCTS_CACHE["fetch_error"] = "API returned None"
+            return None
+        
+        if "result" not in api_result:
+            logger.critical(
+                f"❌ API response missing 'result' field. "
+                f"Keys present: {list(api_result.keys())}"
+            )
+            PRODUCTS_CACHE["fetch_error"] = "Missing 'result' field in API response"
+            return None
+        
+        if not isinstance(api_result["result"], list):
+            logger.critical(
+                f"❌ API result is not a list: {type(api_result['result'])}"
+            )
+            PRODUCTS_CACHE["fetch_error"] = f"Invalid result type: {type(api_result['result'])}"
+            return None
+        
+        if len(api_result["result"]) == 0:
+            logger.critical("❌ API returned empty products list")
+            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
+            return None
+        
+        # =====================================================================
+        # PHASE 3: CACHE RAW API RESPONSE
+        # =====================================================================
+        
+        now = time.time()
+        PRODUCTS_CACHE["data"] = api_result
+        PRODUCTS_CACHE["fetched_at"] = now
+        PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
+        PRODUCTS_CACHE["fetch_error"] = None
+        
+        cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
+        logger.info(
+            f"✅ SUCCESS: Fetched {len(api_result['result'])} products from API | "
+            f"Cache TTL: {cache_hours:.1f} hours"
+        )
+        
+        # =====================================================================
+        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
+        # =====================================================================
+        
+        return build_products_map_from_api_result(api_result)
+    
+    except asyncio.TimeoutError:
+        logger.critical("⏱️ API timeout while fetching products")
+        PRODUCTS_CACHE["fetch_error"] = "API timeout"
+        return None
+    
+    except Exception as e:
+        logger.critical(f"❌ Failed to fetch products from API: {e}", exc_info=True)
+        PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
+        return None
+
+
+def validate_products_map(
+    products_map: Optional[Dict[str, dict]],
+    required_pairs: List[str]
+) -> Tuple[bool, List[str]]:
+    
+    if products_map is None:
+        logger.critical(
+            f"🚨 ABORT: Products map is None (API fetch failed). "
+            f"Error: {PRODUCTS_CACHE.get('fetch_error', 'Unknown')}"
+        )
+        return False, []
+    
+    if not isinstance(products_map, dict):
+        logger.critical(f"🚨 ABORT: Products map is not dict: {type(products_map)}")
+        return False, []
+    
+    if len(products_map) == 0:
+        logger.critical(
+            f"🚨 ABORT: Products map is empty. "
+            f"Check that configured pairs match API symbols.\n"
+            f"  Configured pairs: {required_pairs}\n"
+            f"  Fetch error: {PRODUCTS_CACHE.get('fetch_error', 'None')}"
+        )
+        return False, []
+    
+    # =========================================================================
+    # COVERAGE CALCULATION
+    # =========================================================================
+    
+    available = [p for p in required_pairs if p in products_map]
+    missing = [p for p in required_pairs if p not in products_map]
+    coverage_pct = (len(available) / len(required_pairs) * 100) if required_pairs else 0
+    
+    logger.info(
+        f"📊 Product coverage: {len(available)}/{len(required_pairs)} "
+        f"({coverage_pct:.1f}%)"
+    )
+    
+    if missing:
+        logger.warning(f"⚠️ Missing pairs: {missing}")
+    
+    # =========================================================================
+    # ENFORCE MINIMUM COVERAGE
+    # =========================================================================
+    
+    MIN_COVERAGE_PCT = 80.0
+    
+    if coverage_pct < MIN_COVERAGE_PCT:
+        logger.critical(
+            f"🚨 ABORT: Insufficient coverage ({coverage_pct:.1f}% < {MIN_COVERAGE_PCT}%). "
+            f"Too many pairs missing. Available: {available}"
+        )
+        return False, available
+    
+    return True, available
 
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
@@ -4391,60 +4614,35 @@ async def run_once() -> bool:
         # STEP 2: LOAD/CACHE PRODUCTS
         # =====================================================================
         
-        USE_STATIC_MAP = True
-        STATIC_MAP_REFRESH_DAYS = 7
-        now = time.time()
-
-        last_check_ts = PRODUCTS_CACHE.get("until", 0.0)
-        days_since_check = (now - (last_check_ts - cfg.PRODUCTS_CACHE_TTL)) / 86400 if last_check_ts else 9999
-
-        if USE_STATIC_MAP and days_since_check < STATIC_MAP_REFRESH_DAYS:
-            products_map = STATIC_PRODUCTS_MAP.copy()
-            logger_run.info(f"⚡ Using static map (validated {days_since_check:.1f}d ago)")
-
-        elif not PRODUCTS_CACHE.get("data"):
-            last_fetch_ts = PRODUCTS_CACHE.get("fetched_at", 0.0)
-            reason = "never checked" if last_fetch_ts <= 0 else f"last checked {(now - last_fetch_ts) / 86400:.1f}d ago"
-
-            logger_run.debug(f"📢 Fetching products from API ({reason})")
-
-            temp_fetcher = DataFetcher(cfg.DELTA_API_BASE)
-            prod_resp = await temp_fetcher.fetch_products()
-            if not prod_resp:
-                logger_run.error("❌ Failed to fetch products map - aborting run")
+        logger_run.debug("📦 Creating HTTP fetcher for product fetch...")
+        fetcher = DataFetcher(cfg.DELTA_API_BASE)
+        
+        products_map = await fetch_and_cache_products(fetcher, force_refresh=False)
+        valid_map, available_pairs = validate_products_map(products_map, cfg.PAIRS)
+        
+        if not valid_map:
+            logger_run.critical(
+                f"🚫 Products validation failed | "
+                f"Error: {PRODUCTS_CACHE.get('fetch_error', 'Unknown')} | "
+                f"Available: {available_pairs}"
+            )
+            
+            if cfg.FAIL_ON_REDIS_DOWN:
                 return False
-
-            now = time.time()
-            PRODUCTS_CACHE["data"] = prod_resp
-            PRODUCTS_CACHE["fetched_at"] = now
-            PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
-            clear_stale_products_cache()
-            cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600
-            logger_run.info(f"✅ Products list cached for {cache_hours:.1f} hours")
-
-            products_map = build_products_map_from_api_result(prod_resp)
-
-        else:
-            cache_ttl = PRODUCTS_CACHE["until"] - now
-            logger_run.debug(f"♻️ Using cached products (TTL: {cache_ttl:.0f}s)")
-            prod_resp = PRODUCTS_CACHE["data"]
-            products_map = build_products_map_from_api_result(prod_resp)
-
-        # Validate products_map (CRITICAL)
-        if products_map is None:
-            logger_run.error("❌ Products map is None after initialization")
-            return False
-
-        pairs_to_process = [p for p in cfg.PAIRS if p in products_map]
-
-        if len(pairs_to_process) < len(cfg.PAIRS):
-            missing = set(cfg.PAIRS) - set(pairs_to_process)
-            logger_run.warning(f"⚠️ Missing products for pairs: {missing}")
-
+            else:
+                if not available_pairs:
+                    logger_run.critical("❌ No available pairs - cannot proceed")
+                    return False
+                logger_run.warning(f"⚠️ Proceeding with {len(available_pairs)} available pairs")
+        
+        pairs_to_process = available_pairs if available_pairs else cfg.PAIRS
+        
         if not pairs_to_process:
-            logger_run.error("❌ No valid pairs to process - aborting run")
+            logger_run.error("❌ No pairs to process - aborting")
             return False
-
+        
+        logger_run.info(f"🎯 Processing {len(pairs_to_process)} pairs")
+        
         # =====================================================================
         # STEP 3: CONNECT TO REDIS (FIXED: Manual connect/close, not context manager)
         # =====================================================================
