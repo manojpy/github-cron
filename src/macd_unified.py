@@ -2125,6 +2125,7 @@ async def fetch_and_cache_products(
         PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
         return None
 
+
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
     required_pairs: List[str]
@@ -2181,226 +2182,634 @@ def validate_products_map(
     
     return True, available
 
-
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
-local key = KEYS[1]
-local ttl = tonumber(ARGV[1])
-if redis.call("EXISTS", key) == 1 then
-    return 0
-else
-    redis.call("SET", key, "1", "EX", ttl)
-    return 1
-end
-"""
+    local key = KEYS[1]
+    local ttl = tonumber(ARGV[1])
+    if redis.call("EXISTS", key) == 1 then
+        return 0
+    else
+        redis.call("SET", key, "1", "EX", ttl)
+        return 1
+    end
+    """
+
+    POOL_MAX_AGE_SECONDS = 3600
+    SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0
+
+    _global_pools: ClassVar[Dict[str, Optional[redis.Redis]]] = {}
+    _pool_healthy: ClassVar[Dict[str, bool]] = {}
+    _pool_created_at: ClassVar[Dict[str, float]] = {}
+    _pool_reuse_count: ClassVar[Dict[str, int]] = {}
+    _pool_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _script_reload_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
 
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
+
         self.state_prefix = "pair_state:"
         self.meta_prefix = "metadata:"
         self.alert_prefix = "alert:"
+
         self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
+        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
+
         self.degraded = False
         self.degraded_alerted = False
+        self._connection_attempts = 0
         self._dedup_script_sha: Optional[str] = None
 
-    async def connect(self, timeout: float = 5.0) -> None:
+        if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"RedisStateStore initialized | "
+                f"State TTL: {cfg.STATE_EXPIRY_DAYS}d | "
+                f"Alert TTL: {cfg.STATE_EXPIRY_DAYS}d | "
+                f"Metadata TTL: 7d"
+            )
+
+    async def _attempt_connect(self, timeout: float = 5.0) -> bool:
+        """Attempt to connect to Redis with retry logic."""
         try:
             self._redis = redis.from_url(
                 self.redis_url,
                 socket_connect_timeout=timeout,
                 socket_timeout=timeout,
-                retry_on_timeout=False,
-                max_connections=1,
+                retry_on_timeout=True,
+                max_connections=32,
                 decode_responses=True,
             )
-            await asyncio.wait_for(self._redis.ping(), timeout=1.0)
+
+            ok = await self._ping_with_retry(timeout)
+            if not ok:
+                raise RedisConnectionError("ping failed after retries")
+
+            logger.info("Redis connected")
+            self.degraded = False
+            self.degraded_alerted = False
+            self._connection_attempts = 0
+
+            async with RedisStateStore._pool_lock:
+                existing_pool = RedisStateStore._global_pools.get(self.redis_url)
+                if existing_pool and not existing_pool.closed:
+                    await self._redis.aclose()
+                    self._redis = existing_pool
+                    logger.debug("Using pool created by another coroutine")
+                else:
+                    RedisStateStore._global_pools[self.redis_url] = self._redis
+                    RedisStateStore._pool_healthy[self.redis_url] = True
+                    RedisStateStore._pool_created_at[self.redis_url] = time.time()
+                    RedisStateStore._pool_reuse_count[self.redis_url] = 0
+                    if cfg.DEBUG_MODE:
+                        logger.debug("Redis connection saved to per-URL pool")
 
             try:
                 self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                if cfg.DEBUG_MODE:
+                    logger.debug("Loaded Redis Lua script for alert deduplication")
             except Exception as e:
                 logger.warning(f"Failed to load Lua script (will fallback): {e}")
                 self._dedup_script_sha = None
-
-            self.degraded = False
-            self.degraded_alerted = False
-            logger.info("✅ Redis connected (single-use connection)")
+            return True
 
         except Exception as exc:
-            logger.critical(f"❌ Redis connection failed: {exc}")
-            self.degraded = True
-            if cfg.FAIL_ON_REDIS_DOWN:
-                raise RedisConnectionError("Redis unavailable – FAIL_ON_REDIS_DOWN=true")
-            else:
-                logger.warning("""
+            logger.error(f"Redis connection attempt failed: {exc}")
+            if self._redis:
+                try:
+                    await self._redis.aclose()
+                except Exception:
+                    pass
+                self._redis = None
+            return False
+
+    async def connect(self, timeout: float = 5.0) -> None:
+        
+        pool_reused = False
+
+        async with RedisStateStore._pool_lock:
+            pool = RedisStateStore._global_pools.get(self.redis_url)
+            healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
+
+            if pool and healthy:
+                pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
+
+                if pool_age > self.POOL_MAX_AGE_SECONDS:
+                    logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
+                    RedisStateStore._pool_healthy[self.redis_url] = False
+                    try:
+                        await pool.aclose()
+                    except Exception:
+                        pass
+                    RedisStateStore._global_pools[self.redis_url] = None
+                else:
+                    try:
+                        await asyncio.wait_for(pool.ping(), timeout=1.0)
+                        self._redis = pool
+                        RedisStateStore._pool_reuse_count[self.redis_url] = \
+                            RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
+                    
+                        if not self._dedup_script_sha:
+                            try:
+                                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
+                            except Exception as e:
+                                if cfg.DEBUG_MODE:
+                                    logger.debug(f"Lua script load failed: {e}")
+            
+                        self.degraded = False
+
+                        pool_reused = True
+                        return
+
+                    except Exception as e:
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"Pool health check failed: {e}, creating new pool")
+                        RedisStateStore._pool_healthy[self.redis_url] = False
+                        pool_reused = False
+        
+        if pool_reused:
+            return
+
+        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
+            if await self._attempt_connect(timeout):
+                try:
+                    ping_ok = await asyncio.wait_for(self._redis.ping(), timeout=1.0)
+                    if ping_ok:
+                        max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
+                        logger.info(f"✅ Redis connected ({max_conn} max)")
+                        self.degraded = False
+                        self.degraded_alerted = False
+                        return
+                except asyncio.TimeoutError:
+                    logger.warning("Redis ping timeout, retrying...")
+                    self._redis = None
+                except Exception as e:
+                    logger.warning(f"Redis ping failed: {e}")
+                    self._redis = None
+
+            if attempt < cfg.REDIS_CONNECTION_RETRIES:
+                delay = cfg.REDIS_RETRY_DELAY * attempt
+                logger.warning(f"Retrying Redis connection in {delay}s...")
+                await asyncio.sleep(delay)
+
+        # All retries failed
+        logger.critical("❌ Redis connection failed after all retries")
+        self.degraded = True
+        if self._redis:
+            try:
+                await self._redis.aclose()
+            except Exception:
+                pass
+        self._redis = None
+
+        logger.warning("""
 🚨 REDIS DEGRADED MODE ACTIVE:
 - Alert deduplication:  DISABLED (may get duplicates)
 - State persistence:    DISABLED (alerts reset each run)
 - Trading alerts:       STILL ACTIVE (core functionality preserved)
 """)
 
+        if cfg.FAIL_ON_REDIS_DOWN:
+            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
+
     async def close(self) -> None:
-        if self._redis is not None:
-            try:
-                await self._redis.aclose()
-                logger.debug("✅ Redis connection closed")
-            except Exception as e:
-                logger.error(f"Error closing Redis connection: {e}")
-            finally:
-                self._redis = None
+        """Close Redis connection (called manually in finally block)."""
+        self._redis = None
+
+    @classmethod
+    async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
+        """Shutdown global connection pool(s)."""
+        async with cls._pool_lock:
+            urls = [redis_url] if redis_url else list(cls._global_pools.keys())
+            for url in urls:
+                pool = cls._global_pools.get(url)
+                if pool:
+                    try:
+                        pool_age = time.time() - cls._pool_created_at.get(url, 0.0)
+                        reuse_count = cls._pool_reuse_count.get(url, 0)
+                        logger.debug(f"Shutting down Redis pool | url={url} | Age: {pool_age:.1f}s | Reuses: {reuse_count}")
+
+                        await pool.aclose()
+                        await asyncio.sleep(0.25)  # Allow cleanup
+
+                    except Exception as e:
+                        logger.error(f"Error shutting down Redis pool {url}: {e}")
+
+                cls._global_pools.pop(url, None)
+                cls._pool_healthy.pop(url, None)
+                cls._pool_created_at.pop(url, None)
+                cls._pool_reuse_count.pop(url, None)
+            
+    async def _ping_with_retry(self, timeout: float) -> bool:
+        """Ping Redis to verify connectivity."""
+        result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
+        return bool(result)
+
+    async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):
+        """Execute Redis operation with timeout and error handling."""
+        if not self._redis:
+            return None
+        try:
+            coro = fn()
+            result = await asyncio.wait_for(coro, timeout=timeout)
+            return parser(result) if parser else result
+        except (asyncio.TimeoutError, RedisConnectionError, RedisError) as e:
+            logger.error(f"Redis {op_name} failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to {op_name}: {e}")
+            return None
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
-        if self.degraded or not self._redis:
-            return None
-        try:
-            result = await asyncio.wait_for(
-                self._redis.get(f"{self.state_prefix}{key}"),
-                timeout=timeout
-            )
-            return json_loads(result) if result else None
-        except Exception as e:
-            logger.error(f"Redis get failed for {key}: {e}")
-            return None
+        """Get state from Redis."""
+        return await self._safe_redis_op(
+            lambda: self._redis.get(f"{self.state_prefix}{key}"),
+            timeout,
+            f"get {key}",
+            parser=lambda r: json_loads(r) if r else None,
+        )
 
-    async def set(self, key: str, state: Any, ts: Optional[int] = None, timeout: float = 2.0) -> None:
-        if self.degraded or not self._redis:
-            return
-        try:
-            ts = int(ts or time.time())
-            data = json_dumps({"state": state, "ts": ts})
-            await asyncio.wait_for(
-                self._redis.set(
-                    f"{self.state_prefix}{key}",
-                    data,
-                    ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
-                ),
-                timeout=timeout
-            )
-        except Exception as e:
-            logger.error(f"Redis set failed for {key}: {e}")
+    async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
+        """Set state in Redis."""
+        ts = int(ts or time.time())
+        redis_key = f"{self.state_prefix}{key}"
+        data = json_dumps({"state": state, "ts": ts})
+        await self._safe_redis_op(
+            lambda: self._redis.set(
+                redis_key,
+                data,
+                ex=self.expiry_seconds if self.expiry_seconds > 0 else None,
+            ),
+            timeout,
+            f"set {key}",
+        )
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
-        if self.degraded or not self._redis:
-            return None
-        try:
-            return await asyncio.wait_for(
-                self._redis.get(f"{self.meta_prefix}{key}"),
-                timeout=timeout
-            )
-        except Exception as e:
-            logger.error(f"Redis get_metadata failed for {key}: {e}")
-            return None
+        """Get metadata from Redis."""
+        return await self._safe_redis_op(
+            lambda: self._redis.get(f"{self.meta_prefix}{key}"),
+            timeout,
+            f"get_metadata {key}",
+            parser=lambda r: r if r else None,
+        )
 
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
-        if self.degraded or not self._redis:
-            return
-        try:
-            await asyncio.wait_for(
-                self._redis.set(
-                    f"{self.meta_prefix}{key}",
-                    value,
-                    ex=self.metadata_expiry_seconds
-                ),
-                timeout=timeout
-            )
-        except Exception as e:
-            logger.error(f"Redis set_metadata failed for {key}: {e}")
+        """Set metadata in Redis."""
+        await self._safe_redis_op(
+            lambda: self._redis.set(
+                f"{self.meta_prefix}{key}",
+                value,
+                ex=self.metadata_expiry_seconds
+            ),
+            timeout,
+            f"set_metadata {key}",
+        )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        if self.degraded or not self._redis:
+        """Check if alert was recently sent (deduplication)."""
+        if self.degraded:
             return True
+
+        window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+        recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
+
         try:
-            window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-            recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
             result = await asyncio.wait_for(
-                self._redis.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
+                self._redis.set(
+                    recent_key,
+                    "1",
+                    nx=True,
+                    ex=Constants.ALERT_DEDUP_WINDOW_SEC
+                ),
                 timeout=1.0
             )
-            return bool(result)
+            should_send = bool(result)
+            if cfg.DEBUG_MODE and not should_send:
+                logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
+            return should_send
+
         except Exception as e:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
 
     async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
-        if self.degraded or not self._redis or not checks:
+        
+        if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+
         try:
             async with self._redis.pipeline() as pipe:
                 keys_map: Dict[str, str] = {}
+                
+                # Queue all SET commands (NX = only if not exists)
                 for pair, alert_key, ts in checks:
                     window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                     recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
                     composite_key = f"{pair}:{alert_key}"
                     keys_map[recent_key] = composite_key
-                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                    
+                    # NX=True means "only set if key doesn't exist"
+                    # Returns True if key was set, False if key already existed
+                    pipe.set(
+                        recent_key, 
+                        "1", 
+                        nx=True, 
+                        ex=Constants.ALERT_DEDUP_WINDOW_SEC
+                    )
+
+                # Execute all SET commands atomically
                 results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
-                output: Dict[str, bool] = {}
-                for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
-                    should_send = bool(results[idx]) if idx < len(results) else True
-                    output[composite_key] = should_send
-                if cfg.DEBUG_MODE:
-                    duplicates = sum(1 for v in output.values() if not v)
-                    if duplicates > 0:
-                        logger.debug(f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered")
-                return output
+
+            # Build output: True if SET succeeded (new key), False if already existed (duplicate)
+            output: Dict[str, bool] = {}
+            for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
+                should_send = bool(results[idx]) if idx < len(results) else True
+                output[composite_key] = should_send
+
+            if cfg.DEBUG_MODE:
+                duplicates = sum(1 for v in output.values() if not v)
+                if duplicates > 0:
+                    logger.debug(f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered")
+
+            return output
+            
+        except asyncio.TimeoutError:
+            logger.error("batch_check_recent_alerts timeout")
+            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
+            
         except Exception as e:
             logger.error(f"batch_check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
     async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
-        if self.degraded or not self._redis:
+        
+        if not self._redis or self.degraded:
             return {k: None for k in alert_keys}
+
         try:
             async with self._redis.pipeline(transaction=True) as pipe:
+                # STEP 1: Build mget commands for all keys
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-                for sk in state_keys:
-                    pipe.get(sk)
+                
+                # Add all GET commands to pipeline
+                for state_key in state_keys:
+                    pipe.get(state_key)
+
+                # STEP 2: Build SET commands for all updates
                 now = int(time.time())
                 for full_key, state_value, custom_ts in updates:
                     ts = custom_ts if custom_ts is not None else now
+                    
                     try:
                         data = json_dumps({"state": state_value, "ts": ts})
                     except Exception as e:
                         logger.error(f"Failed to serialize state for {full_key}: {e}")
                         continue
-                    redis_key = f"{self.state_prefix}{full_key}" if not full_key.startswith(self.state_prefix) else full_key
+                
+                    # full_key is expected to be like "pair:alert_key"
+                    # Ensure it has the state prefix
+                    if not full_key.startswith(self.state_prefix):
+                        redis_key = f"{self.state_prefix}{full_key}"
+                    else:
+                        redis_key = full_key
+
                     if self.expiry_seconds > 0:
                         pipe.set(redis_key, data, ex=self.expiry_seconds)
                     else:
                         pipe.set(redis_key, data)
+
+                # STEP 3: Execute pipeline atomically
                 results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-                num_gets = len(alert_keys)
-                mget_results = results[:num_gets] if results else []
-                parsed: Dict[str, Optional[Dict[str, Any]]] = {}
-                for idx, key in enumerate(alert_keys):
-                    val = mget_results[idx] if idx < len(mget_results) else None
-                    if val is None:
+
+            # STEP 4: Parse GET results (first N results are from mget)
+            num_gets = len(alert_keys)
+            mget_results = results[:num_gets] if results else []
+
+            # STEP 5: Build output dictionary
+            parsed: Dict[str, Optional[Dict[str, Any]]] = {}
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                
+                if val is None:
+                    parsed[key] = None
+                    continue
+                
+                try:
+                    # Handle both bytes and string returns
+                    if isinstance(val, bytes):
+                        val_str = val.decode("utf-8")
+                    elif isinstance(val, str):
+                        val_str = val
+                    else:
+                        logger.warning(f"Unexpected Redis type for {pair}:{key} -> {type(val)}")
                         parsed[key] = None
                         continue
-                    try:
-                        val_str = val.decode("utf-8") if isinstance(val, bytes) else val
-                        parsed[key] = json_loads(val_str)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse Redis value for {pair}:{key}: {e}")
-                        parsed[key] = None
-                if cfg.DEBUG_MODE:
-                    retrieved = sum(1 for v in parsed.values() if v is not None)
-                    logger.debug(f"batch_get_and_set_alerts completed | pair={pair} | retrieved={retrieved}/{len(alert_keys)} | updated={len(updates)}")
-                return parsed
+
+                    parsed[key] = json_loads(val_str)
+                    
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    logger.warning(f"Failed to parse Redis value for {pair}:{key}: {e}")
+                    parsed[key] = None
+                except Exception as e:
+                    logger.error(f"Unexpected error parsing {pair}:{key}: {e}")
+                    parsed[key] = None
+
+            if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"batch_get_and_set_alerts completed | pair={pair} | "
+                    f"retrieved={sum(1 for v in parsed.values() if v is not None)}/{len(alert_keys)} | "
+                    f"updated={len(updates)}"
+                )
+
+            return parsed
+
+        except asyncio.TimeoutError:
+            logger.error(f"batch_get_and_set_alerts timeout for {pair}")
+            return {k: None for k in alert_keys}
+            
         except Exception as e:
             logger.error(f"batch_get_and_set_alerts failed for {pair}: {e}")
             return {k: None for k in alert_keys}
 
+    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """Atomically evaluate batch of alerts with pipeline execution."""
+        if self.degraded:
+            empty_prev = {k: False for k in alert_keys}
+            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            return empty_prev, empty_dedup
+
+        try:
+            prev_states, dedup_results = await self._pipeline_ops(
+                pair, alert_keys, state_updates, dedup_checks
+            )
+            return prev_states, dedup_results
+
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
+                f"Degrading to batch_get_and_set_alerts + batch_check_recent_alerts"
+            )
+            try:
+                # FIXED: Use batch_get_and_set_alerts for atomic get+set
+                prev_raw = await asyncio.wait_for(
+                    self.batch_get_and_set_alerts(pair, alert_keys, state_updates),
+                    timeout=2.0
+                )
+
+                prev_states: Dict[str, bool] = {}
+                for k in alert_keys:
+                    env = prev_raw.get(k)
+                    prev_states[k] = isinstance(env, dict) and env.get("state") == "ACTIVE"
+
+                # FIXED: Use batch_check_recent_alerts for deduplication
+                dedup_results = await asyncio.wait_for(
+                    self.batch_check_recent_alerts(dedup_checks),
+                    timeout=2.0
+                )
+                
+                return prev_states, dedup_results
+                
+            except asyncio.TimeoutError:
+                logger.critical(f"Redis completely unresponsive for {pair}")
+                empty_prev = {k: False for k in alert_keys}
+                empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+                return empty_prev, empty_dedup
+
+        except Exception as e:
+            logger.error(f"atomic_eval_batch failed: {e}")
+            empty_prev = {k: False for k in alert_keys}
+            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            return empty_prev, empty_dedup
+
+    async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        
+        if not self._redis:
+            raise RedisConnectionError("Redis unavailable")
+
+        try:
+            async with self._redis.pipeline() as pipe:
+                # ===== PHASE 1: MGET previous states =====
+                state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+                pipe.mget(state_keys)
+
+                # ===== PHASE 2: SET new states =====
+                now = int(time.time())
+                for key, state, custom_ts in state_updates:
+                    ts = custom_ts if custom_ts is not None else now
+                    try:
+                        data = json_dumps({"state": state, "ts": ts})
+                    except Exception as e:
+                        logger.error(f"Failed to serialize state for {key}: {e}")
+                        continue
+                
+                    # Ensure key has proper prefix
+                    if not key.startswith(self.state_prefix):
+                        full_key = f"{self.state_prefix}{key}"
+                    else:
+                        full_key = key
+
+                    if self.expiry_seconds > 0:
+                        pipe.set(full_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(full_key, data)
+
+                # ===== PHASE 3: SET dedup keys (NX) =====
+                dedup_keys_ordered: List[Tuple[str, str]] = []
+            
+                for pair_name, alert_key, ts in dedup_checks:
+                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
+                    composite_key = f"{pair_name}:{alert_key}"
+                    dedup_keys_ordered.append((recent_key, composite_key))
+                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
+                
+                # ===== EXECUTE PIPELINE ATOMICALLY =====
+                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
+
+            num_gets = 1  # mget returns ONE result (list of values)
+            num_sets = len(state_updates)
+            num_dedups = len(dedup_keys_ordered)
+        
+            if not results or len(results) < (num_gets + num_sets + num_dedups):
+                logger.warning("Pipeline returned incomplete results")
+                return (
+                    {k: False for k in alert_keys},
+                    {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+                )
+        
+            # ===== PARSE MGET RESULTS (first result is list of values) =====
+            mget_results = results[0] if results else []
+
+            prev_states: Dict[str, bool] = {}
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                
+                if val is None:
+                    prev_states[key] = False
+                    continue
+                
+                try:
+                    if isinstance(val, bytes):
+                        val_str = val.decode("utf-8")
+                    elif isinstance(val, str):
+                        val_str = val
+                    else:
+                        prev_states[key] = False
+                        continue
+
+                    parsed_state = json_loads(val_str)
+                    prev_states[key] = parsed_state.get("state") == "ACTIVE"
+                    
+                except (json.JSONDecodeError, TypeError) as e:
+                    if cfg.DEBUG_MODE:
+                        logger.debug(f"Failed to parse state for {key}: {e}")
+                    prev_states[key] = False
+                except Exception as e:
+                    logger.error(f"Unexpected error parsing state for {key}: {e}")
+                    prev_states[key] = False
+
+            # ===== PARSE DEDUP RESULTS =====
+            dedup_results: Dict[str, bool] = {}
+            dedup_start_idx = num_gets + num_sets
+            
+            for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
+                result_idx = dedup_start_idx + idx
+                # SET with NX returns True if key was set (new), False if already existed (duplicate)
+                should_send = bool(results[result_idx]) if result_idx < len(results) else True
+                dedup_results[composite_key] = should_send
+
+            if cfg.DEBUG_MODE:
+                duplicates = sum(1 for v in dedup_results.values() if not v)
+                if duplicates > 0:
+                    logger.debug(f"Pipeline dedup: {duplicates}/{len(dedup_checks)} duplicates filtered")
+
+            return prev_states, dedup_results
+
+        except asyncio.TimeoutError:
+            logger.error("Pipeline operation timeout")
+            return (
+                {k: False for k in alert_keys},
+                {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            )
+        except Exception as e:
+            logger.error(f"Pipeline operation failed: {e}")
+            return (
+                {k: False for k in alert_keys},
+                {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
+            )
+
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+        """Atomically update multiple state entries."""
         if self.degraded or not self._redis:
             return False
+
         if not updates and not deletes:
             return True
+
         try:
             async with self._redis.pipeline() as pipe:
                 now = int(time.time())
+
                 for key, state, custom_ts in (updates or []):
                     ts = custom_ts if custom_ts is not None else now
                     try:
@@ -2408,17 +2817,23 @@ end
                     except Exception as e:
                         logger.error(f"Failed to serialize state for {key}: {e}")
                         continue
+                
                     full_key = f"{self.state_prefix}{key}"
                     if self.expiry_seconds > 0:
                         pipe.set(full_key, data, ex=self.expiry_seconds)
                     else:
                         pipe.set(full_key, data)
+
                 if deletes:
                     for key in deletes:
                         if key:
                             pipe.delete(f"{self.state_prefix}{key}")
+
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
-                return True
+            return True
+        except asyncio.TimeoutError:
+            logger.error("Atomic batch update timeout")
+            return False
         except Exception as e:
             logger.error(f"Atomic batch update failed: {e}")
             return False
@@ -4161,6 +4576,7 @@ async def run_once() -> bool:
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     
+    # Initialize resource references
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     fetcher: Optional[DataFetcher] = None
@@ -4168,6 +4584,7 @@ async def run_once() -> bool:
     lock_acquired = False
     lock_extension_task: Optional[asyncio.Task] = None
     alerts_sent = 0
+    
     products_map: Optional[Dict[str, dict]] = None
     pairs_to_process: List[str] = []
     
@@ -4178,6 +4595,10 @@ async def run_once() -> bool:
     )
 
     try:
+        # =====================================================================
+        # STEP 1: MEMORY CHECK & CONFIGURATION VALIDATION
+        # =====================================================================
+        
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
@@ -4189,6 +4610,10 @@ async def run_once() -> bool:
             )
             return False
 
+        # =====================================================================
+        # STEP 2: LOAD/CACHE PRODUCTS
+        # =====================================================================
+        
         logger_run.debug("📦 Creating HTTP fetcher for product fetch...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         
@@ -4218,14 +4643,19 @@ async def run_once() -> bool:
         
         logger_run.info(f"🎯 Processing {len(pairs_to_process)} pairs")
         
+        # =====================================================================
+        # STEP 3: CONNECT TO REDIS (FIXED: Manual connect/close, not context manager)
+        # =====================================================================
+        
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
 
         if sdb.degraded and not sdb.degraded_alerted:
-            logger_run.critical("⚠️ Redis is in degraded mode – alert deduplication disabled!")
-            if telegram_queue is None:
-                telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+            logger_run.critical(
+                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
+            )
+            telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
                 f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
@@ -4233,41 +4663,62 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
+        # =====================================================================
+        # STEP 4: CREATE HTTP FETCHER & TELEGRAM QUEUE
+        # =====================================================================
+        
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
-        lock_acquired = False
-        if not sdb.degraded and sdb._redis is not None:
-            lock = RedisLock(sdb._redis, "macd_bot_run")
-            lock_acquired = await lock.acquire(timeout=5.0)
-            if not lock_acquired:
-                logger_run.warning(
-                    "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
-                )
-                return False
+        # =====================================================================
+        # STEP 5: ACQUIRE REDIS LOCK
+        # =====================================================================
+        
+        lock = RedisLock(sdb._redis, "macd_bot_run")
+        lock_acquired = await lock.acquire(timeout=5.0)
 
-            async def extend_lock_periodically(lock_obj: RedisLock, interval: int = 300):
-                while not shutdown_event.is_set():
-                    try:
-                        await asyncio.sleep(interval)
-                        if lock_obj.should_extend():
-                            success = await lock_obj.extend(timeout=3.0)
-                            if success:
-                                logger_run.debug("Lock extended successfully")
-                            else:
-                                logger_run.warning("❌ Failed to extend lock - may lose it soon")
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        logger_run.error(f"Lock extension error: {e}")
-
-            lock_extension_task = asyncio.create_task(
-                extend_lock_periodically(lock, interval=300)
+        if not lock_acquired:
+            logger_run.warning(
+                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
             )
-        else:
-            logger_run.warning("🔒 Skipping Redis lock (Redis degraded or unavailable)")
+            return False
 
+        # =====================================================================
+        # STEP 6: CREATE LOCK EXTENSION TASK (FIXED per Issue #3)
+        # =====================================================================
+        
+        async def extend_lock_periodically(lock_obj: RedisLock, interval: int = 300):
+            """
+            Extend Redis lock every N seconds to keep it alive during long runs.
+            
+            Redis lock expires after REDIS_LOCK_EXPIRY (~900s). If run takes longer,
+            another instance could acquire the lock. This task prevents that.
+            """
+            while not shutdown_event.is_set():
+                try:
+                    await asyncio.sleep(interval)
+                    
+                    if lock_obj.should_extend():
+                        success = await lock_obj.extend(timeout=3.0)
+                        if success:
+                            logger_run.debug("��� Lock extended successfully")
+                        else:
+                            logger_run.warning("❌ Failed to extend lock - may lose it soon")
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger_run.error(f"Lock extension error: {e}")
+
+        # Launch lock extension task at 5-minute intervals
+        lock_extension_task = asyncio.create_task(
+            extend_lock_periodically(lock, interval=300)
+        )
+
+        # =====================================================================
+        # STEP 7: SEND TEST MESSAGE
+        # =====================================================================
+        
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -4280,6 +4731,10 @@ async def run_once() -> bool:
             f"🔔 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
+        # =====================================================================
+        # STEP 8: PROCESS PAIRS WITH GARBAGE COLLECTION CONTROL
+        # =====================================================================
+        
         logger_run.info("Starting evaluation phase...")
         logger_run.debug("Garbage collection disabled during evaluation loop...")
         
@@ -4288,6 +4743,10 @@ async def run_once() -> bool:
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
 
+        # =====================================================================
+        # STEP 9: AGGREGATE ALERT RESULTS
+        # =====================================================================
+        
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 extra_alerts = state.get("summary", {}).get("alerts", 0)
@@ -4320,12 +4779,18 @@ async def run_once() -> bool:
                 )
             )
 
+        # =====================================================================
+        # STEP 10: LOG STATISTICS
+        # =====================================================================
+        
         if fetcher is None:
-            logger_run.error(" Fetcher is None - cannot get stats")
+            logger_run.error("�� Fetcher is None - cannot get stats")
             return False
 
         fetcher_stats = fetcher.get_stats()
+
         prod_str = "cached" if PRODUCTS_CACHE.get("fetched_at") else f"{fetcher_stats['products']['success']}✅"
+
         total_required = fetcher_stats['candles']['success'] + fetcher_stats['candles']['failed']
 
         logger_run.info(
@@ -4372,11 +4837,12 @@ async def run_once() -> bool:
         return False
 
     except asyncio.CancelledError:
-        logger_run.warning(" Run cancelled (shutdown signal received)")
+        logger_run.warning("�� Run cancelled (shutdown signal received)")
         return False
 
     except Exception as e:
         logger_run.exception(f"❌ Fatal error in run_once: {e}")
+
         if telegram_queue:
             try:
                 await telegram_queue.send(escape_markdown_v2(
@@ -4387,11 +4853,17 @@ async def run_once() -> bool:
                 ))
             except Exception:
                 logger_run.error("Failed to send error notification")
+
         return False
 
     finally:
+        # =====================================================================
+        # CLEANUP PHASE: RESOURCE CLEANUP IN CORRECT ORDER
+        # =====================================================================
+        
         logger_run.debug("🧹 Starting resource cleanup...")
 
+        # 1. Cancel lock extension task FIRST (before releasing lock)
         if lock_extension_task:
             try:
                 lock_extension_task.cancel()
@@ -4401,6 +4873,7 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error cancelling lock extension task: {e}")
 
+        # 2. Release Redis lock
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
@@ -4410,6 +4883,7 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
+        # 3. Close Redis connection (FIXED: manual close, not context manager exit)
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
@@ -4419,16 +4893,33 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
 
+        # 4. Shutdown global Redis pool
+        try:
+            await asyncio.wait_for(
+                RedisStateStore.shutdown_global_pool(),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger_run.error("Timeout shutting down Redis pool")
+        except Exception as e:
+            logger_run.error(f"Error shutting down Redis pool: {e}")
+
+        # 5. Force garbage collection after Redis (frees memory)
         gc.collect()
 
+        # 6. Close HTTP session
         try:
-            await asyncio.wait_for(SessionManager.close_session(), timeout=5.0)
+            await asyncio.wait_for(
+                SessionManager.close_session(),
+                timeout=5.0
+            )
             logger_run.debug("✅ HTTP session closed")
         except asyncio.TimeoutError:
             logger_run.error("Timeout closing HTTP session")
         except Exception as e:
             logger_run.error(f"Error closing HTTP session: {e}", exc_info=False)
 
+        # 7. Clear context variables
         try:
             TRACE_ID.set("")
             PAIR_ID.set("")
@@ -4494,8 +4985,13 @@ if __name__ == "__main__":
             return await run_once()
         finally:
             logger.info("🧹 Shutting down persistent connections...")
-            # Note: Redis connection is now managed *inside* run_once() and closed there.
-            # No global pool to shut down.
+            try:
+                await RedisStateStore.shutdown_global_pool()
+                logger.debug("🌈 Redis pool closed")
+            except Exception as e:
+                logger.error(f"Error closing Redis pool: {e}")
+
+
             try:
                 await SessionManager.close_session()
                 logger.debug("⏰ HTTP session closed")
