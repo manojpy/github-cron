@@ -400,32 +400,30 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-GLOBAL_CONFIG = {
-    "DELTA_API_BASE": "https://api.india.delta.exchange",
-    "PAIRS": [],
-}
 
-def load_config_file():
-    config_path = Path("config_macd.json")
-    if config_path.exists():
+def load_config() -> BotConfig:
+    config_file = os.getenv("CONFIG_FILE", "config_macd.json")
+    data: Dict[str, Any] = {}
+    if Path(config_file).exists():
         try:
-            with open(config_path, "r") as f:
-                external_config = json.load(f)
-                if "PAIRS" in external_config:
-                    GLOBAL_CONFIG["PAIRS"] = external_config["PAIRS"]
-                    # If logger is defined, use it; otherwise use print
-                    if 'logger' in globals():
-                        logger.info(f"✅ Loaded {len(GLOBAL_CONFIG['PAIRS'])} pairs from JSON")
-                    else:
-                        print(f"✅ Loaded {len(GLOBAL_CONFIG['PAIRS'])} pairs from JSON")
-        except Exception as e:
-            print(f"Failed to load config: {e}")
+            with open(config_file, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read()) # Ensure using standard json or orjson
+                # If your JSON has "PAIRS", it will be in 'data' now
+        except Exception as exc:
+            print(f"❌ ERROR: Config file {config_file} is not valid: {exc}", file=sys.stderr)
+            sys.exit(1)
+    
+    # ... (rest of your existing load_config logic for env vars) ...
 
-# --- IMPORTANT: ONLY CALL THIS AFTER logger = setup_logging() ---
-# Search for your "logger = setup_logging()" line in Part 1.
-# Put the call IMMEDIATELY after it.
-logger = setup_logging()
-load_config_file()
+    try:
+        instance = BotConfig(**data)
+        return instance
+    except Exception as exc:
+        print(f"❌ ERROR: Pydantic validation failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+# This is the object your whole script uses
+cfg = load_config()
 
 _IST_TZ = ZoneInfo("Asia/Kolkata")
 
@@ -2167,36 +2165,40 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     
     return products_map
 
+
 class GlobalCache:
     products_map: Dict[str, Any] = {}
     last_refresh: float = 0
 
 async def fetch_and_cache_products(fetcher=None, force_refresh: bool = False) -> Dict[str, Any]:
     """
-    1. Accepts 'fetcher' to fix the TypeError.
-    2. Uses 'GlobalCache' which is now defined above.
-    3. Only fetches the 12 pairs in config.
+    Optimized: Uses 'cfg' from Part 1 and only fetches 12 pairs.
+    Handles 'fetcher' argument to prevent Part 3 crashes.
     """
     if not force_refresh and GlobalCache.products_map:
         return GlobalCache.products_map
 
-    target_symbols = GLOBAL_CONFIG.get("PAIRS", [])
+    # Use the 'cfg' object we updated in Part 1
+    target_symbols = cfg.PAIRS
+    
     if not target_symbols:
-        # Fallback if config failed to load
-        target_symbols = ["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"]
+        logger.error("❌ No symbols found in cfg.PAIRS. Check config_macd.json")
+        return {}
 
-    logger.info(f"📡 Requesting metadata for {len(target_symbols)} pairs...")
+    logger.info(f"📡 Requesting metadata for {len(target_symbols)} specific pairs...")
     
     try:
+        # Join symbols for the API filter
         symbols_query = ",".join(target_symbols)
-        url = f"{GLOBAL_CONFIG['DELTA_API_BASE']}/v2/products?symbols={symbols_query}"
+        url = f"{cfg.DELTA_API_BASE}/v2/products?symbols={symbols_query}"
         
         async with SessionManager.get_session().get(url, timeout=30) as response:
             if response.status != 200:
+                logger.error(f"Delta API error: {response.status}")
                 return {}
             
-            data = await response.json()
-            api_products = data.get("result", [])
+            resp_data = await response.json()
+            api_products = resp_data.get("result", [])
             
             new_map = {}
             for p in api_products:
@@ -2211,11 +2213,12 @@ async def fetch_and_cache_products(fetcher=None, force_refresh: bool = False) ->
                         "underlying_asset": p.get("underlying_asset")
                     }
 
+            logger.info(f"✅ Product map built: {len(new_map)}/{len(target_symbols)} found.")
             GlobalCache.products_map = new_map
-            logger.info(f"✅ Map built: {len(new_map)} pairs.")
             return new_map
+
     except Exception as e:
-        logger.error(f"Fetch failed: {e}")
+        logger.error(f"fetch_and_cache_products failed: {e}")
         return {}
 
 def validate_products_map(
