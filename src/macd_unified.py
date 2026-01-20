@@ -4497,7 +4497,7 @@ async def run_once() -> bool:
         # PHASE 2: FETCH & VALIDATE PRODUCTS (NO STATIC FALLBACK)
         # =====================================================================
         
-        logger_run.debug("Creating HTTP fetcher for product fetch...")
+        logger_run.debug("📦 Creating HTTP fetcher for product fetch...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         
         # FIXED: Use new fetch_and_cache_products function (no static fallback)
@@ -4518,28 +4518,28 @@ async def run_once() -> bool:
             else:
                 # Even if we can't get products, we might have old cache
                 if not available_pairs:
-                    logger_run.critical("No available pairs - cannot proceed")
+                    logger_run.critical("❌ No available pairs - cannot proceed")
                     return False
-                logger_run.warning(f"Proceeding with {len(available_pairs)} available pairs")
+                logger_run.warning(f"⚠️ Proceeding with {len(available_pairs)} available pairs")
         
         pairs_to_process = available_pairs if available_pairs else cfg.PAIRS
         
         if not pairs_to_process:
-            logger_run.error("No pairs to process - aborting")
+            logger_run.error("❌ No pairs to process - aborting")
             return False
         
-        logger_run.info(f"Processing {len(pairs_to_process)} pairs")
+        logger_run.info(f"🎯 Processing {len(pairs_to_process)} pairs")
         
         # =====================================================================
         # PHASE 3: CONNECT TO REDIS (SINGLE CONNECTION, NO GLOBAL POOL)
         # =====================================================================
         
-        logger_run.debug("Connecting to Redis...")
+        logger_run.debug("🔌 Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         
         connection_ok = await sdb.connect(timeout=5.0)
         if not connection_ok and cfg.FAIL_ON_REDIS_DOWN:
-            logger_run.critical("Redis connection failed and FAIL_ON_REDIS_DOWN=true")
+            logger_run.critical("❌ Redis connection failed and FAIL_ON_REDIS_DOWN=true")
             return False
         
         if sdb.degraded:
@@ -4556,7 +4556,7 @@ async def run_once() -> bool:
                     ))
                     sdb.degraded_alerted = True
                 except Exception as e:
-                    logger_run.error(f"Failed to send degradation alert: {e}")
+                    logger_run.error(f"❌ Failed to send degradation alert: {e}")
         
         # =====================================================================
         # PHASE 4: CREATE TELEGRAM QUEUE (if not already created for degradation)
@@ -4593,12 +4593,12 @@ async def run_once() -> bool:
                         if success and cfg.DEBUG_MODE:
                             logger_run.debug("🔄 Lock extended")
                         elif not success:
-                            logger_run.warning("Failed to extend lock")
+                            logger_run.warning("⚠️ Failed to extend lock")
                 
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger_run.error(f"Lock extension error: {e}")
+                    logger_run.error(f"❌ Lock extension error: {e}")
         
         lock_extension_task = asyncio.create_task(
             extend_lock_periodically(lock, interval=300)
@@ -4611,7 +4611,7 @@ async def run_once() -> bool:
         if cfg.SEND_TEST_MESSAGE:
             try:
                 await telegram_queue.send(escape_markdown_v2(
-                    f"🔥 {cfg.BOT_NAME} - Run Started\n"
+                    f"📢 {cfg.BOT_NAME} - Run Started\n"
                     f"Time: {format_ist_time()}\n"
                     f"Correlation: {correlation_id}\n"
                     f"Pairs: {len(pairs_to_process)}"
@@ -4623,7 +4623,7 @@ async def run_once() -> bool:
         # PHASE 8: PROCESS PAIRS WITH WORKERS
         # =====================================================================
         
-        logger_run.info("Starting evaluation phase...")
+        logger_run.info("🚀 Starting evaluation phase...")
         all_results = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process,
             sdb, telegram_queue, correlation_id, lock, reference_time
@@ -4638,16 +4638,16 @@ async def run_once() -> bool:
                 extra_alerts = state.get("summary", {}).get("alerts", 0)
                 
                 if alerts_sent > MAX_ALERTS_PER_RUN:
-                    logger_run.warning(f"Alert limit reached, skipping remaining")
+                    logger_run.warning(f"⚠️ Alert limit reached, skipping remaining")
                     break
                 
                 alerts_sent += extra_alerts
         
         if alerts_sent >= MAX_ALERTS_PER_RUN:
-            logger_run.critical(f"Alert volume limit exceeded: {alerts_sent}/{MAX_ALERTS_PER_RUN}")
+            logger_run.critical(f"📊 Alert volume limit exceeded: {alerts_sent}/{MAX_ALERTS_PER_RUN}")
             try:
                 await telegram_queue.send(escape_markdown_v2(
-                    f"🔇 HIGH ALERT VOLUME\n"
+                    f"📈 HIGH ALERT VOLUME\n"
                     f"Alerts: {alerts_sent}/{MAX_ALERTS_PER_RUN}\n"
                     f"Time: {format_ist_time()}"
                 ))
@@ -4661,7 +4661,7 @@ async def run_once() -> bool:
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
-        redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
+        redis_status = "✅ OK" if (sdb and not sdb.degraded) else "⚠️ DEGRADED"
         
         logger_run.info(
             f"🎯 RUN COMPLETE | "
@@ -4713,7 +4713,7 @@ async def run_once() -> bool:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             except Exception as e:
-                logger_run.error(f"Error cancelling lock task: {e}")
+                logger_run.error(f"❌ Error cancelling lock task: {e}")
         
         # 2. Release Redis lock (BEFORE closing connection)
         if lock_acquired and lock:
@@ -4721,15 +4721,15 @@ async def run_once() -> bool:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
                 logger_run.debug("🔏 Lock released")
             except Exception as e:
-                logger_run.error(f"Error releasing lock: {e}", exc_info=False)
+                logger_run.error(f"❌ Error releasing lock: {e}", exc_info=False)
         
         # 3. Close Redis connection (SINGLE connection per instance)
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
-                logger_run.debug("♨️ Redis closed")
+                logger_run.debug("♻️ Redis closed")
             except Exception as e:
-                logger_run.error(f"Error closing Redis: {e}", exc_info=False)
+                logger_run.error(f"❌ Error closing Redis: {e}", exc_info=False)
         
         # 4. Force garbage collection
         gc.collect()
@@ -4739,7 +4739,7 @@ async def run_once() -> bool:
             await asyncio.wait_for(SessionManager.close_session(), timeout=5.0)
             logger_run.debug("✅ HTTP session closed")
         except Exception as e:
-            logger_run.error(f"Error closing HTTP: {e}", exc_info=False)
+            logger_run.error(f"❌ Error closing HTTP: {e}", exc_info=False)
         
         # 6. Clear context
         TRACE_ID.set("")
@@ -4750,7 +4750,7 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info(f"�� uvloop enabled | {JSON_BACKEND} enabled")
+    logger.info(f"🏀 uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
