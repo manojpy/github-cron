@@ -2181,6 +2181,7 @@ def validate_products_map(
     
     return True, available
 
+
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
 local key = KEYS[1]
@@ -2206,7 +2207,6 @@ end
         self._dedup_script_sha: Optional[str] = None
 
     async def connect(self, timeout: float = 5.0) -> None:
-        """Establish a single Redis connection for this run."""
         try:
             self._redis = redis.from_url(
                 self.redis_url,
@@ -2216,10 +2216,8 @@ end
                 max_connections=1,
                 decode_responses=True,
             )
-            # Test connectivity
             await asyncio.wait_for(self._redis.ping(), timeout=1.0)
 
-            # Load deduplication script
             try:
                 self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
             except Exception as e:
@@ -2244,7 +2242,6 @@ end
 """)
 
     async def close(self) -> None:
-        """Close the Redis connection cleanly."""
         if self._redis is not None:
             try:
                 await self._redis.aclose()
@@ -2255,7 +2252,6 @@ end
                 self._redis = None
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
-        """Get state from Redis."""
         if self.degraded or not self._redis:
             return None
         try:
@@ -2269,7 +2265,6 @@ end
             return None
 
     async def set(self, key: str, state: Any, ts: Optional[int] = None, timeout: float = 2.0) -> None:
-        """Set state in Redis."""
         if self.degraded or not self._redis:
             return
         try:
@@ -2287,7 +2282,6 @@ end
             logger.error(f"Redis set failed for {key}: {e}")
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
-        """Get metadata from Redis."""
         if self.degraded or not self._redis:
             return None
         try:
@@ -2300,7 +2294,6 @@ end
             return None
 
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
-        """Set metadata in Redis."""
         if self.degraded or not self._redis:
             return
         try:
@@ -2316,7 +2309,6 @@ end
             logger.error(f"Redis set_metadata failed for {key}: {e}")
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        """Check if alert was recently sent (deduplication)."""
         if self.degraded or not self._redis:
             return True
         try:
@@ -2402,7 +2394,6 @@ end
             return {k: None for k in alert_keys}
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-        """Atomically update multiple state entries."""
         if self.degraded or not self._redis:
             return False
         if not updates and not deletes:
