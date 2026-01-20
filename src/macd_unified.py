@@ -1928,21 +1928,35 @@ def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minu
     return True
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+    """
+    Build products map ONLY for configured pairs.
+    
+    OPTIMIZED: Filters to only required pairs instead of processing all 1000+
+    
+    Args:
+        api_products: Raw API response with structure {"result": [...]}
+    
+    Returns:
+        Dict mapping pair_name -> {id, symbol, contract_type}
+    """
     
     products_map: Dict[str, dict] = {}
     
     if not api_products or not api_products.get("result"):
-        logger.warning("build_products_map_from_api_result: API result is None or empty")
+        logger.warning("🚨 build_products_map_from_api_result: API result is None or empty")
         return products_map
     
     if not isinstance(api_products["result"], list):
-        logger.error(f"API result is not a list: {type(api_products['result'])}")
+        logger.error(f"❌ API result is not a list: {type(api_products['result'])}")
         return products_map
     
     valid_pattern = CompiledPatterns.VALID_SYMBOL
+    required_set = set(cfg.PAIRS)  # O(1) lookup instead of iterating cfg.PAIRS
     total_checked = 0
     total_matched = 0
     failed_matches = []
+    
+    logger.debug(f"🔍 Starting product matching for {len(required_set)} required pairs")
     
     for p in api_products["result"]:
         try:
@@ -1956,114 +1970,160 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
             # Validate symbol format
             if not valid_pattern.match(symbol):
                 if cfg.DEBUG_MODE:
-                    logger.debug(f"Skipping invalid symbol format: {symbol}")
+                    logger.debug(f"⏭️ Skipping invalid symbol format: {symbol}")
                 continue
             
-            # Only process perpetual futures
-            if p.get("contract_type") != "perpetual_futures":
+            # Only process perpetual futures (skip other contract types early)
+            contract_type = p.get("contract_type", "")
+            if contract_type != "perpetual_futures":
                 if cfg.DEBUG_MODE:
-                    logger.debug(f"Skipping non-futures contract: {symbol} ({p.get('contract_type')})")
+                    logger.debug(f"⏭️ Skipping non-futures: {symbol} ({contract_type})")
                 continue
             
             # Get contract ID
             contract_id = p.get("id")
             if not contract_id:
-                logger.warning(f"Symbol {symbol} missing ID field")
+                logger.warning(f"⚠️ Symbol {symbol} missing ID field")
                 continue
             
             # Normalize symbol for matching
-            # Example: "BTCUSDT" or "BTC_USDT" -> try to match "BTCUSD"
+            # Examples: "BTCUSDT" -> "BTCUSD", "BTC_USDT" -> "BTCUSD"
             symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD").upper()
+            symbol_no_underscore = symbol_norm.replace("_", "")
             
-            # Try to find match in configured pairs
+            # ===================================================================
+            # OPTIMIZATION: Early exit if symbol not in required pairs
+            # ===================================================================
             matched = False
-            for pair_name in cfg.PAIRS:
-                # Exact match after normalization
-                if symbol_norm == pair_name:
-                    products_map[pair_name] = {
-                        "id": contract_id,
-                        "symbol": symbol,
-                        "contract_type": p.get("contract_type")
-                    }
-                    total_matched += 1
-                    matched = True
-                    break
-                
-                # Alternative: try removing underscores from both sides
-                symbol_no_underscore = symbol_norm.replace("_", "")
-                pair_no_underscore = pair_name.replace("_", "")
-                
-                if symbol_no_underscore == pair_no_underscore:
-                    products_map[pair_name] = {
-                        "id": contract_id,
-                        "symbol": symbol,
-                        "contract_type": p.get("contract_type")
-                    }
-                    total_matched += 1
-                    matched = True
-                    break
+            
+            # Try exact match first (fastest)
+            if symbol_norm in required_set:
+                products_map[symbol_norm] = {
+                    "id": contract_id,
+                    "symbol": symbol,
+                    "contract_type": contract_type
+                }
+                total_matched += 1
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"✅ Matched (exact): {symbol} -> {symbol_norm}")
+                matched = True
+            
+            # Try no-underscore match as fallback
+            elif not matched:
+                for pair_name in required_set:
+                    pair_no_underscore = pair_name.replace("_", "")
+                    
+                    if symbol_no_underscore == pair_no_underscore:
+                        products_map[pair_name] = {
+                            "id": contract_id,
+                            "symbol": symbol,
+                            "contract_type": contract_type
+                        }
+                        total_matched += 1
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"✅ Matched (no_underscore): {symbol} -> {pair_name}")
+                        matched = True
+                        break
             
             if not matched and cfg.DEBUG_MODE:
                 failed_matches.append(symbol_norm)
         
         except Exception as e:
-            logger.error(f"Error processing API product: {e}", exc_info=False)
+            logger.error(f"❌ Error processing API product: {e}", exc_info=False)
             continue
     
     # Log summary
+    coverage_pct = (total_matched / len(cfg.PAIRS) * 100) if cfg.PAIRS else 0
+    
     logger.info(
-        f"Product map built: {total_matched}/{total_checked} matched | "
-        f"Coverage: {total_matched}/{len(cfg.PAIRS)} pairs"
+        f"📦 Product map built: {total_matched}/{len(cfg.PAIRS)} matched | "
+        f"Coverage: {coverage_pct:.0f}% | "
+        f"Checked: {total_checked} products from API"
     )
     
     if failed_matches and cfg.DEBUG_MODE:
-        logger.debug(f"Symbols checked but not matched: {failed_matches[:10]}")
+        logger.debug(f"🔍 Checked but not matched (first 10): {failed_matches[:10]}")
     
     return products_map
 
 
-async def fetch_and_cache_products(fetcher: DataFetcher, force_refresh: bool = False) -> Optional[Dict[str, dict]]:
+async def fetch_and_cache_products(
+    fetcher: DataFetcher, 
+    force_refresh: bool = False
+) -> Optional[Dict[str, dict]]:
+    """
+    Fetch and cache products from Delta API.
+    
+    OPTIMIZED:
+    - Only fetches products once per TTL
+    - Caches raw API response (not processed map)
+    - Only processes configured pairs
+    - Reduces network calls and processing overhead
+    
+    Args:
+        fetcher: DataFetcher instance
+        force_refresh: Skip cache and fetch from API
+    
+    Returns:
+        Products map dict or None on failure
+    """
     
     now = time.time()
     cache_data = PRODUCTS_CACHE.get("data")
     cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
     
-    # Check if cache is still valid
+    # =========================================================================
+    # PHASE 1: CHECK CACHE
+    # =========================================================================
+    
     if not force_refresh and cache_data and now < cache_expires_at:
         cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
         cache_remaining = cache_expires_at - now
         logger.debug(
-            f"Using cached products. Age: {cache_age:.0f}s, "
-            f"TTL remaining: {cache_remaining:.0f}s"
+            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
+            f"TTL remaining: {cache_remaining/60:.1f}m"
         )
         return build_products_map_from_api_result(cache_data)
     
-    # Cache expired or forced refresh - fetch from API
-    logger.info("Fetching products from Delta API...")
+    # =========================================================================
+    # PHASE 2: FETCH FROM API (Cache expired or forced refresh)
+    # =========================================================================
+    
+    logger.info("📡 Fetching products from Delta API...")
+    
     try:
         api_result = await fetcher.fetch_products()
         
+        # Validation checks
         if not api_result:
-            logger.critical("API returned None for products")
+            logger.critical("❌ API returned None for products")
             PRODUCTS_CACHE["fetch_error"] = "API returned None"
             return None
         
         if "result" not in api_result:
-            logger.critical(f"API response missing 'result' field: {list(api_result.keys())}")
+            logger.critical(
+                f"❌ API response missing 'result' field. "
+                f"Keys present: {list(api_result.keys())}"
+            )
             PRODUCTS_CACHE["fetch_error"] = "Missing 'result' field in API response"
             return None
         
         if not isinstance(api_result["result"], list):
-            logger.critical(f"API result is not a list: {type(api_result['result'])}")
+            logger.critical(
+                f"❌ API result is not a list: {type(api_result['result'])}"
+            )
             PRODUCTS_CACHE["fetch_error"] = f"Invalid result type: {type(api_result['result'])}"
             return None
         
         if len(api_result["result"]) == 0:
-            logger.critical("API returned empty products list")
+            logger.critical("❌ API returned empty products list")
             PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
             return None
         
-        # Cache the raw API result
+        # =====================================================================
+        # PHASE 3: CACHE RAW API RESPONSE
+        # =====================================================================
+        
         now = time.time()
         PRODUCTS_CACHE["data"] = api_result
         PRODUCTS_CACHE["fetched_at"] = now
@@ -2072,65 +2132,116 @@ async def fetch_and_cache_products(fetcher: DataFetcher, force_refresh: bool = F
         
         cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
         logger.info(
-            f"SUCCESS: Fetched {len(api_result['result'])} products from API. "
+            f"✅ SUCCESS: Fetched {len(api_result['result'])} products from API | "
             f"Cache TTL: {cache_hours:.1f} hours"
         )
         
-        # Build and return products map
+        # =====================================================================
+        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
+        # =====================================================================
+        
         return build_products_map_from_api_result(api_result)
     
+    except asyncio.TimeoutError:
+        logger.critical("⏱️ API timeout while fetching products")
+        PRODUCTS_CACHE["fetch_error"] = "API timeout"
+        return None
+    
     except Exception as e:
-        logger.critical(f"Failed to fetch products from API: {e}", exc_info=True)
+        logger.critical(f"❌ Failed to fetch products from API: {e}", exc_info=True)
         PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
         return None
+
 
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
     required_pairs: List[str]
 ) -> Tuple[bool, List[str]]:
+    """
+    Validate product map has sufficient coverage.
+    
+    Requires minimum 80% coverage of configured pairs.
+    
+    Args:
+        products_map: Map of matched products
+        required_pairs: List of configured pair names
+    
+    Returns:
+        Tuple of (is_valid: bool, available_pairs: List[str])
+    """
+    
+    # =========================================================================
+    # VALIDATION CHECKS
+    # =========================================================================
     
     if products_map is None:
-        logger.critical("ABORT: Products map is None (API fetch failed)")
+        logger.critical(
+            f"🚨 ABORT: Products map is None (API fetch failed). "
+            f"Error: {PRODUCTS_CACHE.get('fetch_error', 'Unknown')}"
+        )
         return False, []
     
     if not isinstance(products_map, dict):
-        logger.critical(f"ABORT: Products map is not dict: {type(products_map)}")
+        logger.critical(f"🚨 ABORT: Products map is not dict: {type(products_map)}")
         return False, []
     
     if len(products_map) == 0:
         logger.critical(
-            f"ABORT: Products map is empty. "
-            f"Check that configured pairs match API symbols."
+            f"🚨 ABORT: Products map is empty. "
+            f"Check that configured pairs match API symbols.\n"
+            f"  Configured pairs: {required_pairs}\n"
+            f"  Fetch error: {PRODUCTS_CACHE.get('fetch_error', 'None')}"
         )
-        logger.debug(f"Configured pairs: {required_pairs}")
-        logger.debug(f"Fetch error: {PRODUCTS_CACHE.get('fetch_error', 'None')}")
         return False, []
     
-    # Calculate coverage
+    # =========================================================================
+    # COVERAGE CALCULATION
+    # =========================================================================
+    
     available = [p for p in required_pairs if p in products_map]
     missing = [p for p in required_pairs if p not in products_map]
     coverage_pct = (len(available) / len(required_pairs) * 100) if required_pairs else 0
     
     logger.info(
-        f"Product coverage: {len(available)}/{len(required_pairs)} "
-        f"({coverage_pct:.0f}%)"
+        f"📊 Product coverage: {len(available)}/{len(required_pairs)} "
+        f"({coverage_pct:.1f}%)"
     )
     
     if missing:
-        logger.warning(f"Missing pairs: {missing}")
+        logger.warning(f"⚠️ Missing pairs: {missing}")
     
-    # Require minimum 80% coverage
+    # =========================================================================
+    # ENFORCE MINIMUM COVERAGE
+    # =========================================================================
+    
     MIN_COVERAGE_PCT = 80.0
+    
     if coverage_pct < MIN_COVERAGE_PCT:
         logger.critical(
-            f"ABORT: Insufficient coverage ({coverage_pct:.0f}% < {MIN_COVERAGE_PCT}%). "
-            f"Too many pairs missing."
+            f"🚨 ABORT: Insufficient coverage ({coverage_pct:.1f}% < {MIN_COVERAGE_PCT}%). "
+            f"Too many pairs missing. Available: {available}"
         )
         return False, available
     
     return True, available
 
 class RedisStateStore:
+    
+    # =========================================================================
+    # LUA SCRIPT FOR ALERT DEDUPLICATION (atomic check-and-set)
+    # =========================================================================
+    DEDUP_LUA = """
+    local key = KEYS[1]
+    local ttl = tonumber(ARGV[1])
+    
+    local exists = redis.call('exists', key)
+    if exists == 1 then
+        return 0  -- Already exists, don't send
+    else
+        redis.call('setex', key, ttl, '1')
+        return 1  -- New, should send
+    end
+    """
     
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
@@ -2158,6 +2269,9 @@ class RedisStateStore:
         if self._redis is None:
             return True
         
+        # Try different ways to check if connection is closed
+        # (redis-py has changed this across versions)
+        
         try:
             # redis-py 5.x+: Check connection_pool
             if hasattr(self._redis, 'connection_pool'):
@@ -2181,7 +2295,11 @@ class RedisStateStore:
     
     @property
     def is_connected(self) -> bool:
+        """
+        True if Redis connection is active and healthy.
         
+        Uses safe checking method compatible with different redis-py versions.
+        """
         return (
             self._redis is not None and
             not self._is_redis_closed() and
@@ -2273,7 +2391,14 @@ class RedisStateStore:
             return False
     
     async def close(self) -> None:
+        """
+        Close Redis connection explicitly.
         
+        Design:
+        - Idempotent (safe to call multiple times)
+        - Always call in finally block
+        - Handles version differences in redis-py
+        """
         if self._connection_state == "CLOSED":
             logger.debug("🔒 Redis already closed")
             return
@@ -2302,7 +2427,11 @@ class RedisStateStore:
         op_name: str,
         parser: Optional[Callable[[Any], Any]] = None
     ):
+        """
+        Execute Redis operation with timeout and error handling.
         
+        FIXED: Handles case where Redis connection drops mid-operation
+        """
         if not self.is_connected:
             logger.warning(f"⚠️ Redis not connected for operation: {op_name}")
             return None
@@ -2400,7 +2529,11 @@ class RedisStateStore:
             return True
     
     async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
+        """
+        Check multiple alerts at once using pipeline.
         
+        FIXED: Handles version differences in Redis connection
+        """
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
@@ -2444,7 +2577,11 @@ class RedisStateStore:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
     
     async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Get and set alerts atomically.
         
+        FIXED: Handles redis-py version differences
+        """
         if not self._redis or self.degraded:
             return {k: None for k in alert_keys}
 
@@ -2525,7 +2662,11 @@ class RedisStateStore:
             return {k: None for k in alert_keys}
     
     async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+        """
+        Atomically evaluate batch of alerts with pipeline execution.
         
+        FIXED: Better error handling for Redis version issues
+        """
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
@@ -2684,7 +2825,11 @@ class RedisStateStore:
             )
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+        """
+        Atomically update multiple state entries.
         
+        FIXED: Better error handling
+        """
         if self.degraded or not self._redis:
             return False
 
@@ -4754,6 +4899,59 @@ try:
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
+async def main_with_cleanup():
+        """
+        Main entry point with proper async cleanup.
+        
+        FIXED: Removed non-existent shutdown_global_pool() call
+        No global connection pools to manage (single per-instance connections only)
+        """
+        try:
+            success = await run_once()
+            if success:
+                logger.info("✅ Bot run completed successfully")
+            else:
+                logger.warning("⚠️ Bot run completed with errors")
+            return success
+        
+        except KeyboardInterrupt:
+            logger.info("⌛ Interrupted by user (Ctrl+C)")
+            return False
+        
+        except asyncio.CancelledError:
+            logger.warning("🛑 Run cancelled (shutdown signal)")
+            return False
+        
+        except Exception as e:
+            logger.exception(f"💥 Unexpected error in main: {e}")
+            return False
+        
+        finally:
+            logger.info("🧹 Shutting down persistent connections...")
+            
+            # Clean up HTTP sessions
+            try:
+                await SessionManager.close_session()
+                logger.debug("✅ HTTP session closed")
+            except Exception as e:
+                logger.error(f"❌ Error closing HTTP session: {e}", exc_info=False)
+            
+            # Clean up any remaining async resources
+            try:
+                pending = asyncio.all_tasks()
+                if pending:
+                    for task in pending:
+                        if task is not asyncio.current_task():
+                            task.cancel()
+                    
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    logger.debug(f"✅ Cancelled {len(pending)} pending tasks")
+            except Exception as e:
+                logger.error(f"❌ Error cleaning up tasks: {e}", exc_info=False)
+            
+            logger.info("✅ Shutdown complete")
+
+
 if __name__ == "__main__":
     aot_bridge.ensure_initialized()
     
@@ -4798,24 +4996,6 @@ if __name__ == "__main__":
         warmup_if_needed()
     else:
         logger.info("Skipping Numba warmup (faster startup)")
-
-    async def main_with_cleanup():
-        try:
-            return await run_once()
-        finally:
-            logger.info("🧹 Shutting down persistent connections...")
-            try:
-                await RedisStateStore.shutdown_global_pool()
-                logger.debug("🌈 Redis pool closed")
-            except Exception as e:
-                logger.error(f"Error closing Redis pool: {e}")
-
-
-            try:
-                await SessionManager.close_session()
-                logger.debug("⏰ HTTP session closed")
-            except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
 
     try:
         success = asyncio.run(main_with_cleanup())
