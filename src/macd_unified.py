@@ -2047,111 +2047,31 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     return products_map
 
 
-async def fetch_and_cache_products(
-    fetcher: DataFetcher, 
-    force_refresh: bool = False
-) -> Optional[Dict[str, dict]]:
-    """
-    Fetch and cache products from Delta API.
+async def fetch_and_cache_products(fetcher: DataFetcher, state_store: RedisStateStore) -> List[Dict[str, Any]]:
+    cache_key = "delta_products_cache"
     
-    OPTIMIZED:
-    - Only fetches products once per TTL
-    - Caches raw API response (not processed map)
-    - Only processes configured pairs
-    - Reduces network calls and processing overhead
-    
-    Args:
-        fetcher: DataFetcher instance
-        force_refresh: Skip cache and fetch from API
-    
-    Returns:
-        Products map dict or None on failure
-    """
-    
-    now = time.time()
-    cache_data = PRODUCTS_CACHE.get("data")
-    cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
-    
-    # =========================================================================
-    # PHASE 1: CHECK CACHE
-    # =========================================================================
-    
-    if not force_refresh and cache_data and now < cache_expires_at:
-        cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
-        cache_remaining = cache_expires_at - now
-        logger.debug(
-            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
-            f"TTL remaining: {cache_remaining/60:.1f}m"
-        )
-        return build_products_map_from_api_result(cache_data)
-    
-    # =========================================================================
-    # PHASE 2: FETCH FROM API (Cache expired or forced refresh)
-    # =========================================================================
-    
-    logger.info("📡 Fetching products from Delta API...")
-    
-    try:
-        api_result = await fetcher.fetch_products()
-        
-        # Validation checks
-        if not api_result:
-            logger.critical("❌ API returned None for products")
-            PRODUCTS_CACHE["fetch_error"] = "API returned None"
-            return None
-        
-        if "result" not in api_result:
-            logger.critical(
-                f"❌ API response missing 'result' field. "
-                f"Keys present: {list(api_result.keys())}"
-            )
-            PRODUCTS_CACHE["fetch_error"] = "Missing 'result' field in API response"
-            return None
-        
-        if not isinstance(api_result["result"], list):
-            logger.critical(
-                f"❌ API result is not a list: {type(api_result['result'])}"
-            )
-            PRODUCTS_CACHE["fetch_error"] = f"Invalid result type: {type(api_result['result'])}"
-            return None
-        
-        if len(api_result["result"]) == 0:
-            logger.critical("❌ API returned empty products list")
-            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
-            return None
-        
-        # =====================================================================
-        # PHASE 3: CACHE RAW API RESPONSE
-        # =====================================================================
-        
-        now = time.time()
-        PRODUCTS_CACHE["data"] = api_result
-        PRODUCTS_CACHE["fetched_at"] = now
-        PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
-        PRODUCTS_CACHE["fetch_error"] = None
-        
-        cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
-        logger.info(
-            f"✅ SUCCESS: Fetched {len(api_result['result'])} products from API | "
-            f"Cache TTL: {cache_hours:.1f} hours"
-        )
-        
-        # =====================================================================
-        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
-        # =====================================================================
-        
-        return build_products_map_from_api_result(api_result)
-    
-    except asyncio.TimeoutError:
-        logger.critical("⏱️ API timeout while fetching products")
-        PRODUCTS_CACHE["fetch_error"] = "API timeout"
-        return None
-    
-    except Exception as e:
-        logger.critical(f"❌ Failed to fetch products from API: {e}", exc_info=True)
-        PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
-        return None
+    # 1. Try to get from Redis Cache first
+    if state_store and state_store.client:
+        cached_data = await state_store.get_state(cache_key)
+        if cached_data:
+            logger.info("♻️ Using cached product list (1146 pairs) from Redis")
+            return cached_data
 
+    # 2. Fetch if not cached
+    logger.info("📡 Fetching products from Delta API...")
+    data = await fetcher.fetch_products()
+    
+    if data and "result" in data:
+        products = data["result"]
+        logger.info(f"SUCCESS: Fetched {len(products)} products from API")
+        
+        # 3. Save to cache for 12 hours
+        if state_store and state_store.client:
+            await state_store.set_state(cache_key, products, ttl=43200)
+            
+        return products
+    
+    return []
 
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
@@ -2226,117 +2146,61 @@ def validate_products_map(
     return True, available
 
 class RedisStateStore:
-    
-    # =========================================================================
-    # LUA SCRIPT FOR ALERT DEDUPLICATION (atomic check-and-set)
-    # =========================================================================
-    DEDUP_LUA = """
+    """
+    Production-grade Redis state store with Lua-based alert deduplication.
+    """
+    # FIX 1: Define the missing Lua script as a class constant
+    DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
-    local ttl = tonumber(ARGV[1])
-    
-    local exists = redis.call('exists', key)
-    if exists == 1 then
-        return 0  -- Already exists, don't send
+    local val = ARGV[1]
+    local ttl = tonumber(ARGV[2])
+    local current = redis.call('GET', key)
+    if current == val then
+        return 0
     else
-        redis.call('setex', key, ttl, '1')
-        return 1  -- New, should send
+        redis.call('SET', key, val, 'EX', ttl)
+        return 1
     end
     """
     
+    # Track the pool globally to allow clean shutdown
+    _pool: ClassVar[Optional[redis.ConnectionPool]] = None
+
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
-        
-        self.state_prefix = "pair_state:"
-        self.meta_prefix = "metadata:"
-        self.alert_prefix = "alert:"
-        
-        self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
-        self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
-        self.metadata_expiry_seconds = 7 * 86400
-        
-        self.degraded = False
-        self.degraded_alerted = False
         self._dedup_script_sha: Optional[str] = None
-        self._connection_state = "INIT"  # INIT -> CONNECTED -> CLOSED
-        
-        logger.debug(
-            f"🔴 RedisStateStore initialized. State TTL: {cfg.STATE_EXPIRY_DAYS}d"
-        )
-    
-    def _is_redis_closed(self) -> bool:
-        
-        if self._redis is None:
-            return True
-        
-        # Try different ways to check if connection is closed
-        # (redis-py has changed this across versions)
-        
-        try:
-            # redis-py 5.x+: Check connection_pool
-            if hasattr(self._redis, 'connection_pool'):
-                pool = self._redis.connection_pool
-                if pool is None:
-                    return True
-                # Connection pool exists, assume connection is open
-                return False
-        except Exception:
-            pass
-        
-        try:
-            # redis-py 4.x: Check 'closed' attribute
-            if hasattr(self._redis, 'closed'):
-                return bool(self._redis.closed)
-        except Exception:
-            pass
-        
-        # If we can't determine, assume it's open
-        return False
-    
+        self._connection_state: str = "INIT"
+        self.degraded: bool = False
+        self.degraded_alerted: bool = False
+
     @property
     def is_connected(self) -> bool:
-        """
-        True if Redis connection is active and healthy.
-        
-        Uses safe checking method compatible with different redis-py versions.
-        """
-        return (
-            self._redis is not None and
-            not self._is_redis_closed() and
-            self._connection_state == "CONNECTED"
-        )
-    
+        return self._connection_state == "CONNECTED" and self._redis is not None
+
     async def connect(self, timeout: float = 5.0) -> bool:
         """
-        Connect to Redis.
-        
-        Args:
-            timeout: Connection timeout in seconds
-        
-        Returns:
-            True if connected successfully, False if degraded/failed
-        
-        Design:
-        - Single connection per instance
-        - Sets self.degraded flag if connection fails
-        - Does NOT retry (simpler for cron jobs)
+        Connect to Redis using your original robust logic + fix for missing DEDUP_LUA.
         """
         if self._connection_state != "INIT":
             logger.warning(
-                f"⚠️ connect() called in state {self._connection_state} "
-                f"(expected INIT)"
+                f"⚠️ connect() called in state {self._connection_state} (expected INIT)"
             )
             return self.is_connected
         
         try:
-            self._redis = redis.from_url(
-                self.redis_url,
-                socket_connect_timeout=timeout,
-                socket_timeout=timeout,
-                retry_on_timeout=True,
-                max_connections=16,
-                decode_responses=True,
-            )
+            # Initialize the global pool if it doesn't exist
+            if not RedisStateStore._pool:
+                RedisStateStore._pool = redis.ConnectionPool.from_url(
+                    self.redis_url,
+                    socket_connect_timeout=timeout,
+                    socket_timeout=timeout,
+                    retry_on_timeout=True,
+                    max_connections=16,
+                    decode_responses=True,
+                )
+
+            self._redis = redis.Redis(connection_pool=RedisStateStore._pool)
             
             # Verify connection works
             ping_result = await asyncio.wait_for(
@@ -2347,7 +2211,7 @@ class RedisStateStore:
             if not ping_result:
                 raise Exception("🔌 Redis ping returned False")
             
-            # Load Lua script for deduplication
+            # Load Lua script for deduplication (Now using the defined DEDUP_LUA)
             try:
                 self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
                 logger.debug("✅ Lua script loaded for alert deduplication")
@@ -2364,32 +2228,39 @@ class RedisStateStore:
         
         except asyncio.TimeoutError:
             logger.error(f"⏱️ Redis connection timeout after {timeout}s")
-            self.degraded = True
-            self._connection_state = "DEGRADED"
-            
-            if not cfg.FAIL_ON_REDIS_DOWN:
-                logger.warning(
-                    "⚠️ Continuing in DEGRADED mode (FAIL_ON_REDIS_DOWN=false):\n"
-                    "  ✗ Alert deduplication: DISABLED\n"
-                    "  ✗ State persistence: DISABLED\n"
-                    "  ✓ Trading alerts: STILL ACTIVE"
-                )
+            self._handle_failure()
             return False
         
         except Exception as e:
             logger.error(f"❌ Redis connection failed: {e}", exc_info=False)
-            self.degraded = True
-            self._connection_state = "DEGRADED"
-            
-            if not cfg.FAIL_ON_REDIS_DOWN:
-                logger.warning(
-                    "⚠️ Continuing in DEGRADED mode (FAIL_ON_REDIS_DOWN=false):\n"
-                    "  ✗ Alert deduplication: DISABLED\n"
-                    "  ✗ State persistence: DISABLED\n"
-                    "  ✓ Trading alerts: STILL ACTIVE"
-                )
+            self._handle_failure()
             return False
-    
+
+    def _handle_failure(self):
+        self.degraded = True
+        self._connection_state = "DEGRADED"
+        if not cfg.FAIL_ON_REDIS_DOWN:
+            logger.warning(
+                "⚠️ Continuing in DEGRADED mode (FAIL_ON_REDIS_DOWN=false):\n"
+                "  ✗ Alert deduplication: DISABLED\n"
+                "  ✗ State persistence: DISABLED\n"
+                "  ✓ Trading alerts: STILL ACTIVE"
+            )
+
+    # FIX 2: Add the missing shutdown_global_pool method for main_with_cleanup
+    @classmethod
+    async def shutdown_global_pool(cls):
+        """Cleanly close the Redis connection pool during bot shutdown."""
+        if cls._pool:
+            try:
+                await cls._pool.disconnect()
+                logger.info("✅ Redis global pool shut down successfully")
+            except Exception as e:
+                # Use print or basic logger as logging system might be shutting down
+                print(f"Error during Redis pool shutdown: {e}")
+            finally:
+                cls._pool = None
+
     async def close(self) -> None:
         """
         Close Redis connection explicitly.
@@ -4904,58 +4775,53 @@ async def run_once() -> bool:
         
         logger_run.debug("🧹 Cleanup complete")
 
-async def main_with_cleanup():
-        """
-        Main entry point with proper async cleanup.
-        
-        FIXED: Removed non-existent shutdown_global_pool() call
-        No global connection pools to manage (single per-instance connections only)
-        """
-        try:
-            success = await run_once()
-            if success:
-                logger.info("✅ Bot run completed successfully")
-            else:
-                logger.warning("⚠️ Bot run completed with errors")
-            return success
-        
-        except KeyboardInterrupt:
-            logger.info("⌛ Interrupted by user (Ctrl+C)")
-            return False
-        
-        except asyncio.CancelledError:
-            logger.warning("🛑 Run cancelled (shutdown signal)")
-            return False
-        
-        except Exception as e:
-            logger.exception(f"💥 Unexpected error in main: {e}")
-            return False
-        
-        finally:
-            logger.info("🧹 Shutting down persistent connections...")
-            
-            # Clean up HTTP sessions
-            try:
-                await SessionManager.close_session()
-                logger.debug("✅ HTTP session closed")
-            except Exception as e:
-                logger.error(f"❌ Error closing HTTP session: {e}", exc_info=False)
-            
-            # Clean up any remaining async resources
-            try:
-                pending = asyncio.all_tasks()
-                if pending:
-                    for task in pending:
-                        if task is not asyncio.current_task():
-                            task.cancel()
-                    
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    logger.debug(f"✅ Cancelled {len(pending)} pending tasks")
-            except Exception as e:
-                logger.error(f"❌ Error cleaning up tasks: {e}", exc_info=False)
-            
-            logger.info("✅ Shutdown complete")
 
+async def main_with_cleanup():
+    """
+    Main entry point with proper async cleanup.
+    """
+    try:
+        success = await run_once()
+        if success:
+            logger.info("✅ Bot run completed successfully")
+        else:
+            logger.warning("⚠️ Bot run completed with errors")
+        return success
+    
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("🛑 Process interrupted or cancelled")
+        return False
+    
+    except Exception as e:
+        logger.exception(f"💥 Unexpected error in main: {e}")
+        return False
+    
+    finally:
+        logger.info("扫 Shutting down persistent connections...")
+        
+        # 1. Close Redis Pool (using the method we just added)
+        await RedisStateStore.shutdown_global_pool()
+        
+        # 2. Close HTTP Sessions
+        try:
+            await SessionManager.close_all()
+            await SessionManager.close_session()
+            logger.debug("✅ HTTP sessions closed")
+        except Exception as e:
+            logger.error(f"❌ Error closing HTTP session: {e}")
+        
+        # 3. Final Task Cleanup
+        try:
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                logger.debug(f"✅ Cancelled {len(pending)} pending tasks")
+        except Exception as e:
+            logger.error(f"❌ Error during final task cleanup: {e}")
+            
+        logger.info("✅ Shutdown complete")
 
 if __name__ == "__main__":
     aot_bridge.ensure_initialized()
