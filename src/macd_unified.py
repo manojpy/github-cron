@@ -459,7 +459,7 @@ if not AOT_IMPORT_SUCCESS:
     AOT_AVAILABLE = False
     logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
 else:
-    logger.info("✅ aot_bridge imported successfully - AOT compilation active")
+    logger.info("🚀 aot_bridge imported successfully - AOT compilation active")
 
 from aot_bridge import (
     sanitize_array_numba,
@@ -788,7 +788,7 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
 
 def warmup_if_needed() -> None:
     if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP:
-        logger.info("✅ Skipping warmup (AOT active or explicitly disabled)")
+        logger.info("♨️ Skipping warmup (AOT active or explicitly disabled)")
         return
 
     logger.info("🔥 Warming up JIT compilation…")
@@ -4931,7 +4931,7 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info(f"✅ uvloop enabled | {JSON_BACKEND} enabled")
+    logger.info(f"🌎 uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
