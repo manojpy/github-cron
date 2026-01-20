@@ -1456,16 +1456,46 @@ class DataFetcher:
             return self._external_session
         return await SessionManager.get_session()
 
+    async def fetch_products_batch(self, symbols: List[str]) -> Optional[Dict[str, Any]]:
+        
+        url = f"{self.api_base}/v2/products"
+        params = {"symbol": ",".join(symbols)}          # server-side filter
+
+        can_proceed, reason = self.circuit_breaker.can_attempt()
+        if not can_proceed:
+            logger.warning(f"Circuit breaker blocked batch-products fetch: {reason}")
+            self.fetch_stats["circuit_breaker_blocks"] += 1
+            self.fetch_stats["products"]["failed"] += 1
+            return None
+
+        async with self.semaphore:
+            data = await self.rate_limiter.call(
+                async_fetch_json,
+                url,
+                params=params,
+                retries=2,
+                timeout=self.timeout
+            )
+
+        # Accept only if we really got a non-empty list
+        if data and isinstance(data.get("result"), list) and data["result"]:
+            self.circuit_breaker.record_success()
+            self.fetch_stats["products"]["success"] += 1
+            return data
+
+        logger.debug("Batch-products returned empty/failed, falling back")
+        return await self.fetch_products()     # fallback
+
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         url = f"{self.api_base}/v2/products"
-        
+
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked products fetch: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
             self.fetch_stats["products"]["failed"] += 1
             return None
-        
+
         async with self.semaphore:
             result = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1474,18 +1504,18 @@ class DataFetcher:
                 backoff=2.0,
                 timeout=self.timeout
             )
-            
-            if result:
-                self.fetch_stats["products"]["success"] += 1
-                self.circuit_breaker.record_success()
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Products fetch successful | Count: {len(result.get('result', []))}")
-            else:
-                self.fetch_stats["products"]["failed"] += 1
-                self.circuit_breaker.record_failure()
-                logger.warning(f"Products fetch failed | URL: {url}")
-            
-            return result
+
+        if result:
+            self.fetch_stats["products"]["success"] += 1
+            self.circuit_breaker.record_success()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Products fetch successful | Count: {len(result.get('result', []))}")
+        else:
+            self.fetch_stats["products"]["failed"] += 1
+            self.circuit_breaker.record_failure()
+            logger.warning(f"Products fetch failed | URL: {url}")
+
+        return result
 
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None) -> Optional[Dict[str, Any]]:
         can_proceed, reason = self.circuit_breaker.can_attempt()
@@ -2065,7 +2095,7 @@ async def fetch_and_cache_products(
     logger.info("📡 Fetching products from Delta API...")
     
     try:
-        api_result = await fetcher.fetch_products()
+        api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
         
         # Validation checks
         if not api_result:
