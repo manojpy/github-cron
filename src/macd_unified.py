@@ -4598,7 +4598,24 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     
     return valid_results
 
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    logger.info(f"🏀 uvloop enabled | {JSON_BACKEND} enabled")
+except ImportError:
+    logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
+
 async def run_once() -> bool:
+    """
+    Main execution loop: Fetch candles, evaluate pairs, send alerts.
+    
+    Returns:
+        True if run completed successfully, False on critical error
+    """
+    
+    # =========================================================================
+    # INITIALIZATION
+    # =========================================================================
     
     MAX_ALERTS_PER_RUN = 50
     all_results: List[Tuple[str, Dict[str, Any]]] = []
@@ -4639,16 +4656,13 @@ async def run_once() -> bool:
             return False
         
         # =====================================================================
-        # PHASE 2: FETCH & VALIDATE PRODUCTS (NO STATIC FALLBACK)
+        # PHASE 2: FETCH & VALIDATE PRODUCTS
         # =====================================================================
         
         logger_run.debug("📦 Creating HTTP fetcher for product fetch...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         
-        # FIXED: Use new fetch_and_cache_products function (no static fallback)
         products_map = await fetch_and_cache_products(fetcher, force_refresh=False)
-        
-        # Validate products map
         valid_map, available_pairs = validate_products_map(products_map, cfg.PAIRS)
         
         if not valid_map:
@@ -4658,10 +4672,9 @@ async def run_once() -> bool:
                 f"Available: {available_pairs}"
             )
             
-            if cfg.FAIL_ON_REDIS_DOWN:  # Reuse as generic "fail on critical" flag
+            if cfg.FAIL_ON_REDIS_DOWN:
                 return False
             else:
-                # Even if we can't get products, we might have old cache
                 if not available_pairs:
                     logger_run.critical("❌ No available pairs - cannot proceed")
                     return False
@@ -4676,7 +4689,7 @@ async def run_once() -> bool:
         logger_run.info(f"🎯 Processing {len(pairs_to_process)} pairs")
         
         # =====================================================================
-        # PHASE 3: CONNECT TO REDIS (SINGLE CONNECTION, NO GLOBAL POOL)
+        # PHASE 3: CONNECT TO REDIS
         # =====================================================================
         
         logger_run.debug("🔌 Connecting to Redis...")
@@ -4689,7 +4702,6 @@ async def run_once() -> bool:
         
         if sdb.degraded:
             logger_run.warning("⚠️ Redis is DEGRADED - alert deduplication disabled")
-            # Create telegram queue even if Redis degraded (still send alerts)
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             
             if not sdb.degraded_alerted:
@@ -4704,7 +4716,7 @@ async def run_once() -> bool:
                     logger_run.error(f"❌ Failed to send degradation alert: {e}")
         
         # =====================================================================
-        # PHASE 4: CREATE TELEGRAM QUEUE (if not already created for degradation)
+        # PHASE 4: CREATE TELEGRAM QUEUE (if not already created)
         # =====================================================================
         
         if telegram_queue is None:
@@ -4800,7 +4812,7 @@ async def run_once() -> bool:
                 pass
         
         # =====================================================================
-        # PHASE 10: LOG STATISTICS
+        # PHASE 10: LOG STATISTICS & RETURN SUCCESS
         # =====================================================================
         
         final_memory_mb = process.memory_info().rss / 1024 / 1024
@@ -4891,13 +4903,6 @@ async def run_once() -> bool:
         PAIR_ID.set("")
         
         logger_run.debug("🧹 Cleanup complete")
-
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info(f"🏀 uvloop enabled | {JSON_BACKEND} enabled")
-except ImportError:
-    logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
 async def main_with_cleanup():
         """
