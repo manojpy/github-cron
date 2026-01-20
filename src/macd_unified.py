@@ -298,7 +298,7 @@ def load_config() -> BotConfig:
         except Exception as exc:
             error_msg = f"❌ ERROR: Config file {config_file} is not valid JSON: {exc}"
             print(error_msg, file=sys.stderr)
-            sys.exit, (1)
+            sys.exit(1)
         
     else:
         print(f"⚠️ WARNING: Config file {config_file} not found, using environment variables only", file=sys.stderr)
@@ -399,31 +399,6 @@ def setup_logging() -> logging.Logger:
     return logger
 
 logger = setup_logging()
-
-
-def load_config() -> BotConfig:
-    config_file = os.getenv("CONFIG_FILE", "config_macd.json")
-    data: Dict[str, Any] = {}
-    if Path(config_file).exists():
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                data = json.loads(f.read()) # Ensure using standard json or orjson
-                # If your JSON has "PAIRS", it will be in 'data' now
-        except Exception as exc:
-            print(f"❌ ERROR: Config file {config_file} is not valid: {exc}", file=sys.stderr)
-            sys.exit(1)
-    
-    # ... (rest of your existing load_config logic for env vars) ...
-
-    try:
-        instance = BotConfig(**data)
-        return instance
-    except Exception as exc:
-        print(f"❌ ERROR: Pydantic validation failed: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-# This is the object your whole script uses
-cfg = load_config()
 
 _IST_TZ = ZoneInfo("Asia/Kolkata")
 
@@ -2165,61 +2140,104 @@ def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -
     
     return products_map
 
-
-class GlobalCache:
-    products_map: Dict[str, Any] = {}
-    last_refresh: float = 0
-
-async def fetch_and_cache_products(fetcher=None, force_refresh: bool = False) -> Dict[str, Any]:
+async def fetch_and_cache_products(
+    fetcher: DataFetcher, 
+    force_refresh: bool = False
+) -> Optional[Dict[str, dict]]:
     """
-    Optimized: Uses 'cfg' from Part 1 and only fetches 12 pairs.
-    Handles 'fetcher' argument to prevent Part 3 crashes.
+    Fetch and cache products. Uses server-side symbol filtering for efficiency.
+    Falls back to full catalogue if filtering not supported by API.
     """
-    if not force_refresh and GlobalCache.products_map:
-        return GlobalCache.products_map
-
-    # Use the 'cfg' object we updated in Part 1
-    target_symbols = cfg.PAIRS
+    now = time.time()
+    cache_data = PRODUCTS_CACHE.get("data")
+    cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
     
-    if not target_symbols:
-        logger.error("❌ No symbols found in cfg.PAIRS. Check config_macd.json")
-        return {}
-
-    logger.info(f"📡 Requesting metadata for {len(target_symbols)} specific pairs...")
+    # =========================================================================
+    # PHASE 1: CHECK CACHE
+    # =========================================================================
+    
+    if not force_refresh and cache_data and now < cache_expires_at:
+        cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
+        cache_remaining = cache_expires_at - now
+        logger.debug(
+            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
+            f"TTL remaining: {cache_remaining/60:.1f}m"
+        )
+        return build_products_map_from_api_result(cache_data)
+    
+    # =========================================================================
+    # PHASE 2: FETCH FROM API (Cache expired or forced refresh)
+    # =========================================================================
+    
+    logger.info(f"📡 Fetching products from Delta API ({len(cfg.PAIRS)} pairs)...")
     
     try:
-        # Join symbols for the API filter
-        symbols_query = ",".join(target_symbols)
-        url = f"{cfg.DELTA_API_BASE}/v2/products?symbols={symbols_query}"
+        # OPTIMIZATION: Try server-side filtering first
+        # This should reduce API response from 1100+ products to just ~12
+        api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
         
-        async with SessionManager.get_session().get(url, timeout=30) as response:
-            if response.status != 200:
-                logger.error(f"Delta API error: {response.status}")
-                return {}
-            
-            resp_data = await response.json()
-            api_products = resp_data.get("result", [])
-            
-            new_map = {}
-            for p in api_products:
-                sym = p.get("symbol")
-                if sym in target_symbols:
-                    new_map[sym] = {
-                        "id": p.get("id"),
-                        "symbol": sym,
-                        "tick_size": float(p.get("tick_size", "0.01")),
-                        "lot_size": float(p.get("lot_size", "1.0")),
-                        "quoting_asset": p.get("quoting_asset"),
-                        "underlying_asset": p.get("underlying_asset")
-                    }
-
-            logger.info(f"✅ Product map built: {len(new_map)}/{len(target_symbols)} found.")
-            GlobalCache.products_map = new_map
-            return new_map
-
+        # Validation checks
+        if not api_result:
+            logger.critical("❌ API returned None for products (both batch and full fetch failed)")
+            PRODUCTS_CACHE["fetch_error"] = "API returned None"
+            return None
+        
+        if "result" not in api_result:
+            logger.critical(
+                f"❌ API response missing 'result' field. "
+                f"Keys present: {list(api_result.keys())}"
+            )
+            PRODUCTS_CACHE["fetch_error"] = "Missing 'result' field in API response"
+            return None
+        
+        if not isinstance(api_result["result"], list):
+            logger.critical(
+                f"❌ API result is not a list: {type(api_result['result'])}"
+            )
+            PRODUCTS_CACHE["fetch_error"] = f"Invalid result type: {type(api_result['result'])}"
+            return None
+        
+        if len(api_result["result"]) == 0:
+            logger.critical("❌ API returned empty products list")
+            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
+            return None
+        
+        # =====================================================================
+        # PHASE 3: CACHE RAW API RESPONSE
+        # =====================================================================
+        
+        now = time.time()
+        PRODUCTS_CACHE["data"] = api_result
+        PRODUCTS_CACHE["fetched_at"] = now
+        PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
+        PRODUCTS_CACHE["fetch_error"] = None
+        
+        cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
+        
+        products_count = len(api_result.get("result", []))
+        efficiency = (1117 - products_count) / 1117 * 100 if products_count < 1117 else 0
+        
+        logger.info(
+            f"✅ SUCCESS: Fetched {products_count} products from API | "
+            f"Cache TTL: {cache_hours:.1f} hours | "
+            f"Efficiency: {efficiency:.0f}% reduction from full catalogue"
+        )
+        
+        # =====================================================================
+        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
+        # =====================================================================
+        
+        return build_products_map_from_api_result(api_result)
+    
+    except asyncio.TimeoutError:
+        logger.critical("⏱️ API timeout while fetching products")
+        PRODUCTS_CACHE["fetch_error"] = "API timeout"
+        return None
+    
     except Exception as e:
-        logger.error(f"fetch_and_cache_products failed: {e}")
-        return {}
+        logger.critical(f"❌ Failed to fetch products from API: {e}", exc_info=True)
+        PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
+        return None
 
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
