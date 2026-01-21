@@ -1454,137 +1454,7 @@ class DataFetcher:
             return self._external_session
         return await SessionManager.get_session()
 
-    async def fetch_products_batch(
-        self,
-        symbols: List[str],
-        *,
-        strict: bool = False,
-        client_side_fallback: bool = True  # if strict and server-side fails, optionally full fetch + filter
-    ) -> Optional[Dict[str, Any]]:
-        
-        if not symbols:
-            logger.warning("fetch_products_batch: No symbols provided")
-            if strict:
-                # Respect strict: do not fetch full catalogue
-                self.fetch_stats["products"]["failed"] += 1
-                return None
-            return await self.fetch_products()
- 
-        symbols_param = ",".join(symbols)
-        params = {"symbol": symbols_param}
-        url = f"{self.api_base}/v2/products"
-
-        logger.debug(
-            f"🎯 Batch fetch (server-side) | Requested={len(symbols)} | Query symbol={symbols_param} | strict={strict}"
-        )
-
-        can_proceed, reason = self.circuit_breaker.can_attempt()
-        if not can_proceed:
-            logger.warning(f"Circuit breaker blocked batch-products fetch: {reason}")
-            self.fetch_stats["circuit_breaker_blocks"] += 1
-            self.fetch_stats["products"]["failed"] += 1
-            if strict:
-                # Respect strict: do not fetch full catalogue
-                return None
-            return await self.fetch_products()
-
-        async with self.semaphore:
-            data = await self.rate_limiter.call(
-                async_fetch_json,
-                url,
-                params=params,
-                retries=2,
-                backoff=1.5,
-                timeout=self.timeout
-            )
-
-        # Validate response
-        if not data:
-            logger.debug("⚠️ Batch-products returned None")
-            self.fetch_stats["products"]["failed"] += 1
-            self.circuit_breaker.record_failure()
-            if strict:
-                if client_side_fallback:
-                    # One full fetch, then filter client-side to the requested symbols
-                    full = await self.fetch_products()
-                    return _filter_products_to_symbols(full, symbols)
-                return None
-            return await self.fetch_products()
-
-        result_list = data.get("result")
-        if not isinstance(result_list, list):
-            logger.debug(f"⚠️ Batch-products invalid format (expected list, got {type(result_list)})")
-            self.fetch_stats["products"]["failed"] += 1
-            self.circuit_breaker.record_failure()
-            if strict:
-                if client_side_fallback:
-                    full = await self.fetch_products()
-                    return _filter_products_to_symbols(full, symbols)
-                return None
-            return await self.fetch_products()
-
-        if len(result_list) == 0:
-            logger.debug("⚠️ Batch-products returned empty list (server may not support filtering)")
-            self.fetch_stats["products"]["failed"] += 1
-            self.circuit_breaker.record_failure()
-            if strict:
-                if client_side_fallback:
-                    full = await self.fetch_products()
-                    return _filter_products_to_symbols(full, symbols)
-                return None
-            return await self.fetch_products()
-
-        # Success: server returned filtered results
-        self.fetch_stats["products"]["success"] += 1
-        self.circuit_breaker.record_success()
-
-        # Precise diagnostics without hardcoded totals
-        requested = len(symbols)
-        received = len(result_list)
-        logger.info(
-            f"✅ Batch-products successful | Requested={requested} | Received={received} | "
-            f"Strict={strict} | Client-side fallback={client_side_fallback}"
-        )
-        return data
-
-    async def fetch_products(self) -> Optional[Dict[str, Any]]:
-        """
-        Fetch ALL products from the API (full catalogue).
-        Used as fallback when batch filtering fails or isn't supported.
-        """
-        url = f"{self.api_base}/v2/products"
-        
-        can_proceed, reason = self.circuit_breaker.can_attempt()
-        if not can_proceed:
-            logger.warning(f"Circuit breaker blocked products fetch: {reason}")
-            self.fetch_stats["circuit_breaker_blocks"] += 1
-            self.fetch_stats["products"]["failed"] += 1
-            return None
-        
-        async with self.semaphore:
-            result = await self.rate_limiter.call(
-                async_fetch_json,
-                url,
-                retries=5,
-                backoff=2.0,
-                timeout=self.timeout
-            )
-            
-            if result:
-                self.fetch_stats["products"]["success"] += 1
-                self.circuit_breaker.record_success()
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"Full products fetch successful | "
-                        f"Count: {len(result.get('result', []))}"
-                    )
-            else:
-                self.fetch_stats["products"]["failed"] += 1
-                self.circuit_breaker.record_failure()
-                logger.warning(f"Products fetch failed | URL: {url}")
-            
-            return result
-
+    
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None) -> Optional[Dict[str, Any]]:
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
@@ -2025,197 +1895,36 @@ def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minu
     )
     return True
 
-def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
+def build_products_map_from_cfg() -> Dict[str, dict]:
     """
-    Build products map strictly for cfg.PAIRS.
-    Ignores all other products even if API returns 1000+.
+    Build a products map directly from cfg.PAIRS.
+    No API call — only configured pairs are included.
     """
     products_map: Dict[str, dict] = {}
-
-    if not api_products or not api_products.get("result"):
-        logger.warning("🚨 API result is None or empty")
-        return products_map
-
-    if not isinstance(api_products["result"], list):
-        logger.error(f"❌ API result is not a list: {type(api_products['result'])}")
-        return products_map
-
-    required_set = set(cfg.PAIRS)
-    valid_pattern = CompiledPatterns.VALID_SYMBOL
-
-    for p in api_products["result"]:
-        try:
-            symbol = p.get("symbol", "").strip()
-            if not symbol or not valid_pattern.match(symbol):
-                continue
-
-            contract_type = p.get("contract_type", "")
-            if contract_type != "perpetual_futures":
-                continue
-
-            contract_id = p.get("id")
-            if not contract_id:
-                continue
-
-            # Normalize symbol
-            symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD").upper()
-            symbol_no_underscore = symbol_norm.replace("_", "")
-
-            # Only keep if in required set
-            if symbol_norm in required_set or symbol_no_underscore in {s.replace("_", "") for s in required_set}:
-                products_map[symbol_norm] = {
-                    "id": contract_id,
-                    "symbol": symbol,
-                    "contract_type": contract_type
-                }
-
-        except Exception as e:
-            logger.error(f"❌ Error processing API product: {e}", exc_info=False)
-            continue
-
+    for pair in cfg.PAIRS:
+        products_map[pair] = {
+            "id": pair,                 
+            "symbol": pair,
+            "contract_type": "perpetual_futures"
+        }
     logger.info(
-        f"📦 Product map built (strict): {len(products_map)}/{len(cfg.PAIRS)} matched | Coverage: {(len(products_map)/len(cfg.PAIRS))*100:.0f}%"
+        f"📦 Product map built from cfg: {len(products_map)}/{len(cfg.PAIRS)} matched | "
+        f"Coverage: {(len(products_map)/len(cfg.PAIRS))*100:.0f}%"
     )
     return products_map
 
-async def fetch_and_cache_products(
-    fetcher: DataFetcher,
-    force_refresh: bool = False
-) -> Optional[Dict[str, dict]]:
-    """
-    Fetch and cache ONLY the configured pairs from Delta API.
-    No fallback to full catalogue — strict mode.
-    """
-    now = time.time()
-    cache_data = PRODUCTS_CACHE.get("data")
-    cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
-
-    if not force_refresh and cache_data and now < cache_expires_at:
-        cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
-        cache_remaining = cache_expires_at - now
-        logger.debug(
-            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
-            f"TTL remaining: {cache_remaining/60:.1f}m"
-        )
-        return build_products_map_from_api_result(cache_data)
-
-    logger.info(f"📡 Fetching products from Delta API (strict {len(cfg.PAIRS)} pairs)...")
-
-    try:
-        api_result = await fetcher.fetch_products_batch(cfg.PAIRS, strict=True)
-
-        if not api_result or "result" not in api_result or not isinstance(api_result["result"], list):
-            PRODUCTS_CACHE["fetch_error"] = "Invalid API response"
-            logger.critical("❌ API response invalid or missing 'result' field")
-            return None
-
-        if len(api_result["result"]) == 0:
-            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API (strict)"
-            logger.critical("❌ API returned empty products list")
-            return None
-
-        PRODUCTS_CACHE.update({
-            "data": api_result,
-            "fetched_at": now,
-            "until": now + cfg.PRODUCTS_CACHE_TTL,
-            "fetch_error": None,
-        })
-
-        cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
-        products_count = len(api_result["result"])
-
-        logger.info(
-            f"✅ SUCCESS: Fetched {products_count} products (strict mode) | "
-            f"Cache TTL: {cache_hours:.1f} hours"
-        )
-
-        return build_products_map_from_api_result(api_result)
-
-    except asyncio.TimeoutError:
-        PRODUCTS_CACHE["fetch_error"] = "API timeout"
-        logger.critical("⏱️ API timeout while fetching products")
-        return None
-
-    except Exception as e:
-        PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
-        logger.critical(f"❌ Failed to fetch products batch: {e}", exc_info=True)
-        return None
-
-
-def _filter_products_to_symbols(api_products: Optional[Dict[str, Any]], symbols: List[str]) -> Optional[Dict[str, Any]]:
-    
-    if not api_products or "result" not in api_products or not isinstance(api_products["result"], list):
-        logger.warning("filter_products_to_symbols: invalid api_products")
-        return None
-
-    # Build a normalized lookup set that matches server-side symbol format.
-    # IMPORTANT: Use the same format as the API returns in 'symbol' field.
-    requested_set = set(s.strip() for s in symbols if s and isinstance(s, str))
-
-    filtered = []
-    for p in api_products["result"]:
-        sym = p.get("symbol", "").strip()
-        if sym in requested_set:
-            filtered.append(p)
-
-    logger.info(f"🔎 Client-side filter | Requested={len(symbols)} | Matched={len(filtered)}")
-    return {"result": filtered}
-
-def validate_products_map(
-    products_map: Optional[Dict[str, dict]],
-    required_pairs: List[str]
-) -> Tuple[bool, List[str]]:
-    
-    if products_map is None:
-        logger.critical(
-            f"🚨 ABORT: Products map is None (API fetch failed). "
-            f"Error: {PRODUCTS_CACHE.get('fetch_error', 'Unknown')}"
-        )
-        return False, []
-    
-    if not isinstance(products_map, dict):
-        logger.critical(f"🚨 ABORT: Products map is not dict: {type(products_map)}")
-        return False, []
-    
-    if len(products_map) == 0:
-        logger.critical(
-            f"🚨 ABORT: Products map is empty. "
-            f"Check that configured pairs match API symbols.\n"
-            f"  Configured pairs: {required_pairs}\n"
-            f"  Fetch error: {PRODUCTS_CACHE.get('fetch_error', 'None')}"
-        )
-        return False, []
-    
-    # =========================================================================
-    # COVERAGE CALCULATION
-    # =========================================================================
-    
-    available = [p for p in required_pairs if p in products_map]
-    missing = [p for p in required_pairs if p not in products_map]
-    coverage_pct = (len(available) / len(required_pairs) * 100) if required_pairs else 0
-    
-    logger.info(
-        f"📊 Product coverage: {len(available)}/{len(required_pairs)} "
-        f"({coverage_pct:.1f}%)"
+async def fetch_all_pairs_candles(fetcher: DataFetcher, reference_time: int) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
+    requests = []
+    for pair in cfg.PAIRS:
+        requests.append((pair, "15", cfg.MIN_CANDLES_FOR_INDICATORS))
+        requests.append((pair, "5", cfg.MIN_CANDLES_FOR_INDICATORS))
+        requests.append((pair, "D", cfg.MIN_CANDLES_FOR_INDICATORS))
+    return await fetcher.fetch_all_candles_truly_parallel(
+        [(pair, [("15", cfg.MIN_CANDLES_FOR_INDICATORS),
+                 ("5", cfg.MIN_CANDLES_FOR_INDICATORS),
+                 ("D", cfg.MIN_CANDLES_FOR_INDICATORS)]) for pair in cfg.PAIRS],
+        reference_time
     )
-    
-    if missing:
-        logger.warning(f"⚠️ Missing pairs: {missing}")
-    
-    # =========================================================================
-    # ENFORCE MINIMUM COVERAGE
-    # =========================================================================
-    
-    MIN_COVERAGE_PCT = 80.0
-    
-    if coverage_pct < MIN_COVERAGE_PCT:
-        logger.critical(
-            f"🚨 ABORT: Insufficient coverage ({coverage_pct:.1f}% < {MIN_COVERAGE_PCT}%). "
-            f"Too many pairs missing. Available: {available}"
-        )
-        return False, available
-    
-    return True, available
 
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
