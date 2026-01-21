@@ -4303,7 +4303,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     except Exception as e:
         logger_main.debug(f"Memory reporting failed: {e}")
     
-    logger_main.info(f"🎯 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated")
+    logger_main.info(f"🧠 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated")
     
     return valid_results
 
@@ -4353,35 +4353,21 @@ async def run_once() -> bool:
         # STEP 2: LOAD/CACHE PRODUCTS
         # =====================================================================
         
-        logger_run.debug("📦 Creating HTTP fetcher for product fetch...")
+        logger_run.debug("📦 Initializing HTTP fetcher...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        
-        products_map = await fetch_and_cache_products(fetcher, force_refresh=False)
-        valid_map, available_pairs = validate_products_map(products_map, cfg.PAIRS)
-        
-        if not valid_map:
-            logger_run.critical(
-                f"🚫 Products validation failed | "
-                f"Error: {PRODUCTS_CACHE.get('fetch_error', 'Unknown')} | "
-                f"Available: {available_pairs}"
-            )
-            
-            if cfg.FAIL_ON_REDIS_DOWN:
-                return False
-            else:
-                if not available_pairs:
-                    logger_run.critical("❌ No available pairs - cannot proceed")
-                    return False
-                logger_run.warning(f"⚠️ Proceeding with {len(available_pairs)} available pairs")
-        
-        pairs_to_process = available_pairs if available_pairs else cfg.PAIRS
-        
+
+        # Build products map directly from config (no API call)
+        products_map = build_products_map_from_cfg()
+
+        # All pairs come from cfg.PAIRS
+        pairs_to_process = list(cfg.PAIRS)
+
         if not pairs_to_process:
-            logger_run.error("❌ No pairs to process - aborting")
+            logger_run.error("❌ No pairs configured - aborting")
             return False
-        
-        logger_run.info(f"🎯 Processing {len(pairs_to_process)} pairs")
-        
+
+        logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs")
+
         # =====================================================================
         # STEP 3: CONNECT TO REDIS (FIXED: Manual connect/close, not context manager)
         # =====================================================================
