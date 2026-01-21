@@ -4346,21 +4346,18 @@ async def run_once() -> bool:
         # =====================================================================
         # STEP 2: LOAD/CACHE PRODUCTS
         # =====================================================================
-        
+               
         logger_run.debug("📦 Initializing HTTP fetcher...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
 
-        # Build products map directly from config (no API call)
-        products_map = build_products_map_from_cfg()
-
-        # All pairs come from cfg.PAIRS
+        # All pairs come directly from cfg.PAIRS (no API call needed)
         pairs_to_process = list(cfg.PAIRS)
 
         if not pairs_to_process:
             logger_run.error("❌ No pairs configured - aborting")
             return False
 
-        logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs")
+        logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs from config")
 
         # =====================================================================
         # STEP 3: CONNECT TO REDIS (FIXED: Manual connect/close, not context manager)
@@ -4508,32 +4505,33 @@ async def run_once() -> bool:
 
         fetcher_stats = fetcher.get_stats()
 
-        # Products are no longer fetched in strict mode – mark as skipped/cfg only
-        prod_str = "skipped (cfg only)"
-
+        # Candle fetch statistics
         total_required = fetcher_stats['candles']['success'] + fetcher_stats['candles']['failed']
+        candles_str = f"{fetcher_stats['candles']['success']}/{total_required}"
 
+        # Log final statistics
         logger_run.info(
-            f"Products: {prod_str} | "
-            f"💡Candles: {fetcher_stats['candles']['success']}/{total_required}"
+            f"📊 Fetch Stats | "
+            f"Products: config only | "
+            f"Candles: {candles_str}"
         )
 
-        if "rate_limiter" in fetcher_stats:
+        if "rate_limiter" in fetcher_stats and fetcher_stats["rate_limiter"].get("total_waits", 0) > 0:
             rate_stats = fetcher_stats["rate_limiter"]
-            if rate_stats.get("total_waits", 0) > 0:
-                logger_run.info(
-                    f"🚦 Rate limiting stats | "
-                    f"Waits: {rate_stats['total_waits']} | "
-                    f"Total wait time: {rate_stats['total_wait_time_seconds']:.1f}s"
-                )
+            logger_run.info(
+                f"🚦 Rate limiting | "
+                f"Waits: {rate_stats['total_waits']} | "
+                f"Total wait: {rate_stats['total_wait_time_seconds']:.1f}s"
+            )
 
+        # Memory and execution summary
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
         redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
         summary = (
-            f"✅ RUN COMPLETE | "
+            f"🎯🌏 RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent} | "
@@ -4542,6 +4540,7 @@ async def run_once() -> bool:
         )
         logger_run.info(summary)
 
+        # Alert on high volume
         if alerts_sent > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"
