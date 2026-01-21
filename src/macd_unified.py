@@ -32,6 +32,7 @@ from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, Cli
 from numba import njit, prange
 import warnings
 import contextlib 
+import traceback
 
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
 warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
@@ -210,7 +211,6 @@ class BotConfig(BaseModel):
         errors = []
         warnings = []
 
-        # CRITICAL ERRORS (always fail)
         if self.PPO_FAST >= self.PPO_SLOW:
             errors.append('PPO_FAST must be less than PPO_SLOW')
 
@@ -232,7 +232,6 @@ class BotConfig(BaseModel):
         if self.ENABLE_PIVOT and self.PIVOT_MAX_DISTANCE_PCT < 1.0:
             errors.append('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
 
-        # PARAMETER RANGE VALIDATION
         ranges = {
             'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
             'RMA_200_PERIOD': (self.RMA_200_PERIOD, 100, 300),
@@ -244,7 +243,6 @@ class BotConfig(BaseModel):
             if not (min_v <= val <= max_v):
                 errors.append(f'{name} must be {min_v}-{max_v}, got {val}')
 
-        # WARNINGS (don't fail, but will be logged later)
         if self.MAX_ALERTS_PER_PAIR > 15:
             warnings.append(
                 f'MAX_ALERTS_PER_PAIR={self.MAX_ALERTS_PER_PAIR} is very high, may cause spam'
@@ -271,12 +269,10 @@ class BotConfig(BaseModel):
                 f'(minimum recommended: 200MB)'
             )
 
-        # FAIL ON ERRORS
         if errors:
             error_msg = 'Configuration validation failed:\n  ' + '\n  '.join(errors)
             raise ValueError(error_msg)
 
-        # Store warnings for later logging
         self._validation_warnings = warnings
 
         return self
@@ -358,10 +354,8 @@ class SafeFormatter(logging.Formatter):
 
     @staticmethod
     def _mask_secret(value: Any) -> Any:
-        """Mask sensitive values in log arguments"""
         if value is None:
             return value
-
         value_str = str(value)
         masked = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED]", value_str)
         masked = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]@", masked)
@@ -411,7 +405,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
                 if ts > 1_000_000_000_000:
                     ts /= 1000
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-
             except (ValueError, TypeError):
                 dt = datetime.fromisoformat(str(dt_or_ts))
                 if dt.tzinfo is None:
@@ -425,11 +418,8 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
 if not AOT_IMPORT_SUCCESS:
     logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
     logger.warning("Creating fallback stub - will use pure JIT Numba")
-    
-    # Create minimal stub
-    class _AotBridgeStub:
-        """Fallback stub when aot_bridge not installed"""
-        
+   
+    class _AotBridgeStub:        
         @staticmethod
         def is_using_aot():
             return False
@@ -508,7 +498,6 @@ def validate_runtime_config() -> None:
     
     errors = []
     warnings = []
-    # ===== Log warnings from BotConfig validation =====
     if hasattr(cfg, '_validation_warnings'):
         warnings.extend(cfg._validation_warnings)
     
@@ -774,7 +763,6 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return momentum
 
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
@@ -879,8 +867,7 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
     return piv
-       
-       
+            
 def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
     try:
         close_15m = data_15m["close"]
@@ -1323,15 +1310,10 @@ class RateLimitedFetcher:
         self.last_request_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
-        """Execute function with rate limiting and concurrency control"""
         async with self.lock:
             now = time.time()
-            
-            # Remove old requests outside 60-second window
             while self.requests and now - self.requests[0] > 60.0:
                 self.requests.popleft()
-            
-            # Check if we'd exceed rate limit
             if len(self.requests) >= self.max_per_minute:
                 oldest_request_age = now - self.requests[0]
                 wait_needed = max(0.0, 60.0 - oldest_request_age)
@@ -1349,22 +1331,18 @@ class RateLimitedFetcher:
                 
                 await asyncio.sleep(total_sleep)
                 
-                # Recheck after sleep
                 now = time.time()
                 while self.requests and now - self.requests[0] > 60.0:
                     self.requests.popleft()
         
-        # Record this request
         async with self.lock:
             self.requests.append(time.time())
             self.last_request_time = time.time()
         
-        # Execute with concurrency control (separate from rate limiting)
         async with self.semaphore:
             return await func(*args, **kwargs)
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get current rate limiter stats"""
         return {
             "total_waits": self.total_waits,
             "total_wait_time_seconds": round(self.total_wait_time, 2),
@@ -1447,8 +1425,7 @@ class DataFetcher:
         if self._external_session is not None:
             return self._external_session
         return await SessionManager.get_session()
-
-    
+  
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None) -> Optional[Dict[str, Any]]:
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
@@ -1567,7 +1544,6 @@ class DataFetcher:
             reference_time = get_trigger_timestamp()
 
         expected_open_15 = calculate_expected_candle_timestamp(reference_time, 15)
-
         all_tasks = []
         task_metadata = []
         for symbol, resolutions in pair_requests:
@@ -1608,8 +1584,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         if n == 0:
             logger.warning("parse_candles_to_numpy: empty candle array")
             return None
-
-
         data = {
             "timestamp": np.asarray(res["t"], dtype=np.int64),
             "open": np.asarray(res["o"], dtype=np.float64),
@@ -1713,8 +1687,6 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
         high_arr = data.get("high")
         low_arr = data.get("low")
         
-        # ===== BASIC STRUCTURE CHECKS (no content checks) =====
-        
         if timestamp is None or len(timestamp) == 0:
             return False, "Timestamp array is empty"
         
@@ -1726,8 +1698,6 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
         
         if len(close) < required_len:
             return False, f"Insufficient data: {len(close)} < {required_len}"
-        
-        # ===== ARRAY STRUCTURE CONSISTENCY =====
         
         if not np.all(timestamp[1:] >= timestamp[:-1]):
             return False, "Timestamps not monotonic increasing"
@@ -1786,34 +1756,23 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
         high_arr = data.get("high")
         low_arr = data.get("low")
         
-        # Validate arrays exist
         if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
             return False, "Missing or empty OHLC/timestamp data"
         
-        # Validate index is in range
         if selected_index < 0 or selected_index >= len(close):
             return False, f"Selected index {selected_index} out of range [0, {len(close)})"
-        
-        # =====================================================================
-        # VALIDATE THE SELECTED CANDLE IS FULLY CLOSED
-        # =====================================================================
         
         selected_candle_time = int(timestamp[selected_index])
         current_time = reference_time
         interval_seconds = interval_minutes * 60
         current_period_start = (current_time // interval_seconds) * interval_seconds
         
-        # Check: Selected candle must be BEFORE current period start
         if selected_candle_time >= current_period_start:
             return False, (
                 f"Selected candle is still forming! "
                 f"ts={format_ist_time(selected_candle_time)} "
                 f"current_period_start={format_ist_time(current_period_start)}"
             )
-        
-        # =====================================================================
-        # VALIDATE SELECTED CANDLE IS NOT TOO STALE
-        # =====================================================================
         
         staleness = current_time - selected_candle_time
         MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
@@ -1825,37 +1784,26 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
                 f"Current: {format_ist_time(current_time)}"
             )
         
-        # =====================================================================
-        # VALIDATE OHLC VALUES FOR SELECTED CANDLE
-        # =====================================================================
-        
         o = open_arr[selected_index]
         h = high_arr[selected_index]
         l = low_arr[selected_index]
         c = close[selected_index]
         
-        # Check for NaN or Inf
         if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
             return False, f"Selected candle has NaN values: O={o} H={h} L={l} C={c}"
         
         if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
             return False, f"Selected candle has Inf values: O={o} H={h} L={l} C={c}"
         
-        # Check for non-positive prices
         if o <= 0 or h <= 0 or l <= 0 or c <= 0:
             return False, f"Selected candle has non-positive prices: O={o} H={h} L={l} C={c}"
         
-        # Check OHLC relationships
         if not (l <= o and o <= h and l <= c and c <= h and l <= h):
             return False, (
                 f"Selected candle has invalid OHLC relationships! "
                 f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} "
                 f"[L≤O={l<=o} O≤H={o<=h} L≤C={l<=c} C≤H={c<=h} L≤H={l<=h}]"
             )
-        
-        # =====================================================================
-        # VALIDATE PRICE MOVEMENT (SELECTED CANDLE ONLY)
-        # =====================================================================
         
         if selected_index > 0:
             prev_close = close[selected_index - 1]
@@ -1890,10 +1838,6 @@ def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minu
     return True
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
-    """
-    Build a products map directly from cfg.PAIRS.
-    No API call — only configured pairs are included.
-    """
     products_map: Dict[str, dict] = {}
     for pair in cfg.PAIRS:
         products_map[pair] = {
@@ -1968,7 +1912,6 @@ class RedisStateStore:
             )
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
-        """Attempt to connect to Redis with retry logic."""
         try:
             self._redis = redis.from_url(
                 self.redis_url,
@@ -2001,7 +1944,6 @@ class RedisStateStore:
                     RedisStateStore._pool_reuse_count[self.redis_url] = 0
                     if cfg.DEBUG_MODE:
                         logger.debug("Redis connection saved to per-URL pool")
-
             try:
                 self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
                 if cfg.DEBUG_MODE:
@@ -2063,8 +2005,7 @@ class RedisStateStore:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
                         RedisStateStore._pool_healthy[self.redis_url] = False
-                        pool_reused = False
-        
+                        pool_reused = False     
         if pool_reused:
             return
 
@@ -2090,7 +2031,6 @@ class RedisStateStore:
                 logger.warning(f"Retrying Redis connection in {delay}s...")
                 await asyncio.sleep(delay)
 
-        # All retries failed
         logger.critical("❌ Redis connection failed after all retries")
         self.degraded = True
         if self._redis:
@@ -2111,12 +2051,10 @@ class RedisStateStore:
             raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
 
     async def close(self) -> None:
-        """Close Redis connection (called manually in finally block)."""
         self._redis = None
 
     @classmethod
     async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
-        """Shutdown global connection pool(s)."""
         async with cls._pool_lock:
             urls = [redis_url] if redis_url else list(cls._global_pools.keys())
             for url in urls:
@@ -2139,12 +2077,10 @@ class RedisStateStore:
                 cls._pool_reuse_count.pop(url, None)
             
     async def _ping_with_retry(self, timeout: float) -> bool:
-        """Ping Redis to verify connectivity."""
         result = await self._safe_redis_op(lambda: self._redis.ping(), timeout, "ping")
         return bool(result)
 
     async def _safe_redis_op(self, fn: Callable[[], Any], timeout: float, op_name: str, parser: Optional[Callable[[Any], Any]] = None):
-        """Execute Redis operation with timeout and error handling."""
         if not self._redis:
             return None
         try:
@@ -2159,7 +2095,6 @@ class RedisStateStore:
             return None
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
-        """Get state from Redis."""
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.state_prefix}{key}"),
             timeout,
@@ -2168,7 +2103,6 @@ class RedisStateStore:
         )
 
     async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
-        """Set state in Redis."""
         ts = int(ts or time.time())
         redis_key = f"{self.state_prefix}{key}"
         data = json_dumps({"state": state, "ts": ts})
@@ -2183,7 +2117,6 @@ class RedisStateStore:
         )
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
-        """Get metadata from Redis."""
         return await self._safe_redis_op(
             lambda: self._redis.get(f"{self.meta_prefix}{key}"),
             timeout,
@@ -2192,7 +2125,6 @@ class RedisStateStore:
         )
 
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
-        """Set metadata in Redis."""
         await self._safe_redis_op(
             lambda: self._redis.set(
                 f"{self.meta_prefix}{key}",
@@ -2204,13 +2136,10 @@ class RedisStateStore:
         )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        """Check if alert was recently sent (deduplication)."""
         if self.degraded:
             return True
-
         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
         recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
-
         try:
             result = await asyncio.wait_for(
                 self._redis.set(
@@ -2230,24 +2159,18 @@ class RedisStateStore:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
 
-    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
-        
+    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:    
         if self.degraded or not checks or not self._redis:
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-
         try:
             async with self._redis.pipeline() as pipe:
                 keys_map: Dict[str, str] = {}
                 
-                # Queue all SET commands (NX = only if not exists)
                 for pair, alert_key, ts in checks:
                     window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
                     recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
                     composite_key = f"{pair}:{alert_key}"
                     keys_map[recent_key] = composite_key
-                    
-                    # NX=True means "only set if key doesn't exist"
-                    # Returns True if key was set, False if key already existed
                     pipe.set(
                         recent_key, 
                         "1", 
@@ -2255,10 +2178,8 @@ class RedisStateStore:
                         ex=Constants.ALERT_DEDUP_WINDOW_SEC
                     )
 
-                # Execute all SET commands atomically
                 results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
 
-            # Build output: True if SET succeeded (new key), False if already existed (duplicate)
             output: Dict[str, bool] = {}
             for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
                 should_send = bool(results[idx]) if idx < len(results) else True
@@ -2286,14 +2207,11 @@ class RedisStateStore:
 
         try:
             async with self._redis.pipeline(transaction=True) as pipe:
-                # STEP 1: Build mget commands for all keys
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
                 
-                # Add all GET commands to pipeline
                 for state_key in state_keys:
                     pipe.get(state_key)
 
-                # STEP 2: Build SET commands for all updates
                 now = int(time.time())
                 for full_key, state_value, custom_ts in updates:
                     ts = custom_ts if custom_ts is not None else now
@@ -2304,8 +2222,6 @@ class RedisStateStore:
                         logger.error(f"Failed to serialize state for {full_key}: {e}")
                         continue
                 
-                    # full_key is expected to be like "pair:alert_key"
-                    # Ensure it has the state prefix
                     if not full_key.startswith(self.state_prefix):
                         redis_key = f"{self.state_prefix}{full_key}"
                     else:
@@ -2316,14 +2232,11 @@ class RedisStateStore:
                     else:
                         pipe.set(redis_key, data)
 
-                # STEP 3: Execute pipeline atomically
                 results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
-            # STEP 4: Parse GET results (first N results are from mget)
             num_gets = len(alert_keys)
             mget_results = results[:num_gets] if results else []
 
-            # STEP 5: Build output dictionary
             parsed: Dict[str, Optional[Dict[str, Any]]] = {}
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
@@ -2333,7 +2246,6 @@ class RedisStateStore:
                     continue
                 
                 try:
-                    # Handle both bytes and string returns
                     if isinstance(val, bytes):
                         val_str = val.decode("utf-8")
                     elif isinstance(val, str):
@@ -2370,7 +2282,6 @@ class RedisStateStore:
             return {k: None for k in alert_keys}
 
     async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """Atomically evaluate batch of alerts with pipeline execution."""
         if self.degraded:
             empty_prev = {k: False for k in alert_keys}
             empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
@@ -2388,18 +2299,15 @@ class RedisStateStore:
                 f"Degrading to batch_get_and_set_alerts + batch_check_recent_alerts"
             )
             try:
-                # FIXED: Use batch_get_and_set_alerts for atomic get+set
                 prev_raw = await asyncio.wait_for(
                     self.batch_get_and_set_alerts(pair, alert_keys, state_updates),
                     timeout=2.0
                 )
-
                 prev_states: Dict[str, bool] = {}
                 for k in alert_keys:
                     env = prev_raw.get(k)
                     prev_states[k] = isinstance(env, dict) and env.get("state") == "ACTIVE"
 
-                # FIXED: Use batch_check_recent_alerts for deduplication
                 dedup_results = await asyncio.wait_for(
                     self.batch_check_recent_alerts(dedup_checks),
                     timeout=2.0
@@ -2426,11 +2334,9 @@ class RedisStateStore:
 
         try:
             async with self._redis.pipeline() as pipe:
-                # ===== PHASE 1: MGET previous states =====
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
                 pipe.mget(state_keys)
 
-                # ===== PHASE 2: SET new states =====
                 now = int(time.time())
                 for key, state, custom_ts in state_updates:
                     ts = custom_ts if custom_ts is not None else now
@@ -2440,7 +2346,6 @@ class RedisStateStore:
                         logger.error(f"Failed to serialize state for {key}: {e}")
                         continue
                 
-                    # Ensure key has proper prefix
                     if not key.startswith(self.state_prefix):
                         full_key = f"{self.state_prefix}{key}"
                     else:
@@ -2451,7 +2356,6 @@ class RedisStateStore:
                     else:
                         pipe.set(full_key, data)
 
-                # ===== PHASE 3: SET dedup keys (NX) =====
                 dedup_keys_ordered: List[Tuple[str, str]] = []
             
                 for pair_name, alert_key, ts in dedup_checks:
@@ -2461,10 +2365,9 @@ class RedisStateStore:
                     dedup_keys_ordered.append((recent_key, composite_key))
                     pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
                 
-                # ===== EXECUTE PIPELINE ATOMICALLY =====
                 results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
 
-            num_gets = 1  # mget returns ONE result (list of values)
+            num_gets = 1
             num_sets = len(state_updates)
             num_dedups = len(dedup_keys_ordered)
         
@@ -2475,7 +2378,6 @@ class RedisStateStore:
                     {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
                 )
         
-            # ===== PARSE MGET RESULTS (first result is list of values) =====
             mget_results = results[0] if results else []
 
             prev_states: Dict[str, bool] = {}
@@ -2506,13 +2408,12 @@ class RedisStateStore:
                     logger.error(f"Unexpected error parsing state for {key}: {e}")
                     prev_states[key] = False
 
-            # ===== PARSE DEDUP RESULTS =====
             dedup_results: Dict[str, bool] = {}
             dedup_start_idx = num_gets + num_sets
             
             for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
                 result_idx = dedup_start_idx + idx
-                # SET with NX returns True if key was set (new), False if already existed (duplicate)
+                
                 should_send = bool(results[result_idx]) if result_idx < len(results) else True
                 dedup_results[composite_key] = should_send
 
@@ -2537,7 +2438,6 @@ class RedisStateStore:
             )
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-        """Atomically update multiple state entries."""
         if self.degraded or not self._redis:
             return False
 
@@ -2577,8 +2477,7 @@ class RedisStateStore:
             return False
 
 class RedisLock:
-    # Lua script for atomic lock release
-    # Prevents releasing a lock we don't own
+    
     RELEASE_LUA = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
         return redis.call("DEL", KEYS[1])
@@ -2587,42 +2486,29 @@ class RedisLock:
     end
     """
 
-    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
-        
+    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):     
         self.redis = redis_client
         self.lock_key = f"lock:{lock_key}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
         
-        # Token: unique identifier for this lock holder
         self.token: Optional[str] = None
-        
-        # lost: True if lock was stolen or expired
         self.lost = False
-        
-        # acquired_by_me: True if we currently hold the lock
         self.acquired_by_me = False
-        
-        # last_extend_time: Unix timestamp of last successful extend
         self.last_extend_time = 0.0
 
-    async def acquire(self, timeout: float = 5.0) -> bool:
-        
+    async def acquire(self, timeout: float = 5.0) -> bool:  
         if not self.redis:
             logger.warning("Redis not available; cannot acquire lock")
             return False
         
         try:
-            # Generate unique token for this lock holder
             token = str(uuid.uuid4())
-            
-            # Attempt atomic SET with NX (only if not exists) and EX (expire)
             ok = await asyncio.wait_for(
                 self.redis.set(self.lock_key, token, nx=True, ex=self.expire),
                 timeout=timeout,
             )
             
             if ok:
-                # Lock acquired successfully
                 self.token = token
                 self.acquired_by_me = True
                 self.lost = False
@@ -2633,7 +2519,6 @@ class RedisLock:
                 )
                 return True
 
-            # Another instance holds the lock
             logger.warning(f"Could not acquire Redis lock (held): {self.lock_key}")
             return False
             
@@ -2644,32 +2529,26 @@ class RedisLock:
             logger.error(f"Redis lock acquisition failed: {e}")
             return False
 
-    async def extend(self, timeout: float = 3.0) -> bool:
-        
+    async def extend(self, timeout: float = 3.0) -> bool:     
         if not self.token or not self.redis or not self.acquired_by_me:
-            # We don't own the lock
             self.lost = True
             return False
         
         try:
-            # Verify we still own the lock (token still matches)
             raw_val = await asyncio.wait_for(
                 self.redis.get(self.lock_key),
                 timeout=timeout,
             )
             
             if raw_val is None:
-                # Key disappeared - lock expired or was deleted
                 logger.warning("Lock lost during extend (key missing)")
                 self.lost = True
                 self.acquired_by_me = False
                 return False
 
-            # Convert bytes to string for comparison
             current_token = str(raw_val) if isinstance(raw_val, bytes) else str(raw_val)
             
             if current_token != self.token:
-                # Token mismatch - lock was stolen by another instance
                 logger.warning(
                     f"Lock token mismatch on extend | "
                     f"Expected: {self.token[:8]}... | "
@@ -2680,20 +2559,17 @@ class RedisLock:
                 self.acquired_by_me = False
                 return False
 
-            # Reset TTL on the lock key (preserves value, extends expiry)
             expire_ok = await asyncio.wait_for(
                 self.redis.expire(self.lock_key, self.expire),
                 timeout=timeout,
             )
             
             if expire_ok:
-                # Extension successful
                 self.last_extend_time = time.time()
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Extended Redis lock: {self.lock_key} (now {self.expire}s)")
                 return True
             else:
-                # Key disappeared between GET and EXPIRE
                 logger.warning("Lock key disappeared during extend")
                 self.lost = True
                 self.acquired_by_me = False
@@ -2711,23 +2587,18 @@ class RedisLock:
             return False
 
     @classmethod
-    def get_lock_extend_interval(cls) -> int:
-        
+    def get_lock_extend_interval(cls) -> int:    
         extend_at = int(Constants.REDIS_LOCK_EXPIRY * 0.7)
         return max(60, min(extend_at, 540))
 
-    def should_extend(self) -> bool:
-        
+    def should_extend(self) -> bool:     
         if not self.acquired_by_me or self.lost:
             return False
 
-        # Get recommended extension interval (e.g., 540s)
         extend_threshold = self.__class__.get_lock_extend_interval()
         
-        # Calculate elapsed time since last extension
         elapsed = max(0, time.time() - self.last_extend_time)
         
-        # Should extend if threshold elapsed
         should_extend = elapsed >= extend_threshold
         
         if cfg.DEBUG_MODE and should_extend:
@@ -2739,27 +2610,20 @@ class RedisLock:
         
         return should_extend
 
-    async def release(self, timeout: float = 3.0) -> None:
-        
+    async def release(self, timeout: float = 3.0) -> None:     
         if not self.token or not self.redis or not self.acquired_by_me:
-            # We don't own the lock or Redis unavailable
             return
-    
         try:
-            # Use Lua script for atomic check-and-delete
-            # Returns 1 if deleted, 0 if token didn't match
             result = await asyncio.wait_for(
                 self.redis.eval(self.RELEASE_LUA, 1, self.lock_key, self.token),
                 timeout=timeout,
             )
         
             if result:
-                # Lock successfully released
                 logger.info(f"🔏 Lock released: {self.lock_key.replace('lock:', '')}")
                 self.acquired_by_me = False
                 self.token = None
             else:
-                # Token didn't match - we don't own this lock anymore
                 logger.warning(
                     f"Lock release failed (token mismatch): {self.lock_key} | "
                     f"Lock was stolen or lost"
@@ -2777,16 +2641,9 @@ class RedisLock:
             self.acquired_by_me = False
     
         finally:
-            # Always clear token
             self.token = None
 
     def get_status(self) -> Dict[str, Any]:
-        """
-        Get current lock status for debugging/monitoring.
-        
-        Returns:
-            Dictionary with lock state information
-        """
         return {
             "lock_key": self.lock_key,
             "acquired_by_me": self.acquired_by_me,
@@ -2800,7 +2657,6 @@ class RedisLock:
         }
 
     def __repr__(self) -> str:
-        """String representation for logging."""
         status = "HELD" if self.acquired_by_me else ("LOST" if self.lost else "RELEASED")
         token_display = self.token[:8] + "..." if self.token else "None"
         return f"RedisLock({self.lock_key}:{status}:{token_display})"
@@ -2874,14 +2730,11 @@ class TelegramQueue:
             return True
 
         def _safe_truncate_utf8(text: str, max_bytes: int) -> str:
-            """Truncate UTF-8 string without breaking multi-byte chars"""
             encoded = text.encode('utf-8')
             if len(encoded) <= max_bytes:
                 return text
-            # Decode truncated, ignoring incomplete chars
             return encoded[:max_bytes].decode('utf-8', errors='ignore')
 
-        # In send_batch():
         MAX_LEN = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
         SAFETY_MARGIN = 100  # Account for URL encoding overhead
         EFFECTIVE_MAX = MAX_LEN - SAFETY_MARGIN
@@ -2899,7 +2752,6 @@ class TelegramQueue:
                 logger.warning(f"Failed to encode message: {e}, skipping")
                 continue
 
-            # Account for URL encoding expansion (~10-15% for special chars)
             estimated_encoded = int(msg_bytes * 1.15)
     
             needed = estimated_encoded
@@ -2911,7 +2763,6 @@ class TelegramQueue:
                     batches.append(current)
                     current = []
                     current_bytes = 0
-                # Truncate at safe boundary
                 truncated = _safe_truncate_utf8(msg, EFFECTIVE_MAX)
                 batches.append([truncated])
                 continue
@@ -3000,7 +2851,6 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     if close_curr is None or close_prev is None:
         return False, "Missing close data"
 
-    # Check if price crossed the pivot
     if is_buy:
         crossed = close_prev <= level_value < close_curr
     else:
@@ -3009,7 +2859,6 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     if not crossed:
         return False, "No pivot cross"
 
-    # Safer percentage difference calculation
     try:
         price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
     except ZeroDivisionError:
@@ -3084,25 +2933,20 @@ def validate_alert_definitions() -> None:
 
 validate_alert_definitions()
 
-async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
-    
+async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:   
     if sdb.degraded:
-        return
-    
+        return   
     state_key = f"{pair}:{key}"
     ts = int(time.time())
     state_val = "ACTIVE" if active else "INACTIVE"
     await sdb.set(state_key, state_val, ts)
 
 async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
-    
     if sdb.degraded:
-        return False
-    
+        return False 
     state_key = f"{pair}:{key}"
     st = await sdb.get(state_key)
     return st is not None and st.get("state") == "ACTIVE"
-
 
 def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
     vwap_curr = ctx.get("vwap_curr")
@@ -3113,12 +2957,10 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
     high_curr = ctx["high_curr"]
     low_curr = ctx["low_curr"]
     
-    # Step 1: Validate VWAP data exists
     if vwap_curr is None or np.isnan(vwap_curr) or vwap_prev is None or np.isnan(vwap_prev):
         return False, "VWAP not available"
     
     if is_buy:
-        # Step 2: Verify candle is GREEN (close > open)
         if close_curr <= open_curr:
             return False, f"Red candle: O={open_curr:.2f}, C={close_curr:.2f}"
         
@@ -3129,12 +2971,10 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
                 f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
             )
         
-        # Step 4: Check price distance from VWAP (prevents crossing too far away)
         dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
         if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
             return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
         
-        # Step 5: Check upper wick ratio (small upper wick = good buy signal)
         candle_range = high_curr - low_curr
         if candle_range > 1e-9:
             body_top = max(open_curr, close_curr)
@@ -3145,14 +2985,10 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
         
         return True, None
     
-    else:  # Sell logic
-        # Step 2: Verify candle is RED (close < open)
+    else:
         if close_curr >= open_curr:
             return False, f"Green candle: O={open_curr:.2f}, C={close_curr:.2f}"
         
-        # Step 3: Verify actual cross BELOW VWAP
-        # - Previous bar: close was above or at VWAP
-        # - Current bar: close is below VWAP
         if not (close_prev > vwap_prev and close_curr < vwap_curr):
             return False, (
                 f"No cross down: "
@@ -3160,12 +2996,10 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
                 f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
             )
         
-        # Step 4: Check price distance from VWAP
         dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
         if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
             return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
         
-        # Step 5: Check lower wick ratio (small lower wick = good sell signal)
         candle_range = high_curr - low_curr
         if candle_range > 1e-9:
             body_bottom = min(open_curr, close_curr)
@@ -3239,23 +3073,19 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_
                 wick_ratio = lower_wick / candle_range
 
         if is_buy:
-            # Must be green
             if close_val <= open_val:
                 return False, f"Not green (C={close_val:.5f} ≤ O={open_val:.5f})"
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-
             return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
 
         else:
-            # Must be red
             if close_val >= open_val:
                 return False, f"Not red (C={close_val:.5f} ≥ O={open_val:.5f})"
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-
             return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
 
     except Exception as e:
@@ -3268,11 +3098,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
 
-    # =========================================================================
-    # INITIALIZE ALL VARIABLES FOR EXCEPTION SAFETY
-    # (Ensures finally block can safely clean up even if error occurs early)
-    # =========================================================================
-    
     close_15m = None
     open_15m = None
     timestamps_15m = None
@@ -3289,11 +3114,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     piv = None
     context = None
 
-    # =========================================================================
-    # PHASE 1: DATA VALIDATION & CANDLE SELECTION
-    # =========================================================================
     try:
-        # Get indices of last fully closed candles (not current/forming)
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
@@ -3310,21 +3131,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cache_key = f"{pair_name}:{ts_15m}"
         aligned_i5 = alignment_cache.get(cache_key)
     
-        # Safety guard (in case data length differs)
         if aligned_i5 is not None and aligned_i5 >= len(ts_5m):
             aligned_i5 = None
     
-        # Compute only if not cached
         if aligned_i5 is None:
-            # YOUR SIMPLER LOGIC
             time_diff = np.abs(ts_5m - ts_15m)
             aligned_i5 = int(np.argmin(time_diff))
         
-            # Validate alignment quality
             if time_diff[aligned_i5] > 60:
                 aligned_i5 = i5  # fallback
         
-            # Cache for future use
             alignment_cache[cache_key] = aligned_i5
     
         i5 = aligned_i5
@@ -3333,24 +3149,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
 
-        # Quick candle type check (green/red/doji)
         close_curr_quick = close_15m[i15]
         open_curr_quick = open_15m[i15]
         is_green = close_curr_quick > open_curr_quick
         is_red = close_curr_quick < open_curr_quick
 
         if not is_green and not is_red:
-            # Doji or neutral candle - skip expensive indicator calculation
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
                     f"Doji/neutral candle for {pair_name} "
                     f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
                 )
             return None
-
-        # =========================================================================
-        # PHASE 2: INDICATOR CALCULATION (Threaded to avoid blocking)
-        # =========================================================================
     
         indicators = await asyncio.to_thread(calculate_all_indicators_numpy, data_15m, data_5m, data_daily)
 
@@ -3364,39 +3174,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
-
-        # =========================================================================
-        # PHASE 3: EXTRACT CURRENT & PREVIOUS VALUES
-        # =========================================================================
-    
-        # Current candle values
         close_curr = close_15m[i15]
         close_prev = close_15m[i15 - 1]
         open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
         low_curr = data_15m["low"][i15]
         ts_curr = int(timestamps_15m[i15])
-    
-        # Previous candle values
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
-    
-        # Other timeframe values (now aligned!)
         close_5m_val = data_5m["close"][i5]
-        
-        # Indicator values
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
-
-        # =====================================================================
-        # PHASE 4: VWAP DATA VALIDATION (Fixed per Issue #9)
-        # =====================================================================
-        
         vwap_enabled = cfg.ENABLE_VWAP
         vwap_available = False
         vwap_curr = None
@@ -3407,7 +3200,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 vwap_curr = vwap[i15]
                 vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
 
-                # Validate data quality
                 if not (np.isnan(vwap_curr) or np.isnan(vwap_prev) or vwap_curr <= 0 or vwap_prev <= 0):
                     vwap_available = True
                 else:
@@ -3427,10 +3219,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"i15={i15}"
                 )
 
-        # =====================================================================
-        # PHASE 5: MMH (MAGICAL MOMENTUM HISTOGRAM) VALIDATION
-        # =====================================================================
-        
         mmh_curr = mmh[i15]
         mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
@@ -3443,20 +3231,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(mmh_m3)
         )
 
-        # =====================================================================
-        # PHASE 6: MOVING AVERAGES & CLOUD STATE
-        # =====================================================================
-        
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
-        # =====================================================================
-        # PHASE 7: CANDLE QUALITY CHECKS (Wick Ratio)
-        # =====================================================================
- 
         candle_range = high_curr - low_curr
         if candle_range <= 1e-9:
             actual_buy_wick_ratio = 1.0
@@ -3477,19 +3257,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"(threshold={Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
 
-        # =====================================================================
-        # PHASE 8: CANDLE TIMESTAMP VALIDATION
-        # =====================================================================
-        
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
             if cfg.DEBUG_MODE:
                 logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
 
-        # =====================================================================
-        # PHASE 9: DAILY PIVOT RESET (Fixed per Issue #10)
-        # =====================================================================
-      
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
             current_date = current_utc_dt.date()
@@ -3512,16 +3284,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
 
             if last_reset_date != current_date:
-                # 1.  SAVE RESET DATE FIRST – abort if this fails
                 try:
                     await sdb.set_metadata(day_tracker_key, current_date.isoformat())
                     logger_pair.debug(f"✅ Saved reset date: {current_date}")
                 except Exception as e:
                     logger_pair.error(f"❌ Failed to save reset date – aborting daily reset: {e}")
-                    # Do NOT continue; no deletes will happen this run
                     raise
 
-                # 2.  Only if the above succeeded, build and execute deletes
                 delete_keys = []
                 if cfg.ENABLE_PIVOT:
                     pivot_alerts = [
@@ -3550,28 +3319,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             logger_pair.debug("Daily reset disabled (ENABLE_PIVOT and ENABLE_VWAP both false)")
 
-        # =====================================================================
-        # PHASE 10: TREND FILTER (BUY/SELL COMMON CONDITIONS)
-        # =====================================================================
-        
-        # Base trend check: price above/below key MAs
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
-        # Add MMH and cloud confirmation
         if base_buy_trend:
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
-        # =====================================================================
-        # PHASE 11: CANDLE QUALITY FILTER
-        # =====================================================================
-        
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
-
 
         buy_candle_reason = None
         sell_candle_reason = None
@@ -3586,17 +3344,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 open_curr, high_curr, low_curr, close_curr, is_buy=False
             )
 
-        # =====================================================================
-        # PHASE 12: COMMON ALERT CONDITIONS (BUY & SELL SETUP)
-        # =====================================================================
-        
         buy_common = base_buy_trend and buy_candle_passed
         sell_common = base_sell_trend and sell_candle_passed
 
-        # =====================================================================
-        # PHASE 13: MMH REVERSALS (Requires Valid Data)
-        # =====================================================================
-        
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
@@ -3606,18 +3356,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             mmh_reversal_buy = False
             mmh_reversal_sell = False
         else:
-            # Buy reversal: MMH crossing above zero with momentum
             mmh_reversal_buy = (buy_common and mmh_curr > 0 and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1)
             
-            # Sell reversal: MMH crossing below zero with momentum
             mmh_reversal_sell = (sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
 
-        # =====================================================================
-        # PHASE 14: BUILD EVALUATION CONTEXT (Fixed per Issue #9)
-        # =====================================================================
-        
         context = {
-            # Candle data
             "close_curr": close_curr,
             "close_prev": close_prev,
             "open_curr": open_curr,
@@ -3625,71 +3368,45 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "low_curr": low_curr,
             "ts_curr": ts_curr,
             "close_5m_val": close_5m_val,
-            
-            # PPO indicators
             "ppo_curr": ppo_curr,
             "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr,
             "ppo_sig_prev": ppo_sig_prev,
-            
-            # RSI indicator
             "rsi_curr": rsi_curr,
             "rsi_prev": rsi_prev,
-            
-            # VWAP (only populated if available)
             "vwap_curr": vwap_curr,
             "vwap_prev": vwap_prev,
-            "vwap_available": vwap_available,  # Only True if data is valid
-            "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,  # Compound flag
-            
-            # MMH momentum
+            "vwap_available": vwap_available,
+            "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
             "mmh_curr": mmh_curr,
             "mmh_m1": mmh_m1,
             "mmh_m2": mmh_m2,
             "mmh_m3": mmh_m3,
             "mmh_reversal_buy": mmh_reversal_buy,
             "mmh_reversal_sell": mmh_reversal_sell,
-            
-            # Moving averages
             "rma50_15_val": rma50_15_val,
             "rma200_5_val": rma200_5_val,
-            
-            # Cloud state
             "cloud_up": cloud_up,
             "cloud_down": cloud_down,
-            
-            # Candle quality
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
-            "buy_wick_ratio": actual_buy_wick_ratio,  # From 15M candle only
-            "sell_wick_ratio": actual_sell_wick_ratio,  # From 15M candle only 
-         
-            # Candle direction
+            "buy_wick_ratio": actual_buy_wick_ratio,
+            "sell_wick_ratio": actual_sell_wick_ratio,
             "is_green": is_green,
             "is_red": is_red,
-            
-            # Common conditions
             "buy_common": buy_common,
             "sell_common": sell_common,
-
             "wick_ratio_timeframe": "15m",
-            
-            # Pivots (empty dict if not available)
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
         }
 
-        # =====================================================================
-        # PHASE 15: RETRIEVE PREVIOUS ALERT STATES FROM REDIS
-        # =====================================================================
-        
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
         raw_alerts = []
 
-        # Build list of alerts to check (skip unavailable data types)
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
@@ -3701,25 +3418,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
         ]
 
-        # Skip pivot alerts if no pivot data
         if not piv or not any(piv.values()):
             alert_keys_to_check = [
                 k for k in alert_keys_to_check
                 if not k.startswith("pivot_")
             ]
 
-        # Map to Redis keys for state lookup
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
 
-        # Get previous state of all alerts from Redis
         previous_states = await check_multiple_alert_states(
             sdb, pair_name, redis_alert_keys
         )
 
-        # =====================================================================
-        # PHASE 16: EVALUATE EACH ALERT CONDITION
-        # =====================================================================
-        
         all_state_changes = []
 
         for alert_key in alert_keys_to_check:
@@ -3730,11 +3440,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             key = ALERT_KEYS[alert_key]
             trigger = False
 
-            # Classify alert type
             is_buy_signal = any(x in alert_key for x in ["up", "buy"])
             is_sell_signal = any(x in alert_key for x in ["down", "sell"])
 
-            # ===== PIVOT ALERTS =====
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                 level = alert_key.split("_")[-1]
                 is_buy = alert_key.startswith("pivot_up_")
@@ -3755,8 +3463,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     trigger = False
 
-            # ===== VWAP ALERTS (Fixed per Issue #9) =====
-
             elif alert_key in ("vwap_up", "vwap_down"):
                 if not vwap_available:
                     if cfg.DEBUG_MODE:
@@ -3765,7 +3471,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 trigger = False
                 try:
-                    # ✅ USE THE CHECK_FN LIKE ALL OTHER ALERTS
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
         
                     if cfg.DEBUG_MODE:
@@ -3784,8 +3489,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 except Exception as e:
                     logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
-
-            # ===== OTHER ALERTS (PPO, RSI, MMH) =====
             else:
                 trigger = False
                 trigger_error = None
@@ -3803,16 +3506,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     trigger = False
                     trigger_error = str(e)
 
-            # =====================================================================
-            # PHASE 17: FIRE ALERT IF TRIGGERED & NOT ALREADY ACTIVE
-            # =====================================================================
-            
             if trigger and not previous_states.get(key, False):
                 extra = ""
                 try:
                     extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
                 except Exception as e:
-                    # Still fire alert even if extra_fn fails (Fixed per Issue #11)
                     logger_pair.error(
                         f"Alert extra_fn failed for {alert_key}, firing alert without extra details: {e}",
                         exc_info=False
@@ -3831,61 +3529,60 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                     )
 
-        # =====================================================================
-        # PHASE 18: RESET ALERTS WHEN CONDITIONS NO LONGER MET
-        # =====================================================================
-        
         resets_to_apply = []
 
-        # PPO Signal crosses back
         if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
+
         if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
 
-        # PPO crosses back over zero
         if ppo_prev > 0 and ppo_curr <= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
+
         elif not buy_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_zero_up']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-                
+           
         if ppo_prev < 0 and ppo_curr >= 0:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
+
         elif not sell_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_zero_down']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-                
-        # PPO crosses 0.11 threshold
+
         if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
+
         elif not buy_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_011_up']):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
-                
+                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None)) 
+         
         if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
+
         elif not sell_common:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['ppo_011_down']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
-                
-        # RSI crosses threshold
+
         if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
+
         elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['rsi_50_up']):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))                
-
+                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
+                
         if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
             resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
+
         elif not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
             if await was_alert_active(sdb, pair_name, ALERT_KEYS['rsi_50_down']):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
                 
-        # VWAP crosses back (if enabled and available)
         if cfg.ENABLE_VWAP and vwap_available:
             if close_prev > vwap_prev and close_curr <= vwap_curr:
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+
             elif not buy_common:
                 if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_up']):
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
@@ -3895,8 +3592,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             elif not sell_common:
                 if await was_alert_active(sdb, pair_name, ALERT_KEYS['vwap_down']):
                     resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-                    
-        # Pivot crosses back
+                   
         if piv:
             for level_name, level_value in piv.items():
                 up_key = f"pivot_up_{level_name}"
@@ -3909,7 +3605,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     if close_prev < level_value and close_curr >= level_value:
                         resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
 
-        # MMH reversals reset
         if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_buy"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
@@ -3917,22 +3612,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if await was_alert_active(sdb, pair_name, ALERT_KEYS["mmh_sell"]):
                 resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
-        # =====================================================================
-        # PHASE 19: PERSIST STATE CHANGES TO REDIS
-        # =====================================================================
-        
         all_state_changes.extend(resets_to_apply)
 
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
 
-        # =====================================================================
-        # PHASE 20: FILTER DUPLICATE ALERTS & APPLY LIMITS
-        # =====================================================================
-        
         alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
-        # Limit pivot alerts (max 3 per pair to avoid spam)
         pivot_count = sum(1 for _, _, k in alerts_to_send if k.startswith("pivot_"))
         if pivot_count > 3:
             logger_pair.warning(
@@ -3942,10 +3628,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
 
-        # =====================================================================
-        # PHASE 21: BUILD & SEND TELEGRAM MESSAGE
-        # =====================================================================
-        
         if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
@@ -3969,10 +3651,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
 
-        # =====================================================================
-        # PHASE 22: GENERATE DEBUG OUTPUT (Suppression Reasons)
-        # =====================================================================
-        
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
@@ -4044,10 +3722,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
 
-        # =====================================================================
-        # PHASE 23: RETURN SUMMARY RESULT
-        # =====================================================================
-        
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
             "ts": int(time.time()),
@@ -4071,13 +3745,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         return None
 
     finally:
-        # =====================================================================
-        # CLEANUP: EXPLICIT MEMORY MANAGEMENT (Fixed per Issue #7)
-        # =====================================================================
         
         PAIR_ID.set("")
         
-        # Delete large arrays to free memory immediately
         if data_15m is not None:
             data_15m = None
         if data_5m is not None:
@@ -4089,7 +3759,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if context is not None:
             context = None
         
-        # Force garbage collection if memory usage high
         try:
             process = psutil.Process()
             current_memory_mb = process.memory_info().rss / 1024 / 1024
@@ -4106,20 +3775,15 @@ logger_main = logging.getLogger("macd_bot.worker_pool")
     
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, alignment_cache: Dict[str, int]):  
     p_name, candles = task_data
-    
-    # ===== EXCEPTION SAFETY: Initialize all variables =====
-    # If an exception occurs early, finally block can safely clean up
     data_15m = None
     data_5m = None
     data_daily = None
     
     try:
-        # ===== PHASE 1: Parse candles to numpy arrays =====
         data_15m = parse_candles_to_numpy(candles.get("15"))
         data_5m = parse_candles_to_numpy(candles.get("5"))
         data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
         
-        # ===== PHASE 2: Quick validation - bail early if bad data =====
         if data_15m is None:
             logger_main.warning(f"Skipping {p_name}: 15m parse failed")
             return None
@@ -4130,14 +3794,12 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         
         reference_time = get_trigger_timestamp()
         
-        # ===== PHASE 3: Get last closed candle index =====
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         if i15 is None or i15 < 4:
             if cfg.DEBUG_MODE:
                 logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
             return None
         
-        # ===== PHASE 4: Validate selected candle =====
         v15_selected, r15_selected = validate_candle_data_at_index(
             data_15m, i15, reference_time, interval_minutes=15
         )
@@ -4145,7 +3807,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
             return None
         
-        # ===== PHASE 5: Full evaluation =====
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, alignment_cache
@@ -4154,30 +3815,23 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         return result
     
     except asyncio.CancelledError:
-        # ===== CRITICAL: Re-raise cancellation =====
-        # Don't swallow shutdown signals
         logger_main.warning(f"Evaluation cancelled for {p_name}")
         raise
     
     except Exception as e:
-        # ===== CATCH ALL OTHER ERRORS =====
         logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
         return None
     
-    finally:
-        
+    finally:     
         data_15m = None
         data_5m = None
         data_daily = None
-        
-        # ===== OPTIONAL: Per-pair aggressive collection =====
-        # Only if memory usage is concerning (to avoid 12× GC calls)
+  
         try:
             process = psutil.Process()
             current_rss_mb = process.memory_info().rss / 1024 / 1024
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             
-            # Only if we're above 85% threshold
             if current_rss_mb > limit_mb * 0.85:
                 gc.collect()
                 
@@ -4200,12 +3854,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
     
-    # Calculate data requirements
     limit_15m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
     
-    # Build fetch requests
     pair_requests = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
@@ -4219,7 +3871,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         
         pair_requests.append((symbol, resolutions))
     
-    # Fetch all candles (returns large dict)
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
@@ -4253,12 +3904,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
     
-    
-    # Filter results (keep only successful evaluations)
     valid_results = []
     for r in results:
         if isinstance(r, Exception):
-            # asyncio.gather returned exception, skip it
             logger_main.warning(f"Evaluation raised exception: {r}")
             continue
         if r is not None:
@@ -4275,7 +3923,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     
     gc.collect()
     
-    # ===== OPTIONAL: Log memory state for debugging =====
     try:
         process = psutil.Process()
         current_memory_mb = process.memory_info().rss / 1024 / 1024
@@ -4288,7 +3935,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 f"({usage_pct:.0f}%)"
             )
         
-        # ===== WARNING: If memory still high, something else is holding refs =====
         if current_memory_mb > limit_mb * 0.9:
             logger_main.warning(
                 f"⚠️ Memory still high after cleanup: {current_memory_mb:.0f}MB ({usage_pct:.0f}%). "
@@ -4308,8 +3954,6 @@ async def run_once() -> bool:
     TRACE_ID.set(correlation_id)
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
-    
-    # Initialize resource references
     sdb: Optional[RedisStateStore] = None
     lock: Optional[RedisLock] = None
     fetcher: Optional[DataFetcher] = None
@@ -4328,9 +3972,6 @@ async def run_once() -> bool:
     )
 
     try:
-        # =====================================================================
-        # STEP 1: MEMORY CHECK & CONFIGURATION VALIDATION
-        # =====================================================================
         
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
@@ -4343,14 +3984,9 @@ async def run_once() -> bool:
             )
             return False
 
-        # =====================================================================
-        # STEP 2: LOAD/CACHE PRODUCTS
-        # =====================================================================
-               
         logger_run.debug("📦 Initializing HTTP fetcher...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
 
-        # All pairs come directly from cfg.PAIRS (no API call needed)
         pairs_to_process = list(cfg.PAIRS)
         products_map = build_products_map_from_cfg()
 
@@ -4360,10 +3996,6 @@ async def run_once() -> bool:
 
         logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs from config")
 
-        # =====================================================================
-        # STEP 3: CONNECT TO REDIS (FIXED: Manual connect/close, not context manager)
-        # =====================================================================
-        
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
@@ -4380,18 +4012,10 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
-        # =====================================================================
-        # STEP 4: CREATE HTTP FETCHER & TELEGRAM QUEUE
-        # =====================================================================
-        
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
-        # =====================================================================
-        # STEP 5: ACQUIRE REDIS LOCK
-        # =====================================================================
-        
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
 
@@ -4401,17 +4025,8 @@ async def run_once() -> bool:
             )
             return False
 
-        # =====================================================================
-        # STEP 6: CREATE LOCK EXTENSION TASK (FIXED per Issue #3)
-        # =====================================================================
-        
         async def extend_lock_periodically(lock_obj: RedisLock, interval: int = 300):
-            """
-            Extend Redis lock every N seconds to keep it alive during long runs.
             
-            Redis lock expires after REDIS_LOCK_EXPIRY (~900s). If run takes longer,
-            another instance could acquire the lock. This task prevents that.
-            """
             while not shutdown_event.is_set():
                 try:
                     await asyncio.sleep(interval)
@@ -4419,7 +4034,7 @@ async def run_once() -> bool:
                     if lock_obj.should_extend():
                         success = await lock_obj.extend(timeout=3.0)
                         if success:
-                            logger_run.debug("��� Lock extended successfully")
+                            logger_run.debug("🔑 Lock extended successfully")
                         else:
                             logger_run.warning("❌ Failed to extend lock - may lose it soon")
                 except asyncio.CancelledError:
@@ -4427,15 +4042,10 @@ async def run_once() -> bool:
                 except Exception as e:
                     logger_run.error(f"Lock extension error: {e}")
 
-        # Launch lock extension task at 5-minute intervals
         lock_extension_task = asyncio.create_task(
             extend_lock_periodically(lock, interval=300)
         )
 
-        # =====================================================================
-        # STEP 7: SEND TEST MESSAGE
-        # =====================================================================
-        
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
@@ -4448,10 +4058,6 @@ async def run_once() -> bool:
             f"🔔 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
-        # =====================================================================
-        # STEP 8: PROCESS PAIRS WITH GARBAGE COLLECTION CONTROL
-        # =====================================================================
-        
         logger_run.info("Starting evaluation phase...")
         logger_run.debug("Garbage collection disabled during evaluation loop...")
         
@@ -4460,10 +4066,6 @@ async def run_once() -> bool:
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
 
-        # =====================================================================
-        # STEP 9: AGGREGATE ALERT RESULTS
-        # =====================================================================
-        
         for _, state in all_results:
             if state.get("state") == "ALERT_SENT":
                 extra_alerts = state.get("summary", {}).get("alerts", 0)
@@ -4496,21 +4098,15 @@ async def run_once() -> bool:
                 )
             )
 
-        # =====================================================================
-        # STEP 10: LOG STATISTICS
-        # =====================================================================
-        
         if fetcher is None:
             logger_run.error("❌ Fetcher is None - cannot get stats")
             return False
 
         fetcher_stats = fetcher.get_stats()
 
-        # Candle fetch statistics
         total_required = fetcher_stats['candles']['success'] + fetcher_stats['candles']['failed']
         candles_str = f"{fetcher_stats['candles']['success']}/{total_required}"
 
-        # Log final statistics
         logger_run.info(
             f"📊 Fetch Stats | "
             f"Products: config only | "
@@ -4525,7 +4121,6 @@ async def run_once() -> bool:
                 f"Total wait: {rate_stats['total_wait_time_seconds']:.1f}s"
             )
 
-        # Memory and execution summary
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
@@ -4541,7 +4136,6 @@ async def run_once() -> bool:
         )
         logger_run.info(summary)
 
-        # Alert on high volume
         if alerts_sent > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"
@@ -4577,13 +4171,8 @@ async def run_once() -> bool:
         return False
 
     finally:
-        # =====================================================================
-        # CLEANUP PHASE: RESOURCE CLEANUP IN CORRECT ORDER
-        # =====================================================================
         
         logger_run.debug("🧹 Starting resource cleanup...")
-
-        # 1. Cancel lock extension task FIRST (before releasing lock)
         if lock_extension_task:
             try:
                 lock_extension_task.cancel()
@@ -4593,7 +4182,6 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error cancelling lock extension task: {e}")
 
-        # 2. Release Redis lock
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
@@ -4603,7 +4191,6 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
-        # 3. Close Redis connection (FIXED: manual close, not context manager exit)
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
@@ -4613,7 +4200,6 @@ async def run_once() -> bool:
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
 
-        # 4. Shutdown global Redis pool
         try:
             await asyncio.wait_for(
                 RedisStateStore.shutdown_global_pool(),
@@ -4624,10 +4210,8 @@ async def run_once() -> bool:
         except Exception as e:
             logger_run.error(f"Error shutting down Redis pool: {e}")
 
-        # 5. Force garbage collection after Redis (frees memory)
         gc.collect()
 
-        # 6. Close HTTP session
         try:
             await asyncio.wait_for(
                 SessionManager.close_session(),
@@ -4639,7 +4223,6 @@ async def run_once() -> bool:
         except Exception as e:
             logger_run.error(f"Error closing HTTP session: {e}", exc_info=False)
 
-        # 7. Clear context variables
         try:
             TRACE_ID.set("")
             PAIR_ID.set("")
@@ -4678,7 +4261,6 @@ if __name__ == "__main__":
     parser.add_argument("--skip-warmup", action="store_true", help="Skip Numba JIT warmup")
     args = parser.parse_args()
 
-    # Set debug level BEFORE validation
     if args.debug:
         logger.setLevel(logging.DEBUG)
         for h in logger.handlers:
@@ -4710,7 +4292,6 @@ if __name__ == "__main__":
                 logger.debug("🌈 Redis pool closed")
             except Exception as e:
                 logger.error(f"Error closing Redis pool: {e}")
-
 
             try:
                 await SessionManager.close_session()
