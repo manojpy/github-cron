@@ -1,92 +1,16 @@
-﻿# 📡 🤖 MACD Unified Alert Bot
-A high-performance, asynchronous cryptocurrency market scanner designed for Delta Exchange. This bot utilizes Numba AOT (Ahead-of-Time) compilation to achieve sub-second technical analysis across multiple trading pairs, delivering real-time alerts via Telegram.
-🚀 Key Features
-Hybrid Execution: Combines Python's flexibility with C-like performance via Numba AOT compilation.
-Asynchronous Engine: Built on aiohttp and asyncio for concurrent data fetching and processing.
-Persistent State: Uses Redis for tracking alert states and avoiding duplicate notifications across runs.
-Advanced TA: Implements MMH, PPO, RSI, Kalman Filters, VWAP, and custom "Cirrus Cloud" indicators.
-Production Ready: Multi-stage Docker builds, resource-constrained execution, and automated GitHub Actions workflows.
-🛠 Project Structure
-The project follows a modular structure to separate performance-critical math from application logic.
-MACD-Unified/
-├── .github/
-│   └── workflows/
-│       ├── build.yml          # CI: Builds & pushes the AOT Docker image
-│       └── run-bot.yml        # CD: Executes the bot (triggered by cron)
+📊 MACD Unified Alert Bot
+A high-performance, asynchronous market scanner for Delta Exchange. This bot uses Numba AOT (Ahead-of-Time) compilation to achieve ultra-fast technical analysis, delivering real-time alerts via Telegram.🕒 Execution ScheduleThe bot is triggered externally via Cron-jobs.org to ensure precise timing:Interval: Every 15 minutes.Timing: 1, 16, 31, 46 minutes past the hour.Purpose: This 1-minute offset allows the exchange to finalize the 15m candle data before the bot starts scanning.🛠 Project StructureThe repository is organized to separate high-performance math from automation logic:MACD-Unified/
+├── .github/workflows/
+│   ├── build.yml             # CI: Compiles AOT binaries & builds Docker image
+│   └── run-bot.yml           # CD: Executes the bot scan on trigger
 ├── src/
-│   ├── macd_unified.py        # Main entry point & Application logic
-│   ├── numba_functions_shared.py # Math & TA logic (Source of Truth)
-│   ├── aot_build.py           # Compiler script to generate .so libraries
-│   └── aot_bridge.py          # Runtime dispatcher (AOT vs JIT fallback)
-├── config_macd.json           # User configuration & parameters
-├── requirements.txt           # Python dependencies (Numba, Redis, Pydantic)
-├── Dockerfile                 # High-optimization multi-stage build
-├── .gitignore  & .dockerignore       # Excludes caches, .so files, and envs
-└── README.md                  # Project documentation
-
-
-
-⚙️ Technical Architecture
-1. Performance: AOT vs JIT
-Most Python trading bots suffer from "Cold Start" latency because Numba compiles functions the first time they are called.
-AOT (Ahead-of-Time): We pre-compile functions into a native .so library during the Docker build stage.
-Result: Zero latency on the first calculation. The bot is "warm" from second one.
-2. Execution Flow
-The bot is designed to be stateless yet persistent:
-Trigger: Cron-jobs.org pings a GitHub Webhook or Workflow dispatch.
-Fetch: Parallel GET requests to Delta Exchange for OHLCV data.
-Compute: Vectorized math via the pre-compiled AOT module.
-Deduplicate: Query Redis to see if the signal was already sent.
-Alert: Ship formatted messages to Telegram.
-Exit: Cleanly close connections to minimize billing seconds.
-📋 Configuration
-The config_macd.json file controls the bot's behavior. Sensitive credentials should be injected via GitHub Secrets.
-Key
-Description
-PAIRS
-List of Delta Exchange symbols (e.g., ["BTCUSD", "ETHUSD"])
-PPO_FAST/SLOW
-Parameters for the Percentage Price Oscillator
-REDIS_URL
-Connection string for alert state persistence
-RUN_TIMEOUT_SECONDS
-Safety cutoff for the execution window
-
-🤖 Automation & Deployment
-Cron Scheduling
-The bot is triggered externally via Cron-jobs.org at the following intervals (UTC):
-1, 16, 31, 46 minutes past the hour.
-This ensures data for the previous 15-minute candle is fully closed and processed.
-CI/CD Pipeline
-Build Workflow (build.yml):
-Triggers on changes to src/ or Dockerfile.
-Compiles math functions into native binaries.
-Pushes a hardened image to GitHub Packages (GHCR).
-Run Workflow (run-bot.yml):
-Pulls the latest AOT-optimized image.
-Mounts config_macd.json.
-Executes the scan and provides a summary in the GitHub Step Summary.
-🛠 Local Development
-To run or compile the bot locally:
-Install Dependencies:
-pip install -r requirements.txt
-
-
-
-Compile AOT (Optional):
-python src/aot_build.py --output-dir ./src
-
-
-
-Run the Bot:
-export TELEGRAM_BOT_TOKEN="your_token"
-export TELEGRAM_CHAT_ID="your_id"
-python src/macd_unified.py
-
-
-
-🛡 Salient Points
-Memory Management: The bot enforces an 850MB limit (configurable) to prevent OOM errors in serverless environments.
-Sanitization: All incoming exchange data is passed through a Numba-optimized sanitization loop to handle NaN or Inf values without crashing.
-Graceful Shutdown: Implements signal handling for SIGTERM to ensure Redis connections are closed cleanly.
-
+│   ├── macd_unified.py       # Main Entry Point: Orchestrates the scan
+│   ├── numba_functions_shared.py # Math Core: TA indicators and logic
+│   ├── aot_build.py          # Compiler: Generates native .so libraries
+│   └── aot_bridge.py         # Loader: Dispatches between AOT and JIT
+├── config_macd.json          # Configuration: Pairs, PPO periods, etc.
+├── requirements.txt          # Dependencies: Numba, Redis, Aiohttp
+├── Dockerfile                # Multi-stage optimized build
+├── .gitignore                # Git exclusion rules
+└── .dockerignore             # Docker build exclusion rules
+🚀 Key Salient Points1. High-Performance Math (AOT)Unlike standard Python bots, this project uses aot_build.py to compile math functions into a native Linux shared library (.so).Benefit: Zero "cold-start" latency. The bot runs at full speed from the very first second.Fallback: If the AOT library is missing, aot_bridge.py automatically falls back to standard JIT compilation.2. Intelligent AlertingDeduplication: Uses Redis to store the state of sent alerts. You won't get spammed with the same signal multiple times.Async Engine: Scans all pairs (BTC, ETH, SOL, etc.) simultaneously using non-blocking I/O.Rate Limiting: Built-in Telegram throttling to prevent the bot from being banned by Telegram during high volatility.3. Automated CI/CDBuild Pipeline: Whenever you change the code in src/, GitHub Actions automatically recompiles the math and updates your Docker image.Runtime Safety: The run-bot.yml workflow mounts your config_macd.json at runtime, allowing you to update pairs or settings without needing a full code rebuild.⚙️ Setup & ConfigurationPrerequisitesRedis: Required for alert persistence.GitHub Secrets: The following must be set in your repo settings:TELEGRAM_BOT_TOKENTELEGRAM_CHAT_IDREDIS_URLLocal ExecutionTo run the bot manually:Install requirements: pip install -r requirements.txtRun the scanner: python src/macd_unified.py📊 Indicator LogicThe bot calculates a "Unified" signal using:PPO (Percentage Price Oscillator): Faster and more accurate than standard MACD for cross-asset comparison.Kalman Filters: To smooth out price noise.Cirrus Clouds: A custom trend-following indicator.Wick Detection: Filters out "fake" breakouts by analyzing candle wicks.
