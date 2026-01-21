@@ -2019,125 +2019,55 @@ def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minu
 
 def build_products_map_from_api_result(api_products: Optional[Dict[str, Any]]) -> Dict[str, dict]:
     """
-    Build products map from API result.
-    With server-side filtering (fetch_products_batch), this typically processes 12-15 items.
-    Early exit optimization saves iterations if API returns unfiltered catalogue.
+    Build products map strictly for cfg.PAIRS.
+    Ignores all other products even if API returns 1000+.
     """
     products_map: Dict[str, dict] = {}
-    
+
     if not api_products or not api_products.get("result"):
-        logger.warning("🚨 build_products_map_from_api_result: API result is None or empty")
+        logger.warning("🚨 API result is None or empty")
         return products_map
-    
+
     if not isinstance(api_products["result"], list):
         logger.error(f"❌ API result is not a list: {type(api_products['result'])}")
         return products_map
-    
+
+    required_set = set(cfg.PAIRS)
     valid_pattern = CompiledPatterns.VALID_SYMBOL
-    required_set = set(cfg.PAIRS)  # O(1) lookup instead of iterating cfg.PAIRS
-    total_checked = 0
-    total_matched = 0
-    failed_matches = []
-    
-    logger.debug(f"🔍 Starting product matching for {len(required_set)} required pairs")
-    
+
     for p in api_products["result"]:
         try:
-            total_checked += 1
-            
-            # ===================================================================
-            # OPTIMIZATION: Early exit if all required pairs found
-            # With server-side filtering, this typically triggers at item 12
-            # If filtering fails and we get 1117 items, breaks after finding all 12
-            # ===================================================================
-            if total_matched == len(required_set):
-                skipped = len(api_products["result"]) - total_checked
-                if skipped > 0:
-                    logger.info(
-                        f"✅ Found all {total_matched} required pairs | "
-                        f"Skipped {skipped} remaining products ({100 * skipped / len(api_products['result']):.0f}%)"
-                    )
-                break
-            
-            # Extract symbol from API
             symbol = p.get("symbol", "").strip()
-            if not symbol:
+            if not symbol or not valid_pattern.match(symbol):
                 continue
-            
-            # Validate symbol format
-            if not valid_pattern.match(symbol):
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"⏭️ Skipping invalid symbol format: {symbol}")
-                continue
-            
-            # Only process perpetual futures (skip other contract types early)
+
             contract_type = p.get("contract_type", "")
             if contract_type != "perpetual_futures":
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"⏭️ Skipping non-futures: {symbol} ({contract_type})")
                 continue
-            
-            # Get contract ID
+
             contract_id = p.get("id")
             if not contract_id:
-                logger.warning(f"⚠️ Symbol {symbol} missing ID field")
                 continue
-            
-            # Normalize symbol for matching
-            # Examples: "BTCUSDT" -> "BTCUSD", "BTC_USDT" -> "BTCUSD"
+
+            # Normalize symbol
             symbol_norm = symbol.replace("_USDT", "USD").replace("USDT", "USD").upper()
             symbol_no_underscore = symbol_norm.replace("_", "")
-            
-            matched = False
-            
-            # Try exact match first (fastest)
-            if symbol_norm in required_set:
+
+            # Only keep if in required set
+            if symbol_norm in required_set or symbol_no_underscore in {s.replace("_", "") for s in required_set}:
                 products_map[symbol_norm] = {
                     "id": contract_id,
                     "symbol": symbol,
                     "contract_type": contract_type
                 }
-                total_matched += 1
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"✅ Matched (exact): {symbol} -> {symbol_norm}")
-                matched = True
-            
-            # Try no-underscore match as fallback
-            elif not matched:
-                for pair_name in required_set:
-                    pair_no_underscore = pair_name.replace("_", "")
-                    
-                    if symbol_no_underscore == pair_no_underscore:
-                        products_map[pair_name] = {
-                            "id": contract_id,
-                            "symbol": symbol,
-                            "contract_type": contract_type
-                        }
-                        total_matched += 1
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"✅ Matched (no_underscore): {symbol} -> {pair_name}")
-                        matched = True
-                        break
-            
-            if not matched and cfg.DEBUG_MODE:
-                failed_matches.append(symbol_norm)
-        
+
         except Exception as e:
             logger.error(f"❌ Error processing API product: {e}", exc_info=False)
             continue
-    
-    # Log summary
-    coverage_pct = (total_matched / len(cfg.PAIRS) * 100) if cfg.PAIRS else 0
-    
+
     logger.info(
-        f"📦 Product map built: {total_matched}/{len(cfg.PAIRS)} matched | "
-        f"Coverage: {coverage_pct:.0f}% | "
-        f"Checked: {total_checked} products from API"
+        f"📦 Product map built (strict): {len(products_map)}/{len(cfg.PAIRS)} matched | Coverage: {(len(products_map)/len(cfg.PAIRS))*100:.0f}%"
     )
-    
-    if failed_matches and cfg.DEBUG_MODE:
-        logger.debug(f"🔍 Checked but not matched (first 10): {failed_matches[:10]}")
-    
     return products_map
 
 async def fetch_and_cache_products(
