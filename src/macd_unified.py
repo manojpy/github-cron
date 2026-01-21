@@ -4509,12 +4509,13 @@ async def run_once() -> bool:
         # =====================================================================
         
         if fetcher is None:
-            logger_run.error("�� Fetcher is None - cannot get stats")
+            logger_run.error("❌ Fetcher is None - cannot get stats")
             return False
 
         fetcher_stats = fetcher.get_stats()
 
-        prod_str = "cached" if PRODUCTS_CACHE.get("fetched_at") else f"{fetcher_stats['products']['success']}✅"
+        # Products are no longer fetched in strict mode – mark as skipped/cfg only
+        prod_str = "skipped (cfg only)"
 
         total_required = fetcher_stats['candles']['success'] + fetcher_stats['candles']['failed']
 
@@ -4556,6 +4557,30 @@ async def run_once() -> bool:
             ))
 
         return True
+
+        except asyncio.TimeoutError:
+            logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
+            return False
+
+        except asyncio.CancelledError:
+            logger_run.warning("❌ Run cancelled (shutdown signal received)")
+            return False
+
+        except Exception as e:
+            logger_run.exception(f"❌ Fatal error in run_once: {e}")
+
+            if telegram_queue:
+                try:
+                    await telegram_queue.send(escape_markdown_v2(
+                        f"❌ {cfg.BOT_NAME} - FATAL ERROR\n"
+                        f"Error: {str(e)[:200]}\n"
+                        f"Correlation ID: {correlation_id}\n"
+                        f"Time: {format_ist_time()}"
+                    ))
+                except Exception:
+                    logger_run.error("Failed to send error notification")
+
+            return False
 
     except asyncio.TimeoutError:
         logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
