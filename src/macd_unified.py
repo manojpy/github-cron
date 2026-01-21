@@ -2184,85 +2184,25 @@ def build_products_map_from_api_result(
     
     return products_map
 
-# ADD THIS DEBUG VERSION of fetch_products_batch() to check what's being sent
-
-async def fetch_products_batch_debug(self, symbols: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    Debug version - logs exactly what's being sent to API
-    """
-    if not symbols:
-        logger.warning("fetch_products_batch: No symbols provided")
-        return await self.fetch_products()
-    
-    url = f"{self.api_base}/v2/products"
-    
-    # Try different symbol formats
-    format_attempts = [
-        ("comma-separated", ",".join(symbols)),
-        ("comma-space-separated", ", ".join(symbols)),
-        ("pipe-separated", "|".join(symbols)),
-        ("array-format", f"[{','.join(symbols)}]"),
-    ]
-    
-    for format_name, symbols_param in format_attempts:
-        params = {"symbol": symbols_param}
-        
-        logger.info(
-            f"🔍 DEBUG: Trying {format_name} format\n"
-            f"   Symbols param: {symbols_param[:100]}...\n"
-            f"   Full URL would be: {url}?symbol={symbols_param[:100]}"
-        )
-        
-        try:
-            async with self.semaphore:
-                data = await self.rate_limiter.call(
-                    async_fetch_json,
-                    url,
-                    params=params,
-                    retries=1,
-                    backoff=1.5,
-                    timeout=self.timeout
-                )
-                
-                if data and data.get("result"):
-                    result_count = len(data.get("result", []))
-                    logger.info(
-                        f"✅ SUCCESS with {format_name}!\n"
-                        f"   Returned {result_count} products (vs {len(symbols)} requested)"
-                    )
-                    
-                    # If we got a reasonable number, this format works
-                    if result_count <= len(symbols) * 5:  # Allow up to 5x expansion
-                        return data
-                    else:
-                        logger.warning(f"   Too many results ({result_count}), trying next format...")
-        
-        except Exception as e:
-            logger.debug(f"   Format failed: {e}")
-            continue
-    
-    # If no format worked, fall back to full fetch
-    logger.warning("All symbol formats failed, falling back to full products fetch")
-    return await self.fetch_products()
-
 async def fetch_and_cache_products(
     fetcher: DataFetcher, 
     force_refresh: bool = False
 ) -> Optional[Dict[str, dict]]:
     """
-    Fetch and cache products for configured pairs only.
-    Uses server-side symbol filtering for efficiency.
-    Falls back to full catalogue if filtering not supported by API.
+    Fetch and cache products efficiently.
     
-    KEY OPTIMIZATION: Scans only configured pairs (cfg.PAIRS) instead of 1100+ products.
-    Early exit once all required pairs found.
+    Since Delta API doesn't support server-side symbol filtering
+    (ignores ?symbol= parameter), we skip the batch request and go
+    straight to full fetch, then filter locally with early exit.
+    
+    This eliminates a wasted API call and is actually FASTER.
     """
     now = time.time()
     cache_data = PRODUCTS_CACHE.get("data")
     cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
     
     # =========================================================================
-    # PHASE 1: CHECK CACHE
+    # PHASE 1: CHECK CACHE (8-hour TTL)
     # =========================================================================
     
     if not force_refresh and cache_data and now < cache_expires_at:
@@ -2281,13 +2221,14 @@ async def fetch_and_cache_products(
     logger.info(f"📡 Fetching products from Delta API ({len(cfg.PAIRS)} pairs)...")
     
     try:
-        # OPTIMIZATION: Try server-side filtering first
-        # This should reduce API response from 1100+ products to just ~12
-        api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
+        # OPTIMIZATION: Skip batch request - Delta API ignores symbol filtering
+        # Go straight to full fetch, then filter locally with early exit
+        logger.debug("Fetching full products catalogue (server-side filtering not supported)...")
+        api_result = await fetcher.fetch_products()
         
         # Validation checks
         if not api_result:
-            logger.critical("❌ API returned None for products (both batch and full fetch failed)")
+            logger.critical("❌ API returned None for products")
             PRODUCTS_CACHE["fetch_error"] = "API returned None"
             return None
         
@@ -2322,19 +2263,17 @@ async def fetch_and_cache_products(
         PRODUCTS_CACHE["fetch_error"] = None
         
         cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
-        
         products_count = len(api_result.get("result", []))
-        efficiency = (1117 - products_count) / 1117 * 100 if products_count < 1117 else 0
         
         logger.info(
-            f"✅ SUCCESS: Fetched {products_count} products from API | "
-            f"Cache TTL: {cache_hours:.1f} hours | "
-            f"Efficiency: {efficiency:.0f}% reduction from full catalogue"
+            f"✅ Fetched {products_count} products from API | "
+            f"Cache TTL: {cache_hours:.1f} hours"
         )
         
         # =====================================================================
         # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
         # =====================================================================
+        # Local filtering with early exit - very fast
         
         return build_products_map_from_api_result(api_result, cfg.PAIRS)
     
@@ -2404,11 +2343,66 @@ def validate_products_map(
     
     return True, available
 
+# ADD THIS DEBUG VERSION of fetch_products_batch() to check what's being sent
 
-
-
-
-
+async def fetch_products_batch_debug(self, symbols: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Debug version - logs exactly what's being sent to API
+    """
+    if not symbols:
+        logger.warning("fetch_products_batch: No symbols provided")
+        return await self.fetch_products()
+    
+    url = f"{self.api_base}/v2/products"
+    
+    # Try different symbol formats
+    format_attempts = [
+        ("comma-separated", ",".join(symbols)),
+        ("comma-space-separated", ", ".join(symbols)),
+        ("pipe-separated", "|".join(symbols)),
+        ("array-format", f"[{','.join(symbols)}]"),
+    ]
+    
+    for format_name, symbols_param in format_attempts:
+        params = {"symbol": symbols_param}
+        
+        logger.info(
+            f"🔍 DEBUG: Trying {format_name} format\n"
+            f"   Symbols param: {symbols_param[:100]}...\n"
+            f"   Full URL would be: {url}?symbol={symbols_param[:100]}"
+        )
+        
+        try:
+            async with self.semaphore:
+                data = await self.rate_limiter.call(
+                    async_fetch_json,
+                    url,
+                    params=params,
+                    retries=1,
+                    backoff=1.5,
+                    timeout=self.timeout
+                )
+                
+                if data and data.get("result"):
+                    result_count = len(data.get("result", []))
+                    logger.info(
+                        f"✅ SUCCESS with {format_name}!\n"
+                        f"   Returned {result_count} products (vs {len(symbols)} requested)"
+                    )
+                    
+                    # If we got a reasonable number, this format works
+                    if result_count <= len(symbols) * 5:  # Allow up to 5x expansion
+                        return data
+                    else:
+                        logger.warning(f"   Too many results ({result_count}), trying next format...")
+        
+        except Exception as e:
+            logger.debug(f"   Format failed: {e}")
+            continue
+    
+    # If no format worked, fall back to full fetch
+    logger.warning("All symbol formats failed, falling back to full products fetch")
+    return await self.fetch_products()
 
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
