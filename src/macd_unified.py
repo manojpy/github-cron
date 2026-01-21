@@ -1454,42 +1454,40 @@ class DataFetcher:
             return self._external_session
         return await SessionManager.get_session()
 
-    async def fetch_products_batch(self, symbols: List[str]) -> Optional[Dict[str, Any]]:
-        """
-        Fetch products for only the specified symbols (server-side filtering).
-        Falls back to full catalogue if the endpoint fails, doesn't support filtering,
-        or returns empty results.
+    async def fetch_products_batch(
+        self,
+        symbols: List[str],
+        *,
+        strict: bool = False,
+        client_side_fallback: bool = True  # if strict and server-side fails, optionally full fetch + filter
+    ) -> Optional[Dict[str, Any]]:
         
-        Args:
-            symbols: List of trading pair symbols (e.g., ["BTCUSD", "ETHUSD"])
-        
-        Returns:
-            API response dict with filtered products, or None on failure.
-        """
         if not symbols:
-            logger.warning("fetch_products_batch: No symbols provided, falling back to full fetch")
+            logger.warning("fetch_products_batch: No symbols provided")
+            if strict:
+                # Respect strict: do not fetch full catalogue
+                self.fetch_stats["products"]["failed"] += 1
+                return None
             return await self.fetch_products()
-        
-        url = f"{self.api_base}/v2/products"
-        
-        # Construct comma-separated symbol list for server-side filtering
-        # Example: symbol=BTCUSD,ETHUSD,AVAXUSD
+ 
         symbols_param = ",".join(symbols)
         params = {"symbol": symbols_param}
-        
+        url = f"{self.api_base}/v2/products"
+
         logger.debug(
-            f"🎯 Attempting server-side filtered fetch | "
-            f"Symbols: {len(symbols)} | "
-            f"Query: symbol={symbols_param}"
+            f"🎯 Batch fetch (server-side) | Requested={len(symbols)} | Query symbol={symbols_param} | strict={strict}"
         )
-        
+
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked batch-products fetch: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
             self.fetch_stats["products"]["failed"] += 1
-            return await self.fetch_products()  # Fallback to full fetch
-        
+            if strict:
+                # Respect strict: do not fetch full catalogue
+                return None
+            return await self.fetch_products()
+
         async with self.semaphore:
             data = await self.rate_limiter.call(
                 async_fetch_json,
@@ -1499,45 +1497,55 @@ class DataFetcher:
                 backoff=1.5,
                 timeout=self.timeout
             )
-            
-            # Validate response structure
-            if not data:
-                logger.debug("⚠️ Batch-products returned None, falling back to full fetch")
-                self.fetch_stats["products"]["failed"] += 1
-                self.circuit_breaker.record_failure()
-                return await self.fetch_products()
-            
-            # Check if response has the expected structure
-            result_list = data.get("result")
-            if not isinstance(result_list, list):
-                logger.debug(
-                    f"⚠️ Batch-products returned invalid format (expected list, got {type(result_list)}), "
-                    f"falling back to full fetch"
-                )
-                self.fetch_stats["products"]["failed"] += 1
-                self.circuit_breaker.record_failure()
-                return await self.fetch_products()
-            
-            # Check if we got meaningful results
-            if len(result_list) == 0:
-                logger.debug(
-                    f"⚠️ Batch-products returned empty list (server may not support filtering), "
-                    f"falling back to full fetch"
-                )
-                self.fetch_stats["products"]["failed"] += 1
-                self.circuit_breaker.record_failure()
-                return await self.fetch_products()
-            
-            # Success! Server returned filtered results
-            logger.info(
-                f"✅ Batch-products successful | "
-                f"Requested: {len(symbols)} symbols | "
-                f"Received: {len(result_list)} products | "
-                f"Reduction: {100 - (len(result_list) / 1117 * 100):.0f}% fewer products to scan"
-            )
-            self.fetch_stats["products"]["success"] += 1
-            self.circuit_breaker.record_success()
-            return data
+
+        # Validate response
+        if not data:
+            logger.debug("⚠️ Batch-products returned None")
+            self.fetch_stats["products"]["failed"] += 1
+            self.circuit_breaker.record_failure()
+            if strict:
+                if client_side_fallback:
+                    # One full fetch, then filter client-side to the requested symbols
+                    full = await self.fetch_products()
+                    return _filter_products_to_symbols(full, symbols)
+                return None
+            return await self.fetch_products()
+
+        result_list = data.get("result")
+        if not isinstance(result_list, list):
+            logger.debug(f"⚠️ Batch-products invalid format (expected list, got {type(result_list)})")
+            self.fetch_stats["products"]["failed"] += 1
+            self.circuit_breaker.record_failure()
+            if strict:
+                if client_side_fallback:
+                    full = await self.fetch_products()
+                    return _filter_products_to_symbols(full, symbols)
+                return None
+            return await self.fetch_products()
+
+        if len(result_list) == 0:
+            logger.debug("⚠️ Batch-products returned empty list (server may not support filtering)")
+            self.fetch_stats["products"]["failed"] += 1
+            self.circuit_breaker.record_failure()
+            if strict:
+                if client_side_fallback:
+                    full = await self.fetch_products()
+                    return _filter_products_to_symbols(full, symbols)
+                return None
+            return await self.fetch_products()
+
+        # Success: server returned filtered results
+        self.fetch_stats["products"]["success"] += 1
+        self.circuit_breaker.record_success()
+
+        # Precise diagnostics without hardcoded totals
+        requested = len(symbols)
+        received = len(result_list)
+        logger.info(
+            f"✅ Batch-products successful | Requested={requested} | Received={received} | "
+            f"Strict={strict} | Client-side fallback={client_side_fallback}"
+        )
+        return data
 
     async def fetch_products(self) -> Optional[Dict[str, Any]]:
         """
@@ -2094,25 +2102,25 @@ async def fetch_and_cache_products(
         )
         return build_products_map_from_api_result(cache_data)
 
-    # =========================================================================
-    # PHASE 2: FETCH ONLY CONFIGURED PAIRS
-    # =========================================================================
+    # PHASE 2: FETCH ONLY CONFIGURED PAIRS (strict)
     logger.info(f"📡 Fetching products from Delta API (strict {len(cfg.PAIRS)} pairs)...")
 
-    try:
-        # ✅ Directly fetch only the configured pairs
-        api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
+    api_result = await fetcher.fetch_products_batch(
+        cfg.PAIRS,
+        strict=True,
+        client_side_fallback=True  # still returns only requested pairs
+    )
 
-        # Validation checks
-        if not api_result or "result" not in api_result or not isinstance(api_result["result"], list):
-            PRODUCTS_CACHE["fetch_error"] = "Invalid API response"
-            logger.critical("❌ API response invalid or missing 'result' field")
-            return None
+    # Validation checks
+    if not api_result or "result" not in api_result or not isinstance(api_result["result"], list):
+        PRODUCTS_CACHE["fetch_error"] = "Invalid API response"
+        logger.critical("❌ API response invalid or missing 'result' field (strict)")
+        return None
 
-        if len(api_result["result"]) == 0:
-            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
-            logger.critical("❌ API returned empty products list")
-            return None
+    if len(api_result["result"]) == 0:
+        PRODUCTS_CACHE["fetch_error"] = "Empty products list from API (strict)")
+        logger.critical("❌ API returned empty products list (strict)")
+        return None
 
         # =========================================================================
         # PHASE 3: CACHE RAW API RESPONSE
@@ -2146,6 +2154,25 @@ async def fetch_and_cache_products(
         PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
         logger.critical(f"❌ Failed to fetch products batch: {e}", exc_info=True)
         return None
+
+    def _filter_products_to_symbols(api_products: Optional[Dict[str, Any]], symbols: List[str]) -> Optional[Dict[str, Any]]:
+    
+        if not api_products or "result" not in api_products or not isinstance(api_products["result"], list):
+            logger.warning("filter_products_to_symbols: invalid api_products")
+            return None
+
+        # Build a normalized lookup set that matches server-side symbol format.
+        # IMPORTANT: Use the same format as the API returns in 'symbol' field.
+        requested_set = set(s.strip() for s in symbols if s and isinstance(s, str))
+
+        filtered = []
+        for p in api_products["result"]:
+            sym = p.get("symbol", "").strip()
+            if sym in requested_set:
+                filtered.append(p)
+
+        logger.info(f"🔎 Client-side filter | Requested={len(symbols)} | Matched={len(filtered)}")
+        return {"result": filtered}
 
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
