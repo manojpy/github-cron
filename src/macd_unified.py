@@ -4352,6 +4352,7 @@ async def run_once() -> bool:
 
         # All pairs come directly from cfg.PAIRS (no API call needed)
         pairs_to_process = list(cfg.PAIRS)
+        products_map = build_products_map_from_cfg()
 
         if not pairs_to_process:
             logger_run.error("❌ No pairs configured - aborting")
