@@ -2155,24 +2155,24 @@ async def fetch_and_cache_products(
         logger.critical(f"❌ Failed to fetch products batch: {e}", exc_info=True)
         return None
 
-    def _filter_products_to_symbols(api_products: Optional[Dict[str, Any]], symbols: List[str]) -> Optional[Dict[str, Any]]:
+def _filter_products_to_symbols(api_products: Optional[Dict[str, Any]], symbols: List[str]) -> Optional[Dict[str, Any]]:
     
-        if not api_products or "result" not in api_products or not isinstance(api_products["result"], list):
-            logger.warning("filter_products_to_symbols: invalid api_products")
-            return None
+    if not api_products or "result" not in api_products or not isinstance(api_products["result"], list):
+        logger.warning("filter_products_to_symbols: invalid api_products")
+        return None
 
-        # Build a normalized lookup set that matches server-side symbol format.
-        # IMPORTANT: Use the same format as the API returns in 'symbol' field.
-        requested_set = set(s.strip() for s in symbols if s and isinstance(s, str))
+    # Build a normalized lookup set that matches server-side symbol format.
+    # IMPORTANT: Use the same format as the API returns in 'symbol' field.
+    requested_set = set(s.strip() for s in symbols if s and isinstance(s, str))
 
-        filtered = []
-        for p in api_products["result"]:
-            sym = p.get("symbol", "").strip()
-            if sym in requested_set:
-                filtered.append(p)
+    filtered = []
+    for p in api_products["result"]:
+        sym = p.get("symbol", "").strip()
+        if sym in requested_set:
+            filtered.append(p)
 
-        logger.info(f"🔎 Client-side filter | Requested={len(symbols)} | Matched={len(filtered)}")
-        return {"result": filtered}
+    logger.info(f"🔎 Client-side filter | Requested={len(symbols)} | Matched={len(filtered)}")
+    return {"result": filtered}
 
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
@@ -4984,7 +4984,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠��� Performance will be degraded. First run may be slow.")
+        logger.warning("⚠���� Performance will be degraded. First run may be slow.")
         
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
