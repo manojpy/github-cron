@@ -91,12 +91,6 @@ class Constants:
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
     
-PRODUCTS_CACHE: Dict[str, Any] = {
-    "data": None,
-    "until": 0.0,
-    "fetched_at": 0.0,
-    "fetch_error": None,
-}
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
