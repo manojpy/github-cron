@@ -2218,11 +2218,9 @@ async def fetch_and_cache_products(
         # OPTIMIZATION: Try server-side filtering first
         # This should reduce API response from 1100+ products to just ~12
         api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
-        
-        # Validation checks
-        if not api_result:
-            logger.critical("❌ API returned None for products (both batch and full fetch failed)")
-            PRODUCTS_CACHE["fetch_error"] = "API returned None"
+
+        if not api_result or not isinstance(api_result.get("result"), list):
+            logger.error("❌ Failed to fetch products (batch + per-symbol). Aborting run.")
             return None
         
         if "result" not in api_result:
