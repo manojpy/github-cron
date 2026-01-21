@@ -2118,7 +2118,7 @@ async def fetch_and_cache_products(
         return None
 
     if len(api_result["result"]) == 0:
-        PRODUCTS_CACHE["fetch_error"] = "Empty products list from API (strict)")
+        PRODUCTS_CACHE["fetch_error"] = "Empty products list from API (strict)"
         logger.critical("❌ API returned empty products list (strict)")
         return None
 
@@ -4984,7 +4984,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠️ Performance will be degraded. First run may be slow.")
+        logger.warning("⚠��� Performance will be degraded. First run may be slow.")
         
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
