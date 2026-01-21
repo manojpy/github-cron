@@ -2184,108 +2184,66 @@ def build_products_map_from_api_result(
     
     return products_map
 
-async def fetch_and_cache_products(
-    fetcher: DataFetcher, 
-    force_refresh: bool = False
-) -> Optional[Dict[str, dict]]:
+# ADD THIS DEBUG VERSION of fetch_products_batch() to check what's being sent
+
+async def fetch_products_batch_debug(self, symbols: List[str]) -> Optional[Dict[str, Any]]:
     """
-    Fetch and cache products for configured pairs only.
-    Uses server-side symbol filtering for efficiency.
-    Falls back to full catalogue if filtering not supported by API.
-    
-    KEY OPTIMIZATION: Scans only configured pairs (cfg.PAIRS) instead of 1100+ products.
-    Early exit once all required pairs found.
+    Debug version - logs exactly what's being sent to API
     """
-    now = time.time()
-    cache_data = PRODUCTS_CACHE.get("data")
-    cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
+    if not symbols:
+        logger.warning("fetch_products_batch: No symbols provided")
+        return await self.fetch_products()
     
-    # =========================================================================
-    # PHASE 1: CHECK CACHE
-    # =========================================================================
+    url = f"{self.api_base}/v2/products"
     
-    if not force_refresh and cache_data and now < cache_expires_at:
-        cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
-        cache_remaining = cache_expires_at - now
-        logger.debug(
-            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
-            f"TTL remaining: {cache_remaining/60:.1f}m"
-        )
-        return build_products_map_from_api_result(cache_data, cfg.PAIRS)
+    # Try different symbol formats
+    format_attempts = [
+        ("comma-separated", ",".join(symbols)),
+        ("comma-space-separated", ", ".join(symbols)),
+        ("pipe-separated", "|".join(symbols)),
+        ("array-format", f"[{','.join(symbols)}]"),
+    ]
     
-    # =========================================================================
-    # PHASE 2: FETCH FROM API (Cache expired or forced refresh)
-    # =========================================================================
-    
-    logger.info(f"📡 Fetching products from Delta API ({len(cfg.PAIRS)} pairs)...")
-    
-    try:
-        # OPTIMIZATION: Try server-side filtering first
-        # This should reduce API response from 1100+ products to just ~12
-        api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
-        
-        # Validation checks
-        if not api_result:
-            logger.critical("❌ API returned None for products (both batch and full fetch failed)")
-            PRODUCTS_CACHE["fetch_error"] = "API returned None"
-            return None
-        
-        if "result" not in api_result:
-            logger.critical(
-                f"❌ API response missing 'result' field. "
-                f"Keys present: {list(api_result.keys())}"
-            )
-            PRODUCTS_CACHE["fetch_error"] = "Missing 'result' field in API response"
-            return None
-        
-        if not isinstance(api_result["result"], list):
-            logger.critical(
-                f"❌ API result is not a list: {type(api_result['result'])}"
-            )
-            PRODUCTS_CACHE["fetch_error"] = f"Invalid result type: {type(api_result['result'])}"
-            return None
-        
-        if len(api_result["result"]) == 0:
-            logger.critical("❌ API returned empty products list")
-            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
-            return None
-        
-        # =====================================================================
-        # PHASE 3: CACHE RAW API RESPONSE
-        # =====================================================================
-        
-        now = time.time()
-        PRODUCTS_CACHE["data"] = api_result
-        PRODUCTS_CACHE["fetched_at"] = now
-        PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
-        PRODUCTS_CACHE["fetch_error"] = None
-        
-        cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
-        
-        products_count = len(api_result.get("result", []))
-        efficiency = (1117 - products_count) / 1117 * 100 if products_count < 1117 else 0
+    for format_name, symbols_param in format_attempts:
+        params = {"symbol": symbols_param}
         
         logger.info(
-            f"✅ SUCCESS: Fetched {products_count} products from API | "
-            f"Cache TTL: {cache_hours:.1f} hours | "
-            f"Efficiency: {efficiency:.0f}% reduction from full catalogue"
+            f"🔍 DEBUG: Trying {format_name} format\n"
+            f"   Symbols param: {symbols_param[:100]}...\n"
+            f"   Full URL would be: {url}?symbol={symbols_param[:100]}"
         )
         
-        # =====================================================================
-        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
-        # =====================================================================
+        try:
+            async with self.semaphore:
+                data = await self.rate_limiter.call(
+                    async_fetch_json,
+                    url,
+                    params=params,
+                    retries=1,
+                    backoff=1.5,
+                    timeout=self.timeout
+                )
+                
+                if data and data.get("result"):
+                    result_count = len(data.get("result", []))
+                    logger.info(
+                        f"✅ SUCCESS with {format_name}!\n"
+                        f"   Returned {result_count} products (vs {len(symbols)} requested)"
+                    )
+                    
+                    # If we got a reasonable number, this format works
+                    if result_count <= len(symbols) * 5:  # Allow up to 5x expansion
+                        return data
+                    else:
+                        logger.warning(f"   Too many results ({result_count}), trying next format...")
         
-        return build_products_map_from_api_result(api_result, cfg.PAIRS)
+        except Exception as e:
+            logger.debug(f"   Format failed: {e}")
+            continue
     
-    except asyncio.TimeoutError:
-        logger.critical("⏱️ API timeout while fetching products")
-        PRODUCTS_CACHE["fetch_error"] = "API timeout"
-        return None
-    
-    except Exception as e:
-        logger.critical(f"❌ Failed to fetch products from API: {e}", exc_info=True)
-        PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
-        return None
+    # If no format worked, fall back to full fetch
+    logger.warning("All symbol formats failed, falling back to full products fetch")
+    return await self.fetch_products()
 
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
