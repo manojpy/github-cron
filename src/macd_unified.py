@@ -2245,6 +2245,109 @@ async def fetch_products_batch_debug(self, symbols: List[str]) -> Optional[Dict[
     logger.warning("All symbol formats failed, falling back to full products fetch")
     return await self.fetch_products()
 
+async def fetch_and_cache_products(
+    fetcher: DataFetcher, 
+    force_refresh: bool = False
+) -> Optional[Dict[str, dict]]:
+    """
+    Fetch and cache products for configured pairs only.
+    Uses server-side symbol filtering for efficiency.
+    Falls back to full catalogue if filtering not supported by API.
+    
+    KEY OPTIMIZATION: Scans only configured pairs (cfg.PAIRS) instead of 1100+ products.
+    Early exit once all required pairs found.
+    """
+    now = time.time()
+    cache_data = PRODUCTS_CACHE.get("data")
+    cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
+    
+    # =========================================================================
+    # PHASE 1: CHECK CACHE
+    # =========================================================================
+    
+    if not force_refresh and cache_data and now < cache_expires_at:
+        cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
+        cache_remaining = cache_expires_at - now
+        logger.debug(
+            f"♻️ Using cached products | Age: {cache_age:.0f}s | "
+            f"TTL remaining: {cache_remaining/60:.1f}m"
+        )
+        return build_products_map_from_api_result(cache_data, cfg.PAIRS)
+    
+    # =========================================================================
+    # PHASE 2: FETCH FROM API (Cache expired or forced refresh)
+    # =========================================================================
+    
+    logger.info(f"📡 Fetching products from Delta API ({len(cfg.PAIRS)} pairs)...")
+    
+    try:
+        # OPTIMIZATION: Try server-side filtering first
+        # This should reduce API response from 1100+ products to just ~12
+        api_result = await fetcher.fetch_products_batch(cfg.PAIRS)
+        
+        # Validation checks
+        if not api_result:
+            logger.critical("❌ API returned None for products (both batch and full fetch failed)")
+            PRODUCTS_CACHE["fetch_error"] = "API returned None"
+            return None
+        
+        if "result" not in api_result:
+            logger.critical(
+                f"❌ API response missing 'result' field. "
+                f"Keys present: {list(api_result.keys())}"
+            )
+            PRODUCTS_CACHE["fetch_error"] = "Missing 'result' field in API response"
+            return None
+        
+        if not isinstance(api_result["result"], list):
+            logger.critical(
+                f"❌ API result is not a list: {type(api_result['result'])}"
+            )
+            PRODUCTS_CACHE["fetch_error"] = f"Invalid result type: {type(api_result['result'])}"
+            return None
+        
+        if len(api_result["result"]) == 0:
+            logger.critical("❌ API returned empty products list")
+            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API"
+            return None
+        
+        # =====================================================================
+        # PHASE 3: CACHE RAW API RESPONSE
+        # =====================================================================
+        
+        now = time.time()
+        PRODUCTS_CACHE["data"] = api_result
+        PRODUCTS_CACHE["fetched_at"] = now
+        PRODUCTS_CACHE["until"] = now + cfg.PRODUCTS_CACHE_TTL
+        PRODUCTS_CACHE["fetch_error"] = None
+        
+        cache_hours = cfg.PRODUCTS_CACHE_TTL / 3600.0
+        
+        products_count = len(api_result.get("result", []))
+        efficiency = (1117 - products_count) / 1117 * 100 if products_count < 1117 else 0
+        
+        logger.info(
+            f"✅ SUCCESS: Fetched {products_count} products from API | "
+            f"Cache TTL: {cache_hours:.1f} hours | "
+            f"Efficiency: {efficiency:.0f}% reduction from full catalogue"
+        )
+        
+        # =====================================================================
+        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
+        # =====================================================================
+        
+        return build_products_map_from_api_result(api_result, cfg.PAIRS)
+    
+    except asyncio.TimeoutError:
+        logger.critical("⏱️ API timeout while fetching products")
+        PRODUCTS_CACHE["fetch_error"] = "API timeout"
+        return None
+    
+    except Exception as e:
+        logger.critical(f"❌ Failed to fetch products from API: {e}", exc_info=True)
+        PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
+        return None
+
 def validate_products_map(
     products_map: Optional[Dict[str, dict]],
     required_pairs: List[str]
