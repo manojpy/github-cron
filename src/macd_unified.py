@@ -2090,9 +2090,6 @@ async def fetch_and_cache_products(
     cache_data = PRODUCTS_CACHE.get("data")
     cache_expires_at = PRODUCTS_CACHE.get("until", 0.0)
 
-    # =========================================================================
-    # PHASE 1: CHECK CACHE
-    # =========================================================================
     if not force_refresh and cache_data and now < cache_expires_at:
         cache_age = now - PRODUCTS_CACHE.get("fetched_at", 0.0)
         cache_remaining = cache_expires_at - now
@@ -2102,29 +2099,21 @@ async def fetch_and_cache_products(
         )
         return build_products_map_from_api_result(cache_data)
 
-    # PHASE 2: FETCH ONLY CONFIGURED PAIRS (strict)
     logger.info(f"📡 Fetching products from Delta API (strict {len(cfg.PAIRS)} pairs)...")
 
-    api_result = await fetcher.fetch_products_batch(
-        cfg.PAIRS,
-        strict=True,
-        client_side_fallback=True  # still returns only requested pairs
-    )
+    try:
+        api_result = await fetcher.fetch_products_batch(cfg.PAIRS, strict=True)
 
-    # Validation checks
-    if not api_result or "result" not in api_result or not isinstance(api_result["result"], list):
-        PRODUCTS_CACHE["fetch_error"] = "Invalid API response"
-        logger.critical("❌ API response invalid or missing 'result' field (strict)")
-        return None
+        if not api_result or "result" not in api_result or not isinstance(api_result["result"], list):
+            PRODUCTS_CACHE["fetch_error"] = "Invalid API response"
+            logger.critical("❌ API response invalid or missing 'result' field")
+            return None
 
-    if len(api_result["result"]) == 0:
-        PRODUCTS_CACHE["fetch_error"] = "Empty products list from API (strict)"
-        logger.critical("❌ API returned empty products list (strict)")
-        return None
+        if len(api_result["result"]) == 0:
+            PRODUCTS_CACHE["fetch_error"] = "Empty products list from API (strict)"
+            logger.critical("❌ API returned empty products list")
+            return None
 
-        # =========================================================================
-        # PHASE 3: CACHE RAW API RESPONSE
-        # =========================================================================
         PRODUCTS_CACHE.update({
             "data": api_result,
             "fetched_at": now,
@@ -2140,9 +2129,6 @@ async def fetch_and_cache_products(
             f"Cache TTL: {cache_hours:.1f} hours"
         )
 
-        # =========================================================================
-        # PHASE 4: BUILD AND RETURN PRODUCTS MAP (Only for required pairs)
-        # =========================================================================
         return build_products_map_from_api_result(api_result)
 
     except asyncio.TimeoutError:
@@ -2154,6 +2140,7 @@ async def fetch_and_cache_products(
         PRODUCTS_CACHE["fetch_error"] = f"Exception: {str(e)[:100]}"
         logger.critical(f"❌ Failed to fetch products batch: {e}", exc_info=True)
         return None
+
 
 def _filter_products_to_symbols(api_products: Optional[Dict[str, Any]], symbols: List[str]) -> Optional[Dict[str, Any]]:
     
