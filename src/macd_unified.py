@@ -2457,7 +2457,7 @@ class RedisLock:
 
     def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):     
         self.redis = redis_client
-        self.lock_key = f"{RedisKeyPrefix.LOCK}{name}"
+        self.lock_key = f"{RedisKeyPrefix.LOCK}{lock_key}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
         
         self.token: Optional[str] = None
