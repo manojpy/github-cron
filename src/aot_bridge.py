@@ -135,6 +135,7 @@ def initialize_jit_fallback() -> None:
             rolling_min_max_numba,
             calculate_ppo_core,
             calculate_rsi_core,
+            calculate_atr_rma,
             vectorized_wick_check_buy,
             vectorized_wick_check_sell,
         )
@@ -157,6 +158,7 @@ def initialize_jit_fallback() -> None:
         globals()['_jit_rolling_min_max_numba'] = rolling_min_max_numba
         globals()['_jit_calculate_ppo_core'] = calculate_ppo_core
         globals()['_jit_calculate_rsi_core'] = calculate_rsi_core
+        globals()['_jit_calculate_atr_rma'] = calculate_atr_rma
         globals()['_jit_vectorized_wick_check_buy'] = vectorized_wick_check_buy
         globals()['_jit_vectorized_wick_check_sell'] = vectorized_wick_check_sell
 
@@ -206,18 +208,15 @@ def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
         return _aot_module.sanitize_array_numba(arr, default)
     return _jit_sanitize_array_numba(arr, default)
 
-
 def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
     if _using_aot:
         return _aot_module.sanitize_array_numba_parallel(arr, default)
     return _jit_sanitize_array_numba_parallel(arr, default)
 
-
 def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     if _using_aot:
         return _aot_module.ema_loop(data, alpha_or_period)
     return _jit_ema_loop(data, alpha_or_period)
-
 
 def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
     if _using_aot:
@@ -231,13 +230,7 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     return _jit_kalman_loop(src, length, R, Q)
 
 
-def vwap_daily_loop(
-    high: np.ndarray,
-    low: np.ndarray,
-    close: np.ndarray,
-    volume: np.ndarray,
-    day_id: np.ndarray,
-) -> np.ndarray:
+def vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, day_id: np.ndarray,) -> np.ndarray:
     if _using_aot:
         return _aot_module.vwap_daily_loop(high, low, close, volume, day_id)
     return _jit_vwap_daily_loop(high, low, close, volume, day_id)
@@ -255,10 +248,7 @@ def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
     return _jit_smooth_range(close, t, m)
 
 
-def calculate_trends_with_state(
-    filt_x1: np.ndarray,
-    filt_x12: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if _using_aot:
         return _aot_module.calculate_trends_with_state(filt_x1, filt_x12)
     return _jit_calculate_trends_with_state(filt_x1, filt_x12)
@@ -302,53 +292,46 @@ def rolling_min_max_numba(arr: np.ndarray, period: int) -> Tuple[np.ndarray, np.
         return _aot_module.rolling_min_max_numba(arr, period)
     return _jit_rolling_min_max_numba(arr, period)
 
-def calculate_ppo_core(
-    close: np.ndarray,
-    fast: int,
-    slow: int,
-    signal: int
-) -> Tuple[np.ndarray, np.ndarray]:
+def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     if _using_aot:
         return _aot_module.calculate_ppo_core(close, fast, slow, signal)
     return _jit_calculate_ppo_core(close, fast, slow, signal)
-
 
 def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
     if _using_aot:
         return _aot_module.calculate_rsi_core(close, period)
     return _jit_calculate_rsi_core(close, period)
 
-def vectorized_wick_check_buy(
-    open_arr: np.ndarray,
-    high_arr: np.ndarray,
-    low_arr: np.ndarray,
-    close_arr: np.ndarray,
-    min_wick_ratio: float
-) -> np.ndarray:
+def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    if _using_aot:
+        return _aot_module.calculate_atr_rma(high, low, close, period)
+    return _jit_calculate_atr_rma(high, low, close, period)
+
+def vectorized_wick_check_buy(open_arr: np.ndarray, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray,
+    min_wick_ratio: float, atr_short: np.ndarray, atr_long: np.ndarray, rvol_threshold: float) -> np.ndarray:
+    """Buy wick check with volatility gating (rvolAlert)"""
     if _using_aot:
         return _aot_module.vectorized_wick_check_buy(
-            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+            open_arr, high_arr, low_arr, close_arr, min_wick_ratio,
+            atr_short, atr_long, rvol_threshold
         )
     return _jit_vectorized_wick_check_buy(
-        open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+        open_arr, high_arr, low_arr, close_arr, min_wick_ratio,
+        atr_short, atr_long, rvol_threshold
     )
 
-
-def vectorized_wick_check_sell(
-    open_arr: np.ndarray,
-    high_arr: np.ndarray,
-    low_arr: np.ndarray,
-    close_arr: np.ndarray,
-    min_wick_ratio: float
-) -> np.ndarray:
+def vectorized_wick_check_sell(open_arr: np.ndarray, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray,
+    min_wick_ratio: float, atr_short: np.ndarray, atr_long: np.ndarray, rvol_threshold: float) -> np.ndarray:
+    """Sell wick check with volatility gating (rvolAlert)"""
     if _using_aot:
         return _aot_module.vectorized_wick_check_sell(
-            open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+            open_arr, high_arr, low_arr, close_arr, min_wick_ratio,
+            atr_short, atr_long, rvol_threshold
         )
     return _jit_vectorized_wick_check_sell(
-        open_arr, high_arr, low_arr, close_arr, min_wick_ratio
+        open_arr, high_arr, low_arr, close_arr, min_wick_ratio,
+        atr_short, atr_long, rvol_threshold
     )
-
 # ============================================================================
 # MODULE EXPORTS
 # ============================================================================
@@ -393,6 +376,7 @@ __all__ = [
     'calc_mmh_momentum_loop',
 
     # Pattern Recognition
+    'calculate_atr_rma', 
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
 ]
