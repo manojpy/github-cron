@@ -3806,14 +3806,12 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             current_rss_mb = process.memory_info().rss / 1024 / 1024
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
                
-        if current_rss_mb > limit_mb * 0.85:
-            logger_main.warning(
-                f"[{p_name}] Memory spike: {current_rss_mb:.0f}MB (threshold: {limit_mb*0.85:.0f}MB)"
-            )
-
+            if current_rss_mb > limit_mb * 0.85:
+                logger_main.warning(
+                    f"[{p_name}] Memory spike: {current_rss_mb:.0f}MB (threshold: {limit_mb*0.85:.0f}MB)"
+                )
         except Exception as psutil_error:
             logger_main.debug(f"Memory check failed: {psutil_error}")
-
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
