@@ -34,9 +34,6 @@ import warnings
 import contextlib 
 import traceback
 
-warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
-warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
-
 try:
     AOT_AVAILABLE = True
     AOT_IMPORT_SUCCESS = True
@@ -275,6 +272,12 @@ class BotConfig(BaseModel):
                 f'(minimum recommended: 200MB)'
             )
 
+        if cfg.RVOL_THRESHOLD < 0.5 or cfg.RVOL_THRESHOLD > 2.0:
+            errors.append(f'RVOL_THRESHOLD {cfg.RVOL_THRESHOLD} outside range [0.5, 2.0]')
+
+        if cfg.MAX_CANDLE_STALENESS_SEC < 300:
+            warnings.append(f'MAX_CANDLE_STALENESS_SEC very low ({cfg.MAX_CANDLE_STALENESS_SEC}s)')
+
         if errors:
             error_msg = 'Configuration validation failed:\n  ' + '\n  '.join(errors)
             raise ValueError(error_msg)
@@ -488,15 +491,6 @@ def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) 
         logger_obj.debug(msg)
 
 _VALIDATION_DONE = False
-
-def clear_stale_products_cache() -> None:
-    global PRODUCTS_CACHE
-    now = time.time()
-    expires_at = PRODUCTS_CACHE.get("until", 0.0)
-    
-    if expires_at <= now:
-        logger.debug("Products cache expired, clearing...")
-        PRODUCTS_CACHE = {"data": None, "until": 0.0}
 
 def validate_runtime_config() -> None:
     global _VALIDATION_DONE
@@ -888,6 +882,15 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
+
+
+    for level_name in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]:
+        if level_name in piv:
+            val = piv[level_name]
+            if np.isnan(val) or np.isinf(val) or val <= 0:
+                logger.warning(f"Invalid pivot {level_name}: {val}, resetting to 0.0")
+                piv[level_name] = 0.0
+
     return piv
             
 def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
@@ -937,7 +940,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['mmh'] = mmh
         
         if cfg.CIRRUS_CLOUD_ENABLED:
-            upw, dnw, filtx1, filtx12 = calculate_cirrus_cloud_numba(close_15m)
+            upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_15m)
             results['upw'] = upw
             results['dnw'] = dnw
         else:
@@ -1713,41 +1716,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
 
-def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    try:
-        if data is None or not data:
-            return False, "Data is None or empty"
-        
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-        open_arr = data.get("open")
-        high_arr = data.get("high")
-        low_arr = data.get("low")
-        
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
-        
-        if close is None or len(close) == 0:
-            return False, "Close array is empty"
-        
-        if open_arr is None or high_arr is None or low_arr is None:
-            return False, "Missing OHLC data (open, high, or low)"
-        
-        if len(close) < required_len:
-            return False, f"Insufficient data: {len(close)} < {required_len}"
-        
-        if not np.all(timestamp[1:] >= timestamp[:-1]):
-            return False, "Timestamps not monotonic increasing"
-        
-        if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
-            return False, "OHLC arrays have mismatched lengths"
-        
-        return True, None
-    
-    except Exception as e:
-        logger.error(f"Data validation exception: {e}", exc_info=True)
-        return False, f"Validation error: {str(e)}"
-
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 2:
         logger.warning("No timestamps or insufficient data")
@@ -1782,78 +1750,29 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
     return last_closed_idx
 
-def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
-    try:
-        if data is None or not data:
-            return False, "Data is None or empty"
-        
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-        open_arr = data.get("open")
-        high_arr = data.get("high")
-        low_arr = data.get("low")
-        
-        if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
-            return False, "Missing or empty OHLC/timestamp data"
-        
-        if selected_index < 0 or selected_index >= len(close):
-            return False, f"Selected index {selected_index} out of range [0, {len(close)})"
-        
-        selected_candle_time = int(timestamp[selected_index])
-        current_time = reference_time
-        interval_seconds = interval_minutes * 60
-        current_period_start = (current_time // interval_seconds) * interval_seconds
-        
-        if selected_candle_time >= current_period_start:
-            return False, (
-                f"Selected candle is still forming! "
-                f"ts={format_ist_time(selected_candle_time)} "
-                f"current_period_start={format_ist_time(current_period_start)}"
-            )
-        
-        staleness = current_time - selected_candle_time
-        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
-        
-        if staleness > MAX_STALENESS:
-            return False, (
-                f"Selected candle is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
-                f"Candle: {format_ist_time(selected_candle_time)} | "
-                f"Current: {format_ist_time(current_time)}"
-            )
-        
-        o = open_arr[selected_index]
-        h = high_arr[selected_index]
-        l = low_arr[selected_index]
-        c = close[selected_index]
-        
-        if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
-            return False, f"Selected candle has NaN values: O={o} H={h} L={l} C={c}"
-        
-        if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
-            return False, f"Selected candle has Inf values: O={o} H={h} L={l} C={c}"
-        
-        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            return False, f"Selected candle has non-positive prices: O={o} H={h} L={l} C={c}"
-        
-        if not (l <= o and o <= h and l <= c and c <= h and l <= h):
-            return False, (
-                f"Selected candle has invalid OHLC relationships! "
-                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} "
-                f"[L≤O={l<=o} O≤H={o<=h} L≤C={l<=c} C≤H={c<=h} L≤H={l<=h}]"
-            )
-        
-        if selected_index > 0:
-            prev_close = close[selected_index - 1]
-            if not np.isnan(prev_close):
-                price_change_pct = abs(c - prev_close) / prev_close * 100
-                if price_change_pct > Constants.MAX_PRICE_CHANGE_PERCENT:
-                    return False, f"Extreme price spike in selected candle: {price_change_pct:.2f}%"
-        
-        return True, None
+def validate_candle_array(data: Dict[str, np.ndarray], required_len: int = 0) -> Tuple[bool, Optional[str]]:
+    if data is None or not data:
+        return False, "Data is None or empty"
     
-    except Exception as e:
-        logger.error(f"Candle validation exception at index {selected_index}: {e}", exc_info=True)
-        return False, f"Validation error: {str(e)}"
+    close = data.get("close")
+    timestamp = data.get("timestamp")
+    if not close is None and len(close) == 0:
+        return False, "Close array empty"
+    if timestamp is None or len(timestamp) == 0:
+        return False, "Timestamp array empty"
+    if len(close) < required_len:
+        return False, f"Data length {len(close)} < {required_len}"
+    
+    # NaN/Inf checks
+    nan_mask = (np.isnan(close) | np.isnan(data.get("open", close)))
+    if np.any(nan_mask):
+        return False, f"Found {np.sum(nan_mask)} NaN values"
+    
+    inf_mask = (np.isinf(close) | np.isinf(data.get("open", close)))
+    if np.any(inf_mask):
+        return False, f"Found {np.sum(inf_mask)} Inf values"
+    
+    return True, None
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
@@ -1901,6 +1820,16 @@ async def fetch_all_pairs_candles(fetcher: DataFetcher, reference_time: int) -> 
         reference_time
     )
 
+
+class RedisKeyPrefix:
+    """Centralized Redis key prefixes"""
+    PAIR_STATE = "pair_state:"
+    METADATA = "metadata:"
+    ALERT = "alert:"
+    RECENT_ALERT = "recent_alert:"
+    LOCK = "lock:"
+
+
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
     local key = KEYS[1]
@@ -1927,9 +1856,9 @@ class RedisStateStore:
         self.redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
 
-        self.state_prefix = "pair_state:"
-        self.meta_prefix = "metadata:"
-        self.alert_prefix = "alert:"
+        self.state_prefix = RedisKeyPrefix.PAIR_STATE
+        self.meta_prefix = RedisKeyPrefix.METADATA
+        self.alert_prefix = RedisKeyPrefix.ALERT
 
         self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
@@ -2022,7 +1951,12 @@ class RedisStateStore:
                 else:
                     try:
                         await asyncio.wait_for(pool.ping(), timeout=1.0)
-                        self._redis = pool
+                        if not RedisStateStore._pool_healthy.get(self.redis_url, False):
+                            logger.debug("Pool invalidated by another task after ping")
+                            pool = None
+                        else:
+                            self._redis = pool
+
                         RedisStateStore._pool_reuse_count[self.redis_url] = \
                             RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
                     
@@ -2033,11 +1967,9 @@ class RedisStateStore:
                                 if cfg.DEBUG_MODE:
                                     logger.debug(f"Lua script load failed: {e}")
             
-                        self.degraded = False
-
+                        self.degraded = False. 
                         pool_reused = True
                         return
-
                     except Exception as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
@@ -2176,7 +2108,7 @@ class RedisStateStore:
         if self.degraded:
             return True
         window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-        recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
+        recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
             result = await asyncio.wait_for(
                 self._redis.set(
@@ -2525,7 +2457,7 @@ class RedisLock:
 
     def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):     
         self.redis = redis_client
-        self.lock_key = f"lock:{lock_key}"
+        self.lock_key = f"{RedisKeyPrefix.LOCK}{name}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
         
         self.token: Optional[str] = None
@@ -3063,68 +2995,32 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair} | keys={len(keys)} | error={e}")
         return {k: False for k in keys}
 
-def check_common_conditions(open_val, high_val, low_val, close_val, is_buy) -> bool:
-    try:
-        candle_range = high_val - low_val
-        if candle_range < 1e-8:
-            return False
-
-        body_bottom = min(open_val, close_val)
-        body_top = max(open_val, close_val)
-
-        if is_buy:
-            if close_val <= open_val:
-                return False
-            upper_wick = max(high_val - body_top, 0.0)
-            wick_ratio = upper_wick / candle_range
-            return wick_ratio < Constants.MIN_WICK_RATIO
-        else:
-            if close_val >= open_val:
-                return False
-            lower_wick = max(body_bottom - low_val, 0.0)
-            wick_ratio = lower_wick / candle_range
-            return wick_ratio < Constants.MIN_WICK_RATIO
-    except Exception:
-        return False
-
-def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_buy, precomputed_ratio: Optional[float] = None) -> Tuple[bool, str]:
+def get_candle_quality_reason(open_val, high_val, low_val, close_val, is_buy) -> Tuple[bool, str]:
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False, "Range too small"
-
-        # Use precomputed wick ratio if provided
-        if precomputed_ratio is not None:
-            wick_ratio = precomputed_ratio
-        else:
-            # Fallback: calculate wick ratio based on candle type
-            if is_buy:
-                upper_wick = high_val - close_val
-                if upper_wick < 0:
-                    return False, f"Corrupted data (H={high_val:.5f} < C={close_val:.5f})"
-                wick_ratio = upper_wick / candle_range
-            else:
-                lower_wick = close_val - low_val
-                if lower_wick < 0:
-                    return False, f"Corrupted data (L={low_val:.5f} > C={close_val:.5f})"
-                wick_ratio = lower_wick / candle_range
-
+        
         if is_buy:
             if close_val <= open_val:
                 return False, f"Not green (C={close_val:.5f} ≤ O={open_val:.5f})"
-
+            upper_wick = high_val - close_val
+            if upper_wick < 0:
+                return False, f"Corrupted data (H={high_val:.5f} < C={close_val:.5f})"
+            wick_ratio = upper_wick / candle_range
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
-
+            return True, f"✓ Green wick:{wick_ratio*100:.1f}%"
         else:
             if close_val >= open_val:
                 return False, f"Not red (C={close_val:.5f} ≥ O={open_val:.5f})"
-
+            lower_wick = close_val - low_val
+            if lower_wick < 0:
+                return False, f"Corrupted data (L={low_val:.5f} > C={close_val:.5f})"
+            wick_ratio = lower_wick / candle_range
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
-
+            return True, f"✓ Red wick:{wick_ratio*100:.1f}%"
     except Exception as e:
         return False, f"Error: {str(e)}"
 
@@ -3134,11 +3030,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
-
+    ALERT_COOLDOWN_SECONDS = 300
     close_15m = None
     open_15m = None
     timestamps_15m = None
-    indicators = None
+    indicators = None, 
     ppo = None
     ppo_signal = None
     smooth_rsi = None
@@ -3155,31 +3051,41 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
-        if i15 is None or i15 < 4 or i5 is None or i5 < 2:
+        if i15 is None or i15 < 4:
             if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Insufficient indices for {pair_name}: i15={i15} (need ≥4), i5={i5} (need ≥2)"
-                )
+                logger_pair.debug(f"Insufficient i15: {i15} (need >=4)")
             return None
+
+        if i5 is None or i5 < 2:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Insufficient i5: {i5} (need >=2)")
+            return None
+
+        assert i15 >= 4, f"i15={i15} but should be >= 4"
+        assert i5 >= 2, f"i5={i5} but should be >= 2"
 
         ts_15m = data_15m["timestamp"][i15]
         ts_5m = data_5m["timestamp"]
     
         cache_key = f"{pair_name}:{ts_15m}"
         aligned_i5 = alignment_cache.get(cache_key)
-    
+
         if aligned_i5 is not None and aligned_i5 >= len(ts_5m):
             aligned_i5 = None
-    
+
         if aligned_i5 is None:
             time_diff = np.abs(ts_5m - ts_15m)
-            aligned_i5 = int(np.argmin(time_diff))
-        
-            if time_diff[aligned_i5] > 60:
-                aligned_i5 = i5  # fallback
-        
-            alignment_cache[cache_key] = aligned_i5
     
+            if len(time_diff) == 0:
+                aligned_i5 = 0
+            else:
+                aligned_i5 = int(np.argmin(time_diff))
+        
+                if aligned_i5 < len(time_diff) and time_diff[aligned_i5] > 60:
+                    aligned_i5 = i5
+    
+            alignment_cache[cache_key] = aligned_i5
+
         i5 = aligned_i5
 
         close_15m = data_15m["close"]
@@ -3535,7 +3441,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
-                    # Consolidated error handling with specific logging (Fixed per Issue #11)
                     if isinstance(e, KeyError):
                         logger_pair.error(f"Missing context key for {alert_key}: {e}")
                     elif isinstance(e, TypeError):
@@ -3666,6 +3571,35 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pivot_alerts = [(t, e, k) for t, e, k in alerts_to_send if k.startswith("pivot_")][:3]
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
+
+
+        filtered_alerts = []
+        for alert_title, alert_extra, alert_key in alerts_to_send:
+            cooldown_key = f"{pair_name}:{alert_key}:last_sent"
+    
+            if not sdb.degraded:
+                try:
+                    last_sent_str = await sdb.get_metadata(cooldown_key)
+                    if last_sent_str:
+                        last_ts = int(float(last_sent_str))
+                        elapsed = ts_curr - last_ts
+                        if elapsed < ALERT_COOLDOWN_SECONDS:
+                            logger_pair.debug(
+                                f"Alert {alert_key} cooldown: {ALERT_COOLDOWN_SECONDS - elapsed:.0f}s remaining"
+                            )
+                            continue
+                except (ValueError, TypeError):
+                    pass
+    
+            filtered_alerts.append((alert_title, alert_extra, alert_key))
+    
+            if not sdb.degraded:
+                try:
+                    await sdb.set_metadata(cooldown_key, str(ts_curr))
+                except Exception as e:
+                    logger_pair.debug(f"Failed to set cooldown: {e}")
+
+        alerts_to_send = filtered_alerts
 
         if alerts_to_send:
             try:
@@ -3803,10 +3737,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             current_memory_mb = process.memory_info().rss / 1024 / 1024
             memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             
-            if current_memory_mb > (memory_limit_mb * 0.8):
-                gc.collect()
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(f"GC triggered at {current_memory_mb:.1f}MB")
+     
+        if current_memory_mb > (memory_limit_mb * 0.8):
+            logger_pair.warning(
+                f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
+            )
         except Exception:
             pass
 
@@ -3870,79 +3805,76 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             process = psutil.Process()
             current_rss_mb = process.memory_info().rss / 1024 / 1024
             limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-            
-            if current_rss_mb > limit_mb * 0.85:
-                gc.collect()
-                
-                if cfg.DEBUG_MODE:
-                    new_rss_mb = process.memory_info().rss / 1024 / 1024
-                    freed_mb = current_rss_mb - new_rss_mb
-                    logger_main.debug(
-                        f"[{p_name}] Per-pair GC triggered at {current_rss_mb:.0f}MB, "
-                        f"freed {freed_mb:.1f}MB"
-                    )
+               
+        if current_rss_mb > limit_mb * 0.85:
+            logger_main.warning(
+                f"[{p_name}] Memory spike: {current_rss_mb:.0f}MB (threshold: {limit_mb*0.85:.0f}MB)"
+            )
+
         except Exception as psutil_error:
             logger_main.debug(f"Memory check failed: {psutil_error}")
 
 
-async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict], pairs_to_process: List[str], 
-    state_db: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
+async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
+    pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
+    correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
 
     alignment_cache: Dict[str, int] = {}
 
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
-    
+
     limit_15m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
-    
+
     pair_requests = []
-    for pair_name in pairs_to_process:
-        product_info = products_map.get(pair_name)
-        if not product_info:
-            continue
-        
-        symbol = product_info["symbol"]
-        resolutions = [("15", limit_15m), ("5", limit_5m)]
-        if cfg.ENABLE_PIVOT:
-            resolutions.append(("D", daily_limit))
-        
-        pair_requests.append((symbol, resolutions))
-    
-    all_candles = await fetcher.fetch_all_candles_truly_parallel(
-        pair_requests, reference_time
-    )
-    
-    fetch_elapsed = time.time() - fetch_start
-    logger_main.info(f"✅ Phase 1 complete: {fetch_elapsed:.1f}s")
-    
-    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
-    
     valid_tasks = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
         if not product_info:
             continue
-        
+
         symbol = product_info["symbol"]
-        candles = all_candles.get(symbol, {})
-        valid_tasks.append((pair_name, candles))
-    
-    logger_main.debug(f"Ready to evaluate {len(valid_tasks)} pairs")
-    
-    logger_main.debug(f"🧠 Phase 3: Evaluating {len(valid_tasks)} pairs...")
-    eval_start = time.time()
-    
-    results = await asyncio.gather(
-        *[guarded_eval(t, state_db, telegram_queue, correlation_id, 
-        reference_time, alignment_cache) for t in valid_tasks],
-        return_exceptions=True
+        resolutions = [("15", limit_15m), ("5", limit_5m)]
+        if cfg.ENABLE_PIVOT:
+            resolutions.append(("D", daily_limit))
+
+        pair_requests.append((symbol, resolutions))
+        # valid_tasks will be populated after fetch
+        valid_tasks.append((pair_name, symbol))
+
+    all_candles = await fetcher.fetch_all_candles_truly_parallel(
+        pair_requests, reference_time
     )
-    
+
+    fetch_elapsed = time.time() - fetch_start
+    logger_main.info(f"✅ Phase 1 complete: {fetch_elapsed:.1f}s")
+
+    logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
+
+    prepared_tasks = []
+    for pair_name, symbol in valid_tasks:
+        candles = all_candles.get(symbol, {})
+        prepared_tasks.append((pair_name, candles))
+
+    logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
+
+    logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
+    eval_start = time.time()
+
+    results = await asyncio.gather( 
+        *[ 
+            guarded_eval(
+                t, state_db, telegram_queue, correlation_id, 
+                reference_time, alignment_cache, 
+            ) for t in prepared_tasks], 
+        return_exceptions=True, 
+    )
+
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
-    
+
     valid_results = []
     for r in results:
         if isinstance(r, Exception):
@@ -3950,40 +3882,54 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             continue
         if r is not None:
             valid_results.append(r)
-    
-    logger_main.debug(f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed")
-    
-    results = None  # Release full results list (can be large)
-    all_candles = None  # ← THIS IS THE BIG ONE (~200MB for 12 pairs)
-    valid_tasks = None  # Release task list references
-    pair_requests = None  # Release request list
-    
+
+    logger_main.debug(
+        f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
+    )
+
+    results = None
+    all_candles = None
+    prepared_tasks = None
+    pair_requests = None
+    valid_tasks = None
+
+    process = psutil.Process()
+
+    def log_memory_usage(stage: str):
+        try:
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+            usage_pct = (mem_mb / limit_mb) * 100
+            if cfg.DEBUG_MODE:
+                logger_main.debug(
+                    f"{stage}: {mem_mb:.0f}MB / {limit_mb:.0f}MB ({usage_pct:.0f}%)"
+                )
+            return mem_mb, limit_mb, usage_pct
+        except Exception as e:
+            logger_main.debug(f"Memory reporting failed at {stage}: {e}")
+            return None, None, None
+
+    peak_memory_mb, limit_mb, usage_pct = log_memory_usage("⚠️ Peak memory after batch")
+    if peak_memory_mb and peak_memory_mb > limit_mb * 0.7:
+        logger_main.warning(
+            f"⚠️ High memory after batch: {peak_memory_mb:.0f}MB / {limit_mb:.0f}MB "
+            f"({usage_pct:.0f}%)"
+        )
+
     logger_main.debug("🧹 Released all fetch-phase data (all_candles, results, etc)")
-    
     gc.collect()
-    
-    try:
-        process = psutil.Process()
-        current_memory_mb = process.memory_info().rss / 1024 / 1024
-        limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-        usage_pct = (current_memory_mb / limit_mb) * 100
-        
-        if cfg.DEBUG_MODE:
-            logger_main.debug(
-                f"💾 Memory after batch cleanup: {current_memory_mb:.0f}MB / {limit_mb:.0f}MB "
-                f"({usage_pct:.0f}%)"
-            )
-        
-        if current_memory_mb > limit_mb * 0.9:
-            logger_main.warning(
-                f"⚠️ Memory still high after cleanup: {current_memory_mb:.0f}MB ({usage_pct:.0f}%). "
-                f"Possible memory leak?"
-            )
-    except Exception as e:
-        logger_main.debug(f"Memory reporting failed: {e}")
-    
-    logger_main.info(f"🧠 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated")
-    
+
+    current_memory_mb, limit_mb, usage_pct = log_memory_usage("💾 Memory after batch cleanup")
+    if current_memory_mb and current_memory_mb > limit_mb * 0.8:
+        logger_main.warning(
+            f"⚠️ Memory still high after cleanup: {current_memory_mb:.0f}MB ({usage_pct:.0f}%). "
+            f"Possible memory leak?"
+        )
+
+    logger_main.info(
+        f"🧠 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated"
+    )
+
     return valid_results
 
 async def run_once() -> bool:
@@ -4267,6 +4213,13 @@ async def run_once() -> bool:
             PAIR_ID.set("")
         except Exception:
             pass
+
+        try:
+            gc.collect()
+            if cfg.DEBUG_MODE:
+                logger_run.debug("🥃 Final garbage collection completed")
+        except Exception as e:
+            logger_run.debug(f"GC error: {e}")
 
         logger_run.debug("🧹 Resource cleanup finished")
 
