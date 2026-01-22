@@ -3738,10 +3738,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
             
      
-        if current_memory_mb > (memory_limit_mb * 0.8):
-            logger_pair.warning(
-                f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
-            )
+            if current_memory_mb > (memory_limit_mb * 0.8):
+                logger_pair.warning(
+                    f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
+                )
         except Exception:
             pass
 
@@ -3955,7 +3955,9 @@ async def run_once() -> bool:
         f"🎯 Run started | Correlation ID: {correlation_id} | "
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
-    try:      
+
+    try:
+        
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
@@ -3968,6 +3970,7 @@ async def run_once() -> bool:
             return False
 
         logger_run.debug("📦 Initializing HTTP fetcher...")
+
         pairs_to_process = list(cfg.PAIRS)
         products_map = build_products_map_from_cfg()
 
