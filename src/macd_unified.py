@@ -3810,6 +3810,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                 logger_main.warning(
                     f"[{p_name}] Memory spike: {current_rss_mb:.0f}MB (threshold: {limit_mb*0.85:.0f}MB)"
                 )
+
         except Exception as psutil_error:
             logger_main.debug(f"Memory check failed: {psutil_error}")
 
@@ -3968,7 +3969,7 @@ async def run_once() -> bool:
             return False
 
         logger_run.debug("📦 Initializing HTTP fetcher...")
-
+        fetcher = DataFetcher(cfg.DELTA_API_BASE)
         pairs_to_process = list(cfg.PAIRS)
         products_map = build_products_map_from_cfg()
 
@@ -3994,7 +3995,6 @@ async def run_once() -> bool:
             ))
             sdb.degraded_alerted = True
 
-        fetcher = DataFetcher(cfg.DELTA_API_BASE)
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
 
