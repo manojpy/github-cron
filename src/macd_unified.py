@@ -1716,6 +1716,41 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
 
+def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
+    try:
+        if data is None or not data:
+            return False, "Data is None or empty"
+        
+        close = data.get("close")
+        timestamp = data.get("timestamp")
+        open_arr = data.get("open")
+        high_arr = data.get("high")
+        low_arr = data.get("low")
+        
+        if timestamp is None or len(timestamp) == 0:
+            return False, "Timestamp array is empty"
+        
+        if close is None or len(close) == 0:
+            return False, "Close array is empty"
+        
+        if open_arr is None or high_arr is None or low_arr is None:
+            return False, "Missing OHLC data (open, high, or low)"
+        
+        if len(close) < required_len:
+            return False, f"Insufficient data: {len(close)} < {required_len}"
+        
+        if not np.all(timestamp[1:] >= timestamp[:-1]):
+            return False, "Timestamps not monotonic increasing"
+        
+        if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
+            return False, "OHLC arrays have mismatched lengths"
+        
+        return True, None
+    
+    except Exception as e:
+        logger.error(f"Data validation exception: {e}", exc_info=True)
+        return False, f"Validation error: {str(e)}"
+
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 2:
         logger.warning("No timestamps or insufficient data")
@@ -1750,29 +1785,78 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
     return last_closed_idx
 
-def validate_candle_array(data: Dict[str, np.ndarray], required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    if data is None or not data:
-        return False, "Data is None or empty"
+def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
+    try:
+        if data is None or not data:
+            return False, "Data is None or empty"
+        
+        close = data.get("close")
+        timestamp = data.get("timestamp")
+        open_arr = data.get("open")
+        high_arr = data.get("high")
+        low_arr = data.get("low")
+        
+        if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
+            return False, "Missing or empty OHLC/timestamp data"
+        
+        if selected_index < 0 or selected_index >= len(close):
+            return False, f"Selected index {selected_index} out of range [0, {len(close)})"
+        
+        selected_candle_time = int(timestamp[selected_index])
+        current_time = reference_time
+        interval_seconds = interval_minutes * 60
+        current_period_start = (current_time // interval_seconds) * interval_seconds
+        
+        if selected_candle_time >= current_period_start:
+            return False, (
+                f"Selected candle is still forming! "
+                f"ts={format_ist_time(selected_candle_time)} "
+                f"current_period_start={format_ist_time(current_period_start)}"
+            )
+        
+        staleness = current_time - selected_candle_time
+        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
+        
+        if staleness > MAX_STALENESS:
+            return False, (
+                f"Selected candle is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
+                f"Candle: {format_ist_time(selected_candle_time)} | "
+                f"Current: {format_ist_time(current_time)}"
+            )
+        
+        o = open_arr[selected_index]
+        h = high_arr[selected_index]
+        l = low_arr[selected_index]
+        c = close[selected_index]
+        
+        if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
+            return False, f"Selected candle has NaN values: O={o} H={h} L={l} C={c}"
+        
+        if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
+            return False, f"Selected candle has Inf values: O={o} H={h} L={l} C={c}"
+        
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return False, f"Selected candle has non-positive prices: O={o} H={h} L={l} C={c}"
+        
+        if not (l <= o and o <= h and l <= c and c <= h and l <= h):
+            return False, (
+                f"Selected candle has invalid OHLC relationships! "
+                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} "
+                f"[L≤O={l<=o} O≤H={o<=h} L≤C={l<=c} C≤H={c<=h} L≤H={l<=h}]"
+            )
+        
+        if selected_index > 0:
+            prev_close = close[selected_index - 1]
+            if not np.isnan(prev_close):
+                price_change_pct = abs(c - prev_close) / prev_close * 100
+                if price_change_pct > Constants.MAX_PRICE_CHANGE_PERCENT:
+                    return False, f"Extreme price spike in selected candle: {price_change_pct:.2f}%"
+        
+        return True, None
     
-    close = data.get("close")
-    timestamp = data.get("timestamp")
-    if not close is None and len(close) == 0:
-        return False, "Close array empty"
-    if timestamp is None or len(timestamp) == 0:
-        return False, "Timestamp array empty"
-    if len(close) < required_len:
-        return False, f"Data length {len(close)} < {required_len}"
-    
-    # NaN/Inf checks
-    nan_mask = (np.isnan(close) | np.isnan(data.get("open", close)))
-    if np.any(nan_mask):
-        return False, f"Found {np.sum(nan_mask)} NaN values"
-    
-    inf_mask = (np.isinf(close) | np.isinf(data.get("open", close)))
-    if np.any(inf_mask):
-        return False, f"Found {np.sum(inf_mask)} Inf values"
-    
-    return True, None
+    except Exception as e:
+        logger.error(f"Candle validation exception at index {selected_index}: {e}", exc_info=True)
+        return False, f"Validation error: {str(e)}"
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
@@ -2995,32 +3079,44 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair} | keys={len(keys)} | error={e}")
         return {k: False for k in keys}
 
-def get_candle_quality_reason(open_val, high_val, low_val, close_val, is_buy) -> Tuple[bool, str]:
+def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_buy, precomputed_ratio: Optional[float] = None) -> Tuple[bool, str]:
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False, "Range too small"
-        
+
+        # Use precomputed wick ratio if provided
+        if precomputed_ratio is not None:
+            wick_ratio = precomputed_ratio
+        else:
+            # Fallback: calculate wick ratio based on candle type
+            if is_buy:
+                upper_wick = high_val - close_val
+                if upper_wick < 0:
+                    return False, f"Corrupted data (H={high_val:.5f} < C={close_val:.5f})"
+                wick_ratio = upper_wick / candle_range
+            else:
+                lower_wick = close_val - low_val
+                if lower_wick < 0:
+                    return False, f"Corrupted data (L={low_val:.5f} > C={close_val:.5f})"
+                wick_ratio = lower_wick / candle_range
+
         if is_buy:
             if close_val <= open_val:
                 return False, f"Not green (C={close_val:.5f} ≤ O={open_val:.5f})"
-            upper_wick = high_val - close_val
-            if upper_wick < 0:
-                return False, f"Corrupted data (H={high_val:.5f} < C={close_val:.5f})"
-            wick_ratio = upper_wick / candle_range
+
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            return True, f"✓ Green wick:{wick_ratio*100:.1f}%"
+            return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
+
         else:
             if close_val >= open_val:
                 return False, f"Not red (C={close_val:.5f} ≥ O={open_val:.5f})"
-            lower_wick = close_val - low_val
-            if lower_wick < 0:
-                return False, f"Corrupted data (L={low_val:.5f} > C={close_val:.5f})"
-            wick_ratio = lower_wick / candle_range
+
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            return True, f"✓ Red wick:{wick_ratio*100:.1f}%"
+            return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
+
     except Exception as e:
         return False, f"Error: {str(e)}"
 
@@ -3070,23 +3166,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cache_key = f"{pair_name}:{ts_15m}"
         aligned_i5 = alignment_cache.get(cache_key)
 
-        if aligned_i5 is not None and aligned_i5 >= len(ts_5m):
-            aligned_i5 = None
-
-        if aligned_i5 is None:
+        if aligned_i5 is None or aligned_i5 >= len(ts_5m):
             time_diff = np.abs(ts_5m - ts_15m)
-    
+
             if len(time_diff) == 0:
                 aligned_i5 = 0
             else:
                 aligned_i5 = int(np.argmin(time_diff))
-        
                 if aligned_i5 < len(time_diff) and time_diff[aligned_i5] > 60:
                     aligned_i5 = i5
-    
+
             alignment_cache[cache_key] = aligned_i5
 
         i5 = aligned_i5
+        close_5m_val = data_5m["close"][i5]
 
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
