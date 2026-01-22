@@ -272,11 +272,11 @@ class BotConfig(BaseModel):
                 f'(minimum recommended: 200MB)'
             )
 
-        if cfg.RVOL_THRESHOLD < 0.5 or cfg.RVOL_THRESHOLD > 2.0:
-            errors.append(f'RVOL_THRESHOLD {cfg.RVOL_THRESHOLD} outside range [0.5, 2.0]')
+        if self.RVOL_THRESHOLD < 0.5 or self.RVOL_THRESHOLD > 2.0:
+            errors.append(f'RVOL_THRESHOLD {self.RVOL_THRESHOLD} outside range [0.5, 2.0]')
 
-        if cfg.MAX_CANDLE_STALENESS_SEC < 300:
-            warnings.append(f'MAX_CANDLE_STALENESS_SEC very low ({cfg.MAX_CANDLE_STALENESS_SEC}s)')
+        if self.MAX_CANDLE_STALENESS_SEC < 300:
+            warnings.append(f'MAX_CANDLE_STALENESS_SEC very low ({self.MAX_CANDLE_STALENESS_SEC}s)')
 
         if errors:
             error_msg = 'Configuration validation failed:\n  ' + '\n  '.join(errors)
