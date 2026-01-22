@@ -30,7 +30,7 @@
 
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
-  "RVOL_THRESHOLD": 1.0
+  "RVOL_THRESHOLD": 1.0, 
 
   "_comment_performance": "✅ HYBRID: Maximum parallelism for 30–35s execution target",
   "MAX_PARALLEL_FETCH": 12,
