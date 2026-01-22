@@ -1967,7 +1967,7 @@ class RedisStateStore:
                                 if cfg.DEBUG_MODE:
                                     logger.debug(f"Lua script load failed: {e}")
             
-                        self.degraded = False. 
+                        self.degraded = False
                         pool_reused = True
                         return
                     except Exception as e:
@@ -3955,9 +3955,7 @@ async def run_once() -> bool:
         f"🎯 Run started | Correlation ID: {correlation_id} | "
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
-
-    try:
-        
+    try:      
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
@@ -3970,8 +3968,6 @@ async def run_once() -> bool:
             return False
 
         logger_run.debug("📦 Initializing HTTP fetcher...")
-        fetcher = DataFetcher(cfg.DELTA_API_BASE)
-
         pairs_to_process = list(cfg.PAIRS)
         products_map = build_products_map_from_cfg()
 
