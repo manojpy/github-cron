@@ -4201,7 +4201,7 @@ async def run_once() -> bool:
         redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
         summary = (
-            f"🎯🌏 RUN COMPLETE | "
+            f"✅ RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent} | "
