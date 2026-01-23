@@ -202,6 +202,18 @@ class BotConfig(BaseModel):
             raise ValueError('Chat ID cannot be empty')
         return v.strip()
 
+    @field_validator('PIVOT_LOOKBACK_PERIOD')
+    def validate_pivot_lookback(cls, v: int) -> int:
+        if v < 5:
+            raise ValueError(
+                f'PIVOT_LOOKBACK_PERIOD must be >= 5 (need minimum historical data), got {v}'
+            )
+        if v > 365:
+            raise ValueError(
+                f'PIVOT_LOOKBACK_PERIOD > 365 days is excessive, got {v}'
+            )
+        return v
+
     @field_validator('DELTA_API_BASE')
     def validate_api_base(cls, v: str) -> str:
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
@@ -990,35 +1002,153 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
    
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
-        n = len(data_15m.get("close", [1]))
+        
+        try:
+            n = len(data_15m.get("close", []))
+            if n == 0:
+                logger.critical(
+                    "calculate_all_indicators_numpy: No close data available - cannot proceed"
+                )
+                return None
+        except Exception:
+            logger.critical(
+                "calculate_all_indicators_numpy: Cannot determine data length - aborting"
+            )
+            return None
+        
+        logger.warning(
+            f"calculate_all_indicators_numpy: Returning NaN arrays ({n} elements) "
+            f"due to calculation failure"
+        )
         return {
-            'ppo': np.zeros(n, dtype=np.float64),
-            'ppo_signal': np.zeros(n, dtype=np.float64),
-            'smooth_rsi': np.full(n, 50.0, dtype=np.float64),
-            'vwap': np.zeros(n, dtype=np.float64),
-            'mmh': np.zeros(n, dtype=np.float64),
+            'ppo': np.full(n, np.nan, dtype=np.float64),
+            'ppo_signal': np.full(n, np.nan, dtype=np.float64),
+            'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
+            'vwap': np.full(n, np.nan, dtype=np.float64),
+            'mmh': np.full(n, np.nan, dtype=np.float64),
             'upw': np.zeros(n, dtype=bool),
             'dnw': np.zeros(n, dtype=bool),
-            'rma50_15': np.zeros(n, dtype=np.float64),
-            'rma200_5': np.zeros(len(data_5m.get("close", [1])), dtype=np.float64),
+            'rma50_15': np.full(n, np.nan, dtype=np.float64),
+            'rma200_5': np.full(len(data_5m.get("close", [])), np.nan, dtype=np.float64),
             'pivots': {},
-            'atr_short': np.zeros(n, dtype=np.float64),
-            'atr_long': np.zeros(n, dtype=np.float64),
+            'atr_short': np.full(n, np.nan, dtype=np.float64),
+            'atr_long': np.full(n, np.nan, dtype=np.float64),
         }
 
 def precompute_candle_quality(data_15m: Dict[str, np.ndarray], 
                               atr_short: np.ndarray, atr_long: np.ndarray,
                               rvol_threshold: float) -> Tuple[np.ndarray, np.ndarray]:
     
-    buy_quality = vectorized_wick_check_buy(
-        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], 
-        Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
-    )
-    sell_quality = vectorized_wick_check_sell(
-        data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"], 
-        Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
-    )
-    return buy_quality, sell_quality
+    try:
+        n_ohlc = len(data_15m["close"])
+        
+        if n_ohlc == 0:
+            logger.error("precompute_candle_quality: OHLC data is empty")
+            return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+        
+        required_ohlc = ["open", "high", "low", "close"]
+        for key in required_ohlc:
+            if key not in data_15m:
+                logger.error(f"precompute_candle_quality: Missing OHLC key '{key}'")
+                return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+            
+            arr = data_15m[key]
+            if arr is None or len(arr) == 0:
+                logger.error(f"precompute_candle_quality: OHLC '{key}' is None or empty")
+                return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+            
+            if len(arr) != n_ohlc:
+                logger.error(
+                    f"precompute_candle_quality: Length mismatch in '{key}' "
+                    f"(expected {n_ohlc}, got {len(arr)})"
+                )
+                return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if atr_short is None or len(atr_short) == 0:
+            logger.error("precompute_candle_quality: atr_short is None or empty")
+            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if atr_long is None or len(atr_long) == 0:
+            logger.error("precompute_candle_quality: atr_long is None or empty")
+            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if len(atr_short) != n_ohlc:
+            logger.error(
+                f"precompute_candle_quality: atr_short length mismatch "
+                f"(expected {n_ohlc}, got {len(atr_short)})"
+            )
+            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if len(atr_long) != n_ohlc:
+            logger.error(
+                f"precompute_candle_quality: atr_long length mismatch "
+                f"(expected {n_ohlc}, got {len(atr_long)})"
+            )
+            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if not isinstance(rvol_threshold, (int, float)) or rvol_threshold <= 0:
+            logger.error(
+                f"precompute_candle_quality: Invalid rvol_threshold={rvol_threshold} "
+                f"(must be positive number)"
+            )
+            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if rvol_threshold > 10.0:
+            logger.warning(
+                f"precompute_candle_quality: rvol_threshold={rvol_threshold} seems very high "
+                f"(typical range 0.5-2.0)"
+            )
+        
+        open_arr = data_15m["open"]
+        high_arr = data_15m["high"]
+        low_arr = data_15m["low"]
+        close_arr = data_15m["close"]
+        
+        buy_quality = vectorized_wick_check_buy(
+            open_arr, high_arr, low_arr, close_arr,
+            Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
+        )
+        
+        sell_quality = vectorized_wick_check_sell(
+            open_arr, high_arr, low_arr, close_arr,
+            Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
+        )
+        
+        if len(buy_quality) != n_ohlc or len(sell_quality) != n_ohlc:
+            logger.error(
+                f"precompute_candle_quality: Output array size mismatch "
+                f"(buy_quality={len(buy_quality)}, sell_quality={len(sell_quality)}, "
+                f"expected={n_ohlc})"
+            )
+            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
+        
+        if cfg.DEBUG_MODE:
+            buy_count = np.sum(buy_quality)
+            sell_count = np.sum(sell_quality)
+            logger.debug(
+                f"precompute_candle_quality complete | "
+                f"Buy signals: {buy_count}/{n_ohlc} | "
+                f"Sell signals: {sell_count}/{n_ohlc}"
+            )
+        
+        return buy_quality, sell_quality
+    
+    except Exception as e:
+        logger.error(
+            f"precompute_candle_quality: Unexpected error: {e}",
+            exc_info=True
+        )
+        try:
+            n = len(data_15m.get("close", []))
+        except:
+            n = 0
+        
+        if n == 0:
+            logger.error("precompute_candle_quality: Cannot determine array size - returning empty")
+            return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+        
+        logger.warning(f"precompute_candle_quality: Returning conservative (all False) arrays of size {n}")
+        return np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
@@ -3199,6 +3329,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             return None
     
         indicators = await asyncio.to_thread(calculate_all_indicators_numpy, data_15m, data_5m, data_daily)
+       
+        if indicators is None:
+            logger_pair.error(
+                f"Skipping {pair_name}: all indicators failed to calculate"
+            )
+            return None
 
         ppo = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
@@ -3446,15 +3582,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "sell_common": sell_common,
             "wick_ratio_timeframe": "15m",
             "pivots": piv if piv else {},
-            "pivot_suppressions": [],
         }
+
+        context["pivot_suppressions"] = []
 
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
         raw_alerts = []
-
+        
         alert_keys_to_check = [
             d["key"] for d in ALERT_DEFINITIONS
             if not (
@@ -4087,7 +4224,7 @@ async def run_once() -> bool:
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
-                "���️ Redis is in degraded mode – alert deduplication disabled!"
+                "🚨 Redis is in degraded mode – alert deduplication disabled!"
             )
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
@@ -4110,17 +4247,34 @@ async def run_once() -> bool:
             return False
 
         async def extend_lock_periodically(lock_obj: RedisLock, interval: int = 300):
-            
             while not shutdown_event.is_set():
                 try:
                     await asyncio.sleep(interval)
-                    
+            
                     if lock_obj.should_extend():
                         success = await lock_obj.extend(timeout=3.0)
                         if success:
-                            logger_run.debug("🔑 Lock extended successfully")
+                            logger_run.debug("🔒 Lock extended successfully")
                         else:
-                            logger_run.warning("❌ Failed to extend lock - may lose it soon")
+                            # Critical failure – shutdown gracefully
+                            logger_run.critical(
+                                "✘ Failed to extend Redis lock - another instance may take over. "
+                                "Initiating graceful shutdown."
+                            )
+                            try:
+                                await telegram_queue.send(escape_markdown_v2(
+                                    f"⚠️ LOCK EXTENSION FAILED\n"
+                                    f"Bot: {cfg.BOT_NAME}\n"
+                                    f"Time: {format_ist_time()}\n"
+                                    f"Another instance may be taking control."
+                                ))
+                            except Exception as e:
+                                logger_run.error(f"Failed to send alert: {e}")
+                    
+                            # Set shutdown flag to exit gracefully
+                            shutdown_event.set()
+                            return
+
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -4323,7 +4477,7 @@ async def run_once() -> bool:
             logger_run.debug(f"GC error: {e}")
 
         logger_run.debug("🧹 Resource cleanup finished")
-
+ 
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
