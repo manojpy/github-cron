@@ -3126,7 +3126,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
-    ALERT_COOLDOWN_SECONDS = 300
     close_15m = None
     open_15m = None
     timestamps_15m = None
@@ -3664,35 +3663,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pivot_alerts = [(t, e, k) for t, e, k in alerts_to_send if k.startswith("pivot_")][:3]
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
-
-
-        filtered_alerts = []
-        for alert_title, alert_extra, alert_key in alerts_to_send:
-            cooldown_key = f"{pair_name}:{alert_key}:last_sent"
-    
-            if not sdb.degraded:
-                try:
-                    last_sent_str = await sdb.get_metadata(cooldown_key)
-                    if last_sent_str:
-                        last_ts = int(float(last_sent_str))
-                        elapsed = ts_curr - last_ts
-                        if elapsed < ALERT_COOLDOWN_SECONDS:
-                            logger_pair.debug(
-                                f"Alert {alert_key} cooldown: {ALERT_COOLDOWN_SECONDS - elapsed:.0f}s remaining"
-                            )
-                            continue
-                except (ValueError, TypeError):
-                    pass
-    
-            filtered_alerts.append((alert_title, alert_extra, alert_key))
-    
-            if not sdb.degraded:
-                try:
-                    await sdb.set_metadata(cooldown_key, str(ts_curr))
-                except Exception as e:
-                    logger_pair.debug(f"Failed to set cooldown: {e}")
-
-        alerts_to_send = filtered_alerts
 
         if alerts_to_send:
             try:
