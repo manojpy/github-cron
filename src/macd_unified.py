@@ -824,39 +824,31 @@ def warmup_if_needed() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
-
 def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, timestamps: np.ndarray) -> Dict[str, float]:
-    piv: Dict[str, float] = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
+    piv = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
     try:
         if len(timestamps) < 2:
             logger.warning("Pivot calc: insufficient data")
             return piv
-            
+
         if np.any(np.isnan(high)) or np.any(np.isnan(low)) or np.any(np.isnan(close)):
             logger.warning("Pivot calc: NaN values in OHLC data")
             return piv
+
         days = timestamps // 86400
         now_utc = datetime.now(timezone.utc)
         yesterday = (now_utc - timedelta(days=1)).date()
-
-        yesterday_ts = datetime(
-            yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc
-        ).timestamp()
+        yesterday_ts = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc).timestamp()
         yesterday_day_number = int(yesterday_ts) // 86400
 
         yesterday_mask = (days == yesterday_day_number)
-
         if not np.any(yesterday_mask):
-            logger.warning(
-                f"Pivot calc: Yesterday ({yesterday.isoformat()}) not found in data. "
-                f"Data range: {format_ist_time((days.min() * 86400))} to {format_ist_time((days.max() * 86400))}"
-            )
+            logger.warning(f"Pivot calc: Yesterday ({yesterday.isoformat()}) not found in data")
             return piv
 
         yesterday_high = high[yesterday_mask]
         yesterday_low = low[yesterday_mask]
         yesterday_close = close[yesterday_mask]
-
         if len(yesterday_high) == 0:
             logger.warning("No candles found for pivot day")
             return piv
@@ -883,15 +875,14 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
 
-
-    for level_name in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]:
-        if level_name in piv:
-            val = piv[level_name]
-            if np.isnan(val) or np.isinf(val) or val <= 0:
-                logger.warning(f"Invalid pivot {level_name}: {val}, resetting to 0.0")
-                piv[level_name] = 0.0
+    # Defensive cleanup
+    for k, val in piv.items():
+        if np.isnan(val) or np.isinf(val) or val <= 0:
+            logger.warning(f"Invalid pivot {k}: {val}, resetting to 0.0")
+            piv[k] = 0.0
 
     return piv
+
             
 def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
     try:
@@ -1636,40 +1627,40 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
     
-        nan_mask = (
-            np.isnan(data["open"]) | np.isnan(data["high"]) |
-            np.isnan(data["low"]) | np.isnan(data["close"])
-        )
-        if np.any(nan_mask):
-            nan_count = np.sum(nan_mask)
-            logger.warning(
-                f"parse_candles_to_numpy: Found {nan_count} candles with NaN values. "
-                f"Indices: {np.where(nan_mask)[0][:10]}"
+        errors = []
+        n = len(data["timestamp"])
+
+        for i in range(n):
+            o, h, l, c = (
+                data["open"][i], 
+                data["high"][i], 
+                data["low"][i], 
+                data["close"][i]
             )
+    
+            if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
+                errors.append(f"Index {i}: NaN in OHLC")
+                continue
+    
+            if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
+                errors.append(f"Index {i}: Inf in OHLC")
+                continue
+    
+            if not (l <= o and o <= h and l <= c and c <= h and l <= h):
+                errors.append(
+                    f"Index {i}: Invalid OHLC (O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f})"
+                )
+                continue
+    
+            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+                errors.append(f"Index {i}: Non-positive price")
+                continue
+
+        if errors:
+            logger.error(f"parse_candles_to_numpy: {len(errors)} invalid candles found:")
+            for err in errors[:5]:
+                logger.error(f"  {err}")
             return None
-        
-        inf_mask = (
-            np.isinf(data["open"]) | np.isinf(data["high"]) |
-            np.isinf(data["low"]) | np.isinf(data["close"])
-        )
-        if np.any(inf_mask):
-            inf_count = np.sum(inf_mask)
-            logger.warning(
-                f"parse_candles_to_numpy: Found {inf_count} candles with Inf values. "
-                f"Indices: {np.where(inf_mask)[0][:10]}"
-            )
-            return None
-        
-        valid_low_open = data["low"] <= data["open"]
-        valid_open_high = data["open"] <= data["high"]
-        valid_low_close = data["low"] <= data["close"]
-        valid_close_high = data["close"] <= data["high"]
-        valid_low_high = data["low"] <= data["high"]
-        
-        invalid_mask = ~(valid_low_open & valid_open_high & valid_low_close & valid_close_high & valid_low_high)
-        
-        if np.any(invalid_mask):
-            invalid_count = np.sum(invalid_mask)
             invalid_indices = np.where(invalid_mask)[0]
             
             logger.error(
@@ -2253,27 +2244,40 @@ class RedisStateStore:
             logger.error(f"batch_check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
-        
+    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:     
         if not self._redis or self.degraded:
             return {k: None for k in alert_keys}
 
         try:
             async with self._redis.pipeline(transaction=True) as pipe:
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-                
+    
                 for state_key in state_keys:
                     pipe.get(state_key)
 
                 now = int(time.time())
+    
+                serialized_updates = []
                 for full_key, state_value, custom_ts in updates:
                     ts = custom_ts if custom_ts is not None else now
-                    
                     try:
                         data = json_dumps({"state": state_value, "ts": ts})
+                        serialized_updates.append((full_key, data))
                     except Exception as e:
                         logger.error(f"Failed to serialize state for {full_key}: {e}")
-                        continue
+    
+                for full_key, data in serialized_updates:
+                    if not full_key.startswith(self.state_prefix):
+                        redis_key = f"{self.state_prefix}{full_key}"
+                    else:
+                        redis_key = full_key
+
+                    if self.expiry_seconds > 0:
+                        pipe.set(redis_key, data, ex=self.expiry_seconds)
+                    else:
+                        pipe.set(redis_key, data)
+
+                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
                 
                     if not full_key.startswith(self.state_prefix):
                         redis_key = f"{self.state_prefix}{full_key}"
@@ -2868,6 +2872,37 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     body = "\n".join(bullets)
     return escape_markdown_v2(f"{headline}\n{body}")
 
+def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
+    """Factory function to create pivot alert definition without lambdas"""
+    if is_buy:
+        return {
+            "key": f"pivot_up_{level}",
+            "title": f"🟢⬆️ Cross above {level}",
+            "check_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
+                ctx.get("buy_common", False) and 
+                get_pivot_alert_info(ctx, level, is_buy=True)[0]
+            ),
+            "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
+                f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+            ),
+            "requires": ["pivots"]
+        }
+    else:
+        return {
+            "key": f"pivot_down_{level}",
+            "title": f"🔴⬇️ Cross below {level}",
+            "check_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
+                ctx.get("sell_common", False) and 
+                get_pivot_alert_info(ctx, level, is_buy=False)[0]
+            ),
+            "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
+                f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+            ),
+            "requires": ["pivots"]
+        }
+
 class AlertDefinition(TypedDict):
     key: str
     title: str
@@ -2933,11 +2968,11 @@ def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple
     
     return ctx[cache_key]
 
-BUY_PIVOT_DEFS = [{"key": f"pivot_up_{level}", "title": f"🟢⬆️ Cross above {level}", "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (ctx.get("buy_common", False) and get_pivot_alert_info(ctx, lvl, is_buy=True)[0]), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"), "requires": ["pivots"]} 
-    for level in ("P", "S1", "S2", "S3", "R1", "R2")]
+BUY_PIVOT_DEFS = [create_pivot_alert(level, is_buy=True) 
+                  for level in ("P", "S1", "S2", "S3", "R1", "R2")]
 
-SELL_PIVOT_DEFS = [{"key": f"pivot_down_{level}", "title": f"🔴⬇️ Cross below {level}", "check_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (ctx.get("sell_common", False) and get_pivot_alert_info(ctx, lvl, is_buy=False)[0]), "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _, lvl=level: (f"${ctx['pivots'][lvl]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) [Dist: {abs(ctx['pivots'][lvl] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"), "requires": ["pivots"]} 
-    for level in ("P", "S1", "S2", "R1", "R2", "R3")]
+SELL_PIVOT_DEFS = [create_pivot_alert(level, is_buy=False) 
+                   for level in ("P", "S1", "S2", "R1", "R2", "R3")]
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
@@ -3016,14 +3051,19 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
     if is_buy:
         if close_curr <= open_curr:
             return False, f"Red candle: O={open_curr:.2f}, C={close_curr:.2f}"
-        
-        if not (close_prev < vwap_prev and close_curr > vwap_curr):
+    
+        crossed_above = (
+            (close_prev <= vwap_prev and close_curr > vwap_curr) or  # Crossed in current candle
+            (close_prev < vwap_prev and close_curr >= vwap_curr)  # Allow equality for slow crosses
+        )
+    
+        if not crossed_above:
             return False, (
                 f"No cross up: "
                 f"prev={close_prev:.2f} vs vwap_prev={vwap_prev:.2f}, "
                 f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
             )
-        
+
         dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
         if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
             return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
@@ -3259,13 +3299,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
-        
+
+        MIN_MMH_BARS_VALID = 50
         has_valid_mmh = (
+            i15 >= MIN_MMH_BARS_VALID and  # ← Added: Enough data processed
             not np.isnan(mmh_curr) and 
             not np.isnan(mmh_m1) and 
             not np.isnan(mmh_m2) and 
             not np.isnan(mmh_m3)
         )
+
+        if not has_valid_mmh:
+            if cfg.DEBUG_MODE:
+                skip_reason = (
+                    f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
+                    else f"MMH NaN (idx={i15})"
+                )
+                logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
@@ -4327,7 +4377,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠���� Performance will be degraded. First run may be slow.")
+        logger.warning("⚠������ Performance will be degraded. First run may be slow.")
         
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
