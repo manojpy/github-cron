@@ -177,7 +177,7 @@ jobs:
             exit 0
           fi
           
-          if grep -q "✅ RUN COMPLETE" "$LOG_FILE"; then
+          if grep -q "RUN COMPLETE" "$LOG_FILE"; then
             STATUS="success"
             DURATION=$(grep -oP "Duration:\s*\K[\d.]+(?=s)" "$LOG_FILE" | head -1 || echo "N/A")
             ALERTS=$(grep -oP "(?:Alerts|Sent):\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
