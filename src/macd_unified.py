@@ -2244,20 +2244,19 @@ class RedisStateStore:
             logger.error(f"batch_check_recent_alerts failed: {e}")
             return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
 
-    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:     
+    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
         if not self._redis or self.degraded:
             return {k: None for k in alert_keys}
 
         try:
             async with self._redis.pipeline(transaction=True) as pipe:
                 state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-    
                 for state_key in state_keys:
                     pipe.get(state_key)
 
                 now = int(time.time())
-    
-                serialized_updates = []
+
+                serialized_updates: List[Tuple[str, str]] = []
                 for full_key, state_value, custom_ts in updates:
                     ts = custom_ts if custom_ts is not None else now
                     try:
@@ -2265,20 +2264,8 @@ class RedisStateStore:
                         serialized_updates.append((full_key, data))
                     except Exception as e:
                         logger.error(f"Failed to serialize state for {full_key}: {e}")
-    
+
                 for full_key, data in serialized_updates:
-                    if not full_key.startswith(self.state_prefix):
-                        redis_key = f"{self.state_prefix}{full_key}"
-                    else:
-                        redis_key = full_key
-
-                    if self.expiry_seconds > 0:
-                        pipe.set(redis_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(redis_key, data)
-
-                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-                
                     if not full_key.startswith(self.state_prefix):
                         redis_key = f"{self.state_prefix}{full_key}"
                     else:
@@ -2297,11 +2284,11 @@ class RedisStateStore:
             parsed: Dict[str, Optional[Dict[str, Any]]] = {}
             for idx, key in enumerate(alert_keys):
                 val = mget_results[idx] if idx < len(mget_results) else None
-                
+
                 if val is None:
                     parsed[key] = None
                     continue
-                
+
                 try:
                     if isinstance(val, bytes):
                         val_str = val.decode("utf-8")
@@ -2313,7 +2300,7 @@ class RedisStateStore:
                         continue
 
                     parsed[key] = json_loads(val_str)
-                    
+
                 except (json.JSONDecodeError, UnicodeDecodeError) as e:
                     logger.warning(f"Failed to parse Redis value for {pair}:{key}: {e}")
                     parsed[key] = None
@@ -2333,7 +2320,7 @@ class RedisStateStore:
         except asyncio.TimeoutError:
             logger.error(f"batch_get_and_set_alerts timeout for {pair}")
             return {k: None for k in alert_keys}
-            
+
         except Exception as e:
             logger.error(f"batch_get_and_set_alerts failed for {pair}: {e}")
             return {k: None for k in alert_keys}
