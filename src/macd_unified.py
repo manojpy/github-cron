@@ -3260,9 +3260,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
 
-        MIN_MMH_BARS_VALID = 50
+        MIN_MMH_BARS_VALID = 160
         has_valid_mmh = (
-            i15 >= MIN_MMH_BARS_VALID and  # ← Added: Enough data processed
+            i15 >= MIN_MMH_BARS_VALID and
             not np.isnan(mmh_curr) and 
             not np.isnan(mmh_m1) and 
             not np.isnan(mmh_m2) and 
