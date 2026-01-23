@@ -1661,33 +1661,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             for err in errors[:5]:
                 logger.error(f"  {err}")
             return None
-            invalid_indices = np.where(invalid_mask)[0]
-            
-            logger.error(
-                f"parse_candles_to_numpy: Found {invalid_count} invalid OHLC candles. "
-                f"Examples:"
-            )
-            for idx in invalid_indices[:5]:
-                logger.error(
-                    f"  Index {idx}: O={data['open'][idx]:.2f} H={data['high'][idx]:.2f} "
-                    f"L={data['low'][idx]:.2f} C={data['close'][idx]:.2f} "
-                    f"Valid: L≤O={valid_low_open[idx]} O≤H={valid_open_high[idx]} "
-                    f"L≤C={valid_low_close[idx]} C≤H={valid_close_high[idx]} L≤H={valid_low_high[idx]}"
-                )
-            
-            logger.error(
-                f"parse_candles_to_numpy: Rejecting entire candle set due to {invalid_count} invalid candles"
-            )
-            return None
-        
-        if not (valid_low_open[-1] and valid_open_high[-1] and 
-                valid_low_close[-1] and valid_close_high[-1] and valid_low_high[-1]):
-            logger.error(
-                f"parse_candles_to_numpy: Last candle is invalid! "
-                f"O={data['open'][-1]:.2f} H={data['high'][-1]:.2f} "
-                f"L={data['low'][-1]:.2f} C={data['close'][-1]:.2f}"
-            )
-            return None
         
         if np.any(data["close"] <= 0) or np.any(data["open"] <= 0) or \
            np.any(data["high"] <= 0) or np.any(data["low"] <= 0):
