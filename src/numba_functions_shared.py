@@ -29,7 +29,7 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
+    """Calculate population rolling std (divided by n) to match Pine Script's ta.stdev."""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
@@ -48,7 +48,7 @@ def rolling_std(close, period, responsiveness):
             if not np.isnan(old_val):
                 window_sum -= old_val
                 window_sq_sum -= old_val * old_val
-                window_count -= 1 # [cite: 3]
+                window_count -= 1
         
         if not np.isnan(curr):
             window_sum += curr
@@ -58,18 +58,14 @@ def rolling_std(close, period, responsiveness):
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
      
-        # Calculate Sample SD (n-1)
         if window_count < 2:
             sd[i] = 0.0
         else:
             mean = window_sum / window_count
             pop_variance = (window_sq_sum / window_count) - (mean * mean)
-            # Convert to Sample Variance: pop_var * (n / (n-1))
-            sample_variance = pop_variance * (window_count / (window_count - 1))
-            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp
-
+            sd[i] = np.sqrt(max(0.0, pop_variance)) * resp
+            
     return sd
-
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
