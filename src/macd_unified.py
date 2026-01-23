@@ -3791,7 +3791,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
-            logger_pair.info(
+            logger_pair.debug(
                 f"😒 {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
@@ -4087,7 +4087,7 @@ async def run_once() -> bool:
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
-                "⚠️ Redis is in degraded mode – alert deduplication disabled!"
+                "���️ Redis is in degraded mode – alert deduplication disabled!"
             )
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
