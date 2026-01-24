@@ -1,11 +1,11 @@
+from __future__ import annotations   
 import warnings
 
 warnings.filterwarnings(
     "ignore",
     category=RuntimeWarning,
     message=".*parsing methods must have __doc__.*"
-)
-from __future__ import annotations         
+)   
 import logging
 import aot_bridge
 import os
