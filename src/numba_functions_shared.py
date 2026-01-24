@@ -365,33 +365,56 @@ def calculate_ppo_core(close, fast, slow, signal):
 
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def calculate_rsi_core(close, period):
+def calculate_rsi_core(close, period):  
     n = len(close)
-    if n < period + 1:
-        return np.full(n, np.nan)
+    rsi_values = np.full(n, np.nan, dtype=np.float64)
     
-    diff = np.empty(n - 1, dtype=np.float64)
-    for i in range(n - 1):
-        diff[i] = close[i+1] - close[i]
-        
+    if n < period + 1:
+        return rsi_values
+
+    # Manually calculate differences (np.diff replacement)
+    # This loop is 100% AOT-compatible
     gains = np.zeros(n - 1, dtype=np.float64)
     losses = np.zeros(n - 1, dtype=np.float64)
     
     for i in range(n - 1):
-        if diff[i] > 0:
-            gains[i] = diff[i]
+        diff_val = close[i+1] - close[i]
+        if diff_val > 0:
+            gains[i] = diff_val
         else:
-            losses[i] = -diff[i]
+            losses[i] = -diff_val
 
-    alpha = 1.0 / period
-    avg_g = np.nanmean(gains[1:period+1]); avg_l = np.nanmean(losses[1:period+1])
+    # Initial SMA of gains and losses for the first period
+    avg_gain = 0.0
+    avg_loss = 0.0
+    for i in range(period):
+        avg_gain += gains[i]
+        avg_loss += losses[i]
     
-    for i in range(period, n):
-        avg_g = (gains[i] * alpha) + (avg_g * (1.0 - alpha))
-        avg_l = (losses[i] * alpha) + (avg_l * (1.0 - alpha))
-        if avg_l == 0: rsi[i] = 100.0 if avg_g > 0 else 50.0
-        else: rsi[i] = 100.0 - (100.0 / (1.0 + avg_g / avg_l))
-    return rsi
+    avg_gain /= period
+    avg_loss /= period
+
+    # Calculate first valid RSI value
+    if avg_loss == 0:
+        rsi_values[period] = 100.0 if avg_gain > 0 else 50.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
+
+    # Wilder's Smoothing Method (RMA)
+    alpha = 1.0 / period
+    for i in range(period + 1, n):
+        # Index in gains/losses is i-1 because it represents change from close[i-1] to close[i]
+        avg_gain = (gains[i-1] - avg_gain) * alpha + avg_gain
+        avg_loss = (losses[i-1] - avg_loss) * alpha + avg_loss
+        
+        if avg_loss == 0:
+            rsi_values[i] = 100.0 if avg_gain > 0 else 50.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi_values
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
