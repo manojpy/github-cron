@@ -746,7 +746,7 @@ def warmup_if_needed():
         logger.info(f"✅ JIT Warmup complete in {elapsed:.2f}s")
     except Exception as e:
         logger.warning(f"⚠️ Warmup partially failed: {e}")
-, 
+        
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
