@@ -301,30 +301,50 @@ def calculate_trends_with_state(filt_x1, filt_x12):
             upw[i], dnw[i] = upw[i-1], dnw[i-1]
     return upw, dnw
 
-
 @njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
-    """Kalman filter implementation"""
+    """Kalman filter in O(n) - FIXED: applies formula on first valid bar"""
     n = len(src)
     result = np.full(n, np.nan, dtype=np.float64)
-    idx = -1
+
+    # Find first valid - O(n)
+    first_valid_idx = -1
     for i in range(n):
         if not np.isnan(src[i]):
-            idx = i
+            first_valid_idx = i
             break
-    if idx == -1: return result
+    
+    if first_valid_idx == -1:
+        return result
 
-    estimate, error_est = src[idx], 1.0
-    error_meas = R * max(1.0, float(length))
-    q_step = Q / max(1.0, float(length))
+    # Initialize estimate with first valid value
+    estimate = src[first_valid_idx]
+    error_est = 1.0
+    error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
+    Q_div_length = Q / (float(length) if float(length) > 1.0 else 1.0)
 
-    for i in range(idx, n):
-        if not np.isnan(src[i]):
-            gain = error_est / (error_est + error_meas)
-            estimate = estimate + gain * (src[i] - estimate)
-            error_est = (1.0 - gain) * error_est + q_step
+    prediction = estimate
+    kalman_gain = error_est / (error_est + error_meas)
+    estimate = prediction + kalman_gain * (src[first_valid_idx] - prediction)
+    error_est = (1.0 - kalman_gain) * error_est + Q_div_length
+    result[first_valid_idx] = estimate
+
+    # Continue for remaining bars - O(n)
+    for i in range(first_valid_idx + 1, n):
+        current = src[i]
+
+        if np.isnan(current):
+            result[i] = estimate
+            continue
+
+        prediction = estimate
+        kalman_gain = error_est / (error_est + error_meas)
+        estimate = prediction + kalman_gain * (current - estimate)
+        error_est = (1.0 - kalman_gain) * error_est + Q_div_length
         result[i] = estimate
+
     return result
+
 
 # ============================================================================
 # 5. MARKET & OSCILLATORS
@@ -363,58 +383,65 @@ def calculate_ppo_core(close, fast, slow, signal):
             ppo[i] = ((f_ma[i] - s_ma[i]) / s_ma[i]) * 100.0
     return ppo, ema_loop(ppo, float(signal))
 
-
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def calculate_rsi_core(close, period):  
+def calculate_rsi_core(close, period):
+    """Calculate RSI in O(n) - single pass gains/losses, then EMA"""
     n = len(close)
-    rsi_values = np.full(n, np.nan, dtype=np.float64)
+    rsi = np.full(n, 50.0, dtype=np.float64)
     
-    if n < period + 1:
-        return rsi_values
+    if n <= period:
+        return rsi
 
-    # Manually calculate differences (np.diff replacement)
-    # This loop is 100% AOT-compatible
-    gains = np.zeros(n - 1, dtype=np.float64)
-    losses = np.zeros(n - 1, dtype=np.float64)
+    # Find first valid - O(n)
+    first_valid_idx = -1
+    last_valid_close = 0.0
+    for i in range(n):
+        if not np.isnan(close[i]):
+            first_valid_idx = i
+            last_valid_close = close[i]
+            break
     
-    for i in range(n - 1):
-        diff_val = close[i+1] - close[i]
-        if diff_val > 0:
-            gains[i] = diff_val
-        else:
-            losses[i] = -diff_val
+    if first_valid_idx == -1:
+        return rsi
 
-    # Initial SMA of gains and losses for the first period
+    # Calculate gains/losses - O(n)
+    gain = np.zeros(n, dtype=np.float64)
+    loss = np.zeros(n, dtype=np.float64)
+
+    for i in range(first_valid_idx + 1, n):
+        curr = close[i]
+        if not np.isnan(curr):
+            diff = curr - last_valid_close
+            if diff > 0.0:
+                gain[i] = diff
+            else:
+                loss[i] = -diff
+            last_valid_close = curr
+
+    # Calculate initial average gains/losses
     avg_gain = 0.0
     avg_loss = 0.0
-    for i in range(period):
-        avg_gain += gains[i]
-        avg_loss += losses[i]
-    
+    for i in range(first_valid_idx + 1, min(first_valid_idx + period + 1, n)):
+        avg_gain += gain[i]
+        avg_loss += loss[i]
     avg_gain /= period
     avg_loss /= period
 
-    # Calculate first valid RSI value
-    if avg_loss == 0:
-        rsi_values[period] = 100.0 if avg_gain > 0 else 50.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi_values[period] = 100.0 - (100.0 / (1.0 + rs))
-
-    # Wilder's Smoothing Method (RMA)
     alpha = 1.0 / period
-    for i in range(period + 1, n):
-        # Index in gains/losses is i-1 because it represents change from close[i-1] to close[i]
-        avg_gain = (gains[i-1] - avg_gain) * alpha + avg_gain
-        avg_loss = (losses[i-1] - avg_loss) * alpha + avg_loss
+
+    # Smooth averages and calculate RSI - O(n)
+    for i in range(first_valid_idx + period, n):
+        if not np.isnan(close[i]):
+            avg_gain = (gain[i] * alpha) + (avg_gain * (1.0 - alpha))
+            avg_loss = (loss[i] * alpha) + (avg_loss * (1.0 - alpha))
         
-        if avg_loss == 0:
-            rsi_values[i] = 100.0 if avg_gain > 0 else 50.0
+        if avg_loss == 0.0:
+            rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
         else:
             rs = avg_gain / avg_loss
-            rsi_values[i] = 100.0 - (100.0 / (1.0 + rs))
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
-    return rsi_values
+    return rsi
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
