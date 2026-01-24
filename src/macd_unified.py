@@ -1,3 +1,10 @@
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    message=".*parsing methods must have __doc__.*"
+)
 from __future__ import annotations         
 import logging
 import aot_bridge
@@ -30,7 +37,6 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
-import warnings
 import contextlib 
 import traceback
 
@@ -1668,81 +1674,67 @@ class DataFetcher:
         logger.info(f"📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
-def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     if not result or not isinstance(result, dict):
         logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
+    
     res = result.get("result", {}) or {}
     required = ("t", "o", "h", "l", "c", "v")
     if not all(k in res for k in required):
         logger.warning(f"parse_candles_to_numpy: missing required fields. Have: {list(res.keys())}")
         return None
+
     try:
-        n = len(res["t"])
+        data = {
+            "timestamp": np.asarray(res["t"], dtype=np.int64),
+            "open":      np.asarray(res["o"], dtype=np.float64),
+            "high":      np.asarray(res["h"], dtype=np.float64),
+            "low":       np.asarray(res["l"], dtype=np.float64),
+            "close":     np.asarray(res["c"], dtype=np.float64),
+            "volume":    np.asarray(res["v"], dtype=np.float64),
+        }
+
+        n = len(data["timestamp"])
         if n == 0:
             logger.warning("parse_candles_to_numpy: empty candle array")
             return None
-        data = {
-            "timestamp": np.asarray(res["t"], dtype=np.int64),
-            "open": np.asarray(res["o"], dtype=np.float64),
-            "high": np.asarray(res["h"], dtype=np.float64),
-            "low": np.asarray(res["l"], dtype=np.float64),
-            "close": np.asarray(res["c"], dtype=np.float64),
-            "volume": np.asarray(res["v"], dtype=np.float64),
-        }
 
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
-    
-        errors = []
-        n = len(data["timestamp"])
 
-        for i in range(n):
-            o, h, l, c = (
-                data["open"][i], 
-                data["high"][i], 
-                data["low"][i], 
-                data["close"][i]
-            )
-    
-            if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
-                errors.append(f"Index {i}: NaN in OHLC")
-                continue
-    
-            if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
-                errors.append(f"Index {i}: Inf in OHLC")
-                continue
-    
-            if not (l <= o and o <= h and l <= c and c <= h and l <= h):
-                errors.append(
-                    f"Index {i}: Invalid OHLC (O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f})"
-                )
-                continue
-    
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-                errors.append(f"Index {i}: Non-positive price")
-                continue
+        o, h, l, c = data["open"], data["high"], data["low"], data["close"]
 
-        if errors:
-            logger.error(f"parse_candles_to_numpy: {len(errors)} invalid candles found:")
-            for err in errors[:5]:
-                logger.error(f"  {err}")
-            return None
+        any_nan = np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c)
+        any_inf = np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c)
         
-        if np.any(data["close"] <= 0) or np.any(data["open"] <= 0) or \
-           np.any(data["high"] <= 0) or np.any(data["low"] <= 0):
-            logger.error("parse_candles_to_numpy: Found non-positive prices")
-            return None
+        invalid_rel = ~((l <= o) & (o <= h) & (l <= c) & (c <= h))
         
-        hl_mid = (data["high"] + data["low"]) / 2.0
-        close_deviation = np.abs(data["close"] - hl_mid) / hl_mid
-        if np.any(close_deviation > 0.5):
-            deviation_count = np.sum(close_deviation > 0.5)
+        non_positive = (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
+
+        error_mask = any_nan | any_inf | invalid_rel | non_positive
+        error_count = np.sum(error_mask)
+
+        if error_count > 0:
+            logger.error(f"parse_candles_to_numpy: {error_count} invalid candles found.")
+            first_errors = np.where(error_mask)[0][:5]
+            for idx in first_errors:
+                logger.error(f"  Index {idx}: Data Anomaly (O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f})")
+            return None
+
+        hl_mid = (h + l) / 2.0
+        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
+        deviation_mask = close_deviation > 0.5
+        deviation_count = np.sum(deviation_mask)
+
+        if deviation_count > 0:
             logger.warning(
                 f"parse_candles_to_numpy: Found {deviation_count} candles with "
                 f"Close deviating >50% from High-Low midpoint (potential data anomaly)"
             )
+
         return data
+
     except Exception as e:
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
