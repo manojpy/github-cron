@@ -141,6 +141,8 @@ class BotConfig(BaseModel):
     SRSI_RSI_LEN: int = 21
     SRSI_KALMAN_LEN: int = 5
     SRSI_EMA_LEN: int = 5
+    ATR_SHORT: int = 5
+    ATR_LONG: int = 14
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 6
@@ -888,11 +890,13 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
         results['atr_short'] = calculate_atr_rma(
-            data_15m["high"], data_15m["low"], data_15m["close"], period=5
+            data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_SHORT
         )
+
         results['atr_long'] = calculate_atr_rma(
-            data_15m["high"], data_15m["low"], data_15m["close"], period=14
+           data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
+
 
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
