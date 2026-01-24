@@ -34,6 +34,9 @@ import warnings
 import contextlib 
 import traceback
 
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
+warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
+
 
 from aot_bridge import (
     sanitize_array_numba,
