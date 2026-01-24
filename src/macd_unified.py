@@ -159,13 +159,6 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
     PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5, description="Max distance from pivot to trigger alert")
-    RVOL_THRESHOLD: float = Field(
-        default=1.0, 
-        ge=0.5, 
-        le=2.0,
-        description="Volatility expansion threshold (Pine: atr1 > atr3 * rvolThreshold). "
-                    "1.0 = baseline, 1.1 = require 10% expansion, 1.5 = require 50% expansion"
-    )
     MAX_CANDLE_STALENESS_SEC: int = Field(
         default=1200,
         ge=600,
@@ -485,7 +478,6 @@ from aot_bridge import (
     rolling_min_max_numba,
     calculate_ppo_core,
     calculate_rsi_core,
-    calculate_atr_rma, 
     vectorized_wick_check_buy,
     vectorized_wick_check_sell
 )
@@ -790,9 +782,6 @@ def warmup_if_needed() -> None:
         test_data = np.random.random(200).astype(np.float64) * 1000
         test_data2 = np.random.random(200).astype(np.float64)
         test_int = 14
-        test_threshold = 1.0
-        
-        # Core indicators
         _ = aot_bridge.ema_loop(test_data, 7.0)
         _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
         _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
@@ -802,28 +791,16 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.rolling_std(test_data, test_int, 0.5)
         _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
         _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
-        
-        # Filters and trends
         _ = aot_bridge.rng_filter_loop(test_data, test_data2)
         _ = aot_bridge.smooth_range(test_data, 10, 2)
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data2)
-        
-        # Market indicators
-        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)).astype(np.int64))
-        _ = aot_bridge.calculate_atr_rma(test_data, test_data2, test_data2, 5)
-        _ = aot_bridge.calculate_atr_rma(test_data, test_data2, test_data2, 14)   
-
-        # MMH components
+        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)))
         _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
         _ = aot_bridge.calc_mmh_value_loop(test_data2, np.zeros_like(test_data2), np.ones_like(test_data2), len(test_data2))
         _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
-        _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))
-        
-        # Wick checks with volatility gating (NEW - corrected signatures)
-        _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3, test_data2, test_data2, test_threshold)
-        _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3, test_data2, test_data2, test_threshold)
-        
-        # Parallel sanitization
+        _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))  # ADD THIS LINE
+        _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3)
+        _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3)
         _ = aot_bridge.sanitize_array_numba_parallel(test_data, 0.0)
 
         warmup_elapsed = time.time() - warmup_start
@@ -894,7 +871,6 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
             piv[k] = 0.0
 
     return piv
-
             
 def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
     try:
@@ -914,8 +890,6 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'rma50_15': np.empty(n_15m, dtype=np.float64),
             'rma200_5': np.empty(n_5m, dtype=np.float64),
             'pivots': {},
-            'atr_short': np.empty(n_15m, dtype=np.float64),
-            'atr_long': np.empty(n_15m, dtype=np.float64),
         }
 
         ppo, ppo_signal = calculate_ppo_numpy(
@@ -952,13 +926,6 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-
-        results['atr_short'] = calculate_atr_rma(
-            data_15m["high"], data_15m["low"], data_15m["close"], period=5
-        )
-        results['atr_long'] = calculate_atr_rma(
-            data_15m["high"], data_15m["low"], data_15m["close"], period=14
-        )
 
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
@@ -1031,14 +998,9 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
             'rma200_5': np.full(len(data_5m.get("close", [])), np.nan, dtype=np.float64),
             'pivots': {},
-            'atr_short': np.full(n, np.nan, dtype=np.float64),
-            'atr_long': np.full(n, np.nan, dtype=np.float64),
         }
 
-def precompute_candle_quality(data_15m: Dict[str, np.ndarray], 
-                              atr_short: np.ndarray, atr_long: np.ndarray,
-                              rvol_threshold: float) -> Tuple[np.ndarray, np.ndarray]:
-    
+def precompute_candle_quality(data_15m: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:   
     try:
         n_ohlc = len(data_15m["close"])
         
@@ -1064,41 +1026,6 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray],
                 )
                 return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
         
-        if atr_short is None or len(atr_short) == 0:
-            logger.error("precompute_candle_quality: atr_short is None or empty")
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if atr_long is None or len(atr_long) == 0:
-            logger.error("precompute_candle_quality: atr_long is None or empty")
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if len(atr_short) != n_ohlc:
-            logger.error(
-                f"precompute_candle_quality: atr_short length mismatch "
-                f"(expected {n_ohlc}, got {len(atr_short)})"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if len(atr_long) != n_ohlc:
-            logger.error(
-                f"precompute_candle_quality: atr_long length mismatch "
-                f"(expected {n_ohlc}, got {len(atr_long)})"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if not isinstance(rvol_threshold, (int, float)) or rvol_threshold <= 0:
-            logger.error(
-                f"precompute_candle_quality: Invalid rvol_threshold={rvol_threshold} "
-                f"(must be positive number)"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if rvol_threshold > 10.0:
-            logger.warning(
-                f"precompute_candle_quality: rvol_threshold={rvol_threshold} seems very high "
-                f"(typical range 0.5-2.0)"
-            )
-        
         open_arr = data_15m["open"]
         high_arr = data_15m["high"]
         low_arr = data_15m["low"]
@@ -1106,12 +1033,12 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray],
         
         buy_quality = vectorized_wick_check_buy(
             open_arr, high_arr, low_arr, close_arr,
-            Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
+            Constants.MIN_WICK_RATIO
         )
         
         sell_quality = vectorized_wick_check_sell(
             open_arr, high_arr, low_arr, close_arr,
-            Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
+            Constants.MIN_WICK_RATIO
         )
         
         if len(buy_quality) != n_ohlc or len(sell_quality) != n_ohlc:
@@ -3509,9 +3436,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
-        buy_quality_arr, sell_quality_arr = precompute_candle_quality(
-            data_15m, indicators["atr_short"], indicators["atr_long"], cfg.RVOL_THRESHOLD)
-
+        buy_quality_arr, sell_quality_arr = precompute_candle_quality(data_15m)
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
 
@@ -3857,7 +3782,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
                 logger_pair.info(
-                    f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                    f"🔔🎯��� Sent {len(alerts_to_send)} alerts for {pair_name} | "
                     f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                 )
             except Exception as e:

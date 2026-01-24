@@ -44,7 +44,6 @@ try:
         rolling_min_max_numba,
         calculate_ppo_core,
         calculate_rsi_core,
-        calculate_atr_rma, 
         vectorized_wick_check_buy,
         vectorized_wick_check_sell,
     )
@@ -107,7 +106,6 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
         ('ema_loop_alpha', 'f8[:](f8[:], f8)', ema_loop_alpha),
         ('kalman_loop', 'f8[:](f8[:], i4, f8, f8)', kalman_loop),
         ('vwap_daily_loop', 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])', vwap_daily_loop),
-        ('calculate_atr_rma', 'f8[:](f8[:], f8[:], f8[:], i4)', calculate_atr_rma),
         ('rng_filter_loop', 'f8[:](f8[:], f8[:])', rng_filter_loop),
         ('smooth_range', 'f8[:](f8[:], i4, i4)', smooth_range),
         ('calculate_trends_with_state', 'Tuple((b1[:], b1[:]))(f8[:], f8[:])', calculate_trends_with_state),
@@ -120,13 +118,13 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
         ('rolling_min_max_numba', 'Tuple((f8[:], f8[:]))(f8[:], i4)', rolling_min_max_numba),
         ('calculate_ppo_core', 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)', calculate_ppo_core),
         ('calculate_rsi_core', 'f8[:](f8[:], i4)', calculate_rsi_core),
-        ('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)', vectorized_wick_check_buy),
-        ('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)', vectorized_wick_check_sell),
+        ('vectorized_wick_check_buy', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)', vectorized_wick_check_buy),
+        ('vectorized_wick_check_sell', 'b1[:](f8[:], f8[:], f8[:], f8[:], f8)', vectorized_wick_check_sell),
     ]
-
+    
     for idx, (name, sig, func) in enumerate(functions_to_export, 1):
         try:
-            print(f"  [{idx:2d}/21] {name}...", end=" ", flush=True)
+            print(f"  [{idx:2d}/20] {name}...", end=" ", flush=True)
             cc.export(name, sig)(func)
             signatures[name] = sig
             print("✅")
@@ -135,7 +133,7 @@ def export_all_functions(cc: CC, type_defs: tuple) -> Dict[str, Any]:
             traceback.print_exc()
             raise
     
-    print(f"\n✅ All 21 functions exported successfully\n")
+    print(f"\n✅ All 20 functions exported successfully\n")
     return signatures
 
 
