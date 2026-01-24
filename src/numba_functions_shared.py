@@ -29,7 +29,7 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """Calculate sample rolling std (n-1) to match Pine ta.stdev"""
+    """Calculate population rolling std (divided by n) to match Pine Script's ta.stdev."""
     n = len(close)
     sd = np.empty(n, dtype=np.float64)
     resp = 0.00001 if responsiveness < 0.00001 else (1.0 if responsiveness > 1.0 else responsiveness)
@@ -48,7 +48,7 @@ def rolling_std(close, period, responsiveness):
             if not np.isnan(old_val):
                 window_sum -= old_val
                 window_sq_sum -= old_val * old_val
-                window_count -= 1 # [cite: 3]
+                window_count -= 1
         
         if not np.isnan(curr):
             window_sum += curr
@@ -58,18 +58,14 @@ def rolling_std(close, period, responsiveness):
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
      
-        # Calculate Sample SD (n-1)
         if window_count < 2:
             sd[i] = 0.0
         else:
             mean = window_sum / window_count
             pop_variance = (window_sq_sum / window_count) - (mean * mean)
-            # Convert to Sample Variance: pop_var * (n / (n-1))
-            sample_variance = pop_variance * (window_count / (window_count - 1))
-            sd[i] = np.sqrt(max(0.0, sample_variance)) * resp
-
+            sd[i] = np.sqrt(max(0.0, pop_variance)) * resp
+            
     return sd
-
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
@@ -626,58 +622,100 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
+@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
+def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    
+    n = len(close)
+    if n < period:
+        return np.full(n, np.nan, dtype=np.float64)
+    
+    # Step 1: Calculate True Range
+    tr = np.empty(n, dtype=np.float64)
+    tr[0] = high[0] - low[0]
+    
+    for i in range(1, n):
+        h = high[i]
+        l = low[i]
+        c = close[i - 1]  # Previous close
+        
+        tr1 = h - l                # High - Low
+        tr2 = abs(h - c)           # Abs(High - Previous Close)
+        tr3 = abs(l - c)           # Abs(Low - Previous Close)
+        tr[i] = max(tr1, tr2, tr3)
+    
+    # Step 2: Apply RMA (Wilder's) with alpha = 1/period
+    alpha = 1.0 / float(period)
+    atr = ema_loop_alpha(tr, alpha)
+    
+    return atr
 
-@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
-def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio):
+@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
+def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio, 
+                               atr_short, atr_long, rvol_threshold):
+    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
     for i in range(n):
+        # GATE 1: Volatility expansion with threshold (Pine: atr1 > atr3 * rvolThreshold)
+        if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
+            continue
+        
+        if atr_short[i] <= (atr_long[i] * rvol_threshold):
+            continue  # Volatility not expanding enough, skip this candle
+        
+        # GATE 2: Candle range
         candle_range = high_p[i] - low_p[i]
         if candle_range <= 1e-9:
             continue  # Range too small
-
-        # Must be green for buy
+        
+        # GATE 3: Must be green candle for buy
         if close_p[i] <= open_p[i]:
             continue
-
-        # Upper wick = distance from close to high
+        
+        # GATE 4: Upper wick ratio (rejection wicks)
         upper_wick = high_p[i] - close_p[i]
-
-        # Safeguard: skip corrupted data
         if upper_wick < 0:
-            continue
-
+            continue  # Corrupted data
+        
         wick_ratio = upper_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
-
+    
     return result
 
-@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8)", nogil=True, cache=True)
-def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio):
+
+@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
+def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio, 
+                                atr_short, atr_long, rvol_threshold):
+    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
     for i in range(n):
+        # GATE 1: Volatility expansion with threshold (Pine: atr1 > atr3 * rvolThreshold)
+        if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
+            continue
+        
+        if atr_short[i] <= (atr_long[i] * rvol_threshold):
+            continue  # Volatility not expanding enough, skip this candle
+        
+        # GATE 2: Candle range
         candle_range = high_p[i] - low_p[i]
         if candle_range <= 1e-9:
             continue  # Range too small
-
-        # Must be red for sell
+        
+        # GATE 3: Must be red candle for sell
         if close_p[i] >= open_p[i]:
             continue
-
-        # Lower wick = distance from low to close
+        
+        # GATE 4: Lower wick ratio (rejection wicks)
         lower_wick = close_p[i] - low_p[i]
-
-
-        # Safeguard: skip corrupted data
         if lower_wick < 0:
-            continue
-
+            continue  # Corrupted data
+        
         wick_ratio = lower_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
-
+    
     return result
 
 # ============================================================================
@@ -718,8 +756,9 @@ __all__ = [
     'calc_mmh_momentum_loop',
 
     # Pattern Recognition
+    'calculate_atr_rma', 
     'vectorized_wick_check_buy',
     'vectorized_wick_check_sell',
 ]
 
-assert len(__all__) == 20, f"Expected 20 functions, found {len(__all__)}"
+assert len(__all__) == 21, f"Expected 21 functions, found {len(__all__)}"
