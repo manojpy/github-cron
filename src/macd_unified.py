@@ -34,33 +34,15 @@ import warnings
 import contextlib 
 import traceback
 
-warnings.filterwarnings('ignore', category=RuntimeWarning, module='pycparser')
-warnings.filterwarnings('ignore', message='.*parsing methods must have __doc__.*')
-
-
-from aot_bridge import (
-    sanitize_array_numba,
-    sanitize_array_numba_parallel,
-    ema_loop,
-    ema_loop_alpha,
-    kalman_loop,
-    vwap_daily_loop,
-    rng_filter_loop,
-    smooth_range,
-    calculate_trends_with_state, 
-    calc_mmh_worm_loop,
-    calc_mmh_value_loop,
-    calc_mmh_momentum_loop,
-    rolling_std,
-    calc_mmh_momentum_smoothing,
-    rolling_mean_numba,
-    rolling_min_max_numba,
-    calculate_ppo_core,
-    calculate_rsi_core,
-    calculate_atr_rma, 
-    vectorized_wick_check_buy,
-    vectorized_wick_check_sell
-)
+try:
+    AOT_AVAILABLE = True
+    AOT_IMPORT_SUCCESS = True
+    AOT_IMPORT_ERROR = None
+except ImportError as e:
+    AOT_AVAILABLE = False
+    AOT_IMPORT_SUCCESS = False
+    AOT_IMPORT_ERROR = str(e)
+    aot_bridge = None
 
 try:
     import orjson
@@ -146,6 +128,7 @@ class BotConfig(BaseModel):
     SRSI_EMA_LEN: int = 5
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
+
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 6
@@ -455,6 +438,60 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         if cfg.DEBUG_MODE:
             logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
         return str(dt_or_ts)
+
+if not AOT_IMPORT_SUCCESS:
+    logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
+    logger.warning("Creating fallback stub - will use pure JIT Numba")
+   
+    class _AotBridgeStub:        
+        @staticmethod
+        def is_using_aot():
+            return False
+        
+        @staticmethod
+        def get_fallback_reason():
+            return f"aot_bridge not installed: {AOT_IMPORT_ERROR}"
+        
+        @staticmethod
+        def ensure_initialized():
+            pass
+        
+        def __getattr__(self, name):
+            """Dynamically import from numba_functions_shared"""
+            try:
+                import numba_functions_shared
+                return getattr(numba_functions_shared, name)
+            except (AttributeError, ImportError) as e:
+                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
+    aot_bridge = _AotBridgeStub()
+    AOT_AVAILABLE = False
+    logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
+else:
+    logger.info("🚀 aot_bridge imported successfully - AOT compilation active")
+
+from aot_bridge import (
+    sanitize_array_numba,
+    sanitize_array_numba_parallel,
+    ema_loop,
+    ema_loop_alpha,
+    kalman_loop,
+    vwap_daily_loop,
+    rng_filter_loop,
+    smooth_range,
+    calculate_trends_with_state, 
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    rolling_std,
+    calc_mmh_momentum_smoothing,
+    rolling_mean_numba,
+    rolling_min_max_numba,
+    calculate_ppo_core,
+    calculate_rsi_core,
+    calculate_atr_rma, 
+    vectorized_wick_check_buy,
+    vectorized_wick_check_sell
+)
 
 shutdown_event = asyncio.Event()
 
