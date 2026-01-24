@@ -367,14 +367,22 @@ def calculate_ppo_core(close, fast, slow, signal):
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
     n = len(close)
-    rsi = np.full(n, 50.0, dtype=np.float64)
-    if n <= period: return rsi
+    if n < period + 1:
+        return np.full(n, np.nan)
     
-    diff = np.diff(close)
-    gains = np.zeros(n); losses = np.zeros(n)
-    gains[1:] = np.where(diff > 0, diff, 0)
-    losses[1:] = np.where(diff < 0, -diff, 0)
+    diff = np.empty(n - 1, dtype=np.float64)
+    for i in range(n - 1):
+        diff[i] = close[i+1] - close[i]
+        
+    gains = np.zeros(n - 1, dtype=np.float64)
+    losses = np.zeros(n - 1, dtype=np.float64)
     
+    for i in range(n - 1):
+        if diff[i] > 0:
+            gains[i] = diff[i]
+        else:
+            losses[i] = -diff[i]
+
     alpha = 1.0 / period
     avg_g = np.nanmean(gains[1:period+1]); avg_l = np.nanmean(losses[1:period+1])
     
