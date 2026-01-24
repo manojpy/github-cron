@@ -35,16 +35,6 @@ import contextlib
 import traceback
 
 try:
-    AOT_AVAILABLE = True
-    AOT_IMPORT_SUCCESS = True
-    AOT_IMPORT_ERROR = None
-except ImportError as e:
-    AOT_AVAILABLE = False
-    AOT_IMPORT_SUCCESS = False
-    AOT_IMPORT_ERROR = str(e)
-    aot_bridge = None
-
-try:
     import orjson
     
     def json_dumps(obj: Any) -> str:
@@ -436,60 +426,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
             logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
         return str(dt_or_ts)
 
-if not AOT_IMPORT_SUCCESS:
-    logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
-    logger.warning("Creating fallback stub - will use pure JIT Numba")
-   
-    class _AotBridgeStub:        
-        @staticmethod
-        def is_using_aot():
-            return False
-        
-        @staticmethod
-        def get_fallback_reason():
-            return f"aot_bridge not installed: {AOT_IMPORT_ERROR}"
-        
-        @staticmethod
-        def ensure_initialized():
-            pass
-        
-        def __getattr__(self, name):
-            """Dynamically import from numba_functions_shared"""
-            try:
-                import numba_functions_shared
-                return getattr(numba_functions_shared, name)
-            except (AttributeError, ImportError) as e:
-                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
-    aot_bridge = _AotBridgeStub()
-    AOT_AVAILABLE = False
-    logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
-else:
-    logger.info("🚀 aot_bridge imported successfully - AOT compilation active")
-
-from aot_bridge import (
-    sanitize_array_numba,
-    sanitize_array_numba_parallel,
-    ema_loop,
-    ema_loop_alpha,
-    kalman_loop,
-    vwap_daily_loop,
-    rng_filter_loop,
-    smooth_range,
-    calculate_trends_with_state, 
-    calc_mmh_worm_loop,
-    calc_mmh_value_loop,
-    calc_mmh_momentum_loop,
-    rolling_std,
-    calc_mmh_momentum_smoothing,
-    rolling_mean_numba,
-    rolling_min_max_numba,
-    calculate_ppo_core,
-    calculate_rsi_core,
-    calculate_atr_rma, 
-    vectorized_wick_check_buy,
-    vectorized_wick_check_sell
-)
-
 shutdown_event = asyncio.Event()
 
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
@@ -743,96 +679,74 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:  
-    try:
-        if close is None or len(close) < period:
-            return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
+def calculate_magical_momentum_hist(data: Dict[str, np.ndarray], period: int, responsiveness: float) -> np.ndarray:
+    """
+    Optimized MMH calculation.
+    Uses the new stable rolling_std and vectorized intermediate math.
+    """
+    close = data["close"]
+    rows = len(close)
+    
+    if rows < period:
+        return np.full(rows, np.nan)
 
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        close_c = np.ascontiguousarray(close, dtype=np.float64)
+    # 1. Stable Standard Deviation (matches Pine Script accurately)
+    sd = aot_bridge.rolling_std(close, 50, responsiveness)
 
-        sd = rolling_std(close_c, 50, resp_clamped)
+    # 2. Worm Calculation (Recursive loop)
+    worm = aot_bridge.calc_mmh_worm_loop(close, sd, rows)
 
-        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
+    # 3. Simple Moving Average (ta.sma)
+    ma = aot_bridge.rolling_mean_numba(close, period)
 
-        ma = rolling_mean_numba(close_c, period)
+    # 4. VECTORIZED Raw Momentum - (Worm - MA) / Worm
+    # We do this in NumPy rather than a loop for maximum speed
+    with np.errstate(divide='ignore', invalid='ignore'):
+        raw_momentum = (worm - ma) / worm
+        raw_momentum[~np.isfinite(raw_momentum)] = 0.0
 
-        raw = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            if np.abs(worm_arr[i]) < 1e-10:
-                raw[i] = np.nan
-            else:
-                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
+    # 5. Min/Max range of raw momentum
+    min_med, max_med = aot_bridge.rolling_min_max_numba(raw_momentum, period)
 
-        min_med, max_med = rolling_min_max_numba(raw, period)
+    # 6. Value Loop (Fisher-like transform)
+    value_arr = aot_bridge.calc_mmh_value_loop(raw_momentum, min_med, max_med, rows)
 
-        value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
+    # 7. Momentum Loop (Log transform)
+    momentum_raw = aot_bridge.calc_mmh_momentum_loop(value_arr, rows)
 
-        momentum = calc_mmh_momentum_loop(value_arr, rows)
+    # Step 8: Final Smoothing
+    momentum = aot_bridge.calc_mmh_momentum_smoothing(momentum_raw, rows)
 
-        momentum = calc_mmh_momentum_smoothing(momentum, rows)
+    return momentum
 
-        return momentum
-
-    except Exception as e:
-        traceback.print_exc()
-        return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
-
-def warmup_if_needed() -> None:
-    if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP:
-        logger.info("♨️ Skipping warmup (AOT active or explicitly disabled)")
+def warmup_if_needed():
+    
+    if not aot_bridge.requires_warmup():
+        logger.info("🚀 AOT Library detected: Skipping warmup (functions already compiled)")
         return
 
-    logger.info("🔥 Warming up JIT compilation…")
-    warmup_start = time.time()
+    logger.info("⏳ AOT not found: Performing Numba JIT warmup for critical functions...")
+    start_time = time.time()
+    
     try:
-        test_data = np.random.random(200).astype(np.float64) * 1000
-        test_data2 = np.random.random(200).astype(np.float64)
-        test_int = 14
-        test_threshold = 1.0
+        # Create minimal dummy data for compilation
+        dummy_data = np.random.random(100).astype(np.float64)
+        dummy_data_32 = np.random.random(100).astype(np.float32) # If any use f4
         
-        # Core indicators
-        _ = aot_bridge.ema_loop(test_data, 7.0)
-        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
-        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
-        _ = aot_bridge.calculate_rsi_core(test_data, 21)
-        _ = aot_bridge.sanitize_array_numba(test_data, 0.0)
-        _ = aot_bridge.rolling_mean_numba(test_data, test_int)
-        _ = aot_bridge.rolling_std(test_data, test_int, 0.5)
-        _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
-        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
+        # Warmup the most heavy indicators
+        _ = aot_bridge.rolling_std(dummy_data, 14, 0.9)
+        _ = aot_bridge.ema_loop(dummy_data, 14.0)
+        _ = aot_bridge.rolling_mean_numba(dummy_data, 14)
         
-        # Filters and trends
-        _ = aot_bridge.rng_filter_loop(test_data, test_data2)
-        _ = aot_bridge.smooth_range(test_data, 10, 2)
-        _ = aot_bridge.calculate_trends_with_state(test_data, test_data2)
+        # Warmup MMH core
+        dummy_sd = np.full(100, 0.01, dtype=np.float64)
+        _ = aot_bridge.calc_mmh_worm_loop(dummy_data, dummy_sd, 100)
         
-        # Market indicators
-        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)).astype(np.int64))
-        _ = aot_bridge.calculate_atr_rma(test_data, test_data2, test_data2, 5)
-        _ = aot_bridge.calculate_atr_rma(test_data, test_data2, test_data2, 14)   
-
-        # MMH components
-        _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
-        _ = aot_bridge.calc_mmh_value_loop(test_data2, np.zeros_like(test_data2), np.ones_like(test_data2), len(test_data2))
-        _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
-        _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))
-        
-        # Wick checks with volatility gating (NEW - corrected signatures)
-        _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3, test_data2, test_data2, test_threshold)
-        _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3, test_data2, test_data2, test_threshold)
-        
-        # Parallel sanitization
-        _ = aot_bridge.sanitize_array_numba_parallel(test_data, 0.0)
-
-        warmup_elapsed = time.time() - warmup_start
-        logger.info("✅ JIT warmup complete (%.2f s)", warmup_elapsed)
-
+        elapsed = time.time() - start_time
+        logger.info(f"✅ JIT Warmup complete in {elapsed:.2f}s")
     except Exception as e:
-        warmup_elapsed = time.time() - warmup_start
-        logger.warning("Warmup failed (non-fatal, elapsed %.2f s): %s", warmup_elapsed, e)
-
+        logger.warning(f"⚠️ Warmup partially failed: {e}")
+, 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -1730,81 +1644,77 @@ class DataFetcher:
         logger.info(f"📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
-def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     if not result or not isinstance(result, dict):
         logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
+    
     res = result.get("result", {}) or {}
     required = ("t", "o", "h", "l", "c", "v")
     if not all(k in res for k in required):
         logger.warning(f"parse_candles_to_numpy: missing required fields. Have: {list(res.keys())}")
         return None
+
     try:
-        n = len(res["t"])
+        # 1. Initial conversion to NumPy arrays
+        data = {
+            "timestamp": np.asarray(res["t"], dtype=np.int64),
+            "open":      np.asarray(res["o"], dtype=np.float64),
+            "high":      np.asarray(res["h"], dtype=np.float64),
+            "low":       np.asarray(res["l"], dtype=np.float64),
+            "close":     np.asarray(res["c"], dtype=np.float64),
+            "volume":    np.asarray(res["v"], dtype=np.float64),
+        }
+
+        n = len(data["timestamp"])
         if n == 0:
             logger.warning("parse_candles_to_numpy: empty candle array")
             return None
-        data = {
-            "timestamp": np.asarray(res["t"], dtype=np.int64),
-            "open": np.asarray(res["o"], dtype=np.float64),
-            "high": np.asarray(res["h"], dtype=np.float64),
-            "low": np.asarray(res["l"], dtype=np.float64),
-            "close": np.asarray(res["c"], dtype=np.float64),
-            "volume": np.asarray(res["v"], dtype=np.float64),
-        }
 
+        # 2. Handle Milliseconds vs Seconds (same as your original)
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
-    
-        errors = []
-        n = len(data["timestamp"])
 
-        for i in range(n):
-            o, h, l, c = (
-                data["open"][i], 
-                data["high"][i], 
-                data["low"][i], 
-                data["close"][i]
-            )
-    
-            if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
-                errors.append(f"Index {i}: NaN in OHLC")
-                continue
-    
-            if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
-                errors.append(f"Index {i}: Inf in OHLC")
-                continue
-    
-            if not (l <= o and o <= h and l <= c and c <= h and l <= h):
-                errors.append(
-                    f"Index {i}: Invalid OHLC (O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f})"
-                )
-                continue
-    
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-                errors.append(f"Index {i}: Non-positive price")
-                continue
+        # 3. VECTORIZED VALIDATION (Replaces the 'for' loop)
+        o, h, l, c = data["open"], data["high"], data["low"], data["close"]
 
-        if errors:
-            logger.error(f"parse_candles_to_numpy: {len(errors)} invalid candles found:")
-            for err in errors[:5]:
-                logger.error(f"  {err}")
-            return None
+        # Check for NaN or Inf
+        any_nan = np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c)
+        any_inf = np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c)
         
-        if np.any(data["close"] <= 0) or np.any(data["open"] <= 0) or \
-           np.any(data["high"] <= 0) or np.any(data["low"] <= 0):
-            logger.error("parse_candles_to_numpy: Found non-positive prices")
-            return None
+        # Check OHLC Relationships (L <= O <= H and L <= C <= H)
+        invalid_rel = ~((l <= o) & (o <= h) & (l <= c) & (c <= h))
         
-        hl_mid = (data["high"] + data["low"]) / 2.0
-        close_deviation = np.abs(data["close"] - hl_mid) / hl_mid
-        if np.any(close_deviation > 0.5):
-            deviation_count = np.sum(close_deviation > 0.5)
+        # Check Non-positive prices
+        non_positive = (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
+
+        # Combine all errors into a single mask
+        error_mask = any_nan | any_inf | invalid_rel | non_positive
+        error_count = np.sum(error_mask)
+
+        if error_count > 0:
+            logger.error(f"parse_candles_to_numpy: {error_count} invalid candles found.")
+            # Optional: Log the first few indices where errors occurred
+            first_errors = np.where(error_mask)[0][:5]
+            for idx in first_errors:
+                logger.error(f"  Index {idx}: Data Anomaly (O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f})")
+            return None
+
+        # 4. DATA ANOMALY CHECK (Deviation > 50% from Midpoint)
+        hl_mid = (h + l) / 2.0
+        # Use epsilon to avoid division by zero
+        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
+        deviation_mask = close_deviation > 0.5
+        deviation_count = np.sum(deviation_mask)
+
+        if deviation_count > 0:
             logger.warning(
                 f"parse_candles_to_numpy: Found {deviation_count} candles with "
                 f"Close deviating >50% from High-Low midpoint (potential data anomaly)"
             )
+
         return data
+
     except Exception as e:
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
