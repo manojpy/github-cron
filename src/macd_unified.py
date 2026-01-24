@@ -34,6 +34,31 @@ import warnings
 import contextlib 
 import traceback
 
+
+from aot_bridge import (
+    sanitize_array_numba,
+    sanitize_array_numba_parallel,
+    ema_loop,
+    ema_loop_alpha,
+    kalman_loop,
+    vwap_daily_loop,
+    rng_filter_loop,
+    smooth_range,
+    calculate_trends_with_state, 
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    rolling_std,
+    calc_mmh_momentum_smoothing,
+    rolling_mean_numba,
+    rolling_min_max_numba,
+    calculate_ppo_core,
+    calculate_rsi_core,
+    calculate_atr_rma, 
+    vectorized_wick_check_buy,
+    vectorized_wick_check_sell
+)
+
 try:
     import orjson
     
@@ -679,45 +704,41 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(default_len, dtype=np.float64)
         )
         
-def calculate_magical_momentum_hist(data: Dict[str, np.ndarray], period: int, responsiveness: float) -> np.ndarray:
-    """
-    Optimized MMH calculation.
-    Uses the new stable rolling_std and vectorized intermediate math.
-    """
-    close = data["close"]
-    rows = len(close)
-    
-    if rows < period:
-        return np.full(rows, np.nan)
+def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:  
+    try:
+        if close is None or len(close) < period:
+            return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
-    # 1. Stable Standard Deviation (matches Pine Script accurately)
-    sd = aot_bridge.rolling_std(close, 50, responsiveness)
+        rows = len(close)
+        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
+        close_c = np.ascontiguousarray(close, dtype=np.float64)
 
-    # 2. Worm Calculation (Recursive loop)
-    worm = aot_bridge.calc_mmh_worm_loop(close, sd, rows)
+        sd = rolling_std(close_c, 50, resp_clamped)
 
-    # 3. Simple Moving Average (ta.sma)
-    ma = aot_bridge.rolling_mean_numba(close, period)
+        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
 
-    # 4. VECTORIZED Raw Momentum - (Worm - MA) / Worm
-    # We do this in NumPy rather than a loop for maximum speed
-    with np.errstate(divide='ignore', invalid='ignore'):
-        raw_momentum = (worm - ma) / worm
-        raw_momentum[~np.isfinite(raw_momentum)] = 0.0
+        ma = rolling_mean_numba(close_c, period)
 
-    # 5. Min/Max range of raw momentum
-    min_med, max_med = aot_bridge.rolling_min_max_numba(raw_momentum, period)
+        raw = np.empty(rows, dtype=np.float64)
+        for i in range(rows):
+            if np.abs(worm_arr[i]) < 1e-10:
+                raw[i] = np.nan
+            else:
+                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
 
-    # 6. Value Loop (Fisher-like transform)
-    value_arr = aot_bridge.calc_mmh_value_loop(raw_momentum, min_med, max_med, rows)
+        min_med, max_med = rolling_min_max_numba(raw, period)
 
-    # 7. Momentum Loop (Log transform)
-    momentum_raw = aot_bridge.calc_mmh_momentum_loop(value_arr, rows)
+        value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
 
-    # Step 8: Final Smoothing
-    momentum = aot_bridge.calc_mmh_momentum_smoothing(momentum_raw, rows)
+        momentum = calc_mmh_momentum_loop(value_arr, rows)
 
-    return momentum
+        momentum = calc_mmh_momentum_smoothing(momentum, rows)
+
+        return momentum
+
+    except Exception as e:
+        traceback.print_exc()
+        return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
 def warmup_if_needed():
     
@@ -746,7 +767,7 @@ def warmup_if_needed():
         logger.info(f"✅ JIT Warmup complete in {elapsed:.2f}s")
     except Exception as e:
         logger.warning(f"⚠️ Warmup partially failed: {e}")
-        
+
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
