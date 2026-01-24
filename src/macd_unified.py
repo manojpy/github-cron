@@ -34,15 +34,29 @@ import warnings
 import contextlib 
 import traceback
 
-try:
-    AOT_AVAILABLE = True
-    AOT_IMPORT_SUCCESS = True
-    AOT_IMPORT_ERROR = None
-except ImportError as e:
-    AOT_AVAILABLE = False
-    AOT_IMPORT_SUCCESS = False
-    AOT_IMPORT_ERROR = str(e)
-    aot_bridge = None
+from aot_bridge import (
+    sanitize_array_numba,
+    sanitize_array_numba_parallel,
+    ema_loop,
+    ema_loop_alpha,
+    kalman_loop,
+    vwap_daily_loop,
+    rng_filter_loop,
+    smooth_range,
+    calculate_trends_with_state, 
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    rolling_std,
+    calc_mmh_momentum_smoothing,
+    rolling_mean_numba,
+    rolling_min_max_numba,
+    calculate_ppo_core,
+    calculate_rsi_core,
+    calculate_atr_rma, 
+    vectorized_wick_check_buy,
+    vectorized_wick_check_sell
+)
 
 try:
     import orjson
@@ -128,7 +142,6 @@ class BotConfig(BaseModel):
     SRSI_EMA_LEN: int = 5
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
-
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 6
@@ -438,60 +451,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         if cfg.DEBUG_MODE:
             logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
         return str(dt_or_ts)
-
-if not AOT_IMPORT_SUCCESS:
-    logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
-    logger.warning("Creating fallback stub - will use pure JIT Numba")
-   
-    class _AotBridgeStub:        
-        @staticmethod
-        def is_using_aot():
-            return False
-        
-        @staticmethod
-        def get_fallback_reason():
-            return f"aot_bridge not installed: {AOT_IMPORT_ERROR}"
-        
-        @staticmethod
-        def ensure_initialized():
-            pass
-        
-        def __getattr__(self, name):
-            """Dynamically import from numba_functions_shared"""
-            try:
-                import numba_functions_shared
-                return getattr(numba_functions_shared, name)
-            except (AttributeError, ImportError) as e:
-                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
-    aot_bridge = _AotBridgeStub()
-    AOT_AVAILABLE = False
-    logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
-else:
-    logger.info("🚀 aot_bridge imported successfully - AOT compilation active")
-
-from aot_bridge import (
-    sanitize_array_numba,
-    sanitize_array_numba_parallel,
-    ema_loop,
-    ema_loop_alpha,
-    kalman_loop,
-    vwap_daily_loop,
-    rng_filter_loop,
-    smooth_range,
-    calculate_trends_with_state, 
-    calc_mmh_worm_loop,
-    calc_mmh_value_loop,
-    calc_mmh_momentum_loop,
-    rolling_std,
-    calc_mmh_momentum_smoothing,
-    rolling_mean_numba,
-    rolling_min_max_numba,
-    calculate_ppo_core,
-    calculate_rsi_core,
-    calculate_atr_rma, 
-    vectorized_wick_check_buy,
-    vectorized_wick_check_sell
-)
 
 shutdown_event = asyncio.Event()
 
@@ -1709,77 +1668,81 @@ class DataFetcher:
         logger.info(f"📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
-def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:  
     if not result or not isinstance(result, dict):
         logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
-    
     res = result.get("result", {}) or {}
     required = ("t", "o", "h", "l", "c", "v")
     if not all(k in res for k in required):
         logger.warning(f"parse_candles_to_numpy: missing required fields. Have: {list(res.keys())}")
         return None
-
     try:
-        # 1. Initial conversion to NumPy arrays
-        data = {
-            "timestamp": np.asarray(res["t"], dtype=np.int64),
-            "open":      np.asarray(res["o"], dtype=np.float64),
-            "high":      np.asarray(res["h"], dtype=np.float64),
-            "low":       np.asarray(res["l"], dtype=np.float64),
-            "close":     np.asarray(res["c"], dtype=np.float64),
-            "volume":    np.asarray(res["v"], dtype=np.float64),
-        }
-
-        n = len(data["timestamp"])
+        n = len(res["t"])
         if n == 0:
             logger.warning("parse_candles_to_numpy: empty candle array")
             return None
+        data = {
+            "timestamp": np.asarray(res["t"], dtype=np.int64),
+            "open": np.asarray(res["o"], dtype=np.float64),
+            "high": np.asarray(res["h"], dtype=np.float64),
+            "low": np.asarray(res["l"], dtype=np.float64),
+            "close": np.asarray(res["c"], dtype=np.float64),
+            "volume": np.asarray(res["v"], dtype=np.float64),
+        }
 
-        # 2. Handle Milliseconds vs Seconds (same as your original)
         if data["timestamp"][-1] > 1_000_000_000_000:
             data["timestamp"] //= 1000
+    
+        errors = []
+        n = len(data["timestamp"])
 
-        # 3. VECTORIZED VALIDATION (Replaces the 'for' loop)
-        o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+        for i in range(n):
+            o, h, l, c = (
+                data["open"][i], 
+                data["high"][i], 
+                data["low"][i], 
+                data["close"][i]
+            )
+    
+            if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
+                errors.append(f"Index {i}: NaN in OHLC")
+                continue
+    
+            if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
+                errors.append(f"Index {i}: Inf in OHLC")
+                continue
+    
+            if not (l <= o and o <= h and l <= c and c <= h and l <= h):
+                errors.append(
+                    f"Index {i}: Invalid OHLC (O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f})"
+                )
+                continue
+    
+            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+                errors.append(f"Index {i}: Non-positive price")
+                continue
 
-        # Check for NaN or Inf
-        any_nan = np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c)
-        any_inf = np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c)
-        
-        # Check OHLC Relationships (L <= O <= H and L <= C <= H)
-        invalid_rel = ~((l <= o) & (o <= h) & (l <= c) & (c <= h))
-        
-        # Check Non-positive prices
-        non_positive = (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
-
-        # Combine all errors into a single mask
-        error_mask = any_nan | any_inf | invalid_rel | non_positive
-        error_count = np.sum(error_mask)
-
-        if error_count > 0:
-            logger.error(f"parse_candles_to_numpy: {error_count} invalid candles found.")
-            # Optional: Log the first few indices where errors occurred
-            first_errors = np.where(error_mask)[0][:5]
-            for idx in first_errors:
-                logger.error(f"  Index {idx}: Data Anomaly (O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f})")
+        if errors:
+            logger.error(f"parse_candles_to_numpy: {len(errors)} invalid candles found:")
+            for err in errors[:5]:
+                logger.error(f"  {err}")
             return None
-
-        # 4. DATA ANOMALY CHECK (Deviation > 50% from Midpoint)
-        hl_mid = (h + l) / 2.0
-        # Use epsilon to avoid division by zero
-        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
-        deviation_mask = close_deviation > 0.5
-        deviation_count = np.sum(deviation_mask)
-
-        if deviation_count > 0:
+        
+        if np.any(data["close"] <= 0) or np.any(data["open"] <= 0) or \
+           np.any(data["high"] <= 0) or np.any(data["low"] <= 0):
+            logger.error("parse_candles_to_numpy: Found non-positive prices")
+            return None
+        
+        hl_mid = (data["high"] + data["low"]) / 2.0
+        close_deviation = np.abs(data["close"] - hl_mid) / hl_mid
+        if np.any(close_deviation > 0.5):
+            deviation_count = np.sum(close_deviation > 0.5)
             logger.warning(
                 f"parse_candles_to_numpy: Found {deviation_count} candles with "
                 f"Close deviating >50% from High-Low midpoint (potential data anomaly)"
             )
-
         return data
-
     except Exception as e:
         logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
         return None
