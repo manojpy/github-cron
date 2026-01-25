@@ -19,9 +19,9 @@ import importlib.util
 import numpy as np
 
 # Suppress Numba/pcparser warnings at import time
-warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*parsing methods must have __doc__.*")
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", message=".*inspect.getargspec.*")
+#warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*parsing methods must have __doc__.*")
+#warnings.filterwarnings("ignore", category=DeprecationWarning)
+#warnings.filterwarnings("ignore", message=".*inspect.getargspec.*")
 
 # Global state
 _aot_module: Optional[Any] = None
