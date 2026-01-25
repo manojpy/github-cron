@@ -1,12 +1,14 @@
-
 # ============================================================================
 # Shared Numba Function Definitions - Single Source of Truth 
 # ============================================================================
 
 import numpy as np
 from numba import njit, prange, types
-from numba.types import Tuple
+from numba.types import Tuple, bool_
 
+# ============================================================================
+# 1. SANITIZATION
+# ============================================================================
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
@@ -60,7 +62,6 @@ def rolling_std(close, period, responsiveness):
     sd[mask] = 0.0
     
     return sd
-
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
@@ -714,46 +715,32 @@ def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio,
     return result
 
 # ============================================================================
-# METADATA & EXPORTS
+# AOT EXPORT CONFIGURATION (Import this in aot_build.py)
 # ============================================================================
 
-__all__ = [
-    # Sanitization
-    'sanitize_array_numba',
-    'sanitize_array_numba_parallel',
+EXPORT_CONFIG = {
+    'sanitize_array_numba': 'f8[:](f8[:], f8)',
+    'sanitize_array_numba_parallel': 'f8[:](f8[:], f8)',
+    'rolling_std': 'f8[:](f8[:], i4, f8)',
+    'rolling_mean_numba': 'f8[:](f8[:], i4)',
+    'rolling_min_max_numba': 'Tuple((f8[:], f8[:]))(f8[:], i4)',
+    'calc_mmh_worm_loop': 'f8[:](f8[:], f8[:], i8)',
+    'calc_mmh_value_loop': 'f8[:](f8[:], f8[:], f8[:], i4)',
+    'calc_mmh_momentum_loop': 'f8[:](f8[:], i4)',
+    'calc_mmh_momentum_smoothing': 'f8[:](f8[:], i4)',
+    'ema_loop': 'f8[:](f8[:], f8)',
+    'ema_loop_alpha': 'f8[:](f8[:], f8)',
+    'rng_filter_loop': 'f8[:](f8[:], f8[:])',
+    'smooth_range': 'f8[:](f8[:], i4, i4)',
+    'calculate_trends_with_state': 'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
+    'kalman_loop': 'f8[:](f8[:], i4, f8, f8)',
+    'vwap_daily_loop': 'f8[:](f8[:], f8[:], f8[:], f8[:], i8[:])',
+    'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
+    'calculate_rsi_core': 'f8[:](f8[:], i4)',
+    'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',
+    'vectorized_wick_check_buy': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)',
+    'vectorized_wick_check_sell': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)',
+}
 
-    # Moving Averages
-    'ema_loop',
-    'ema_loop_alpha',
-
-    # Filters
-    'rng_filter_loop',
-    'smooth_range',
-    'calculate_trends_with_state',
-    'kalman_loop',
-
-    # Market Indicators
-    'vwap_daily_loop',
-
-    # Statistical
-    'rolling_std',
-    'calc_mmh_momentum_smoothing',
-    'rolling_mean_numba',
-    'rolling_min_max_numba',
-
-    # Oscillators
-    'calculate_ppo_core',
-    'calculate_rsi_core',
-
-    # MMH Components
-    'calc_mmh_worm_loop',
-    'calc_mmh_value_loop',
-    'calc_mmh_momentum_loop',
-
-    # Pattern Recognition
-    'calculate_atr_rma', 
-    'vectorized_wick_check_buy',
-    'vectorized_wick_check_sell',
-]
-
-assert len(__all__) == 21, f"Expected 21 functions, found {len(__all__)}"
+__all__ = list(EXPORT_CONFIG.keys())
+assert len(__all__) == 21
