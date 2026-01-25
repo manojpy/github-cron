@@ -3235,14 +3235,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             aligned_i5 = len(ts_5m) - 1 
         i5 = aligned_i5
 
-            if len(time_diff) == 0:
-                aligned_i5 = 0
-            else:
-                aligned_i5 = int(np.argmin(time_diff))
-                if aligned_i5 < len(time_diff) and time_diff[aligned_i5] > 60:
-                    aligned_i5 = i5
-
-            alignment_cache[cache_key] = aligned_i5
+        if len(time_diff) == 0:
+            aligned_i5 = 0
+        else:
+            aligned_i5 = int(np.argmin(time_diff))
+        if aligned_i5 < len(time_diff) and time_diff[aligned_i5] > 60:
+            aligned_i5 = i5
+        alignment_cache[cache_key] = aligned_i5
 
         i5 = aligned_i5
         close_5m_val = data_5m["close"][i5]
