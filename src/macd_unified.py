@@ -720,11 +720,15 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         ma = rolling_mean_numba(close_c, period)
 
         raw = np.empty(rows, dtype=np.float64)
-        for i in range(rows):
-            if np.abs(worm_arr[i]) < 1e-10:
-                raw[i] = np.nan
-            else:
-                raw[i] = (worm_arr[i] - ma[i]) / worm_arr[i]
+
+        nonzero_mask = np.abs(worm_arr) >= 1e-10
+
+        raw[nonzero_mask] = (
+            (worm_arr[nonzero_mask] - ma[nonzero_mask]) 
+            / worm_arr[nonzero_mask]
+        )
+
+        raw[~nonzero_mask] = np.nan
 
         min_med, max_med = rolling_min_max_numba(raw, period)
 
@@ -3226,11 +3230,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ts_15m = data_15m["timestamp"][i15]
         ts_5m = data_5m["timestamp"]
     
-        cache_key = f"{pair_name}:{ts_15m}"
-        aligned_i5 = alignment_cache.get(cache_key)
-
-        if aligned_i5 is None or aligned_i5 >= len(ts_5m):
-            time_diff = np.abs(ts_5m - ts_15m)
+        aligned_i5 = int(np.searchsorted(ts_5m, ts_15m,  side='nearest')) 
+        if aligned_i5 >= len(ts_5m): 
+            aligned_i5 = len(ts_5m) - 1 
+        i5 = aligned_i5
 
             if len(time_diff) == 0:
                 aligned_i5 = 0
@@ -3890,9 +3893,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         return None
 
     finally:
-        
         PAIR_ID.set("")
-        
         if data_15m is not None:
             data_15m = None
         if data_5m is not None:
@@ -3903,19 +3904,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             indicators = None
         if context is not None:
             context = None
-        
-        try:
-            process = psutil.Process()
-            current_memory_mb = process.memory_info().rss / 1024 / 1024
-            memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-            
+    try:
+        process = psutil.Process() 
+        current_memory_mb = process.memory_info().rss / 1024 / 1024
+        memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024        
      
-            if current_memory_mb > (memory_limit_mb * 0.8):
-                logger_pair.warning(
-                    f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
-                )
-        except Exception:
-            pass
+        if current_memory_mb > (memory_limit_mb * 0.8):
+            logger_pair.warning(
+                f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
+            )
+    except Exception:
+        pass
 
 logger_main = logging.getLogger("macd_bot.worker_pool")
     
@@ -3968,24 +3967,12 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         logger_main.error(f"Error in {p_name} evaluation: {e}", exc_info=False)
         return None
     
-    finally:     
+    finally:
         data_15m = None
         data_5m = None
         data_daily = None
-  
-        try:
-            process = psutil.Process()
-            current_rss_mb = process.memory_info().rss / 1024 / 1024
-            limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-               
-            if current_rss_mb > limit_mb * 0.85:
-                logger_main.warning(
-                    f"[{p_name}] Memory spike: {current_rss_mb:.0f}MB (threshold: {limit_mb*0.85:.0f}MB)"
-                )
-
-        except Exception as psutil_error:
-            logger_main.debug(f"Memory check failed: {psutil_error}")
-
+    pass
+        
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
     correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
@@ -4379,12 +4366,8 @@ async def run_once() -> bool:
         except asyncio.TimeoutError:
             logger_run.error("Timeout shutting down Redis pool")
         except Exception as e:
-            logger_run.error(f"Error shutting down Redis pool: {e}")
+        logger_run.error(f"Error shutting down Redis pool: {e}")
 
-        try:
-            gc.collect()
-        except Exception as e:
-            logger_run.debug(f"GC error: {e}")
         try:
             await asyncio.wait_for(
                 SessionManager.close_session(),
@@ -4410,7 +4393,7 @@ async def run_once() -> bool:
             logger_run.debug(f"GC error: {e}")
 
         logger_run.debug("🧹 Resource cleanup finished")
- 
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
