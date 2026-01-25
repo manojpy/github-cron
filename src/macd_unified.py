@@ -1,11 +1,4 @@
-from __future__ import annotations   
-import warnings
-
-warnings.filterwarnings(
-    "ignore",
-    category=RuntimeWarning,
-    message=".*parsing methods must have __doc__.*"
-)   
+from __future__ import annotations         
 import logging
 import aot_bridge
 import os
@@ -37,32 +30,19 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 from numba import njit, prange
+import warnings
 import contextlib 
 import traceback
 
-from aot_bridge import (
-    sanitize_array_numba,
-    sanitize_array_numba_parallel,
-    ema_loop,
-    ema_loop_alpha,
-    kalman_loop,
-    vwap_daily_loop,
-    rng_filter_loop,
-    smooth_range,
-    calculate_trends_with_state, 
-    calc_mmh_worm_loop,
-    calc_mmh_value_loop,
-    calc_mmh_momentum_loop,
-    rolling_std,
-    calc_mmh_momentum_smoothing,
-    rolling_mean_numba,
-    rolling_min_max_numba,
-    calculate_ppo_core,
-    calculate_rsi_core,
-    calculate_atr_rma, 
-    vectorized_wick_check_buy,
-    vectorized_wick_check_sell
-)
+try:
+    AOT_AVAILABLE = True
+    AOT_IMPORT_SUCCESS = True
+    AOT_IMPORT_ERROR = None
+except ImportError as e:
+    AOT_AVAILABLE = False
+    AOT_IMPORT_SUCCESS = False
+    AOT_IMPORT_ERROR = str(e)
+    aot_bridge = None
 
 try:
     import orjson
@@ -458,6 +438,60 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
             logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
         return str(dt_or_ts)
 
+if not AOT_IMPORT_SUCCESS:
+    logger.warning(f"aot_bridge not available: {AOT_IMPORT_ERROR}")
+    logger.warning("Creating fallback stub - will use pure JIT Numba")
+   
+    class _AotBridgeStub:        
+        @staticmethod
+        def is_using_aot():
+            return False
+        
+        @staticmethod
+        def get_fallback_reason():
+            return f"aot_bridge not installed: {AOT_IMPORT_ERROR}"
+        
+        @staticmethod
+        def ensure_initialized():
+            pass
+        
+        def __getattr__(self, name):
+            """Dynamically import from numba_functions_shared"""
+            try:
+                import numba_functions_shared
+                return getattr(numba_functions_shared, name)
+            except (AttributeError, ImportError) as e:
+                raise AttributeError(f"aot_bridge stub: function {name} not found - {e}")        
+    aot_bridge = _AotBridgeStub()
+    AOT_AVAILABLE = False
+    logger.info("🏀 aot_bridge stub initialized - JIT fallback ready")
+else:
+    logger.info("🚀 aot_bridge imported successfully - AOT compilation active")
+
+from aot_bridge import (
+    sanitize_array_numba,
+    sanitize_array_numba_parallel,
+    ema_loop,
+    ema_loop_alpha,
+    kalman_loop,
+    vwap_daily_loop,
+    rng_filter_loop,
+    smooth_range,
+    calculate_trends_with_state, 
+    calc_mmh_worm_loop,
+    calc_mmh_value_loop,
+    calc_mmh_momentum_loop,
+    rolling_std,
+    calc_mmh_momentum_smoothing,
+    rolling_mean_numba,
+    rolling_min_max_numba,
+    calculate_ppo_core,
+    calculate_rsi_core,
+    calculate_atr_rma, 
+    vectorized_wick_check_buy,
+    vectorized_wick_check_sell
+)
+
 shutdown_event = asyncio.Event()
 
 def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
@@ -747,33 +781,59 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         traceback.print_exc()
         return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
-def warmup_if_needed():
-    
-    if not aot_bridge.requires_warmup():
-        logger.info("🚀 AOT Library detected: Skipping warmup (functions already compiled)")
+def warmup_if_needed() -> None:
+    if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP:
+        logger.info("♨️ Skipping warmup (AOT active or explicitly disabled)")
         return
 
-    logger.info("⏳ AOT not found: Performing Numba JIT warmup for critical functions...")
-    start_time = time.time()
-    
+    logger.info("🔥 Warming up JIT compilation…")
+    warmup_start = time.time()
     try:
-        # Create minimal dummy data for compilation
-        dummy_data = np.random.random(100).astype(np.float64)
-        dummy_data_32 = np.random.random(100).astype(np.float32) # If any use f4
+        test_data = np.random.random(200).astype(np.float64) * 1000
+        test_data2 = np.random.random(200).astype(np.float64)
+        test_int = 14
+        test_threshold = 1.0
         
-        # Warmup the most heavy indicators
-        _ = aot_bridge.rolling_std(dummy_data, 14, 0.9)
-        _ = aot_bridge.ema_loop(dummy_data, 14.0)
-        _ = aot_bridge.rolling_mean_numba(dummy_data, 14)
+        # Core indicators
+        _ = aot_bridge.ema_loop(test_data, 7.0)
+        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
+        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
+        _ = aot_bridge.calculate_rsi_core(test_data, 21)
+        _ = aot_bridge.sanitize_array_numba(test_data, 0.0)
+        _ = aot_bridge.rolling_mean_numba(test_data, test_int)
+        _ = aot_bridge.rolling_std(test_data, test_int, 0.5)
+        _ = aot_bridge.rolling_min_max_numba(test_data, test_int)
+        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
         
-        # Warmup MMH core
-        dummy_sd = np.full(100, 0.01, dtype=np.float64)
-        _ = aot_bridge.calc_mmh_worm_loop(dummy_data, dummy_sd, 100)
+        # Filters and trends
+        _ = aot_bridge.rng_filter_loop(test_data, test_data2)
+        _ = aot_bridge.smooth_range(test_data, 10, 2)
+        _ = aot_bridge.calculate_trends_with_state(test_data, test_data2)
         
-        elapsed = time.time() - start_time
-        logger.info(f"✅ JIT Warmup complete in {elapsed:.2f}s")
+        # Market indicators
+        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_data, test_data, np.arange(len(test_data)).astype(np.int64))
+        _ = aot_bridge.calculate_atr_rma(test_data, test_data2, test_data2, 5)
+        _ = aot_bridge.calculate_atr_rma(test_data, test_data2, test_data2, 14)   
+
+        # MMH components
+        _ = aot_bridge.calc_mmh_worm_loop(test_data, test_data2, len(test_data))
+        _ = aot_bridge.calc_mmh_value_loop(test_data2, np.zeros_like(test_data2), np.ones_like(test_data2), len(test_data2))
+        _ = aot_bridge.calc_mmh_momentum_loop(test_data2, len(test_data2))
+        _ = aot_bridge.calc_mmh_momentum_smoothing(test_data2, len(test_data2))
+        
+        # Wick checks with volatility gating (NEW - corrected signatures)
+        _ = aot_bridge.vectorized_wick_check_buy(test_data, test_data, test_data, test_data, 0.3, test_data2, test_data2, test_threshold)
+        _ = aot_bridge.vectorized_wick_check_sell(test_data, test_data, test_data, test_data, 0.3, test_data2, test_data2, test_threshold)
+        
+        # Parallel sanitization
+        _ = aot_bridge.sanitize_array_numba_parallel(test_data, 0.0)
+
+        warmup_elapsed = time.time() - warmup_start
+        logger.info("✅ JIT warmup complete (%.2f s)", warmup_elapsed)
+
     except Exception as e:
-        logger.warning(f"⚠️ Warmup partially failed: {e}")
+        warmup_elapsed = time.time() - warmup_start
+        logger.warning("Warmup failed (non-fatal, elapsed %.2f s): %s", warmup_elapsed, e)
 
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -899,9 +959,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         )
 
         results['atr_long'] = calculate_atr_rma(
-           data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
+            data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
-
 
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
