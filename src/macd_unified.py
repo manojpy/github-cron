@@ -4365,7 +4365,7 @@ async def run_once() -> bool:
         except asyncio.TimeoutError:
             logger_run.error("Timeout shutting down Redis pool")
         except Exception as e:
-        logger_run.error(f"Error shutting down Redis pool: {e}")
+            logger_run.error(f"Error shutting down Redis pool: {e}")
 
         try:
             await asyncio.wait_for(
