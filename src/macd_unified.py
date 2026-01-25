@@ -3212,39 +3212,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     try:
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-        i5 = get_last_closed_index_from_array(data_5m["timestamp"], 5, reference_time)
 
         if i15 is None or i15 < 4:
             if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Insufficient i15: {i15} (need >=4)")
+                logger_pair.debug(f"Insufficient 15m data: {i15} closed (need >=4)")
             return None
 
-        if i5 is None or i5 < 2:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Insufficient i5: {i5} (need >=2)")
-            return None
-
-        assert i15 >= 4, f"i15={i15} but should be >= 4"
-        assert i5 >= 2, f"i5={i5} but should be >= 2"
-
-        ts_15m = data_15m["timestamp"][i15]
-        ts_5m = data_5m["timestamp"]
-    
-        aligned_i5 = int(np.searchsorted(ts_5m, ts_15m,  side='nearest')) 
-        if aligned_i5 >= len(ts_5m): 
-            aligned_i5 = len(ts_5m) - 1 
-        i5 = aligned_i5
-
-        if len(time_diff) == 0:
-            aligned_i5 = 0
+        ts_15m_val = data_15m["timestamp"][i15]
+        ts_5m_arr = data_5m["timestamp"]
+        
+        cache_key = f"{pair_name}_{ts_15m_val}"
+        if cache_key in alignment_cache:
+            i5 = alignment_cache[cache_key]
         else:
-            aligned_i5 = int(np.argmin(time_diff))
-        if aligned_i5 < len(time_diff) and time_diff[aligned_i5] > 60:
-            aligned_i5 = i5
-        alignment_cache[cache_key] = aligned_i5
+            idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
+            i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
+            alignment_cache[cache_key] = i5
 
-        i5 = aligned_i5
-        close_5m_val = data_5m["close"][i5]
+        if i5 < 2:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Insufficient aligned 5m data: {i5} (need >=2)")
+            return None
 
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
@@ -3263,12 +3251,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
     
-        indicators = await asyncio.to_thread(calculate_all_indicators_numpy, data_15m, data_5m, data_daily)
        
+        indicators = await asyncio.to_thread(
+            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+        )
+        
         if indicators is None:
-            logger_pair.error(
-                f"Skipping {pair_name}: all indicators failed to calculate"
-            )
+            logger_pair.error(f"Skipping {pair_name}: all indicators failed to calculate")
             return None
 
         ppo = indicators["ppo"]
