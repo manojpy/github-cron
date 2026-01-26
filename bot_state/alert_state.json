@@ -51,10 +51,6 @@
     "state": "INACTIVE",
     "ts": 1769445098
   },
-  "BNBUSD:ALERT:VWAP_UP": {
-    "state": "INACTIVE",
-    "ts": 1769445986
-  },
   "BTCUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769445986
@@ -62,5 +58,21 @@
   "BCHUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769445986
+  },
+  "AAVEUSD:ALERT:PPO_SIGNAL_UP": {
+    "state": "INACTIVE",
+    "ts": 1769447787
+  },
+  "BCHUSD:ALERT:PIVOT_UP_P": {
+    "state": "INACTIVE",
+    "ts": 1769447787
+  },
+  "SOLUSD:ALERT:PPO_SIGNAL_UP": {
+    "state": "INACTIVE",
+    "ts": 1769447787
+  },
+  "BNBUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769447787
   }
 }
