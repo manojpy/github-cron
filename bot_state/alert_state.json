@@ -217,7 +217,7 @@
   },
   "AVAXUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769463983
+    "ts": 1769471182
   },
   "BCHUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -241,11 +241,11 @@
   },
   "DOTUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769463983
+    "ts": 1769471182
   },
   "ADAUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769463983
+    "ts": 1769471182
   },
   "AAVEUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
@@ -421,7 +421,7 @@
   },
   "ADAUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769464883
+    "ts": 1769471182
   },
   "XRPUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
