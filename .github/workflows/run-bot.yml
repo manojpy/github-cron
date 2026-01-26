@@ -192,4 +192,13 @@ jobs:
             GITHUB_STATUS=$(grep -oP "GitHub:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
           else
             STATUS="failed"
-            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" |
+            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
+          fi
+          
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
+          echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
+          echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
+          echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
+          echo "github_status=${GITHUB_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
+          echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
