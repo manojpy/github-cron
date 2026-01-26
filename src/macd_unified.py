@@ -324,7 +324,7 @@ def load_config() -> BotConfig:
     else:
         print(f"⚠️ WARNING: Config file {config_file} not found, using environment variables only", file=sys.stderr)
 
-    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REDIS_URL", "DELTA_API_BASE"):
+    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "MACD_BOT_TOKEN", "MACD_REPO", "MACD_BRANCH", "DELTA_API_BASE"):
         env_value = os.getenv(key)
         if env_value:
             data[key] = env_value
