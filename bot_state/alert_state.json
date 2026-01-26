@@ -35,19 +35,7 @@
     "state": "INACTIVE",
     "ts": 1769443287
   },
-  "SUIUSD:ALERT:VWAP_UP": {
-    "state": "ACTIVE",
-    "ts": 1769444185
-  },
-  "SUIUSD:ALERT:VWAP_DOWN": {
-    "state": "INACTIVE",
-    "ts": 1769444185
-  },
   "BCHUSD:ALERT:PPO_ZERO_UP": {
-    "state": "INACTIVE",
-    "ts": 1769444185
-  },
-  "BCHUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
     "ts": 1769444185
   }
