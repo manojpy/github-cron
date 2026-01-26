@@ -109,7 +109,7 @@
   },
   "SUIUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769449582
+    "ts": 1769462183
   },
   "AAVEUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -161,7 +161,7 @@
   },
   "BTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769451384
+    "ts": 1769462183
   },
   "ETHUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -358,5 +358,9 @@
   "AAVEUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
     "ts": 1769461282
+  },
+  "ADAUSD:ALERT:VWAP_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769462183
   }
 }
