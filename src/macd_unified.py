@@ -3323,7 +3323,7 @@ async def run_once() -> bool:
 
         logger_run.debug("Connecting to GitHub...")
         sdb = RedisStateStore(cfg.GITHUB_TOKEN, cfg.GITHUB_REPO, cfg.GITHUB_BRANCH)
-      await sdb.connect()
+        await sdb.connect()
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
