@@ -24,5 +24,7 @@
   "BNBUSD:ppo_zero_up:last_sent": "1769450400",
   "BNBUSD:rsi_50_up:last_sent": "1769450400",
   "BTCUSD:ppo_zero_up:last_sent": "1769451300",
-  "AVAXUSD:ppo_signal_up:last_sent": "1769451300"
+  "AVAXUSD:ppo_signal_up:last_sent": "1769451300",
+  "BCHUSD:ppo_zero_up:last_sent": "1769451300",
+  "BCHUSD:rsi_50_up:last_sent": "1769451300"
 }
