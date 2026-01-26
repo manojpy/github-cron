@@ -94,5 +94,9 @@
   "DOTUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
     "ts": 1769448711
+  },
+  "BNBUSD:ALERT:RSI_50_UP": {
+    "state": "INACTIVE",
+    "ts": 1769448720
   }
 }
