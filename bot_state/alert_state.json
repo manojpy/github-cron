@@ -63,15 +63,7 @@
     "state": "INACTIVE",
     "ts": 1769447787
   },
-  "BCHUSD:ALERT:PIVOT_UP_P": {
-    "state": "INACTIVE",
-    "ts": 1769447787
-  },
   "SOLUSD:ALERT:PPO_SIGNAL_UP": {
-    "state": "INACTIVE",
-    "ts": 1769447787
-  },
-  "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769447787
   },
