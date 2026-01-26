@@ -11,5 +11,6 @@
   "SUIUSD:last_reset_date": "2026-01-26",
   "AAVEUSD:last_reset_date": "2026-01-26",
   "SOLUSD:last_reset_date": "2026-01-26",
-  "SUIUSD:ppo_signal_up:last_sent": "1769444100"
+  "SUIUSD:ppo_signal_up:last_sent": "1769444100",
+  "SUIUSD:mmh_buy:last_sent": "1769444100"
 }
