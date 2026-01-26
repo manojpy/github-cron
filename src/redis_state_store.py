@@ -87,47 +87,51 @@ class RedisStateStore:
             return None
 
     async def _write_file_to_github(self, file_path: str, data: Dict[str, Any], message: str) -> bool:
-        """Write JSON file to GitHub with commit"""
+        """Write JSON file to GitHub with commit (409-safe)"""
         try:
             session = await self._get_session()
             url = f"https://api.github.com/repos/{self.repo}/contents/{file_path}"
             headers = {
                 "Authorization": f"token {self.github_token}",
-                "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "macd-bot"
+                "Accept":        "application/vnd.github.v3+json",
+                "User-Agent":    "macd-bot"
             }
-            
-            # Get current file SHA (for updates)
+
+            # ---- 1.  grab current SHA (if file exists) -----------------
             sha = None
             async with session.get(url, headers=headers, timeout=5) as resp:
                 self._api_calls += 1
                 if resp.status == 200:
-                    file_info = await resp.json()
-                    sha = file_info.get("sha")
-            
-            # Encode content
-            content = json.dumps(data, indent=2, default=str)
-            content_b64 = base64.b64encode(content.encode()).decode()
-            
-            # Prepare payload
-            payload = {
+                    sha = (await resp.json()).get("sha")
+
+            # ---- 2.  race guard – re-check if file appeared ------------
+            if sha is None:                       # file did not exist a few ms ago
+                await asyncio.sleep(0.1)
+                async with session.get(url, headers=headers, timeout=5) as dbl:
+                    self._api_calls += 1
+                    if dbl.status == 200:
+                        sha = (await dbl.json()).get("sha")
+
+            # ---- 3.  prepare payload ----------------------------------
+            content      = json.dumps(data, indent=2, default=str)
+            content_b64  = base64.b64encode(content.encode()).decode()
+            payload      = {
                 "message": message,
                 "content": content_b64,
-                "branch": self.branch
+                "branch":  self.branch
             }
             if sha:
                 payload["sha"] = sha
-            
-            # Write file
+
+            # ---- 4.  write / create ------------------------------------
             async with session.put(url, json=payload, headers=headers, timeout=10) as resp:
                 self._api_calls += 1
-                if resp.status in (201, 200):
+                if resp.status in (200, 201):
                     logger.debug(f"✅ Synced {file_path} to GitHub")
                     return True
-                else:
-                    logger.warning(f"GitHub write error ({file_path}): {resp.status}")
-                    return False
-                    
+                logger.warning(f"GitHub write error ({file_path}): {resp.status}")
+                return False
+
         except asyncio.TimeoutError:
             logger.warning(f"Timeout writing {file_path} to GitHub")
             return False
@@ -321,7 +325,8 @@ class RedisStateStore:
             for key in deletes:
                 if key in self._local_cache:
                     del self._local_cache[key]
-        
+
+        await asyncio.sleep(random.uniform(0.05, 0.15))
         return await self._sync_to_github()
 
     def get_stats(self) -> Dict[str, Any]:
