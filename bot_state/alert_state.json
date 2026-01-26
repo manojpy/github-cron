@@ -78,5 +78,9 @@
   "SUIUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769448689
+  },
+  "XRPUSD:ALERT:PPO_011_UP": {
+    "state": "INACTIVE",
+    "ts": 1769448693
   }
 }
