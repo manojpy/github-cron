@@ -29,7 +29,7 @@
   },
   "SUIUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
-    "ts": 1769443287
+    "ts": 1769448689
   },
   "XRPUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -41,11 +41,11 @@
   },
   "SUIUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769445986
+    "ts": 1769448689
   },
   "SUIUSD:ALERT:MMH_BUY": {
-    "state": "ACTIVE",
-    "ts": 1769445098
+    "state": "INACTIVE",
+    "ts": 1769448689
   },
   "SUIUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
@@ -74,5 +74,9 @@
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769447787
+  },
+  "SUIUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769448689
   }
 }
