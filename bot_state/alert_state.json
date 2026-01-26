@@ -82,5 +82,13 @@
   "XRPUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
     "ts": 1769448693
+  },
+  "AAVEUSD:ALERT:PPO_011_UP": {
+    "state": "INACTIVE",
+    "ts": 1769448698
+  },
+  "AAVEUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769448698
   }
 }
