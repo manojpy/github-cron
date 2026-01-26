@@ -173,7 +173,7 @@
   },
   "BCHUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769457689
+    "ts": 1769466682
   },
   "BCHUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
