@@ -39,10 +39,6 @@
     "state": "INACTIVE",
     "ts": 1769444185
   },
-  "BNBUSD:ALERT:VWAP_DOWN": {
-    "state": "INACTIVE",
-    "ts": 1769445097
-  },
   "SUIUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "ACTIVE",
     "ts": 1769445098
