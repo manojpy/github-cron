@@ -3186,7 +3186,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
-    correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
+    correlation_id: str, lock: SimpleLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
 
     alignment_cache: Dict[str, int] = {}
 
@@ -3309,7 +3309,7 @@ async def run_once() -> bool:
     logger_run = logging.getLogger(f"macd_bot.run.{correlation_id}")
     start_time = time.time()
     sdb: Optional[RedisStateStore] = None
-    lock: Optional[RedisLock] = None
+    lock: Optional[SimpleLock] = None
     fetcher: Optional[DataFetcher] = None
     telegram_queue: Optional[TelegramQueue] = None
     lock_acquired = False
@@ -3602,7 +3602,7 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠������ Performance will be degraded. First run may be slow.")
+        logger.warning("⚠ Performance will be degraded. First run may be slow.")
         
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
