@@ -52,8 +52,8 @@ jobs:
             "TELEGRAM_BOT_TOKEN": "your_token_here",
             "TELEGRAM_CHAT_ID": "your_chat_id_here",
             "MACD_BOT_TOKEN": "your_pat_here",
-            "GITHUB_REPO": "owner/repo",
-            "GITHUB_BRANCH": "main",
+            "MACD_REPO": "owner/repo",
+            "MACD_BRANCH": "main",
             "DELTA_API_BASE": "https://api.example.com",
             "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD"],
             "DRY_RUN_MODE": false
@@ -100,8 +100,8 @@ jobs:
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
           [ -z "${{ secrets.MACD_BOT_TOKEN }}" ] && MISSING+=("MACD_BOT_TOKEN")
-          [ -z "${{ secrets.GITHUB_REPO }}" ] && MISSING+=("GITHUB_REPO")
-          [ -z "${{ secrets.GITHUB_BRANCH }}" ] && MISSING+=("GITHUB_BRANCH")
+          [ -z "${{ secrets.MACD_REPO }}" ] && MISSING+=("MACD_REPO")
+          [ -z "${{ secrets.MACD_BRANCH }}" ] && MISSING+=("MACD_BRANCH")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
           
           if [ ${#MISSING[@]} -gt 0 ]; then
@@ -146,9 +146,9 @@ jobs:
             -e PYTHONPATH=/app/src:$PYTHONPATH \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -e GITHUB_TOKEN="${{ secrets.MACD_BOT_TOKEN }}" \
-            -e GITHUB_REPO="${{ secrets.GITHUB_REPO }}" \
-            -e GITHUB_BRANCH="${{ secrets.GITHUB_BRANCH }}" \
+            -e MACD_BOT_TOKEN="${{ secrets.MACD_BOT_TOKEN }}" \
+            -e MACD_REPO="${{ secrets.MACD_REPO }}" \
+            -e MACD_BRANCH="${{ secrets.MACD_BRANCH }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DRY_RUN_MODE="$DRY_RUN" \
             -e PYTHONUNBUFFERED=1 \
