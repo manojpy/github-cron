@@ -15,5 +15,6 @@
   "AAVEUSD:vwap_up:last_sent": "1769448600",
   "BNBUSD:ppo_signal_up:last_sent": "1769449500",
   "BNBUSD:vwap_up:last_sent": "1769449500",
-  "BNBUSD:mmh_buy:last_sent": "1769449500"
+  "BNBUSD:mmh_buy:last_sent": "1769449500",
+  "AAVEUSD:mmh_buy:last_sent": "1769449500"
 }
