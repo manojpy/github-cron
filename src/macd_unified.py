@@ -3639,7 +3639,7 @@ if __name__ == "__main__":
 
     async def main_with_cleanup():
         sdb = None # We need to ensure we can access the instance created in run_once
-            try:
+        try:
             return await run_once()
         finally:
             logger.info("🧹 Shutting down persistent connections...")
