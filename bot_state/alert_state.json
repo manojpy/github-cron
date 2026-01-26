@@ -80,8 +80,8 @@
     "ts": 1769448698
   },
   "AAVEUSD:ALERT:VWAP_UP": {
-    "state": "INACTIVE",
-    "ts": 1769448698
+    "state": "ACTIVE",
+    "ts": 1769449582
   },
   "AVAXUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -98,5 +98,21 @@
   "BNBUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769448720
+  },
+  "ETHUSD:ALERT:MMH_BUY": {
+    "state": "ACTIVE",
+    "ts": 1769449582
+  },
+  "XRPUSD:ALERT:PPO_ZERO_UP": {
+    "state": "INACTIVE",
+    "ts": 1769449582
+  },
+  "SUIUSD:ALERT:VWAP_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769449582
+  },
+  "AAVEUSD:ALERT:VWAP_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769449582
   }
 }
