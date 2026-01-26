@@ -18,6 +18,11 @@ from typing import Optional, Any, Callable, Dict, Tuple
 import importlib.util
 import numpy as np
 
+# Suppress Numba/pcparser warnings at import time
+#warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*parsing methods must have __doc__.*")
+#warnings.filterwarnings("ignore", category=DeprecationWarning)
+#warnings.filterwarnings("ignore", message=".*inspect.getargspec.*")
+
 # Global state
 _aot_module: Optional[Any] = None
 _using_aot: bool = False
@@ -258,8 +263,8 @@ def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     return _dispatch['kalman_loop'](src, length, R, Q)
 
-def vwap_daily_loop(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
-    return _dispatch['vwap_daily_loop'](high, low, close, volume, timestamps)
+def vwap_daily_loop(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    return _dispatch['vwap_daily_loop'](hlc3, volumes, timestamps)
 
 def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     return _dispatch['rng_filter_loop'](x, r)
