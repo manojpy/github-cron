@@ -105,7 +105,7 @@
   },
   "XRPUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769449582
+    "ts": 1769456784
   },
   "SUIUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -241,7 +241,7 @@
   },
   "DOTUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769452281
+    "ts": 1769456784
   },
   "ADAUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
