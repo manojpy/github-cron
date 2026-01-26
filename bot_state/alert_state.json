@@ -59,10 +59,6 @@
     "state": "INACTIVE",
     "ts": 1769445986
   },
-  "XRPUSD:ALERT:PIVOT_UP_R2": {
-    "state": "INACTIVE",
-    "ts": 1769445986
-  },
   "BCHUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769445986
