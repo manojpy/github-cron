@@ -30,5 +30,8 @@
   "LTCUSD:pivot_up_R1:last_sent": "1769451300",
   "BTCUSD:ppo_011_up:last_sent": "1769453100",
   "ETHUSD:pivot_up_R1:last_sent": "1769453100",
-  "AVAXUSD:ppo_zero_up:last_sent": "1769453100"
+  "AVAXUSD:ppo_zero_up:last_sent": "1769453100",
+  "SUIUSD:ppo_signal_up:last_sent": "1769463000",
+  "SUIUSD:ppo_zero_up:last_sent": "1769463000",
+  "SUIUSD:rsi_50_up:last_sent": "1769463000"
 }
