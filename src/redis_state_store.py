@@ -1,14 +1,13 @@
 # ============================================================================
-# RedisStateStore - Now using GitHub JSON backend (no Redis needed!)
-# Stores alert states in GitHub repo for free, unlimited requests
+# RedisStateStore - GitHub JSON backend (lock-serialized, 409-free)
 # ============================================================================
 
 import json
 import asyncio
 import logging
 import time
-import random
 import base64
+import random
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
 import aiohttp
@@ -16,41 +15,38 @@ from pathlib import Path
 
 logger = logging.getLogger("macd_bot.redis_state_store")
 
-class RedisStateStore:
+
+class GitHubStateStore:
     """
-    Replaces RedisStateStore - Now backs to GitHub repo
-    Uses the same repo where your code lives
-    NO Redis needed, NO request limits, completely FREE
+    Drop-in replacement for RedisStateStore using GitHub repo storage.
+    All writes are serialized through an async lock to prevent 409 conflicts.
     """
-    
+
     def __init__(self, github_token: str, repo: str, branch: str = "main"):
-        """
-        Args:
-            github_token: GitHub personal access token (GITHUB_TOKEN env var)
-            repo: repo in format "owner/repo" (e.g., "manojpy/github-cron")
-            branch: branch to store state (default: "main")
-        """
         self.github_token = github_token
         self.repo = repo
         self.branch = branch
         self.degraded = False
         self.degraded_alerted = False
-        
+
         # Local cache (fast reads)
         self._local_cache: Dict[str, Dict[str, Any]] = {}
         self._metadata_cache: Dict[str, str] = {}
         self._session: Optional[aiohttp.ClientSession] = None
-        
-        # State files in your repo
+
+        # State files in repo
         self.state_file = "bot_state/alert_state.json"
         self.metadata_file = "bot_state/metadata.json"
-        
-        # Expiry (same as before)
+
+        # Expiry
         self.expiry_seconds = 30 * 86400  # 30 days
         self.metadata_expiry_seconds = 7 * 86400  # 7 days
-        
-        self._sync_counter = 0  # Sync every 10 writes to avoid rate limits
-        self._api_calls = 0  # Track API usage
+
+        # Write serialization lock (prevents 409s)
+        self._write_lock = asyncio.Lock()
+        self._pending_writes = 0  # Track queued writes
+
+        self._api_calls = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -67,7 +63,7 @@ class RedisStateStore:
                 "Accept": "application/vnd.github.v3.raw",
                 "User-Agent": "macd-bot"
             }
-            
+
             async with session.get(url, headers=headers, timeout=10) as resp:
                 self._api_calls += 1
                 if resp.status == 200:
@@ -79,7 +75,7 @@ class RedisStateStore:
                 else:
                     logger.warning(f"GitHub read error ({file_path}): {resp.status}")
                     return None
-                    
+
         except asyncio.TimeoutError:
             logger.warning(f"Timeout reading {file_path} from GitHub")
             return None
@@ -87,71 +83,62 @@ class RedisStateStore:
             logger.warning(f"Error reading {file_path}: {e}")
             return None
 
-    async def _write_file_to_github(self, file_path: str, data: Dict[str, Any], message: str) -> bool:
-        """Write JSON file to GitHub with commit (409-safe + back-off)"""
-        for attempt in range(1, 6):                # 5 attempts
-            try:
-                session = await self._get_session()
-                url   = f"https://api.github.com/repos/{self.repo}/contents/{file_path}"
-                headers = {
-                    "Authorization": f"token {self.github_token}",
-                    "Accept":        "application/vnd.github.v3+json",
-                    "User-Agent":    "macd-bot"
-                }
+    async def _write_file_to_github_locked(self, file_path: str, data: Dict[str, Any], message: str) -> bool:
+        """
+        Internal write method - MUST be called while holding _write_lock.
+        No 409 handling needed because lock guarantees single-writer.
+        """
+        try:
+            session = await self._get_session()
+            url = f"https://api.github.com/repos/{self.repo}/contents/{file_path}"
+            headers = {
+                "Authorization": f"token {self.github_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "macd-bot"
+            }
 
-                # ---- 1.  grab current SHA (if file exists) -----------------
-                sha = None
-                async with session.get(url, headers=headers, timeout=5) as resp:
-                    self._api_calls += 1
-                    if resp.status == 200:
-                        sha = (await resp.json()).get("sha")
+            # Get current SHA
+            sha = None
+            async with session.get(url, headers=headers, timeout=5) as resp:
+                self._api_calls += 1
+                if resp.status == 200:
+                    sha = (await resp.json()).get("sha")
 
-                # ---- 2.  race guard – re-check if file appeared ------------
-                if sha is None:
-                    await asyncio.sleep(0.1)
-                    async with session.get(url, headers=headers, timeout=5) as dbl:
-                        self._api_calls += 1
-                        if dbl.status == 200:
-                            sha = (await dbl.json()).get("sha")
+            # Encode and write
+            content = json.dumps(data, indent=2, default=str)
+            content_b64 = base64.b64encode(content.encode()).decode()
+            payload = {
+                "message": message,
+                "content": content_b64,
+                "branch": self.branch
+            }
+            if sha:
+                payload["sha"] = sha
 
-                # ---- 3.  prepare payload ----------------------------------
-                content     = json.dumps(data, indent=2, default=str)
-                content_b64 = base64.b64encode(content.encode()).decode()
-                payload     = {"message": message, "content": content_b64, "branch": self.branch}
-                if sha:
-                    payload["sha"] = sha
+            async with session.put(url, json=payload, headers=headers, timeout=10) as resp:
+                self._api_calls += 1
+                if resp.status in (200, 201):
+                    logger.debug(f"✅ Synced {file_path} to GitHub")
+                    return True
+                logger.warning(f"GitHub write error ({file_path}): {resp.status}")
+                return False
 
-                # ---- 4.  write / create ------------------------------------
-                async with session.put(url, json=payload, headers=headers, timeout=10) as resp:
-                    self._api_calls += 1
-                    if resp.status in (200, 201):
-                        logger.debug(f"✅ Synced {file_path} to GitHub")
-                        return True
-                    if resp.status == 409:                      # conflict → back-off
-                        wait = 0.3 * (2 ** attempt) + random.uniform(0, 0.2)
-                        logger.debug(f"409 on {file_path} – retry {attempt}/5 after {wait:.2f}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    logger.warning(f"GitHub write error ({file_path}): {resp.status}")
-                    return False
-
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout writing {file_path} from GitHub (attempt {attempt})")
-            except Exception as e:
-                logger.warning(f"Error writing {file_path}: {e}")
-
-        logger.error(f"Giving up on {file_path} after 5 attempts")
-        return False
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout writing {file_path} to GitHub")
+            return False
+        except Exception as e:
+            logger.warning(f"Error writing {file_path}: {e}")
+            return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        """Initialize - test GitHub API access"""
+        """Initialize - test GitHub API access and load state"""
         try:
             session = await self._get_session()
             headers = {
                 "Authorization": f"token {self.github_token}",
                 "User-Agent": "macd-bot"
             }
-            
+
             async with session.get(
                 f"https://api.github.com/repos/{self.repo}",
                 headers=headers,
@@ -162,30 +149,37 @@ class RedisStateStore:
                     repo_data = await resp.json()
                     logger.info(f"✅ GitHub connected: {repo_data.get('full_name')}")
                     self.degraded = False
-                    
+
                     # Load existing state
                     state_data = await self._read_file_from_github(self.state_file)
                     if state_data:
                         self._local_cache = state_data
                         logger.info(f"Loaded {len(self._local_cache)} alert states from GitHub")
-                    
+
+                    # Load metadata
+                    meta_data = await self._read_file_from_github(self.metadata_file)
+                    if meta_data:
+                        self._metadata_cache = meta_data
+
                     return
                 else:
                     logger.warning(f"GitHub connection failed: {resp.status}")
                     self.degraded = True
-                    
+
         except Exception as e:
             logger.error(f"GitHub connection error: {e}")
             self.degraded = True
 
     async def close(self) -> None:
         """Close session and sync final state"""
-        await self._sync_to_github()
+        # One final sync under lock
+        async with self._write_lock:
+            await self._sync_to_github_locked()
         if self._session and not self._session.closed:
             await self._session.close()
 
     async def get(self, key: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
-        """Get state from local cache (fast)"""
+        """Get state from local cache (fast, no lock needed)"""
         if key in self._local_cache:
             data = self._local_cache[key]
             age = time.time() - data.get("ts", 0)
@@ -196,62 +190,49 @@ class RedisStateStore:
         return None
 
     async def set(self, key: str, state: Optional[Any], ts: Optional[int] = None, timeout: float = 2.0) -> None:
-        """Set state in local cache, periodic sync to GitHub"""
+        """Set state in local cache, lazy sync"""
         ts = int(ts or time.time())
         self._local_cache[key] = {"state": state, "ts": ts}
-        
-        # Sync every 10 writes to avoid GitHub rate limits
-        self._sync_counter += 1
-        if self._sync_counter % 10 == 0:
-            await self._sync_to_github()
+        # Sync happens in batch operations, not here
 
     async def get_metadata(self, key: str, timeout: float = 2.0) -> Optional[str]:
         """Get metadata value"""
         return self._metadata_cache.get(key)
 
     async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
-        """Set metadata and sync"""
+        """Set metadata in cache, lazy sync"""
         self._metadata_cache[key] = value
-        await self._sync_metadata_to_github()
 
-    async def _sync_to_github(self) -> bool:
-        """Sync alert states to GitHub"""
+    async def _sync_to_github_locked(self) -> bool:
+        """
+        Sync both state files to GitHub.
+        MUST be called while holding _write_lock.
+        """
         if self.degraded:
             return False
-        
-        try:
-            # Clean expired entries
-            now = time.time()
-            expired = [k for k, v in self._local_cache.items() 
-                      if (now - v.get("ts", 0)) > self.expiry_seconds]
-            for k in expired:
-                del self._local_cache[k]
-            
-            success = await self._write_file_to_github(
-                self.state_file,
-                self._local_cache,
-                f"🤖 Alert state sync | {len(self._local_cache)} active | {datetime.now(timezone.utc).isoformat()}"
-            )
-            return success
-        except Exception as e:
-            logger.error(f"Failed to sync state: {e}")
-            return False
 
-    async def _sync_metadata_to_github(self) -> bool:
-        """Sync metadata to GitHub"""
-        if self.degraded:
-            return False
-        
-        try:
-            success = await self._write_file_to_github(
-                self.metadata_file,
-                self._metadata_cache,
-                f"🤖 Metadata sync | {datetime.now(timezone.utc).isoformat()}"
-            )
-            return success
-        except Exception as e:
-            logger.error(f"Failed to sync metadata: {e}")
-            return False
+        # Clean expired entries
+        now = time.time()
+        expired = [k for k, v in self._local_cache.items()
+                   if (now - v.get("ts", 0)) > self.expiry_seconds]
+        for k in expired:
+            del self._local_cache[k]
+
+        # Write state file
+        state_ok = await self._write_file_to_github_locked(
+            self.state_file,
+            self._local_cache,
+            f"🤖 Alert state sync | {len(self._local_cache)} active | {datetime.now(timezone.utc).isoformat()}"
+        )
+
+        # Write metadata file
+        meta_ok = await self._write_file_to_github_locked(
+            self.metadata_file,
+            self._metadata_cache,
+            f"🤖 Metadata sync | {datetime.now(timezone.utc).isoformat()}"
+        )
+
+        return state_ok and meta_ok
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
         """Check if alert was recently sent (dedup)"""
@@ -263,75 +244,66 @@ class RedisStateStore:
         return True
 
     async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:
-        """Batch check recent alerts"""
+        """Batch check recent alerts (pure cache, no lock)"""
         result = {}
         for pair, alert_key, ts in checks:
             dedup_key = f"{pair}:{alert_key}"
             result[dedup_key] = await self.check_recent_alert(pair, alert_key, ts)
         return result
 
-    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], 
+    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str],
                                        updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
-        """Batch get and set alerts"""
+        """Batch get and set - writes are queued, sync happens separately"""
+        # Get current states (no lock needed)
         result = {}
         for key in alert_keys:
             state_key = f"{pair}:{key}"
             result[key] = await self.get(state_key)
-        
+
+        # Apply updates to cache only
         now = int(time.time())
         for full_key, state_value, custom_ts in updates:
             ts = custom_ts or now
             await self.set(full_key, state_value, ts)
-        
+
         return result
 
-    @staticmethod
-    async def shutdown_global_pool() -> None:
-        """Compatibility stub – GitHub store has no pool to shut down."""
-        return
-
-
-    async def close(self):
-        """Properly close the aiohttp session"""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            logger.debug("GitHub State Store session closed.")
-
-    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], 
-                               state_updates: List[Tuple[str, Any, Optional[int]]], 
-                               dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        """Atomic batch evaluation"""
-        prev_states = {}
-        for key in alert_keys:
-            state_key = f"{pair}:{key}"
-            state_data = await self.get(state_key)
-            prev_states[key] = isinstance(state_data, dict) and state_data.get("state") == "ACTIVE"
-        
-        dedup_results = await self.batch_check_recent_alerts(dedup_checks)
-        
-        now = int(time.time())
-        for key, state_value, custom_ts in state_updates:
-            ts = custom_ts or now
-            await self.set(key, state_value, ts)
-        
-        return prev_states, dedup_results
-
-    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], 
+    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]],
                                   deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-        """Atomic batch update"""
+        """
+        Atomic batch update with serialized GitHub write.
+        All workers queue here; only one writes at a time.
+        """
+        if self.degraded:
+            return False
+
+        # Apply changes to local cache first (fast, no lock)
         now = int(time.time())
-        
         for key, state, custom_ts in (updates or []):
             ts = custom_ts or now
-            await self.set(key, state, ts)
-        
+            self._local_cache[key] = {"state": state, "ts": ts}
+
         if deletes:
             for key in deletes:
                 if key in self._local_cache:
                     del self._local_cache[key]
 
-        await asyncio.sleep(random.uniform(0.05, 0.15))
-        return await self._sync_to_github()
+        # Serialize the actual GitHub write
+        async with self._write_lock:
+            self._pending_writes += 1
+            try:
+                # Small jitter to prevent thundering herd on first acquisition
+                if self._pending_writes > 1:
+                    await asyncio.sleep(random.uniform(0.01, 0.05))
+
+                return await self._sync_to_github_locked()
+            finally:
+                self._pending_writes -= 1
+
+    @staticmethod
+    async def shutdown_global_pool():
+        """Placeholder for compatibility with old Redis code"""
+        return True
 
     def get_stats(self) -> Dict[str, Any]:
         """Get store statistics"""
@@ -341,4 +313,9 @@ class RedisStateStore:
             "metadata_cached": len(self._metadata_cache),
             "repo": self.repo,
             "api_calls": self._api_calls,
+            "pending_writes": self._pending_writes,
         }
+
+
+# Backwards-compatible alias so old imports keep working
+RedisStateStore = GitHubStateStore
