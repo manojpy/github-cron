@@ -20,5 +20,7 @@
   "BTCUSD:vwap_up:last_sent": "1769450400",
   "BCHUSD:ppo_signal_up:last_sent": "1769450400",
   "BCHUSD:vwap_up:last_sent": "1769450400",
-  "BCHUSD:pivot_up_P:last_sent": "1769450400"
+  "BCHUSD:pivot_up_P:last_sent": "1769450400",
+  "BNBUSD:ppo_zero_up:last_sent": "1769450400",
+  "BNBUSD:rsi_50_up:last_sent": "1769450400"
 }
