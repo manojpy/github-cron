@@ -10,5 +10,6 @@
   "ADAUSD:last_reset_date": "2026-01-26",
   "SUIUSD:last_reset_date": "2026-01-26",
   "AAVEUSD:last_reset_date": "2026-01-26",
-  "SOLUSD:last_reset_date": "2026-01-26"
+  "SOLUSD:last_reset_date": "2026-01-26",
+  "SUIUSD:vwap_up:last_sent": "1769443200"
 }
