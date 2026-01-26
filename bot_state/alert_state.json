@@ -90,5 +90,9 @@
   "AVAXUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769448707
+  },
+  "DOTUSD:ALERT:PPO_011_UP": {
+    "state": "INACTIVE",
+    "ts": 1769448711
   }
 }
