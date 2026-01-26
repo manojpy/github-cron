@@ -377,15 +377,14 @@ class SafeFormatter(logging.Formatter):
         return formatted
 
     @staticmethod
-        def _mask_secret(value: Any) -> Any:
-            if value is None:
-                return value
-            value_str = str(value) 
-    masked = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TELEGRAM_TOKEN]", value_str)
-    masked = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", masked)
-    masked = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", masked)
-    return masked
-
+    def _mask_secret(value: Any) -> Any:
+        if value is None:
+            return value
+        value_str = str(value) 
+        masked = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TELEGRAM_TOKEN]", value_str)
+        masked = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", masked)
+        masked = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", masked)
+        return masked
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("macd_bot")
