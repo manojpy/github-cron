@@ -380,7 +380,7 @@ class SafeFormatter(logging.Formatter):
     def _mask_secret(value: Any) -> Any:
         if value is None:
             return value
-        value_str = str(value) 
+        value_str = str(value)
         masked = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TELEGRAM_TOKEN]", value_str)
         masked = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", masked)
         masked = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", masked)
@@ -1964,8 +1964,6 @@ class SimpleLock:
         except Exception as e:
             logger.warning(f"SimpleLock release error: {e}")
             return False
-
-
 
 class TokenBucket:
     def __init__(self, rate: int, burst: int):
@@ -3640,16 +3638,15 @@ if __name__ == "__main__":
         logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
-        try:
+        sdb = None # We need to ensure we can access the instance created in run_once
+            try:
             return await run_once()
         finally:
             logger.info("🧹 Shutting down persistent connections...")
             try:
-                await RedisStateStore.shutdown_global_pool()
-                logger.debug("🌈 Redis pool closed")
+                await RedisStateStore.shutdown_global_pool() 
             except Exception as e:
-                logger.error(f"Error closing Redis pool: {e}")
-
+                logger.error(f"Error calling shutdown_global_pool: {e}")
             try:
                 await SessionManager.close_session()
                 logger.debug("⏰ HTTP session closed")

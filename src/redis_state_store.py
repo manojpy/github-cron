@@ -277,6 +277,18 @@ class RedisStateStore:
         
         return result
 
+    @staticmethod
+    async def shutdown_global_pool():
+        """Placeholder for compatibility with old Redis code"""
+        logger.info("GitHub state store does not use a global pool.")
+        return True
+
+    async def close(self):
+        """Properly close the aiohttp session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            logger.debug("GitHub State Store session closed.")
+
     async def atomic_eval_batch(self, pair: str, alert_keys: List[str], 
                                state_updates: List[Tuple[str, Any, Optional[int]]], 
                                dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
