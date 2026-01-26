@@ -640,27 +640,29 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:   
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
+                         volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:   
     try:
-        if any(x is None or len(x) == 0 for x in [high, low, close, volume, timestamps]):
-            return np.zeros_like(close) if close is not None else np.array([0.0])
+        if close is None or len(close) == 0:
+            return np.array([], dtype=np.float64)
 
-        n = len(close)
-        if n == 0 or any(len(x) != n for x in [high, low, volume, timestamps]):
-            return np.zeros_like(close)
+        ts_secs = timestamps.astype(np.int64).copy()
+        
+        if ts_secs[0] > 1_000_000_000_000:
+            ts_secs //= 1000
 
-        ts_adjusted = timestamps.astype(np.int64).copy()
-        if np.any(ts_adjusted > 1_000_000_000_000):
-            ts_adjusted //= 1000
+        hlc3 = (high + low + close) / 3.0
 
-        vwap = vwap_daily_loop(high, low, close, volume, ts_adjusted)
+        vwap = vwap_daily_loop(hlc3, volume, ts_secs)
+
+        if np.any(np.isnan(vwap)):
+            vwap = np.where(np.isnan(vwap), close, vwap)
 
         return vwap
 
     except Exception as e:
         logger.error(f"VWAP calculation failed: {e}")
-        return np.full_like(close, np.nan) if close is not None else np.array([np.nan])
-
+        return np.full_like(close, np.nan)
 
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
@@ -882,6 +884,15 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             low_15m = data_15m["low"]
             volume_15m = data_15m["volume"]
             ts_15m = data_15m["timestamp"]
+            
+            if cfg.DEBUG_MODE and len(ts_15m) > 0:
+                logger.debug(
+                    f"VWAP input | "
+                    f"First ts: {ts_15m[0]} ({format_ist_time(ts_15m[0])}) | "
+                    f"Last ts: {ts_15m[-1]} ({format_ist_time(ts_15m[-1])}) | "
+                    f"Bars: {len(ts_15m)}"
+                )
+            
             results["vwap"] = calculate_vwap_numpy(
                 high_15m, low_15m, close_15m, volume_15m, ts_15m
             )
@@ -1935,7 +1946,6 @@ async def fetch_all_pairs_candles(fetcher: DataFetcher, reference_time: int) -> 
         reference_time
     )
 
-
 class RedisKeyPrefix:
     """Centralized Redis key prefixes"""
     PAIR_STATE = "pair_state:"
@@ -1943,7 +1953,6 @@ class RedisKeyPrefix:
     ALERT = "alert:"
     RECENT_ALERT = "recent_alert:"
     LOCK = "lock:"
-
 
 class RedisStateStore:
     DEDUP_LUA: ClassVar[str] = """
