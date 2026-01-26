@@ -51,7 +51,9 @@ jobs:
           {
             "TELEGRAM_BOT_TOKEN": "your_token_here",
             "TELEGRAM_CHAT_ID": "your_chat_id_here",
-            "REDIS_URL": "redis://user:pass@host:port",
+            "MACD_BOT_TOKEN": "your_pat_here",
+            "GITHUB_REPO": "owner/repo",
+            "GITHUB_BRANCH": "main",
             "DELTA_API_BASE": "https://api.example.com",
             "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD"],
             "DRY_RUN_MODE": false
@@ -97,7 +99,9 @@ jobs:
           MISSING=()
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
           [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
+          [ -z "${{ secrets.MACD_BOT_TOKEN }}" ] && MISSING+=("MACD_BOT_TOKEN")
+          [ -z "${{ secrets.GITHUB_REPO }}" ] && MISSING+=("GITHUB_REPO")
+          [ -z "${{ secrets.GITHUB_BRANCH }}" ] && MISSING+=("GITHUB_BRANCH")
           [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
           
           if [ ${#MISSING[@]} -gt 0 ]; then
@@ -142,7 +146,9 @@ jobs:
             -e PYTHONPATH=/app/src:$PYTHONPATH \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e GITHUB_TOKEN="${{ secrets.MACD_BOT_TOKEN }}" \
+            -e GITHUB_REPO="${{ secrets.GITHUB_REPO }}" \
+            -e GITHUB_BRANCH="${{ secrets.GITHUB_BRANCH }}" \
             -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
             -e DRY_RUN_MODE="$DRY_RUN" \
             -e PYTHONUNBUFFERED=1 \
@@ -183,58 +189,7 @@ jobs:
             ALERTS=$(grep -oP "(?:Alerts|Sent):\s*\K\d+" "$LOG_FILE" | head -1 || echo "0")
             PAIRS=$(grep -oP "Pairs:\s*\K[\d/]+" "$LOG_FILE" | head -1 || echo "N/A")
             MEMORY=$(grep -oP "Memory:\s*\K\d+MB" "$LOG_FILE" | head -1 || echo "N/A")
-            REDIS_STATUS=$(grep -oP "Redis:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
+            GITHUB_STATUS=$(grep -oP "GitHub:\s*\K\w+" "$LOG_FILE" | head -1 || echo "UNKNOWN")
           else
             STATUS="failed"
-            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" | head -1 | cut -c1-120 || echo "Unknown error")
-          fi
-          
-          echo "status=${STATUS}" >> $GITHUB_OUTPUT
-          echo "duration=${DURATION:-N/A}" >> $GITHUB_OUTPUT
-          echo "alerts=${ALERTS:-0}" >> $GITHUB_OUTPUT
-          echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
-          echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
-          echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
-          echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
-
-      - name: 📋 Generate Summary Report
-        if: always()
-        run: |
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🤖 MACD Bot Execution Report
-          
-          | Metric | Value |
-          |--------|-------|
-          | **Status** | ${{ steps.results.outputs.status }} |
-          | **Duration** | ${{ steps.results.outputs.duration }}s |
-          | **Alerts** | ${{ steps.results.outputs.alerts }} |
-          | **Pairs** | ${{ steps.results.outputs.pairs }} |
-          | **Memory** | ${{ steps.results.outputs.memory }} |
-          | **Redis** | ${{ steps.results.outputs.redis_status }} |
-          
-          EOF
-          
-          if [ "${{ steps.results.outputs.status }}" != "success" ]; then
-            echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ✅ Run Completed Successfully" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "- 📡 Duration: ${{ steps.results.outputs.duration }}s" >> $GITHUB_STEP_SUMMARY
-            echo "- 📊 Alerts Sent: ${{ steps.results.outputs.alerts }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 📈 Pairs Scanned: ${{ steps.results.outputs.pairs }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 💾 Memory Used: ${{ steps.results.outputs.memory }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # PHASE 4: ARTIFACT UPLOAD
-      - name: 📦 Upload Execution Logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-execution-logs-${{ github.run_number }}
-          path: logs/
-          retention-days: 2
-          compression-level: 9
+            ERROR_MSG=$(grep -E "FATAL ERROR|Bot run failed|Error|ERROR" "$LOG_FILE" |
