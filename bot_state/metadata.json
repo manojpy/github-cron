@@ -33,5 +33,8 @@
   "AVAXUSD:ppo_zero_up:last_sent": "1769453100",
   "SUIUSD:ppo_signal_up:last_sent": "1769463000",
   "SUIUSD:ppo_zero_up:last_sent": "1769463000",
-  "SUIUSD:rsi_50_up:last_sent": "1769463000"
+  "SUIUSD:rsi_50_up:last_sent": "1769463000",
+  "AAVEUSD:ppo_signal_up:last_sent": "1769463000",
+  "AAVEUSD:ppo_zero_up:last_sent": "1769463000",
+  "AAVEUSD:ppo_011_up:last_sent": "1769463000"
 }
