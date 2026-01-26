@@ -145,7 +145,7 @@
   },
   "BNBUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769450481
+    "ts": 1769463081
   },
   "AAVEUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -362,5 +362,17 @@
   "ADAUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
     "ts": 1769462183
+  },
+  "XRPUSD:ALERT:PIVOT_DOWN_R1": {
+    "state": "INACTIVE",
+    "ts": 1769463081
+  },
+  "ADAUSD:ALERT:RSI_50_UP": {
+    "state": "INACTIVE",
+    "ts": 1769463081
+  },
+  "SUIUSD:ALERT:PPO_011_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769463081
   }
 }
