@@ -99,7 +99,7 @@ class Constants:
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
-    CANDLE_PUBLICATION_LAG_SEC = 45
+    CANDLE_PUBLICATION_LAG_SEC = 30
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -2434,6 +2434,29 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         ts_15m_val = data_15m["timestamp"][i15]  # Extract timestamp ONCE
         ts_5m_arr = data_5m["timestamp"]
+
+        ts_curr = int(ts_15m_val)
+
+        if ts_curr > 1e10:  # Likely milliseconds (too large for seconds)
+            ts_curr = ts_curr // 1000  # Convert to seconds
+
+        interval_seconds = 15 * 60
+        candle_close_ts = ts_curr + interval_seconds
+        time_since_close = reference_time - candle_close_ts
+
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                 f"Lag check: ts_curr={ts_curr}, candle_close_ts={candle_close_ts}, "
+                 f"reference_time={reference_time}, time_since_close={time_since_close}s"
+            )
+
+        if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
+             if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Skipping {pair_name} - candle not finalized yet | "
+                    f"Lag: {time_since_close}s (need >= {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
+                )
+             return None
         
         cache_key = f"{pair_name}_{ts_15m_val}"
         if cache_key in alignment_cache:
