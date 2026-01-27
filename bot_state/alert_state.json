@@ -397,7 +397,7 @@
   },
   "AVAXUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
-    "ts": 1769476583
+    "ts": 1769506283
   },
   "BCHUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
@@ -493,7 +493,7 @@
   },
   "LTCUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769504483
+    "ts": 1769506283
   },
   "ADAUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
