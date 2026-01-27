@@ -681,7 +681,7 @@
   },
   "ADAUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
-    "ts": 1769553983
+    "ts": 1769556679
   },
   "SOLUSD:ALERT:PIVOT_UP_R2": {
     "state": "INACTIVE",
@@ -701,6 +701,6 @@
   },
   "BTCUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
-    "ts": 1769547684
+    "ts": 1769556679
   }
 }
