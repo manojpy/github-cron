@@ -25,7 +25,7 @@
   },
   "DOTUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769469399
+    "ts": 1769472108
   },
   "SUIUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
