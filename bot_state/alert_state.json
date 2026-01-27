@@ -13,7 +13,7 @@
   },
   "AVAXUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769472103
+    "ts": 1769484681
   },
   "ADAUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -237,7 +237,7 @@
   },
   "SOLUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
-    "ts": 1769469399
+    "ts": 1769484681
   },
   "XRPUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
@@ -345,7 +345,7 @@
   },
   "SOLUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769474781
+    "ts": 1769484681
   },
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
