@@ -2417,7 +2417,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     close_15m = None
     open_15m = None
     timestamps_15m = None
-    indicators = None, 
+    indicators = None
     ppo = None
     ppo_signal = None
     smooth_rsi = None
@@ -2455,6 +2455,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         time_since_close = reference_time - candle_close_ts
         
         if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Skipping {pair_name} - candle not finalized ({time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
+                )
             return None
 
         cache_key = f"{pair_name}_{ts_15m_val}"
@@ -2510,7 +2514,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
         low_curr = data_15m["low"][i15]
-        ts_curr = int(timestamps_15m[i15])
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
