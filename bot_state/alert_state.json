@@ -261,7 +261,7 @@
   },
   "SUIUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769465781
+    "ts": 1769474784
   },
   "AAVEUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
