@@ -33,15 +33,15 @@
   },
   "XRPUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769476583
+    "ts": 1769486479
   },
   "BCHUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
     "ts": 1769459483
   },
   "SUIUSD:ALERT:PPO_SIGNAL_UP": {
-    "state": "ACTIVE",
-    "ts": 1769463983
+    "state": "INACTIVE",
+    "ts": 1769486479
   },
   "SUIUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -65,7 +65,7 @@
   },
   "SOLUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769469399
+    "ts": 1769486479
   },
   "XRPUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
@@ -105,7 +105,7 @@
   },
   "BNBUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769472986
+    "ts": 1769486479
   },
   "BNBUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -217,11 +217,11 @@
   },
   "BTCUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769483781
+    "ts": 1769486479
   },
   "ETHUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769472981
+    "ts": 1769486479
   },
   "ADAUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -229,7 +229,7 @@
   },
   "LTCUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769459483
+    "ts": 1769486479
   },
   "SUIUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -341,11 +341,11 @@
   },
   "DOTUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769483781
+    "ts": 1769486479
   },
   "SOLUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769484681
+    "ts": 1769486479
   },
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
@@ -353,7 +353,7 @@
   },
   "AAVEUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769483781
+    "ts": 1769486479
   },
   "BTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -377,7 +377,7 @@
   },
   "ADAUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769483781
+    "ts": 1769486479
   },
   "AVAXUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -393,7 +393,7 @@
   },
   "AVAXUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769483781
+    "ts": 1769486479
   },
   "AVAXUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
