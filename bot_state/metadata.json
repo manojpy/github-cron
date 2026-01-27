@@ -14,14 +14,14 @@
   "ETHUSD:mmh_buy:last_sent": "1769448600",
   "AAVEUSD:vwap_up:last_sent": "1769503500",
   "BNBUSD:ppo_signal_up:last_sent": "1769513400",
-  "BNBUSD:vwap_up:last_sent": "1769449500",
-  "BNBUSD:mmh_buy:last_sent": "1769449500",
+  "BNBUSD:vwap_up:last_sent": "1769520600",
+  "BNBUSD:mmh_buy:last_sent": "1769520600",
   "AAVEUSD:mmh_buy:last_sent": "1769449500",
   "BTCUSD:vwap_up:last_sent": "1769450400",
   "BCHUSD:ppo_signal_up:last_sent": "1769506200",
   "BCHUSD:vwap_up:last_sent": "1769506200",
   "BCHUSD:pivot_up_P:last_sent": "1769450400",
-  "BNBUSD:ppo_zero_up:last_sent": "1769450400",
+  "BNBUSD:ppo_zero_up:last_sent": "1769520600",
   "BNBUSD:rsi_50_up:last_sent": "1769450400",
   "BTCUSD:ppo_zero_up:last_sent": "1769451300",
   "AVAXUSD:ppo_signal_up:last_sent": "1769486400",
@@ -40,5 +40,6 @@
   "BCHUSD:ppo_011_up:last_sent": "1769508000",
   "AVAXUSD:vwap_up:last_sent": "1769486400",
   "AVAXUSD:mmh_buy:last_sent": "1769486400",
-  "BCHUSD:mmh_buy:last_sent": "1769506200"
+  "BCHUSD:mmh_buy:last_sent": "1769506200",
+  "BNBUSD:pivot_up_R1:last_sent": "1769520600"
 }
