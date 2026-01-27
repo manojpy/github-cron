@@ -51,5 +51,6 @@
   "XRPUSD:mmh_sell:last_sent": "1769526900",
   "SOLUSD:ppo_zero_up:last_sent": "1769528700",
   "SOLUSD:ppo_011_up:last_sent": "1769528700",
-  "BNBUSD:ppo_011_up:last_sent": "1769529600"
+  "BNBUSD:ppo_011_up:last_sent": "1769529600",
+  "ADAUSD:pivot_up_R1:last_sent": "1769532300"
 }
