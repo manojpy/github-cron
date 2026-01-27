@@ -209,7 +209,7 @@
   },
   "LTCUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
-    "ts": 1769457689
+    "ts": 1769481083
   },
   "ADAUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
@@ -333,7 +333,7 @@
   },
   "XRPUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769476583
+    "ts": 1769481083
   },
   "LTCUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
@@ -401,7 +401,7 @@
   },
   "BCHUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769476583
+    "ts": 1769481083
   },
   "ETHUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
