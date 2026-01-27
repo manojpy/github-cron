@@ -3352,11 +3352,11 @@ async def run_once() -> bool:
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
-                "🚨 Redis is in degraded mode – alert deduplication disabled!"
+                "🚨 GitHub is in degraded mode – alert deduplication disabled!"
             )
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
-                f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
+                f"⚠️ {cfg.BOT_NAME} - GITHUB DEGRADED MODE\n"
                 f"Alert deduplication is disabled. You may receive duplicate alerts.\n"
                 f"Time: {format_ist_time()}"
             ))
@@ -3370,7 +3370,7 @@ async def run_once() -> bool:
 
         if not lock_acquired:
             logger_run.warning(
-                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
+                "⏸️ Another instance is running (GitHub lock held) - exiting gracefully"
             )
             return False
 
@@ -3474,7 +3474,7 @@ async def run_once() -> bool:
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
-        redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
+        github_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
 
         summary = (
             f"🎯🌏 RUN COMPLETE | "
@@ -3482,7 +3482,7 @@ async def run_once() -> bool:
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
-            f"Redis: {redis_status}"
+            f"GitHub: {github_status}"
         )
         logger_run.info(summary)
 
@@ -3535,7 +3535,7 @@ async def run_once() -> bool:
         if lock_acquired and lock and lock.acquired_by_me:
             try:
                 await asyncio.wait_for(lock.release(timeout=3.0), timeout=4.0)
-                logger_run.debug("🔏 Redis lock released")
+                logger_run.debug("🔏 GitHub-backed lock released")
             except asyncio.TimeoutError:
                 logger_run.error("Timeout releasing lock")
             except Exception as e:
@@ -3544,11 +3544,11 @@ async def run_once() -> bool:
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
-                logger_run.debug("✅ Redis connection closed")
+                logger_run.debug("✅ GitHub state store connection closed")
             except asyncio.TimeoutError:
-                logger_run.error("Timeout closing Redis")
+                logger_run.error("Timeout closing GitHub state store")
             except Exception as e:
-                logger_run.error(f"Error closing Redis: {e}", exc_info=False)
+                logger_run.error(f"Error closing Github state store: {e}", exc_info=False)
 
         try:
             await asyncio.wait_for(
@@ -3556,9 +3556,9 @@ async def run_once() -> bool:
                 timeout=5.0
             )
         except asyncio.TimeoutError:
-            logger_run.error("Timeout shutting down Redis pool")
+            logger_run.error("Timeout shutting down GitHub state store pool")
         except Exception as e:
-            logger_run.error(f"Error shutting down Redis pool: {e}")
+            logger_run.error(f"Error shutting down GitHub state store pool: {e}")
 
         try:
             await asyncio.wait_for(
