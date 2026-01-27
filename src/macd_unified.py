@@ -99,7 +99,7 @@ class Constants:
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
-    
+    CANDLE_PUBLICATION_LAG_SEC = 20
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -2440,7 +2440,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
+        ts_curr = int(ts_15m_val)
         
+        if ts_curr > 1e10:
+            ts_curr = ts_curr // 1000
+        
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
+            return None
+            
+        interval_seconds = 15 * 60
+        candle_close_ts = ts_curr + interval_seconds
+        time_since_close = reference_time - candle_close_ts
+        
+        if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
+            return None
+
         cache_key = f"{pair_name}_{ts_15m_val}"
         if cache_key in alignment_cache:
             i5 = alignment_cache[cache_key]
@@ -2470,7 +2486,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
                 )
             return None
-    
        
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
@@ -2560,11 +2575,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
-            return None
-
+        
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
