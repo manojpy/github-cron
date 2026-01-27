@@ -13,7 +13,7 @@
   },
   "AVAXUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769488281
+    "ts": 1769504483
   },
   "ADAUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -352,8 +352,8 @@
     "ts": 1769472986
   },
   "AAVEUSD:ALERT:VWAP_UP": {
-    "state": "INACTIVE",
-    "ts": 1769503584
+    "state": "ACTIVE",
+    "ts": 1769504483
   },
   "BTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -369,7 +369,7 @@
   },
   "AAVEUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769494583
+    "ts": 1769504483
   },
   "SOLUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -393,7 +393,7 @@
   },
   "AVAXUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769490082
+    "ts": 1769504483
   },
   "AVAXUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
@@ -481,10 +481,18 @@
   },
   "SUIUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769493682
+    "ts": 1769504483
   },
   "XRPUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
     "ts": 1769503584
+  },
+  "XRPUSD:ALERT:PIVOT_DOWN_P": {
+    "state": "INACTIVE",
+    "ts": 1769504483
+  },
+  "LTCUSD:ALERT:PPO_011_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769504483
   }
 }
