@@ -17,7 +17,7 @@
   },
   "ADAUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769505382
+    "ts": 1769535083
   },
   "ETHUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
