@@ -36,8 +36,8 @@
     "ts": 1769503584
   },
   "BCHUSD:ALERT:PPO_ZERO_UP": {
-    "state": "INACTIVE",
-    "ts": 1769503584
+    "state": "ACTIVE",
+    "ts": 1769507184
   },
   "SUIUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -128,12 +128,12 @@
     "ts": 1769477482
   },
   "BCHUSD:ALERT:PPO_SIGNAL_UP": {
-    "state": "INACTIVE",
-    "ts": 1769488281
+    "state": "ACTIVE",
+    "ts": 1769507184
   },
   "BCHUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769475702
+    "ts": 1769507184
   },
   "BNBUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -161,7 +161,7 @@
   },
   "BCHUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769464883
+    "ts": 1769507184
   },
   "BCHUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
@@ -273,7 +273,7 @@
   },
   "SUIUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769477482
+    "ts": 1769507184
   },
   "AVAXUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
@@ -400,8 +400,8 @@
     "ts": 1769506283
   },
   "BCHUSD:ALERT:VWAP_UP": {
-    "state": "INACTIVE",
-    "ts": 1769489182
+    "state": "ACTIVE",
+    "ts": 1769507184
   },
   "ETHUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -409,11 +409,11 @@
   },
   "AVAXUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769477482
+    "ts": 1769507184
   },
   "BNBUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769477482
+    "ts": 1769507184
   },
   "DOTUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -433,7 +433,7 @@
   },
   "BCHUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769494583
+    "ts": 1769507184
   },
   "BTCUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
@@ -441,7 +441,7 @@
   },
   "BCHUSD:ALERT:PIVOT_DOWN_R3": {
     "state": "INACTIVE",
-    "ts": 1769493682
+    "ts": 1769507184
   },
   "BTCUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
@@ -502,5 +502,13 @@
   "SOLUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769505382
+  },
+  "BCHUSD:ALERT:MMH_BUY": {
+    "state": "ACTIVE",
+    "ts": 1769507184
+  },
+  "AAVEUSD:ALERT:RSI_50_UP": {
+    "state": "INACTIVE",
+    "ts": 1769507184
   }
 }
