@@ -624,8 +624,8 @@
     "ts": 1769533283
   },
   "ETHUSD:ALERT:PIVOT_UP_R2": {
-    "state": "ACTIVE",
-    "ts": 1769543184
+    "state": "INACTIVE",
+    "ts": 1769544083
   },
   "AVAXUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
