@@ -353,7 +353,7 @@
   },
   "AAVEUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769490982
+    "ts": 1769493682
   },
   "BTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -441,7 +441,7 @@
   },
   "BCHUSD:ALERT:PIVOT_DOWN_R3": {
     "state": "INACTIVE",
-    "ts": 1769482880
+    "ts": 1769493682
   },
   "BTCUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
@@ -478,5 +478,9 @@
   "SUIUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
     "ts": 1769491883
+  },
+  "SUIUSD:ALERT:PIVOT_DOWN_P": {
+    "state": "INACTIVE",
+    "ts": 1769493682
   }
 }
