@@ -113,7 +113,7 @@
   },
   "BNBUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769457689
+    "ts": 1769472986
   },
   "BNBUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -354,5 +354,9 @@
   "SOLUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769472981
+  },
+  "BNBUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769472986
   }
 }
