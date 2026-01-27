@@ -48,5 +48,7 @@
   "AAVEUSD:pivot_up_R1:last_sent": "1769522400",
   "BNBUSD:pivot_up_R2:last_sent": "1769528700",
   "XRPUSD:ppo_signal_down:last_sent": "1769526900",
-  "XRPUSD:mmh_sell:last_sent": "1769526900"
+  "XRPUSD:mmh_sell:last_sent": "1769526900",
+  "SOLUSD:ppo_zero_up:last_sent": "1769528700",
+  "SOLUSD:ppo_011_up:last_sent": "1769528700"
 }
