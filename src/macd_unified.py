@@ -2438,41 +2438,35 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.debug(f"Insufficient 15m data: {i15} closed (need >=4)")
             return None
 
-        o_curr = data_15m["open"][i15]
-        h_curr = data_15m["high"][i15]
-        l_curr = data_15m["low"][i15]
-        c_curr = data_15m["close"][i15]
-
-        candle_range = h_curr - l_curr
-        
-        if candle_range <= 1e-9:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - flat/doji candle (range={candle_range})")
-            return None
-        
-        upper_wick_ratio = (h_curr - c_curr) / candle_range
-        lower_wick_ratio = (c_curr - l_curr) / candle_range
-        
-        is_green = c_curr > o_curr
-        is_red = c_curr < o_curr
-        
-        if (is_green and upper_wick_ratio > 0.20) or (is_red and lower_wick_ratio > 0.20):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping {pair_name} - high wick candle (upper={upper_wick_ratio:.2%}, lower={lower_wick_ratio:.2%})"
-                )
-            return None
-        
-        if not is_green and not is_red:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping {pair_name} - doji/neutral candle (O={o_curr:.4f}, C={c_curr:.4f})"
-                )
-            return None
-        
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
+        ts_curr = int(ts_15m_val)
         
+        if ts_curr > 1e10:
+            ts_curr = ts_curr // 1000
+        
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 120):
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
+            return None
+            
+        interval_seconds = 15 * 60
+        candle_close_ts = ts_curr + interval_seconds
+        time_since_close = reference_time - candle_close_ts
+
+
+        if reference_time - ts_curr > 1200:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - candle too stale ({reference_time - ts_curr}s > 600s)")
+            return None
+        
+        if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Skipping {pair_name} - candle not finalized ({time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
+                )
+            return None
+
         cache_key = f"{pair_name}_{ts_15m_val}"
         if cache_key in alignment_cache:
             i5 = alignment_cache[cache_key]
@@ -2486,6 +2480,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.debug(f"Insufficient aligned 5m data: {i5} (need >=2)")
             return None
 
+        close_15m = data_15m["close"]
+        open_15m = data_15m["open"]
+        timestamps_15m = data_15m["timestamp"]
+
+        close_curr_quick = close_15m[i15]
+        open_curr_quick = open_15m[i15]
+        is_green = close_curr_quick > open_curr_quick
+        is_red = close_curr_quick < open_curr_quick
+
+        if not is_green and not is_red:
+            if logger_pair.isEnabledFor(logging.DEBUG):
+                logger_pair.debug(
+                    f"Doji/neutral candle for {pair_name} "
+                    f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
+                )
+            return None
+       
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
         )
@@ -2504,27 +2515,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
-        
-        close_15m = data_15m["close"]
-        open_15m = data_15m["open"]
-        high_15m = data_15m["high"]
-        low_15m = data_15m["low"]
         close_curr = close_15m[i15]
-        close_prev = close_15m[i15 - 1] if i15 >= 1 else close_curr
+        close_prev = close_15m[i15 - 1]
         open_curr = open_15m[i15]
-        high_curr = high_15m[i15]
-        low_curr = low_15m[i15]
-        ts_curr = int(ts_15m_val)
-        
-    
-        if ts_curr > 1e10:
-            ts_curr = ts_curr // 1000
-        
+        high_curr = data_15m["high"][i15]
+        low_curr = data_15m["low"][i15]
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
-        high_prev = high_15m[i15 - 1] if i15 >= 1 else high_curr
-        low_prev = low_15m[i15 - 1] if i15 >= 1 else low_curr
+        high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
+        low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
         close_5m_val = data_5m["close"][i5]
-        
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         ppo_sig_curr = ppo_signal[i15]
