@@ -509,7 +509,7 @@
   },
   "AAVEUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769507184
+    "ts": 1769538686
   },
   "BTCUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
