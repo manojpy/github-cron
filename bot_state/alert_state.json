@@ -77,7 +77,7 @@
   },
   "AAVEUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
-    "ts": 1769470283
+    "ts": 1769472991
   },
   "AVAXUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -358,5 +358,9 @@
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769472986
+  },
+  "AAVEUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769472991
   }
 }
