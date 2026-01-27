@@ -665,7 +665,7 @@
   },
   "AVAXUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
-    "ts": 1769545882
+    "ts": 1769547684
   },
   "DOTUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
@@ -684,15 +684,23 @@
     "ts": 1769545882
   },
   "SOLUSD:ALERT:PIVOT_UP_R2": {
-    "state": "INACTIVE",
-    "ts": 1769546784
+    "state": "ACTIVE",
+    "ts": 1769547684
   },
   "SOLUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
-    "ts": 1769545882
+    "ts": 1769547684
   },
   "AVAXUSD:ALERT:PIVOT_UP_R2": {
     "state": "INACTIVE",
     "ts": 1769546784
+  },
+  "BTCUSD:ALERT:PIVOT_UP_R2": {
+    "state": "ACTIVE",
+    "ts": 1769547684
+  },
+  "BTCUSD:ALERT:PIVOT_DOWN_R2": {
+    "state": "INACTIVE",
+    "ts": 1769547684
   }
 }
