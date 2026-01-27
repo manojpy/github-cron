@@ -179,7 +179,7 @@ class BotConfig(BaseModel):
                     "1.0 = baseline, 1.1 = require 10% expansion, 1.5 = require 50% expansion"
     )
     MAX_CANDLE_STALENESS_SEC: int = Field(
-        default=600,
+        default=1100,
         ge=600,
         le=3600,
         description="Maximum allowed candle staleness in seconds (10-60 minutes)"
@@ -2455,7 +2455,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         time_since_close = reference_time - candle_close_ts
 
 
-        if reference_time - ts_curr > 600:
+        if reference_time - ts_curr > 1100:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(f"Skipping {pair_name} - candle too stale ({reference_time - ts_curr}s > 600s)")
             return None
