@@ -169,7 +169,7 @@
   },
   "LTCUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769522481
+    "ts": 1769542280
   },
   "DOTUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
@@ -200,8 +200,8 @@
     "ts": 1769540483
   },
   "BCHUSD:ALERT:PPO_011_UP": {
-    "state": "ACTIVE",
-    "ts": 1769540483
+    "state": "INACTIVE",
+    "ts": 1769542280
   },
   "BNBUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
@@ -477,7 +477,7 @@
   },
   "SUIUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
-    "ts": 1769525186
+    "ts": 1769542280
   },
   "SUIUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
@@ -585,11 +585,11 @@
   },
   "BNBUSD:ALERT:PIVOT_DOWN_R3": {
     "state": "INACTIVE",
-    "ts": 1769540483
+    "ts": 1769542280
   },
   "DOTUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769540483
+    "ts": 1769542280
   },
   "SOLUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
@@ -613,7 +613,7 @@
   },
   "DOTUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769533283
+    "ts": 1769542280
   },
   "ADAUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
