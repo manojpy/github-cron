@@ -217,7 +217,7 @@
   },
   "XRPUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769453184
+    "ts": 1769472105
   },
   "AAVEUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
