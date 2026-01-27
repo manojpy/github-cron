@@ -99,7 +99,7 @@ class Constants:
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
-    CANDLE_PUBLICATION_LAG_SEC = 20
+    
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -2407,104 +2407,39 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], 
-    data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], 
-    sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
+async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
+    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, alignment_cache: Dict[str, int]) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     ALERT_COOLDOWN_SECONDS = 300
+    close_15m = None
+    open_15m = None
+    timestamps_15m = None
+    indicators = None, 
+    ppo = None
+    ppo_signal = None
+    smooth_rsi = None
+    vwap = None
+    mmh = None
+    upw = None
+    dnw = None
+    rma50_15 = None
+    rma200_5 = None
+    piv = None
+    context = None
 
-    close_15m = open_15m = high_15m = low_15m = timestamps_15m = None
-    indicators = ppo = ppo_signal = smooth_rsi = vwap = mmh = None
-    upw = dnw = rma50_15 = rma200_5 = piv = context = None
-  
     try:
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
+
         if i15 is None or i15 < 4:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(f"Insufficient 15m data: {i15} closed (need >=4)")
             return None
 
-        if i15 >= len(data_15m["timestamp"]) - 1:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - i15 points to last element (likely forming)")
-            return None
-
-        ts_15m_val = data_15m["timestamp"][i15]  # Extract timestamp ONCE
+        ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
-
-        ts_curr = int(ts_15m_val)  # Convert ONCE, reuse existing extraction
-        
-        # ✅ DEBUG: Check timestamp units BEFORE any processing
-        if cfg.DEBUG_MODE:
-            logger_pair.debug(
-                f"[DEBUG] Raw timestamp values: "
-                f"ts_15m_val={ts_15m_val} (type={type(ts_15m_val).__name__}) | "
-                f"ts_curr={ts_curr} | reference_time={reference_time}"
-            )
-        
-        # ✅ FIX: Detect and convert millisecond/second mismatch
-        if ts_curr > 1e10:  # Heuristic: Unix timestamp in ms is > 10 billion
-            original_ts = ts_curr
-            ts_curr = ts_curr // 1000
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"[DEBUG] Timestamp unit conversion: "
-                    f"{original_ts} (ms) → {ts_curr} (s)"
-                )
-        
-        # ✅ DEBUG: Validate candle timestamp with details
-        if cfg.DEBUG_MODE:
-            logger_pair.debug(
-                f"[DEBUG] Before timestamp validation: "
-                f"ts_curr={ts_curr}, reference_time={reference_time}"
-            )
-        
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"[WARN] Timestamp validation FAILED - "
-                    f"ts_curr={ts_curr}, reference_time={reference_time}, "
-                    f"difference={(reference_time - ts_curr)}s"
-                )
-            return None
-
-        # ✅ CRITICAL FIX 3: Publication lag check with detailed debugging
-        interval_seconds = 15 * 60  # 900 seconds
-        candle_close_ts = ts_curr + interval_seconds
-        time_since_close = reference_time - candle_close_ts
-
-        if cfg.DEBUG_MODE:
-            logger_pair.debug(
-                f"[DEBUG] Lag calculation: "
-                f"ts_curr={ts_curr} | "
-                f"candle_close_ts={candle_close_ts} | "
-                f"reference_time={reference_time} | "
-                f"time_since_close={time_since_close}s | "
-                f"required={Constants.CANDLE_PUBLICATION_LAG_SEC}s"
-            )
-            
-            # Additional debugging for the check itself
-            will_skip = time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC
-            logger_pair.debug(
-                f"[DEBUG] Lag check: {time_since_close} < {Constants.CANDLE_PUBLICATION_LAG_SEC}? "
-                f"{will_skip} → {'SKIP' if will_skip else 'PROCEED'}"
-            )
-
-        if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"[SKIP] Candle not finalized | "
-                    f"Candle close: {format_ist_time(candle_close_ts)} | "
-                    f"Current time: {format_ist_time(reference_time)} | "
-                    f"Lag: {time_since_close}s (need >= {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
-                )
-            return None
-        
-        if cfg.DEBUG_MODE:
-            logger_pair.debug(f"[✓] All validations passed, proceeding with evaluation")
         
         cache_key = f"{pair_name}_{ts_15m_val}"
         if cache_key in alignment_cache:
@@ -2521,44 +2456,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
-        high_15m = data_15m["high"]
-        low_15m = data_15m["low"]
         timestamps_15m = data_15m["timestamp"]
 
-        close_curr = close_15m[i15]
-        open_curr = open_15m[i15]
-        is_green = close_curr > open_curr
-        is_red = close_curr < open_curr
+        close_curr_quick = close_15m[i15]
+        open_curr_quick = open_15m[i15]
+        is_green = close_curr_quick > open_curr_quick
+        is_red = close_curr_quick < open_curr_quick
 
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
                     f"Doji/neutral candle for {pair_name} "
-                    f"(O={open_curr:.2f}, C={close_curr:.2f}), skipping indicators"
+                    f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
                 )
             return None
-
-        ts_curr = int(ts_15m_val)  # Convert ONCE, reuse existing extraction
-        
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - 15m candle timestamp misaligned")
-            return None
-
-        interval_seconds = 15 * 60
-        candle_close_ts = ts_curr + interval_seconds
-        time_since_close = reference_time - candle_close_ts
-
-        if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping {pair_name} - candle not finalized yet | "
-                    f"Candle close: {format_ist_time(candle_close_ts)} | "
-                    f"Current time: {format_ist_time(reference_time)} | "
-                    f"Lag: {time_since_close}s (need >= {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
-                )
-            return None
-
+    
+       
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
         )
@@ -2577,34 +2490,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
-        
-        high_curr = high_15m[i15]
-        low_curr = low_15m[i15]
-        close_prev = close_15m[i15 - 1] if i15 >= 1 else close_curr
+        close_curr = close_15m[i15]
+        close_prev = close_15m[i15 - 1]
+        open_curr = open_15m[i15]
+        high_curr = data_15m["high"][i15]
+        low_curr = data_15m["low"][i15]
+        ts_curr = int(timestamps_15m[i15])
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
-        high_prev = high_15m[i15 - 1] if i15 >= 1 else high_curr
-        low_prev = low_15m[i15 - 1] if i15 >= 1 else low_curr
-        
+        high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
+        low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
         close_5m_val = data_5m["close"][i5]
-        
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
-
-        candle_range = high_curr - low_curr
-        if candle_range <= 1e-9:
-            actual_buy_wick_ratio = 1.0 
-            actual_sell_wick_ratio = 1.0
-        else:
-            upper_wick = high_curr - close_curr
-            actual_buy_wick_ratio = upper_wick / candle_range
-
-            lower_wick = close_curr - low_curr
-            actual_sell_wick_ratio = lower_wick / candle_range
-
         vwap_enabled = cfg.ENABLE_VWAP
         vwap_available = False
         vwap_curr = None
@@ -2658,9 +2559,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-        
+
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
+            return None
+
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
+
+        candle_range = high_curr - low_curr
+        if candle_range <= 1e-9:
+            actual_buy_wick_ratio = 1.0
+            actual_sell_wick_ratio = 1.0
+        else:        
+            upper_wick = high_curr - close_curr
+            actual_buy_wick_ratio = upper_wick / candle_range
+
+            lower_wick = close_curr - low_curr
+            actual_sell_wick_ratio = lower_wick / candle_range
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
