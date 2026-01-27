@@ -11,7 +11,7 @@
   "SUIUSD:last_reset_date": "2026-01-27",
   "AAVEUSD:last_reset_date": "2026-01-27",
   "SOLUSD:last_reset_date": "2026-01-27",
-  "ETHUSD:mmh_buy:last_sent": "1769448600",
+  "ETHUSD:mmh_buy:last_sent": "1769522400",
   "AAVEUSD:vwap_up:last_sent": "1769503500",
   "BNBUSD:ppo_signal_up:last_sent": "1769513400",
   "BNBUSD:vwap_up:last_sent": "1769520600",
@@ -41,5 +41,8 @@
   "AVAXUSD:vwap_up:last_sent": "1769486400",
   "AVAXUSD:mmh_buy:last_sent": "1769486400",
   "BCHUSD:mmh_buy:last_sent": "1769506200",
-  "BNBUSD:pivot_up_R1:last_sent": "1769520600"
+  "BNBUSD:pivot_up_R1:last_sent": "1769520600",
+  "ETHUSD:ppo_signal_up:last_sent": "1769522400",
+  "ETHUSD:ppo_zero_up:last_sent": "1769522400",
+  "ETHUSD:vwap_up:last_sent": "1769522400"
 }
