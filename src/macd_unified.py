@@ -2435,28 +2435,76 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ts_15m_val = data_15m["timestamp"][i15]  # Extract timestamp ONCE
         ts_5m_arr = data_5m["timestamp"]
 
-        ts_curr = int(ts_15m_val)
+        ts_curr = int(ts_15m_val)  # Convert ONCE, reuse existing extraction
+        
+        # ✅ DEBUG: Check timestamp units BEFORE any processing
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                f"[DEBUG] Raw timestamp values: "
+                f"ts_15m_val={ts_15m_val} (type={type(ts_15m_val).__name__}) | "
+                f"ts_curr={ts_curr} | reference_time={reference_time}"
+            )
+        
+        # ✅ FIX: Detect and convert millisecond/second mismatch
+        if ts_curr > 1e10:  # Heuristic: Unix timestamp in ms is > 10 billion
+            original_ts = ts_curr
+            ts_curr = ts_curr // 1000
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"[DEBUG] Timestamp unit conversion: "
+                    f"{original_ts} (ms) → {ts_curr} (s)"
+                )
+        
+        # ✅ DEBUG: Validate candle timestamp with details
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                f"[DEBUG] Before timestamp validation: "
+                f"ts_curr={ts_curr}, reference_time={reference_time}"
+            )
+        
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"[WARN] Timestamp validation FAILED - "
+                    f"ts_curr={ts_curr}, reference_time={reference_time}, "
+                    f"difference={(reference_time - ts_curr)}s"
+                )
+            return None
 
-        if ts_curr > 1e10:  # Likely milliseconds (too large for seconds)
-            ts_curr = ts_curr // 1000  # Convert to seconds
-
-        interval_seconds = 15 * 60
+        # ✅ CRITICAL FIX 3: Publication lag check with detailed debugging
+        interval_seconds = 15 * 60  # 900 seconds
         candle_close_ts = ts_curr + interval_seconds
         time_since_close = reference_time - candle_close_ts
 
         if cfg.DEBUG_MODE:
             logger_pair.debug(
-                 f"Lag check: ts_curr={ts_curr}, candle_close_ts={candle_close_ts}, "
-                 f"reference_time={reference_time}, time_since_close={time_since_close}s"
+                f"[DEBUG] Lag calculation: "
+                f"ts_curr={ts_curr} | "
+                f"candle_close_ts={candle_close_ts} | "
+                f"reference_time={reference_time} | "
+                f"time_since_close={time_since_close}s | "
+                f"required={Constants.CANDLE_PUBLICATION_LAG_SEC}s"
+            )
+            
+            # Additional debugging for the check itself
+            will_skip = time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC
+            logger_pair.debug(
+                f"[DEBUG] Lag check: {time_since_close} < {Constants.CANDLE_PUBLICATION_LAG_SEC}? "
+                f"{will_skip} → {'SKIP' if will_skip else 'PROCEED'}"
             )
 
         if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
-             if cfg.DEBUG_MODE:
+            if cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"Skipping {pair_name} - candle not finalized yet | "
+                    f"[SKIP] Candle not finalized | "
+                    f"Candle close: {format_ist_time(candle_close_ts)} | "
+                    f"Current time: {format_ist_time(reference_time)} | "
                     f"Lag: {time_since_close}s (need >= {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
                 )
-             return None
+            return None
+        
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(f"[✓] All validations passed, proceeding with evaluation")
         
         cache_key = f"{pair_name}_{ts_15m_val}"
         if cache_key in alignment_cache:
