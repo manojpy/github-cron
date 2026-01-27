@@ -421,7 +421,7 @@
   },
   "SUIUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769545882
+    "ts": 1769553083
   },
   "XRPUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
@@ -481,7 +481,7 @@
   },
   "SUIUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769544981
+    "ts": 1769553083
   },
   "XRPUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
@@ -685,7 +685,7 @@
   },
   "SOLUSD:ALERT:PIVOT_UP_R2": {
     "state": "INACTIVE",
-    "ts": 1769551284
+    "ts": 1769553083
   },
   "SOLUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
