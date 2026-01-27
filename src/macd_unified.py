@@ -2560,6 +2560,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
+            return None
+
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
@@ -2582,11 +2587,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"Wick (15M): Buy={actual_buy_wick_ratio*100:.2f}% Sell={actual_sell_wick_ratio*100:.2f}% "
                 f"(threshold={Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
-
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
-            return None
 
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
             current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
@@ -2753,10 +2753,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if not k.startswith("pivot_")
             ]
 
-        redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
+        state_store_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
 
         previous_states = await check_multiple_alert_states(
-            sdb, pair_name, redis_alert_keys
+            sdb, pair_name, state_store_alert_keys
         )
 
         all_state_changes = []
