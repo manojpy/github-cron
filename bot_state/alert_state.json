@@ -606,5 +606,21 @@
   "DOTUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
     "ts": 1769531490
+  },
+  "LTCUSD:ALERT:PIVOT_DOWN_R1": {
+    "state": "INACTIVE",
+    "ts": 1769533283
+  },
+  "DOTUSD:ALERT:RSI_50_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769533283
+  },
+  "ADAUSD:ALERT:PIVOT_UP_R1": {
+    "state": "ACTIVE",
+    "ts": 1769533283
+  },
+  "ADAUSD:ALERT:PIVOT_DOWN_R1": {
+    "state": "INACTIVE",
+    "ts": 1769533283
   }
 }
