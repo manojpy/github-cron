@@ -2445,19 +2445,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if ts_curr > 1e10:
             ts_curr = ts_curr // 1000
         
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
-            return None
-            
         interval_seconds = 15 * 60
         candle_close_ts = ts_curr + interval_seconds
+        
+        if reference_time < candle_close_ts:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"Skipping {pair_name} - candle still forming (closes in {candle_close_ts - reference_time}s)"
+                )
+            return None
+        
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 300):
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle timestamp misaligned")
+            return None
+        
         time_since_close = reference_time - candle_close_ts
         
         if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"Skipping {pair_name} - candle not finalized ({time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
+                    f"Skipping {pair_name} - data not finalized ({time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
                 )
             return None
 
