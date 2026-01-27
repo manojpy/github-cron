@@ -25,7 +25,7 @@
   },
   "DOTUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769527882
+    "ts": 1769549483
   },
   "SUIUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
@@ -696,8 +696,8 @@
     "ts": 1769546784
   },
   "BTCUSD:ALERT:PIVOT_UP_R2": {
-    "state": "ACTIVE",
-    "ts": 1769547684
+    "state": "INACTIVE",
+    "ts": 1769549483
   },
   "BTCUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
