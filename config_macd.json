@@ -10,7 +10,7 @@
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
   "SEND_TEST_MESSAGE": false,
-  "ENABLE_RVOL_ALERT": true, 
+  "ENABLE_RVOL_ALERT": false, 
 
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
