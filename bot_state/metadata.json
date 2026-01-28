@@ -69,5 +69,7 @@
   "DOTUSD:mmh_buy:last_sent": "1769605200",
   "XRPUSD:mmh_buy:last_sent": "1769607000",
   "BTCUSD:ppo_signal_up:last_sent": "1769616900",
-  "BTCUSD:mmh_buy:last_sent": "1769616900"
+  "BTCUSD:mmh_buy:last_sent": "1769616900",
+  "SUIUSD:ppo_signal_down:last_sent": "1769628600",
+  "SUIUSD:mmh_sell:last_sent": "1769628600"
 }
