@@ -171,12 +171,18 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
     PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5, description="Max distance from pivot to trigger alert")
+
     RVOL_THRESHOLD: float = Field(
         default=1.0, 
         ge=0.5, 
         le=2.0,
         description="Volatility expansion threshold (Pine: atr1 > atr3 * rvolThreshold). "
                     "1.0 = baseline, 1.1 = require 10% expansion, 1.5 = require 50% expansion"
+    )
+    ENABLE_RVOL_ALERT: bool = Field(
+        default=True,
+        description="Enable volatility expansion check (RVOL alert). "
+                    "When False, wick patterns are evaluated without volatility requirement"
     )
     MAX_CANDLE_STALENESS_SEC: int = Field(
         default=1200,
@@ -984,10 +990,9 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'atr_long': np.full(n, np.nan, dtype=np.float64),
         }
 
-def precompute_candle_quality(data_15m: Dict[str, np.ndarray], 
-                              atr_short: np.ndarray, atr_long: np.ndarray,
-                              rvol_threshold: float) -> Tuple[np.ndarray, np.ndarray]:
-    
+def precompute_candle_quality(data_15m: Dict[str, np.ndarray], atr_short: np.ndarray, 
+                              atr_long: np.ndarray, rvol_threshold: float = 1.0,
+                              enable_rvol_alert: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     try:
         n_ohlc = len(data_15m["close"])
         
@@ -1047,7 +1052,12 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray],
                 f"precompute_candle_quality: rvol_threshold={rvol_threshold} seems very high "
                 f"(typical range 0.5-2.0)"
             )
+        effective_rvol_threshold = rvol_threshold if enable_rvol_alert else 0.0
         
+        if cfg.DEBUG_MODE:
+            rvol_status = "ENABLED" if enable_rvol_alert else "DISABLED"
+            logger.debug(f"precompute_candle_quality: RVOL Alert {rvol_status}")        
+
         open_arr = data_15m["open"]
         high_arr = data_15m["high"]
         low_arr = data_15m["low"]
@@ -1055,12 +1065,12 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray],
         
         buy_quality = vectorized_wick_check_buy(
             open_arr, high_arr, low_arr, close_arr,
-            Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
+            Constants.MIN_WICK_RATIO, atr_short, atr_long, effective_rvol_threshold
         )
         
         sell_quality = vectorized_wick_check_sell(
             open_arr, high_arr, low_arr, close_arr,
-            Constants.MIN_WICK_RATIO, atr_short, atr_long, rvol_threshold
+            Constants.MIN_WICK_RATIO, atr_short, atr_long, effective_rvol_threshold
         )
         
         if len(buy_quality) != n_ohlc or len(sell_quality) != n_ohlc:
@@ -2674,7 +2684,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
         buy_quality_arr, sell_quality_arr = precompute_candle_quality(
-            data_15m, indicators["atr_short"], indicators["atr_long"], cfg.RVOL_THRESHOLD)
+            data_15m, indicators["atr_short"], indicators["atr_long"], cfg.RVOL_THRESHOLD,
+            cfg.ENABLE_RVOL_ALERT)
 
         buy_candle_passed = bool(buy_quality_arr[i15])
         sell_candle_passed = bool(sell_quality_arr[i15])
