@@ -10,6 +10,7 @@
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
   "SEND_TEST_MESSAGE": false,
+  "ENABLE_RVOL_ALERT": false, 
 
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
@@ -34,8 +35,7 @@
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
   "RVOL_THRESHOLD": 1.0,
-  "ENABLE_RVOL_ALERT": true,
-
+  
   "MAX_PARALLEL_FETCH": 12,
   "HTTP_TIMEOUT": 8,
   "CANDLE_FETCH_RETRIES": 2,
