@@ -192,8 +192,8 @@
     "ts": 1769593583
   },
   "BTCUSD:ALERT:PPO_011_UP": {
-    "state": "INACTIVE",
-    "ts": 1769596284
+    "state": "ACTIVE",
+    "ts": 1769597182
   },
   "AVAXUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -585,7 +585,7 @@
   },
   "XRPUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
-    "ts": 1769594480
+    "ts": 1769597182
   },
   "BNBUSD:ALERT:PIVOT_DOWN_R2": {
     "state": "INACTIVE",
