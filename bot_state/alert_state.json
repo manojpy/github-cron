@@ -125,7 +125,7 @@
   },
   "ETHUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769631385
+    "ts": 1769641284
   },
   "BCHUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -185,7 +185,7 @@
   },
   "XRPUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769630483
+    "ts": 1769641284
   },
   "XRPUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -401,7 +401,7 @@
   },
   "AAVEUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769540483
+    "ts": 1769641284
   },
   "AVAXUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
@@ -457,7 +457,7 @@
   },
   "ETHUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769639484
+    "ts": 1769641284
   },
   "AVAXUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -537,7 +537,7 @@
   },
   "XRPUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769630483
+    "ts": 1769641284
   },
   "XRPUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
