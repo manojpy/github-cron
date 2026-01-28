@@ -38,7 +38,7 @@
   "AAVEUSD:ppo_zero_up:last_sent": "1769539500",
   "AAVEUSD:ppo_011_up:last_sent": "1769529600",
   "BCHUSD:ppo_011_up:last_sent": "1769539500",
-  "AVAXUSD:vwap_up:last_sent": "1769486400",
+  "AVAXUSD:vwap_up:last_sent": "1769582700",
   "AVAXUSD:mmh_buy:last_sent": "1769486400",
   "BCHUSD:mmh_buy:last_sent": "1769571000",
   "BNBUSD:pivot_up_R1:last_sent": "1769526000",
@@ -59,5 +59,6 @@
   "DOTUSD:pivot_up_R1:last_sent": "1769544900",
   "ADAUSD:pivot_up_R2:last_sent": "1769544900",
   "SOLUSD:pivot_up_R2:last_sent": "1769546700",
-  "BTCUSD:pivot_up_R2:last_sent": "1769546700"
+  "BTCUSD:pivot_up_R2:last_sent": "1769546700",
+  "AVAXUSD:ppo_011_up:last_sent": "1769582700"
 }
