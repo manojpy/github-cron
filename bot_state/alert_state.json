@@ -49,7 +49,7 @@
   },
   "SUIUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769600784
+    "ts": 1769619687
   },
   "BTCUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
@@ -133,7 +133,7 @@
   },
   "BCHUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769606183
+    "ts": 1769619687
   },
   "BNBUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -149,7 +149,7 @@
   },
   "SOLUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769617882
+    "ts": 1769619687
   },
   "BTCUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -157,7 +157,7 @@
   },
   "AVAXUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769593583
+    "ts": 1769619687
   },
   "BCHUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -181,7 +181,7 @@
   },
   "BTCUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769593583
+    "ts": 1769619687
   },
   "XRPUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
@@ -349,7 +349,7 @@
   },
   "AAVEUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769580080
+    "ts": 1769619687
   },
   "SOLUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
@@ -453,7 +453,7 @@
   },
   "BTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769617882
+    "ts": 1769619687
   },
   "ETHUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -541,7 +541,7 @@
   },
   "XRPUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769617882
+    "ts": 1769619687
   },
   "AAVEUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
@@ -569,7 +569,7 @@
   },
   "AAVEUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
-    "ts": 1769593583
+    "ts": 1769619687
   },
   "BTCUSD:ALERT:PIVOT_UP_R1": {
     "state": "ACTIVE",
@@ -693,11 +693,11 @@
   },
   "DOTUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
-    "ts": 1769617882
+    "ts": 1769619687
   },
   "SOLUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769617882
+    "ts": 1769619687
   },
   "BNBUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
