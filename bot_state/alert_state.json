@@ -265,7 +265,7 @@
   },
   "AAVEUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769564782
+    "ts": 1769574683
   },
   "ADAUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
@@ -344,8 +344,8 @@
     "ts": 1769505382
   },
   "BCHUSD:ALERT:MMH_BUY": {
-    "state": "ACTIVE",
-    "ts": 1769571985
+    "state": "INACTIVE",
+    "ts": 1769574683
   },
   "AAVEUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
