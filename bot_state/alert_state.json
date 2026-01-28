@@ -104,12 +104,12 @@
     "ts": 1769606183
   },
   "BNBUSD:ALERT:PPO_SIGNAL_UP": {
-    "state": "ACTIVE",
-    "ts": 1769606183
+    "state": "INACTIVE",
+    "ts": 1769607082
   },
   "BNBUSD:ALERT:MMH_BUY": {
-    "state": "ACTIVE",
-    "ts": 1769606183
+    "state": "INACTIVE",
+    "ts": 1769607082
   },
   "BNBUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
