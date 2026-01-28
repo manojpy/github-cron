@@ -169,7 +169,7 @@
   },
   "LTCUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769553983
+    "ts": 1769571082
   },
   "DOTUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
@@ -477,7 +477,7 @@
   },
   "SOLUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769569279
+    "ts": 1769571082
   },
   "XRPUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
