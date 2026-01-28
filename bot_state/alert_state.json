@@ -1,7 +1,7 @@
 {
   "BTCUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769623283
+    "ts": 1769626884
   },
   "BNBUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -125,7 +125,7 @@
   },
   "ETHUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769625083
+    "ts": 1769626884
   },
   "BCHUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -189,7 +189,7 @@
   },
   "XRPUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769593583
+    "ts": 1769626884
   },
   "BTCUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
@@ -273,7 +273,7 @@
   },
   "SUIUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769593583
+    "ts": 1769626884
   },
   "AVAXUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
@@ -441,7 +441,7 @@
   },
   "BTCUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769618781
+    "ts": 1769626884
   },
   "ETHUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
@@ -457,7 +457,7 @@
   },
   "ETHUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769623283
+    "ts": 1769626884
   },
   "AVAXUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -465,7 +465,7 @@
   },
   "LTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769622381
+    "ts": 1769626884
   },
   "SUIUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -572,8 +572,8 @@
     "ts": 1769622381
   },
   "BTCUSD:ALERT:PIVOT_UP_R1": {
-    "state": "ACTIVE",
-    "ts": 1769617882
+    "state": "INACTIVE",
+    "ts": 1769626884
   },
   "BTCUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
@@ -697,7 +697,7 @@
   },
   "SOLUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
-    "ts": 1769622381
+    "ts": 1769626884
   },
   "BNBUSD:ALERT:PIVOT_DOWN_R1": {
     "state": "INACTIVE",
