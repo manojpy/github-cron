@@ -201,7 +201,7 @@
   },
   "BCHUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
-    "ts": 1769603480
+    "ts": 1769611619
   },
   "BNBUSD:ALERT:PPO_011_UP": {
     "state": "INACTIVE",
@@ -225,7 +225,7 @@
   },
   "ADAUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769562982
+    "ts": 1769611619
   },
   "LTCUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -341,7 +341,7 @@
   },
   "SOLUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769592679
+    "ts": 1769611619
   },
   "BCHUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -409,7 +409,7 @@
   },
   "BCHUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769603480
+    "ts": 1769611619
   },
   "LTCUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
@@ -449,7 +449,7 @@
   },
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769563882
+    "ts": 1769611619
   },
   "BTCUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -529,7 +529,7 @@
   },
   "BCHUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
-    "ts": 1769589081
+    "ts": 1769611619
   },
   "BCHUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
