@@ -321,7 +321,7 @@
   },
   "XRPUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769539598
+    "ts": 1769575584
   },
   "XRPUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
@@ -522,5 +522,9 @@
   "ADAUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
     "ts": 1769569279
+  },
+  "BNBUSD:ALERT:VWAP_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769575584
   }
 }
