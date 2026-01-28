@@ -17,7 +17,7 @@
   "BNBUSD:vwap_up:last_sent": "1769526000",
   "BNBUSD:mmh_buy:last_sent": "1769605200",
   "AAVEUSD:mmh_buy:last_sent": "1769607000",
-  "BTCUSD:vwap_up:last_sent": "1769450400",
+  "BTCUSD:vwap_up:last_sent": "1769616900",
   "BCHUSD:ppo_signal_up:last_sent": "1769571000",
   "BCHUSD:vwap_up:last_sent": "1769571000",
   "BCHUSD:pivot_up_P:last_sent": "1769450400",
@@ -55,7 +55,7 @@
   "ADAUSD:pivot_up_R1:last_sent": "1769600700",
   "AAVEUSD:rsi_50_up:last_sent": "1769539500",
   "ETHUSD:pivot_up_R2:last_sent": "1769544000",
-  "BTCUSD:pivot_up_R1:last_sent": "1769599800",
+  "BTCUSD:pivot_up_R1:last_sent": "1769616900",
   "DOTUSD:pivot_up_R1:last_sent": "1769544900",
   "ADAUSD:pivot_up_R2:last_sent": "1769544900",
   "SOLUSD:pivot_up_R2:last_sent": "1769546700",
@@ -67,5 +67,7 @@
   "AVAXUSD:pivot_up_R1:last_sent": "1769600700",
   "XRPUSD:pivot_up_R2:last_sent": "1769600700",
   "DOTUSD:mmh_buy:last_sent": "1769605200",
-  "XRPUSD:mmh_buy:last_sent": "1769607000"
+  "XRPUSD:mmh_buy:last_sent": "1769607000",
+  "BTCUSD:ppo_signal_up:last_sent": "1769616900",
+  "BTCUSD:mmh_buy:last_sent": "1769616900"
 }
