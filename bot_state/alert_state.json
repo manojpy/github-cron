@@ -698,5 +698,13 @@
   "SOLUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
     "ts": 1769614285
+  },
+  "BNBUSD:ALERT:PIVOT_DOWN_R1": {
+    "state": "INACTIVE",
+    "ts": 1769615185
+  },
+  "LTCUSD:ALERT:PIVOT_DOWN_S1": {
+    "state": "INACTIVE",
+    "ts": 1769615185
   }
 }
