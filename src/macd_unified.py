@@ -1704,136 +1704,136 @@ class DataFetcher:
         return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+    try:   
+        if not result or not isinstance(result, dict):
+            logger.warning("parse_candles_to_numpy: result is None or not dict")
+            return None
     
-    if not result or not isinstance(result, dict):
-        logger.warning("parse_candles_to_numpy: result is None or not dict")
-        return None
+        res = result.get("result", {}) or {}
+        required_fields = ("t", "o", "h", "l", "c", "v")
     
-    res = result.get("result", {}) or {}
-    required_fields = ("t", "o", "h", "l", "c", "v")
-    
-    if not all(k in res for k in required_fields):
-        missing = [k for k in required_fields if k not in res]
-        logger.warning(
-            f"parse_candles_to_numpy: Missing required fields: {missing} | "
-            f"Available: {list(res.keys())}"
-        )
-        return None
-    
-    try:
-        data = {
-            "timestamp": np.asarray(res["t"], dtype=np.int64),
-            "open":      np.asarray(res["o"], dtype=np.float64),
-            "high":      np.asarray(res["h"], dtype=np.float64),
-            "low":       np.asarray(res["l"], dtype=np.float64),
-            "close":     np.asarray(res["c"], dtype=np.float64),
-            "volume":    np.asarray(res["v"], dtype=np.float64),
-        }
-    
-    except (ValueError, TypeError) as e:
-        logger.error(f"parse_candles_to_numpy: Failed to convert data to arrays: {e}")
-        return None
-    
-    n = len(data["timestamp"])
-    
-    if n == 0:
-        logger.warning("parse_candles_to_numpy: empty candle array (n=0)")
-        return None
-    
-    for key in ["open", "high", "low", "close", "volume"]:
-        if len(data[key]) != n:
-            logger.error(
-                f"parse_candles_to_numpy: Array length mismatch in '{key}': "
-                f"{len(data[key])} != {n}"
+        if not all(k in res for k in required_fields):
+            missing = [k for k in required_fields if k not in res]
+            logger.warning(
+                f"parse_candles_to_numpy: Missing required fields: {missing} | "
+                f"Available: {list(res.keys())}"
             )
             return None
     
-    if data["timestamp"][-1] > 1_000_000_000_000:
-        data["timestamp"] //= 1000
+        try:
+            data = {
+                "timestamp": np.asarray(res["t"], dtype=np.int64),
+                "open":      np.asarray(res["o"], dtype=np.float64),
+                "high":      np.asarray(res["h"], dtype=np.float64),
+                "low":       np.asarray(res["l"], dtype=np.float64),
+                "close":     np.asarray(res["c"], dtype=np.float64),
+                "volume":    np.asarray(res["v"], dtype=np.float64),
+            }
     
-    o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+        except (ValueError, TypeError) as e:
+            logger.error(f"parse_candles_to_numpy: Failed to convert data to arrays: {e}")
+            return None
     
-    error_mask = (
-        np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c) |  # NaN check
-        np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c) |  # Inf check
-        ~((l <= o) & (o <= h) & (l <= c) & (c <= h)) |            # Relationship check
-        (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)                 # Non-positive check
-    )
+        n = len(data["timestamp"])
     
-    error_count = np.sum(error_mask)
+        if n == 0:
+            logger.warning("parse_candles_to_numpy: empty candle array (n=0)")
+            return None
     
-    if error_count > 0:
-        logger.error(
-            f"parse_candles_to_numpy: Found {error_count} invalid candle(s) out of {n} "
-            f"({error_count / n * 100:.1f}%)"
+        for key in ["open", "high", "low", "close", "volume"]:
+            if len(data[key]) != n:
+                logger.error(
+                    f"parse_candles_to_numpy: Array length mismatch in '{key}': "
+                    f"{len(data[key])} != {n}"
+                )
+                return None
+    
+        if data["timestamp"][-1] > 1_000_000_000_000:
+            data["timestamp"] //= 1000
+    
+        o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+    
+        error_mask = (
+            np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c) |  # NaN check
+            np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c) |  # Inf check
+            ~((l <= o) & (o <= h) & (l <= c) & (c <= h)) |            # Relationship check
+             (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)                 # Non-positive check
         )
-        
-        error_indices = np.where(error_mask)[0]
-        first_errors = error_indices[:min(5, len(error_indices))]
-        
-        for idx in first_errors:
+    
+        error_count = np.sum(error_mask)
+    
+        if error_count > 0:
             logger.error(
-                f"  Index {idx}: O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f}"
+                f"parse_candles_to_numpy: Found {error_count} invalid candle(s) out of {n} "
+                f"({error_count / n * 100:.1f}%)"
             )
         
-        logger.error("parse_candles_to_numpy: Rejecting data due to invalid candles")
-        return None
-    
-    hl_mid = (h + l) / 2.0
-    close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
-    deviation_mask = close_deviation > 0.5
-    deviation_count = np.sum(deviation_mask)
-    
-    if deviation_count > 0:
-        logger.warning(
-            f"parse_candles_to_numpy: Found {deviation_count} candle(s) with "
-            f"Close >50% from High-Low midpoint (potential data anomaly) | "
-            f"These candles are kept but flagged for review"
-        )
+            error_indices = np.where(error_mask)[0]
+            first_errors = error_indices[:min(5, len(error_indices))]
         
-        if cfg.DEBUG_MODE and deviation_count <= 5:
-            dev_indices = np.where(deviation_mask)[0]
-            for idx in dev_indices:
-                dev_pct = close_deviation[idx] * 100
+            for idx in first_errors:
+                logger.error(
+                    f"  Index {idx}: O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f}"
+                )
+        
+            logger.error("parse_candles_to_numpy: Rejecting data due to invalid candles")
+            return None
+    
+        hl_mid = (h + l) / 2.0
+        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
+        deviation_mask = close_deviation > 0.5
+        deviation_count = np.sum(deviation_mask)
+    
+        if deviation_count > 0:
+            logger.warning(
+                f"parse_candles_to_numpy: Found {deviation_count} candle(s) with "
+                f"Close >50% from High-Low midpoint (potential data anomaly) | "
+                f"These candles are kept but flagged for review"
+            )
+        
+            if cfg.DEBUG_MODE and deviation_count <= 5:
+                dev_indices = np.where(deviation_mask)[0]
+                for idx in dev_indices:
+                    dev_pct = close_deviation[idx] * 100
+                    logger.debug(
+                        f"  Index {idx}: Deviation {dev_pct:.1f}% | "
+                        f"Mid={(h[idx]+l[idx])/2:.2f} Close={c[idx]:.2f}"
+                    )
+    
+        if n > 1:
+            ts_diffs = np.diff(data["timestamp"])
+            min_diff = np.min(ts_diffs)
+            max_diff = np.max(ts_diffs)
+        
+            if min_diff <= 0:
+                logger.warning(
+                    f"parse_candles_to_numpy: Found non-monotonic timestamps | "
+                    f"Min diff: {min_diff}s, Max diff: {max_diff}s"
+                )
+        
+            if cfg.DEBUG_MODE:
                 logger.debug(
-                    f"  Index {idx}: Deviation {dev_pct:.1f}% | "
-                    f"Mid={(h[idx]+l[idx])/2:.2f} Close={c[idx]:.2f}"
+                    f"parse_candles_to_numpy: Timestamp range | "
+                    f"First: {format_ist_time(data['timestamp'][0])} | "
+                    f"Last: {format_ist_time(data['timestamp'][-1])} | "
+                    f"Count: {n} candles"
                 )
     
-    if n > 1:
-        ts_diffs = np.diff(data["timestamp"])
-        min_diff = np.min(ts_diffs)
-        max_diff = np.max(ts_diffs)
-        
-        if min_diff <= 0:
-            logger.warning(
-                f"parse_candles_to_numpy: Found non-monotonic timestamps | "
-                f"Min diff: {min_diff}s, Max diff: {max_diff}s"
-            )
-        
         if cfg.DEBUG_MODE:
             logger.debug(
-                f"parse_candles_to_numpy: Timestamp range | "
-                f"First: {format_ist_time(data['timestamp'][0])} | "
-                f"Last: {format_ist_time(data['timestamp'][-1])} | "
-                f"Count: {n} candles"
+                f"parse_candles_to_numpy: SUCCESSFUL | "
+                f"Candles: {n} | "
+                f"Range: {format_ist_time(data['timestamp'][0])} to {format_ist_time(data['timestamp'][-1])}"
             )
     
-    if cfg.DEBUG_MODE:
-        logger.debug(
-            f"parse_candles_to_numpy: SUCCESSFUL | "
-            f"Candles: {n} | "
-            f"Range: {format_ist_time(data['timestamp'][0])} to {format_ist_time(data['timestamp'][-1])}"
-        )
-    
-    return data
+        return data
 
-except Exception as e:
-    logger.error(
-        f"parse_candles_to_numpy: Unexpected exception: {e}",
-        exc_info=True
-    )
-    return None
+    except Exception as e:
+        logger.error(
+            f"parse_candles_to_numpy: Unexpected exception: {e}",
+            exc_info=True
+        )
+        return None
 
 def _validate_basic_candle_data(data: Optional[Dict[str, np.ndarray]]) -> Tuple[bool, Optional[str]]:
     """Common validation for candle data structure."""
