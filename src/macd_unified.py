@@ -27,7 +27,6 @@ from aiohttp import web
 import numpy as np
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
-from numba import njit, prange
 import contextlib 
 import traceback
 from redis_state_store import RedisStateStore 
@@ -91,7 +90,7 @@ class Constants:
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
-    CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 45))
+    CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 20))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     VWAP_MAX_DISTANCE_PCT = 1.0
@@ -99,7 +98,6 @@ class Constants:
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
-    CANDLE_PUBLICATION_LAG_SEC = 20
 
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
@@ -360,37 +358,34 @@ class TraceContextFilter(logging.Filter):
         return True
 
 class SafeFormatter(logging.Formatter):
+    @staticmethod
+    def _apply_all_redactions(text: str) -> str:
+        """Apply all redaction patterns to text in one pass."""
+        text = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", text)
+        text = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", text)
+        text = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", text)
+        return text
+    
     def format(self, record: logging.LogRecord) -> str:
+        # Apply redactions to message and args before formatting
         if record.msg:
-            msg_str = str(record.msg)
-            msg_str = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", msg_str)
-            msg_str = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", msg_str)
-            msg_str = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", msg_str)
-            record.msg = msg_str  # optional, could skip reassigning
-
+            record.msg = self._apply_all_redactions(str(record.msg))
+        
         if record.args:
             if isinstance(record.args, dict):
                 record.args = {k: self._mask_secret(v) for k, v in record.args.items()}
             elif isinstance(record.args, tuple):
                 record.args = tuple(self._mask_secret(v) for v in record.args)
-
+        
         formatted = super().format(record)
-
-        formatted = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", formatted)
-        formatted = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", formatted)
-        formatted = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", formatted)
-
-        return formatted
-
+        return self._apply_all_redactions(formatted)
+    
     @staticmethod
     def _mask_secret(value: Any) -> Any:
+        """Mask sensitive values."""
         if value is None:
             return value
-        value_str = str(value)
-        masked = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TELEGRAM_TOKEN]", value_str)
-        masked = CompiledPatterns.GITHUB_TOKEN.sub("[REDACTED_GITHUB_PAT]", masked)
-        masked = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", masked)
-        return masked
+        return SafeFormatter._apply_all_redactions(str(value))
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("macd_bot")
@@ -810,9 +805,9 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
             logger.warning("No candles found for pivot day")
             return piv
 
-        H_prev = float(np.max(yesterday_high))
-        L_prev = float(np.min(yesterday_low))
-        C_prev = float(yesterday_close[-1])
+        H_prev = np.max(yesterday_high)
+        L_prev = np.min(yesterday_low)
+        C_prev = yesterday_close[-1]
         rng_prev = H_prev - L_prev
         if rng_prev < 1e-8:
             logger.warning(f"Invalid pivot range: {rng_prev}")
@@ -946,13 +941,15 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                     )            
         else:
             results['pivots'] = {}
-            pass
         
         for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5']:
             arr = results[key]
-            if np.any(np.isinf(arr)):
-                logger.warning(f"Infinity detected in {key}, clamping values")
-                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)        
+            if np.any(~np.isfinite(arr)):  # Check both NaN and Inf
+                if cfg.DEBUG_MODE:
+                    inf_count = np.sum(np.isinf(arr))
+                    nan_count = np.sum(np.isnan(arr))
+                    logger.warning(f"{key}: {inf_count} infs, {nan_count} nans - clamping")
+                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)    
         return results    
    
     except Exception as e:
@@ -990,60 +987,68 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'atr_long': np.full(n, np.nan, dtype=np.float64),
         }
 
+def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
+                         expected_len: int) -> Tuple[bool, Optional[str]]:
+    
+    required_keys = ["open", "high", "low", "close"]
+    
+    for key in required_keys:
+        if key not in data_15m:
+            return False, f"Missing OHLC key '{key}'"
+        
+        arr = data_15m[key]
+        if arr is None or len(arr) == 0:
+            return False, f"OHLC '{key}' is None or empty"
+        
+        if len(arr) != expected_len:
+            return False, f"Length mismatch in '{key}': {len(arr)} != {expected_len}"
+    
+    return True, None
+
+
+def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
+                        expected_len: int) -> Tuple[bool, Optional[str]]:
+    
+    if atr_short is None or atr_long is None:
+        return False, "ATR arrays are None"
+    
+    if len(atr_short) == 0 or len(atr_long) == 0:
+        return False, "ATR arrays are empty"
+    
+    if len(atr_short) != expected_len:
+        return False, f"atr_short length mismatch: {len(atr_short)} != {expected_len}"
+    
+    if len(atr_long) != expected_len:
+        return False, f"atr_long length mismatch: {len(atr_long)} != {expected_len}"
+    
+    return True, None
+
 def precompute_candle_quality(data_15m: Dict[str, np.ndarray], atr_short: np.ndarray, 
                               atr_long: np.ndarray, rvol_threshold: float = 1.0,
-                              enable_rvol_alert: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                              enable_rvol_alert: bool = True) -> Tuple[np.ndarray, np.ndarray]:  
     try:
-        n_ohlc = len(data_15m["close"])
+
+        close_data = data_15m.get("close", [])
+        n_ohlc = len(close_data) if close_data is not None else 0
         
         if n_ohlc == 0:
             logger.error("precompute_candle_quality: OHLC data is empty")
             return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
         
-        required_ohlc = ["open", "high", "low", "close"]
-        for key in required_ohlc:
-            if key not in data_15m:
-                logger.error(f"precompute_candle_quality: Missing OHLC key '{key}'")
-                return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-            
-            arr = data_15m[key]
-            if arr is None or len(arr) == 0:
-                logger.error(f"precompute_candle_quality: OHLC '{key}' is None or empty")
-                return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-            
-            if len(arr) != n_ohlc:
-                logger.error(
-                    f"precompute_candle_quality: Length mismatch in '{key}' "
-                    f"(expected {n_ohlc}, got {len(arr)})"
-                )
-                return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if atr_short is None or len(atr_short) == 0:
-            logger.error("precompute_candle_quality: atr_short is None or empty")
+        valid, msg = _validate_ohlc_arrays(data_15m, n_ohlc)
+        if not valid:
+            logger.error(f"precompute_candle_quality: {msg}")
             return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
         
-        if atr_long is None or len(atr_long) == 0:
-            logger.error("precompute_candle_quality: atr_long is None or empty")
+        valid, msg = _validate_atr_arrays(atr_short, atr_long, n_ohlc)
+        if not valid:
+            logger.error(f"precompute_candle_quality: {msg}")
             return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
         
-        if len(atr_short) != n_ohlc:
-            logger.error(
-                f"precompute_candle_quality: atr_short length mismatch "
-                f"(expected {n_ohlc}, got {len(atr_short)})"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if len(atr_long) != n_ohlc:
-            logger.error(
-                f"precompute_candle_quality: atr_long length mismatch "
-                f"(expected {n_ohlc}, got {len(atr_long)})"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if not isinstance(rvol_threshold, (int, float)) or rvol_threshold <= 0:
+        if not isinstance(rvol_threshold, (int, float)) or rvol_threshold < 0:
             logger.error(
                 f"precompute_candle_quality: Invalid rvol_threshold={rvol_threshold} "
-                f"(must be positive number)"
+                f"(must be >= 0; 0.0 disables volatility check)"
             )
             return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
         
@@ -1056,8 +1061,12 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray], atr_short: np.nda
         
         if cfg.DEBUG_MODE:
             rvol_status = "ENABLED" if enable_rvol_alert else "DISABLED"
-            logger.debug(f"precompute_candle_quality: RVOL Alert {rvol_status}")        
-
+            threshold_info = f"threshold={rvol_threshold}" if enable_rvol_alert else "N/A"
+            logger.debug(
+                f"precompute_candle_quality: RVOL Alert {rvol_status} | {threshold_info} | "
+                f"Data: {n_ohlc} candles | ATR short: {cfg.ATR_SHORT} | ATR long: {cfg.ATR_LONG}"
+            )
+        
         open_arr = data_15m["open"]
         high_arr = data_15m["high"]
         low_arr = data_15m["low"]
@@ -1084,10 +1093,13 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray], atr_short: np.nda
         if cfg.DEBUG_MODE:
             buy_count = np.sum(buy_quality)
             sell_count = np.sum(sell_quality)
+            buy_pct = (buy_count / n_ohlc * 100) if n_ohlc > 0 else 0
+            sell_pct = (sell_count / n_ohlc * 100) if n_ohlc > 0 else 0
+            
             logger.debug(
                 f"precompute_candle_quality complete | "
-                f"Buy signals: {buy_count}/{n_ohlc} | "
-                f"Sell signals: {sell_count}/{n_ohlc}"
+                f"Buy signals: {buy_count}/{n_ohlc} ({buy_pct:.1f}%) | "
+                f"Sell signals: {sell_count}/{n_ohlc} ({sell_pct:.1f}%)"
             )
         
         return buy_quality, sell_quality
@@ -1097,16 +1109,17 @@ def precompute_candle_quality(data_15m: Dict[str, np.ndarray], atr_short: np.nda
             f"precompute_candle_quality: Unexpected error: {e}",
             exc_info=True
         )
+        
         try:
             n = len(data_15m.get("close", []))
-        except:
+        except Exception:
             n = 0
         
         if n == 0:
             logger.error("precompute_candle_quality: Cannot determine array size - returning empty")
             return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
         
-        logger.warning(f"precompute_candle_quality: Returning conservative (all False) arrays of size {n}")
+        logger.warning(f"precompute_candle_quality: Returning zero arrays of size {n} due to error")
         return np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
 
 class SessionManager:
@@ -1691,16 +1704,22 @@ class DataFetcher:
         return output
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+    
     if not result or not isinstance(result, dict):
         logger.warning("parse_candles_to_numpy: result is None or not dict")
         return None
     
     res = result.get("result", {}) or {}
-    required = ("t", "o", "h", "l", "c", "v")
-    if not all(k in res for k in required):
-        logger.warning(f"parse_candles_to_numpy: missing required fields. Have: {list(res.keys())}")
+    required_fields = ("t", "o", "h", "l", "c", "v")
+    
+    if not all(k in res for k in required_fields):
+        missing = [k for k in required_fields if k not in res]
+        logger.warning(
+            f"parse_candles_to_numpy: Missing required fields: {missing} | "
+            f"Available: {list(res.keys())}"
+        )
         return None
-
+    
     try:
         data = {
             "timestamp": np.asarray(res["t"], dtype=np.int64),
@@ -1710,52 +1729,152 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             "close":     np.asarray(res["c"], dtype=np.float64),
             "volume":    np.asarray(res["v"], dtype=np.float64),
         }
-
-        n = len(data["timestamp"])
-        if n == 0:
-            logger.warning("parse_candles_to_numpy: empty candle array")
-            return None
-
-        if data["timestamp"][-1] > 1_000_000_000_000:
-            data["timestamp"] //= 1000
-
-        o, h, l, c = data["open"], data["high"], data["low"], data["close"]
-
-        any_nan = np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c)
-        any_inf = np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c)
-        
-        invalid_rel = ~((l <= o) & (o <= h) & (l <= c) & (c <= h))
-        
-        non_positive = (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
-
-        error_mask = any_nan | any_inf | invalid_rel | non_positive
-        error_count = np.sum(error_mask)
-
-        if error_count > 0:
-            logger.error(f"parse_candles_to_numpy: {error_count} invalid candles found.")
-            first_errors = np.where(error_mask)[0][:5]
-            for idx in first_errors:
-                logger.error(f"  Index {idx}: Data Anomaly (O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f})")
-            return None
-
-        hl_mid = (h + l) / 2.0
-        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
-        deviation_mask = close_deviation > 0.5
-        deviation_count = np.sum(deviation_mask)
-
-        if deviation_count > 0:
-            logger.warning(
-                f"parse_candles_to_numpy: Found {deviation_count} candles with "
-                f"Close deviating >50% from High-Low midpoint (potential data anomaly)"
-            )
-
-        return data
-
-    except Exception as e:
-        logger.error(f"parse_candles_to_numpy: Exception during parsing: {e}")
+    
+    except (ValueError, TypeError) as e:
+        logger.error(f"parse_candles_to_numpy: Failed to convert data to arrays: {e}")
         return None
+    
+    n = len(data["timestamp"])
+    
+    if n == 0:
+        logger.warning("parse_candles_to_numpy: empty candle array (n=0)")
+        return None
+    
+    for key in ["open", "high", "low", "close", "volume"]:
+        if len(data[key]) != n:
+            logger.error(
+                f"parse_candles_to_numpy: Array length mismatch in '{key}': "
+                f"{len(data[key])} != {n}"
+            )
+            return None
+    
+    if data["timestamp"][-1] > 1_000_000_000_000:
+        data["timestamp"] //= 1000
+    
+    o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+    
+    error_mask = (
+        np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c) |  # NaN check
+        np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c) |  # Inf check
+        ~((l <= o) & (o <= h) & (l <= c) & (c <= h)) |            # Relationship check
+        (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)                 # Non-positive check
+    )
+    
+    error_count = np.sum(error_mask)
+    
+    if error_count > 0:
+        logger.error(
+            f"parse_candles_to_numpy: Found {error_count} invalid candle(s) out of {n} "
+            f"({error_count / n * 100:.1f}%)"
+        )
+        
+        error_indices = np.where(error_mask)[0]
+        first_errors = error_indices[:min(5, len(error_indices))]
+        
+        for idx in first_errors:
+            logger.error(
+                f"  Index {idx}: O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f}"
+            )
+        
+        logger.error("parse_candles_to_numpy: Rejecting data due to invalid candles")
+        return None
+    
+    hl_mid = (h + l) / 2.0
+    close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
+    deviation_mask = close_deviation > 0.5
+    deviation_count = np.sum(deviation_mask)
+    
+    if deviation_count > 0:
+        logger.warning(
+            f"parse_candles_to_numpy: Found {deviation_count} candle(s) with "
+            f"Close >50% from High-Low midpoint (potential data anomaly) | "
+            f"These candles are kept but flagged for review"
+        )
+        
+        if cfg.DEBUG_MODE and deviation_count <= 5:
+            dev_indices = np.where(deviation_mask)[0]
+            for idx in dev_indices:
+                dev_pct = close_deviation[idx] * 100
+                logger.debug(
+                    f"  Index {idx}: Deviation {dev_pct:.1f}% | "
+                    f"Mid={(h[idx]+l[idx])/2:.2f} Close={c[idx]:.2f}"
+                )
+    
+    if n > 1:
+        ts_diffs = np.diff(data["timestamp"])
+        min_diff = np.min(ts_diffs)
+        max_diff = np.max(ts_diffs)
+        
+        if min_diff <= 0:
+            logger.warning(
+                f"parse_candles_to_numpy: Found non-monotonic timestamps | "
+                f"Min diff: {min_diff}s, Max diff: {max_diff}s"
+            )
+        
+        if cfg.DEBUG_MODE:
+            logger.debug(
+                f"parse_candles_to_numpy: Timestamp range | "
+                f"First: {format_ist_time(data['timestamp'][0])} | "
+                f"Last: {format_ist_time(data['timestamp'][-1])} | "
+                f"Count: {n} candles"
+            )
+    
+    if cfg.DEBUG_MODE:
+        logger.debug(
+            f"parse_candles_to_numpy: SUCCESSFUL | "
+            f"Candles: {n} | "
+            f"Range: {format_ist_time(data['timestamp'][0])} to {format_ist_time(data['timestamp'][-1])}"
+        )
+    
+    return data
 
-def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: int = 0) -> Tuple[bool, Optional[str]]:
+except Exception as e:
+    logger.error(
+        f"parse_candles_to_numpy: Unexpected exception: {e}",
+        exc_info=True
+    )
+    return None
+
+def _validate_basic_candle_data(data: Optional[Dict[str, np.ndarray]]) -> Tuple[bool, Optional[str]]:
+    """Common validation for candle data structure."""
+    if data is None or not data:
+        return False, "Data is None or empty"
+    
+    close = data.get("close")
+    timestamp = data.get("timestamp")
+    open_arr = data.get("open")
+    high_arr = data.get("high")
+    low_arr = data.get("low")
+    
+    if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
+        return False, "Missing or empty OHLC/timestamp data"
+    
+    if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
+        return False, "OHLC arrays have mismatched lengths"
+    
+    return True, None
+
+def validate_candle_data(data: Optional[Dict[str, np.ndarray]], 
+                        required_len: int = 0) -> Tuple[bool, Optional[str]]:
+    valid, msg = _validate_basic_candle_data(data)
+    if not valid:
+        return False, msg
+    
+    close = data.get("close")
+    if len(close) < required_len:
+        return False, f"Insufficient data: {len(close)} < {required_len}"
+    
+    timestamp = data.get("timestamp")
+    if not np.all(timestamp[1:] >= timestamp[:-1]):
+        return False, "Timestamps not monotonic increasing"
+    
+    return True, None
+
+def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], 
+                                 selected_index: int, 
+                                 reference_time: int, 
+                                 interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
+    
     try:
         if data is None or not data:
             return False, "Data is None or empty"
@@ -1766,28 +1885,123 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]], required_len: in
         high_arr = data.get("high")
         low_arr = data.get("low")
         
-        if timestamp is None or len(timestamp) == 0:
-            return False, "Timestamp array is empty"
+        required_arrays = {
+            "close": close,
+            "timestamp": timestamp,
+            "open": open_arr,
+            "high": high_arr,
+            "low": low_arr
+        }
         
-        if close is None or len(close) == 0:
-            return False, "Close array is empty"
+        for name, arr in required_arrays.items():
+            if arr is None or len(arr) == 0:
+                return False, f"Missing or empty {name} data"
         
-        if open_arr is None or high_arr is None or low_arr is None:
-            return False, "Missing OHLC data (open, high, or low)"
+        array_len = len(close)
+        if selected_index < 0 or selected_index >= array_len:
+            return False, f"Selected index {selected_index} out of range [0, {array_len - 1}]"
         
-        if len(close) < required_len:
-            return False, f"Insufficient data: {len(close)} < {required_len}"
+        selected_candle_time = int(timestamp[selected_index])
+        interval_seconds = interval_minutes * 60
+        current_period_start = (reference_time // interval_seconds) * interval_seconds
         
-        if not np.all(timestamp[1:] >= timestamp[:-1]):
-            return False, "Timestamps not monotonic increasing"
+        # Check if candle is still forming (in the current period)
+        if selected_candle_time >= current_period_start:
+            return False, (
+                f"Selected candle is still forming! "
+                f"Candle ts: {format_ist_time(selected_candle_time)} >= "
+                f"Current period: {format_ist_time(current_period_start)}"
+            )
         
-        if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
-            return False, "OHLC arrays have mismatched lengths"
+        staleness = reference_time - selected_candle_time
+        max_staleness = cfg.MAX_CANDLE_STALENESS_SEC
+        
+        if staleness > max_staleness:
+            return False, (
+                f"Selected candle is stale: {staleness}s old (max: {max_staleness}s) | "
+                f"Candle: {format_ist_time(selected_candle_time)} | "
+                f"Current: {format_ist_time(reference_time)}"
+            )
+        
+        o = open_arr[selected_index]
+        h = high_arr[selected_index]
+        l = low_arr[selected_index]
+        c = close[selected_index]
+        
+        nan_check = np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c)
+        if nan_check:
+            return False, (
+                f"Selected candle has NaN value(s): "
+                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
+            )
+        
+        inf_check = np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c)
+        if inf_check:
+            return False, (
+                f"Selected candle has Infinity value(s): "
+                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
+            )
+        
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return False, (
+                f"Selected candle has non-positive price(s): "
+                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
+            )
+
+        relationships_valid = (l <= o) and (o <= h) and (l <= c) and (c <= h) and (l <= h)
+        
+        if not relationships_valid:
+            checks = {
+                "L≤O": l <= o,
+                "O≤H": o <= h,
+                "L≤C": l <= c,
+                "C≤H": c <= h,
+                "L≤H": l <= h
+            }
+            failed_checks = [k for k, v in checks.items() if not v]
+            
+            return False, (
+                f"Selected candle has invalid OHLC relationships! "
+                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
+                f"Failed: {', '.join(failed_checks)}"
+            )
+        
+        if selected_index > 0:
+            prev_close = close[selected_index - 1]
+            
+            # Only check if previous close is valid (not NaN)
+            if not np.isnan(prev_close) and prev_close > 0:
+                price_change_pct = abs(c - prev_close) / prev_close * 100
+                
+                if price_change_pct > Constants.MAX_PRICE_CHANGE_PERCENT:
+                    return False, (
+                        f"Extreme price gap detected: {price_change_pct:.2f}% "
+                        f"(max: {Constants.MAX_PRICE_CHANGE_PERCENT}%) | "
+                        f"Previous close: {prev_close:.2f}, Current close: {c:.2f}"
+                    )
+        
+        if cfg.DEBUG_MODE:
+            logger.debug(
+                f"validate_candle_data_at_index: PASSED | "
+                f"Index: {selected_index} | "
+                f"Time: {format_ist_time(selected_candle_time)} | "
+                f"OHLC: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
+            )
         
         return True, None
     
+    except IndexError as e:
+        logger.error(
+            f"validate_candle_data_at_index: Index error at {selected_index}: {e}",
+            exc_info=True
+        )
+        return False, f"Index out of bounds: {str(e)}"
+    
     except Exception as e:
-        logger.error(f"Data validation exception: {e}", exc_info=True)
+        logger.error(
+            f"validate_candle_data_at_index: Unexpected error at index {selected_index}: {e}",
+            exc_info=True
+        )
         return False, f"Validation error: {str(e)}"
 
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
@@ -1823,79 +2037,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         ),
     )
     return last_closed_idx
-
-def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
-    try:
-        if data is None or not data:
-            return False, "Data is None or empty"
-        
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-        open_arr = data.get("open")
-        high_arr = data.get("high")
-        low_arr = data.get("low")
-        
-        if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
-            return False, "Missing or empty OHLC/timestamp data"
-        
-        if selected_index < 0 or selected_index >= len(close):
-            return False, f"Selected index {selected_index} out of range [0, {len(close)})"
-        
-        selected_candle_time = int(timestamp[selected_index])
-        current_time = reference_time
-        interval_seconds = interval_minutes * 60
-        current_period_start = (current_time // interval_seconds) * interval_seconds
-        
-        if selected_candle_time >= current_period_start:
-            return False, (
-                f"Selected candle is still forming! "
-                f"ts={format_ist_time(selected_candle_time)} "
-                f"current_period_start={format_ist_time(current_period_start)}"
-            )
-        
-        staleness = current_time - selected_candle_time
-        MAX_STALENESS = cfg.MAX_CANDLE_STALENESS_SEC
-        
-        if staleness > MAX_STALENESS:
-            return False, (
-                f"Selected candle is stale: {staleness}s old (max: {MAX_STALENESS}s). "    
-                f"Candle: {format_ist_time(selected_candle_time)} | "
-                f"Current: {format_ist_time(current_time)}"
-            )
-        
-        o = open_arr[selected_index]
-        h = high_arr[selected_index]
-        l = low_arr[selected_index]
-        c = close[selected_index]
-        
-        if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
-            return False, f"Selected candle has NaN values: O={o} H={h} L={l} C={c}"
-        
-        if np.isinf(o) or np.isinf(h) or np.isinf(l) or np.isinf(c):
-            return False, f"Selected candle has Inf values: O={o} H={h} L={l} C={c}"
-        
-        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            return False, f"Selected candle has non-positive prices: O={o} H={h} L={l} C={c}"
-        
-        if not (l <= o and o <= h and l <= c and c <= h and l <= h):
-            return False, (
-                f"Selected candle has invalid OHLC relationships! "
-                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} "
-                f"[L≤O={l<=o} O≤H={o<=h} L≤C={l<=c} C≤H={c<=h} L≤H={l<=h}]"
-            )
-        
-        if selected_index > 0:
-            prev_close = close[selected_index - 1]
-            if not np.isnan(prev_close):
-                price_change_pct = abs(c - prev_close) / prev_close * 100
-                if price_change_pct > Constants.MAX_PRICE_CHANGE_PERCENT:
-                    return False, f"Extreme price spike in selected candle: {price_change_pct:.2f}%"
-        
-        return True, None
-    
-    except Exception as e:
-        logger.error(f"Candle validation exception at index {selected_index}: {e}", exc_info=True)
-        return False, f"Validation error: {str(e)}"
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
@@ -2403,7 +2544,7 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_
                 return False, f"Not green (C={close_val:.5f} ≤ O={open_val:.5f})"
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
+                return False, f"Upper wick {wick_ratio*100:.1f}% ��� {Constants.MIN_WICK_RATIO*100:.1f}%"
             return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
 
         else:
