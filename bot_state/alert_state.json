@@ -5,7 +5,7 @@
   },
   "BNBUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769522481
+    "ts": 1769565681
   },
   "LTCUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -477,7 +477,7 @@
   },
   "SOLUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769562081
+    "ts": 1769565681
   },
   "XRPUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
@@ -502,5 +502,13 @@
   "LTCUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
     "ts": 1769564782
+  },
+  "DOTUSD:ALERT:PIVOT_DOWN_P": {
+    "state": "INACTIVE",
+    "ts": 1769565681
+  },
+  "ADAUSD:ALERT:PIVOT_DOWN_P": {
+    "state": "INACTIVE",
+    "ts": 1769565681
   }
 }
