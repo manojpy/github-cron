@@ -137,7 +137,7 @@
   },
   "BNBUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769521583
+    "ts": 1769576483
   },
   "BNBUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
