@@ -75,5 +75,6 @@
   "SUIUSD:vwap_down:last_sent": "1769632200",
   "SUIUSD:pivot_down_S2:last_sent": "1769632200",
   "SUIUSD:ppo_011_down:last_sent": "1769645700",
-  "SUIUSD:pivot_down_S1:last_sent": "1769646600"
+  "SUIUSD:pivot_down_S1:last_sent": "1769646600",
+  "SOLUSD:pivot_down_S1:last_sent": "1769646600"
 }
