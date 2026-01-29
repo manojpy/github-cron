@@ -533,7 +533,7 @@
   },
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769650280
+    "ts": 1769657484
   },
   "BNBUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
@@ -609,11 +609,11 @@
   },
   "DOTUSD:ALERT:PIVOT_UP_S2": {
     "state": "INACTIVE",
-    "ts": 1769654780
+    "ts": 1769657484
   },
   "ADAUSD:ALERT:PIVOT_UP_S2": {
     "state": "INACTIVE",
-    "ts": 1769654780
+    "ts": 1769657484
   },
   "SUIUSD:ALERT:PIVOT_UP_S2": {
     "state": "INACTIVE",
@@ -629,7 +629,7 @@
   },
   "AAVEUSD:ALERT:PIVOT_UP_S1": {
     "state": "INACTIVE",
-    "ts": 1769655686
+    "ts": 1769657484
   },
   "BNBUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
@@ -640,11 +640,19 @@
     "ts": 1769656582
   },
   "ADAUSD:ALERT:PIVOT_DOWN_S2": {
-    "state": "INACTIVE",
-    "ts": 1769656582
+    "state": "ACTIVE",
+    "ts": 1769657484
   },
   "AAVEUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
     "ts": 1769656582
+  },
+  "LTCUSD:ALERT:PIVOT_DOWN_S2": {
+    "state": "ACTIVE",
+    "ts": 1769657484
+  },
+  "LTCUSD:ALERT:PIVOT_UP_S2": {
+    "state": "INACTIVE",
+    "ts": 1769657484
   }
 }
