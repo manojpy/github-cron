@@ -688,7 +688,7 @@
     "ts": 1769661081
   },
   "DOTUSD:ALERT:MMH_SELL": {
-    "state": "ACTIVE",
-    "ts": 1769666483
+    "state": "INACTIVE",
+    "ts": 1769667380
   }
 }
