@@ -113,7 +113,7 @@
   },
   "BNBUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769638581
+    "ts": 1769649383
   },
   "AAVEUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -133,7 +133,7 @@
   },
   "BCHUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769630483
+    "ts": 1769649383
   },
   "BNBUSD:ALERT:PPO_ZERO_DOWN": {
     "state": "INACTIVE",
@@ -397,51 +397,19 @@
   },
   "DOTUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769568382
+    "ts": 1769649383
   },
   "AAVEUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
     "ts": 1769641284
   },
-  "AAVEUSD:ALERT:VWAP_UP": {
-    "state": "INACTIVE",
-    "ts": 1769629581
-  },
-  "AAVEUSD:ALERT:VWAP_DOWN": {
-    "state": "INACTIVE",
-    "ts": 1769637684
-  },
   "LTCUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769646681
   },
-  "AAVEUSD:ALERT:PIVOT_UP_P": {
-    "state": "INACTIVE",
-    "ts": 1769580080
-  },
-  "AAVEUSD:ALERT:PIVOT_DOWN_P": {
-    "state": "INACTIVE",
-    "ts": 1769583682
-  },
   "ETHUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769644886
-  },
-  "AAVEUSD:ALERT:PIVOT_UP_R1": {
-    "state": "INACTIVE",
-    "ts": 1769629581
-  },
-  "AAVEUSD:ALERT:PIVOT_DOWN_R1": {
-    "state": "INACTIVE",
-    "ts": 1769630483
-  },
-  "AAVEUSD:ALERT:PIVOT_UP_R2": {
-    "state": "INACTIVE",
-    "ts": 1769624185
-  },
-  "AAVEUSD:ALERT:PIVOT_DOWN_R2": {
-    "state": "INACTIVE",
-    "ts": 1769623283
   },
   "DOTUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -450,10 +418,6 @@
   "XRPUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
     "ts": 1769609784
-  },
-  "AAVEUSD:ALERT:PIVOT_DOWN_R3": {
-    "state": "INACTIVE",
-    "ts": 1769607984
   },
   "BTCUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -480,8 +444,8 @@
     "ts": 1769645782
   },
   "SUIUSD:ALERT:PIVOT_DOWN_S1": {
-    "state": "ACTIVE",
-    "ts": 1769647582
+    "state": "INACTIVE",
+    "ts": 1769649383
   },
   "SUIUSD:ALERT:PIVOT_UP_S1": {
     "state": "INACTIVE",
@@ -530,5 +494,9 @@
   "SOLUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
     "ts": 1769648480
+  },
+  "XRPUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769649383
   }
 }
