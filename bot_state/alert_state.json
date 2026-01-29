@@ -477,7 +477,7 @@
   },
   "BNBUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769648480
+    "ts": 1769656582
   },
   "BNBUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
@@ -630,5 +630,21 @@
   "AAVEUSD:ALERT:PIVOT_UP_S1": {
     "state": "INACTIVE",
     "ts": 1769655686
+  },
+  "BNBUSD:ALERT:PIVOT_DOWN_S1": {
+    "state": "INACTIVE",
+    "ts": 1769656582
+  },
+  "DOTUSD:ALERT:PIVOT_DOWN_S2": {
+    "state": "INACTIVE",
+    "ts": 1769656582
+  },
+  "ADAUSD:ALERT:PIVOT_DOWN_S2": {
+    "state": "INACTIVE",
+    "ts": 1769656582
+  },
+  "AAVEUSD:ALERT:PIVOT_DOWN_S1": {
+    "state": "INACTIVE",
+    "ts": 1769656582
   }
 }
