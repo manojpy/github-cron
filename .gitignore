@@ -23,9 +23,3 @@ config_macd.json
 # OS Metadata
 .DS_Store
 Thumbs.db
-
-# Bot state files (cached locally, synced to GitHub)
-bot_state/alert_state.json
-bot_state/metadata.json
-.bot_lock
-*.db

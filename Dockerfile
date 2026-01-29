@@ -93,7 +93,6 @@ COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
-COPY --chown=appuser:appuser src/redis_state_store.py ./
 
 # ⚠️ NOTE: config_macd.json is NOT copied here - mounted at runtime via run-bot.yml
 # This allows config changes without rebuilding the entire image

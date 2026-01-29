@@ -1,16 +1,12 @@
 {
   "TELEGRAM_BOT_TOKEN": "__SET_IN_GITHUB_SECRETS__",
   "TELEGRAM_CHAT_ID": "__SET_IN_GITHUB_SECRETS__",
-  "MACD_BOT_TOKEN": "__SET_IN_GITHUB_SECRETS__",
-  "MACD_REPO": "owner/repo",
-  "MACD_BRANCH": "main",
-
+  "REDIS_URL": "__SET_IN_GITHUB_SECRETS__",
 
   "DELTA_API_BASE": "https://api.india.delta.exchange",
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
   "SEND_TEST_MESSAGE": false,
-  "ENABLE_RVOL_ALERT": false, 
 
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
@@ -34,17 +30,21 @@
 
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
-  "RVOL_THRESHOLD": 1.0,
-  
+  "RVOL_THRESHOLD": 1.0, 
+  "ENABLE_RVOL_ALERT": true,
+
+  "_comment_performance": "✅ HYBRID: Maximum parallelism for 30–35s execution target",
   "MAX_PARALLEL_FETCH": 12,
   "HTTP_TIMEOUT": 8,
   "CANDLE_FETCH_RETRIES": 2,
   "CANDLE_FETCH_BACKOFF": 1.2,
   "RUN_TIMEOUT_SECONDS": 300,
 
+  "_comment_rate_limits": "✅ HYBRID: Safe Telegram rate limit to avoid throttling",
   "TELEGRAM_RATE_LIMIT_PER_MINUTE": 25,
   "TELEGRAM_BURST_SIZE": 8,
 
+  "_comment_memory": "✅ OPTIMIZED: Reduced memory limit for efficiency",
   "MEMORY_LIMIT_BYTES": 700000000,
   "STATE_EXPIRY_DAYS": 30,
 
@@ -52,15 +52,22 @@
   "ENABLE_PIVOT": true,
   "PIVOT_LOOKBACK_PERIOD": 15,
 
+  "_comment_resilience": "✅ OPTIMIZED: Fail-fast for faster error detection",
+  "FAIL_ON_REDIS_DOWN": false,
   "FAIL_ON_TELEGRAM_DOWN": false,
+
+  "REDIS_CONNECTION_RETRIES": 2,
+  "REDIS_RETRY_DELAY": 1.5,
 
   "MAX_ALERTS_PER_PAIR": 8,
   "SKIP_WARMUP": true,
   "NUMBA_PARALLEL": true,
 
+  "_comment_caching": "✅ OPTIMIZED: Extended cache TTL (12 hours) to minimize API calls",
   "PRODUCTS_CACHE_TTL": 43200,
   "MAX_CANDLE_STALENESS_SEC": 1200,
 
+  "_comment_api_limits": "✅ HYBRID: Increased rate limit for parallel processing, balanced for safety",
   "RATE_LIMIT_PER_MINUTE": 60,
   "CB_FAILURE_THRESHOLD": 5,
   "CB_RECOVERY_TIMEOUT": 30
