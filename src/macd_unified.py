@@ -2135,7 +2135,7 @@ class RedisStateStore:
         self.meta_prefix = RedisKeyPrefix.METADATA
         self.alert_prefix = RedisKeyPrefix.ALERT
 
-        self.expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
+        self.expiry_seconds = max(cfg.STATE_EXPIRY_DAYS * 86400 if cfg.STATE_EXPIRY_DAYS > 0 else 0, 7 * 86400)
         self.alert_expiry_seconds = cfg.STATE_EXPIRY_DAYS * 86400
         self.metadata_expiry_seconds = 7 * 86400
 
