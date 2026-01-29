@@ -245,7 +245,7 @@
   },
   "DOTUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769609784
+    "ts": 1769647582
   },
   "SOLUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -478,5 +478,21 @@
   "DOTUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769645782
+  },
+  "SUIUSD:ALERT:PIVOT_DOWN_S1": {
+    "state": "ACTIVE",
+    "ts": 1769647582
+  },
+  "SUIUSD:ALERT:PIVOT_UP_S1": {
+    "state": "INACTIVE",
+    "ts": 1769647582
+  },
+  "SOLUSD:ALERT:PIVOT_DOWN_S1": {
+    "state": "ACTIVE",
+    "ts": 1769647582
+  },
+  "SOLUSD:ALERT:PIVOT_UP_S1": {
+    "state": "INACTIVE",
+    "ts": 1769647582
   }
 }
