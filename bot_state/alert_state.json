@@ -486,5 +486,9 @@
   "SUIUSD:ALERT:MMH_SELL": {
     "state": "INACTIVE",
     "ts": 1769630483
+  },
+  "ADAUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769644893
   }
 }
