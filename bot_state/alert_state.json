@@ -129,7 +129,7 @@
   },
   "BCHUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769634083
+    "ts": 1769645782
   },
   "BCHUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
@@ -217,7 +217,7 @@
   },
   "BTCUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
-    "ts": 1769633184
+    "ts": 1769645782
   },
   "ETHUSD:ALERT:PPO_SIGNAL_UP": {
     "state": "INACTIVE",
@@ -225,11 +225,11 @@
   },
   "ADAUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769611619
+    "ts": 1769645782
   },
   "LTCUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
-    "ts": 1769639484
+    "ts": 1769645782
   },
   "SUIUSD:ALERT:PPO_ZERO_UP": {
     "state": "INACTIVE",
@@ -407,10 +407,6 @@
     "state": "INACTIVE",
     "ts": 1769629581
   },
-  "BNBUSD:ALERT:VWAP_UP": {
-    "state": "INACTIVE",
-    "ts": 1769634083
-  },
   "AAVEUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
     "ts": 1769637684
@@ -418,10 +414,6 @@
   "LTCUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
     "ts": 1769639484
-  },
-  "BNBUSD:ALERT:VWAP_DOWN": {
-    "state": "INACTIVE",
-    "ts": 1769637684
   },
   "AAVEUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
@@ -443,14 +435,6 @@
     "state": "INACTIVE",
     "ts": 1769630483
   },
-  "BNBUSD:ALERT:PIVOT_DOWN_R2": {
-    "state": "INACTIVE",
-    "ts": 1769607984
-  },
-  "BNBUSD:ALERT:PIVOT_UP_R2": {
-    "state": "INACTIVE",
-    "ts": 1769608881
-  },
   "AAVEUSD:ALERT:PIVOT_UP_R2": {
     "state": "INACTIVE",
     "ts": 1769624185
@@ -471,14 +455,6 @@
     "state": "INACTIVE",
     "ts": 1769607984
   },
-  "BNBUSD:ALERT:PIVOT_UP_R1": {
-    "state": "INACTIVE",
-    "ts": 1769629581
-  },
-  "BNBUSD:ALERT:PIVOT_DOWN_R1": {
-    "state": "INACTIVE",
-    "ts": 1769630483
-  },
   "BTCUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
     "ts": 1769625083
@@ -490,5 +466,17 @@
   "ADAUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769644893
+  },
+  "LTCUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769645782
+  },
+  "LTCUSD:ALERT:PIVOT_UP_P": {
+    "state": "INACTIVE",
+    "ts": 1769645782
+  },
+  "DOTUSD:ALERT:VWAP_UP": {
+    "state": "INACTIVE",
+    "ts": 1769645782
   }
 }
