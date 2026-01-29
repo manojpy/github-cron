@@ -353,7 +353,7 @@
   },
   "SOLUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769640382
+    "ts": 1769669181
   },
   "ETHUSD:ALERT:PPO_011_DOWN": {
     "state": "INACTIVE",
@@ -489,7 +489,7 @@
   },
   "ADAUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769648480
+    "ts": 1769669181
   },
   "SOLUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
@@ -549,7 +549,7 @@
   },
   "AVAXUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769653881
+    "ts": 1769669181
   },
   "AVAXUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
@@ -690,5 +690,9 @@
   "DOTUSD:ALERT:MMH_SELL": {
     "state": "INACTIVE",
     "ts": 1769667380
+  },
+  "XRPUSD:ALERT:PIVOT_DOWN_S2": {
+    "state": "INACTIVE",
+    "ts": 1769669181
   }
 }
