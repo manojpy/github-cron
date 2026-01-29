@@ -669,7 +669,7 @@
   },
   "BCHUSD:ALERT:PIVOT_UP_S3": {
     "state": "INACTIVE",
-    "ts": 1769660182
+    "ts": 1769663784
   },
   "SUIUSD:ALERT:PIVOT_UP_S3": {
     "state": "INACTIVE",
