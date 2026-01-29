@@ -368,8 +368,8 @@
     "ts": 1769622381
   },
   "BCHUSD:ALERT:PPO_011_DOWN": {
-    "state": "INACTIVE",
-    "ts": 1769623283
+    "state": "ACTIVE",
+    "ts": 1769652983
   },
   "LTCUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
