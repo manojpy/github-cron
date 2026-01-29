@@ -85,7 +85,7 @@
   },
   "BNBUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769629581
+    "ts": 1769645786
   },
   "ETHUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
