@@ -47,7 +47,7 @@
 
   "_comment_memory": "✅ OPTIMIZED: Reduced memory limit for efficiency",
   "MEMORY_LIMIT_BYTES": 700000000,
-  "STATE_EXPIRY_DAYS": 30,
+  "STATE_EXPIRY_DAYS": 7,
 
   "ENABLE_VWAP": true,
   "ENABLE_PIVOT": true,
