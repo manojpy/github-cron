@@ -533,7 +533,7 @@
   },
   "BNBUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
-    "ts": 1769657484
+    "ts": 1769659282
   },
   "BNBUSD:ALERT:PIVOT_UP_P": {
     "state": "INACTIVE",
