@@ -368,8 +368,8 @@
     "ts": 1769622381
   },
   "BCHUSD:ALERT:PPO_011_DOWN": {
-    "state": "ACTIVE",
-    "ts": 1769652983
+    "state": "INACTIVE",
+    "ts": 1769653881
   },
   "LTCUSD:ALERT:RSI_50_DOWN": {
     "state": "INACTIVE",
@@ -549,11 +549,11 @@
   },
   "AVAXUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769651183
+    "ts": 1769653881
   },
   "AVAXUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
-    "ts": 1769651183
+    "ts": 1769653881
   },
   "BCHUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
