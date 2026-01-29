@@ -622,5 +622,13 @@
   "SOLUSD:ALERT:PIVOT_UP_S2": {
     "state": "INACTIVE",
     "ts": 1769654780
+  },
+  "BNBUSD:ALERT:PIVOT_UP_S1": {
+    "state": "INACTIVE",
+    "ts": 1769655686
+  },
+  "AAVEUSD:ALERT:PIVOT_UP_S1": {
+    "state": "INACTIVE",
+    "ts": 1769655686
   }
 }
