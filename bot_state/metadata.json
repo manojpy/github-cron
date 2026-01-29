@@ -83,5 +83,6 @@
   "LTCUSD:pivot_down_S2:last_sent": "1769656500",
   "ADAUSD:pivot_down_S2:last_sent": "1769656500",
   "BTCUSD:mmh_sell:last_sent": "1769659200",
-  "AAVEUSD:pivot_down_S2:last_sent": "1769659200"
+  "AAVEUSD:pivot_down_S2:last_sent": "1769659200",
+  "SOLUSD:mmh_sell:last_sent": "1769659200"
 }
