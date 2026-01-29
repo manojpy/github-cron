@@ -113,7 +113,7 @@
   },
   "BNBUSD:ALERT:PPO_SIGNAL_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769649383
+    "ts": 1769661081
   },
   "AAVEUSD:ALERT:MMH_BUY": {
     "state": "INACTIVE",
@@ -477,7 +477,7 @@
   },
   "BNBUSD:ALERT:VWAP_DOWN": {
     "state": "INACTIVE",
-    "ts": 1769658380
+    "ts": 1769661081
   },
   "BNBUSD:ALERT:PIVOT_DOWN_P": {
     "state": "INACTIVE",
@@ -633,7 +633,7 @@
   },
   "BNBUSD:ALERT:PIVOT_DOWN_S1": {
     "state": "INACTIVE",
-    "ts": 1769656582
+    "ts": 1769661081
   },
   "DOTUSD:ALERT:PIVOT_DOWN_S2": {
     "state": "INACTIVE",
@@ -656,8 +656,8 @@
     "ts": 1769657484
   },
   "BTCUSD:ALERT:MMH_SELL": {
-    "state": "ACTIVE",
-    "ts": 1769660182
+    "state": "INACTIVE",
+    "ts": 1769661081
   },
   "ETHUSD:ALERT:PIVOT_UP_S3": {
     "state": "INACTIVE",
@@ -684,7 +684,7 @@
     "ts": 1769660182
   },
   "SOLUSD:ALERT:MMH_SELL": {
-    "state": "ACTIVE",
-    "ts": 1769660182
+    "state": "INACTIVE",
+    "ts": 1769661081
   }
 }
