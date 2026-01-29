@@ -17,7 +17,7 @@ import math
 import gc
 import json
 from collections import deque, defaultdict
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -29,7 +29,6 @@ import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
-from numba import njit, prange
 import contextlib 
 import traceback
 
@@ -72,6 +71,19 @@ except ImportError:
     json_dumps = json.dumps
     json_loads = json.loads
     JSON_BACKEND = "stdlib"
+
+def normalize_timestamp(ts: Union[int, float]) -> int:
+    ts_int = int(ts)
+    if ts_int > 4102444800:
+        return ts_int // 1000
+    return ts_int
+
+def validate_timestamp_format(ts: Union[int, float], name: str = "timestamp") -> Tuple[bool, str]:
+    ts_sec = normalize_timestamp(ts)
+    if ts_sec < 1577836800 or ts_sec > 4102444799:
+        return False, f"{name} {ts_sec} out of valid range [1577836800, 4102444799]"
+    return True, "Valid"
+
 
 __version__ = "1.8.0-stable"
 
@@ -515,6 +527,126 @@ def validate_runtime_config() -> None:
         f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s"
     )    
     _VALIDATION_DONE = True
+
+def calculate_wick_ratio(open_val: float, high_val: float, low_val: float, 
+                        close_val: float, is_buy: bool) -> float:
+    candle_range = high_val - low_val
+    
+    if candle_range < 1e-9:
+        return 0.0
+    
+    try:
+        if is_buy:
+            upper_wick = high_val - close_val
+            
+            if upper_wick < 0:
+                logger.warning(
+                    f"Negative upper wick: H={high_val:.5f}, C={close_val:.5f}"
+                )
+                return 0.0
+            
+            wick_ratio = upper_wick / candle_range
+            
+        else:
+            lower_wick = close_val - low_val
+            
+            if lower_wick < 0:
+                logger.warning(
+                    f"Negative lower wick: C={close_val:.5f}, L={low_val:.5f}"
+                )
+                return 0.0
+            
+            wick_ratio = lower_wick / candle_range
+        
+        return max(0.0, min(1.0, wick_ratio))
+        
+    except (ValueError, ZeroDivisionError) as e:
+        logger.error(f"Error calculating wick ratio: {e}")
+        return 0.0
+
+def validate_indicator_array(arr: Optional[np.ndarray], name: str, 
+                            min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:    
+    if arr is None:
+        return False, f"{name} is None"
+    
+    if len(arr) == 0:
+        return False, f"{name} is empty array"
+    
+    if np.all(np.isnan(arr)):
+        return False, f"{name} is all NaN values"
+    
+    valid_count = np.sum(~np.isnan(arr))
+    if valid_count < min_valid_values:
+        return False, f"{name} has only {valid_count} valid values (need {min_valid_values})"
+    
+    return True, None
+
+
+def validate_indicators_dict(indicators: Optional[dict], required_keys: List[str]) -> Tuple[bool, Optional[str]]:   
+    if indicators is None:
+        return False, "Indicators dict is None"
+    
+    if not isinstance(indicators, dict):
+        return False, f"Indicators is {type(indicators)}, not dict"
+    
+    missing_keys = set(required_keys) - set(indicators.keys())
+    if missing_keys:
+        return False, f"Missing indicator keys: {missing_keys}"
+    
+    for key in required_keys:
+        is_valid, msg = validate_indicator_array(indicators[key], f"indicators[{key}]")
+        if not is_valid:
+            return False, msg
+    
+    return True, None
+
+def validate_vwap_cross(close_prev: float, close_curr: float, 
+                        vwap_prev: float, vwap_curr: float, 
+                        is_buy: bool) -> Tuple[bool, Optional[str]]:
+    if np.isnan(close_prev) or np.isnan(close_curr) or \
+       np.isnan(vwap_prev) or np.isnan(vwap_curr):
+        return False, "NaN in price or VWAP data"
+    
+    if close_prev <= 0 or close_curr <= 0 or vwap_prev <= 0 or vwap_curr <= 0:
+        return False, "Non-positive price values"
+    
+    if is_buy:
+        crossed_above = (close_prev <= vwap_prev) and (close_curr > vwap_curr)
+        
+        if not crossed_above:
+            return False, (
+                f"No cross up: "
+                f"prev_close={close_prev:.2f} vs prev_vwap={vwap_prev:.2f}, "
+                f"curr_close={close_curr:.2f} vs curr_vwap={vwap_curr:.2f}"
+            )
+        
+        return True, None
+        
+    else:
+        crossed_below = (close_prev >= vwap_prev) and (close_curr < vwap_curr)
+        
+        if not crossed_below:
+            return False, (
+                f"No cross down: "
+                f"prev_close={close_prev:.2f} vs prev_vwap={vwap_prev:.2f}, "
+                f"curr_close={close_curr:.2f} vs curr_vwap={vwap_curr:.2f}"
+            )
+        
+        return True, None
+
+def get_utc_date_key(timestamp: int) -> str:
+    utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return utc_dt.date().isoformat()
+
+
+def should_reset_daily_state(current_timestamp: int, 
+                             last_reset_timestamp_str: Optional[str]) -> bool:
+    current_date_str = get_utc_date_key(current_timestamp)
+    
+    if not last_reset_timestamp_str:
+        return True  # Never reset before
+    
+    return last_reset_timestamp_str != current_date_str
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -1914,11 +2046,10 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
         if selected_index < 0 or selected_index >= array_len:
             return False, f"Selected index {selected_index} out of range [0, {array_len - 1}]"
         
-        selected_candle_time = int(timestamp[selected_index])
+        selected_candle_time = normalize_timestamp(timestamp[selected_index])
         interval_seconds = interval_minutes * 60
         current_period_start = (reference_time // interval_seconds) * interval_seconds
-        
-        # Check if candle is still forming (in the current period)
+       
         if selected_candle_time >= current_period_start:
             return False, (
                 f"Selected candle is still forming! "
@@ -2025,10 +2156,13 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     if reference_time is None:
         reference_time = get_trigger_timestamp()
 
+    reference_time = normalize_timestamp(reference_time)
+
     interval_seconds = interval_minutes * 60
     current_period_start = (reference_time // interval_seconds) * interval_seconds
 
     last_closed_period_start = current_period_start - interval_seconds
+    timestamps = np.array([normalize_timestamp(t) for t in timestamps])
     valid_mask = (timestamps >= last_closed_period_start) & (timestamps < current_period_start)
 
     valid_indices = np.nonzero(valid_mask)[0]
@@ -3275,6 +3409,9 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
     return st is not None and st.get("state") == "ACTIVE"
 
 def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
+    """
+    Validate VWAP cross with all safety checks.
+    """
     vwap_curr = ctx.get("vwap_curr")
     vwap_prev = ctx.get("vwap_prev")
     close_curr = ctx["close_curr"]
@@ -3286,30 +3423,24 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
     if vwap_curr is None or np.isnan(vwap_curr) or vwap_prev is None or np.isnan(vwap_prev):
         return False, "VWAP not available"
     
+    is_valid_cross, cross_error = validate_vwap_cross(
+        close_prev, close_curr, vwap_prev, vwap_curr, is_buy
+    )
+    
+    if not is_valid_cross:
+        return False, cross_error
+    
     if is_buy:
         if close_curr <= open_curr:
             return False, f"Red candle: O={open_curr:.2f}, C={close_curr:.2f}"
-    
-        crossed_above = (
-            (close_prev <= vwap_prev and close_curr > vwap_curr) or  # Crossed in current candle
-            (close_prev < vwap_prev and close_curr >= vwap_curr)  # Allow equality for slow crosses
-        )
-    
-        if not crossed_above:
-            return False, (
-                f"No cross up: "
-                f"prev={close_prev:.2f} vs vwap_prev={vwap_prev:.2f}, "
-                f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
-            )
-
+        
         dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
         if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
             return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
         
         candle_range = high_curr - low_curr
         if candle_range > 1e-9:
-            body_top = max(open_curr, close_curr)
-            upper_wick = high_curr - body_top
+            upper_wick = high_curr - close_curr
             wick_ratio = upper_wick / candle_range
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Upper wick too large: {wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
@@ -3320,21 +3451,13 @@ def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dic
         if close_curr >= open_curr:
             return False, f"Green candle: O={open_curr:.2f}, C={close_curr:.2f}"
         
-        if not (close_prev > vwap_prev and close_curr < vwap_curr):
-            return False, (
-                f"No cross down: "
-                f"prev={close_prev:.2f} vs vwap_prev={vwap_prev:.2f}, "
-                f"curr={close_curr:.2f} vs vwap_curr={vwap_curr:.2f}"
-            )
-        
         dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
         if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
             return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
         
         candle_range = high_curr - low_curr
         if candle_range > 1e-9:
-            body_bottom = min(open_curr, close_curr)
-            lower_wick = body_bottom - low_curr
+            lower_wick = close_curr - low_curr
             wick_ratio = lower_wick / candle_range
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Lower wick too large: {wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
@@ -3357,27 +3480,19 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
         logger.error(f"check_multiple_alert_states failed for {pair} | keys={len(keys)} | error={e}")
         return {k: False for k in keys}
 
-def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_buy, precomputed_ratio: Optional[float] = None) -> Tuple[bool, str]:
+def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, 
+                                    is_buy, precomputed_ratio: Optional[float] = None) -> Tuple[bool, str]:
     try:
         candle_range = high_val - low_val
         if candle_range < 1e-8:
             return False, "Range too small"
 
-        # Use precomputed wick ratio if provided
         if precomputed_ratio is not None:
             wick_ratio = precomputed_ratio
         else:
-            # Fallback: calculate wick ratio based on candle type
-            if is_buy:
-                upper_wick = high_val - close_val
-                if upper_wick < 0:
-                    return False, f"Corrupted data (H={high_val:.5f} < C={close_val:.5f})"
-                wick_ratio = upper_wick / candle_range
-            else:
-                lower_wick = close_val - low_val
-                if lower_wick < 0:
-                    return False, f"Corrupted data (L={low_val:.5f} > C={close_val:.5f})"
-                wick_ratio = lower_wick / candle_range
+            wick_ratio = calculate_wick_ratio(
+                open_val, high_val, low_val, close_val, is_buy
+            )
 
         if is_buy:
             if close_val <= open_val:
@@ -3385,6 +3500,7 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
+            
             return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
 
         else:
@@ -3393,6 +3509,7 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, is_
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
                 return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
+            
             return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
 
     except Exception as e:
@@ -3404,7 +3521,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
-    ALERT_COOLDOWN_SECONDS = 300
+    ALERT_COOLDOWN_SECONDS = Constants.ALERT_DEDUP_WINDOW_SEC 
     close_15m = None
     open_15m = None
     timestamps_15m = None
@@ -3431,10 +3548,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
-        ts_curr = int(ts_15m_val)
-        
-        if ts_curr > 1e10:
-            ts_curr = ts_curr // 1000
+        ts_curr = normalize_timestamp(ts_15m_val)  # ← Use new helper
+
+        is_valid, error_msg = validate_timestamp_format(ts_curr, f"{pair_name}_15m_candle")
+        if not is_valid:
+            logger_pair.error(f"Invalid timestamp: {error_msg}")
+            return None
         
         if not validate_candle_timestamp(ts_curr, reference_time, 15, 120):
             if cfg.DEBUG_MODE:
@@ -3444,7 +3563,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         interval_seconds = 15 * 60
         candle_close_ts = ts_curr + interval_seconds
         time_since_close = reference_time - candle_close_ts
-
 
         if reference_time - ts_curr > 1200:
             if cfg.DEBUG_MODE:
@@ -3491,9 +3609,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
         )
-        
+
         if indicators is None:
             logger_pair.error(f"Skipping {pair_name}: all indicators failed to calculate")
+            return None
+
+        critical_indicators = ["ppo", "ppo_signal", "smooth_rsi"]
+        is_valid, msg = validate_indicators_dict(indicators, critical_indicators)
+        if not is_valid:
+            logger_pair.warning(f"Skipping {pair_name}: {msg}")
             return None
 
         ppo = indicators["ppo"]
@@ -3515,16 +3639,28 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
         close_5m_val = data_5m["close"][i5]
-        ppo_curr = ppo[i15]
-        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
-        rsi_curr = smooth_rsi[i15]
-        rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
         vwap_enabled = cfg.ENABLE_VWAP
         vwap_available = False
         vwap_curr = None
         vwap_prev = None
+        ppo_curr = ppo[i15]
+        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
+        rsi_curr = smooth_rsi[i15]
+        rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
+
+        if np.isnan(ppo_curr) or np.isnan(ppo_prev):
+            logger_pair.debug(f"PPO has NaN at index {i15}: curr={ppo_curr}, prev={ppo_prev}")
+            return None
+
+        if np.isnan(rsi_curr) or np.isnan(rsi_prev):
+            logger_pair.debug(f"RSI has NaN at index {i15}: curr={rsi_curr}, prev={rsi_prev}")
+            return None
+
+        if np.isnan(ppo_sig_curr) or np.isnan(ppo_sig_prev):
+            logger_pair.debug(f"PPO Signal has NaN at index {i15}: curr={ppo_sig_curr}, prev={ppo_sig_prev}")
+            return None
 
         if vwap_enabled and vwap is not None and len(vwap) > i15:
             try:
@@ -3579,17 +3715,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
-        candle_range = high_curr - low_curr
-        if candle_range <= 1e-9:
-            actual_buy_wick_ratio = 1.0
-            actual_sell_wick_ratio = 1.0
-        else:        
-            upper_wick = high_curr - close_curr
-            actual_buy_wick_ratio = upper_wick / candle_range
-
-            lower_wick = close_curr - low_curr
-            actual_sell_wick_ratio = lower_wick / candle_range
-
+        actual_buy_wick_ratio = calculate_wick_ratio(
+            open_curr, high_curr, low_curr, close_curr, is_buy=True
+        )
+        actual_sell_wick_ratio = calculate_wick_ratio(
+            open_curr, high_curr, low_curr, close_curr, is_buy=False
+        )
         if cfg.DEBUG_MODE:
             logger_pair.debug(
                 f"PHASE 7 [15M]: O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f}"
@@ -3600,32 +3731,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
 
         if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
-            current_utc_dt = datetime.fromtimestamp(reference_time, tz=timezone.utc)
-            current_date = current_utc_dt.date()
             day_tracker_key = f"{pair_name}:last_reset_date"
-
-            last_reset_date = None
+            current_date_str = get_utc_date_key(reference_time)  # ← UTC date string
+    
             last_reset_date_str = None
             try:
                 last_reset_date_str = await sdb.get_metadata(day_tracker_key)
-                if last_reset_date_str:
-                    last_reset_date = datetime.fromisoformat(last_reset_date_str).date()
             except Exception as e:
-                logger_pair.warning(f"Failed to parse last_reset_date '{last_reset_date_str}': {e}")
-                last_reset_date = None
+                logger_pair.warning(f"Failed to get last reset date: {e}")
+                last_reset_date_str = None
 
             logger_pair.debug(
-                f"Daily reset check | stored='{last_reset_date_str}' | "
-                f"parsed={last_reset_date} | current={current_date} | "
-                f"needs_reset={last_reset_date != current_date}"
+                f"Daily reset check (UTC) | last_reset='{last_reset_date_str}' | "
+                f"current='{current_date_str}' | needs_reset={should_reset_daily_state(reference_time, last_reset_date_str)}"
             )
 
-            if last_reset_date != current_date:
+            if should_reset_daily_state(reference_time, last_reset_date_str):
                 try:
-                    await sdb.set_metadata(day_tracker_key, current_date.isoformat())
-                    logger_pair.debug(f"✅ Saved reset date: {current_date}")
+                    await sdb.set_metadata(day_tracker_key, current_date_str)
+                    logger_pair.debug(f"✅ Daily reset on {current_date_str} UTC")
                 except Exception as e:
-                    logger_pair.error(f"❌ Failed to save reset date – aborting daily reset: {e}")
+                    logger_pair.error(f"❌ Failed to save reset date: {e}")
                     raise
 
                 delete_keys = []
