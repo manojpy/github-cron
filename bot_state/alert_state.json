@@ -498,5 +498,9 @@
   "XRPUSD:ALERT:VWAP_UP": {
     "state": "INACTIVE",
     "ts": 1769649383
+  },
+  "AAVEUSD:ALERT:VWAP_DOWN": {
+    "state": "INACTIVE",
+    "ts": 1769649391
   }
 }
