@@ -433,7 +433,7 @@
   },
   "ETHUSD:ALERT:RSI_50_UP": {
     "state": "INACTIVE",
-    "ts": 1769614285
+    "ts": 1769644886
   },
   "AAVEUSD:ALERT:PIVOT_UP_R1": {
     "state": "INACTIVE",
