@@ -59,17 +59,8 @@ from aot_bridge import (
 try:
     import orjson
     
-    def _ensure_str_keys(obj: Any) -> Any:
-        """Recursively convert dict keys to strings."""
-        if isinstance(obj, dict):
-            return {str(k): _ensure_str_keys(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [_ensure_str_keys(item) for item in obj]
-        return obj
-    
     def json_dumps(obj: Any) -> str:
-        obj = _ensure_str_keys(obj)
-        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY).decode('utf-8')
+        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS).decode('utf-8')
 
     def json_loads(s: str | bytes) -> Any:
         return orjson.loads(s)
@@ -85,13 +76,8 @@ except ImportError:
 
 def normalize_timestamp(ts: Union[int, float]) -> int:
     ts_int = int(ts)
-    
-    if ts_int > 1_000_000_000_000:
-        ts_int = ts_int // 1000
-    
-    if ts_int < 0 or ts_int > 4102444800:
-        raise ValueError(f"Normalized timestamp {ts_int} out of valid range [0, 4102444800]")
-    
+    if ts_int > 4102444800:
+        return ts_int // 1000
     return ts_int
 
 def validate_timestamp_format(ts: Union[int, float], name: str = "timestamp") -> Tuple[bool, str]:
@@ -131,9 +117,6 @@ class Constants:
     CANDLE_SAFETY_BUFFER = 100
     
 
-PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
-PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
-
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 class CompiledPatterns:
@@ -146,20 +129,22 @@ class CompiledPatterns:
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 
+
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     REDIS_URL: str = Field(..., min_length=1)
     DELTA_API_BASE: str = Field(..., min_length=1)
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
-    SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
-    BOT_NAME: str = "Unified Alert Bot"   
-    PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
-    PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
-    PPO_SIGNAL: int = Field(default=5, ge=1, le=20, description="PPO signal period")
-    RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
-    RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
+    SEND_TEST_MESSAGE: bool = True
+    BOT_NAME: str = "Unified Alert Bot"
     PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"], min_length=1)
+    PPO_FAST: int = 7
+    PPO_SLOW: int = 16
+    PPO_SIGNAL: int = 5
+    PPO_USE_SMA: bool = False
+    RMA_50_PERIOD: int = 50
+    RMA_200_PERIOD: int = 200
     CIRRUS_CLOUD_ENABLED: bool = True
     X1: int = 22
     X2: int = 9
@@ -269,22 +254,6 @@ class BotConfig(BaseModel):
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
-
-    @field_validator('PPO_FAST', 'PPO_SLOW', 'PPO_SIGNAL')
-    @classmethod
-    def validate_ppo_params(cls, v):
-        if not (1 <= v <= 100):
-            raise ValueError(f'PPO parameter must be 1-100, got {v}')
-        return v
-    
-    @model_validator(mode='after')
-    def validate_ppo_ordering(self) -> 'BotConfig':
-        if self.PPO_FAST >= self.PPO_SLOW:
-            raise ValueError(
-                f'PPO_FAST ({self.PPO_FAST}) must be strictly less than '
-                f'PPO_SLOW ({self.PPO_SLOW})'
-            )
-        return self
 
     @model_validator(mode='after')
     def validate_logic(self) -> 'BotConfig':
@@ -1915,16 +1884,9 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             return None
     
         n = len(data["timestamp"])
-   
+    
         if n == 0:
             logger.warning("parse_candles_to_numpy: empty candle array (n=0)")
-            return None
-    
-        if n < Constants.MIN_CANDLES_FOR_INDICATORS:
-            logger.warning(
-                f"parse_candles_to_numpy: Insufficient candles | "
-                f"Got {n}, need {Constants.MIN_CANDLES_FOR_INDICATORS}"
-            )
             return None
     
         for key in ["open", "high", "low", "close", "volume"]:
@@ -1936,7 +1898,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
                 return None
     
         if data["timestamp"][-1] > 1_000_000_000_000:
-            data["timestamp"] = data["timestamp"] // 1000
+            data["timestamp"] //= 1000
     
         o, h, l, c = data["open"], data["high"], data["low"], data["close"]
     
@@ -2224,37 +2186,23 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
     return last_closed_idx
 
-def validate_candle_timestamp(candle_ts, reference_time, interval_minutes, tolerance_seconds=120, logger_ctx=None):
-    if logger_ctx is None:
-        logger_ctx = logger
-    logger_ctx.error(...)
-    return False
-    
+def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
-    
-    current_period_start = (reference_time // interval_seconds) * interval_seconds
-    
-    last_closed_period_start = current_period_start - interval_seconds
-    
-    expected_open_ts = last_closed_period_start
-    
+    current_window = reference_time // interval_seconds
+    expected_open_ts = (current_window * interval_seconds) - interval_seconds
+
     diff = abs(candle_ts - expected_open_ts)
     if diff > tolerance_seconds:
-        logger_ctx.error(
-            f"Candle timestamp mismatch! "
-            f"Expected ~{expected_open_ts} ({format_ist_time(expected_open_ts)}), "
-            f"got {candle_ts} ({format_ist_time(candle_ts)}) | "
-            f"Diff: {diff}s"
+        logger.error(
+            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
+            f"got {candle_ts} (diff: {diff}s)"
         )
         return False
-    
-    if logger_ctx.isEnabledFor(logging.DEBUG):
-        logger_ctx.debug(
-            f"Candle timestamp validated | "
-            f"Expected: {expected_open_ts} ({format_ist_time(expected_open_ts)}) | "
-            f"Got: {candle_ts} ({format_ist_time(candle_ts)}) | "
-            f"Diff: {diff}s"
-        )
+
+    logger.debug(
+        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
+        f"Got: {candle_ts} | Diff: {diff}s"
+    )
     return True
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
@@ -2272,16 +2220,15 @@ def build_products_map_from_cfg() -> Dict[str, dict]:
     return products_map
 
 async def fetch_all_pairs_candles(fetcher: DataFetcher, reference_time: int) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-    """Fetch OHLC candles for all configured pairs (15m, 5m, daily)."""
+    requests = []
+    for pair in cfg.PAIRS:
+        requests.append((pair, "15", cfg.MIN_CANDLES_FOR_INDICATORS))
+        requests.append((pair, "5", cfg.MIN_CANDLES_FOR_INDICATORS))
+        requests.append((pair, "D", cfg.MIN_CANDLES_FOR_INDICATORS))
     return await fetcher.fetch_all_candles_truly_parallel(
-        [
-            (pair, [
-                ("15", cfg.MIN_CANDLES_FOR_INDICATORS),
-                ("5", cfg.MIN_CANDLES_FOR_INDICATORS),
-                ("D", cfg.MIN_CANDLES_FOR_INDICATORS)
-            ]) 
-            for pair in cfg.PAIRS
-        ],
+        [(pair, [("15", cfg.MIN_CANDLES_FOR_INDICATORS),
+                 ("5", cfg.MIN_CANDLES_FOR_INDICATORS),
+                 ("D", cfg.MIN_CANDLES_FOR_INDICATORS)]) for pair in cfg.PAIRS],
         reference_time
     )
 
@@ -2416,7 +2363,7 @@ class RedisStateStore:
                         pool_reused = False     
         if pool_reused:
             return
- 
+
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             if await self._attempt_connect(timeout):
                 try:
@@ -3284,16 +3231,22 @@ def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple
     return ctx[cache_key]
 
 BUY_PIVOT_DEFS = [create_pivot_alert(level, is_buy=True) 
-                  for level in PIVOT_LEVELS_BUY]
+                  for level in ("P", "S1", "S2", "S3", "R1", "R2")]
 
 SELL_PIVOT_DEFS = [create_pivot_alert(level, is_buy=False) 
-                   for level in PIVOT_LEVELS_SELL]
+                   for level in ("P", "S1", "S2", "R1", "R2", "R3")]
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
 
+ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
+
+ALERT_KEYS: Dict[str, str] = {
+    d["key"]: f"ALERT:{d['key'].upper()}" for d in ALERT_DEFINITIONS
+}
+
+logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 def validate_alert_definitions() -> None:
-    """Validate all alert definitions are well-formed."""
     errors = []
     
     keys_seen = set()
@@ -3317,24 +3270,18 @@ def validate_alert_definitions() -> None:
         if not isinstance(def_.get("requires", []), list):
             errors.append(f"Alert {def_.get('key', idx)}: requires must be a list")
     
+    for def_ in ALERT_DEFINITIONS:
+        if def_["key"] not in ALERT_KEYS:
+            errors.append(f"Alert key {def_['key']} missing from ALERT_KEYS mapping")
+    
     if errors:
         error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
         logger.critical(error_msg)
         raise ValueError(error_msg)
     
-    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions")
+    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
 
-# VALIDATE FIRST
 validate_alert_definitions()
-
-# CREATE MAPS AFTER VALIDATION
-ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
-
-ALERT_KEYS: Dict[str, str] = {
-    d["key"]: f"ALERT:{d['key'].upper()}" for d in ALERT_DEFINITIONS
-}
-
-logger.debug(f"Alert keys initialized: {len(ALERT_KEYS)} mappings")
 
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:   
     if sdb.degraded:
@@ -3491,36 +3438,31 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
-        ts_curr = normalize_timestamp(ts_15m_val)
+        ts_curr = normalize_timestamp(ts_15m_val)  # ← Use new helper
 
         is_valid, error_msg = validate_timestamp_format(ts_curr, f"{pair_name}_15m_candle")
         if not is_valid:
             logger_pair.error(f"Invalid timestamp: {error_msg}")
             return None
-
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 120, logger_ctx=logger_pair):
+        
+        if not validate_candle_timestamp(ts_curr, reference_time, 15, 120):
             if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - 15m candle timestamp not valid")
+                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
             return None
-
+            
         interval_seconds = 15 * 60
         candle_close_ts = ts_curr + interval_seconds
         time_since_close = reference_time - candle_close_ts
 
+        if reference_time - ts_curr > 1200:
+            if cfg.DEBUG_MODE:
+                logger_pair.debug(f"Skipping {pair_name} - candle too stale ({reference_time - ts_curr}s > 600s)")
+            return None
+        
         if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"Skipping {pair_name} - candle not finalized yet | "
-                    f"Time since close: {time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s"
-                )
-            return None
-
-        candle_age = reference_time - ts_curr
-        if candle_age > cfg.MAX_CANDLE_STALENESS_SEC:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping {pair_name} - candle too stale | "
-                    f"Age: {candle_age}s > max {cfg.MAX_CANDLE_STALENESS_SEC}s"
+                    f"Skipping {pair_name} - candle not finalized ({time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
                 )
             return None
 
@@ -3554,40 +3496,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
        
-        try:
-            data_15m_safe = {
-                k: v.copy() if isinstance(v, np.ndarray) else v 
-                for k, v in data_15m.items()
-            }
-            data_5m_safe = {
-                k: v.copy() if isinstance(v, np.ndarray) else v 
-                for k, v in data_5m.items()
-            }
-            data_daily_safe = None
-            if data_daily:
-                data_daily_safe = {
-                    k: v.copy() if isinstance(v, np.ndarray) else v 
-                    for k, v in data_daily.items()
-                }
-
-            indicators = await asyncio.wait_for(
-                asyncio.to_thread(
-                    calculate_all_indicators_numpy, 
-                    data_15m_safe, 
-                    data_5m_safe, 
-                    data_daily_safe
-                ),
-
-                timeout=30.0  # 30 second timeout per indicator calculation
-            )
-
-        except asyncio.TimeoutError:
-            logger_pair.error(f"Indicator calculation for {pair_name} timed out (>30s)")
-            return None
-
-        except Exception as e:
-            logger_pair.error(f"Error calculating indicators for {pair_name}: {e}", exc_info=True)
-            return None
+        indicators = await asyncio.to_thread(
+            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+        )
 
         if indicators is None:
             logger_pair.error(f"Skipping {pair_name}: all indicators failed to calculate")
@@ -4183,7 +4094,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
 
-            logger_pair.info(
+            logger_pair.debug(
                 f"😒 {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
