@@ -65,11 +65,13 @@ try:
     def json_loads(s: str | bytes) -> Any:
         return orjson.loads(s)
     
+    JSONDecodeError = orjson.JSONDecodeError
     JSON_BACKEND = "orjson"
 except ImportError:
     import json
     json_dumps = json.dumps
     json_loads = json.loads
+    JSONDecodeError = json.JSONDecodeError
     JSON_BACKEND = "stdlib"
 
 def normalize_timestamp(ts: Union[int, float]) -> int:
@@ -393,7 +395,6 @@ class SafeFormatter(logging.Formatter):
         return text
     
     def format(self, record: logging.LogRecord) -> str:
-        # Apply redactions to message and args before formatting
         if record.msg:
             record.msg = self._apply_all_redactions(str(record.msg))
         
@@ -2240,17 +2241,6 @@ class RedisKeyPrefix:
     LOCK = "lock:"
 
 class RedisStateStore:
-    DEDUP_LUA: ClassVar[str] = """
-    local key = KEYS[1]
-    local ttl = tonumber(ARGV[1])
-    if redis.call("EXISTS", key) == 1 then
-        return 0
-    else
-        redis.call("SET", key, "1", "EX", ttl)
-        return 1
-    end
-    """
-
     POOL_MAX_AGE_SECONDS = 3600
     SCRIPT_RELOAD_LOCK_TIMEOUT = 2.0
 
@@ -2276,7 +2266,6 @@ class RedisStateStore:
         self.degraded = False
         self.degraded_alerted = False
         self._connection_attempts = 0
-        self._dedup_script_sha: Optional[str] = None
 
         if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -2319,14 +2308,8 @@ class RedisStateStore:
                     RedisStateStore._pool_reuse_count[self.redis_url] = 0
                     if cfg.DEBUG_MODE:
                         logger.debug("Redis connection saved to per-URL pool")
-            try:
-                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                if cfg.DEBUG_MODE:
-                    logger.debug("Loaded Redis Lua script for alert deduplication")
-            except Exception as e:
-                logger.warning(f"Failed to load Lua script (will fallback): {e}")
-                self._dedup_script_sha = None
-            return True
+
+                return True
 
         except Exception as exc:
             logger.error(f"Redis connection attempt failed: {exc}")
@@ -2369,16 +2352,10 @@ class RedisStateStore:
                         RedisStateStore._pool_reuse_count[self.redis_url] = \
                             RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
                     
-                        if not self._dedup_script_sha:
-                            try:
-                                self._dedup_script_sha = await self._redis.script_load(self.DEDUP_LUA)
-                            except Exception as e:
-                                if cfg.DEBUG_MODE:
-                                    logger.debug(f"Lua script load failed: {e}")
-            
                         self.degraded = False
                         pool_reused = True
                         return
+
                     except Exception as e:
                         if cfg.DEBUG_MODE:
                             logger.debug(f"Pool health check failed: {e}, creating new pool")
@@ -2537,47 +2514,6 @@ class RedisStateStore:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
 
-    async def batch_check_recent_alerts(self, checks: List[Tuple[str, str, int]]) -> Dict[str, bool]:    
-        if self.degraded or not checks or not self._redis:
-            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-        try:
-            async with self._redis.pipeline() as pipe:
-                keys_map: Dict[str, str] = {}
-                
-                for pair, alert_key, ts in checks:
-                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-                    recent_key = f"recent_alert:{pair}:{alert_key}:{window}"
-                    composite_key = f"{pair}:{alert_key}"
-                    keys_map[recent_key] = composite_key
-                    pipe.set(
-                        recent_key, 
-                        "1", 
-                        nx=True, 
-                        ex=Constants.ALERT_DEDUP_WINDOW_SEC
-                    )
-
-                results = await asyncio.wait_for(pipe.execute(), timeout=3.0)
-
-            output: Dict[str, bool] = {}
-            for idx, (recent_key, composite_key) in enumerate(keys_map.items()):
-                should_send = bool(results[idx]) if idx < len(results) else True
-                output[composite_key] = should_send
-
-            if cfg.DEBUG_MODE:
-                duplicates = sum(1 for v in output.values() if not v)
-                if duplicates > 0:
-                    logger.debug(f"Batch dedup: {duplicates}/{len(checks)} duplicates filtered")
-
-            return output
-            
-        except asyncio.TimeoutError:
-            logger.error("batch_check_recent_alerts timeout")
-            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-            
-        except Exception as e:
-            logger.error(f"batch_check_recent_alerts failed: {e}")
-            return {f"{pair}:{alert_key}": True for pair, alert_key, _ in checks}
-
     async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
         
         if not self._redis or self.degraded:
@@ -2634,7 +2570,7 @@ class RedisStateStore:
 
                     parsed[key] = json_loads(val_str)
 
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                except (JSONDecodeError, UnicodeDecodeError) as e:
                     logger.warning(f"Failed to parse Redis value for {pair}:{key}: {e}")
                     parsed[key] = None
                 except Exception as e:
@@ -2690,7 +2626,7 @@ class RedisStateStore:
                     parsed_state = json_loads(val_str)
                     states[key] = parsed_state.get("state") == "ACTIVE"
                     
-                except (json.JSONDecodeError, TypeError) as e:
+                except (JSONDecodeError, TypeError) as e:
                     if cfg.DEBUG_MODE:
                         logger.debug(f"Failed to parse state for {key}: {e}")
                     states[key] = False
@@ -2706,52 +2642,6 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"batch_get_all_alert_states failed for {pair}: {e}")
             return {k: False for k in alert_keys}
-
-    async def atomic_eval_batch(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        if self.degraded:
-            empty_prev = {k: False for k in alert_keys}
-            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-            return empty_prev, empty_dedup
-
-        try:
-            prev_states, dedup_results = await self._pipeline_ops(
-                pair, alert_keys, state_updates, dedup_checks
-            )
-            return prev_states, dedup_results
-
-        except asyncio.TimeoutError:
-            logger.error(
-                f"Redis timeout | pair={pair} | ops={len(alert_keys)} | "
-                f"Degrading to batch_get_and_set_alerts + batch_check_recent_alerts"
-            )
-            try:
-                prev_raw = await asyncio.wait_for(
-                    self.batch_get_and_set_alerts(pair, alert_keys, state_updates),
-                    timeout=2.0
-                )
-                prev_states: Dict[str, bool] = {}
-                for k in alert_keys:
-                    env = prev_raw.get(k)
-                    prev_states[k] = isinstance(env, dict) and env.get("state") == "ACTIVE"
-
-                dedup_results = await asyncio.wait_for(
-                    self.batch_check_recent_alerts(dedup_checks),
-                    timeout=2.0
-                )
-                
-                return prev_states, dedup_results
-                
-            except asyncio.TimeoutError:
-                logger.critical(f"Redis completely unresponsive for {pair}")
-                empty_prev = {k: False for k in alert_keys}
-                empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-                return empty_prev, empty_dedup
-
-        except Exception as e:
-            logger.error(f"atomic_eval_batch failed: {e}")
-            empty_prev = {k: False for k in alert_keys}
-            empty_dedup = {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-            return empty_prev, empty_dedup
 
     async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
         
@@ -2826,7 +2716,7 @@ class RedisStateStore:
                     parsed_state = json_loads(val_str)
                     prev_states[key] = parsed_state.get("state") == "ACTIVE"
                     
-                except (json.JSONDecodeError, TypeError) as e:
+                except (JSONDecodeError, TypeError) as e:
                     if cfg.DEBUG_MODE:
                         logger.debug(f"Failed to parse state for {key}: {e}")
                     prev_states[key] = False
@@ -3730,57 +3620,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"(threshold={Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
 
-        if cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP:
-            day_tracker_key = f"{pair_name}:last_reset_date"
-            current_date_str = get_utc_date_key(reference_time)  # ← UTC date string
-    
-            last_reset_date_str = None
-            try:
-                last_reset_date_str = await sdb.get_metadata(day_tracker_key)
-            except Exception as e:
-                logger_pair.warning(f"Failed to get last reset date: {e}")
-                last_reset_date_str = None
-
-            logger_pair.debug(
-                f"Daily reset check (UTC) | last_reset='{last_reset_date_str}' | "
-                f"current='{current_date_str}' | needs_reset={should_reset_daily_state(reference_time, last_reset_date_str)}"
-            )
-
-            if should_reset_daily_state(reference_time, last_reset_date_str):
-                try:
-                    await sdb.set_metadata(day_tracker_key, current_date_str)
-                    logger_pair.debug(f"✅ Daily reset on {current_date_str} UTC")
-                except Exception as e:
-                    logger_pair.error(f"❌ Failed to save reset date: {e}")
-                    raise
-
-                delete_keys = []
-                if cfg.ENABLE_PIVOT:
-                    pivot_alerts = [
-                        "pivot_up_P", "pivot_up_S1", "pivot_up_S2", "pivot_up_S3",
-                        "pivot_up_R1", "pivot_up_R2",
-                        "pivot_down_P", "pivot_down_S1", "pivot_down_S2",
-                        "pivot_down_S3", "pivot_down_R1", "pivot_down_R2", "pivot_down_R3"
-                    ]
-                    for alert_key in pivot_alerts:
-                        redis_key = ALERT_KEYS.get(alert_key)
-                        if redis_key:
-                            delete_keys.append(f"{pair_name}:{redis_key}")
-
-                if cfg.ENABLE_VWAP:
-                    vwap_alerts = ["vwap_up", "vwap_down"]
-                    for alert_key in vwap_alerts:
-                        redis_key = ALERT_KEYS.get(alert_key)
-                        if redis_key:
-                            delete_keys.append(f"{pair_name}:{redis_key}")
-
-                if delete_keys:
-                    await sdb.atomic_batch_update([], deletes=delete_keys)
-                    logger_pair.info(f"🔄 Daily reset on {current_date}. Cleared {len(delete_keys)} alerts")
-                else:
-                    logger_pair.debug(f"🔄 Daily reset on {current_date} (no alerts to clear)")
-        else:
-            logger_pair.debug("Daily reset disabled (ENABLE_PIVOT and ENABLE_VWAP both false)")
+        if cfg.DEBUG_MODE and (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP):
+            logger_pair.debug("Daily reset handled globally (no per-pair reset)")
 
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
@@ -4502,7 +4343,6 @@ async def run_once() -> bool:
     )
 
     try:
-        
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
         limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
@@ -4514,6 +4354,7 @@ async def run_once() -> bool:
             )
             return False
 
+        # Step 2: Initialize fetcher & load config
         logger_run.debug("📦 Initializing HTTP fetcher...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         pairs_to_process = list(cfg.PAIRS)
@@ -4525,6 +4366,7 @@ async def run_once() -> bool:
 
         logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs from config")
 
+        # Step 3: Connect to Redis
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
@@ -4533,6 +4375,63 @@ async def run_once() -> bool:
             logger_run.critical(
                 "🚨 Redis is in degraded mode – alert deduplication disabled!"
             )
+
+        if sdb and not sdb.degraded and (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP):
+            logger_run.debug("Checking daily reset conditions...")
+            day_tracker_key = "global:last_reset_date"
+            current_date_str = get_utc_date_key(reference_time)
+            
+            last_reset_date_str = None
+            try:
+                last_reset_date_str = await sdb.get_metadata(day_tracker_key)
+            except Exception as e:
+                logger_run.warning(f"Failed to get last reset date: {e}")
+            
+            if should_reset_daily_state(reference_time, last_reset_date_str):
+                logger_run.info(f"🔄 New day detected ({current_date_str}). Resetting daily states...")
+                try:
+                    await sdb.set_metadata(day_tracker_key, current_date_str)
+                except Exception as e:
+                    logger_run.error(f"Failed to save global reset date: {e}")
+                    raise
+                
+                all_delete_keys = []
+                
+                if cfg.ENABLE_PIVOT:
+                    pivot_alerts = [
+                        "pivot_up_P", "pivot_up_S1", "pivot_up_S2", "pivot_up_S3",
+                        "pivot_up_R1", "pivot_up_R2",
+                        "pivot_down_P", "pivot_down_S1", "pivot_down_S2",
+                        "pivot_down_S3", "pivot_down_R1", "pivot_down_R2", "pivot_down_R3"
+                    ]
+                    for pair in pairs_to_process:
+                        for alert_key in pivot_alerts:
+                            redis_key = ALERT_KEYS.get(alert_key)
+                            if redis_key:
+                                all_delete_keys.append(f"{pair}:{redis_key}")
+                
+                if cfg.ENABLE_VWAP:
+                    vwap_alerts = ["vwap_up", "vwap_down"]
+                    for pair in pairs_to_process:
+                        for alert_key in vwap_alerts:
+                            redis_key = ALERT_KEYS.get(alert_key)
+                            if redis_key:
+                                all_delete_keys.append(f"{pair}:{redis_key}")
+                
+                if all_delete_keys:
+                    try:
+                        await sdb.atomic_batch_update([], deletes=all_delete_keys)
+                        logger_run.info(
+                            f"✅ Daily reset complete ({current_date_str}). "
+                            f"Cleared {len(all_delete_keys)} alerts from {len(pairs_to_process)} pairs"
+                        )
+                    except Exception as e:
+                        logger_run.error(f"Failed to delete reset keys: {e}")
+                        raise
+            else:
+                logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
+
+        if sdb.degraded and not sdb.degraded_alerted:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ {cfg.BOT_NAME} - REDIS DEGRADED MODE\n"
@@ -4543,10 +4442,9 @@ async def run_once() -> bool:
 
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-
+        
         lock = RedisLock(sdb._redis, "macd_bot_run")
         lock_acquired = await lock.acquire(timeout=5.0)
-
         if not lock_acquired:
             logger_run.warning(
                 "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
