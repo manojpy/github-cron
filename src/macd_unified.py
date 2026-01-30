@@ -59,8 +59,17 @@ from aot_bridge import (
 try:
     import orjson
     
+    def _ensure_str_keys(obj: Any) -> Any:
+        """Recursively convert dict keys to strings."""
+        if isinstance(obj, dict):
+            return {str(k): _ensure_str_keys(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_ensure_str_keys(item) for item in obj]
+        return obj
+    
     def json_dumps(obj: Any) -> str:
-        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS).decode('utf-8')
+        obj = _ensure_str_keys(obj)
+        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY).decode('utf-8')
 
     def json_loads(s: str | bytes) -> Any:
         return orjson.loads(s)
@@ -74,10 +83,15 @@ except ImportError:
     JSONDecodeError = json.JSONDecodeError
     JSON_BACKEND = "stdlib"
 
-def normalize_timestamp(ts: Union[int, float]) -> int:
+def normalize_timestamp(ts: Union[int, float]) -> int:   
     ts_int = int(ts)
-    if ts_int > 4102444800:
-        return ts_int // 1000
+   
+    if ts_int > 1_000_000_000_000:  # > year 33658 in seconds, definitely milliseconds
+        ts_int = ts_int // 1000
+    
+    if ts_int < 0 or ts_int > 4102444800:
+        raise ValueError(f"Normalized timestamp {ts_int} out of valid range [0, 4102444800]")
+    
     return ts_int
 
 def validate_timestamp_format(ts: Union[int, float], name: str = "timestamp") -> Tuple[bool, str]:
@@ -117,6 +131,9 @@ class Constants:
     CANDLE_SAFETY_BUFFER = 100
     
 
+PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
+PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
+
 PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 class CompiledPatterns:
@@ -129,22 +146,20 @@ class CompiledPatterns:
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 
-
 class BotConfig(BaseModel):
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     REDIS_URL: str = Field(..., min_length=1)
     DELTA_API_BASE: str = Field(..., min_length=1)
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
-    SEND_TEST_MESSAGE: bool = True
+    SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
-    PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"], min_length=1)
-    PPO_FAST: int = 7
-    PPO_SLOW: int = 16
-    PPO_SIGNAL: int = 5
-    PPO_USE_SMA: bool = False
-    RMA_50_PERIOD: int = 50
-    RMA_200_PERIOD: int = 200
+    PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD"], min_length=1) 
+    PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
+    PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
+    PPO_SIGNAL: int = Field(default=5, ge=1, le=20, description="PPO signal period")
+    RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
+    RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     CIRRUS_CLOUD_ENABLED: bool = True
     X1: int = 22
     X2: int = 9
@@ -254,6 +269,22 @@ class BotConfig(BaseModel):
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
+
+    @field_validator('PPO_FAST', 'PPO_SLOW', 'PPO_SIGNAL')
+    @classmethod
+    def validate_ppo_params(cls, v):
+        if not (1 <= v <= 100):
+            raise ValueError(f'PPO parameter must be 1-100, got {v}')
+        return v
+    
+    @model_validator(mode='after')
+    def validate_ppo_ordering(self) -> 'BotConfig':
+        if self.PPO_FAST >= self.PPO_SLOW:
+            raise ValueError(
+                f'PPO_FAST ({self.PPO_FAST}) must be strictly less than '
+                f'PPO_SLOW ({self.PPO_SLOW})'
+            )
+        return self
 
     @model_validator(mode='after')
     def validate_logic(self) -> 'BotConfig':
@@ -3231,10 +3262,10 @@ def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple
     return ctx[cache_key]
 
 BUY_PIVOT_DEFS = [create_pivot_alert(level, is_buy=True) 
-                  for level in ("P", "S1", "S2", "S3", "R1", "R2")]
+                  for level in PIVOT_LEVELS_BUY]
 
 SELL_PIVOT_DEFS = [create_pivot_alert(level, is_buy=False) 
-                   for level in ("P", "S1", "S2", "R1", "R2", "R3")]
+                   for level in PIVOT_LEVELS_SELL]
 
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
