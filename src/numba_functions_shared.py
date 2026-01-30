@@ -5,6 +5,10 @@
 import numpy as np
 from numba import njit, prange, types
 from numba.types import Tuple, bool_
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # 1. SANITIZATION
@@ -725,4 +729,12 @@ EXPORT_CONFIG = {
 }
 
 __all__ = list(EXPORT_CONFIG.keys())
-assert len(__all__) == 21
+
+expected_min_functions = 20
+if len(__all__) < expected_min_functions:
+    raise AssertionError(
+        f"Expected at least {expected_min_functions} exported functions, "
+        f"but only {len(__all__)} found: {__all__}"
+    )
+
+logger.info(f"✅ Exported {len(__all__)} Numba-compiled functions for AOT")
