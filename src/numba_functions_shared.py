@@ -31,24 +31,33 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
+    """
+    STABLE Population Standard Deviation matching Pine Script's ta.stdev.
+    Uses slicing to prevent floating-point catastrophic cancellation on high-price assets.
+    """
     n = len(close)
     sd = np.full(n, np.nan, dtype=np.float64)
-   
-    resp = max(0.00001, min(1000.0, responsiveness))
-    
+    # Clamp responsiveness
+    resp = max(0.00001, min(1.0, responsiveness))
+
+    # We need at least 2 values for a standard deviation
     if n < 2 or period < 2:
         return np.zeros(n, dtype=np.float64)
-    
+
     for i in range(period - 1, n):
+        # Slicing in Numba is efficient (view-based)
         window = close[i - period + 1 : i + 1]
         
+        # Count valid numbers in window
         valid_window = window[~np.isnan(window)]
         
         if len(valid_window) >= 2:
+            # np.std is numerically stable and matches population std (ddof=0)
             sd[i] = np.std(valid_window) * resp
         else:
             sd[i] = 0.0
-    
+            
+    # Handle the initial warmup period by filling with 0.0 or propagating first valid
     mask = np.isnan(sd)
     sd[mask] = 0.0
     
@@ -171,6 +180,7 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
+    """Corrected value loop with NaN propagation to match Pine Script recursion"""
     value_arr = np.full(rows, np.nan, dtype=np.float64)
     
     for i in range(rows):
@@ -178,38 +188,30 @@ def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
         mn = min_arr[i]
         mx = max_arr[i]
         
+        # 1. Calculate temp (Must be NaN if inputs are NaN or range is zero)
         denom = mx - mn
-        
-        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx):
+        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx) or np.abs(denom) < 1e-10:
             temp = np.nan
-        
-        elif np.abs(denom) < 1e-10:
-            temp = np.nan
-        
         else:
             temp = (raw - mn) / denom
-            
-            if temp < -1e-6 or temp > 1.0 + 1e-6:
-                # Data corruption detected - clip to valid range
-                temp = np.clip(temp, 0.0, 1.0)
-        
+
+        # 2. Calculate recursive value
+        # In Pine, if temp is na, value becomes na.
         if np.isnan(temp):
             value_arr[i] = np.nan
-        
         else:
-            prev_v = value_arr[i - 1] if i > 0 else np.nan
+            # Get previous value; use nz() logic (0.0 if previous is na)
+            prev_v = value_arr[i-1] if i > 0 else np.nan
             prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
             
+            # Formula: value := 1.0 * (temp - 0.5 + 0.5 * nz(value[1]))
             v = 1.0 * (temp - 0.5 + 0.5 * prev_v_safe)
             
-            if v > 0.9999:
-                v = 0.9999
-
-            if v < -0.9999:
-                v = -0.9999
-            
+            # Clamp to Pine limits
+            if v > 0.9999: v = 0.9999
+            if v < -0.9999: v = -0.9999
             value_arr[i] = v
-    
+            
     return value_arr
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
