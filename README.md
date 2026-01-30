@@ -96,7 +96,7 @@ Check results in Telegram inbox 📱
   "CIRRUS_CLOUD_ENABLED": true,    // Trend indicator
 
   // Resilience
-  "MEMORY_LIMIT_BYTES": 700000000, // 700MB soft limit
+  "MEMORY_LIMIT_BYTES": 850000000, // 700MB soft limit
   "FAIL_ON_REDIS_DOWN": false,     // Degrade gracefully
   "FAIL_ON_TELEGRAM_DOWN": false   // Continue if Telegram fails
 }
