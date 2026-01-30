@@ -2380,67 +2380,43 @@ class RedisStateStore:
 
         async with RedisStateStore._pool_lock:
             pool = RedisStateStore._global_pools.get(self.redis_url)
-            is_healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
-        
-            if pool and is_healthy:
-                try:
-                    await asyncio.wait_for(pool.ping(), timeout=1.0)
-                
-                    if RedisStateStore._pool_healthy.get(self.redis_url, False):
-                        self._redis = pool
-                    
+            healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
+
+            if pool and healthy:
+                pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
+
+                if pool_age > self.POOL_MAX_AGE_SECONDS:
+                    logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
+                    RedisStateStore._pool_healthy[self.redis_url] = False
+                    try:
+                        await pool.aclose()
+                    except Exception:
+                        pass
+                    RedisStateStore._global_pools[self.redis_url] = None
+                else:
+                    try:
+                        await asyncio.wait_for(pool.ping(), timeout=1.0)
+                        if not RedisStateStore._pool_healthy.get(self.redis_url, False):
+                            logger.debug("Pool invalidated by another task after ping")
+                            pool = None
+                        else:
+                            self._redis = pool
+
                         RedisStateStore._pool_reuse_count[self.redis_url] = \
                             RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
                     
                         self.degraded = False
-                    
-                        if cfg.DEBUG_MODE:
-                            reuse_count = RedisStateStore._pool_reuse_count[self.redis_url]
-                            logger.debug(
-                                f"[Redis] Pool reused for {self.redis_url} | "
-                                f"Reuse count: {reuse_count}"
-                            )
-                    
+                        pool_reused = True
                         return
-                
-                    else:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(
-                                f"[Redis] Pool was invalidated by another task, "
-                                f"will create new connection"
-                            )
-                        pool = None  # Fall through to create new connection
-            
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"[Redis] Pool health check timed out (>1.0s) for {self.redis_url}, "
-                        f"creating new pool"
-                    )
-                    RedisStateStore._pool_healthy[self.redis_url] = False
-                    pool = None  # Fall through to create new connection
-            
-                except Exception as e:
-                    logger.warning(
-                        f"[Redis] Pool health check failed for {self.redis_url}: {e}, "
-                        f"creating new pool"
-                    )
-                    RedisStateStore._pool_healthy[self.redis_url] = False
-                    pool = None  # Fall through to create new connection
-    
-        success = await self._attempt_connect(timeout)
-    
-        if not success:
-            logger.error(
-                f"[Redis] Failed to connect to {self.redis_url} after all retries, "
-                f"entering degraded mode"
-            )
-            self.degraded = True
-            return  # Exit gracefully, bot will continue with warnings
-    
-        self.degraded = False
-        if cfg.DEBUG_MODE:
-            logger.debug(f"[Redis] New connection established to {self.redis_url}")         
 
+                    except Exception as e:
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"Pool health check failed: {e}, creating new pool")
+                        RedisStateStore._pool_healthy[self.redis_url] = False
+                        pool_reused = False     
+        if pool_reused:
+            return
+ 
         for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
             if await self._attempt_connect(timeout):
                 try:
