@@ -57,8 +57,7 @@ from aot_bridge import (
 )
 
 try:
-    import orjson
-    
+    import orjson  
     def _ensure_str_keys(obj: Any) -> Any:
         """Recursively convert dict keys to strings."""
         if isinstance(obj, dict):
@@ -99,7 +98,7 @@ def validate_timestamp_format(ts: Union[int, float], name: str = "timestamp") ->
     if ts_sec < 1577836800 or ts_sec > 4102444799:
         return False, f"{name} {ts_sec} out of valid range [1577836800, 4102444799]"
     return True, "Valid"
-    
+
 __version__ = "1.8.0-stable"
 
 class Constants:
@@ -377,7 +376,7 @@ def load_config() -> BotConfig:
         except Exception as exc:
             error_msg = f"❌ ERROR: Config file {config_file} is not valid JSON: {exc}"
             print(error_msg, file=sys.stderr)
-            sys.exit(1)        
+            sys.exit(1)    
     else:
         print(f"⚠️ WARNING: Config file {config_file} not found, using environment variables only", file=sys.stderr)
 
@@ -517,8 +516,7 @@ _VALIDATION_DONE = False
 def validate_runtime_config() -> None:
     global _VALIDATION_DONE
     if _VALIDATION_DONE:       
-        return
-    
+        return   
     errors = []
     warnings = []
     if hasattr(cfg, '_validation_warnings'):
@@ -563,8 +561,7 @@ def validate_runtime_config() -> None:
 
 def calculate_wick_ratio(open_val: float, high_val: float, low_val: float, 
                         close_val: float, is_buy: bool) -> float:
-    candle_range = high_val - low_val
-    
+    candle_range = high_val - low_val   
     if candle_range < 1e-9:
         return 0.0
     
@@ -578,8 +575,7 @@ def calculate_wick_ratio(open_val: float, high_val: float, low_val: float,
                 )
                 return 0.0
             
-            wick_ratio = upper_wick / candle_range
-            
+            wick_ratio = upper_wick / candle_range         
         else:
             lower_wick = close_val - low_val
             
@@ -613,7 +609,6 @@ def validate_indicator_array(arr: Optional[np.ndarray], name: str,
         return False, f"{name} has only {valid_count} valid values (need {min_valid_values})"
     
     return True, None
-
 
 def validate_indicators_dict(indicators: Optional[dict], required_keys: List[str]) -> Tuple[bool, Optional[str]]:   
     if indicators is None:
@@ -670,7 +665,6 @@ def validate_vwap_cross(close_prev: float, close_curr: float,
 def get_utc_date_key(timestamp: int) -> str:
     utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     return utc_dt.date().isoformat()
-
 
 def should_reset_daily_state(current_timestamp: int, 
                              last_reset_timestamp_str: Optional[str]) -> bool:
@@ -736,11 +730,8 @@ def get_trigger_timestamp() -> int:
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
    
     interval_seconds = interval_minutes * 60
-
     current_interval_open = (reference_time // interval_seconds) * interval_seconds
-
     last_closed_candle_open = current_interval_open - interval_seconds
-
     return last_closed_candle_open
 
 _ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
@@ -769,10 +760,8 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int)
             )
             return np.full(len(close), 50.0, dtype=np.float64)
 
-        rsi = calculate_rsi_core(close, rsi_len)
-        
-        smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
-        
+        rsi = calculate_rsi_core(close, rsi_len)     
+        smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)      
         smooth_rsi = ema_loop(smooth_rsi, float(cfg.SRSI_EMA_LEN))
         
         if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
@@ -815,13 +804,10 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
         if close is None or len(close) == 0:
             return np.array([], dtype=np.float64)
 
-        ts_secs = timestamps.astype(np.int64).copy()
-        
+        ts_secs = timestamps.astype(np.int64).copy()      
         if ts_secs[0] > 1_000_000_000_000:
             ts_secs //= 1000
-
         hlc3 = (high + low + close) / 3.0
-
         vwap = vwap_daily_loop(hlc3, volume, ts_secs)
 
         if np.any(np.isnan(vwap)):
@@ -885,28 +871,19 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         close_c = np.ascontiguousarray(close, dtype=np.float64)
 
         sd = rolling_std(close_c, 50, resp_clamped)
-
         worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
-
         ma = rolling_mean_numba(close_c, period)
-
         raw = np.empty(rows, dtype=np.float64)
-
         nonzero_mask = np.abs(worm_arr) >= 1e-10
-
         raw[nonzero_mask] = (
             (worm_arr[nonzero_mask] - ma[nonzero_mask]) 
             / worm_arr[nonzero_mask]
         )
 
         raw[~nonzero_mask] = np.nan
-
         min_med, max_med = rolling_min_max_numba(raw, period)
-
         value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
-
         momentum = calc_mmh_momentum_loop(value_arr, rows)
-
         momentum = calc_mmh_momentum_smoothing(momentum, rows)
 
         return momentum
@@ -929,21 +906,15 @@ def warmup_if_needed() -> None:
         test_data_ts = np.arange(200).astype(np.int64) * 900
         
         _ = aot_bridge.ema_loop(test_data, 7.0)
-        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
-        
-        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
-        
-        _ = aot_bridge.calculate_rsi_core(test_data, 21)
-        
+        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)      
+        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)     
+        _ = aot_bridge.calculate_rsi_core(test_data, 21)      
         _ = aot_bridge.rolling_std(test_data, 14, 0.5)
-        _ = aot_bridge.rolling_mean_numba(test_data, 14)
-        
-        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
-        
+        _ = aot_bridge.rolling_mean_numba(test_data, 14)      
+        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)     
         _ = aot_bridge.smooth_range(test_data, 22, 2)
         _ = aot_bridge.rng_filter_loop(test_data, test_data * 0.5)
-        _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
-        
+        _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)     
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         
         warmup_elapsed = time.time() - warmup_start
@@ -1008,7 +979,6 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
 
-    # Defensive cleanup
     for k, val in piv.items():
         if np.isnan(val) or np.isinf(val) or val <= 0:
             logger.warning(f"Invalid pivot {k}: {val}, resetting to 0.0")
@@ -1169,10 +1139,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         }
 
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
-                         expected_len: int) -> Tuple[bool, Optional[str]]:
-    
-    required_keys = ["open", "high", "low", "close"]
-    
+                         expected_len: int) -> Tuple[bool, Optional[str]]:  
+    required_keys = ["open", "high", "low", "close"]    
     for key in required_keys:
         if key not in data_15m:
             return False, f"Missing OHLC key '{key}'"
@@ -1188,8 +1156,7 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
 
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
-                        expected_len: int) -> Tuple[bool, Optional[str]]:
-    
+                        expected_len: int) -> Tuple[bool, Optional[str]]:   
     if atr_short is None or atr_long is None:
         return False, "ATR arrays are None"
     
@@ -1756,7 +1723,6 @@ class DataFetcher:
         else:
             expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
 
-
         buffer_periods = Constants.CANDLE_FETCH_BUFFER_PERIODS
         to_time = reference_time + (interval_seconds * buffer_periods)
         from_time = expected_open_ts - (limit * interval_seconds)
@@ -2196,7 +2162,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     interval_seconds = interval_minutes * 60
     current_period_start = (reference_time // interval_seconds) * interval_seconds
-
     last_closed_period_start = current_period_start - interval_seconds
     timestamps = np.array([normalize_timestamp(t) for t in timestamps])
     valid_mask = (timestamps >= last_closed_period_start) & (timestamps < current_period_start)
@@ -2678,8 +2643,7 @@ class RedisStateStore:
             logger.error(f"batch_get_all_alert_states failed for {pair}: {e}")
             return {k: False for k in alert_keys}
 
-    async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
-        
+    async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:    
         if not self._redis:
             raise RedisConnectionError("Redis unavailable")
 
@@ -2830,8 +2794,7 @@ class RedisStateStore:
             logger.error(f"Atomic batch update failed: {e}")
             return False
 
-class RedisLock:
-    
+class RedisLock:    
     RELEASE_LUA = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
         return redis.call("DEL", KEYS[1])
@@ -2839,7 +2802,6 @@ class RedisLock:
         return 0
     end
     """
-
     def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):     
         self.redis = redis_client
         self.lock_key = f"{RedisKeyPrefix.LOCK}{lock_key}"
@@ -2949,10 +2911,8 @@ class RedisLock:
         if not self.acquired_by_me or self.lost:
             return False
 
-        extend_threshold = self.__class__.get_lock_extend_interval()
-        
-        elapsed = max(0, time.time() - self.last_extend_time)
-        
+        extend_threshold = self.__class__.get_lock_extend_interval()       
+        elapsed = max(0, time.time() - self.last_extend_time)   
         should_extend = elapsed >= extend_threshold
         
         if cfg.DEBUG_MODE and should_extend:
@@ -3078,8 +3038,7 @@ class TelegramQueue:
                     await asyncio.sleep(min((cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)), 30))
         return False
 
-    async def send_batch(self, messages: List[str]) -> bool:
-    
+    async def send_batch(self, messages: List[str]) -> bool:   
         if not messages:
             return True
 
@@ -4426,7 +4385,6 @@ async def run_once() -> bool:
             )
             return False
 
-        # Step 2: Initialize fetcher & load config
         logger_run.debug("📦 Initializing HTTP fetcher...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
         pairs_to_process = list(cfg.PAIRS)
@@ -4438,7 +4396,6 @@ async def run_once() -> bool:
 
         logger_run.info(f"🔄 Processing {len(pairs_to_process)} pairs from config")
 
-        # Step 3: Connect to Redis
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
@@ -4533,7 +4490,6 @@ async def run_once() -> bool:
                         if success:
                             logger_run.debug("🔒 Lock extended successfully")
                         else:
-                            # Critical failure – shutdown gracefully
                             logger_run.critical(
                                 "✘ Failed to extend Redis lock - another instance may take over. "
                                 "Initiating graceful shutdown."
@@ -4548,7 +4504,6 @@ async def run_once() -> bool:
                             except Exception as e:
                                 logger_run.error(f"Failed to send alert: {e}")
                     
-                            # Set shutdown flag to exit gracefully
                             shutdown_event.set()
                             return
 
