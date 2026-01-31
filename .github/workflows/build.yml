@@ -99,38 +99,37 @@ jobs:
             -e REQUIRE_AOT=${{ env.REQUIRE_AOT }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python << 'EOF'
+          import sys
+          import os
+          import traceback 
 
-      import sys
-      import os
-      import traceback 
-
-      try:
-          from aot_bridge import is_using_aot, get_fallback_reason
-    
-          if is_using_aot():
-              print('✅ AOT Binary: LOADED & ACTIVE')
-              sys.exit(0)
-          else:
-              reason = get_fallback_reason() or 'Unknown'
-              print(f'⚠️ AOT not available: {reason}')
+          try:
+              from aot_bridge import is_using_aot, get_fallback_reason
         
-              # REQUIRE_AOT enforces compilation success in production
-              if os.getenv('REQUIRE_AOT', 'false').lower() == 'true':
-                  print('❌ REQUIRE_AOT=true: AOT compilation is mandatory')
-                  print('This build is not suitable for production')
-                  sys.exit(1)
-              else:
-                  print('⚠️ JIT fallback enabled (REQUIRE_AOT=false)')
+              if is_using_aot():
+                  print('✅ AOT Binary: LOADED & ACTIVE')
                   sys.exit(0)
+              else:
+                  reason = get_fallback_reason() or 'Unknown'
+                  print(f'⚠️ AOT not available: {reason}')
             
-      except ImportError as e:
-          print(f'❌ FAILED: Cannot import aot_bridge: {e}')
-          sys.exit(1)
-      except Exception as e:
-          print(f'❌ FAILED: {e}')
-          traceback.print_exc()
-          sys.exit(1)
-      EOF
+                  # REQUIRE_AOT enforces compilation success in production
+                  if os.getenv('REQUIRE_AOT', 'false').lower() == 'true':
+                      print('❌ REQUIRE_AOT=true: AOT compilation is mandatory')
+                      print('This build is not suitable for production')
+                      sys.exit(1)
+                  else:
+                      print('⚠️ JIT fallback enabled (REQUIRE_AOT=false)')
+                      sys.exit(0)
+                
+          except ImportError as e:
+              print(f'❌ FAILED: Cannot import aot_bridge: {e}')
+              sys.exit(1)
+          except Exception as e:
+              print(f'❌ FAILED: {e}')
+              traceback.print_exc()
+              sys.exit(1)
+          EOF
 
       - name: ✅ Verify Required Files in Image
         run: |
