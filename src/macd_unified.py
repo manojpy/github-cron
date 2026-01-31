@@ -129,8 +129,11 @@ class Constants:
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
+    MIN_CLOSED_CANDLES_15M = 4          
+    MIN_ALIGNED_5M_CANDLES = 2               
+    CANDLE_FETCH_BUFFER_PERIODS = 3 
+    API_TIMESTAMP_TOLERANCE_SEC = 300 
     
-
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
@@ -1755,8 +1758,9 @@ class DataFetcher:
         else:
             expected_open_ts = calculate_expected_candle_timestamp(reference_time, minutes)
 
-        buffer_periods = 3
-        to_time   = reference_time + (interval_seconds * buffer_periods)
+
+        buffer_periods = Constants.CANDLE_FETCH_BUFFER_PERIODS
+        to_time = reference_time + (interval_seconds * buffer_periods)
         from_time = expected_open_ts - (limit * interval_seconds)
 
         params = {
@@ -1787,12 +1791,14 @@ class DataFetcher:
                     if num_candles > 0:
                         last_open = result["t"][-1]
                         diff = abs(expected_open_ts - last_open)
-                        if diff > 300:
+
+                        if diff > Constants.API_TIMESTAMP_TOLERANCE_SEC:
                             if last_open < expected_open_ts:
                                 logger.warning(
                                     f"⚠️ API DELAY | {symbol} {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
-                                    f"Got: {format_ist_time(last_open)} (Diff: {diff}s)"
+                                    f"Got: {format_ist_time(last_open)} "
+                                    f"(Diff: {diff}s > tolerance {Constants.API_TIMESTAMP_TOLERANCE_SEC}s)"
                                 )
                             else:
                                 logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
@@ -3314,20 +3320,47 @@ def validate_alert_definitions() -> None:
 
 validate_alert_definitions()
 
-async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:   
+async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
+    """Store alert state in Redis for dedup"""
     if sdb.degraded:
-        return   
+        return
+    
     state_key = f"{pair}:{key}"
     ts = int(time.time())
-    state_val = "ACTIVE" if active else "INACTIVE"
-    await sdb.set(state_key, state_val, ts)
+    
+    state_data = {
+        "state": "ACTIVE" if active else "INACTIVE",
+        "timestamp": ts,
+        "pair": pair,
+        "alert_key": key
+    }
+    
+    await sdb.set(state_key, state_data, ts)
+    
 
 async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
+    """Check if alert was recently active (for dedup)"""
     if sdb.degraded:
-        return False 
+        return False
+    
     state_key = f"{pair}:{key}"
-    st = await sdb.get(state_key)
-    return st is not None and st.get("state") == "ACTIVE"
+    
+    try:
+        st = await sdb.get(state_key)
+        if st is None:
+            return False
+        
+        if isinstance(st, dict):
+            return st.get("state") == "ACTIVE"
+        elif isinstance(st, str):
+            return st == "ACTIVE"
+        else:
+            logger.warning(f"Unexpected state type for {state_key}: {type(st)}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error checking alert state for {state_key}: {e}")
+        return False
 
 def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
     """
@@ -3462,9 +3495,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     try:
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
 
-        if i15 is None or i15 < 4:
+        if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Insufficient 15m data: {i15} closed (need >=4)")
+                logger_pair.debug(
+                    f"Insufficient 15m data: {i15} closed "
+                    f"(need >={Constants.MIN_CLOSED_CANDLES_15M})"
+                )
             return None
 
         ts_15m_val = data_15m["timestamp"][i15]
@@ -3485,9 +3521,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         candle_close_ts = ts_curr + interval_seconds
         time_since_close = reference_time - candle_close_ts
 
-        if reference_time - ts_curr > 1200:
+        if reference_time - ts_curr > cfg.MAX_CANDLE_STALENESS_SEC:
+            staleness_seconds = reference_time - ts_curr
             if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - candle too stale ({reference_time - ts_curr}s > 600s)")
+                logger_pair.debug(
+                    f"Skipping {pair_name} - candle too stale "
+                    f"({staleness_seconds}s > {cfg.MAX_CANDLE_STALENESS_SEC}s)"
+                )
             return None
         
         if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
@@ -3505,9 +3545,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
             alignment_cache[cache_key] = i5
 
-        if i5 < 2:
+        if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
             if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Insufficient aligned 5m data: {i5} (need >=2)")
+                logger_pair.debug(
+                    f"Insufficient aligned 5m data: {i5} "
+                    f"(need >={Constants.MIN_ALIGNED_5M_CANDLES})"
+                )
             return None
 
         close_15m = data_15m["close"]
@@ -4723,8 +4766,8 @@ if __name__ == "__main__":
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
         logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
-        logger.warning("⚠������ Performance will be degraded. First run may be slow.")
-        
+        logger.warning("⚠️ Performance may be degraded. First run may be slow.")
+
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
             logger.critical("❌ REQUIRE_AOT=true but AOT unavailable - exiting")
             sys.exit(1)
