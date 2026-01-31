@@ -42,24 +42,36 @@ COPY src/aot_build.py ./
 COPY src/macd_unified.py ./
 
 # ✅ Verify files exist before compilation
+
 RUN ls -la *.py && \
     test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
-    test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
+    test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1) && \
+    test -f aot_bridge.py || (echo "❌ Missing aot_bridge.py" && exit 1) && \
+    test -f macd_unified.py || (echo "❌ Missing macd_unified.py" && exit 1)
 
 # ✅ AOT Compilation WITHOUT optimization (compiler needs full debug capability)
 ARG AOT_STRICT=0
+
 RUN echo "🔨 Starting AOT compilation (unoptimized build)..." && \
     python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
     (echo "❌ AOT build script failed" && exit 1) && \
     echo "📂 Listing build outputs..." && ls -lh /build && \
     echo "🔄 Normalizing compiled filename..." && \
-    mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
+    SO_FILE=$(ls -1 /build/macd_aot_compiled*.so 2>/dev/null | head -1) && \
+    if [ -z "$SO_FILE" ]; then \
+        echo "❌ No AOT binary found matching pattern macd_aot_compiled*.so" && exit 1; \
+    fi && \
+    SO_COUNT=$(ls -1 /build/macd_aot_compiled*.so 2>/dev/null | wc -l) && \
+    if [ "$SO_COUNT" -gt 1 ]; then \
+        echo "⚠️ Multiple .so files found ($SO_COUNT), using first: $SO_FILE"; \
+    fi && \
+    mv "$SO_FILE" /build/macd_aot_compiled.so && \
+    ls -lh /build/macd_aot_compiled.so && \
     python -c "import importlib.util; \
 spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
 mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
 print('✅ AOT binary verified')" || \
     ( [ \"$AOT_STRICT\" != \"1\" ] && echo \"⚠️ AOT failed, continuing...\" || (echo \"❌ AOT STRICT mode: Compilation failed\" && exit 1) )
-
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.11-slim-bookworm AS final
