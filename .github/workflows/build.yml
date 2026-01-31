@@ -99,9 +99,10 @@ jobs:
             -e REQUIRE_AOT=${{ env.REQUIRE_AOT }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python << 'EOF'
-import sys
-import os
-import traceback 
+
+      import sys
+      import os
+      import traceback 
 
       try:
           from aot_bridge import is_using_aot, get_fallback_reason
