@@ -32,47 +32,29 @@ jobs:
       packages: read
 
     steps:
-      # PHASE 1: SETUP & VALIDATION
-      - name: 🔥 Checkout Config Only
+      # PHASE 1: VALIDATION & SETUP
+      - name: 🔐 Verify Secrets
+        run: |
+          MISSING=()
+          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
+          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
+          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
+          [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
+          
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "❌ Missing secrets: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "✅ All required secrets configured"
+
+      - name: 🔥 Checkout Config
         uses: actions/checkout@v4
         with:
-          sparse-checkout: |
-            config_macd.json
+          sparse-checkout: config_macd.json
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      - name: ✅ Verify Config File Exists
-        run: |
-          if [ ! -f "config_macd.json" ]; then
-            echo "❌ ERROR: config_macd.json not found in repo root"
-            echo ""
-            echo "Please create config_macd.json with your settings and commit it."
-            echo "Example structure:"
-            cat << 'JSONEOF'
-          {
-            "TELEGRAM_BOT_TOKEN": "your_token_here",
-            "TELEGRAM_CHAT_ID": "your_chat_id_here",
-            "REDIS_URL": "redis://user:pass@host:port",
-            "DELTA_API_BASE": "https://api.example.com",
-            "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD"],
-            "DRY_RUN_MODE": false
-          }
-          JSONEOF
-            exit 1
-          fi
-          
-          echo "✅ Config file found"
-          FILE_SIZE=$(wc -c < config_macd.json)
-          echo "   Size: $FILE_SIZE bytes"
-          
-          if python -m json.tool config_macd.json > /dev/null 2>&1; then
-            echo "✅ Config is valid JSON"
-          else
-            echo "❌ Config is not valid JSON - please fix syntax errors"
-            exit 1
-          fi
-
-      - name: 🔐 Log in to GHCR
+      - name: 🐳 Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -87,24 +69,9 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
-      - name: 🔑 Verify Secrets
-        run: |
-          MISSING=()
-          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
-          [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ] && MISSING+=("TELEGRAM_CHAT_ID")
-          [ -z "${{ secrets.REDIS_URL }}" ] && MISSING+=("REDIS_URL")
-          [ -z "${{ secrets.DELTA_API_BASE }}" ] && MISSING+=("DELTA_API_BASE")
-          
-          if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "❌ Missing required secrets: ${MISSING[*]}"
-            echo ""
-            echo "Add these to GitHub Repository Settings > Secrets and variables > Actions:"
-            for secret in "${MISSING[@]}"; do
-              echo "  - $secret"
-            done
-            exit 1
-          fi
-          echo "✅ All required secrets configured"
+
+
+
 
       # PHASE 2: BOT EXECUTION
       - name: 🚀 Execute MACD Bot
