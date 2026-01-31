@@ -20,7 +20,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: manojpy/github-cron/macd-unified-aot
-  BOT_TIMEOUT: 330
+  BOT_TIMEOUT: 300
+  WORKFLOW_TIMEOUT: 6
 
 jobs:
   run-bot:
@@ -47,7 +48,7 @@ jobs:
             echo ""
             echo "Please create config_macd.json with your settings and commit it."
             echo "Example structure:"
-            cat << 'EOF'
+            cat << 'JSONEOF'
           {
             "TELEGRAM_BOT_TOKEN": "your_token_here",
             "TELEGRAM_CHAT_ID": "your_chat_id_here",
@@ -56,7 +57,7 @@ jobs:
             "PAIRS": ["BTCUSD", "ETHUSD", "AVAXUSD"],
             "DRY_RUN_MODE": false
           }
-          EOF
+          JSONEOF
             exit 1
           fi
           
@@ -78,19 +79,59 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Pull Latest AOT Image
+      - name: 📥 Pull Latest Image
         run: |
-          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          echo "🔦 Pulling AOT image..."
-          START_TIME=$(date +%s)
-          export DOCKER_BUILDKIT=1
-          if docker pull --quiet --platform linux/amd64 "$IMAGE_REF"; then
-            PULL_TIME=$(( $(date +%s) - START_TIME ))
-            echo "✅ Image pulled in ${PULL_TIME}s"
-          else
-            echo "❌ Failed to pull image"
-            exit 1
-          fi
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "🐳 Pulling image..."
+          START=$(date +%s)
+          docker pull --quiet --platform linux/amd64 "$IMAGE"
+          echo "✅ Image ready in $(( $(date +%s) - START ))s"
+
+      - name: ✅ Verify Required Files in Image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+          # production files must exist
+          PRODUCTION_FILES=(
+            "/app/src/macd_unified.py"
+            "/app/src/aot_bridge.py"
+            "/app/src/numba_functions_shared.py"
+            "/app/src/macd_aot_compiled.so"
+          )
+
+          # build-time files must NOT exist
+          BUILD_ONLY_FILES=(
+            "aot_build.py"
+            "aot_builder.py"
+            "requirements.txt"
+            "config_macd.json"
+          )
+
+          # one container = many commands → faster
+          docker run --rm --platform linux/amd64 "$IMAGE" \
+            /bin/sh -c "
+          # check production files
+          for f in ${PRODUCTION_FILES[*]}; do
+            if [ ! -f \"\$f\" ]; then
+              echo \"❌ MISSING: \$f\"
+              exit 1
+            fi
+            SIZE=\$(stat -c%s \"\$f\" 2>/dev/null || echo 0)
+            echo \"✅ Found: \$f (\$(numfmt --to=iec-i --suffix=B \$SIZE 2>/dev/null || echo \${SIZE}B))\"
+          done
+
+          # check build-only files are absent
+          for f in ${BUILD_ONLY_FILES[*]}; do
+            if [ -f \"/app/src/\$f\" ]; then
+              echo \"❌ ERROR: \$f must NOT be in production image\"
+              exit 1
+            fi
+            echo \"✅ Excluded: \$f\"
+          done
+
+          echo ''
+          echo '✅ All file verification checks passed!'
+          "
 
       - name: 🔑 Verify Secrets
         run: |
