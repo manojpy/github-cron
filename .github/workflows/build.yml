@@ -99,8 +99,9 @@ jobs:
             -e REQUIRE_AOT=${{ env.REQUIRE_AOT }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             python << 'EOF'
-      import sys
-      import os
+import sys
+import os
+import traceback 
 
       try:
           from aot_bridge import is_using_aot, get_fallback_reason
@@ -126,7 +127,6 @@ jobs:
           sys.exit(1)
       except Exception as e:
           print(f'❌ FAILED: {e}')
-          import traceback
           traceback.print_exc()
           sys.exit(1)
       EOF
