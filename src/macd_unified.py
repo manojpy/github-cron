@@ -99,8 +99,7 @@ def validate_timestamp_format(ts: Union[int, float], name: str = "timestamp") ->
     if ts_sec < 1577836800 or ts_sec > 4102444799:
         return False, f"{name} {ts_sec} out of valid range [1577836800, 4102444799]"
     return True, "Valid"
-
-
+    
 __version__ = "1.8.0-stable"
 
 class Constants:
@@ -378,8 +377,7 @@ def load_config() -> BotConfig:
         except Exception as exc:
             error_msg = f"❌ ERROR: Config file {config_file} is not valid JSON: {exc}"
             print(error_msg, file=sys.stderr)
-            sys.exit(1)
-        
+            sys.exit(1)        
     else:
         print(f"⚠️ WARNING: Config file {config_file} not found, using environment variables only", file=sys.stderr)
 
