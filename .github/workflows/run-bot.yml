@@ -69,10 +69,6 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
-
-
-
-
       # PHASE 2: BOT EXECUTION
       - name: 🚀 Execute MACD Bot
         id: bot_run
@@ -119,10 +115,10 @@ jobs:
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
 
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
-            echo "⚠️ Bot execution timed out after ${DURATION}s"
+            echo "⚠️ Bot execution timed out after ${DURATION}s" | tee -a logs/bot_output.log
             exit 1
           elif [ $EXIT_CODE -ne 0 ]; then
-            echo "❌ Bot exited with code $EXIT_CODE"
+            echo "❌ Bot exited with code $EXIT_CODE" | tee -a logs/bot_output.log
             exit 1
           fi
           echo "✅ Bot completed successfully in ${DURATION}s"
@@ -191,12 +187,38 @@ jobs:
             echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
           fi
 
-      # PHASE 4: ARTIFACT UPLOAD
+      # PHASE 4: ARTIFACT UPLOAD & VISIBILITY
+      - name: 📂 Ensure Logs Directory Exists
+        if: always()
+        run: |
+          mkdir -p logs
+          if [ ! -f "logs/bot_output.log" ]; then
+            echo "No logs from bot execution" > logs/bot_output.log
+          fi
+
       - name: 📦 Upload Execution Logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bot-execution-logs-${{ github.run_number }}
           path: logs/
           retention-days: 2
           compression-level: 9
+          if-no-files-found: ignore
+
+      - name: 📝 Add Log Location to Summary
+        if: failure()
+        run: |
+          echo "## 📋 Execution Logs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📦 Logs available in: **Artifacts > bot-execution-logs-${{ github.run_number }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "logs/bot_output.log" ] && [ -s "logs/bot_output.log" ]; then
+            echo "### 📄 Recent Log Output (last 50 lines)" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 logs/bot_output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No logs captured" >> $GITHUB_STEP_SUMMARY
+          fi
