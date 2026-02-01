@@ -32,7 +32,6 @@ jobs:
       packages: read
 
     steps:
-      # PHASE 1: VALIDATION & SETUP
       - name: 🔐 Verify Secrets
         run: |
           MISSING=()
@@ -46,18 +45,32 @@ jobs:
             exit 1
           fi
 
-      # OPTIMIZATION: Config created from Secret instead of Git Checkout
-      # Requires secret 'MACD_CONFIG_JSON' containing the JSON content
+      # OPTIMIZATION: Config created from Secret (Instant) or GitHub API (Fast)
+      # Replaces slow 'git clone' actions
       - name: 📄 Create Config
+        env:
+          # CRITICAL FIX: Map secret to env var to avoid "too many arguments" error
+          CONFIG_JSON: ${{ secrets.MACD_CONFIG_JSON }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -n "${{ secrets.MACD_CONFIG_JSON }}" ]; then
-            echo '${{ secrets.MACD_CONFIG_JSON }}' > config_macd.json
+          if [[ -n "$CONFIG_JSON" ]]; then
+            echo "$CONFIG_JSON" > config_macd.json
             echo "✅ Config loaded from Secret (Fast)"
           else
-            # Fallback if secret is missing (slower, but safe)
-            echo "⚠️ Secret MACD_CONFIG_JSON missing, cloning repo..."
-            git clone --depth 1 --filter=blob:none --sparse https://github.com/${{ github.repository }} .
-            git sparse-checkout set config_macd.json
+            echo "⚠️ Secret MACD_CONFIG_JSON missing."
+            echo "📥 Falling back to GitHub API download..."
+            
+            # Use GitHub API to fetch raw file - faster/safer than git clone
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
+              -o config_macd.json)
+              
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "❌ Failed to download config via API (HTTP $HTTP_STATUS)"
+              exit 1
+            fi
+            echo "✅ Config downloaded via API"
           fi
 
       - name: 🐳 Log in to GHCR
@@ -67,7 +80,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # OPTIMIZATION: ZSTD compressed images pull significantly faster
+      # OPTIMIZATION: Pulls zstd compressed image (Configured in build.yml)
       - name: 📥 Pull Latest Image
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
@@ -76,7 +89,6 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
-      # PHASE 2: BOT EXECUTION
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 7
@@ -86,10 +98,10 @@ jobs:
           mkdir -p logs
           echo "::group::🔥 Launch Macd-Unified...🔥"
           echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
+          # Removed --network host for better compatibility if not needed, add back if required
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
@@ -120,16 +132,11 @@ jobs:
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
 
-          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
-            echo "⚠️ Bot execution timed out after ${DURATION}s" | tee -a logs/bot_output.log
-            exit 1
-          elif [ $EXIT_CODE -ne 0 ]; then
-            echo "❌ Bot exited with code $EXIT_CODE" | tee -a logs/bot_output.log
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Bot exited with code $EXIT_CODE"
             exit 1
           fi
-          echo "✅ Bot completed successfully in ${DURATION}s"
 
-      # PHASE 3: RESULTS ANALYSIS
       - name: 📊 Parse Execution Results
         if: always()
         id: results
@@ -137,7 +144,6 @@ jobs:
           LOG_FILE="logs/bot_output.log"
           if [ ! -f "$LOG_FILE" ]; then
             echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
           
@@ -159,14 +165,12 @@ jobs:
           echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
           echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
           echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
-          echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
       - name: 📋 Generate Summary Report
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
-          
           | Metric | Value |
           |--------|-------|
           | **Status** | ${{ steps.results.outputs.status }} |
@@ -175,24 +179,7 @@ jobs:
           | **Pairs** | ${{ steps.results.outputs.pairs }} |
           | **Memory** | ${{ steps.results.outputs.memory }} |
           | **Redis** | ${{ steps.results.outputs.redis_status }} |
-          
           EOF
-          
-          if [ "${{ steps.results.outputs.status }}" != "success" ]; then
-            echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # PHASE 4: ARTIFACT UPLOAD & VISIBILITY
-      - name: 📂 Ensure Logs Directory Exists
-        if: always()
-        run: |
-          mkdir -p logs
-          if [ ! -f "logs/bot_output.log" ]; then
-            echo "No logs from bot execution" > logs/bot_output.log
-          fi
 
       - name: 📦 Upload Execution Logs
         if: always()
