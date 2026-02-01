@@ -76,7 +76,8 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          push: true
+          # OPTIMIZATION: Use zstd compression for faster pulls in run-bot.yml
+          outputs: type=image,compression=zstd,force-compression=true,push=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -113,10 +114,8 @@ jobs:
                   reason = get_fallback_reason() or 'Unknown'
                   print(f'⚠️ AOT not available: {reason}')
             
-                  # REQUIRE_AOT enforces compilation success in production
                   if os.getenv('REQUIRE_AOT', 'false').lower() == 'true':
                       print('❌ REQUIRE_AOT=true: AOT compilation is mandatory')
-                      print('This build is not suitable for production')
                       sys.exit(1)
                   else:
                       print('⚠️ JIT fallback enabled (REQUIRE_AOT=false)')
@@ -152,7 +151,6 @@ jobs:
             fi
           done
           
-          # Verify aot_build.py is NOT in image
           if docker run --rm --platform linux/amd64 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             test -f "/app/src/aot_build.py"; then
@@ -186,7 +184,6 @@ jobs:
         if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
         run: |
           echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f trivy-results.sarif ]; then
             CRITICAL=$(jq '[.runs[].results[] | select(.level=="error")] | length' trivy-results.sarif || echo "0")
             HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' trivy-results.sarif || echo "0")
@@ -194,14 +191,13 @@ jobs:
             echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
             echo "| 🔴 Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
             echo "| 🟠 High | $HIGH |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
             if [ "$CRITICAL" -gt 0 ]; then
               echo "⚠️ **Action Required:** Critical vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
             else
               echo "✅ No critical vulnerabilities found" >> $GITHUB_STEP_SUMMARY
             fi
           else
-            echo "ℹ️ Trivy scan skipped or results unavailable" >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ Trivy scan skipped" >> $GITHUB_STEP_SUMMARY
           fi
 
       # PHASE 4: BUILD SUMMARY
@@ -209,19 +205,12 @@ jobs:
         if: always()
         run: |
           echo "## 🔨 Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
           echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Compression** | ZSTD (Optimized for speed) |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Platform** | linux/amd64 |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Cache Strategy** | GitHub Actions (type=gha) + Registry fallback |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🏷️ Image Tags" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
 
       # PHASE 5: CLEANUP
       - name: 🧹 Cleanup Artifacts
@@ -229,4 +218,3 @@ jobs:
         run: |
           rm -f trivy-results.sarif
           docker image prune -f --filter "until=24h" || true
-          echo "✅ Cleanup complete (cache preserved)"
