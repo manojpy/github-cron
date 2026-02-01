@@ -32,8 +32,7 @@ jobs:
       packages: read
 
     steps:
-      # PHASE 1: VALIDATION & SETUP
-      - name: 🔑 Verify Secrets
+      - name: 🔐 Verify Secrets
         run: |
           MISSING=()
           [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && MISSING+=("TELEGRAM_BOT_TOKEN")
@@ -45,11 +44,10 @@ jobs:
             echo "❌ Missing secrets: ${MISSING[*]}"
             exit 1
           fi
-          echo "✅ All required secrets configured"
 
       # OPTIMIZATION: Config created from Secret (Instant) or GitHub API (Fast)
       # Replaces slow 'git clone' actions
-      - name: 🔨 Create Config
+      - name: 📄 Create Config
         env:
           # CRITICAL FIX: Map secret to env var to avoid "too many arguments" error
           CONFIG_JSON: ${{ secrets.MACD_CONFIG_JSON }}
@@ -60,7 +58,7 @@ jobs:
             echo "✅ Config loaded from Secret (Fast)"
           else
             echo "⚠️ Secret MACD_CONFIG_JSON missing."
-            echo "🔥 Falling back to GitHub API download..."
+            echo "📥 Falling back to GitHub API download..."
             
             # Use GitHub API to fetch raw file - faster/safer than git clone
             HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
@@ -82,7 +80,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🔥 Pull Latest Image
+      # OPTIMIZATION: Pulls zstd compressed image (Configured in build.yml)
+      - name: 📥 Pull Latest Image
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo "🐳 Pulling image..."
@@ -90,7 +89,6 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
-      # PHASE 2: BOT EXECUTION
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 7
@@ -100,11 +98,10 @@ jobs:
           mkdir -p logs
           echo "::group::🔥 Launch Macd-Unified...🔥"
           echo "🕐 Trigger Time: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST')"
-          echo "🏷️ Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          echo "🧪 Dry Run: $DRY_RUN"
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
+          # Removed --network host for better compatibility if not needed, add back if required
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
@@ -135,16 +132,11 @@ jobs:
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
 
-          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
-            echo "⚠️ Bot execution timed out after ${DURATION}s" | tee -a logs/bot_output.log
-            exit 1
-          elif [ $EXIT_CODE -ne 0 ]; then
-            echo "❌ Bot exited with code $EXIT_CODE" | tee -a logs/bot_output.log
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Bot exited with code $EXIT_CODE"
             exit 1
           fi
-          echo "✅ Bot completed successfully in ${DURATION}s"
 
-      # PHASE 3: RESULTS ANALYSIS
       - name: 📊 Parse Execution Results
         if: always()
         id: results
@@ -152,7 +144,6 @@ jobs:
           LOG_FILE="logs/bot_output.log"
           if [ ! -f "$LOG_FILE" ]; then
             echo "status=error" >> $GITHUB_OUTPUT
-            echo "message=Log file not found" >> $GITHUB_OUTPUT
             exit 0
           fi
           
@@ -174,14 +165,12 @@ jobs:
           echo "pairs=${PAIRS:-N/A}" >> $GITHUB_OUTPUT
           echo "memory=${MEMORY:-N/A}" >> $GITHUB_OUTPUT
           echo "redis_status=${REDIS_STATUS:-UNKNOWN}" >> $GITHUB_OUTPUT
-          echo "error_msg=${ERROR_MSG:-None}" >> $GITHUB_OUTPUT
 
       - name: 📋 Generate Summary Report
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🤖 MACD Bot Execution Report
-          
           | Metric | Value |
           |--------|-------|
           | **Status** | ${{ steps.results.outputs.status }} |
@@ -190,32 +179,7 @@ jobs:
           | **Pairs** | ${{ steps.results.outputs.pairs }} |
           | **Memory** | ${{ steps.results.outputs.memory }} |
           | **Redis** | ${{ steps.results.outputs.redis_status }} |
-          
           EOF
-          
-          if [ "${{ steps.results.outputs.status }}" != "Success" ]; then
-            echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "${{ steps.results.outputs.error_msg }}" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ✅ Run Completed Successfully" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "- ⏱️ Duration: ${{ steps.results.outputs.duration }}s" >> $GITHUB_STEP_SUMMARY
-            echo "- 📊 Alerts Sent: ${{ steps.results.outputs.alerts }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 📈 Pairs Scanned: ${{ steps.results.outputs.pairs }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 💾 Memory Used: ${{ steps.results.outputs.memory }}" >> $GITHUB_STEP_SUMMARY
-            echo "- 🗄️ Redis Status: ${{ steps.results.outputs.redis_status }}" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      # PHASE 4: ARTIFACT UPLOAD & VISIBILITY
-      - name: 📂 Ensure Logs Directory Exists
-        if: always()
-        run: |
-          mkdir -p logs
-          if [ ! -f "logs/bot_output.log" ]; then
-            echo "No logs from bot execution" > logs/bot_output.log
-          fi
 
       - name: 📦 Upload Execution Logs
         if: always()
@@ -226,20 +190,3 @@ jobs:
           retention-days: 2
           compression-level: 9
           if-no-files-found: ignore
-
-      - name: 📍 Add Log Location to Summary
-        if: failure()
-        run: |
-          echo "## 📋 Execution Logs" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📦 Logs available in: **Artifacts > bot-execution-logs-${{ github.run_number }}**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ -f "logs/bot_output.log" ] && [ -s "logs/bot_output.log" ]; then
-            echo "### 📄 Recent Log Output (last 50 lines)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 50 logs/bot_output.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ No logs captured" >> $GITHUB_STEP_SUMMARY
-          fi
