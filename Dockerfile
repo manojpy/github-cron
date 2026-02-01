@@ -24,9 +24,11 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# ✅ Install dependencies & compile with Level 2 optimization
+# ✅ OPTIMIZATION: Use BuildKit cache for UV downloads
+ENV UV_CACHE_DIR='/tmp/uv_cache'
 COPY requirements.txt .
-RUN uv pip install --system --no-cache -r requirements.txt && \
+RUN --mount=type=cache,target=/tmp/uv_cache \
+    uv pip install --system --no-cache -r requirements.txt && \
     python -m compileall -q -o 2 /usr/local/lib/python3.11/site-packages
 
 
@@ -42,7 +44,6 @@ COPY src/aot_build.py ./
 COPY src/macd_unified.py ./
 
 # ✅ Verify files exist before compilation
-
 RUN ls -la *.py && \
     test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
     test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1) && \
