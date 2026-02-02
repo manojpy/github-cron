@@ -179,19 +179,8 @@ jobs:
       - name: 📋 Generate Summary Report
         if: always()
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🤖 MACD Bot Execution Report
-          
-          | Metric | Value |
-          |--------|-------|
-          | **Status** | ${{ steps.results.outputs.status }} |
-          | **Duration** | ${{ steps.results.outputs.duration }}s |
-          | **Alerts** | ${{ steps.results.outputs.alerts }} |
-          | **Pairs** | ${{ steps.results.outputs.pairs }} |
-          | **Memory** | ${{ steps.results.outputs.memory }} |
-          | **Redis** | ${{ steps.results.outputs.redis_status }} |
-          
-          EOF
+          echo "## 🤖 MACD Bot Execution Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ steps.results.outputs.status }}" != "Success" ]; then
             echo "### ❌ Error Details" >> $GITHUB_STEP_SUMMARY
