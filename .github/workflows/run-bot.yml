@@ -47,7 +47,7 @@ jobs:
           fi
           echo "✅ All required secrets configured"
 
-      # OPTIMIZATION: Config created from Secret (Instant) or GitHub API (Fast)
+      # OPTIMIZATION: Config created from Secret (Instant) or Root Folder or GitHub API (Fast)
       # Replaces slow 'git clone' actions
       - name: 🔨 Create Config
         env:
@@ -60,19 +60,29 @@ jobs:
             echo "✅ Config loaded from Secret (Fast)"
           else
             echo "⚠️ Secret MACD_CONFIG_JSON missing."
-            echo "🔥 Falling back to GitHub API download..."
+            echo "🔍 Checking for config_macd.json in root folder..."
             
-            # Use GitHub API to fetch raw file - faster/safer than git clone
-            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3.raw" \
-              -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
-              -o config_macd.json)
+            if [ -f "config_macd.json" ]; then
+              echo "✅ Config found in root folder"
+            else
+              echo "⚠️ Config not found in root folder."
+              echo "🔥 Falling back to GitHub API download..."
               
-            if [ "$HTTP_STATUS" != "200" ]; then
-              echo "❌ Failed to download config via API (HTTP $HTTP_STATUS)"
-              exit 1
+              # Use GitHub API to fetch raw file - faster/safer than git clone
+              HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3.raw" \
+                -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
+                -o config_macd.json)
+                
+              if [ "$HTTP_STATUS" != "200" ]; then
+                echo "❌ Failed to load config from all sources:"
+                echo "   1. Secret MACD_CONFIG_JSON: Not available"
+                echo "   2. Root folder config_macd.json: Not found"
+                echo "   3. GitHub API download: Failed (HTTP $HTTP_STATUS)"
+                exit 1
+              fi
+              echo "✅ Config downloaded via API"
             fi
-            echo "✅ Config downloaded via API"
           fi
 
       - name: 🐳 Log in to GHCR
