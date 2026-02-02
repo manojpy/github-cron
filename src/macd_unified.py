@@ -893,38 +893,43 @@ def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, respon
         return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
 
 def warmup_if_needed() -> None:
+    """Hybrid warmup with comprehensive coverage & better logging"""
+   
+    is_prod = os.path.isfile("/.dockerenv")
     
-    if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP:
-        logger.info("🚨 Skipping JIT warmup (AOT active or explicitly disabled)")
+    if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP or is_prod:
+        reason = ("AOT active" if aot_bridge.is_using_aot() else 
+                 "Explicitly disabled" if cfg.SKIP_WARMUP else "Production mode")
+        logger.info(f"🚨 Skipping JIT warmup ({reason})")
+        if aot_bridge.is_using_aot():
+            logger.debug("Native library status: Operational (Zero-warmup mode)")
         return
 
-    logger.info("🔥 Warming up JIT (core indicators only)...")
+    logger.info("🔥 AOT not found. Warming up JIT (core indicators)...")
     warmup_start = time.time()
     
     try:
-        test_data = np.random.random(200).astype(np.float64) * 1000.0
-        test_data_ts = np.arange(200).astype(np.int64) * 900
+        test_data = np.random.random(150).astype(np.float64) * 1000.0
         
         _ = aot_bridge.ema_loop(test_data, 7.0)
-        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)      
-        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)     
-        _ = aot_bridge.calculate_rsi_core(test_data, 21)      
+        _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
+        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
+        _ = aot_bridge.calculate_rsi_core(test_data, 21)
         _ = aot_bridge.rolling_std(test_data, 14, 0.5)
-        _ = aot_bridge.rolling_mean_numba(test_data, 14)      
-        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)     
+        _ = aot_bridge.rolling_mean_numba(test_data, 14)
+        _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
         _ = aot_bridge.smooth_range(test_data, 22, 2)
         _ = aot_bridge.rng_filter_loop(test_data, test_data * 0.5)
-        _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)     
+        _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         
         warmup_elapsed = time.time() - warmup_start
-        logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s) | "
-                   f"Core functions: EMA, PPO, RSI, RMA, Kalman, Filters")
+        logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
 
     except Exception as e:
         warmup_elapsed = time.time() - warmup_start
-        logger.warning(f"🚫 Warmup partially failed (non-fatal, {warmup_elapsed:.2f}s elapsed): {e}")
-       
+        logger.warning(f"🚫 Warmup failed (non-fatal, {warmup_elapsed:.2f}s): {e}")
+
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
