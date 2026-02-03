@@ -2079,7 +2079,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     valid_mask = np.abs(ts_normalized - expected_closed_ts) <= tolerance
     
     valid_indices = np.nonzero(valid_mask)[0]
-    
+
     if valid_indices.size == 0:
         logger.warning(
             f"No closed {interval_minutes}m candle found | "
@@ -2091,13 +2091,21 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     last_closed_idx = int(valid_indices[-1])
     actual_ts = ts_normalized[last_closed_idx]
     
-    logger.info(
-        f"Selected candle | Index: {last_closed_idx} | "
-        f"Expected: {format_ist_time(expected_closed_ts)} | "
-        f"Actual: {format_ist_time(actual_ts)}"
-    )
+    if abs(actual_ts - expected_closed_ts) > 0:
+        logger.warning(
+            f"Candle timestamp mismatch | Index: {last_closed_idx} | "
+            f"Expected: {format_ist_time(expected_closed_ts)} | "
+            f"Actual: {format_ist_time(actual_ts)} | "
+            f"Diff: {abs(actual_ts - expected_closed_ts)}s"
+        )
+    else:
+        logger.debug(
+            f"Selected candle | Index: {last_closed_idx} | "
+            f"Time: {format_ist_time(actual_ts)}"
+        )
     
     return last_closed_idx
+
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
