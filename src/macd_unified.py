@@ -2020,10 +2020,22 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
                 f"Failed: {', '.join(failed_checks)}"
             )
         
+        candle_range = h - l
+        if candle_range > 1e-9:
+            upper_wick_ratio = (h - c) / candle_range
+            lower_wick_ratio = (c - l) / candle_range
+            
+            if upper_wick_ratio > 0.75 or lower_wick_ratio > 0.75:
+                return False, (
+                    f"Extreme wick detected - likely forming candle: "
+                    f"upper_wick={upper_wick_ratio*100:.1f}%, "
+                    f"lower_wick={lower_wick_ratio*100:.1f}% | "
+                    f"OHLC: O={o:.5f} H={h:.5f} L={l:.5f} C={c:.5f}"
+                )
+        
         if selected_index > 0:
             prev_close = close[selected_index - 1]
             
-            # Only check if previous close is valid (not NaN)
             if not np.isnan(prev_close) and prev_close > 0:
                 price_change_pct = abs(c - prev_close) / prev_close * 100
                 
@@ -2039,7 +2051,8 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
                 f"validate_candle_data_at_index: PASSED | "
                 f"Index: {selected_index} | "
                 f"Time: {format_ist_time(selected_candle_time)} | "
-                f"OHLC: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
+                f"OHLC: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
+                f"Wicks: upper={upper_wick_ratio*100:.1f}%, lower={lower_wick_ratio*100:.1f}%"
             )
         
         return True, None
@@ -4132,8 +4145,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         if data_5m is None:
             logger_main.warning(f"Skipping {p_name}: 5m parse failed")
             return None
-        
-        reference_time = get_trigger_timestamp()
         
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         if i15 is None or i15 < 4:
