@@ -2023,7 +2023,6 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
         if selected_index > 0:
             prev_close = close[selected_index - 1]
             
-            # Only check if previous close is valid (not NaN)
             if not np.isnan(prev_close) and prev_close > 0:
                 price_change_pct = abs(c - prev_close) / prev_close * 100
                 
