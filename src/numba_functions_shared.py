@@ -633,32 +633,28 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio, 
-                               atr_short, atr_long, rvol_threshold):
-    
+                               atr_short, atr_long, rvol_threshold):    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
     for i in range(n):
-        # GATE 1: Volatility expansion with threshold (Pine: atr1 > atr3 * rvolThreshold)
         if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
             continue
         
         if atr_short[i] <= (atr_long[i] * rvol_threshold):
-            continue  # Volatility not expanding enough, skip this candle
+            continue
         
-        # GATE 2: Candle range
         candle_range = high_p[i] - low_p[i]
         if candle_range <= 1e-9:
-            continue  # Range too small
+            continue
         
-        # GATE 3: Must be green candle for buy
         if close_p[i] <= open_p[i]:
             continue
         
-        # GATE 4: Upper wick ratio (rejection wicks)
         upper_wick = high_p[i] - close_p[i]
+        
         if upper_wick < 0:
-            continue  # Corrupted data
+            continue
         
         wick_ratio = upper_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio
@@ -669,31 +665,27 @@ def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio,
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio, 
                                 atr_short, atr_long, rvol_threshold):
-    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
     for i in range(n):
-        # GATE 1: Volatility expansion with threshold (Pine: atr1 > atr3 * rvolThreshold)
         if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
             continue
         
         if atr_short[i] <= (atr_long[i] * rvol_threshold):
-            continue  # Volatility not expanding enough, skip this candle
-        
-        # GATE 2: Candle range
+            continue
+      
         candle_range = high_p[i] - low_p[i]
         if candle_range <= 1e-9:
-            continue  # Range too small
+            continue
         
-        # GATE 3: Must be red candle for sell
         if close_p[i] >= open_p[i]:
             continue
         
-        # GATE 4: Lower wick ratio (rejection wicks)
         lower_wick = close_p[i] - low_p[i]
+        
         if lower_wick < 0:
-            continue  # Corrupted data
+            continue
         
         wick_ratio = lower_wick / candle_range
         result[i] = wick_ratio < min_wick_ratio

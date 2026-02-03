@@ -562,6 +562,7 @@ def validate_runtime_config() -> None:
 def calculate_wick_ratio(open_val: float, high_val: float, low_val: float, 
                         close_val: float, is_buy: bool) -> float:
     candle_range = high_val - low_val   
+    
     if candle_range < 1e-9:
         return 0.0
     
@@ -571,17 +572,18 @@ def calculate_wick_ratio(open_val: float, high_val: float, low_val: float,
             
             if upper_wick < 0:
                 logger.warning(
-                    f"Negative upper wick: H={high_val:.5f}, C={close_val:.5f}"
+                    f"Negative upper wick (buy): H={high_val:.5f}, C={close_val:.5f}"
                 )
                 return 0.0
             
-            wick_ratio = upper_wick / candle_range         
+            wick_ratio = upper_wick / candle_range
+        
         else:
             lower_wick = close_val - low_val
             
             if lower_wick < 0:
                 logger.warning(
-                    f"Negative lower wick: C={close_val:.5f}, L={low_val:.5f}"
+                    f"Negative lower wick (sell): C={close_val:.5f}, L={low_val:.5f}"
                 )
                 return 0.0
             
@@ -1175,105 +1177,6 @@ def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray,
         return False, f"atr_long length mismatch: {len(atr_long)} != {expected_len}"
     
     return True, None
-
-def precompute_candle_quality(data_15m: Dict[str, np.ndarray], atr_short: np.ndarray, 
-                              atr_long: np.ndarray, rvol_threshold: float = 1.0,
-                              enable_rvol_alert: bool = True) -> Tuple[np.ndarray, np.ndarray]:  
-    try:
-
-        close_data = data_15m.get("close", [])
-        n_ohlc = len(close_data) if close_data is not None else 0
-        
-        if n_ohlc == 0:
-            logger.error("precompute_candle_quality: OHLC data is empty")
-            return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
-        
-        valid, msg = _validate_ohlc_arrays(data_15m, n_ohlc)
-        if not valid:
-            logger.error(f"precompute_candle_quality: {msg}")
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        valid, msg = _validate_atr_arrays(atr_short, atr_long, n_ohlc)
-        if not valid:
-            logger.error(f"precompute_candle_quality: {msg}")
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if not isinstance(rvol_threshold, (int, float)) or rvol_threshold < 0:
-            logger.error(
-                f"precompute_candle_quality: Invalid rvol_threshold={rvol_threshold} "
-                f"(must be >= 0; 0.0 disables volatility check)"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if rvol_threshold > 10.0:
-            logger.warning(
-                f"precompute_candle_quality: rvol_threshold={rvol_threshold} seems very high "
-                f"(typical range 0.5-2.0)"
-            )
-        effective_rvol_threshold = rvol_threshold if enable_rvol_alert else 0.0
-        
-        if cfg.DEBUG_MODE:
-            rvol_status = "ENABLED" if enable_rvol_alert else "DISABLED"
-            threshold_info = f"threshold={rvol_threshold}" if enable_rvol_alert else "N/A"
-            logger.debug(
-                f"precompute_candle_quality: RVOL Alert {rvol_status} | {threshold_info} | "
-                f"Data: {n_ohlc} candles | ATR short: {cfg.ATR_SHORT} | ATR long: {cfg.ATR_LONG}"
-            )
-        
-        open_arr = data_15m["open"]
-        high_arr = data_15m["high"]
-        low_arr = data_15m["low"]
-        close_arr = data_15m["close"]
-        
-        buy_quality = vectorized_wick_check_buy(
-            open_arr, high_arr, low_arr, close_arr,
-            Constants.MIN_WICK_RATIO, atr_short, atr_long, effective_rvol_threshold
-        )
-        
-        sell_quality = vectorized_wick_check_sell(
-            open_arr, high_arr, low_arr, close_arr,
-            Constants.MIN_WICK_RATIO, atr_short, atr_long, effective_rvol_threshold
-        )
-        
-        if len(buy_quality) != n_ohlc or len(sell_quality) != n_ohlc:
-            logger.error(
-                f"precompute_candle_quality: Output array size mismatch "
-                f"(buy_quality={len(buy_quality)}, sell_quality={len(sell_quality)}, "
-                f"expected={n_ohlc})"
-            )
-            return np.zeros(n_ohlc, dtype=bool), np.zeros(n_ohlc, dtype=bool)
-        
-        if cfg.DEBUG_MODE:
-            buy_count = np.sum(buy_quality)
-            sell_count = np.sum(sell_quality)
-            buy_pct = (buy_count / n_ohlc * 100) if n_ohlc > 0 else 0
-            sell_pct = (sell_count / n_ohlc * 100) if n_ohlc > 0 else 0
-            
-            logger.debug(
-                f"precompute_candle_quality complete | "
-                f"Buy signals: {buy_count}/{n_ohlc} ({buy_pct:.1f}%) | "
-                f"Sell signals: {sell_count}/{n_ohlc} ({sell_pct:.1f}%)"
-            )
-        
-        return buy_quality, sell_quality
-    
-    except Exception as e:
-        logger.error(
-            f"precompute_candle_quality: Unexpected error: {e}",
-            exc_info=True
-        )
-        
-        try:
-            n = len(data_15m.get("close", []))
-        except Exception:
-            n = 0
-        
-        if n == 0:
-            logger.error("precompute_candle_quality: Cannot determine array size - returning empty")
-            return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
-        
-        logger.warning(f"precompute_candle_quality: Returning zero arrays of size {n} due to error")
-        return np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
@@ -3424,7 +3327,7 @@ def check_candle_quality_with_reason(open_val, high_val, low_val, close_val,
                 return False, f"Not red (C={close_val:.5f} ≥ O={open_val:.5f})"
 
             if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
+                return False, f"Lower wick {wick_ratio*100:.1f}% ��� {Constants.MIN_WICK_RATIO*100:.1f}%"
             
             return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
 
@@ -3667,13 +3570,42 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
 
-        buy_quality_arr, sell_quality_arr = precompute_candle_quality(
-            data_15m, indicators["atr_short"], indicators["atr_long"], cfg.RVOL_THRESHOLD,
-            cfg.ENABLE_RVOL_ALERT)
-
-        buy_candle_passed = bool(buy_quality_arr[i15])
-        sell_candle_passed = bool(sell_quality_arr[i15])
-
+        is_green = close_curr > open_curr
+        is_red = close_curr < open_curr
+        
+        atr_short_val = (indicators["atr_short"][i15] 
+                         if i15 < len(indicators["atr_short"]) 
+                         else np.nan)
+        atr_long_val = (indicators["atr_long"][i15] 
+                        if i15 < len(indicators["atr_long"]) 
+                        else np.nan)
+        
+        rvol_threshold_effective = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
+        rvol_gate_passed = (
+            not np.isnan(atr_short_val) and 
+            not np.isnan(atr_long_val) and 
+            atr_short_val > (atr_long_val * rvol_threshold_effective)
+        )
+        
+        buy_candle_passed = False
+        sell_candle_passed = False
+        
+        if rvol_gate_passed and is_green:
+            candle_range = high_curr - low_curr
+            if candle_range > 1e-9:
+                upper_wick = high_curr - close_curr
+                if upper_wick >= 0:
+                    wick_ratio_buy = upper_wick / candle_range
+                    buy_candle_passed = wick_ratio_buy < Constants.MIN_WICK_RATIO
+        
+        if rvol_gate_passed and is_red:
+            candle_range = high_curr - low_curr
+            if candle_range > 1e-9:
+                lower_wick = close_curr - low_curr
+                if lower_wick >= 0:
+                    wick_ratio_sell = lower_wick / candle_range
+                    sell_candle_passed = wick_ratio_sell < Constants.MIN_WICK_RATIO
+        
         buy_candle_reason = None
         sell_candle_reason = None
 
