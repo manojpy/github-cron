@@ -3380,6 +3380,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"(need >={Constants.MIN_CLOSED_CANDLES_15M})"
                 )
             return None
+        
+        is_valid, error_msg = validate_candle_data_at_index(
+            data_15m, i15, reference_time, interval_minutes=15
+        )
+        if not is_valid:
+            logger_pair.warning(f"Skipping {pair_name}: {error_msg}")
+            return None
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
@@ -3586,12 +3593,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         is_green = close_curr > open_curr
         is_red = close_curr < open_curr
         
-        atr_short_val = (indicators["atr_short"][i15] 
-                         if i15 < len(indicators["atr_short"]) 
-                         else np.nan)
-        atr_long_val = (indicators["atr_long"][i15] 
-                        if i15 < len(indicators["atr_long"]) 
-                        else np.nan)
+        atr_short_val = indicators["atr_short"][i15] if i15 < len(indicators["atr_short"]) else np.nan
+        atr_long_val = indicators["atr_long"][i15] if i15 < len(indicators["atr_long"]) else np.nan
         
         rvol_threshold_effective = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
         rvol_gate_passed = (
@@ -3599,41 +3602,42 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(atr_long_val) and 
             atr_short_val > (atr_long_val * rvol_threshold_effective)
         )
-        
+
         buy_candle_passed = False
         sell_candle_passed = False
-        
-        if rvol_gate_passed and is_green:
-            candle_range = high_curr - low_curr
-            if candle_range > 1e-9:
+        buy_candle_reason = "Setup criteria not met"
+        sell_candle_reason = "Setup criteria not met"
+
+        if is_green:
+            if not rvol_gate_passed:
+                buy_candle_reason = f"Low RVOL: {atr_short_val:.6f} <= {atr_long_val*rvol_threshold_effective:.6f}"
+            else:
+                candle_range = high_curr - low_curr
                 upper_wick = high_curr - close_curr
-                if upper_wick >= 0:
-                    wick_ratio_buy = upper_wick / candle_range
-                    buy_candle_passed = wick_ratio_buy < Constants.MIN_WICK_RATIO
-        
-        if rvol_gate_passed and is_red:
-            candle_range = high_curr - low_curr
-            if candle_range > 1e-9:
+                wick_ratio = upper_wick / candle_range if candle_range > 1e-9 else 1.0
+                
+                if wick_ratio < Constants.MIN_WICK_RATIO:
+                    buy_candle_passed = True
+                    buy_candle_reason = "Quality Passed"
+                else:
+                    buy_candle_reason = f"Upper wick too long: {wick_ratio*100:.1f}%"
+
+        if is_red:
+            if not rvol_gate_passed:
+                sell_candle_reason = f"Low RVOL: {atr_short_val:.6f} <= {atr_long_val*rvol_threshold_effective:.6f}"
+            else:
+                candle_range = high_curr - low_curr
                 lower_wick = close_curr - low_curr
-                if lower_wick >= 0:
-                    wick_ratio_sell = lower_wick / candle_range
-                    sell_candle_passed = wick_ratio_sell < Constants.MIN_WICK_RATIO
-        
-        buy_candle_reason = None
-        sell_candle_reason = None
+                wick_ratio = lower_wick / candle_range if candle_range > 1e-9 else 1.0
+                
+                if wick_ratio < Constants.MIN_WICK_RATIO:
+                    sell_candle_passed = True
+                    sell_candle_reason = "Quality Passed"
+                else:
+                    sell_candle_reason = f"Lower wick too long: {wick_ratio*100:.1f}%"
 
-        if base_buy_trend and not buy_candle_passed:
-            _, buy_candle_reason = check_candle_quality_with_reason(
-                open_curr, high_curr, low_curr, close_curr, is_buy=True
-            )
-
-        if base_sell_trend and not sell_candle_passed:
-            _, sell_candle_reason = check_candle_quality_with_reason(
-                open_curr, high_curr, low_curr, close_curr, is_buy=False
-            )
-
-        buy_common = base_buy_trend and buy_candle_passed
-        sell_common = base_sell_trend and sell_candle_passed
+        buy_common = base_buy_trend and buy_candle_passed and is_green
+        sell_common = base_sell_trend and sell_candle_passed and is_red
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
