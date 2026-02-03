@@ -2020,22 +2020,10 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
                 f"Failed: {', '.join(failed_checks)}"
             )
         
-        candle_range = h - l
-        if candle_range > 1e-9:
-            upper_wick_ratio = (h - c) / candle_range
-            lower_wick_ratio = (c - l) / candle_range
-            
-            if upper_wick_ratio > 0.75 or lower_wick_ratio > 0.75:
-                return False, (
-                    f"Extreme wick detected - likely forming candle: "
-                    f"upper_wick={upper_wick_ratio*100:.1f}%, "
-                    f"lower_wick={lower_wick_ratio*100:.1f}% | "
-                    f"OHLC: O={o:.5f} H={h:.5f} L={l:.5f} C={c:.5f}"
-                )
-        
         if selected_index > 0:
             prev_close = close[selected_index - 1]
             
+            # Only check if previous close is valid (not NaN)
             if not np.isnan(prev_close) and prev_close > 0:
                 price_change_pct = abs(c - prev_close) / prev_close * 100
                 
@@ -2051,8 +2039,7 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
                 f"validate_candle_data_at_index: PASSED | "
                 f"Index: {selected_index} | "
                 f"Time: {format_ist_time(selected_candle_time)} | "
-                f"OHLC: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
-                f"Wicks: upper={upper_wick_ratio*100:.1f}%, lower={lower_wick_ratio*100:.1f}%"
+                f"OHLC: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
             )
         
         return True, None
@@ -2072,39 +2059,45 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
         return False, f"Validation error: {str(e)}"
 
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
+    """
+    Get the index of the LAST FULLY CLOSED candle by exact timestamp matching.
+    """
     if timestamps is None or timestamps.size < 2:
-        logger.warning("No timestamps or insufficient data")
         return None
 
     if reference_time is None:
         reference_time = get_trigger_timestamp()
 
     reference_time = normalize_timestamp(reference_time)
-
     interval_seconds = interval_minutes * 60
+    
     current_period_start = (reference_time // interval_seconds) * interval_seconds
-    last_closed_period_start = current_period_start - interval_seconds
-    timestamps = np.array([normalize_timestamp(t) for t in timestamps])
-    valid_mask = (timestamps >= last_closed_period_start) & (timestamps < current_period_start)
-
+    expected_closed_ts = current_period_start - interval_seconds
+    
+    ts_normalized = np.array([normalize_timestamp(t) for t in timestamps])
+    
+    tolerance = 60
+    valid_mask = np.abs(ts_normalized - expected_closed_ts) <= tolerance
+    
     valid_indices = np.nonzero(valid_mask)[0]
+    
     if valid_indices.size == 0:
-        logger.info(
-            f"No fully closed {interval_minutes}m candle available yet | "
-            f"Latest ts: {format_ist_time(timestamps[-1])} | "
-            f"Current period start: {format_ist_time(current_period_start)}"
+        logger.warning(
+            f"No closed {interval_minutes}m candle found | "
+            f"Expected: {format_ist_time(expected_closed_ts)} | "
+            f"Last 3 available: {[format_ist_time(t) for t in ts_normalized[-3:]]}"
         )
         return None
-
+    
     last_closed_idx = int(valid_indices[-1])
-    debug_if(
-        cfg.DEBUG_MODE,
-        logger,
-        lambda: (
-            f"Selected fully closed candle | Index: {last_closed_idx} | "
-            f"TS: {format_ist_time(timestamps[last_closed_idx])}"
-        ),
+    actual_ts = ts_normalized[last_closed_idx]
+    
+    logger.info(
+        f"Selected candle | Index: {last_closed_idx} | "
+        f"Expected: {format_ist_time(expected_closed_ts)} | "
+        f"Actual: {format_ist_time(actual_ts)}"
     )
+    
     return last_closed_idx
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
