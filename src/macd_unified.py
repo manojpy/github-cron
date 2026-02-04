@@ -3399,7 +3399,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         normalized_ts = normalize_timestamp(ts_15m_val)
         candle_age = reference_time - normalized_ts
-        logger_pair.warning(
+        logger_pair.debug(
             f"[DIAGNOSTIC] 15m Candle Selection | "
             f"i15={i15} | "
             f"API Timestamp: {ts_15m_val} ({format_ist_time(normalized_ts)}) | "
@@ -3672,14 +3672,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 sell_candle_reason = "Unknown reason"
 
         if not buy_candle_passed and is_green:
-            logger_pair.debug(
+            logger_pair.warning(
                 f"[BUY CANDLE REJECTED] {pair_name}: {buy_candle_reason} | "
                 f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
                 f"Wick%={buy_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
             )
 
         if not sell_candle_passed and is_red:
-            logger_pair.debug(
+            logger_pair.warning(
                 f"[SELL CANDLE REJECTED] {pair_name}: {sell_candle_reason} | "
                 f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
                 f"Wick%={sell_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
