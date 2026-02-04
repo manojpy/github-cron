@@ -2058,9 +2058,6 @@ def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selecte
         return False, f"Validation error: {str(e)}"
 
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
-    """
-    Get the index of the LAST FULLY CLOSED candle by exact timestamp matching.
-    """
     if timestamps is None or timestamps.size < 2:
         return None
 
@@ -2070,42 +2067,51 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     reference_time = normalize_timestamp(reference_time)
     interval_seconds = interval_minutes * 60
     
-    current_period_start = (reference_time // interval_seconds) * interval_seconds
-    expected_closed_ts = current_period_start - interval_seconds
-    
+    current_period_start = (reference_time // interval_seconds) * interval_seconds   
+    expected_ts_open_time_convention = current_period_start - interval_seconds   
+    expected_ts_close_time_convention = current_period_start   
     ts_normalized = np.array([normalize_timestamp(t) for t in timestamps])
     
-    tolerance = 60
-    valid_mask = np.abs(ts_normalized - expected_closed_ts) <= tolerance
+    tolerance = 30
     
+    valid_mask = np.abs(ts_normalized - expected_ts_open_time_convention) <= tolerance
     valid_indices = np.nonzero(valid_mask)[0]
-
+    
+    if valid_indices.size == 0:
+        valid_mask = np.abs(ts_normalized - expected_ts_close_time_convention) <= tolerance
+        valid_indices = np.nonzero(valid_mask)[0]
+        convention_used = "CLOSE-time"
+    else:
+        convention_used = "OPEN-time"
+    
     if valid_indices.size == 0:
         logger.warning(
             f"No closed {interval_minutes}m candle found | "
-            f"Expected: {format_ist_time(expected_closed_ts)} | "
-            f"Last 3 available: {[format_ist_time(t) for t in ts_normalized[-3:]]}"
+            f"Expected (OPEN-time): {format_ist_time(expected_ts_open_time_convention)} | "
+            f"Expected (CLOSE-time): {format_ist_time(expected_ts_close_time_convention)} | "
+            f"Last 3 available timestamps: {[format_ist_time(t) for t in ts_normalized[-3:]]}"
         )
         return None
     
     last_closed_idx = int(valid_indices[-1])
     actual_ts = ts_normalized[last_closed_idx]
     
-    if abs(actual_ts - expected_closed_ts) > 0:
+    candle_age = reference_time - actual_ts
+    
+    logger.info(
+        f"Selected candle (idx={last_closed_idx}) | Convention: {convention_used} | "
+        f"Timestamp: {format_ist_time(actual_ts)} | "
+        f"Age from reference_time: {candle_age}s"
+    )
+    
+    if candle_age < 20:
         logger.warning(
-            f"Candle timestamp mismatch | Index: {last_closed_idx} | "
-            f"Expected: {format_ist_time(expected_closed_ts)} | "
-            f"Actual: {format_ist_time(actual_ts)} | "
-            f"Diff: {abs(actual_ts - expected_closed_ts)}s"
+            f"⚠️ Selected candle is very fresh ({candle_age}s old) - likely a forming candle! "
+            f"Returning None to skip this bar."
         )
-    else:
-        logger.debug(
-            f"Selected candle | Index: {last_closed_idx} | "
-            f"Time: {format_ist_time(actual_ts)}"
-        )
+        return None
     
     return last_closed_idx
-
 
 def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
     interval_seconds = interval_minutes * 60
@@ -3390,6 +3396,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
+
+        normalized_ts = normalize_timestamp(ts_15m_val)
+        candle_age = reference_time - normalized_ts
+        logger_pair.warning(
+            f"[DIAGNOSTIC] 15m Candle Selection | "
+            f"i15={i15} | "
+            f"API Timestamp: {ts_15m_val} ({format_ist_time(normalized_ts)}) | "
+            f"Reference Time: {reference_time} ({format_ist_time(reference_time)}) | "
+            f"Candle Age: {candle_age} seconds | "
+            f"OHLC: O={data_15m['open'][i15]:.8f} H={data_15m['high'][i15]:.8f} "
+            f"L={data_15m['low'][i15]:.8f} C={data_15m['close'][i15]:.8f} | "
+            f"Range: {data_15m['high'][i15] - data_15m['low'][i15]:.8f}"
+        )
+
         ts_curr = normalize_timestamp(ts_15m_val)  # ← Use new helper
 
         is_valid, error_msg = validate_timestamp_format(ts_curr, f"{pair_name}_15m_candle")
@@ -3403,9 +3423,28 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             return None
             
         interval_seconds = 15 * 60
-        candle_close_ts = ts_curr + interval_seconds
-        time_since_close = reference_time - candle_close_ts
+        expected_candle_close_time = ts_curr + interval_seconds
 
+        time_since_candle_close = reference_time - expected_candle_close_time
+
+        if time_since_candle_close < 0:
+            logger_pair.warning(
+                f"FORMING CANDLE DETECTED for {pair_name}: "
+                f"Candle won't close for {abs(time_since_candle_close)}s"
+            )
+            return None
+
+        if time_since_candle_close < 30:
+            logger_pair.debug(
+                f"SKIPPING {pair_name}: Candle too fresh "
+                f"({time_since_candle_close}s since close, need ≥30s)"
+            )
+            return None
+
+        logger_pair.debug(
+            f"{pair_name}: Candle closed {time_since_candle_close}s ago ✓"
+        )
+          
         if reference_time - ts_curr > cfg.MAX_CANDLE_STALENESS_SEC:
             staleness_seconds = reference_time - ts_curr
             if cfg.DEBUG_MODE:
@@ -3559,28 +3598,92 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-
-        
+      
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
 
-        actual_buy_wick_ratio = calculate_wick_ratio(
-            open_curr, high_curr, low_curr, close_curr, is_buy=True
+        is_green = close_curr > open_curr
+        is_red = close_curr < open_curr
+        candle_range = high_curr - low_curr
+
+        atr_short_val = indicators["atr_short"][i15] if i15 < len(indicators["atr_short"]) else np.nan
+        atr_long_val = indicators["atr_long"][i15] if i15 < len(indicators["atr_long"]) else np.nan
+
+        rvol_threshold_effective = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
+
+        rvol_gate_passed = (
+            not np.isnan(atr_short_val) and 
+            not np.isnan(atr_long_val) and 
+            atr_short_val > (atr_long_val * rvol_threshold_effective)
         )
-        actual_sell_wick_ratio = calculate_wick_ratio(
-            open_curr, high_curr, low_curr, close_curr, is_buy=False
-        )
-        if cfg.DEBUG_MODE:
+
+        if candle_range > 1e-9:
+            upper_wick = high_curr - close_curr
+            lower_wick = close_curr - low_curr
+            buy_wick_ratio = upper_wick / candle_range
+            sell_wick_ratio = lower_wick / candle_range
+        else:
+            buy_wick_ratio = 1.0
+            sell_wick_ratio = 1.0
+
+        if cfg.DEBUG_MODE and candle_range > 1e-9:
             logger_pair.debug(
-                f"PHASE 7 [15M]: O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f}"
-            )
-            logger_pair.debug(
-                f"Wick (15M): Buy={actual_buy_wick_ratio*100:.2f}% Sell={actual_sell_wick_ratio*100:.2f}% "
-                f"(threshold={Constants.MIN_WICK_RATIO*100:.1f}%)"
+                f"WICK RATIOS (15M): "
+                f"O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f} | "
+                f"Buy wick: {buy_wick_ratio*100:.2f}% (threshold: {Constants.MIN_WICK_RATIO*100:.1f}%) | "
+                f"Sell wick: {sell_wick_ratio*100:.2f}% (threshold: {Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
 
-        if cfg.DEBUG_MODE and (cfg.ENABLE_PIVOT or cfg.ENABLE_VWAP):
-            logger_pair.debug("Daily reset handled globally (no per-pair reset)")
+        wick_check_results_buy = vectorized_wick_check_buy(
+            data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
+            Constants.MIN_WICK_RATIO,
+            indicators["atr_short"], indicators["atr_long"],
+            rvol_threshold_effective
+        )
+
+        wick_check_results_sell = vectorized_wick_check_sell(
+            data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
+            Constants.MIN_WICK_RATIO,
+            indicators["atr_short"], indicators["atr_long"],
+            rvol_threshold_effective
+        )
+
+        buy_candle_passed = bool(wick_check_results_buy[i15])
+        sell_candle_passed = bool(wick_check_results_sell[i15])
+
+        if buy_candle_passed:
+            buy_candle_reason = f"✓ Quality Passed (wick: {buy_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
+        else:
+            if not rvol_gate_passed:
+                buy_candle_reason = f"Low RVOL: ATR_short={atr_short_val:.6f} <= ATR_long*threshold={atr_long_val*rvol_threshold_effective:.6f}"
+            elif candle_range > 1e-9 and buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+                buy_candle_reason = f"Upper wick TOO LARGE: {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
+            else:
+                buy_candle_reason = "Unknown reason"
+
+        if sell_candle_passed:
+            sell_candle_reason = f"✓ Quality Passed (wick: {sell_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
+        else:
+            if not rvol_gate_passed:
+                sell_candle_reason = f"Low RVOL: ATR_short={atr_short_val:.6f} <= ATR_long*threshold={atr_long_val*rvol_threshold_effective:.6f}"
+            elif candle_range > 1e-9 and sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+                sell_candle_reason = f"Lower wick TOO LARGE: {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
+            else:
+                sell_candle_reason = "Unknown reason"
+
+        if not buy_candle_passed and is_green:
+            logger_pair.warning(
+                f"[BUY CANDLE REJECTED] {pair_name}: {buy_candle_reason} | "
+                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
+                f"Wick%={buy_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
+            )
+
+        if not sell_candle_passed and is_red:
+            logger_pair.warning(
+                f"[SELL CANDLE REJECTED] {pair_name}: {sell_candle_reason} | "
+                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
+                f"Wick%={sell_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
+            )
 
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
@@ -3589,52 +3692,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
         if base_sell_trend:
             base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-
-        is_green = close_curr > open_curr
-        is_red = close_curr < open_curr
-        
-        atr_short_val = indicators["atr_short"][i15] if i15 < len(indicators["atr_short"]) else np.nan
-        atr_long_val = indicators["atr_long"][i15] if i15 < len(indicators["atr_long"]) else np.nan
-        
-        rvol_threshold_effective = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
-        rvol_gate_passed = (
-            not np.isnan(atr_short_val) and 
-            not np.isnan(atr_long_val) and 
-            atr_short_val > (atr_long_val * rvol_threshold_effective)
-        )
-
-        buy_candle_passed = False
-        sell_candle_passed = False
-        buy_candle_reason = "Setup criteria not met"
-        sell_candle_reason = "Setup criteria not met"
-
-        if is_green:
-            if not rvol_gate_passed:
-                buy_candle_reason = f"Low RVOL: {atr_short_val:.6f} <= {atr_long_val*rvol_threshold_effective:.6f}"
-            else:
-                candle_range = high_curr - low_curr
-                upper_wick = high_curr - close_curr
-                wick_ratio = upper_wick / candle_range if candle_range > 1e-9 else 1.0
-                
-                if wick_ratio < Constants.MIN_WICK_RATIO:
-                    buy_candle_passed = True
-                    buy_candle_reason = "Quality Passed"
-                else:
-                    buy_candle_reason = f"Upper wick too long: {wick_ratio*100:.1f}%"
-
-        if is_red:
-            if not rvol_gate_passed:
-                sell_candle_reason = f"Low RVOL: {atr_short_val:.6f} <= {atr_long_val*rvol_threshold_effective:.6f}"
-            else:
-                candle_range = high_curr - low_curr
-                lower_wick = close_curr - low_curr
-                wick_ratio = lower_wick / candle_range if candle_range > 1e-9 else 1.0
-                
-                if wick_ratio < Constants.MIN_WICK_RATIO:
-                    sell_candle_passed = True
-                    sell_candle_reason = "Quality Passed"
-                else:
-                    sell_candle_reason = f"Lower wick too long: {wick_ratio*100:.1f}%"
 
         buy_common = base_buy_trend and buy_candle_passed and is_green
         sell_common = base_sell_trend and sell_candle_passed and is_red
