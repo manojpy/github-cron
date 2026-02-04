@@ -2098,7 +2098,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     
     candle_age = reference_time - actual_ts
     
-    logger.info(
+    logger.debug(
         f"Selected candle (idx={last_closed_idx}) | Convention: {convention_used} | "
         f"Timestamp: {format_ist_time(actual_ts)} | "
         f"Age from reference_time: {candle_age}s"
@@ -3739,8 +3739,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_down": cloud_down,
             "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
             "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
-            "buy_wick_ratio": actual_buy_wick_ratio,
-            "sell_wick_ratio": actual_sell_wick_ratio,
+            "buy_wick_ratio": buy_wick_ratio,
+            "sell_wick_ratio": sell_wick_ratio,
             "is_green": is_green,
             "is_red": is_red,
             "buy_common": buy_common,
