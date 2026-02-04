@@ -3672,14 +3672,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 sell_candle_reason = "Unknown reason"
 
         if not buy_candle_passed and is_green:
-            logger_pair.warning(
+            logger_pair.debug(
                 f"[BUY CANDLE REJECTED] {pair_name}: {buy_candle_reason} | "
                 f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
                 f"Wick%={buy_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
             )
 
         if not sell_candle_passed and is_red:
-            logger_pair.warning(
+            logger_pair.debug(
                 f"[SELL CANDLE REJECTED] {pair_name}: {sell_candle_reason} | "
                 f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
                 f"Wick%={sell_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
