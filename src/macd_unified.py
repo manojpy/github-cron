@@ -3454,10 +3454,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             return None
         
-        if time_since_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
+        if time_since_candle_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
             if cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"Skipping {pair_name} - candle not finalized ({time_since_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
+                    f"Skipping {pair_name} - candle not finalized ({time_since_candle_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
                 )
             return None
 
