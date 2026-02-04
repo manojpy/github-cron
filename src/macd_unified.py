@@ -3221,7 +3221,6 @@ async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: boo
     
     await sdb.set(state_key, state_data, ts)
     
-
 async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
     """Check if alert was recently active (for dedup)"""
     if sdb.degraded:
@@ -3317,41 +3316,6 @@ async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: Lis
     except Exception as e:
         logger.error(f"check_multiple_alert_states failed for {pair} | keys={len(keys)} | error={e}")
         return {k: False for k in keys}
-
-def check_candle_quality_with_reason(open_val, high_val, low_val, close_val, 
-                                    is_buy, precomputed_ratio: Optional[float] = None) -> Tuple[bool, str]:
-    try:
-        candle_range = high_val - low_val
-        if candle_range < 1e-8:
-            return False, "Range too small"
-
-        if precomputed_ratio is not None:
-            wick_ratio = precomputed_ratio
-        else:
-            wick_ratio = calculate_wick_ratio(
-                open_val, high_val, low_val, close_val, is_buy
-            )
-
-        if is_buy:
-            if close_val <= open_val:
-                return False, f"Not green (C={close_val:.5f} ≤ O={open_val:.5f})"
-
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick {wick_ratio*100:.1f}% ≥ {Constants.MIN_WICK_RATIO*100:.1f}%"
-            
-            return True, f"✅ Green wick:{wick_ratio*100:.1f}%"
-
-        else:
-            if close_val >= open_val:
-                return False, f"Not red (C={close_val:.5f} ≥ O={open_val:.5f})"
-
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick {wick_ratio*100:.1f}% ��� {Constants.MIN_WICK_RATIO*100:.1f}%"
-            
-            return True, f"✅ Red wick:{wick_ratio*100:.1f}%"
-
-    except Exception as e:
-        return False, f"Error: {str(e)}"
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
@@ -3874,7 +3838,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"✅ Alert FIRED: {alert_key} | "
                         f"buy_common={buy_common} sell_common={sell_common} | "
                         f"buy_passed={buy_candle_passed} sell_passed={sell_candle_passed} | "
-                        f"Wick ratios: buy={actual_buy_wick_ratio*100:.1f}% sell={actual_sell_wick_ratio*100:.1f}% | "
+                        f"Wick ratios: buy={buy_wick_ratio*100:.1f}% sell={sell_wick_ratio*100:.1f}% | "
                         f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                     )
 
@@ -4267,7 +4231,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             resolutions.append(("D", daily_limit))
 
         pair_requests.append((symbol, resolutions))
-        # valid_tasks will be populated after fetch
         valid_tasks.append((pair_name, symbol))
 
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
