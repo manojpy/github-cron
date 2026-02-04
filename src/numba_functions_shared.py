@@ -41,27 +41,21 @@ def rolling_std(close, period, responsiveness):
     """
     n = len(close)
     sd = np.full(n, np.nan, dtype=np.float64)
-    # Clamp responsiveness
     resp = max(0.00001, min(1.0, responsiveness))
 
-    # We need at least 2 values for a standard deviation
     if n < 2 or period < 2:
         return np.zeros(n, dtype=np.float64)
 
     for i in range(period - 1, n):
-        # Slicing in Numba is efficient (view-based)
         window = close[i - period + 1 : i + 1]
         
-        # Count valid numbers in window
         valid_window = window[~np.isnan(window)]
         
         if len(valid_window) >= 2:
-            # np.std is numerically stable and matches population std (ddof=0)
             sd[i] = np.std(valid_window) * resp
         else:
             sd[i] = 0.0
             
-    # Handle the initial warmup period by filling with 0.0 or propagating first valid
     mask = np.isnan(sd)
     sd[mask] = 0.0
     
@@ -83,17 +77,14 @@ def rolling_mean_numba(data, period):
     for i in range(n):
         curr = data[i]
 
-        # Remove old value once window is full (starting at i == period)
         if i >= period:
             old_val = queue[queue_idx]
             window_sum -= old_val
 
-        # Add current value
         window_sum += curr
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
 
-        # Only assign output once we have a full window (i >= period - 1)
         if i >= period - 1:
             out[i] = window_sum / period
 
@@ -106,15 +97,12 @@ def rolling_min_max_numba(arr, period):
     min_arr = np.full(n, np.nan, dtype=np.float64)
     max_arr = np.full(n, np.nan, dtype=np.float64)
 
-    # Use double-ended queue for indices (monotonic queues)
     min_deque = np.zeros(period, dtype=np.int32)
     max_deque = np.zeros(period, dtype=np.int32)
     min_h = min_t = 0
     max_h = max_t = 0
 
-    # Track count of non-nan in current window
     valid_count = 0
-    # Circular buffer to store validity (True/False) for each position
     valid_buffer = np.zeros(period, dtype=np.bool_)
     buf_idx = 0
 
@@ -122,27 +110,22 @@ def rolling_min_max_numba(arr, period):
         val = arr[i]
         is_valid = not np.isnan(val)
 
-        # Remove old element if window is full
         if i >= period:
             old_valid = valid_buffer[buf_idx]
             if old_valid:
                 valid_count -= 1
-                # Also remove from deques if head matches old index
                 if min_h < min_t and min_deque[min_h] == i - period:
                     min_h += 1
                 if max_h < max_t and max_deque[max_h] == i - period:
                     max_h += 1
 
-        # Add new element
         valid_buffer[buf_idx] = is_valid
         if is_valid:
             valid_count += 1
-            # Maintain min deque (increasing)
             while min_t > min_h and arr[min_deque[min_t - 1]] >= val:
                 min_t -= 1
             min_deque[min_t] = i
             min_t += 1
-            # Maintain max deque (decreasing)
             while max_t > max_h and arr[max_deque[max_t - 1]] <= val:
                 max_t -= 1
             max_deque[max_t] = i
@@ -150,7 +133,6 @@ def rolling_min_max_numba(arr, period):
 
         buf_idx = (buf_idx + 1) % period
 
-        # Only output if we have a full window of valid data
         if i >= period - 1 and valid_count == period:
             min_arr[i] = arr[min_deque[min_h]]
             max_arr[i] = arr[max_deque[max_h]]
@@ -162,7 +144,6 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Calculate worm array - Pine's exact logic"""
     worm_arr = np.empty(rows, dtype=np.float64)
     
-    # Initialize with first close value
     worm_arr[0] = close_arr[0]
 
     for i in range(1, rows):
@@ -171,7 +152,6 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
         diff = src - prev_worm
         sd_i = sd_arr[i]
 
-        # Pine: delta = math.abs(diff) > sd ? math.sign(diff) * sd : diff
         if np.abs(diff) > sd_i:
             delta = np.sign(diff) * sd_i
         else:
@@ -180,7 +160,6 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
         worm_arr[i] = prev_worm + delta
 
     return worm_arr
-
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
@@ -192,26 +171,20 @@ def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
         mn = min_arr[i]
         mx = max_arr[i]
         
-        # 1. Calculate temp (Must be NaN if inputs are NaN or range is zero)
         denom = mx - mn
         if np.isnan(raw) or np.isnan(mn) or np.isnan(mx) or np.abs(denom) < 1e-10:
             temp = np.nan
         else:
             temp = (raw - mn) / denom
 
-        # 2. Calculate recursive value
-        # In Pine, if temp is na, value becomes na.
         if np.isnan(temp):
             value_arr[i] = np.nan
         else:
-            # Get previous value; use nz() logic (0.0 if previous is na)
             prev_v = value_arr[i-1] if i > 0 else np.nan
             prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
             
-            # Formula: value := 1.0 * (temp - 0.5 + 0.5 * nz(value[1]))
             v = 1.0 * (temp - 0.5 + 0.5 * prev_v_safe)
             
-            # Clamp to Pine limits
             if v > 0.9999: v = 0.9999
             if v < -0.9999: v = -0.9999
             value_arr[i] = v
@@ -228,8 +201,6 @@ def calc_mmh_momentum_loop(value_arr, rows):
         if np.isnan(v):
             momentum[i] = np.nan
         else:
-            # Formula: .25 * math.log((1 + value) / (1 - value))
-            # Safe clamping for log
             val_clamped = max(-0.99999, min(0.99999, v))
             temp2 = (1.0 + val_clamped) / (1.0 - val_clamped)
             momentum[i] = 0.25 * np.log(temp2)
@@ -244,8 +215,6 @@ def calc_mmh_momentum_smoothing(momentum_arr, rows):
     for i in range(rows):
         curr = momentum_arr[i]
         
-        # In Pine: momentum := momentum + .5 * nz(momentum[1])
-        # If current momentum is na, the result of the addition is na.
         if np.isnan(curr):
             result[i] = np.nan
         else:
@@ -262,7 +231,6 @@ def ema_loop(data, alpha_or_period):
     alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
     out = np.full(n, np.nan, dtype=np.float64)
     
-    # Find first valid index in O(n)
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
@@ -274,13 +242,11 @@ def ema_loop(data, alpha_or_period):
     
     out[first_valid_idx] = data[first_valid_idx]
     
-    # Single pass EMA calculation - O(n)
     for i in range(first_valid_idx + 1, n):
         curr = data[i]
         out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
     
     return out
-
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
@@ -288,7 +254,6 @@ def ema_loop_alpha(data, alpha):
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
     
-    # Find first valid index
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
@@ -298,10 +263,8 @@ def ema_loop_alpha(data, alpha):
     if first_valid_idx == -1:
         return out
     
-    # Derive period from alpha (for RMA: alpha = 1/period)
     period = int(1.0 / alpha + 0.5)
     
-    # Initialize with SMA of first 'period' values if possible
     if first_valid_idx + period <= n:
         sma_sum = 0.0
         valid_count = 0
@@ -311,17 +274,14 @@ def ema_loop_alpha(data, alpha):
                 valid_count += 1
         sma_init = sma_sum / valid_count if valid_count > 0 else data[first_valid_idx]
         
-        # Fill warmup period with SMA value
         for i in range(first_valid_idx, first_valid_idx + period):
             out[i] = sma_init
         
         start_idx = first_valid_idx + period
     else:
-        # Not enough data for full period, fallback
         out[first_valid_idx] = data[first_valid_idx]
         start_idx = first_valid_idx + 1
     
-    # Apply EMA/RMA formula
     for i in range(start_idx, n):
         curr = data[i]
         out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
@@ -334,7 +294,6 @@ def rng_filter_loop(x, r):
     n = len(x)
     filt = np.empty(n, dtype=np.float64)
 
-    # Initialize with first value (not 0.0)
     filt[0] = x[0] if not np.isnan(x[0]) else 0.0
 
     for i in range(1, n):
@@ -360,13 +319,11 @@ def smooth_range(close, t, m):
     """Calculate smoothed range - with explicit type handling"""
     n = len(close)
 
-    # Step 1: Absolute differences
     diff = np.empty(n, dtype=np.float64)
     diff[0] = 0.0
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i - 1])
 
-    # Step 2: First EMA (period t)
     alpha_t = 2.0 / (float(t) + 1.0)
     avrng = np.empty(n, dtype=np.float64)
     avrng[0] = diff[0]
@@ -374,7 +331,6 @@ def smooth_range(close, t, m):
         curr = diff[i]
         avrng[i] = (alpha_t * curr + (1.0 - alpha_t) * avrng[i-1]) if not np.isnan(curr) else avrng[i-1]
 
-    # Step 3: Second EMA (period wper = t*2-1)
     wper = t * 2 - 1
     alpha_w = 2.0 / (float(wper) + 1.0)
     smoothrng = np.empty(n, dtype=np.float64)
@@ -392,7 +348,6 @@ def calculate_trends_with_state(filt_x1, filt_x12):
     upw = np.empty(n, dtype=np.bool_)
     dnw = np.empty(n, dtype=np.bool_)
 
-    # Initialize first value - O(1)
     if filt_x1[0] < filt_x12[0]:
         upw[0] = True
         dnw[0] = False
@@ -403,7 +358,6 @@ def calculate_trends_with_state(filt_x1, filt_x12):
         upw[0] = True
         dnw[0] = False
 
-    # Single pass - O(n)
     for i in range(1, n):
         if filt_x1[i] < filt_x12[i]:
             upw[i] = True
@@ -424,7 +378,6 @@ def kalman_loop(src, length, R, Q):
     n = len(src)
     result = np.full(n, np.nan, dtype=np.float64)
 
-    # Find first valid - O(n)
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(src[i]):
@@ -434,7 +387,6 @@ def kalman_loop(src, length, R, Q):
     if first_valid_idx == -1:
         return result
 
-    # Initialize estimate with first valid value
     estimate = src[first_valid_idx]
     error_est = 1.0
     error_meas = R * (float(length) if float(length) > 1.0 else 1.0)
@@ -446,7 +398,6 @@ def kalman_loop(src, length, R, Q):
     error_est = (1.0 - kalman_gain) * error_est + Q_div_length
     result[first_valid_idx] = estimate
 
-    # Continue for remaining bars - O(n)
     for i in range(first_valid_idx + 1, n):
         current = src[i]
 
@@ -461,7 +412,6 @@ def kalman_loop(src, length, R, Q):
         result[i] = estimate
 
     return result
-
 
 @njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop(hlc3, volumes, timestamps):
@@ -486,7 +436,6 @@ def vwap_daily_loop(hlc3, volumes, timestamps):
         if cum_vol > 0.0:
             vwap[i] = cum_pv / cum_vol
         else:
-            # Fallback for bars with zero volume
             vwap[i] = hlc3[i]
     
     return vwap
@@ -501,7 +450,6 @@ def calculate_ppo_core(close, fast, slow, signal):
     fast_ma = np.full(n, np.nan, dtype=np.float64)
     slow_ma = np.full(n, np.nan, dtype=np.float64)
 
-    # Find first valid - O(n)
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(close[i]):
@@ -514,7 +462,6 @@ def calculate_ppo_core(close, fast, slow, signal):
     fast_ma[first_valid_idx] = close[first_valid_idx]
     slow_ma[first_valid_idx] = close[first_valid_idx]
 
-    # Single pass EMA calculations - O(n)
     for i in range(first_valid_idx + 1, n):
         c = close[i]
         if np.isnan(c):
@@ -524,7 +471,6 @@ def calculate_ppo_core(close, fast, slow, signal):
             fast_ma[i] = fast_alpha * c + (1.0 - fast_alpha) * fast_ma[i-1]
             slow_ma[i] = slow_alpha * c + (1.0 - slow_alpha) * slow_ma[i-1]
 
-    # Calculate PPO - O(n)
     ppo = np.empty(n, dtype=np.float64)
     for i in range(n):
         if slow_ma[i] != 0.0 and not np.isnan(slow_ma[i]):
@@ -532,7 +478,6 @@ def calculate_ppo_core(close, fast, slow, signal):
         else:
             ppo[i] = 0.0
 
-    # Signal line EMA - O(n)
     sig_alpha = 2.0 / (signal + 1.0)
     ppo_sig = np.full(n, np.nan, dtype=np.float64)
     ppo_sig[first_valid_idx] = ppo[first_valid_idx]
@@ -553,7 +498,6 @@ def calculate_rsi_core(close, period):
     if n <= period:
         return rsi
 
-    # Find first valid - O(n)
     first_valid_idx = -1
     last_valid_close = 0.0
     for i in range(n):
@@ -565,7 +509,6 @@ def calculate_rsi_core(close, period):
     if first_valid_idx == -1:
         return rsi
 
-    # Calculate gains/losses - O(n)
     gain = np.zeros(n, dtype=np.float64)
     loss = np.zeros(n, dtype=np.float64)
 
@@ -579,7 +522,6 @@ def calculate_rsi_core(close, period):
                 loss[i] = -diff
             last_valid_close = curr
 
-    # Calculate initial average gains/losses
     avg_gain = 0.0
     avg_loss = 0.0
     for i in range(first_valid_idx + 1, min(first_valid_idx + period + 1, n)):
@@ -590,7 +532,6 @@ def calculate_rsi_core(close, period):
 
     alpha = 1.0 / period
 
-    # Smooth averages and calculate RSI - O(n)
     for i in range(first_valid_idx + period, n):
         if not np.isnan(close[i]):
             avg_gain = (gain[i] * alpha) + (avg_gain * (1.0 - alpha))
@@ -611,7 +552,6 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
     if n < period:
         return np.full(n, np.nan, dtype=np.float64)
     
-    # Step 1: Calculate True Range
     tr = np.empty(n, dtype=np.float64)
     tr[0] = high[0] - low[0]
     
@@ -620,12 +560,11 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
         l = low[i]
         c = close[i - 1]  # Previous close
         
-        tr1 = h - l                # High - Low
-        tr2 = abs(h - c)           # Abs(High - Previous Close)
-        tr3 = abs(l - c)           # Abs(Low - Previous Close)
+        tr1 = h - l
+        tr2 = abs(h - c)
+        tr3 = abs(l - c)
         tr[i] = max(tr1, tr2, tr3)
     
-    # Step 2: Apply RMA (Wilder's) with alpha = 1/period
     alpha = 1.0 / float(period)
     atr = ema_loop_alpha(tr, alpha)
     
@@ -660,7 +599,6 @@ def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio,
         result[i] = wick_ratio < min_wick_ratio
     
     return result
-
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio, 
