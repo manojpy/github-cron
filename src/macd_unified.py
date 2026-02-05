@@ -1761,6 +1761,13 @@ class DataFetcher:
         logger.info(f"📏 Parallel fetch complete | Success: {success_count}/{len(all_tasks)}")
         return output
 
+def validate_indicator_values(indicators_dict: Dict[str, float], names: List[str]) -> Tuple[bool, str]:
+    for name in names:
+        val = indicators_dict.get(name)
+        if val is None or np.isnan(val):
+            return False, f"{name} is NaN"
+    return True, "OK"
+
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     try:   
         if not result or not isinstance(result, dict):
@@ -3092,7 +3099,7 @@ class AlertDefinition(TypedDict):
     check_fn: Callable[[Any, Any, Any, Any], bool]
     extra_fn: Callable[[Any, Any, Any, Any, Dict[str, Any]], str]
     requires: List[str]
-    
+ 
 ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
     {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
@@ -3246,78 +3253,6 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
         logger.error(f"Error checking alert state for {state_key}: {e}")
         return False
 
-def _validate_vwap_cross(ctx: Dict[str, Any], is_buy: bool, previous_states: Dict[str, bool]) -> Tuple[bool, Optional[str]]:
-    """
-    Validate VWAP cross with all safety checks.
-    """
-    vwap_curr = ctx.get("vwap_curr")
-    vwap_prev = ctx.get("vwap_prev")
-    close_curr = ctx["close_curr"]
-    close_prev = ctx["close_prev"]
-    open_curr = ctx["open_curr"]
-    high_curr = ctx["high_curr"]
-    low_curr = ctx["low_curr"]
-    
-    if vwap_curr is None or np.isnan(vwap_curr) or vwap_prev is None or np.isnan(vwap_prev):
-        return False, "VWAP not available"
-    
-    is_valid_cross, cross_error = validate_vwap_cross(
-        close_prev, close_curr, vwap_prev, vwap_curr, is_buy
-    )
-    
-    if not is_valid_cross:
-        return False, cross_error
-    
-    if is_buy:
-        if close_curr <= open_curr:
-            return False, f"Red candle: O={open_curr:.2f}, C={close_curr:.2f}"
-        
-        dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
-        if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
-            return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
-        
-        candle_range = high_curr - low_curr
-        if candle_range > 1e-9:
-            upper_wick = high_curr - close_curr
-            wick_ratio = upper_wick / candle_range
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Upper wick too large: {wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
-        
-        return True, None
-    
-    else:
-        if close_curr >= open_curr:
-            return False, f"Green candle: O={open_curr:.2f}, C={close_curr:.2f}"
-        
-        dist_pct = abs(close_curr - vwap_curr) / vwap_curr * 100
-        if dist_pct > Constants.VWAP_MAX_DISTANCE_PCT:
-            return False, f"Price too far from VWAP: {dist_pct:.2f}% > {Constants.VWAP_MAX_DISTANCE_PCT}%"
-        
-        candle_range = high_curr - low_curr
-        if candle_range > 1e-9:
-            lower_wick = close_curr - low_curr
-            wick_ratio = lower_wick / candle_range
-            if wick_ratio >= Constants.MIN_WICK_RATIO:
-                return False, f"Lower wick too large: {wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
-        
-        return True, None
-
-async def check_multiple_alert_states(sdb: RedisStateStore, pair: str, keys: List[str]) -> Dict[str, bool]:
-    if sdb.degraded or not keys:
-        return {k: False for k in keys}
-    try:
-        results = await sdb.batch_get_and_set_alerts(pair, keys, [])
-        output: Dict[str, bool] = {}       
-        for key in keys:
-            st = results.get(key)
-            output[key] = isinstance(st, dict) and st.get("state") == "ACTIVE"
-
-        return output
-
-    except Exception as e:
-        logger.error(f"check_multiple_alert_states failed for {pair} | keys={len(keys)} | error={e}")
-        return {k: False for k in keys}
-
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, alignment_cache: Dict[str, int]) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -3445,7 +3380,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
+        close_curr = close_15m[i15]
+        open_curr = open_15m[i15]
+        high_curr = data_15m["high"][i15]
+        low_curr = data_15m["low"][i15]
 
+        is_green = close_curr > open_curr
+        is_red = close_curr < open_curr
+        candle_range = high_curr - low_curr
+    
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
@@ -3478,11 +3421,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         piv = indicators["pivots"]
-        close_curr = close_15m[i15]
+        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
         close_prev = close_15m[i15 - 1]
-        open_curr = open_15m[i15]
-        high_curr = data_15m["high"][i15]
-        low_curr = data_15m["low"][i15]
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
@@ -3497,17 +3438,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
-
-        if np.isnan(ppo_curr) or np.isnan(ppo_prev):
-            logger_pair.debug(f"PPO has NaN at index {i15}: curr={ppo_curr}, prev={ppo_prev}")
-            return None
-
-        if np.isnan(rsi_curr) or np.isnan(rsi_prev):
-            logger_pair.debug(f"RSI has NaN at index {i15}: curr={rsi_curr}, prev={rsi_prev}")
-            return None
-
-        if np.isnan(ppo_sig_curr) or np.isnan(ppo_sig_prev):
-            logger_pair.debug(f"PPO Signal has NaN at index {i15}: curr={ppo_sig_curr}, prev={ppo_sig_prev}")
+    
+        values_to_check = {
+            'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
+            'rsi_curr': rsi_curr, 'rsi_prev': rsi_prev,
+            'ppo_sig_curr': ppo_sig_curr, 'ppo_sig_prev': ppo_sig_prev,
+        }
+        is_valid, msg = validate_indicator_values(values_to_check, list(values_to_check.keys()))
+        if not is_valid:
+            logger_pair.debug(msg)
             return None
 
         if vwap_enabled and vwap is not None and len(vwap) > i15:
@@ -3558,116 +3497,71 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-      
-        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
-        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
-
-        is_green = close_curr > open_curr
-        is_red = close_curr < open_curr
-        candle_range = high_curr - low_curr
-
-        atr_short_val = indicators["atr_short"][i15] if i15 < len(indicators["atr_short"]) else np.nan
-        atr_long_val = indicators["atr_long"][i15] if i15 < len(indicators["atr_long"]) else np.nan
-
-        rvol_threshold_effective = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
-
-        rvol_gate_passed = (
-            not np.isnan(atr_short_val) and 
-            not np.isnan(atr_long_val) and 
-            atr_short_val > (atr_long_val * rvol_threshold_effective)
-        )
-
-        if candle_range > 1e-9:
-            upper_wick = high_curr - close_curr
-            lower_wick = close_curr - low_curr
-            
-            if is_green:
-                buy_wick_ratio = upper_wick / candle_range
-            else:
-                buy_wick_ratio = 1.0  # Mark as invalid - will fail < 0.2 check
-            
-            if is_red:
-                sell_wick_ratio = lower_wick / candle_range
-            else:
-                sell_wick_ratio = 1.0  # Mark as invalid - will fail < 0.2 check
-        else:
-            buy_wick_ratio = 1.0
-            sell_wick_ratio = 1.0
-
-        if cfg.DEBUG_MODE and candle_range > 1e-9:
-            logger_pair.debug(
-                f"WICK RATIOS (15M): "
-                f"O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f} | "
-                f"Color: {'GREEN' if is_green else 'RED' if is_red else 'DOJI'} | "
-                f"Buy wick: {buy_wick_ratio*100:.2f}% (threshold: {Constants.MIN_WICK_RATIO*100:.1f}%) | "
-                f"Sell wick: {sell_wick_ratio*100:.2f}% (threshold: {Constants.MIN_WICK_RATIO*100:.1f}%)"
-            )
+           
+        rvol_threshold = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
 
         wick_check_results_buy = vectorized_wick_check_buy(
             data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
             Constants.MIN_WICK_RATIO,
             indicators["atr_short"], indicators["atr_long"],
-            rvol_threshold_effective
+            rvol_threshold
         )
 
         wick_check_results_sell = vectorized_wick_check_sell(
             data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
             Constants.MIN_WICK_RATIO,
             indicators["atr_short"], indicators["atr_long"],
-            rvol_threshold_effective
+            rvol_threshold
         )
 
         buy_candle_passed = bool(wick_check_results_buy[i15])
         sell_candle_passed = bool(wick_check_results_sell[i15])
 
+        candle_range = high_curr - low_curr
+        buy_wick_ratio = (high_curr - close_curr) / candle_range if (is_green and candle_range > 1e-9) else 1.0
+        sell_wick_ratio = (close_curr - low_curr) / candle_range if (is_red and candle_range > 1e-9) else 1.0
+
+        buy_candle_reason = (
+            f"✓ Passed (wick {buy_wick_ratio*100:.1f}%)" if buy_candle_passed
+            else f"Failed: {'RED candle' if not is_green else f'wick {buy_wick_ratio*100:.1f}% or RVOL'}"
+        )
+        sell_candle_reason = (
+            f"✓ Passed (wick {sell_wick_ratio*100:.1f}%)" if sell_candle_passed
+            else f"Failed: {'GREEN candle' if not is_red else f'wick {sell_wick_ratio*100:.1f}% or RVOL'}"
+        )
+
         if buy_candle_passed:
             buy_candle_reason = f"✓ Quality Passed (wick: {buy_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
         else:
-            if not rvol_gate_passed:
-                buy_candle_reason = f"Low RVOL: ATR_short={atr_short_val:.6f} <= ATR_long*threshold={atr_long_val*rvol_threshold_effective:.6f}"
-            elif not is_green:
+            if not is_green:
                 buy_candle_reason = f"RED/DOJI candle: cannot check upper wick on non-green"
-            elif candle_range > 1e-9 and buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+            elif candle_range <= 1e-9:
+                buy_candle_reason = f"Invalid candle range: {candle_range}"
+            elif buy_wick_ratio >= Constants.MIN_WICK_RATIO:
                 buy_candle_reason = f"Upper wick TOO LARGE: {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
             else:
-                buy_candle_reason = "Unknown reason"
+                buy_candle_reason = f"RVOL or other filter failed"
 
         if sell_candle_passed:
             sell_candle_reason = f"✓ Quality Passed (wick: {sell_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
         else:
-            if not rvol_gate_passed:
-                sell_candle_reason = f"Low RVOL: ATR_short={atr_short_val:.6f} <= ATR_long*threshold={atr_long_val*rvol_threshold_effective:.6f}"
-            elif not is_red:
+            if not is_red:
                 sell_candle_reason = f"GREEN/DOJI candle: cannot check lower wick on non-red"
-            elif candle_range > 1e-9 and sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+            elif candle_range <= 1e-9:
+                sell_candle_reason = f"Invalid candle range: {candle_range}"
+            elif sell_wick_ratio >= Constants.MIN_WICK_RATIO:
                 sell_candle_reason = f"Lower wick TOO LARGE: {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
             else:
-                sell_candle_reason = "Unknown reason"
+                sell_candle_reason = f"RVOL or other filter failed"
 
-        if not buy_candle_passed and is_green:
-            logger_pair.debug(
-                f"[BUY CANDLE REJECTED] {pair_name}: {buy_candle_reason} | "
-                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
-                f"Wick%={buy_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
-            )
+        trend_buy = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
+        trend_sell = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
-        if not sell_candle_passed and is_red:
-            logger_pair.debug(
-                f"[SELL CANDLE REJECTED] {pair_name}: {sell_candle_reason} | "
-                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
-                f"Wick%={sell_wick_ratio*100:.2f}% Threshold={Constants.MIN_WICK_RATIO*100:.1f}%"
-            )
+        confirmation_buy = (mmh_curr > 0) and cloud_up
+        confirmation_sell = (mmh_curr < 0) and cloud_down
 
-        base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
-        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
-
-        if base_buy_trend:
-            base_buy_trend = base_buy_trend and (mmh_curr > 0) and cloud_up
-        if base_sell_trend:
-            base_sell_trend = base_sell_trend and (mmh_curr < 0) and cloud_down
-
-        buy_common = base_buy_trend and buy_candle_passed and is_green
-        sell_common = base_sell_trend and sell_candle_passed and is_red
+        buy_common = trend_buy and confirmation_buy and buy_candle_passed and is_green
+        sell_common = trend_sell and confirmation_sell and sell_candle_passed and is_red
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3683,74 +3577,58 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             mmh_reversal_sell = (sell_common and mmh_curr < 0 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1)
 
         context = {
-            "close_curr": close_curr,
-            "close_prev": close_prev,
-            "open_curr": open_curr,
-            "high_curr": high_curr,
-            "low_curr": low_curr,
-            "ts_curr": ts_curr,
-            "close_5m_val": close_5m_val,
-            "ppo_curr": ppo_curr,
-            "ppo_prev": ppo_prev,
-            "ppo_sig_curr": ppo_sig_curr,
-            "ppo_sig_prev": ppo_sig_prev,
-            "rsi_curr": rsi_curr,
-            "rsi_prev": rsi_prev,
-            "vwap_curr": vwap_curr,
-            "vwap_prev": vwap_prev,
-            "vwap_available": vwap_available,
-            "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
-            "mmh_curr": mmh_curr,
-            "mmh_m1": mmh_m1,
-            "mmh_m2": mmh_m2,
-            "mmh_m3": mmh_m3,
-            "mmh_reversal_buy": mmh_reversal_buy,
-            "mmh_reversal_sell": mmh_reversal_sell,
-            "rma50_15_val": rma50_15_val,
-            "rma200_5_val": rma200_5_val,
-            "cloud_up": cloud_up,
-            "cloud_down": cloud_down,
-            "candle_quality_failed_buy": base_buy_trend and not buy_candle_passed,
-            "candle_quality_failed_sell": base_sell_trend and not sell_candle_passed,
-            "buy_wick_ratio": buy_wick_ratio,
-            "sell_wick_ratio": sell_wick_ratio,
-            "is_green": is_green,
-            "is_red": is_red,
-            "buy_common": buy_common,
-            "sell_common": sell_common,
-            "wick_ratio_timeframe": "15m",
+            "close_curr": close_curr, "close_prev": close_prev,
+            "open_curr": open_curr, "high_curr": high_curr, "low_curr": low_curr,
+            "ts_curr": ts_curr, "close_5m_val": close_5m_val,
+    
+            "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
+            "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
+            "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
+            "vwap_curr": vwap_curr, "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr, "mmh_m1": mmh_m1, "mmh_m2": mmh_m2, "mmh_m3": mmh_m3,
+            "rma50_15_val": rma50_15_val, "rma200_5_val": rma200_5_val,
+    
+            "cloud_up": cloud_up, "cloud_down": cloud_down,
+            "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell,
+            "buy_common": buy_common, "sell_common": sell_common,
+            "vwap_available": vwap_available, "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
+    
+            "buy_wick_ratio": buy_wick_ratio if 'buy_wick_ratio' in locals() else 0.0,
+            "sell_wick_ratio": sell_wick_ratio if 'sell_wick_ratio' in locals() else 0.0,
+            "is_green": is_green, "is_red": is_red,
+    
             "pivots": piv if piv else {},
+            "pivot_suppressions": [],
         }
-
-        context["pivot_suppressions"] = []
 
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
-        raw_alerts = []
-        
-        alert_keys_to_check = [
-            d["key"] for d in ALERT_DEFINITIONS
-            if not (
-                ("pivots" in d["requires"] and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values()))) or
-                ("vwap" in d["requires"] and (not cfg.ENABLE_VWAP or not vwap_available)) or
-                ("ppo" in d["requires"] and (ppo_ctx is None)) or
-                ("ppo_signal" in d["requires"] and (ppo_sig_ctx is None)) or
-                ("rsi" in d["requires"] and (rsi_ctx is None))
-            )
-        ]
-
-        if not piv or not any(piv.values()):
-            alert_keys_to_check = [
-                k for k in alert_keys_to_check
-                if not k.startswith("pivot_")
-            ]
+        alert_keys_to_check = []
+        for d in ALERT_DEFINITIONS:
+            key = d["key"]
+            requires = d.get("requires", [])
+            
+            skip = False
+            if "pivots" in requires and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values())):
+                skip = True
+            elif "vwap" in requires and not vwap_available:
+                skip = True
+            elif "ppo" in requires and ppo_ctx is None:
+                skip = True
+            elif "ppo_signal" in requires and ppo_sig_ctx is None:
+                skip = True
+            elif "rsi" in requires and rsi_ctx is None:
+                skip = True
+            
+            if not skip:
+                alert_keys_to_check.append(key)
 
         redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
 
-        previous_states = await check_multiple_alert_states(
-            sdb, pair_name, redis_alert_keys
+        previous_states = await sdb.batch_get_all_alert_states(
+            pair_name, redis_alert_keys
         )
 
         all_state_changes = []
