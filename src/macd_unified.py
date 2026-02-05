@@ -3611,7 +3611,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
-           
+
+        adx_15m = calculate_adx_core(
+            data_15m["high"],
+            data_15m["low"],
+            cfg.ADX_DI_LENGTH,
+            cfg.ADX_SMOOTHING_LENGTH
+        )        
         rvol_threshold = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
 
         wick_check_results_buy = vectorized_wick_check_buy(
