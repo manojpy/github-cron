@@ -1086,10 +1086,10 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['adx'] = calculate_adx_core(
             data_15m["high"],
             data_15m["low"],
+            data_15m["close"],
             cfg.ADX_DI_LENGTH,
             cfg.ADX_SMOOTHING_LENGTH
         )
-
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
@@ -3615,6 +3615,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         adx_15m = calculate_adx_core(
             data_15m["high"],
             data_15m["low"],
+            data_15m["close"],
             cfg.ADX_DI_LENGTH,
             cfg.ADX_SMOOTHING_LENGTH
         )        

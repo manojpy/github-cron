@@ -308,8 +308,8 @@ def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
 def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
     return _dispatch['calculate_atr_rma'](high, low, close, period)
 
-def calculate_adx_core(high: np.ndarray, low: np.ndarray, di_length: int, adx_length: int) -> np.ndarray:
-    return _dispatch['calculate_adx_core'](high, low, di_length, adx_length)
+def calculate_adx_core(high: np.ndarray, low: np.ndarray, close: np.ndarray, di_length: int, adx_length: int) -> np.ndarray:
+    return _dispatch['calculate_adx_core'](high, low, close, di_length, adx_length)
 
 def vectorized_wick_check_buy(open_arr: np.ndarray, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray,
                               min_wick_ratio: float, atr_short: np.ndarray, atr_long: np.ndarray, rvol_threshold: float,

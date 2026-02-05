@@ -570,109 +570,70 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
     
     return atr
 
-@njit("f8[:](f8[:], f8[:], i4, i4)", nogil=True, cache=True)
-def calculate_adx_core(high, low, di_length, adx_length):
+@njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
+def calculate_adx_core(high, low, close, di_length, adx_length):
+    """
+    Calculate ADX in O(n) using Pine Script equivalent logic.
+    Requires Close for accurate True Range calculation.
+    """
     n = len(high)
     adx = np.full(n, np.nan, dtype=np.float64)
-    
+
     if n < di_length + adx_length:
         return adx
-    
+
     plus_dm = np.zeros(n, dtype=np.float64)
     minus_dm = np.zeros(n, dtype=np.float64)
     tr = np.zeros(n, dtype=np.float64)
-    
+
+    # First bar TR is just high-low
     tr[0] = high[0] - low[0]
     
     for i in range(1, n):
         h = high[i]
         l = low[i]
-        c = high[i - 1] if i > 0 else 0.0
-        
+        prev_h = high[i - 1]
+        prev_l = low[i - 1]
+        prev_c = close[i - 1] # Corrected: Use prev close for TR
+
+        # True Range Calculation
         tr1 = h - l
-        tr2 = abs(h - c)
-        tr3 = abs(l - c)
+        tr2 = abs(h - prev_c)
+        tr3 = abs(l - prev_c)
         tr[i] = max(tr1, tr2, tr3)
-        
-        up = h - high[i - 1]
-        down = low[i - 1] - l
-        
-        if up > down and up > 0:
-            plus_dm[i] = up
-        else:
-            plus_dm[i] = 0.0
-        
-        if down > up and down > 0:
-            minus_dm[i] = down
-        else:
-            minus_dm[i] = 0.0
-    
+
+        # Directional Movement Calculation
+        up = h - prev_h
+        down = prev_l - l
+
+        plus_dm[i] = up if (up > down and up > 0) else 0.0
+        minus_dm[i] = down if (down > up and down > 0) else 0.0
+
+    # RMA Smoothing (alpha = 1/length)
     alpha_di = 1.0 / float(di_length)
-    
-    plus_dm_smooth = np.full(n, np.nan, dtype=np.float64)
-    minus_dm_smooth = np.full(n, np.nan, dtype=np.float64)
-    tr_smooth = np.full(n, np.nan, dtype=np.float64)
-    
-    plus_dm_sum = 0.0
-    minus_dm_sum = 0.0
-    tr_sum = 0.0
-    
-    for i in range(di_length):
-        plus_dm_sum += plus_dm[i]
-        minus_dm_sum += minus_dm[i]
-        tr_sum += tr[i]
-    
-    plus_dm_smooth[di_length - 1] = plus_dm_sum
-    minus_dm_smooth[di_length - 1] = minus_dm_sum
-    tr_smooth[di_length - 1] = tr_sum
-    
-    for i in range(di_length, n):
-        plus_dm_smooth[i] = (plus_dm_smooth[i - 1] * (di_length - 1) + plus_dm[i]) / di_length
-        minus_dm_smooth[i] = (minus_dm_smooth[i - 1] * (di_length - 1) + minus_dm[i]) / di_length
-        tr_smooth[i] = (tr_smooth[i - 1] * (di_length - 1) + tr[i]) / di_length
-    
+    plus_dm_smooth = ema_loop_alpha(plus_dm, alpha_di)
+    minus_dm_smooth = ema_loop_alpha(minus_dm, alpha_di)
+    tr_smooth = ema_loop_alpha(tr, alpha_di)
+
     plus_di = np.full(n, np.nan, dtype=np.float64)
     minus_di = np.full(n, np.nan, dtype=np.float64)
     
-    for i in range(di_length - 1, n):
-        if tr_smooth[i] > 0:
+    for i in range(n):
+        if tr_smooth[i] > 0.0 and not np.isnan(tr_smooth[i]):
             plus_di[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
             minus_di[i] = 100.0 * minus_dm_smooth[i] / tr_smooth[i]
         else:
             plus_di[i] = 0.0
             minus_di[i] = 0.0
-    
-    di_diff = np.full(n, np.nan, dtype=np.float64)
-    di_sum = np.full(n, np.nan, dtype=np.float64)
-    
-    for i in range(di_length - 1, n):
-        s = plus_di[i] + minus_di[i]
-        if s == 0:
-            di_diff[i] = 0.0
-            di_sum[i] = 1.0
-        else:
-            di_diff[i] = abs(plus_di[i] - minus_di[i])
-            di_sum[i] = s
-    
-    raw_adx = np.full(n, np.nan, dtype=np.float64)
-    for i in range(di_length - 1, n):
-        if di_sum[i] != 0:
-            raw_adx[i] = 100.0 * di_diff[i] / di_sum[i]
-        else:
-            raw_adx[i] = 0.0
-    
+
+    di_diff = np.abs(plus_di - minus_di)
+    di_sum = plus_di + minus_di
+    raw_adx = np.where(di_sum == 0.0, 0.0, 100.0 * di_diff / di_sum)
+
+    # Final ADX Smoothing
     alpha_adx = 1.0 / float(adx_length)
-    
-    adx_sum = 0.0
-    for i in range(di_length - 1, min(di_length - 1 + adx_length, n)):
-        adx_sum += raw_adx[i]
-    
-    if di_length - 1 + adx_length <= n:
-        adx[di_length - 1 + adx_length - 1] = adx_sum
-        
-        for i in range(di_length - 1 + adx_length, n):
-            adx[i] = (adx[i - 1] * (adx_length - 1) + raw_adx[i]) / adx_length
-    
+    adx = ema_loop_alpha(raw_adx, alpha_adx)
+
     return adx
 
 @njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)", nogil=True, cache=True)
@@ -779,7 +740,7 @@ EXPORT_CONFIG = {
     'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
     'calculate_rsi_core': 'f8[:](f8[:], i4)',
     'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',
-    'calculate_adx_core': 'f8[:](f8[:], f8[:], i4, i4)',
+    'calculate_adx_core': 'f8[:](f8[:], f8[:], f8[:], i4, i4)',
     'vectorized_wick_check_buy': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)',
     'vectorized_wick_check_sell': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)',
 }
