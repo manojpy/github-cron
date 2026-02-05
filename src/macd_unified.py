@@ -3555,14 +3555,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             else:
                 sell_candle_reason = f"RVOL or other filter failed"
 
-        trend_buy = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
-        trend_sell = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
+        base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
+        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
         confirmation_buy = (mmh_curr > 0) and cloud_up
         confirmation_sell = (mmh_curr < 0) and cloud_down
 
-        buy_common = trend_buy and confirmation_buy and buy_candle_passed and is_green
-        sell_common = trend_sell and confirmation_sell and sell_candle_passed and is_red
+        buy_common = base_buy_trend and confirmation_buy and buy_candle_passed and is_green
+        sell_common = base_sell_trend and confirmation_sell and sell_candle_passed and is_red
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
