@@ -532,15 +532,6 @@ def validate_runtime_config() -> None:
     except Exception as e:
         errors.append(f"Failed to parse REDIS_URL: {e}")
     
-    if not CompiledPatterns.SECRET_TOKEN.match(cfg.TELEGRAM_BOT_TOKEN):
-        errors.append("TELEGRAM_BOT_TOKEN format invalid (should be: 123456:ABC-DEF...)")
-    
-    if not cfg.DELTA_API_BASE.startswith(('http://', 'https://')):
-        errors.append("DELTA_API_BASE must start with http:// or https://")
-    
-    if not cfg.PAIRS or len(cfg.PAIRS) == 0:
-        errors.append("PAIRS list is empty - no trading pairs configured")
-    
     if errors:
         logger.critical("Configuration validation FAILED:")
         for error in errors:
@@ -736,10 +727,8 @@ def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: i
     last_closed_candle_open = current_interval_open - interval_seconds
     return last_closed_candle_open
 
-_ESCAPE_RE = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
-
 def escape_markdown_v2(text: str) -> str:
-    return _ESCAPE_RE.sub(r'\\\g<0>', str(text))
+    return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -1924,56 +1913,44 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]],
     valid, msg = _validate_basic_candle_data(data)
     if not valid:
         return False, msg
-    
-    close = data.get("close")
+
+    close = data["close"]
     if len(close) < required_len:
         return False, f"Insufficient data: {len(close)} < {required_len}"
-    
-    timestamp = data.get("timestamp")
+
+    timestamp = data["timestamp"]
     if not np.all(timestamp[1:] >= timestamp[:-1]):
         return False, "Timestamps not monotonic increasing"
-    
+
     return True, None
 
-def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, 
-                                 reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:   
+def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
     try:
-        if data is None or not data:
-            return False, "Data is None or empty"
-        
-        close = data.get("close")
-        timestamp = data.get("timestamp")
-        open_arr = data.get("open")
-        high_arr = data.get("high")
-        low_arr = data.get("low")
-        
-        required_arrays = {
-            "close": close,
-            "timestamp": timestamp,
-            "open": open_arr,
-            "high": high_arr,
-            "low": low_arr
-        }
-        
-        for name, arr in required_arrays.items():
-            if arr is None or len(arr) == 0:
-                return False, f"Missing or empty {name} data"
-        
+        valid, msg = _validate_basic_candle_data(data)
+        if not valid:
+            return False, msg
+
+        close = data["close"]
+        timestamp = data["timestamp"]
+        open_arr = data["open"]
+        high_arr = data["high"]
+        low_arr = data["low"]
+
         array_len = len(close)
         if selected_index < 0 or selected_index >= array_len:
             return False, f"Selected index {selected_index} out of range [0, {array_len - 1}]"
-        
+
         selected_candle_time = normalize_timestamp(timestamp[selected_index])
         interval_seconds = interval_minutes * 60
         current_period_start = (reference_time // interval_seconds) * interval_seconds
-       
+
         if selected_candle_time >= current_period_start:
             return False, (
                 f"Selected candle is still forming! "
                 f"Candle ts: {format_ist_time(selected_candle_time)} >= "
                 f"Current period: {format_ist_time(current_period_start)}"
             )
-        
+
         staleness = reference_time - selected_candle_time
         max_staleness = cfg.MAX_CANDLE_STALENESS_SEC
         
@@ -2256,89 +2233,74 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-        
-        pool_reused = False
+    pool_reused = False
 
-        async with RedisStateStore._pool_lock:
-            pool = RedisStateStore._global_pools.get(self.redis_url)
-            healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
+    async with RedisStateStore._pool_lock:
+        pool = RedisStateStore._global_pools.get(self.redis_url)
+        healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
 
-            if pool and healthy:
-                pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
-
-                if pool_age > self.POOL_MAX_AGE_SECONDS:
-                    logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
-                    RedisStateStore._pool_healthy[self.redis_url] = False
-                    try:
-                        await pool.aclose()
-                    except Exception:
-                        pass
-                    RedisStateStore._global_pools[self.redis_url] = None
-                else:
-                    try:
-                        await asyncio.wait_for(pool.ping(), timeout=1.0)
-                        if not RedisStateStore._pool_healthy.get(self.redis_url, False):
-                            logger.debug("Pool invalidated by another task after ping")
-                            pool = None
-                        else:
-                            self._redis = pool
-
+        if pool and healthy:
+            pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
+            if pool_age > self.POOL_MAX_AGE_SECONDS:
+                logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
+                RedisStateStore._pool_healthy[self.redis_url] = False
+                try:
+                    await pool.aclose()
+                except Exception:
+                    pass
+                RedisStateStore._global_pools[self.redis_url] = None
+            else:
+                try:
+                    ok = await self._ping_with_retry(timeout)
+                    if ok:
+                        self._redis = pool
                         RedisStateStore._pool_reuse_count[self.redis_url] = \
                             RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
-                    
                         self.degraded = False
                         pool_reused = True
                         return
+                except Exception as e:
+                    if cfg.DEBUG_MODE:
+                        logger.debug(f"Pool health check failed: {e}, creating new pool")
+                    RedisStateStore._pool_healthy[self.redis_url] = False
+                    pool_reused = False
 
-                    except Exception as e:
-                        if cfg.DEBUG_MODE:
-                            logger.debug(f"Pool health check failed: {e}, creating new pool")
-                        RedisStateStore._pool_healthy[self.redis_url] = False
-                        pool_reused = False     
-        if pool_reused:
+    if pool_reused:
+        return
+
+    # Retry loop using _attempt_connect only
+    for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
+        if await self._attempt_connect(timeout):
+            max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
+            logger.info(f"✅ Redis connected ({max_conn} max)")
+            self.degraded = False
+            self.degraded_alerted = False
             return
 
-        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-            if await self._attempt_connect(timeout):
-                try:
-                    ping_ok = await asyncio.wait_for(self._redis.ping(), timeout=1.0)
-                    if ping_ok:
-                        max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
-                        logger.info(f"✅ Redis connected ({max_conn} max)")
-                        self.degraded = False
-                        self.degraded_alerted = False
-                        return
-                except asyncio.TimeoutError:
-                    logger.warning("Redis ping timeout, retrying...")
-                    self._redis = None
-                except Exception as e:
-                    logger.warning(f"Redis ping failed: {e}")
-                    self._redis = None
+        if attempt < cfg.REDIS_CONNECTION_RETRIES:
+            delay = cfg.REDIS_RETRY_DELAY * attempt
+            logger.warning(f"Retrying Redis connection in {delay}s...")
+            await asyncio.sleep(delay)
 
-            if attempt < cfg.REDIS_CONNECTION_RETRIES:
-                delay = cfg.REDIS_RETRY_DELAY * attempt
-                logger.warning(f"Retrying Redis connection in {delay}s...")
-                await asyncio.sleep(delay)
+    logger.critical("❌ Redis connection failed after all retries")
+    self.degraded = True
+    if self._redis:
+        try:
+            await self._redis.aclose()
+        except Exception:
+            pass
+    self._redis = None
 
-        logger.critical("❌ Redis connection failed after all retries")
-        self.degraded = True
-        if self._redis:
-            try:
-                await self._redis.aclose()
-            except Exception:
-                pass
-        self._redis = None
-
-        logger.warning("""
+    logger.warning("""
 🚨 REDIS DEGRADED MODE ACTIVE:
 - Alert deduplication:  DISABLED (may get duplicates)
 - State persistence:    DISABLED (alerts reset each run)
 - Trading alerts:       STILL ACTIVE (core functionality preserved)
 """)
 
-        if cfg.FAIL_ON_REDIS_DOWN:
-            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
-
+    if cfg.FAIL_ON_REDIS_DOWN:
+        raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
+      
     async def close(self) -> None:
         self._redis = None
 
@@ -3151,6 +3113,124 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
+def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
+    ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
+    buy_common, sell_common = context["buy_common"], context["sell_common"]
+
+    if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
+
+    if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+
+    if ppo_prev > 0 and ppo_curr <= 0:
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
+
+    if ppo_prev < 0 and ppo_curr >= 0:
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
+
+    if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
+
+    if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
+
+    return resets
+
+def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
+    buy_common, sell_common = context["buy_common"], context["sell_common"]
+    ppo_curr = context["ppo_curr"]
+
+    if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
+    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['rsi_50_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
+
+    if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
+    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['rsi_50_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
+
+    return resets
+
+def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    if not context.get("vwap_available", False):
+        return resets
+
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    vwap_curr, vwap_prev = context["vwap_curr"], context["vwap_prev"]
+    buy_common, sell_common = context["buy_common"], context["sell_common"]
+
+    if close_prev > vwap_prev and close_curr <= vwap_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS['vwap_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+
+    if close_prev < vwap_prev and close_curr >= vwap_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS['vwap_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+
+    return resets
+
+def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    piv = context.get("pivots", {})
+    if not piv:
+        return resets
+
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    buy_common, sell_common = context["buy_common"], context["sell_common"]
+
+    for level_name, level_value in piv.items():
+        up_key = f"pivot_up_{level_name}"
+        down_key = f"pivot_down_{level_name}"
+
+        if up_key in ALERT_KEYS:
+            if close_prev > level_value and close_curr <= level_value:
+                resets.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
+            elif not buy_common and conditional_states.get(ALERT_KEYS[up_key], False):
+                resets.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
+
+        if down_key in ALERT_KEYS:
+            if close_prev < level_value and close_curr >= level_value:
+                resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
+            elif not sell_common and conditional_states.get(ALERT_KEYS[down_key], False):
+                resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
+
+    return resets
+
+def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    mmh_curr, mmh_m1 = context["mmh_curr"], context["mmh_m1"]
+
+    if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
+        if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
+
+    if (mmh_curr < 0) and (mmh_curr >= mmh_m1):
+        if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
+
+    return resets
+
 def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     cache_key = f"_pivot_cache_{level}_{'buy' if is_buy else 'sell'}"
     
@@ -3769,92 +3849,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             conditional_states = {}
             
-        if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-        elif not buy_common:
-            if conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-
-        if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-        elif not sell_common:
-            if conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-
-        if ppo_prev > 0 and ppo_curr <= 0:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-        elif not buy_common:
-            if conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-           
-        if ppo_prev < 0 and ppo_curr >= 0:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-        elif not sell_common:
-            if conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-
-        if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
-        elif not buy_common:
-            if conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None)) 
-         
-        if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
-        elif not sell_common:
-            if conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
-
-        if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
-        elif not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
-            if conditional_states.get(ALERT_KEYS['rsi_50_up'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
-                
-        if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
-            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
-        elif not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
-            if conditional_states.get(ALERT_KEYS['rsi_50_down'], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
-                
-        if cfg.ENABLE_VWAP and vwap_available:
-            if close_prev > vwap_prev and close_curr <= vwap_curr:
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-            elif not buy_common:
-                if conditional_states.get(ALERT_KEYS['vwap_up'], False):
-                    resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-                    
-            if close_prev < vwap_prev and close_curr >= vwap_curr:
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-            elif not sell_common:      
-                if conditional_states.get(ALERT_KEYS['vwap_down'], False):
-                    resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-                   
-        if piv:
-            for level_name, level_value in piv.items():
-                up_key = f"pivot_up_{level_name}"
-                if up_key in ALERT_KEYS:
-                    if close_prev > level_value and close_curr <= level_value:
-                        resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
-                    elif not buy_common:
-                        if conditional_states.get(ALERT_KEYS[up_key], False):
-                            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
-        
-                down_key = f"pivot_down_{level_name}"
-                if down_key in ALERT_KEYS:
-                    if close_prev < level_value and close_curr >= level_value:
-                        resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
-                    elif not sell_common:
-                        if conditional_states.get(ALERT_KEYS[down_key], False):
-                            resets_to_apply.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
-
-        if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
-            if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
-
-        if (mmh_curr < 0) and (mmh_curr >= mmh_m1):
-            if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
-                resets_to_apply.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
+        resets_to_apply = []
+        resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_vwap_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_mmh_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
 
