@@ -3260,6 +3260,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     ALERT_COOLDOWN_SECONDS = Constants.ALERT_DEDUP_WINDOW_SEC 
+    raw_alerts: List[Tuple[str, str, str]] = []
     close_15m = None
     open_15m = None
     timestamps_15m = None
