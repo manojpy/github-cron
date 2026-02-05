@@ -8,7 +8,8 @@
   "DEBUG_MODE": false,
   "SEND_TEST_MESSAGE": false,
   "ENABLE_RVOL_ALERT": true,
-
+  "ENABLE_ADX_FILTER": true,
+   
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
     "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD",
@@ -32,6 +33,7 @@
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
   "RVOL_THRESHOLD": 1.0,
+  "ADX_THRESHOLD": 18.0,
 
   "MAX_PARALLEL_FETCH": 12,
   "HTTP_TIMEOUT": 8,
