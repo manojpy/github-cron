@@ -2233,73 +2233,72 @@ class RedisStateStore:
             return False
 
     async def connect(self, timeout: float = 5.0) -> None:
-    pool_reused = False
+        pool_reused = False
 
-    async with RedisStateStore._pool_lock:
-        pool = RedisStateStore._global_pools.get(self.redis_url)
-        healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
+        async with RedisStateStore._pool_lock:
+            pool = RedisStateStore._global_pools.get(self.redis_url)
+            healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
 
-        if pool and healthy:
-            pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
-            if pool_age > self.POOL_MAX_AGE_SECONDS:
-                logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
-                RedisStateStore._pool_healthy[self.redis_url] = False
-                try:
-                    await pool.aclose()
-                except Exception:
-                    pass
-                RedisStateStore._global_pools[self.redis_url] = None
-            else:
-                try:
-                    ok = await self._ping_with_retry(timeout)
-                    if ok:
-                        self._redis = pool
-                        RedisStateStore._pool_reuse_count[self.redis_url] = \
-                            RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
-                        self.degraded = False
-                        pool_reused = True
-                        return
-                except Exception as e:
-                    if cfg.DEBUG_MODE:
-                        logger.debug(f"Pool health check failed: {e}, creating new pool")
+            if pool and healthy:
+                pool_age = time.time() - RedisStateStore._pool_created_at.get(self.redis_url, 0.0)
+                if pool_age > self.POOL_MAX_AGE_SECONDS:
+                    logger.info(f"Redis pool aged {pool_age:.0f}s, refreshing")
                     RedisStateStore._pool_healthy[self.redis_url] = False
-                    pool_reused = False
+                    try:
+                        await pool.aclose()
+                    except Exception:
+                        pass
+                    RedisStateStore._global_pools[self.redis_url] = None
+                else:
+                    try:
+                        ok = await self._ping_with_retry(timeout)
+                        if ok:
+                            self._redis = pool
+                            RedisStateStore._pool_reuse_count[self.redis_url] = \
+                                RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
+                            self.degraded = False
+                            pool_reused = True
+                            return
+                    except Exception as e:
+                        if cfg.DEBUG_MODE:
+                            logger.debug(f"Pool health check failed: {e}, creating new pool")
+                        RedisStateStore._pool_healthy[self.redis_url] = False
+                        pool_reused = False
 
-    if pool_reused:
-        return
-
-    # Retry loop using _attempt_connect only
-    for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
-        if await self._attempt_connect(timeout):
-            max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
-            logger.info(f"✅ Redis connected ({max_conn} max)")
-            self.degraded = False
-            self.degraded_alerted = False
+        if pool_reused:
             return
 
-        if attempt < cfg.REDIS_CONNECTION_RETRIES:
-            delay = cfg.REDIS_RETRY_DELAY * attempt
-            logger.warning(f"Retrying Redis connection in {delay}s...")
-            await asyncio.sleep(delay)
+        for attempt in range(1, cfg.REDIS_CONNECTION_RETRIES + 1):
+            if await self._attempt_connect(timeout):
+                max_conn = getattr(self._redis.connection_pool, "max_connections", "?")
+                logger.info(f"✅ Redis connected ({max_conn} max)")
+                self.degraded = False
+                self.degraded_alerted = False
+                return
 
-    logger.critical("❌ Redis connection failed after all retries")
-    self.degraded = True
-    if self._redis:
-        try:
-            await self._redis.aclose()
-        except Exception:
-            pass
-    self._redis = None
+            if attempt < cfg.REDIS_CONNECTION_RETRIES:
+                delay = cfg.REDIS_RETRY_DELAY * attempt
+                logger.warning(f"Retrying Redis connection in {delay}s...")
+                await asyncio.sleep(delay)
 
-    logger.warning("""
-🚨 REDIS DEGRADED MODE ACTIVE:
-- Alert deduplication:  DISABLED (may get duplicates)
-- State persistence:    DISABLED (alerts reset each run)
-- Trading alerts:       STILL ACTIVE (core functionality preserved)
-""")
+        logger.critical("❌ Redis connection failed after all retries")
+        self.degraded = True
+        if self._redis:
+            try:
+                await self._redis.aclose()
+            except Exception:
+                pass
+        self._redis = None
 
-    if cfg.FAIL_ON_REDIS_DOWN:
-        raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
+        logger.warning("""
+    🚨 REDIS DEGRADED MODE ACTIVE:
+    - Alert deduplication:  DISABLED (may get duplicates)
+    - State persistence:    DISABLED (alerts reset each run)
+    - Trading alerts:       STILL ACTIVE (core functionality preserved)
+    """)
+
+        if cfg.FAIL_ON_REDIS_DOWN:
+            raise RedisConnectionError("Redis unavailable after all retries – FAIL_ON_REDIS_DOWN=true")
       
     async def close(self) -> None:
         self._redis = None
