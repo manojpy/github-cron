@@ -938,7 +938,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.rng_filter_loop(test_data, test_data * 0.5)
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
-        _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, 14, 14)
+        _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
         
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
