@@ -570,9 +570,114 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
     
     return atr
 
-@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], i4, i4)", nogil=True, cache=True)
+def calculate_adx_core(high, low, di_length, adx_length):
+    n = len(high)
+    adx = np.full(n, np.nan, dtype=np.float64)
+    
+    if n < di_length + adx_length:
+        return adx
+    
+    plus_dm = np.zeros(n, dtype=np.float64)
+    minus_dm = np.zeros(n, dtype=np.float64)
+    tr = np.zeros(n, dtype=np.float64)
+    
+    tr[0] = high[0] - low[0]
+    
+    for i in range(1, n):
+        h = high[i]
+        l = low[i]
+        c = high[i - 1] if i > 0 else 0.0
+        
+        tr1 = h - l
+        tr2 = abs(h - c)
+        tr3 = abs(l - c)
+        tr[i] = max(tr1, tr2, tr3)
+        
+        up = h - high[i - 1]
+        down = low[i - 1] - l
+        
+        if up > down and up > 0:
+            plus_dm[i] = up
+        else:
+            plus_dm[i] = 0.0
+        
+        if down > up and down > 0:
+            minus_dm[i] = down
+        else:
+            minus_dm[i] = 0.0
+    
+    alpha_di = 1.0 / float(di_length)
+    
+    plus_dm_smooth = np.full(n, np.nan, dtype=np.float64)
+    minus_dm_smooth = np.full(n, np.nan, dtype=np.float64)
+    tr_smooth = np.full(n, np.nan, dtype=np.float64)
+    
+    plus_dm_sum = 0.0
+    minus_dm_sum = 0.0
+    tr_sum = 0.0
+    
+    for i in range(di_length):
+        plus_dm_sum += plus_dm[i]
+        minus_dm_sum += minus_dm[i]
+        tr_sum += tr[i]
+    
+    plus_dm_smooth[di_length - 1] = plus_dm_sum
+    minus_dm_smooth[di_length - 1] = minus_dm_sum
+    tr_smooth[di_length - 1] = tr_sum
+    
+    for i in range(di_length, n):
+        plus_dm_smooth[i] = (plus_dm_smooth[i - 1] * (di_length - 1) + plus_dm[i]) / di_length
+        minus_dm_smooth[i] = (minus_dm_smooth[i - 1] * (di_length - 1) + minus_dm[i]) / di_length
+        tr_smooth[i] = (tr_smooth[i - 1] * (di_length - 1) + tr[i]) / di_length
+    
+    plus_di = np.full(n, np.nan, dtype=np.float64)
+    minus_di = np.full(n, np.nan, dtype=np.float64)
+    
+    for i in range(di_length - 1, n):
+        if tr_smooth[i] > 0:
+            plus_di[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
+            minus_di[i] = 100.0 * minus_dm_smooth[i] / tr_smooth[i]
+        else:
+            plus_di[i] = 0.0
+            minus_di[i] = 0.0
+    
+    di_diff = np.full(n, np.nan, dtype=np.float64)
+    di_sum = np.full(n, np.nan, dtype=np.float64)
+    
+    for i in range(di_length - 1, n):
+        s = plus_di[i] + minus_di[i]
+        if s == 0:
+            di_diff[i] = 0.0
+            di_sum[i] = 1.0
+        else:
+            di_diff[i] = abs(plus_di[i] - minus_di[i])
+            di_sum[i] = s
+    
+    raw_adx = np.full(n, np.nan, dtype=np.float64)
+    for i in range(di_length - 1, n):
+        if di_sum[i] != 0:
+            raw_adx[i] = 100.0 * di_diff[i] / di_sum[i]
+        else:
+            raw_adx[i] = 0.0
+    
+    alpha_adx = 1.0 / float(adx_length)
+    
+    adx_sum = 0.0
+    for i in range(di_length - 1, min(di_length - 1 + adx_length, n)):
+        adx_sum += raw_adx[i]
+    
+    if di_length - 1 + adx_length <= n:
+        adx[di_length - 1 + adx_length - 1] = adx_sum
+        
+        for i in range(di_length - 1 + adx_length, n):
+            adx[i] = (adx[i - 1] * (adx_length - 1) + raw_adx[i]) / adx_length
+    
+    return adx
+
+@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)", nogil=True, cache=True)
 def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio, 
-                               atr_short, atr_long, rvol_threshold):    
+                               atr_short, atr_long, rvol_threshold, adx, enable_adx, adx_threshold):    
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
@@ -580,7 +685,17 @@ def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio,
         if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
             continue
         
-        if atr_short[i] <= (atr_long[i] * rvol_threshold):
+        rvol_pass = True
+        if rvol_threshold > 0.0:
+            if atr_short[i] <= (atr_long[i] * rvol_threshold):
+                rvol_pass = False
+        
+        adx_pass = True
+        if enable_adx:
+            if np.isnan(adx[i]) or adx[i] <= adx_threshold:
+                adx_pass = False
+        
+        if not (rvol_pass or adx_pass):
             continue
         
         candle_range = high_p[i] - low_p[i]
@@ -600,9 +715,9 @@ def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio,
     
     return result
 
-@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)", nogil=True, cache=True)
+@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)", nogil=True, cache=True)
 def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio, 
-                                atr_short, atr_long, rvol_threshold):
+                                atr_short, atr_long, rvol_threshold, adx, enable_adx, adx_threshold):
     n = len(close_p)
     result = np.zeros(n, dtype=np.bool_)
     
@@ -610,7 +725,17 @@ def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio,
         if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
             continue
         
-        if atr_short[i] <= (atr_long[i] * rvol_threshold):
+        rvol_pass = True
+        if rvol_threshold > 0.0:
+            if atr_short[i] <= (atr_long[i] * rvol_threshold):
+                rvol_pass = False
+        
+        adx_pass = True
+        if enable_adx:
+            if np.isnan(adx[i]) or adx[i] <= adx_threshold:
+                adx_pass = False
+        
+        if not (rvol_pass or adx_pass):
             continue
       
         candle_range = high_p[i] - low_p[i]
@@ -631,7 +756,7 @@ def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio,
     return result
 
 # ============================================================================
-# AOT EXPORT CONFIGURATION (Import this in aot_build.py)
+# AOT EXPORT CONFIGURATION
 # ============================================================================
 
 EXPORT_CONFIG = {
@@ -654,8 +779,9 @@ EXPORT_CONFIG = {
     'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
     'calculate_rsi_core': 'f8[:](f8[:], i4)',
     'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',
-    'vectorized_wick_check_buy': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)',
-    'vectorized_wick_check_sell': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8)',
+    'calculate_adx_core': 'f8[:](f8[:], f8[:], i4, i4)',
+    'vectorized_wick_check_buy': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)',
+    'vectorized_wick_check_sell': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)',
 }
 
 __all__ = list(EXPORT_CONFIG.keys())

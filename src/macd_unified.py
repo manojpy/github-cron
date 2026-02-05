@@ -52,6 +52,7 @@ from aot_bridge import (
     calculate_ppo_core,
     calculate_rsi_core,
     calculate_atr_rma, 
+    calculate_adx_core, 
     vectorized_wick_check_buy,
     vectorized_wick_check_sell
 )
@@ -217,6 +218,30 @@ class BotConfig(BaseModel):
         description="Enable volatility expansion check (RVOL alert). "
                     "When False, wick patterns are evaluated without volatility requirement"
     )    
+    ADX_DI_LENGTH: int = Field(
+        default=14,
+        ge=5,
+        le=30,
+        description="ADX DI length (number of bars for directional movement calculation)"
+    )
+    ADX_SMOOTHING_LENGTH: int = Field(
+        default=14,
+        ge=5,
+        le=30,
+        description="ADX smoothing length (RMA period)"
+    )
+    ADX_THRESHOLD: float = Field(
+        default=18.0,
+        ge=5.0,
+        le=50.0,
+        description="ADX threshold for signals (0-100 scale). 18 = moderate trend. "
+                    "Higher values = stronger trend requirement"
+    )
+    ENABLE_ADX_FILTER: bool = Field(
+        default=True,
+        description="Enable ADX trend strength filter. "
+                    "When enabled with RVOL, uses OR logic (either condition can trigger)"
+    )
     MAX_CANDLE_STALENESS_SEC: int = Field(
         default=1200,
         ge=600,
@@ -913,6 +938,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.rng_filter_loop(test_data, test_data * 0.5)
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
+        _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, 14, 14)
         
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
@@ -1002,6 +1028,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'pivots': {},
             'atr_short': np.empty(n_15m, dtype=np.float64),
             'atr_long': np.empty(n_15m, dtype=np.float64),
+            'adx': np.empty(n_15m, dtype=np.float64),
         }
 
         ppo, ppo_signal = calculate_ppo_numpy(
@@ -1056,6 +1083,12 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
            data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
 
+        results['adx'] = calculate_adx_core(
+            data_15m["high"],
+            data_15m["low"],
+            cfg.ADX_DI_LENGTH,
+            cfg.ADX_SMOOTHING_LENGTH
+        )
 
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
@@ -1088,15 +1121,15 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                     )            
         else:
             results['pivots'] = {}
-        
-        for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5']:
+
+        for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5', 'adx']:
             arr = results[key]
             if np.any(~np.isfinite(arr)):  # Check both NaN and Inf
                 if cfg.DEBUG_MODE:
                     inf_count = np.sum(np.isinf(arr))
                     nan_count = np.sum(np.isnan(arr))
                     logger.warning(f"{key}: {inf_count} infs, {nan_count} nans - clamping")
-                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)    
+                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP) 
         return results    
    
     except Exception as e:
@@ -1132,6 +1165,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'pivots': {},
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
+            'adx': np.full(n, np.nan, dtype=np.float64),
         }
 
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
@@ -3584,14 +3618,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
             Constants.MIN_WICK_RATIO,
             indicators["atr_short"], indicators["atr_long"],
-            rvol_threshold
+            rvol_threshold,
+            adx_15m,                      
+            cfg.ENABLE_ADX_FILTER,            
+            cfg.ADX_THRESHOLD                
         )
 
         wick_check_results_sell = vectorized_wick_check_sell(
             data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
             Constants.MIN_WICK_RATIO,
             indicators["atr_short"], indicators["atr_long"],
-            rvol_threshold
+            rvol_threshold,
+            adx_15m,                   
+            cfg.ENABLE_ADX_FILTER,     
+            cfg.ADX_THRESHOLD         
         )
 
         buy_candle_passed = bool(wick_check_results_buy[i15])
@@ -3676,7 +3716,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "buy_wick_ratio": buy_wick_ratio if 'buy_wick_ratio' in locals() else 0.0,
             "sell_wick_ratio": sell_wick_ratio if 'sell_wick_ratio' in locals() else 0.0,
             "is_green": is_green, "is_red": is_red,
-    
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
         }
