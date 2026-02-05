@@ -3103,10 +3103,11 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
-    {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]}, 
+    {"key":"mmh_buy", "title":"🔵⬆️ MMH Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False) and ctx.get("buy_wick_ratio", 1.0) < Constants.MIN_WICK_RATIO), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%", "requires":[]},   
+    {"key":"mmh_sell", "title":"🟣⬇️ MMH Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False) and ctx.get("sell_wick_ratio", 1.0) < Constants.MIN_WICK_RATIO), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%", "requires":[]}
 ]
+
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots:
@@ -3445,16 +3446,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
 
-        close_curr_quick = close_15m[i15]
-        open_curr_quick = open_15m[i15]
-        is_green = close_curr_quick > open_curr_quick
-        is_red = close_curr_quick < open_curr_quick
-
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
                     f"Doji/neutral candle for {pair_name} "
-                    f"(O={open_curr_quick:.2f}, C={close_curr_quick:.2f}), skipping indicators"
+                    f"(O={open_curr:.2f}, C={close_curr:.2f}), skipping indicators"
                 )
             return None
        
@@ -3584,8 +3580,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if candle_range > 1e-9:
             upper_wick = high_curr - close_curr
             lower_wick = close_curr - low_curr
-            buy_wick_ratio = upper_wick / candle_range
-            sell_wick_ratio = lower_wick / candle_range
+            
+            if is_green:
+                buy_wick_ratio = upper_wick / candle_range
+            else:
+                buy_wick_ratio = 1.0  # Mark as invalid - will fail < 0.2 check
+            
+            if is_red:
+                sell_wick_ratio = lower_wick / candle_range
+            else:
+                sell_wick_ratio = 1.0  # Mark as invalid - will fail < 0.2 check
         else:
             buy_wick_ratio = 1.0
             sell_wick_ratio = 1.0
@@ -3594,6 +3598,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(
                 f"WICK RATIOS (15M): "
                 f"O={open_curr:.5f} H={high_curr:.5f} L={low_curr:.5f} C={close_curr:.5f} | "
+                f"Color: {'GREEN' if is_green else 'RED' if is_red else 'DOJI'} | "
                 f"Buy wick: {buy_wick_ratio*100:.2f}% (threshold: {Constants.MIN_WICK_RATIO*100:.1f}%) | "
                 f"Sell wick: {sell_wick_ratio*100:.2f}% (threshold: {Constants.MIN_WICK_RATIO*100:.1f}%)"
             )
@@ -3620,6 +3625,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             if not rvol_gate_passed:
                 buy_candle_reason = f"Low RVOL: ATR_short={atr_short_val:.6f} <= ATR_long*threshold={atr_long_val*rvol_threshold_effective:.6f}"
+            elif not is_green:
+                buy_candle_reason = f"RED/DOJI candle: cannot check upper wick on non-green"
             elif candle_range > 1e-9 and buy_wick_ratio >= Constants.MIN_WICK_RATIO:
                 buy_candle_reason = f"Upper wick TOO LARGE: {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
             else:
@@ -3630,6 +3637,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             if not rvol_gate_passed:
                 sell_candle_reason = f"Low RVOL: ATR_short={atr_short_val:.6f} <= ATR_long*threshold={atr_long_val*rvol_threshold_effective:.6f}"
+            elif not is_red:
+                sell_candle_reason = f"GREEN/DOJI candle: cannot check lower wick on non-red"
             elif candle_range > 1e-9 and sell_wick_ratio >= Constants.MIN_WICK_RATIO:
                 sell_candle_reason = f"Lower wick TOO LARGE: {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
             else:
