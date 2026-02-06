@@ -2084,50 +2084,41 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     reference_time = normalize_timestamp(reference_time)
     interval_seconds = interval_minutes * 60
-    
     current_period_start = (reference_time // interval_seconds) * interval_seconds   
-    expected_ts_open_time_convention = current_period_start - interval_seconds   
-    expected_ts_close_time_convention = current_period_start   
+    expected_ts_open_time = current_period_start - interval_seconds   
+    
     ts_normalized = np.array([normalize_timestamp(t) for t in timestamps])
     
-    tolerance = 30
+    tolerance = 15
     
-    valid_mask = np.abs(ts_normalized - expected_ts_open_time_convention) <= tolerance
+    valid_mask = np.abs(ts_normalized - expected_ts_open_time) <= tolerance
     valid_indices = np.nonzero(valid_mask)[0]
-    
-    if valid_indices.size == 0:
-        valid_mask = np.abs(ts_normalized - expected_ts_close_time_convention) <= tolerance
-        valid_indices = np.nonzero(valid_mask)[0]
-        convention_used = "CLOSE-time"
-    else:
-        convention_used = "OPEN-time"
     
     if valid_indices.size == 0:
         logger.warning(
             f"No closed {interval_minutes}m candle found | "
-            f"Expected (OPEN-time): {format_ist_time(expected_ts_open_time_convention)} | "
-            f"Expected (CLOSE-time): {format_ist_time(expected_ts_close_time_convention)} | "
+            f"Expected (OPEN-time): {format_ist_time(expected_ts_open_time)} | "
             f"Last 3 available timestamps: {[format_ist_time(t) for t in ts_normalized[-3:]]}"
         )
         return None
     
     last_closed_idx = int(valid_indices[-1])
     actual_ts = ts_normalized[last_closed_idx]
+    candle_age = reference_time - actual_ts  
+    minimum_age = interval_seconds + 30
     
-    candle_age = reference_time - actual_ts
-    
-    logger.debug(
-        f"Selected candle (idx={last_closed_idx}) | Convention: {convention_used} | "
-        f"Timestamp: {format_ist_time(actual_ts)} | "
-        f"Age from reference_time: {candle_age}s"
-    )
-    
-    if candle_age < 20:
+    if candle_age < minimum_age:
         logger.warning(
-            f"⚠️ Selected candle is very fresh ({candle_age}s old) - likely a forming candle! "
-            f"Returning None to skip this bar."
+            f"⚠️ Selected candle is too fresh ({candle_age}s old, need {minimum_age}s) - "
+            f"likely a forming candle! Returning None."
         )
         return None
+    
+    logger.debug(
+        f"Selected candle (idx={last_closed_idx}) | OPEN-time convention | "
+        f"Timestamp: {format_ist_time(actual_ts)} | "
+        f"Age: {candle_age}s (>{minimum_age}s required)"
+    )
     
     return last_closed_idx
 
@@ -3369,7 +3360,7 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, alignment_cache: Dict[str, int]) -> Optional[Tuple[str, Dict[str, Any]]]:
-
+    
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     ALERT_COOLDOWN_SECONDS = Constants.ALERT_DEDUP_WINDOW_SEC 
@@ -3424,7 +3415,39 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"Range: {data_15m['high'][i15] - data_15m['low'][i15]:.8f}"
         )
 
-        ts_curr = normalize_timestamp(ts_15m_val)  # ← Use new helper
+        ts_curr = normalize_timestamp(ts_15m_val)
+
+        if i15 >= 1:
+            ts_prev_val = data_15m["timestamp"][i15 - 1]
+            ts_prev = normalize_timestamp(ts_prev_val)
+            expected_prev = ts_curr - (15 * 60)  # 15 minutes
+            
+            time_diff = abs(ts_prev - expected_prev)
+            
+            if time_diff > 30:  # More than 30s deviation indicates gap
+                gap_minutes = (ts_curr - ts_prev) / 60.0
+                logger_pair.warning(
+                    f"⚠️ Data Gap Detected for {pair_name}! | "
+                    f"Current: {format_ist_time(ts_curr)} | "
+                    f"Previous: {format_ist_time(ts_prev)} | "
+                    f"Expected Previous: {format_ist_time(expected_prev)} | "
+                    f"Gap Size: {gap_minutes:.1f} minutes | "
+                    f"Timestamp Diff: {time_diff}s | "
+                    f"Skipping to avoid false signals from gapped data"
+                )
+                return None
+            
+            if ts_curr == ts_prev:
+                logger_pair.error(
+                    f"❌ DUPLICATE TIMESTAMPS for {pair_name}! | "
+                    f"Both i15={i15} and i15-1 have timestamp {format_ist_time(ts_curr)} | "
+                    f"DATA CORRUPTION - aborting"
+                )
+                return None
+        else:
+            logger_pair.debug(
+                f"Skipping continuity check for {pair_name} (i15={i15}, no previous candle)"
+            )
 
         is_valid, error_msg = validate_timestamp_format(ts_curr, f"{pair_name}_15m_candle")
         if not is_valid:
@@ -3498,11 +3521,50 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_curr = open_15m[i15]
         high_curr = data_15m["high"][i15]
         low_curr = data_15m["low"][i15]
+        
+        if not (low_curr <= open_curr <= high_curr and low_curr <= close_curr <= high_curr):
+            logger_pair.error(
+                f"❌ INVALID CANDLE DETECTED for {pair_name} at index {i15} | "
+                f"O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
+                f"Timestamp: {format_ist_time(normalize_timestamp(data_15m['timestamp'][i15]))} | "
+                f"This indicates DATA CORRUPTION or FORMING CANDLE!"
+            )
+            return None
+        
+        if high_curr - low_curr < 1e-9:
+            logger_pair.warning(
+                f"❌ ZERO-RANGE CANDLE for {pair_name} at index {i15} | "
+                f"H={high_curr:.8f} L={low_curr:.8f} | Skipping"
+            )
+            return None
 
         is_green = close_curr > open_curr
         is_red = close_curr < open_curr
         candle_range = high_curr - low_curr
-    
+        
+        if candle_range > 1e-9:
+            upper_wick_ratio = (high_curr - close_curr) / candle_range
+            lower_wick_ratio = (close_curr - low_curr) / candle_range
+            
+            buy_wick_ratio = upper_wick_ratio
+            sell_wick_ratio = lower_wick_ratio
+            
+            logger_pair.debug(
+                f"Wick analysis | {pair_name} | "
+                f"Candle: {'GREEN' if is_green else 'RED' if is_red else 'DOJI'} | "
+                f"Upper wick: {upper_wick_ratio*100:.1f}% | "
+                f"Lower wick: {lower_wick_ratio*100:.1f}% | "
+                f"Range: {candle_range:.8f}"
+            )
+        else:
+            buy_wick_ratio = 0.0
+            sell_wick_ratio = 0.0
+            logger_pair.warning(
+                f"Zero-range candle | {pair_name} | "
+                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} "
+                f"L={low_curr:.8f} C={close_curr:.8f}"
+            )
+     
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
@@ -3643,18 +3705,41 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         buy_candle_passed = bool(wick_check_results_buy[i15])
         sell_candle_passed = bool(wick_check_results_sell[i15])
-
-        candle_range = high_curr - low_curr
-        buy_wick_ratio = (high_curr - close_curr) / candle_range if (is_green and candle_range > 1e-9) else 1.0
-        sell_wick_ratio = (close_curr - low_curr) / candle_range if (is_red and candle_range > 1e-9) else 1.0
-
+        
+        if is_green and sell_candle_passed:
+            logger_pair.error(
+                f"🚨 CRITICAL LOGIC ERROR: GREEN candle passed SELL wick check! | "
+                f"Pair: {pair_name} | i15: {i15} | "
+                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
+                f"This should NEVER happen - data corruption or vectorized check bug!"
+            )
+            return None
+        
+        if is_red and buy_candle_passed:
+            logger_pair.error(
+                f"🚨 CRITICAL LOGIC ERROR: RED candle passed BUY wick check! | "
+                f"Pair: {pair_name} | i15: {i15} | "
+                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
+                f"This should NEVER happen - data corruption or vectorized check bug!"
+            )
+            return None
+        
+        logger_pair.debug(
+            f"Wick checks for {pair_name} | "
+            f"Candle: {'GREEN' if is_green else 'RED' if is_red else 'DOJI'} | "
+            f"Buy check: {'PASS' if buy_candle_passed else 'FAIL'} | "
+            f"Sell check: {'PASS' if sell_candle_passed else 'FAIL'} | "
+            f"Index: i15={i15} | "
+            f"Timestamp: {format_ist_time(ts_curr)}"
+        )
+   
         buy_candle_reason = (
             f"✓ Passed (wick {buy_wick_ratio*100:.1f}%)" if buy_candle_passed
-            else f"Failed: {'RED candle' if not is_green else f'wick {buy_wick_ratio*100:.1f}% or RVOL'}"
+            else f"Failed: {'RED candle' if not is_green else f'wick {buy_wick_ratio*100:.1f}% or RVOL/ADX'}"
         )
         sell_candle_reason = (
             f"✓ Passed (wick {sell_wick_ratio*100:.1f}%)" if sell_candle_passed
-            else f"Failed: {'GREEN candle' if not is_red else f'wick {sell_wick_ratio*100:.1f}% or RVOL'}"
+            else f"Failed: {'GREEN candle' if not is_red else f'wick {sell_wick_ratio*100:.1f}% or RVOL/ADX'}"
         )
 
         if buy_candle_passed:
@@ -3667,7 +3752,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             elif buy_wick_ratio >= Constants.MIN_WICK_RATIO:
                 buy_candle_reason = f"Upper wick TOO LARGE: {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
             else:
-                buy_candle_reason = f"RVOL or other filter failed"
+                buy_candle_reason = f"RVOL or ADX filter failed"
 
         if sell_candle_passed:
             sell_candle_reason = f"✓ Quality Passed (wick: {sell_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
@@ -3679,7 +3764,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             elif sell_wick_ratio >= Constants.MIN_WICK_RATIO:
                 sell_candle_reason = f"Lower wick TOO LARGE: {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
             else:
-                sell_candle_reason = f"RVOL or other filter failed"
+                sell_candle_reason = f"RVOL or ADX filter failed"
 
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
@@ -3720,8 +3805,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available, "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
     
-            "buy_wick_ratio": buy_wick_ratio if 'buy_wick_ratio' in locals() else 0.0,
-            "sell_wick_ratio": sell_wick_ratio if 'sell_wick_ratio' in locals() else 0.0,
+            "buy_wick_ratio": buy_wick_ratio,
+            "sell_wick_ratio": sell_wick_ratio,
             "is_green": is_green, "is_red": is_red,
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
@@ -3835,13 +3920,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if trigger and not previous_states.get(key, False):
                 extra = ""
                 try:
-                    extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
+                    base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
+                    candle_type = "🟢" if is_green else "🔴" if is_red else "⚪"
+                    ohlc_debug = (
+                        f" {candle_type} (O:{open_curr:.4f} H:{high_curr:.4f} "
+                        f"L:{low_curr:.4f} C:{close_curr:.4f})"
+                    )
+                    
+                    ts_debug = f" [i15={i15}, {format_ist_time(ts_curr)}]"
+                    
+                    extra = f"{base_extra}{ohlc_debug}{ts_debug}"
+                    
                 except Exception as e:
                     logger_pair.error(
-                        f"Alert extra_fn failed for {alert_key}, firing alert without extra details: {e}",
-                        exc_info=False
+                        f"Alert extra_fn failed for {alert_key}: {e}",
+                        exc_info=cfg.DEBUG_MODE
                     )
-                    extra = f"(Error: {str(e)[:50]})"
+                    extra = f"(Error: {str(e)[:100]})"
 
                 raw_alerts.append((def_["title"], extra, def_["key"]))
                 all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
