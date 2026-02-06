@@ -3531,40 +3531,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             return None
         
-        if high_curr - low_curr < 1e-9:
+        candle_range = high_curr - low_curr
+        if candle_range < 1e-9:
             logger_pair.warning(
                 f"❌ ZERO-RANGE CANDLE for {pair_name} at index {i15} | "
                 f"H={high_curr:.8f} L={low_curr:.8f} | Skipping"
             )
             return None
-
+        
         is_green = close_curr > open_curr
         is_red = close_curr < open_curr
-        candle_range = high_curr - low_curr
         
-        if candle_range > 1e-9:
-            upper_wick_ratio = (high_curr - close_curr) / candle_range
-            lower_wick_ratio = (close_curr - low_curr) / candle_range
-            
-            buy_wick_ratio = upper_wick_ratio
-            sell_wick_ratio = lower_wick_ratio
-            
-            logger_pair.debug(
-                f"Wick analysis | {pair_name} | "
-                f"Candle: {'GREEN' if is_green else 'RED' if is_red else 'DOJI'} | "
-                f"Upper wick: {upper_wick_ratio*100:.1f}% | "
-                f"Lower wick: {lower_wick_ratio*100:.1f}% | "
-                f"Range: {candle_range:.8f}"
-            )
-        else:
-            buy_wick_ratio = 0.0
-            sell_wick_ratio = 0.0
-            logger_pair.warning(
-                f"Zero-range candle | {pair_name} | "
-                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} "
-                f"L={low_curr:.8f} C={close_curr:.8f}"
-            )
-     
         if not is_green and not is_red:
             if logger_pair.isEnabledFor(logging.DEBUG):
                 logger_pair.debug(
@@ -3572,7 +3549,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"(O={open_curr:.2f}, C={close_curr:.2f}), skipping indicators"
                 )
             return None
-       
+        
+        if is_green:
+            upper_wick = high_curr - close_curr
+            buy_wick_ratio = upper_wick / candle_range
+            sell_wick_ratio = float('nan')
+        else:
+            lower_wick = close_curr - low_curr
+            sell_wick_ratio = lower_wick / candle_range
+            buy_wick_ratio = float('nan')
+        
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
         )
@@ -3586,7 +3572,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if not is_valid:
             logger_pair.warning(f"Skipping {pair_name}: {msg}")
             return None
-
+        
         ppo = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
         smooth_rsi = indicators["smooth_rsi"]
@@ -3675,64 +3661,45 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma200_5_val = rma200_5[i5]
 
         adx_15m = calculate_adx_core(
-            data_15m["high"],
-            data_15m["low"],
-            data_15m["close"],
-            cfg.ADX_DI_LENGTH,
-            cfg.ADX_SMOOTHING_LENGTH
-        )        
+            data_15m["high"], data_15m["low"], data_15m["close"],
+            cfg.ADX_DI_LENGTH, cfg.ADX_SMOOTHING_LENGTH
+        )
         rvol_threshold = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
-
+        
         wick_check_results_buy = vectorized_wick_check_buy(
             data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
             Constants.MIN_WICK_RATIO,
             indicators["atr_short"], indicators["atr_long"],
-            rvol_threshold,
-            adx_15m,                      
-            cfg.ENABLE_ADX_FILTER,            
-            cfg.ADX_THRESHOLD                
+            rvol_threshold, adx_15m, cfg.ENABLE_ADX_FILTER, cfg.ADX_THRESHOLD
         )
-
         wick_check_results_sell = vectorized_wick_check_sell(
             data_15m["open"], data_15m["high"], data_15m["low"], data_15m["close"],
             Constants.MIN_WICK_RATIO,
             indicators["atr_short"], indicators["atr_long"],
-            rvol_threshold,
-            adx_15m,                   
-            cfg.ENABLE_ADX_FILTER,     
-            cfg.ADX_THRESHOLD         
+            rvol_threshold, adx_15m, cfg.ENABLE_ADX_FILTER, cfg.ADX_THRESHOLD
         )
-
+        
         buy_candle_passed = bool(wick_check_results_buy[i15])
         sell_candle_passed = bool(wick_check_results_sell[i15])
         
+        if is_green and buy_candle_passed:
+            if buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger_pair.error(f"Mismatch: green candle passed but wick {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%")
+                buy_candle_passed = False
+
+        if is_red and sell_candle_passed:
+            if sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+                logger_pair.error(f"Mismatch: red candle passed but wick {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%")
+                sell_candle_passed = False
+
         if is_green and sell_candle_passed:
-            logger_pair.error(
-                f"🚨 CRITICAL LOGIC ERROR: GREEN candle passed SELL wick check! | "
-                f"Pair: {pair_name} | i15: {i15} | "
-                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
-                f"This should NEVER happen - data corruption or vectorized check bug!"
-            )
-            return None
-        
+            logger_pair.error(f"CRITICAL: Green candle passed SELL check!")
+            sell_candle_passed = False
+
         if is_red and buy_candle_passed:
-            logger_pair.error(
-                f"🚨 CRITICAL LOGIC ERROR: RED candle passed BUY wick check! | "
-                f"Pair: {pair_name} | i15: {i15} | "
-                f"OHLC: O={open_curr:.8f} H={high_curr:.8f} L={low_curr:.8f} C={close_curr:.8f} | "
-                f"This should NEVER happen - data corruption or vectorized check bug!"
-            )
-            return None
-        
-        logger_pair.debug(
-            f"Wick checks for {pair_name} | "
-            f"Candle: {'GREEN' if is_green else 'RED' if is_red else 'DOJI'} | "
-            f"Buy check: {'PASS' if buy_candle_passed else 'FAIL'} | "
-            f"Sell check: {'PASS' if sell_candle_passed else 'FAIL'} | "
-            f"Index: i15={i15} | "
-            f"Timestamp: {format_ist_time(ts_curr)}"
-        )
-   
+            logger_pair.error(f"CRITICAL: Red candle passed BUY check!")
+            buy_candle_passed = False
+
         buy_candle_reason = (
             f"✓ Passed (wick {buy_wick_ratio*100:.1f}%)" if buy_candle_passed
             else f"Failed: {'RED candle' if not is_green else f'wick {buy_wick_ratio*100:.1f}% or RVOL/ADX'}"
