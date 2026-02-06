@@ -3024,19 +3024,28 @@ class TelegramQueue:
 
         return all(results)
 
+import re
+
+def _clean_extra(extra: str) -> str:
+    if not extra:
+        return ""
+    extra = re.sub(r"\(O:[^)]*\)", "", extra)
+    extra = re.sub(r"
+
+\[i15=[^]]*\]
+
+", "", extra)
+    return extra.strip()
+
 def build_single_msg(title, pair, price, ts, extra=None):
     if not title:
         title = "ALERT"
     parts = title.split(" ", 1)
     symbols = parts[0]
     description = parts[1] if len(parts) == 2 else title
-
     price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
 
-    if extra:
-        clean_extra = extra.split("[")[0].strip()
-    else:
-        clean_extra = ""
+    clean_extra = _clean_extra(extra) if extra else ""
 
     date_str = format_ist_time(ts, "%d-%m-%Y")
     time_str = format_ist_time(ts, "%H:%M IST")
@@ -3064,7 +3073,7 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     for idx, (title, extra) in enumerate(items):
         parts = title.split(" ", 1)
         description = parts[1] if len(parts) == 2 else title
-        clean_extra = extra.split("[")[0].strip()
+        clean_extra = _clean_extra(extra)
 
         prefix = "└➤" if idx == len(items) - 1 else "├➤"
         bullets.append(f"{prefix} {description} : {clean_extra}")
