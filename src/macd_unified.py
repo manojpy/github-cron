@@ -3025,54 +3025,86 @@ class TelegramQueue:
         return all(results)
 
 def build_single_msg(title, pair, price, ts, extra=None):
-    if not title: title = "ALERT"
+    if not title:
+        title = "ALERT"
     parts = title.split(" ", 1)
     symbols = parts[0]
     description = parts[1] if len(parts) == 2 else title
+
     price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
-    line2 = f"{description} : {extra}" if extra else description
-    return escape_markdown_v2(f"{symbols} {pair} - {price_str}\n{line2}\n{format_ist_time(ts, '%d-%m-%Y %H:%M IST')}")
-        
+
+    if extra:
+        clean_extra = extra.split("[")[0].strip()
+    else:
+        clean_extra = ""
+
+    date_str = format_ist_time(ts, "%d-%m-%Y")
+    time_str = format_ist_time(ts, "%H:%M IST")
+
+    msg = (
+        f"{symbols} {pair} - {price_str}\n"
+        f"{description} : {clean_extra}\n"
+        f"{date_str:<15}{time_str:>30}"
+    )
+    return escape_markdown_v2(msg)
+
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
     if not items:
-        return escape_markdown_v2(f"{pair} - ${price:,.2f} {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}")
-    
+        return escape_markdown_v2(
+            f"{pair} - ${price:,.2f}\n{format_ist_time(ts, '%d-%m-%Y %H:%M IST')}"
+        )
+
     headline_emoji = items[0][0].split(" ", 1)[0] if items[0][0] else "📊"
-    headline = f"{headline_emoji} **{pair}** • ${price:,.2f}  {format_ist_time(ts, '%d-%m-%Y %H:%M IST')}"
-    
+    price_str = f"${price:,.2f}"
+
+    date_str = format_ist_time(ts, "%d-%m-%Y")
+    time_str = format_ist_time(ts, "%H:%M IST")
+
     bullets = []
     for idx, (title, extra) in enumerate(items):
+        parts = title.split(" ", 1)
+        description = parts[1] if len(parts) == 2 else title
+        clean_extra = extra.split("[")[0].strip()
+
         prefix = "└➤" if idx == len(items) - 1 else "├➤"
-        bullets.append(f"{prefix} {title} | {extra}")
-    
+        bullets.append(f"{prefix} {description} : {clean_extra}")
+
     body = "\n".join(bullets)
-    return escape_markdown_v2(f"{headline}\n{body}")
+
+    msg = (
+        f"{headline_emoji} {pair} - {price_str}\n"
+        f"{body}\n"
+        f"{date_str:<15}{time_str:>30}"
+    )
+    return escape_markdown_v2(msg)
 
 def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
     """Factory function to create pivot alert definition without lambdas"""
     if is_buy:
         return {
             "key": f"pivot_up_{level}",
-            "title": f"🟢 Cross above {level}",
+            "title": f"🟢⬆️ Cross above {level}",
             "check_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 ctx.get("buy_common", False) and 
                 get_pivot_alert_info(ctx, level, is_buy=True)[0]
             ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                f"${ctx['pivots'][level]:,.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%"
+                f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             ),
             "requires": ["pivots"]
         }
     else:
         return {
             "key": f"pivot_down_{level}",
-            "title": f"🔴 Cross below {level}",
+            "title": f"🔴⬇️ Cross below {level}",
             "check_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 ctx.get("sell_common", False) and 
                 get_pivot_alert_info(ctx, level, is_buy=False)[0]
             ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                f"${ctx['pivots'][level]:,.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%"
+                f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
             ),
             "requires": ["pivots"]
         }
@@ -3085,18 +3117,18 @@ class AlertDefinition(TypedDict):
     requires: List[str]
  
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"rsi_50_up","title":"🟢 RSI cross above 50","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
-    {"key":"rsi_50_down","title":"🔴 RSI cross below 50","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
-    {"key":"vwap_up","title":"🔵 VWAP cross above","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣 VWAP cross below","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
-    {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False) and ctx.get("buy_wick_ratio",1.0)<Constants.MIN_WICK_RATIO),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False) and ctx.get("sell_wick_ratio",1.0)<Constants.MIN_WICK_RATIO),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
+    {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
+    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
+    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]}, 
+    {"key":"mmh_buy", "title":"🔵⬆️ MMH Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False) and ctx.get("buy_wick_ratio", 1.0) < Constants.MIN_WICK_RATIO), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%", "requires":[]},   
+    {"key":"mmh_sell", "title":"🟣⬇️ MMH Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False) and ctx.get("sell_wick_ratio", 1.0) < Constants.MIN_WICK_RATIO), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%", "requires":[]}
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
