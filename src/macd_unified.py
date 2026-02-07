@@ -3431,6 +3431,40 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"(need >={Constants.MIN_CLOSED_CANDLES_15M})"
                 )
             return None
+
+        interval_seconds = 15 * 60
+        ts_candidate = normalize_timestamp(data_15m["timestamp"][i15])
+        candidate_close_time = ts_candidate + interval_seconds
+        time_until_close = candidate_close_time - reference_time
+
+        if time_until_close > 0:
+            logger_pair.warning(
+                f"{pair_name}: Forming candle detected at i15={i15}. "
+                f"Falling back to previous candle."
+            )
+    
+            i15_fallback = i15 - 1
+    
+            if i15_fallback < Constants.MIN_CLOSED_CANDLES_15M:
+                return None
+    
+            ts_fallback = normalize_timestamp(data_15m["timestamp"][i15_fallback])
+            fallback_close_time = ts_fallback + interval_seconds
+            fallback_time_since_close = reference_time - fallback_close_time
+    
+            if fallback_time_since_close < 30:
+                logger_pair.warning(
+                    f"{pair_name}: Fallback candle too fresh "
+                    f"({fallback_time_since_close}s since close). Skipping."
+                )
+                return None
+    
+            i15 = i15_fallback
+    
+            logger_pair.debug(
+                f"{pair_name}: Using fallback candle i15={i15} "
+                f"(timestamp: {format_ist_time(ts_fallback)})"
+            )
         
         is_valid, error_msg = validate_candle_data_at_index(
             data_15m, i15, reference_time, interval_minutes=15
