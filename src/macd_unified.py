@@ -3024,17 +3024,11 @@ class TelegramQueue:
 
         return all(results)
 
-import re
-
 def _clean_extra(extra: str) -> str:
     if not extra:
         return ""
     extra = re.sub(r"\(O:[^)]*\)", "", extra)
-    extra = re.sub(r"
-
-\[i15=[^]]*\]
-
-", "", extra)
+    extra = re.sub(r"\[i15=[^]]*\]", "", extra)
     return extra.strip()
 
 def build_single_msg(title, pair, price, ts, extra=None):
