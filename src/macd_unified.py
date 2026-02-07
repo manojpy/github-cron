@@ -3511,7 +3511,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             alignment_cache[cache_key] = i5
             alignment_cache.move_to_end(cache_key)
 
-            if len(alignment_cache) > MAX_ALIGNMENT_CACHE:
+            if len(alignment_cache) > Constants.MAX_ALIGNMENT_CACHE:
                 alignment_cache.popitem(last=False)
 
         if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
