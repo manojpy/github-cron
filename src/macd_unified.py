@@ -16,7 +16,7 @@ import psutil
 import math
 import gc
 import json
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict 
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 import contextlib 
 import traceback
+
 
 from aot_bridge import (
     sanitize_array_numba,
@@ -131,7 +132,8 @@ class Constants:
     MIN_CLOSED_CANDLES_15M = 4          
     MIN_ALIGNED_5M_CANDLES = 2               
     CANDLE_FETCH_BUFFER_PERIODS = 3 
-    API_TIMESTAMP_TOLERANCE_SEC = 300 
+    API_TIMESTAMP_TOLERANCE_SEC = 300
+    MAX_ALIGNMENT_CACHE = 500
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -3498,12 +3500,19 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             return None
 
         cache_key = f"{pair_name}_{ts_15m_val}"
+
         if cache_key in alignment_cache:
             i5 = alignment_cache[cache_key]
+            alignment_cache.move_to_end(cache_key)  # mark as recently used
         else:
             idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
             i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
+
             alignment_cache[cache_key] = i5
+            alignment_cache.move_to_end(cache_key)
+
+            if len(alignment_cache) > MAX_ALIGNMENT_CACHE:
+                alignment_cache.popitem(last=False)
 
         if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
             if cfg.DEBUG_MODE:
@@ -4185,7 +4194,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
     correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
 
-    alignment_cache: Dict[str, int] = {}
+    alignment_cache: Dict[str, int] = OrderedDict()
 
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
@@ -4526,7 +4535,7 @@ async def run_once() -> bool:
         candles_str = f"{fetcher_stats['candles']['success']}/{total_required}"
 
         logger_run.info(
-            f"��� Fetch Stats | "
+            f"Fetch Stats | "
             f"Products: config only | "
             f"Candles: {candles_str}"
         )
