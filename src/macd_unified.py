@@ -3024,62 +3024,69 @@ class TelegramQueue:
 
         return all(results)
 
-def _clean_extra(extra: str) -> str:
-    if not extra:
-        return ""
-    extra = re.sub(r"\(O:[^)]*\)", "", extra)
-    extra = re.sub(r"\[i15=[^]]*\]", "", extra)
-    return extra.strip()
-
 def build_single_msg(title, pair, price, ts, extra=None):
-    if not title:
+    """Build a clean, formatted alert message."""
+    if not title: 
         title = "ALERT"
+    
     parts = title.split(" ", 1)
     symbols = parts[0]
     description = parts[1] if len(parts) == 2 else title
+    
     price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
-
-    clean_extra = _clean_extra(extra) if extra else ""
-
-    date_str = format_ist_time(ts, "%d-%m-%Y")
-    time_str = format_ist_time(ts, "%H:%M IST")
-
-    msg = (
-        f"{symbols} {pair} - {price_str}\n"
-        f"{description} : {clean_extra}\n"
-        f"{date_str:<15}{time_str:>30}"
-    )
-    return escape_markdown_v2(msg)
-
+    
+    line1 = f"{symbols} {pair} - {price_str}"
+    
+    if extra:
+        extra_clean = extra
+        extra_clean = re.sub(r'🟢|🔴', '', extra_clean)  # Remove color emojis
+        extra_clean = re.sub(r'\(O:[\d.]+ H:[\d.]+ L:[\d.]+ C:[\d.]+\)', '', extra_clean)  # Remove OHLC
+        extra_clean = re.sub(r'\[i15=\d+,\s*[\d-]+\s+[\d:]+\s+IST\]', '', extra_clean)  # Remove index info
+        extra_clean = extra_clean.strip()
+        line2 = f"{description} : {extra_clean}"
+    else:
+        line2 = description
+    
+    date_str = format_ist_time(ts, '%d-%m-%Y')
+    time_str = format_ist_time(ts, '%H:%M IST')
+    spacing = " " * 15
+    line3 = f"🗓️ {date_str}{spacing}🕙 {time_str}"
+    
+    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
+        
 def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
+    """Build a batched alert message when multiple alerts fire for same pair."""
     if not items:
-        return escape_markdown_v2(
-            f"{pair} - ${price:,.2f}\n{format_ist_time(ts, '%d-%m-%Y %H:%M IST')}"
-        )
-
+        date_str = format_ist_time(ts, '%d-%m-%Y')
+        time_str = format_ist_time(ts, '%H:%M IST')
+        spacing = " " * 15
+        return escape_markdown_v2(f"{pair} - ${price:,.2f}\n🗓️ {date_str}{spacing}🕙 {time_str}")
+    
     headline_emoji = items[0][0].split(" ", 1)[0] if items[0][0] else "📊"
-    price_str = f"${price:,.2f}"
-
-    date_str = format_ist_time(ts, "%d-%m-%Y")
-    time_str = format_ist_time(ts, "%H:%M IST")
-
-    bullets = []
+    
+    line1 = f"{headline_emoji} {pair} - ${price:,.2f}"
+    
+    alert_lines = []
     for idx, (title, extra) in enumerate(items):
         parts = title.split(" ", 1)
         description = parts[1] if len(parts) == 2 else title
-        clean_extra = _clean_extra(extra)
-
+        
+        extra_clean = extra
+        extra_clean = re.sub(r'🟢|🔴', '', extra_clean)
+        extra_clean = re.sub(r'\(O:[\d.]+ H:[\d.]+ L:[\d.]+ C:[\d.]+\)', '', extra_clean)
+        extra_clean = re.sub(r'\[i15=\d+,\s*[\d-]+\s+[\d:]+\s+IST\]', '', extra_clean)
+        extra_clean = extra_clean.strip()
+        
         prefix = "└➤" if idx == len(items) - 1 else "├➤"
-        bullets.append(f"{prefix} {description} : {clean_extra}")
-
-    body = "\n".join(bullets)
-
-    msg = (
-        f"{headline_emoji} {pair} - {price_str}\n"
-        f"{body}\n"
-        f"{date_str:<15}{time_str:>30}"
-    )
-    return escape_markdown_v2(msg)
+        alert_lines.append(f"{prefix} {description} : {extra_clean}")
+    
+    date_str = format_ist_time(ts, '%d-%m-%Y')
+    time_str = format_ist_time(ts, '%H:%M IST')
+    spacing = " " * 15
+    datetime_line = f"🗓️ {date_str}{spacing}🕙 {time_str}"
+    
+    body = "\n".join(alert_lines)
+    return escape_markdown_v2(f"{line1}\n{body}\n{datetime_line}")
 
 def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
     """Factory function to create pivot alert definition without lambdas"""
