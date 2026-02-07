@@ -3050,7 +3050,7 @@ def build_single_msg(title, pair, price, ts, extra=None):
     date_str = format_ist_time(ts, '%d-%m-%Y')
     time_str = format_ist_time(ts, '%H:%M IST')
     spacing = " " * 15
-    line3 = f"🗓️ {date_str}{spacing}🕙 {time_str}"
+    line3 = f"📅 {date_str}{spacing}⏰ {time_str}"
     
     return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
         
@@ -3083,7 +3083,7 @@ def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, s
     date_str = format_ist_time(ts, '%d-%m-%Y')
     time_str = format_ist_time(ts, '%H:%M IST')
     spacing = " " * 15
-    datetime_line = f"🗓️ {date_str}{spacing}🕙 {time_str}"
+    datetime_line = f"📅 {date_str}{spacing}⏰ {time_str}"
     
     body = "\n".join(alert_lines)
     return escape_markdown_v2(f"{line1}\n{body}\n{datetime_line}")
@@ -4585,7 +4585,7 @@ async def run_once() -> bool:
         candles_str = f"{fetcher_stats['candles']['success']}/{total_required}"
 
         logger_run.info(
-            f"📊 Fetch Stats | "
+            f"��� Fetch Stats | "
             f"Products: config only | "
             f"Candles: {candles_str}"
         )
