@@ -4160,13 +4160,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                 logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
             return None
         
-        v15_selected, r15_selected = validate_candle_data_at_index(
-            data_15m, i15, reference_time, interval_minutes=15
-        )
-        if not v15_selected:
-            logger_main.warning(f"Skipping {p_name}: selected candle invalid ({r15_selected})")
-            return None
-        
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, alignment_cache
