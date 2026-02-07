@@ -1958,123 +1958,6 @@ def validate_candle_data(data: Optional[Dict[str, np.ndarray]],
 
     return True, None
 
-def validate_candle_data_at_index(data: Optional[Dict[str, np.ndarray]], selected_index: int, reference_time: int, interval_minutes: int = 15) -> Tuple[bool, Optional[str]]:
-    try:
-        valid, msg = _validate_basic_candle_data(data)
-        if not valid:
-            return False, msg
-
-        close = data["close"]
-        timestamp = data["timestamp"]
-        open_arr = data["open"]
-        high_arr = data["high"]
-        low_arr = data["low"]
-
-        array_len = len(close)
-        if selected_index < 0 or selected_index >= array_len:
-            return False, f"Selected index {selected_index} out of range [0, {array_len - 1}]"
-
-        selected_candle_time = normalize_timestamp(timestamp[selected_index])
-        interval_seconds = interval_minutes * 60
-        current_period_start = (reference_time // interval_seconds) * interval_seconds
-
-        if selected_candle_time >= current_period_start:
-            return False, (
-                f"Selected candle is still forming! "
-                f"Candle ts: {format_ist_time(selected_candle_time)} >= "
-                f"Current period: {format_ist_time(current_period_start)}"
-            )
-
-        staleness = reference_time - selected_candle_time
-        max_staleness = cfg.MAX_CANDLE_STALENESS_SEC
-        
-        if staleness > max_staleness:
-            return False, (
-                f"Selected candle is stale: {staleness}s old (max: {max_staleness}s) | "
-                f"Candle: {format_ist_time(selected_candle_time)} | "
-                f"Current: {format_ist_time(reference_time)}"
-            )
-        
-        o = open_arr[selected_index]
-        h = high_arr[selected_index]
-        l = low_arr[selected_index]
-        c = close[selected_index]
-        
-        nan_check = np.isnan(o) | np.isnan(h) | np.isnan(l) | np.isnan(c)
-        if nan_check:
-            return False, (
-                f"Selected candle has NaN value(s): "
-                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
-            )
-        
-        inf_check = np.isinf(o) | np.isinf(h) | np.isinf(l) | np.isinf(c)
-        if inf_check:
-            return False, (
-                f"Selected candle has Infinity value(s): "
-                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
-            )
-        
-        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            return False, (
-                f"Selected candle has non-positive price(s): "
-                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
-            )
-
-        relationships_valid = (l <= o) and (o <= h) and (l <= c) and (c <= h) and (l <= h)
-        
-        if not relationships_valid:
-            checks = {
-                "L≤O": l <= o,
-                "O≤H": o <= h,
-                "L≤C": l <= c,
-                "C≤H": c <= h,
-                "L≤H": l <= h
-            }
-            failed_checks = [k for k, v in checks.items() if not v]
-            
-            return False, (
-                f"Selected candle has invalid OHLC relationships! "
-                f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
-                f"Failed: {', '.join(failed_checks)}"
-            )
-        
-        if selected_index > 0:
-            prev_close = close[selected_index - 1]
-            
-            if not np.isnan(prev_close) and prev_close > 0:
-                price_change_pct = abs(c - prev_close) / prev_close * 100
-                
-                if price_change_pct > Constants.MAX_PRICE_CHANGE_PERCENT:
-                    return False, (
-                        f"Extreme price gap detected: {price_change_pct:.2f}% "
-                        f"(max: {Constants.MAX_PRICE_CHANGE_PERCENT}%) | "
-                        f"Previous close: {prev_close:.2f}, Current close: {c:.2f}"
-                    )
-        
-        if cfg.DEBUG_MODE:
-            logger.debug(
-                f"validate_candle_data_at_index: PASSED | "
-                f"Index: {selected_index} | "
-                f"Time: {format_ist_time(selected_candle_time)} | "
-                f"OHLC: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
-            )
-        
-        return True, None
-    
-    except IndexError as e:
-        logger.error(
-            f"validate_candle_data_at_index: Index error at {selected_index}: {e}",
-            exc_info=True
-        )
-        return False, f"Index out of bounds: {str(e)}"
-    
-    except Exception as e:
-        logger.error(
-            f"validate_candle_data_at_index: Unexpected error at index {selected_index}: {e}",
-            exc_info=True
-        )
-        return False, f"Validation error: {str(e)}"
-
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 2:
         return None
@@ -3425,53 +3308,95 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
 
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Insufficient 15m data: {i15} closed "
-                    f"(need >={Constants.MIN_CLOSED_CANDLES_15M})"
-                )
             return None
 
         interval_seconds = 15 * 60
-        ts_candidate = normalize_timestamp(data_15m["timestamp"][i15])
-        candidate_close_time = ts_candidate + interval_seconds
-        time_until_close = candidate_close_time - reference_time
 
-        if time_until_close > 0:
+        ts_curr = normalize_timestamp(data_15m["timestamp"][i15])
+        candidate_close_time = ts_curr + interval_seconds
+
+        if reference_time < candidate_close_time:
             logger_pair.warning(
-                f"{pair_name}: Forming candle detected at i15={i15}. "
-                f"Falling back to previous candle."
+                f"{pair_name}: Selected candle forming. Falling back."
             )
-    
-            i15_fallback = i15 - 1
-    
-            if i15_fallback < Constants.MIN_CLOSED_CANDLES_15M:
+
+            i15 -= 1
+
+            if i15 < Constants.MIN_CLOSED_CANDLES_15M:
                 return None
-    
-            ts_fallback = normalize_timestamp(data_15m["timestamp"][i15_fallback])
-            fallback_close_time = ts_fallback + interval_seconds
-            fallback_time_since_close = reference_time - fallback_close_time
-    
-            if fallback_time_since_close < 30:
+
+            ts_curr = normalize_timestamp(data_15m["timestamp"][i15])
+            candidate_close_time = ts_curr + interval_seconds
+
+        o = data_15m["open"][i15]
+        h = data_15m["high"][i15]
+        l = data_15m["low"][i15]
+        c = data_15m["close"][i15]
+
+        is_green = c > o
+        is_red = c < o
+
+        if not is_green and not is_red:
+            logger_pair.debug(
+                f"{pair_name}: Neutral candle. Skipping."
+            )
+            return None
+
+        if (
+            np.isnan(o) or np.isnan(h) or
+            np.isnan(l) or np.isnan(c) or
+            o <= 0 or h <= 0 or l <= 0 or c <= 0 or
+            not (l <= o <= h and l <= c <= h)
+        ):
+            logger_pair.warning(
+                f"{pair_name}: Invalid OHLC values at selected candle."
+            )
+            return None
+
+        time_since_close = reference_time - candidate_close_time
+
+        if time_since_close < 30:
+            logger_pair.warning(
+                f"⚠️ {pair_name}: Candle too fresh ({time_since_close}s). Skipping."
+            )
+            return None
+
+        if (reference_time - ts_curr) > cfg.MAX_CANDLE_STALENESS_SEC:
+            logger_pair.debug(
+                f"{pair_name}: Candle stale. Skipping."
+            )
+            return None
+
+        if i15 >= 1:
+            ts_prev = normalize_timestamp(data_15m["timestamp"][i15 - 1])
+            expected_prev = ts_curr - interval_seconds
+
+            if abs(ts_prev - expected_prev) > 30:
                 logger_pair.warning(
-                    f"{pair_name}: Fallback candle too fresh "
-                    f"({fallback_time_since_close}s since close). Skipping."
+                    f"⚠️ {pair_name}: Time gap detected. Skipping."
                 )
                 return None
-    
-            i15 = i15_fallback
-    
-            logger_pair.debug(
-                f"{pair_name}: Using fallback candle i15={i15} "
-                f"(timestamp: {format_ist_time(ts_fallback)})"
-            )
-        
-        is_valid, error_msg = validate_candle_data_at_index(
-            data_15m, i15, reference_time, interval_minutes=15
+
+            close_curr = data_15m["close"][i15]
+            close_prev = data_15m["close"][i15 - 1]
+
+            if close_prev <= 0 or np.isnan(close_prev):
+                logger_pair.warning(
+                    f"⚠️ {pair_name}: Invalid prev close ({close_prev})."
+                )
+                return None
+
+            pct = abs(close_curr - close_prev) / close_prev * 100
+
+            if pct > Constants.MAX_PRICE_CHANGE_PERCENT:
+                logger_pair.warning(
+                    f"⚠️ {pair_name}: Extreme price gap ({pct:.2f}%)."
+                )
+                return None
+
+        logger_pair.debug(
+            f"✅ {pair_name}: Candle validated | i15={i15}"
         )
-        if not is_valid:
-            logger_pair.warning(f"Skipping {pair_name}: {error_msg}")
-            return None
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
@@ -3611,17 +3536,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"❌ ZERO-RANGE CANDLE for {pair_name} at index {i15} | "
                 f"H={high_curr:.8f} L={low_curr:.8f} | Skipping"
             )
-            return None
-        
-        is_green = close_curr > open_curr
-        is_red = close_curr < open_curr
-        
-        if not is_green and not is_red:
-            if logger_pair.isEnabledFor(logging.DEBUG):
-                logger_pair.debug(
-                    f"Doji/neutral candle for {pair_name} "
-                    f"(O={open_curr:.2f}, C={close_curr:.2f}), skipping indicators"
-                )
             return None
         
         if is_green:
