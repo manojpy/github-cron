@@ -3571,7 +3571,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         sell_candle_reason = (
             f"✓ Passed (wick {sell_wick_ratio*100:.1f}%)" if sell_candle_passed
             else f"Failed: {'GREEN candle' if not is_red else f'wick {sell_wick_ratio*100:.1f}% or RVOL/ADX'}"
-        )
+        )0
 
         if buy_candle_passed:
             buy_candle_reason = f"✓ Quality Passed (wick: {buy_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
@@ -4230,30 +4230,25 @@ async def run_once() -> bool:
                 last_reset_date_str = await sdb.get_metadata(day_tracker_key)
             except Exception as e:
                 logger_run.warning(f"Failed to get last reset date: {e}")
-            
+     
+
             if should_reset_daily_state(reference_time, last_reset_date_str):
                 logger_run.info(f"🔄 New day detected ({current_date_str}). Resetting daily states...")
-                try:
-                    await sdb.set_metadata(day_tracker_key, current_date_str)
-                except Exception as e:
-                    logger_run.error(f"Failed to save global reset date: {e}")
-                    raise
-                
+    
                 all_delete_keys = []
-                
+    
                 if cfg.ENABLE_PIVOT:
-                    pivot_alerts = [
-                        "pivot_up_P", "pivot_up_S1", "pivot_up_S2", "pivot_up_S3",
-                        "pivot_up_R1", "pivot_up_R2",
-                        "pivot_down_P", "pivot_down_S1", "pivot_down_S2",
-                        "pivot_down_S3", "pivot_down_R1", "pivot_down_R2", "pivot_down_R3"
-                    ]
+                    pivot_alerts = (
+                        [f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY] +
+                        [f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL]
+                    )
+        
                     for pair in pairs_to_process:
                         for alert_key in pivot_alerts:
                             redis_key = ALERT_KEYS.get(alert_key)
                             if redis_key:
                                 all_delete_keys.append(f"{pair}:{redis_key}")
-                
+    
                 if cfg.ENABLE_VWAP:
                     vwap_alerts = ["vwap_up", "vwap_down"]
                     for pair in pairs_to_process:
@@ -4261,17 +4256,23 @@ async def run_once() -> bool:
                             redis_key = ALERT_KEYS.get(alert_key)
                             if redis_key:
                                 all_delete_keys.append(f"{pair}:{redis_key}")
-                
+   
                 if all_delete_keys:
                     try:
                         await sdb.atomic_batch_update([], deletes=all_delete_keys)
                         logger_run.info(
-                            f"✅ Daily reset complete ({current_date_str}). "
-                            f"Cleared {len(all_delete_keys)} alerts from {len(pairs_to_process)} pairs"
+                            f"✅ Cleared {len(all_delete_keys)} daily alert keys "
+                            f"from {len(pairs_to_process)} pairs"
                         )
                     except Exception as e:
-                        logger_run.error(f"Failed to delete reset keys: {e}")
+                        logger_run.error(f"❌ Failed to delete daily reset keys: {e}")
                         raise
+    
+                try:
+                    await sdb.set_metadata(day_tracker_key, current_date_str)
+                    logger_run.info(f"✅ Daily reset complete ({current_date_str})")
+                except Exception as e:
+                    logger_run.error(f"⚠️ Failed to save reset date: {e}")
             else:
                 logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
 
