@@ -1186,7 +1186,6 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
     
     return True, None
 
-
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
     if atr_short is None or atr_long is None:
@@ -1925,41 +1924,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         )
         return None
 
-def _validate_basic_candle_data(data: Optional[Dict[str, np.ndarray]]) -> Tuple[bool, Optional[str]]:
-    """Common validation for candle data structure."""
-    if data is None or not data:
-        return False, "Data is None or empty"
-    
-    close = data.get("close")
-    timestamp = data.get("timestamp")
-    open_arr = data.get("open")
-    high_arr = data.get("high")
-    low_arr = data.get("low")
-    
-    if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
-        return False, "Missing or empty OHLC/timestamp data"
-    
-    if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
-        return False, "OHLC arrays have mismatched lengths"
-    
-    return True, None
-
-def validate_candle_data(data: Optional[Dict[str, np.ndarray]], 
-                        required_len: int = 0) -> Tuple[bool, Optional[str]]:
-    valid, msg = _validate_basic_candle_data(data)
-    if not valid:
-        return False, msg
-
-    close = data["close"]
-    if len(close) < required_len:
-        return False, f"Insufficient data: {len(close)} < {required_len}"
-
-    timestamp = data["timestamp"]
-    if not np.all(timestamp[1:] >= timestamp[:-1]):
-        return False, "Timestamps not monotonic increasing"
-
-    return True, None
-
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 2:
         return None
@@ -2006,25 +1970,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
     
     return last_closed_idx
-
-def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
-    interval_seconds = interval_minutes * 60
-    current_window = reference_time // interval_seconds
-    expected_open_ts = (current_window * interval_seconds) - interval_seconds
-
-    diff = abs(candle_ts - expected_open_ts)
-    if diff > tolerance_seconds:
-        logger.error(
-            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
-            f"got {candle_ts} (diff: {diff}s)"
-        )
-        return False
-
-    logger.debug(
-        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
-        f"Got: {candle_ts} | Diff: {diff}s"
-    )
-    return True
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
@@ -3308,27 +3253,39 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     try:
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 
         interval_seconds = 15 * 60
-
         ts_curr = normalize_timestamp(data_15m["timestamp"][i15])
         candidate_close_time = ts_curr + interval_seconds
 
         if reference_time < candidate_close_time:
             logger_pair.warning(
-                f"{pair_name}: Selected candle forming. Falling back."
+                f"{pair_name}: Forming candle detected at i15={i15}. Falling back."
             )
-
+            
             i15 -= 1
-
+            
             if i15 < Constants.MIN_CLOSED_CANDLES_15M:
+                logger_pair.warning(f"{pair_name}: Fallback failed - insufficient history.")
                 return None
-
+            
             ts_curr = normalize_timestamp(data_15m["timestamp"][i15])
             candidate_close_time = ts_curr + interval_seconds
+            
+            if reference_time < candidate_close_time:
+                logger_pair.warning(f"{pair_name}: Fallback also forming. Skipping.")
+                return None
+            
+            time_since_close = reference_time - candidate_close_time
+            if time_since_close < 30:
+                logger_pair.warning(
+                    f"{pair_name}: Fallback too fresh ({time_since_close}s). Skipping."
+                )
+                return None
+            
+            logger_pair.debug(f"{pair_name}: Using fallback candle i15={i15}")
 
         o = data_15m["open"][i15]
         h = data_15m["high"][i15]
@@ -3339,20 +3296,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         is_red = c < o
 
         if not is_green and not is_red:
-            logger_pair.debug(
-                f"{pair_name}: Neutral candle. Skipping."
-            )
+            logger_pair.debug(f"{pair_name}: Neutral candle. Skipping.")
             return None
 
         if (
-            np.isnan(o) or np.isnan(h) or
-            np.isnan(l) or np.isnan(c) or
+            np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c) or
             o <= 0 or h <= 0 or l <= 0 or c <= 0 or
             not (l <= o <= h and l <= c <= h)
         ):
-            logger_pair.warning(
-                f"{pair_name}: Invalid OHLC values at selected candle."
-            )
+            logger_pair.warning(f"{pair_name}: Invalid OHLC values.")
             return None
 
         time_since_close = reference_time - candidate_close_time
@@ -3364,9 +3316,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             return None
 
         if (reference_time - ts_curr) > cfg.MAX_CANDLE_STALENESS_SEC:
-            logger_pair.debug(
-                f"{pair_name}: Candle stale. Skipping."
-            )
+            logger_pair.debug(f"{pair_name}: Candle stale. Skipping.")
             return None
 
         if i15 >= 1:
@@ -3374,143 +3324,59 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             expected_prev = ts_curr - interval_seconds
 
             if abs(ts_prev - expected_prev) > 30:
-                logger_pair.warning(
-                    f"⚠️ {pair_name}: Time gap detected. Skipping."
+                logger_pair.warning(f"⚠️ {pair_name}: Time gap detected. Skipping.")
+                return None
+            
+            if ts_curr == ts_prev:
+                logger_pair.error(
+                    f"❌ {pair_name}: Duplicate timestamps at i15={i15}. Data corruption!"
                 )
                 return None
 
-            close_curr = data_15m["close"][i15]
+            close_curr = c
             close_prev = data_15m["close"][i15 - 1]
 
             if close_prev <= 0 or np.isnan(close_prev):
-                logger_pair.warning(
-                    f"⚠️ {pair_name}: Invalid prev close ({close_prev})."
-                )
+                logger_pair.warning(f"⚠️ {pair_name}: Invalid prev close ({close_prev}).")
                 return None
 
             pct = abs(close_curr - close_prev) / close_prev * 100
 
             if pct > Constants.MAX_PRICE_CHANGE_PERCENT:
-                logger_pair.warning(
-                    f"⚠️ {pair_name}: Extreme price gap ({pct:.2f}%)."
-                )
+                logger_pair.warning(f"⚠️ {pair_name}: Extreme price gap ({pct:.2f}%).")
                 return None
 
-        logger_pair.debug(
-            f"✅ {pair_name}: Candle validated | i15={i15}"
-        )
+        logger_pair.debug(f"✅ {pair_name}: Candle validated | i15={i15}")
 
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
-
-        normalized_ts = normalize_timestamp(ts_15m_val)
-        candle_age = reference_time - normalized_ts
-        logger_pair.debug(
-            f"[DIAGNOSTIC] 15m Candle Selection | "
-            f"i15={i15} | "
-            f"API Timestamp: {ts_15m_val} ({format_ist_time(normalized_ts)}) | "
-            f"Reference Time: {reference_time} ({format_ist_time(reference_time)}) | "
-            f"Candle Age: {candle_age} seconds | "
-            f"OHLC: O={data_15m['open'][i15]:.8f} H={data_15m['high'][i15]:.8f} "
-            f"L={data_15m['low'][i15]:.8f} C={data_15m['close'][i15]:.8f} | "
-            f"Range: {data_15m['high'][i15] - data_15m['low'][i15]:.8f}"
-        )
-
-        ts_curr = normalize_timestamp(ts_15m_val)
-
-        if i15 >= 1:
-            ts_prev_val = data_15m["timestamp"][i15 - 1]
-            ts_prev = normalize_timestamp(ts_prev_val)
-            expected_prev = ts_curr - (15 * 60)  # 15 minutes
-            
-            time_diff = abs(ts_prev - expected_prev)
-            
-            if time_diff > 30:  # More than 30s deviation indicates gap
-                gap_minutes = (ts_curr - ts_prev) / 60.0
-                logger_pair.warning(
-                    f"⚠️ Data Gap Detected for {pair_name}! | "
-                    f"Current: {format_ist_time(ts_curr)} | "
-                    f"Previous: {format_ist_time(ts_prev)} | "
-                    f"Expected Previous: {format_ist_time(expected_prev)} | "
-                    f"Gap Size: {gap_minutes:.1f} minutes | "
-                    f"Timestamp Diff: {time_diff}s | "
-                    f"Skipping to avoid false signals from gapped data"
-                )
-                return None
-            
-            if ts_curr == ts_prev:
-                logger_pair.error(
-                    f"❌ DUPLICATE TIMESTAMPS for {pair_name}! | "
-                    f"Both i15={i15} and i15-1 have timestamp {format_ist_time(ts_curr)} | "
-                    f"DATA CORRUPTION - aborting"
-                )
-                return None
-        else:
-            logger_pair.debug(
-                f"Skipping continuity check for {pair_name} (i15={i15}, no previous candle)"
-            )
-
-        is_valid, error_msg = validate_timestamp_format(ts_curr, f"{pair_name}_15m_candle")
-        if not is_valid:
-            logger_pair.error(f"Invalid timestamp: {error_msg}")
-            return None
         
-        if not validate_candle_timestamp(ts_curr, reference_time, 15, 120):
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(f"Skipping {pair_name} - 15m candle not confirmed closed")
-            return None
-            
-        interval_seconds = 15 * 60
-        expected_candle_close_time = ts_curr + interval_seconds
-
-        time_since_candle_close = reference_time - expected_candle_close_time
-
-        if time_since_candle_close < 0:
-            logger_pair.warning(
-                f"FORMING CANDLE DETECTED for {pair_name}: "
-                f"Candle won't close for {abs(time_since_candle_close)}s"
-            )
-            return None
-
-        if time_since_candle_close < 30:
-            logger_pair.debug(
-                f"SKIPPING {pair_name}: Candle too fresh "
-                f"({time_since_candle_close}s since close, need ≥30s)"
-            )
-            return None
-
-        logger_pair.debug(
-            f"{pair_name}: Candle closed {time_since_candle_close}s ago ✓"
-        )
-          
-        if reference_time - ts_curr > cfg.MAX_CANDLE_STALENESS_SEC:
-            staleness_seconds = reference_time - ts_curr
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping {pair_name} - candle too stale "
-                    f"({staleness_seconds}s > {cfg.MAX_CANDLE_STALENESS_SEC}s)"
-                )
-            return None
+        candle_age = reference_time - ts_curr
         
-        if time_since_candle_close < Constants.CANDLE_PUBLICATION_LAG_SEC:
-            if cfg.DEBUG_MODE:
-                logger_pair.debug(
-                    f"Skipping {pair_name} - candle not finalized ({time_since_candle_close}s < {Constants.CANDLE_PUBLICATION_LAG_SEC}s)"
-                )
-            return None
+        if cfg.DEBUG_MODE:
+            logger_pair.debug(
+                f"[DIAGNOSTIC] 15m Candle Selection | "
+                f"i15={i15} | "
+                f"Timestamp: {format_ist_time(ts_curr)} | "
+                f"Reference: {format_ist_time(reference_time)} | "
+                f"Candle Age: {candle_age}s | "
+                f"Time since close: {time_since_close}s | "
+                f"OHLC: O={o:.8f} H={h:.8f} L={l:.8f} C={c:.8f} | "
+                f"Range: {h - l:.8f}"
+            )
 
         cache_key = f"{pair_name}_{ts_15m_val}"
-
+        
         if cache_key in alignment_cache:
             i5 = alignment_cache[cache_key]
-            alignment_cache.move_to_end(cache_key)  # mark as recently used
+            alignment_cache.move_to_end(cache_key)  # Mark as recently used
         else:
             idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
             i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
-
+            
             alignment_cache[cache_key] = i5
             alignment_cache.move_to_end(cache_key)
-
+            
             if len(alignment_cache) > Constants.MAX_ALIGNMENT_CACHE:
                 alignment_cache.popitem(last=False)
 
@@ -3525,10 +3391,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
-        close_curr = close_15m[i15]
-        open_curr = open_15m[i15]
-        high_curr = data_15m["high"][i15]
-        low_curr = data_15m["low"][i15]
+        close_curr = c
+        open_curr = o
+        high_curr = h
+        low_curr = l
         
         if not (low_curr <= open_curr <= high_curr and low_curr <= close_curr <= high_curr):
             logger_pair.error(
