@@ -3780,8 +3780,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"Wick ratios: buy={buy_wick_ratio*100:.1f}% sell={sell_wick_ratio*100:.1f}% | "
                         f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                     )
-
-        resets_to_apply = []
         
         if not sdb.degraded:
             conditional_alert_keys = [
@@ -4049,7 +4047,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         data_15m = None
         data_5m = None
         data_daily = None
-    pass
         
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
