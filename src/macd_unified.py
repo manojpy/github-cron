@@ -4031,12 +4031,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             logger_main.warning(f"Skipping {p_name}: 5m parse failed")
             return None
         
-        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
-        if i15 is None or i15 < 4:
-            if cfg.DEBUG_MODE:
-                logger_main.debug(f"Skipping {p_name}: insufficient closed candles (i15={i15})")
-            return None
-        
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, alignment_cache
