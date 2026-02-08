@@ -3571,7 +3571,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         sell_candle_reason = (
             f"✓ Passed (wick {sell_wick_ratio*100:.1f}%)" if sell_candle_passed
             else f"Failed: {'GREEN candle' if not is_red else f'wick {sell_wick_ratio*100:.1f}% or RVOL/ADX'}"
-        )0
+        )
 
         if buy_candle_passed:
             buy_candle_reason = f"✓ Quality Passed (wick: {buy_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
