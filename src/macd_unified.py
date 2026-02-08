@@ -1186,6 +1186,7 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
     
     return True, None
 
+
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
     if atr_short is None or atr_long is None:
@@ -1924,6 +1925,41 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         )
         return None
 
+def _validate_basic_candle_data(data: Optional[Dict[str, np.ndarray]]) -> Tuple[bool, Optional[str]]:
+    """Common validation for candle data structure."""
+    if data is None or not data:
+        return False, "Data is None or empty"
+    
+    close = data.get("close")
+    timestamp = data.get("timestamp")
+    open_arr = data.get("open")
+    high_arr = data.get("high")
+    low_arr = data.get("low")
+    
+    if any(arr is None or len(arr) == 0 for arr in [close, timestamp, open_arr, high_arr, low_arr]):
+        return False, "Missing or empty OHLC/timestamp data"
+    
+    if len(open_arr) != len(close) or len(high_arr) != len(close) or len(low_arr) != len(close):
+        return False, "OHLC arrays have mismatched lengths"
+    
+    return True, None
+
+def validate_candle_data(data: Optional[Dict[str, np.ndarray]], 
+                        required_len: int = 0) -> Tuple[bool, Optional[str]]:
+    valid, msg = _validate_basic_candle_data(data)
+    if not valid:
+        return False, msg
+
+    close = data["close"]
+    if len(close) < required_len:
+        return False, f"Insufficient data: {len(close)} < {required_len}"
+
+    timestamp = data["timestamp"]
+    if not np.all(timestamp[1:] >= timestamp[:-1]):
+        return False, "Timestamps not monotonic increasing"
+
+    return True, None
+
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 2:
         return None
@@ -1970,6 +2006,25 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
     
     return last_closed_idx
+
+def validate_candle_timestamp(candle_ts: int, reference_time: int, interval_minutes: int, tolerance_seconds: int = 120) -> bool:
+    interval_seconds = interval_minutes * 60
+    current_window = reference_time // interval_seconds
+    expected_open_ts = (current_window * interval_seconds) - interval_seconds
+
+    diff = abs(candle_ts - expected_open_ts)
+    if diff > tolerance_seconds:
+        logger.error(
+            f"Candle timestamp mismatch! Expected open ~{expected_open_ts}, "
+            f"got {candle_ts} (diff: {diff}s)"
+        )
+        return False
+
+    logger.debug(
+        f"Candle timestamp validated | Expected open: {expected_open_ts} | "
+        f"Got: {candle_ts} | Diff: {diff}s"
+    )
+    return True
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
@@ -3377,6 +3432,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             alignment_cache[cache_key] = i5
             alignment_cache.move_to_end(cache_key)
             
+            # LRU eviction: remove oldest entry if cache is full
             if len(alignment_cache) > Constants.MAX_ALIGNMENT_CACHE:
                 alignment_cache.popitem(last=False)
 
@@ -3391,10 +3447,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
-        close_curr = c
-        open_curr = o
-        high_curr = h
-        low_curr = l
+        close_curr = close_15m[i15]
+        open_curr = open_15m[i15]
+        high_curr = data_15m["high"][i15]
+        low_curr = data_15m["low"][i15]
         
         if not (low_curr <= open_curr <= high_curr and low_curr <= close_curr <= high_curr):
             logger_pair.error(
