@@ -3447,10 +3447,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
-        close_curr = close_15m[i15]
-        open_curr = open_15m[i15]
-        high_curr = data_15m["high"][i15]
-        low_curr = data_15m["low"][i15]
+        close_curr = c
+        open_curr = o
+        high_curr = h
+        low_curr = l
         
         if not (low_curr <= open_curr <= high_curr and low_curr <= close_curr <= high_curr):
             logger_pair.error(
