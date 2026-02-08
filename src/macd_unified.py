@@ -3370,7 +3370,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         
         if cache_key in alignment_cache:
             i5 = alignment_cache[cache_key]
-            alignment_cache.move_to_end(cache_key)  # Mark as recently used
+            alignment_cache.move_to_end(cache_key)
         else:
             idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
             i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
@@ -3378,7 +3378,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             alignment_cache[cache_key] = i5
             alignment_cache.move_to_end(cache_key)
             
-            # LRU eviction: remove oldest entry if cache is full
             if len(alignment_cache) > Constants.MAX_ALIGNMENT_CACHE:
                 alignment_cache.popitem(last=False)
 
@@ -3416,14 +3415,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             return None
         
         if is_green:
-            upper_wick = high_curr - close_curr
+            upper_wick = max(0.0, high_curr - close_curr)
             buy_wick_ratio = upper_wick / candle_range
             sell_wick_ratio = 0.0
         else:
-            lower_wick = close_curr - low_curr
+            lower_wick = max(0.0, close_curr - low_curr)
             sell_wick_ratio = lower_wick / candle_range
             buy_wick_ratio = 0.0
-        
+    
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
         )
