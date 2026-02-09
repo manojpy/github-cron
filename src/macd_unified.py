@@ -3256,42 +3256,42 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
-
+ 
         interval_seconds = 15 * 60
         ts_curr = normalize_timestamp(data_15m["timestamp"][i15])
-        candidate_close_time = ts_curr + interval_seconds
+    
+        expected_next_open = ts_curr + interval_seconds
+        expected_close_time = expected_next_open - 1 
 
-        if reference_time < candidate_close_time:
+        time_since_candle_should_have_closed = reference_time - expected_close_time
+        MIN_TIME_SINCE_SHOULD_HAVE_CLOSED = 30 
+
+        if time_since_candle_should_have_closed < MIN_TIME_SINCE_SHOULD_HAVE_CLOSED:
             logger_pair.warning(
-                f"{pair_name}: Forming candle detected at i15={i15}. Falling back."
+                f"⚠️ {pair_name}: Candle {format_ist_time(ts_curr)} is too fresh. "
+                f"Buffer: {time_since_candle_should_have_closed}s < {MIN_TIME_SINCE_SHOULD_HAVE_CLOSED}s. Skipping to avoid partial data."
             )
-            
-            i15 -= 1
-            
-            if i15 < Constants.MIN_CLOSED_CANDLES_15M:
-                logger_pair.warning(f"{pair_name}: Fallback failed - insufficient history.")
-                return None
-            
-            ts_curr = normalize_timestamp(data_15m["timestamp"][i15])
-            candidate_close_time = ts_curr + interval_seconds
-            
-            if reference_time < candidate_close_time:
-                logger_pair.warning(f"{pair_name}: Fallback also forming. Skipping.")
-                return None
-            
-            time_since_close = reference_time - candidate_close_time
-            if time_since_close < 30:
+            return None
+
+        next_candle_exists = (i15 + 1 < len(data_15m["timestamp"]))
+        if next_candle_exists:
+            ts_next_open = normalize_timestamp(data_15m["timestamp"][i15 + 1])
+            if ts_next_open != expected_next_open: 
                 logger_pair.warning(
-                    f"{pair_name}: Fallback too fresh ({time_since_close}s). Skipping."
+                    f"⚠️ {pair_name}: Gap detected! "
+                    f"Curr Open: {format_ist_time(ts_curr)}, Expected Next: {format_ist_time(expected_next_open)}, "
+                    f"Found Next: {format_ist_time(ts_next_open)}. Skipping."
                 )
                 return None
-            
-            logger_pair.debug(f"{pair_name}: Using fallback candle i15={i15}")
+        else:
+            logger_pair.debug(f"ℹ️ {pair_name}: Processing trailing candle (No new candle started yet).")
 
-        o = data_15m["open"][i15]
-        h = data_15m["high"][i15]
-        l = data_15m["low"][i15]
-        c = data_15m["close"][i15]
+        time_since_candle_opened = reference_time - ts_curr
+        if time_since_candle_opened > cfg.MAX_CANDLE_STALENESS_SEC:
+            logger_pair.error(f"❌ {pair_name}: Data is stale ({time_since_candle_opened}s old).")
+            return None
+
+        o, h, l, c = data_15m["open"][i15], data_15m["high"][i15], data_15m["low"][i15], data_15m["close"][i15]
 
         is_green = c > o
         is_red = c < o
@@ -3570,8 +3570,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_buy = (mmh_curr > 0) and cloud_up
         confirmation_sell = (mmh_curr < 0) and cloud_down
 
-        buy_common = base_buy_trend and confirmation_buy and buy_candle_passed and is_green
-        sell_common = base_sell_trend and confirmation_sell and sell_candle_passed and is_red
+        buy_common = base_buy_trend and confirmation_buy and buy_candle_passed and is_green and buy_wick_ratio < Constants.MIN_WICK_RATIO 
+        sell_common = base_sell_trend and confirmation_sell and sell_candle_passed and is_red and sell_wick_ratio < Constants.MIN_WICK_RATIO 
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
