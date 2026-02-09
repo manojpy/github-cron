@@ -3564,39 +3564,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.error(f"CRITICAL: Red candle passed BUY check!")
             buy_candle_passed = False
 
-        buy_candle_reason = (
-            f"✓ Passed (wick {buy_wick_ratio*100:.1f}%)" if buy_candle_passed
-            else f"Failed: {'RED candle' if not is_green else f'wick {buy_wick_ratio*100:.1f}% or RVOL/ADX'}"
-        )
-        sell_candle_reason = (
-            f"✓ Passed (wick {sell_wick_ratio*100:.1f}%)" if sell_candle_passed
-            else f"Failed: {'GREEN candle' if not is_red else f'wick {sell_wick_ratio*100:.1f}% or RVOL/ADX'}"
-        )
-
-        if buy_candle_passed:
-            buy_candle_reason = f"✓ Quality Passed (wick: {buy_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
-        else:
-            if not is_green:
-                buy_candle_reason = f"RED/DOJI candle: cannot check upper wick on non-green"
-            elif candle_range <= 1e-9:
-                buy_candle_reason = f"Invalid candle range: {candle_range}"
-            elif buy_wick_ratio >= Constants.MIN_WICK_RATIO:
-                buy_candle_reason = f"Upper wick TOO LARGE: {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
-            else:
-                buy_candle_reason = f"RVOL or ADX filter failed"
-
-        if sell_candle_passed:
-            sell_candle_reason = f"✓ Quality Passed (wick: {sell_wick_ratio*100:.1f}% < {Constants.MIN_WICK_RATIO*100:.1f}%)"
-        else:
-            if not is_red:
-                sell_candle_reason = f"GREEN/DOJI candle: cannot check lower wick on non-red"
-            elif candle_range <= 1e-9:
-                sell_candle_reason = f"Invalid candle range: {candle_range}"
-            elif sell_wick_ratio >= Constants.MIN_WICK_RATIO:
-                sell_candle_reason = f"Lower wick TOO LARGE: {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.1f}%"
-            else:
-                sell_candle_reason = f"RVOL or ADX filter failed"
-
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
@@ -3895,12 +3862,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
-
-        if context.get("candle_quality_failed_buy") and buy_candle_reason:
-            reasons.append(f"BUY quality: {buy_candle_reason}")
-
-        if context.get("candle_quality_failed_sell") and sell_candle_reason:
-            reasons.append(f"SELL quality: {sell_candle_reason}")
 
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
