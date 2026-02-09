@@ -3307,15 +3307,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ):
             logger_pair.warning(f"{pair_name}: Invalid OHLC values.")
             return None
-
-        time_since_close = reference_time - candidate_close_time
-
-        if time_since_close < 30:
-            logger_pair.warning(
-                f"⚠️ {pair_name}: Candle too fresh ({time_since_close}s). Skipping."
-            )
-            return None
-
+            
         if (reference_time - ts_curr) > cfg.MAX_CANDLE_STALENESS_SEC:
             logger_pair.debug(f"{pair_name}: Candle stale. Skipping.")
             return None
