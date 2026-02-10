@@ -3409,11 +3409,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if is_green:
             upper_wick = max(0.0, high_curr - close_curr)
             buy_wick_ratio = upper_wick / candle_range
-            sell_wick_ratio = 0.0
+            sell_wick_ratio = 1.0
         else:
             lower_wick = max(0.0, close_curr - low_curr)
             sell_wick_ratio = lower_wick / candle_range
-            buy_wick_ratio = 0.0
+            buy_wick_ratio = 1.0
     
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily
