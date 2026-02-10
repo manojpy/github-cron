@@ -2242,8 +2242,8 @@ class RedisStateStore:
         )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-    if self.degraded:
-        return True
+        if self.degraded:
+            return True
     
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
