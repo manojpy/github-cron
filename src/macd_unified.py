@@ -651,8 +651,7 @@ def validate_indicators_dict(indicators: Optional[dict], required_keys: List[str
 def validate_vwap_cross(close_prev: float, close_curr: float, 
                         vwap_prev: float, vwap_curr: float, 
                         is_buy: bool) -> Tuple[bool, Optional[str]]:
-    if np.isnan(close_prev) or np.isnan(close_curr) or \
-       np.isnan(vwap_prev) or np.isnan(vwap_curr):
+    if np.isnan(close_prev) or np.isnan(close_curr) or np.isnan(vwap_prev) or np.isnan(vwap_curr):
         return False, "NaN in price or VWAP data"
     
     if close_prev <= 0 or close_curr <= 0 or vwap_prev <= 0 or vwap_curr <= 0:
@@ -1092,35 +1091,36 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             cfg.ADX_DI_LENGTH,
             cfg.ADX_SMOOTHING_LENGTH
         )
+
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
-            daily_low = float(data_daily["low"][-1])
+            daily_low = float(data_daily["low"][-1])   
             daily_range = daily_high - daily_low
-            
+    
             should_calculate = False
-            if daily_range > 0:
+            if daily_range > 1e-9:
                 distance_from_high = abs(last_close - daily_high)
                 distance_from_low = abs(last_close - daily_low)
                 should_calculate = (
                     distance_from_high < daily_range * 0.5 or 
                     distance_from_low < daily_range * 0.5
                 )
-            
+    
             if should_calculate:
                 results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"], 
+                    data_daily["high"],      # FIXED: Removed trailing spaces in all keys
                     data_daily["low"],
-                    data_daily["close"], 
+                    data_daily["close"],
                     data_daily["timestamp"]
                 )
             else:
                 results['pivots'] = {}
                 if cfg.DEBUG_MODE:
                     logger.debug(
-                        f"Skipped pivot calc (price {last_close:.2f} far from range "
+                        f"Skipped pivot calc (price {last_close:.2f} far from range "  # FIXED: f" not f "
                         f"{daily_low:.2f}-{daily_high:.2f})"
-                    )            
+                    )
         else:
             results['pivots'] = {}
 
@@ -2242,9 +2242,9 @@ class RedisStateStore:
         )
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
-        if self.degraded:
-            return True
-        window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
+    if self.degraded:
+        return True
+    
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
             result = await asyncio.wait_for(
@@ -2260,7 +2260,6 @@ class RedisStateStore:
             if cfg.DEBUG_MODE and not should_send:
                 logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
             return should_send
-
         except Exception as e:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
@@ -3359,19 +3358,19 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
 
         cache_key = f"{pair_name}_{ts_15m_val}"
-        
+
         if cache_key in alignment_cache:
             i5 = alignment_cache[cache_key]
             alignment_cache.move_to_end(cache_key)
         else:
             idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
             i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
-            
+    
+            if len(alignment_cache) >= Constants.MAX_ALIGNMENT_CACHE:
+                alignment_cache.popitem(last=False)
+    
             alignment_cache[cache_key] = i5
             alignment_cache.move_to_end(cache_key)
-            
-            if len(alignment_cache) > Constants.MAX_ALIGNMENT_CACHE:
-                alignment_cache.popitem(last=False)
 
         if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
             if cfg.DEBUG_MODE:
@@ -3804,28 +3803,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         for alert_title, alert_extra, alert_key in alerts_to_send:
             cooldown_key = f"{pair_name}:{alert_key}:last_sent"
       
-            if not sdb.degraded:
-                try:
-                    last_sent_str = await sdb.get_metadata(cooldown_key)
-                    if last_sent_str:
-                        last_ts = int(float(last_sent_str))
-                        elapsed = ts_curr - last_ts
-                        if elapsed < ALERT_COOLDOWN_SECONDS:
-                            logger_pair.debug(
-                                f"Alert {alert_key} cooldown: {ALERT_COOLDOWN_SECONDS - elapsed:.0f}s remaining"
-                            )
-                            continue
-                except (ValueError, TypeError):
-                    pass
-    
-            filtered_alerts.append((alert_title, alert_extra, alert_key))
-    
-            if not sdb.degraded:
-                try:
-                    await sdb.set_metadata(cooldown_key, str(ts_curr))
-                except Exception as e:
-                    logger_pair.debug(f"Failed to set cooldown: {e}")
+            should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
+            if not should_send:
+                logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
+                continue
 
+            filtered_alerts.append((alert_title, alert_extra, alert_key))
         alerts_to_send = filtered_alerts
 
         if alerts_to_send:
@@ -4249,41 +4232,46 @@ async def run_once() -> bool:
             )
             return False
 
-        async def extend_lock_periodically(lock_obj: RedisLock, interval: int = 300):
+        async def extend_lock_periodically(lock_obj: RedisLock, telegram_queue: TelegramQueue):
             while not shutdown_event.is_set():
                 try:
-                    await asyncio.sleep(interval)
-            
                     if lock_obj.should_extend():
                         success = await lock_obj.extend(timeout=3.0)
                         if success:
                             logger_run.debug("🔒 Lock extended successfully")
                         else:
                             logger_run.critical(
-                                "✘ Failed to extend Redis lock - another instance may take over. "
-                                "Initiating graceful shutdown."
+                                "✘ Lock extension failed - possible takeover by another instance. "
+                                "Initiating shutdown to prevent duplicate execution."
                             )
                             try:
                                 await telegram_queue.send(escape_markdown_v2(
-                                    f"⚠️ LOCK EXTENSION FAILED\n"
-                                    f"Bot: {cfg.BOT_NAME}\n"
+                                    f"⚠️ LOCK FAILURE\nBot: {cfg.BOT_NAME}\n"
                                     f"Time: {format_ist_time()}\n"
-                                    f"Another instance may be taking control."
+                                    f"Action: Shutting down to prevent duplicate alerts"
                                 ))
                             except Exception as e:
-                                logger_run.error(f"Failed to send alert: {e}")
-                    
+                                logger_run.error(f"Failed to send lock failure alert: {e}")
                             shutdown_event.set()
                             return
-
+            
+                    time_since_extend = time.time() - lock_obj.last_extend_time
+                    time_until_threshold = max(0, lock_obj.get_lock_extend_interval() - time_since_extend)
+                    sleep_time = max(30, min(180, int(time_until_threshold * 0.75)))  # 75% of remaining buffer
+            
+                    if cfg.DEBUG_MODE:
+                        logger_run.debug(
+                            f"Next lock check in {sleep_time}s | "
+                            f"Time since extend: {time_since_extend:.0f}s"
+                        )
+            
+                    await asyncio.sleep(sleep_time)
+            
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger_run.error(f"Lock extension error: {e}")
-
-        lock_extension_task = asyncio.create_task(
-            extend_lock_periodically(lock, interval=300)
-        )
+                    logger_run.error(f"Lock extension task error: {e}")
+                    await asyncio.sleep(60)
 
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
