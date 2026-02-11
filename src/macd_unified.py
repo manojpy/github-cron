@@ -981,6 +981,15 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
         
+        test_size = 100
+        test_hlc3 = np.random.random(test_size).astype(np.float64) * 50000.0
+        test_volumes = np.random.random(test_size).astype(np.float64) * 1000.0
+        now_ts = int(time.time())
+        test_ts = np.array([now_ts - (i * 900) for i in range(test_size)][::-1], dtype=np.int64)
+        
+        _ = aot_bridge.vwap_daily_loop(test_hlc3, test_volumes, test_ts)
+        _ = aot_bridge.vwap_daily_loop_safe(test_hlc3, test_volumes, test_ts, now_ts, 300)
+        
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
 

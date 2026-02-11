@@ -457,26 +457,19 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps, reference_time, buffer_secon
         candle_day_number = timestamps[i] // 86400
         
         if candle_day_number != last_day_number:
-            # Reset if:
-            # 1. We're past the buffer period, OR
-            # 2. Processing historical data (older than yesterday)
-            should_reset = (
-                reset_allowed or 
-                candle_day_number < (current_day_number - 1)
-            )
+            is_not_today = candle_day_number < current_day_number
+            should_reset = is_not_today or reset_allowed
             
             if should_reset:
                 cum_pv = 0.0
                 cum_vol = 0.0
-                last_day_number = candle_day_number
+            
+            last_day_number = candle_day_number
         
         cum_pv += hlc3[i] * volumes[i]
         cum_vol += volumes[i]
         
-        if cum_vol > 0.0:
-            vwap[i] = cum_pv / cum_vol
-        else:
-            vwap[i] = hlc3[i]
+        vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
     
     return vwap
 
