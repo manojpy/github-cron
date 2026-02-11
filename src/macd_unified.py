@@ -954,9 +954,9 @@ def warmup_if_needed() -> None:
    
     is_prod = os.path.isfile("/.dockerenv")
     
-    if aot_bridge.is_using_aot() or cfg.SKIP_WARMUP or is_prod:
+    if aot_bridge.is_using_aot() or getattr(cfg, 'SKIP_WARMUP', False) or is_prod:
         reason = ("AOT active" if aot_bridge.is_using_aot() else 
-                 "Explicitly disabled" if cfg.SKIP_WARMUP else "Production mode")
+                 "Explicitly disabled" if getattr(cfg, 'SKIP_WARMUP', False) else "Production mode")
         logger.info(f"🚨 Skipping JIT warmup ({reason})")
         if aot_bridge.is_using_aot():
             logger.debug("Native library status: Operational (Zero-warmup mode)")
@@ -967,6 +967,9 @@ def warmup_if_needed() -> None:
     
     try:
         test_data = np.random.random(150).astype(np.float64) * 1000.0
+        
+        now_ts = int(time.time())
+        test_ts = np.arange(now_ts - (150 * 900), now_ts, 900, dtype=np.int64)
         
         _ = aot_bridge.ema_loop(test_data, 7.0)
         _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
@@ -980,15 +983,8 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
-        
-        test_size = 100
-        test_hlc3 = np.random.random(test_size).astype(np.float64) * 50000.0
-        test_volumes = np.random.random(test_size).astype(np.float64) * 1000.0
-        now_ts = int(time.time())
-        test_ts = np.array([now_ts - (i * 900) for i in range(test_size)][::-1], dtype=np.int64)
-        
-        _ = aot_bridge.vwap_daily_loop(test_hlc3, test_volumes, test_ts)
-        _ = aot_bridge.vwap_daily_loop_safe(test_hlc3, test_volumes, test_ts, now_ts, 300)
+        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_ts)
+        _ = aot_bridge.vwap_daily_loop_safe(test_data, test_data, test_ts, now_ts, 300)
         
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
@@ -3407,7 +3403,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pct = abs(close_curr - close_prev) / close_prev * 100
 
             if pct > Constants.MAX_PRICE_CHANGE_PERCENT:
-                logger_pair.warning(f"⚠️ {pair_name}: Extreme price gap ({pct:.2f}%).")
+                logger_pair.warning(f"��️ {pair_name}: Extreme price gap ({pct:.2f}%).")
                 return None
 
         logger_pair.debug(f"✅ {pair_name}: Candle validated | i15={i15}")
