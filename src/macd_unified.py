@@ -276,10 +276,10 @@ class BotConfig(BaseModel):
         description="Buffer time (seconds) after midnight UTC before allowing daily resets for VWAP and pivots"
     )   
     MIN_CANDLES_PER_DAY: int = Field(
-        default=90, 
+        default=94, 
         ge=50, 
         le=100,
-        description="Minimum candles required for a complete daily period (90 for 15min candles = ~23 hours)"
+        description="Minimum candles required for a complete daily period (94 for 15min candles = ~23 hours)"
     ) 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -789,7 +789,7 @@ def get_trigger_timestamp() -> int:
         except (ValueError, TypeError):
             logger.warning(f"Invalid TRIGGER_TIMESTAMP: {trigger_ts_str}, using current time")
     
-    return int(time.time())
+    return int(datetime.now(timezone.utc).timestamp())
 
 def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
    
@@ -2002,42 +2002,28 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     reference_time = normalize_timestamp(reference_time)
     interval_seconds = interval_minutes * 60
-    current_period_start = (reference_time // interval_seconds) * interval_seconds   
-    expected_ts_open_time = current_period_start - interval_seconds   
-    
-    ts_normalized = np.array([normalize_timestamp(t) for t in timestamps])
-    
-    tolerance = 15
-    
-    valid_mask = np.abs(ts_normalized - expected_ts_open_time) <= tolerance
-    valid_indices = np.nonzero(valid_mask)[0]
-    
-    if valid_indices.size == 0:
+    current_period_start = (reference_time // interval_seconds) * interval_seconds
+    expected_ts_open_time = current_period_start - interval_seconds
+    ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
+
+    matches = np.nonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)[0]
+    if matches.size == 0:
         logger.warning(
-            f"No closed {interval_minutes}m candle found | "
-            f"Expected (OPEN-time): {format_ist_time(expected_ts_open_time)} | "
+            f"No exact closed {interval_minutes}m candle found | Expected OPEN-time: {format_ist_time(expected_ts_open_time)} | "
             f"Last 3 available timestamps: {[format_ist_time(t) for t in ts_normalized[-3:]]}"
         )
         return None
-    
-    last_closed_idx = int(valid_indices[-1])
+
+    last_closed_idx = int(matches[-1])
     actual_ts = ts_normalized[last_closed_idx]
-    candle_age = reference_time - actual_ts  
-    minimum_age = interval_seconds + 30
-    
+    candle_age = reference_time - actual_ts
+    minimum_age = interval_seconds + 45
     if candle_age < minimum_age:
         logger.warning(
-            f"⚠️ Selected candle is too fresh ({candle_age}s old, need {minimum_age}s) - "
-            f"likely a forming candle! Returning None."
+            f"Selected candle is too fresh ({candle_age}s old, need {minimum_age}s) - likely a forming candle. Returning None."
         )
         return None
-    
-    logger.debug(
-        f"Selected candle (idx={last_closed_idx}) | OPEN-time convention | "
-        f"Timestamp: {format_ist_time(actual_ts)} | "
-        f"Age: {candle_age}s (>{minimum_age}s required)"
-    )
-    
+
     return last_closed_idx
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
@@ -3605,12 +3591,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         sell_candle_passed = bool(wick_check_results_sell[i15])
         
         if is_green and buy_candle_passed:
-            if buy_wick_ratio >= Constants.MIN_WICK_RATIO:
+            if buy_wick_ratio > Constants.MIN_WICK_RATIO:
                 logger_pair.error(f"Mismatch: green candle passed but wick {buy_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%")
                 buy_candle_passed = False
 
         if is_red and sell_candle_passed:
-            if sell_wick_ratio >= Constants.MIN_WICK_RATIO:
+            if sell_wick_ratio > Constants.MIN_WICK_RATIO:
                 logger_pair.error(f"Mismatch: red candle passed but wick {sell_wick_ratio*100:.1f}% >= {Constants.MIN_WICK_RATIO*100:.0f}%")
                 sell_candle_passed = False
 
