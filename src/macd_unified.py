@@ -673,7 +673,7 @@ def is_previous_day_complete(timestamps: np.ndarray, current_time: int, min_cand
     previous_day_candles = timestamps[previous_day_mask]
     
     if len(previous_day_candles) == 0:
-        return False, f"No candles for day
+        return False, f"No candles for day #{previous_day_number}"
     
     if len(previous_day_candles) < min_candles:
         return False, (
