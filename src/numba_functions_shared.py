@@ -440,6 +440,46 @@ def vwap_daily_loop(hlc3, volumes, timestamps):
     
     return vwap
 
+@njit("f8[:](f8[:], f8[:], i8[:], i8, i4)", nogil=True, cache=True)
+def vwap_daily_loop_safe(hlc3, volumes, timestamps, reference_time, buffer_seconds):
+    n = len(hlc3)
+    vwap = np.empty(n, dtype=np.float64)
+    
+    cum_pv = 0.0
+    cum_vol = 0.0
+    last_day_number = -1
+    
+    current_day_number = reference_time // 86400
+    seconds_into_day = reference_time % 86400
+    reset_allowed = (seconds_into_day >= buffer_seconds)
+    
+    for i in range(n):
+        candle_day_number = timestamps[i] // 86400
+        
+        if candle_day_number != last_day_number:
+            # Reset if:
+            # 1. We're past the buffer period, OR
+            # 2. Processing historical data (older than yesterday)
+            should_reset = (
+                reset_allowed or 
+                candle_day_number < (current_day_number - 1)
+            )
+            
+            if should_reset:
+                cum_pv = 0.0
+                cum_vol = 0.0
+                last_day_number = candle_day_number
+        
+        cum_pv += hlc3[i] * volumes[i]
+        cum_vol += volumes[i]
+        
+        if cum_vol > 0.0:
+            vwap[i] = cum_pv / cum_vol
+        else:
+            vwap[i] = hlc3[i]
+    
+    return vwap
+
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
     """Calculate PPO in O(n) - three EMA passes"""
@@ -737,6 +777,7 @@ EXPORT_CONFIG = {
     'calculate_trends_with_state': 'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
     'kalman_loop': 'f8[:](f8[:], i4, f8, f8)',
     'vwap_daily_loop': 'f8[:](f8[:], f8[:], i8[:])',
+    'vwap_daily_loop_safe': 'f8[:](f8[:], f8[:], i8[:], i8, i4)',
     'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
     'calculate_rsi_core': 'f8[:](f8[:], i4)',
     'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',
@@ -747,7 +788,7 @@ EXPORT_CONFIG = {
 
 __all__ = list(EXPORT_CONFIG.keys())
 
-expected_min_functions = 20
+expected_min_functions = 22
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

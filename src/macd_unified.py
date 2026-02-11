@@ -40,6 +40,7 @@ from aot_bridge import (
     ema_loop_alpha,
     kalman_loop,
     vwap_daily_loop,
+    vwap_daily_loop_safe,
     rng_filter_loop,
     smooth_range,
     calculate_trends_with_state, 
@@ -268,6 +269,18 @@ class BotConfig(BaseModel):
         le=600,
         description="Seconds to wait before half-open probe"
     )
+    DAILY_RESET_BUFFER_SEC: int = Field(
+        default=300, 
+        ge=0, 
+        le=3600,
+        description="Buffer time (seconds) after midnight UTC before allowing daily resets for VWAP and pivots"
+    )   
+    MIN_CANDLES_PER_DAY: int = Field(
+        default=90, 
+        ge=50, 
+        le=100,
+        description="Minimum candles required for a complete daily period (90 for 15min candles = ~23 hours)"
+    ) 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
@@ -648,6 +661,38 @@ def validate_indicators_dict(indicators: Optional[dict], required_keys: List[str
     
     return True, None
 
+def is_previous_day_complete(timestamps: np.ndarray, current_time: int, min_candles: int = 90, buffer_seconds: int = 300) -> Tuple[bool, str]:
+    if len(timestamps) == 0:
+        return False, "No timestamp data available"
+    
+    days = timestamps // 86400
+    current_day_number = current_time // 86400
+    previous_day_number = current_day_number - 1
+    
+    previous_day_mask = (days == previous_day_number)
+    previous_day_candles = timestamps[previous_day_mask]
+    
+    if len(previous_day_candles) == 0:
+        return False, f"No candles for day
+    
+    if len(previous_day_candles) < min_candles:
+        return False, (
+            f"Insufficient candles: {len(previous_day_candles)} "
+            f"(need >={min_candles})"
+        )
+    
+    seconds_into_day = current_time % 86400
+    if seconds_into_day < buffer_seconds:
+        return False, (
+            f"Within buffer: {seconds_into_day}s < {buffer_seconds}s"
+        )
+    
+    last_candle_day = previous_day_candles[-1] // 86400
+    if last_candle_day != previous_day_number:
+        return False, "Last candle has wrong day number"
+    
+    return True, "Complete"
+
 def validate_vwap_cross(close_prev: float, close_curr: float, 
                         vwap_prev: float, vwap_curr: float, 
                         is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -815,26 +860,21 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
-                         volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:   
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray, reference_time: int) -> np.ndarray:
     try:
-        if close is None or len(close) == 0:
-            return np.array([], dtype=np.float64)
-
-        ts_secs = timestamps.astype(np.int64).copy()      
-        if ts_secs[0] > 1_000_000_000_000:
-            ts_secs //= 1000
         hlc3 = (high + low + close) / 3.0
-        vwap = vwap_daily_loop(hlc3, volume, ts_secs)
-
-        if np.any(np.isnan(vwap)):
-            vwap = np.where(np.isnan(vwap), close, vwap)
-
-        return vwap
-
+        
+        buffer_seconds = (
+            cfg.DAILY_RESET_BUFFER_SEC 
+            if hasattr(cfg, 'DAILY_RESET_BUFFER_SEC') 
+            else 300
+        )
+        
+        return vwap_daily_loop_safe(hlc3, volume, timestamps, reference_time, buffer_seconds)
+        
     except Exception as e:
-        logger.error(f"VWAP calculation failed: {e}")
-        return np.full_like(close, np.nan)
+        logger.error(f"VWAP calculation failed: {e}", exc_info=True)
+        return np.full(len(close), np.nan, dtype=np.float64)
 
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
@@ -951,39 +991,53 @@ def warmup_if_needed() -> None:
 async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
-def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, timestamps: np.ndarray) -> Dict[str, float]:
+def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, timestamps_daily: np.ndarray, timestamps_15m: np.ndarray, reference_time: int) -> Dict[str, float]:   
     piv = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
+    
     try:
-        if len(timestamps) < 2:
-            logger.warning("Pivot calc: insufficient data")
+        if len(timestamps_daily) < 2:
+            logger.warning("Pivot calc: insufficient data (< 2 daily candles)")
             return piv
 
         if np.any(np.isnan(high)) or np.any(np.isnan(low)) or np.any(np.isnan(close)):
-            logger.warning("Pivot calc: NaN values in OHLC data")
+            logger.warning("Pivot calc: NaN values in OHLC")
             return piv
 
-        days = timestamps // 86400
-        now_utc = datetime.now(timezone.utc)
-        yesterday = (now_utc - timedelta(days=1)).date()
-        yesterday_ts = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc).timestamp()
-        yesterday_day_number = int(yesterday_ts) // 86400
+        is_complete, reason = is_previous_day_complete(
+            timestamps_15m,  # Use 15m for validation
+            reference_time,
+            min_candles=cfg.MIN_CANDLES_PER_DAY if hasattr(cfg, 'MIN_CANDLES_PER_DAY') else 90,
+            buffer_seconds=cfg.DAILY_RESET_BUFFER_SEC if hasattr(cfg, 'DAILY_RESET_BUFFER_SEC') else 300
+        )
+        
+        if not is_complete:
+            if cfg.DEBUG_MODE:
+                logger.debug(f"Pivot calc skipped: {reason}")
+            return piv
+
+        days = timestamps_daily // 86400
+        current_day_number = reference_time // 86400
+        yesterday_day_number = current_day_number - 1
 
         yesterday_mask = (days == yesterday_day_number)
+        
         if not np.any(yesterday_mask):
-            logger.warning(f"Pivot calc: Yesterday ({yesterday.isoformat()}) not found in data")
+            logger.warning(f"No daily candle for day #{yesterday_day_number}")
             return piv
 
         yesterday_high = high[yesterday_mask]
         yesterday_low = low[yesterday_mask]
         yesterday_close = close[yesterday_mask]
+
         if len(yesterday_high) == 0:
-            logger.warning("No candles found for pivot day")
+            logger.warning("No candles for pivot day")
             return piv
 
         H_prev = np.max(yesterday_high)
         L_prev = np.min(yesterday_low)
         C_prev = yesterday_close[-1]
         rng_prev = H_prev - L_prev
+        
         if rng_prev < 1e-8:
             logger.warning(f"Invalid pivot range: {rng_prev}")
             return piv
@@ -999,17 +1053,23 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
             "S3": P - rng_prev,
         })
 
+        if cfg.DEBUG_MODE:
+            logger.debug(
+                f"✅ Pivots calculated | H={H_prev:.2f} L={L_prev:.2f} "
+                f"C={C_prev:.2f} | P={P:.2f}"
+            )
+
     except Exception as e:
         logger.error(f"Pivot calculation failed: {e}", exc_info=True)
 
     for k, val in piv.items():
         if np.isnan(val) or np.isinf(val) or val <= 0:
-            logger.warning(f"Invalid pivot {k}: {val}, resetting to 0.0")
+            logger.warning(f"Invalid pivot {k}: {val}, reset to 0.0")
             piv[k] = 0.0
 
     return piv
-          
-def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+
+def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Dict[str, np.ndarray]:
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
@@ -1057,7 +1117,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 )
             
             results["vwap"] = calculate_vwap_numpy(
-                high_15m, low_15m, close_15m, volume_15m, ts_15m
+                high_15m, low_15m, close_15m, volume_15m, ts_15m,
+                reference_time
             )
         else:
             results["vwap"] = np.full(n_15m, np.nan)
@@ -1109,16 +1170,18 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
     
             if should_calculate:
                 results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"],      # FIXED: Removed trailing spaces in all keys
+                    data_daily["high"],      
                     data_daily["low"],
                     data_daily["close"],
-                    data_daily["timestamp"]
+                    data_daily["timestamp"], 
+                    data_15m["timestamp"],  
+                    reference_time
                 )
             else:
                 results['pivots'] = {}
                 if cfg.DEBUG_MODE:
                     logger.debug(
-                        f"Skipped pivot calc (price {last_close:.2f} far from range "  # FIXED: f" not f "
+                        f"Skipped pivot calc (price {last_close:.2f} far from range "
                         f"{daily_low:.2f}-{daily_high:.2f})"
                     )
         else:
@@ -3415,9 +3478,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             buy_wick_ratio = 1.0
     
         indicators = await asyncio.to_thread(
-            calculate_all_indicators_numpy, data_15m, data_5m, data_daily
+            calculate_all_indicators_numpy, data_15m, data_5m, data_daily, reference_time
         )
-
         if indicators is None:
             logger_pair.error(f"Skipping {pair_name}: all indicators failed to calculate")
             return None

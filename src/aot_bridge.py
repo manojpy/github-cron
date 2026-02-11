@@ -134,6 +134,7 @@ def initialize_jit_fallback() -> None:
             ema_loop_alpha,
             kalman_loop,
             vwap_daily_loop,
+            vwap_daily_loop_safe, 
             rng_filter_loop,
             smooth_range,
             calculate_trends_with_state,
@@ -160,6 +161,7 @@ def initialize_jit_fallback() -> None:
             'ema_loop_alpha': ema_loop_alpha,
             'kalman_loop': kalman_loop,
             'vwap_daily_loop': vwap_daily_loop,
+            'vwap_daily_loop_safe': vwap_daily_loop_safe,
             'rng_filter_loop': rng_filter_loop,
             'smooth_range': smooth_range,
             'calculate_trends_with_state': calculate_trends_with_state,
@@ -204,6 +206,7 @@ def ensure_initialized() -> None:
             'ema_loop_alpha': _aot_module.ema_loop_alpha,
             'kalman_loop': _aot_module.kalman_loop,
             'vwap_daily_loop': _aot_module.vwap_daily_loop,
+            'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
             'rng_filter_loop': _aot_module.rng_filter_loop,
             'smooth_range': _aot_module.smooth_range,
             'calculate_trends_with_state': _aot_module.calculate_trends_with_state,
@@ -268,6 +271,10 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
 
 def vwap_daily_loop(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     return _dispatch['vwap_daily_loop'](hlc3, volumes, timestamps)
+
+def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray, 
+                         reference_time: int, buffer_seconds: int) -> np.ndarray:
+    return _dispatch['vwap_daily_loop_safe'](hlc3, volumes, timestamps, reference_time, buffer_seconds)
 
 def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     return _dispatch['rng_filter_loop'](x, r)
@@ -357,6 +364,7 @@ __all__ = [
 
     # Market Indicators
     'vwap_daily_loop',
+    'vwap_daily_loop_safe',
 
     # Statistical
     'rolling_std',
