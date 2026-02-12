@@ -281,6 +281,13 @@ class BotConfig(BaseModel):
         le=100,
         description="Minimum candles required for a complete daily period (94 for 15min candles = ~23 hours)"
     ) 
+    CANDLE_MIN_AGE_BUFFER: int = Field(
+        default=45,
+        ge=0,
+        le=600,
+        description="Extra seconds beyond candle interval required before a candle is considered finalized"
+    )
+
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
@@ -1994,35 +2001,56 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         return None
 
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
-    if timestamps is None or timestamps.size < 2:
+    if timestamps is None or timestamps.size < 1:
         return None
 
     if reference_time is None:
         reference_time = get_trigger_timestamp()
-
     reference_time = normalize_timestamp(reference_time)
+
     interval_seconds = interval_minutes * 60
     current_period_start = (reference_time // interval_seconds) * interval_seconds
     expected_ts_open_time = current_period_start - interval_seconds
-    ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
 
-    matches = np.nonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)[0]
+    try:
+        ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
+    except Exception as e:
+        logger.error(f"Timestamp normalization failed: {e}")
+        return None
+
+    if ts_normalized.size >= 2 and np.any(np.diff(ts_normalized) <= 0):
+        target_area_mask = np.abs(ts_normalized - expected_ts_open_time) <= interval_seconds
+        if np.any(np.diff(ts_normalized[target_area_mask]) <= 0):
+            logger.warning("Timestamps corrupted near target candle; rejecting.")
+            return None
+        else:
+            logger.info("Duplicate timestamps exist in data, but not near target candle.")
+
+    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
         logger.warning(
-            f"No exact closed {interval_minutes}m candle found | Expected OPEN-time: {format_ist_time(expected_ts_open_time)} | "
-            f"Last 3 available timestamps: {[format_ist_time(t) for t in ts_normalized[-3:]]}"
+            f"Target {interval_minutes}m candle open-time {format_ist_time(expected_ts_open_time)} not found. "
+            f"Last available: {format_ist_time(ts_normalized[-1]) if ts_normalized.size > 0 else 'N/A'}"
         )
         return None
 
     last_closed_idx = int(matches[-1])
-    actual_ts = ts_normalized[last_closed_idx]
-    candle_age = reference_time - actual_ts
-    minimum_age = interval_seconds + 45
-    if candle_age < minimum_age:
+    actual_candle_open = int(ts_normalized[last_closed_idx])
+
+    minimum_required_age = interval_seconds + getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60)
+    candle_age = reference_time - actual_candle_open
+    if candle_age < minimum_required_age:
         logger.warning(
-            f"Selected candle is too fresh ({candle_age}s old, need {minimum_age}s) - likely a forming candle. Returning None."
+            f"Candle at {format_ist_time(actual_candle_open)} is only {candle_age}s old; "
+            f"needs {minimum_required_age}s. Skipping."
         )
         return None
+
+    logger.info(
+        f"Selected {interval_minutes}m candle index={last_closed_idx} | "
+        f"expected_open={format_ist_time(expected_ts_open_time)} | "
+        f"actual_open={format_ist_time(actual_candle_open)} | age_s={candle_age}"
+    )
 
     return last_closed_idx
 
