@@ -2000,7 +2000,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         )
         return None
 
-def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None) -> Optional[int]:
+def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None, pair_name: Optional[str] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 1:
         return None
 
@@ -2015,22 +2015,25 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     try:
         ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
     except Exception as e:
-        logger.error(f"Timestamp normalization failed: {e}")
+        logger.error("[%s] Timestamp normalization failed: %s", pair_name or "?", e)
         return None
 
     if ts_normalized.size >= 2 and np.any(np.diff(ts_normalized) <= 0):
         target_area_mask = np.abs(ts_normalized - expected_ts_open_time) <= interval_seconds
         if np.any(np.diff(ts_normalized[target_area_mask]) <= 0):
-            logger.warning("Timestamps corrupted near target candle; rejecting.")
+            logger.warning("[%s] Timestamps corrupted near target candle; rejecting.", pair_name or "?")
             return None
         else:
-            logger.info("Duplicate timestamps exist in data, but not near target candle.")
+            logger.info("[%s] Duplicate timestamps exist in data, but not near target candle.", pair_name or "?")
 
     matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
         logger.warning(
-            f"Target {interval_minutes}m candle open-time {format_ist_time(expected_ts_open_time)} not found. "
-            f"Last available: {format_ist_time(ts_normalized[-1]) if ts_normalized.size > 0 else 'N/A'}"
+            "[%s] Target %dm open %s not found. last_ts=%s count=%d last5=%s",
+            pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time),
+            format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A',
+            ts_normalized.size,
+            [format_ist_time(t) for t in ts_normalized[-5:]]
         )
         return None
 
@@ -2041,15 +2044,15 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     candle_age = reference_time - actual_candle_open
     if candle_age < minimum_required_age:
         logger.warning(
-            f"Candle at {format_ist_time(actual_candle_open)} is only {candle_age}s old; "
-            f"needs {minimum_required_age}s. Skipping."
+            "[%s] Candle at %s is only %ds old; needs %ds. Skipping.",
+            pair_name or "?", format_ist_time(actual_candle_open), candle_age, minimum_required_age
         )
         return None
 
-    logger.info(
-        f"Selected {interval_minutes}m candle index={last_closed_idx} | "
-        f"expected_open={format_ist_time(expected_ts_open_time)} | "
-        f"actual_open={format_ist_time(actual_candle_open)} | age_s={candle_age}"
+    logger.debug(
+        "[%s] Selected %dm candle idx=%d expected_open=%s actual_open=%s age_s=%d",
+        pair_name or "?", interval_minutes, last_closed_idx,
+        format_ist_time(expected_ts_open_time), format_ist_time(actual_candle_open), candle_age
     )
 
     return last_closed_idx
