@@ -191,6 +191,8 @@ class BotConfig(BaseModel):
     MEMORY_LIMIT_BYTES: int = 400_000_000
     STATE_EXPIRY_DAYS: int = 30
     LOG_LEVEL: str = "INFO"
+    ENABLE_ADX_FILTER: bool = Field(default=True)
+    ENABLE_RVOL_ALERT: bool = Field(default=True)
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
     PIVOT_LOOKBACK_PERIOD: int = 15
@@ -200,93 +202,26 @@ class BotConfig(BaseModel):
     TELEGRAM_BURST_SIZE: int = 5
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
-    INDICATOR_THREAD_LIMIT: int = 3
-    DRY_RUN_MODE: bool = Field(default=False, description="Dry-run: log alerts without sending")
-    MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800, description="Min/max run timeout bounds")
-    MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15, description="Max alerts per pair per run")
-    NUMBA_PARALLEL: bool = Field(default=True, description="Enable Numba parallel execution")
-    SKIP_WARMUP: bool = Field(default=False, description="Skip Numba warmup (faster startup)")
-    PRODUCTS_CACHE_TTL: int = Field(default=28800, description="Products cache TTL in seconds (8 hours)")
-    PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5, description="Max distance from pivot to trigger alert")
+    INDICATOR_THREAD_LIMIT: int = 3   
+    DRY_RUN_MODE: bool = Field(default=False)
+    NUMBA_PARALLEL: bool = Field(default=True)
+    SKIP_WARMUP: bool = Field(default=False)
 
-    RVOL_THRESHOLD: float = Field(
-        default=1.0, 
-        ge=0.5, 
-        le=2.0,
-        description="Volatility expansion threshold (Pine: atr1 > atr3 * rvolThreshold). "
-                    "1.0 = baseline, 1.1 = require 10% expansion, 1.5 = require 50% expansion"
-    )    
-    ENABLE_RVOL_ALERT: bool = Field(
-        default=True,
-        description="Enable volatility expansion check (RVOL alert). "
-                    "When False, wick patterns are evaluated without volatility requirement"
-    )    
-    ADX_DI_LENGTH: int = Field(
-        default=14,
-        ge=5,
-        le=30,
-        description="ADX DI length (number of bars for directional movement calculation)"
-    )
-    ADX_SMOOTHING_LENGTH: int = Field(
-        default=14,
-        ge=5,
-        le=30,
-        description="ADX smoothing length (RMA period)"
-    )
-    ADX_THRESHOLD: float = Field(
-        default=18.0,
-        ge=5.0,
-        le=50.0,
-        description="ADX threshold for signals (0-100 scale). 18 = moderate trend. "
-                    "Higher values = stronger trend requirement"
-    )
-    ENABLE_ADX_FILTER: bool = Field(
-        default=True,
-        description="Enable ADX trend strength filter. "
-                    "When enabled with RVOL, uses OR logic (either condition can trigger)"
-    )
-    MAX_CANDLE_STALENESS_SEC: int = Field(
-        default=1200,
-        ge=600,
-        le=3600,
-        description="Maximum allowed candle staleness in seconds (10-60 minutes)"
-    )
-    RATE_LIMIT_PER_MINUTE: int = Field(
-        default=60,
-        ge=10,
-        le=120,
-        description="Max HTTP requests per minute to Delta API"
-    )
-    CB_FAILURE_THRESHOLD: int = Field(
-        default=3,
-        ge=1,
-        le=10,
-        description="Consecutive failures before circuit breaker opens"
-    )
-    CB_RECOVERY_TIMEOUT: int = Field(
-        default=60,
-        ge=10,
-        le=600,
-        description="Seconds to wait before half-open probe"
-    )
-    DAILY_RESET_BUFFER_SEC: int = Field(
-        default=300, 
-        ge=0, 
-        le=3600,
-        description="Buffer time (seconds) after midnight UTC before allowing daily resets for VWAP and pivots"
-    )   
-    MIN_CANDLES_PER_DAY: int = Field(
-        default=94, 
-        ge=50, 
-        le=100,
-        description="Minimum candles required for a complete daily period (94 for 15min candles = ~23 hours)"
-    ) 
-    CANDLE_MIN_AGE_BUFFER: int = Field(
-        default=45,
-        ge=0,
-        le=600,
-        description="Extra seconds beyond candle interval required before a candle is considered finalized"
-    )
+    MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
+    MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
+    PRODUCTS_CACHE_TTL: int = Field(default=28800)  # Products cache TTL in seconds (8h default)
+    PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5)  # Max distance from pivot to trigger alert (1.5%)
+    RVOL_THRESHOLD: float = Field(default=1.0, ge=0.5, le=2.0)  # Volatility expansion threshold (1.0=baseline, 1.5=50% expansion required)   
+    ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX directional movement calculation period
+    ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
+    ADX_THRESHOLD: float = Field(default=18.0, ge=5.0, le=50.0)  # ADX trend strength threshold (18=moderate, higher=stronger)   
+    MAX_CANDLE_STALENESS_SEC: int = Field(default=1200, ge=600, le=3600)  # Max candle age in seconds (10-60 min)
+    RATE_LIMIT_PER_MINUTE: int = Field(default=60, ge=10, le=120)  # Max API requests per minute
+    CB_FAILURE_THRESHOLD: int = Field(default=3, ge=1, le=10)  # Failures before circuit breaker opens
+    CB_RECOVERY_TIMEOUT: int = Field(default=60, ge=10, le=600)  # Circuit breaker recovery wait time (seconds)
+    DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
+    MIN_CANDLES_PER_DAY: int = Field(default=94, ge=50, le=100)  # Minimum candles for complete day (94=23h for 15m candles)
+    CANDLE_MIN_AGE_BUFFER: int = Field(default=45, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
