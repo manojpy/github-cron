@@ -3337,7 +3337,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     context = None
 
     try:
-        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time)
+        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time, pair_name)
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
  
