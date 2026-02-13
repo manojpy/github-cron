@@ -2057,15 +2057,15 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     candle_close_time = actual_candle_open + interval_seconds
 
     time_since_candle_closed = reference_time - candle_close_time
-    if time_since_candle_closed < getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60):
+    if time_since_candle_closed < getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 90):
         logger.warning(
-            "[%s] Candle at %s closed only %ds ago; need %ds. Skipping forming candle.",
-            pair_name or "?", format_ist_time(candle_close_time),
-            time_since_candle_closed, cfg.CANDLE_MIN_AGE_BUFFER
+            "[%s] Target %dm open %s not found. last_ts=%s count=%d last5=%s",
+            pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time),
+            format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A',
+            int(ts_normalized.size),  # ✅ integer for %d
+            [format_ist_time(t) for t in ts_normalized[-5:]]  # ✅ list will stringify fine
         )
         return None
-
-
 
     logger.debug(
         "[%s] Selected %dm candle idx=%d open=%s close=%s age_since_close=%ds",
