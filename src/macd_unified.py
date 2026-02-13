@@ -3846,68 +3846,97 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
-
+        
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
-
+        
         if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
             if not base_buy_trend:
                 reasons.append("PPO>0 blocked: base_buy_trend=False")
+            elif not confirmation_buy:
+                reasons.append("PPO>0 blocked: confirmation_buy=False (MMH or cloud)")
             elif not is_valid_for_buy:
-                reasons.append("PPO>0 blocked: candle quality failed")
-            elif not is_green:
-                reasons.append(f"PPO>0 blocked: candle not green (C={close_curr:.5f}, O={open_curr:.5f})")
-
+                reasons.append("PPO>0 blocked: Knox rejected candle (wick/color/timing)")
+        
         if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
             if not base_sell_trend:
                 reasons.append("PPO<0 blocked: base_sell_trend=False")
-            elif not is_valid_for_sell:  # Changed from sell_candle_passed
-                reasons.append("PPO<0 blocked: candle quality failed")
-            elif not is_red:
-                reasons.append(f"PPO<0 blocked: candle not red (C={close_curr:.5f}, O={open_curr:.5f})")
-
+            elif not confirmation_sell:
+                reasons.append("PPO<0 blocked: confirmation_sell=False (MMH or cloud)")
+            elif not is_valid_for_sell:
+                reasons.append("PPO<0 blocked: Knox rejected candle (wick/color/timing)")
+       
         if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
-            reasons.append("PPO>+0.11 blocked: buy_common=False")
-
+            if not base_buy_trend:
+                reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
+            elif not confirmation_buy:
+                reasons.append("PPO>+0.11 blocked: confirmation_buy=False")
+            elif not is_valid_for_buy:
+                reasons.append("PPO>+0.11 blocked: Knox rejected candle")
+        
         if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
-            reasons.append("PPO<-0.11 blocked: sell_common=False")
-
+            if not base_sell_trend:
+                reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
+            elif not confirmation_sell:
+                reasons.append("PPO<-0.11 blocked: confirmation_sell=False")
+            elif not is_valid_for_sell:
+                reasons.append("PPO<-0.11 blocked: Knox rejected candle")
+        
         if rsi_prev <= Constants.RSI_THRESHOLD and rsi_curr > Constants.RSI_THRESHOLD:
             if ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
                 reasons.append(f"RSI>50 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
             elif not buy_common:
-                reasons.append("RSI>50 blocked: buy_common=False")
-
+                if not base_buy_trend:
+                    reasons.append("RSI>50 blocked: base_buy_trend=False")
+                elif not confirmation_buy:
+                    reasons.append("RSI>50 blocked: confirmation_buy=False")
+                elif not is_valid_for_buy:
+                    reasons.append("RSI>50 blocked: Knox rejected candle")
+        
         if rsi_prev >= Constants.RSI_THRESHOLD and rsi_curr < Constants.RSI_THRESHOLD:
             if ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
                 reasons.append(f"RSI<50 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
             elif not sell_common:
-                reasons.append("RSI<50 blocked: sell_common=False")
-
+                if not base_sell_trend:
+                    reasons.append("RSI<50 blocked: base_sell_trend=False")
+                elif not confirmation_sell:
+                    reasons.append("RSI<50 blocked: confirmation_sell=False")
+                elif not is_valid_for_sell:
+                    reasons.append("RSI<50 blocked: Knox rejected candle")
+        
         if cfg.ENABLE_VWAP and vwap_available:
             if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
-                reasons.append("VWAP up-cross blocked: buy_common=False")
+                if not base_buy_trend:
+                    reasons.append("VWAP up-cross blocked: base_buy_trend=False")
+                elif not confirmation_buy:
+                    reasons.append("VWAP up-cross blocked: confirmation_buy=False")
+                elif not is_valid_for_buy:
+                    reasons.append("VWAP up-cross blocked: Knox rejected candle")
+            
             if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
-                reasons.append("VWAP down-cross blocked: sell_common=False")
-
+                if not base_sell_trend:
+                    reasons.append("VWAP down-cross blocked: base_sell_trend=False")
+                elif not confirmation_sell:
+                    reasons.append("VWAP down-cross blocked: confirmation_sell=False")
+                elif not is_valid_for_sell:
+                    reasons.append("VWAP down-cross blocked: Knox rejected candle")
+        
         failed_conditions = [
             name for name, val in [
                 ("buy_common", buy_common),
                 ("sell_common", sell_common),
-                ("is_green", is_green),
-                ("is_red", is_red)
             ] if not val
         ]
-
+        
+        # Debug logging when no alerts sent
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-
             logger_pair.debug(
                 f"😒 {pair_name} | "
                 f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
-
+        
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
             "ts": int(time.time()),
