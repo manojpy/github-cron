@@ -3391,12 +3391,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pair_name=pair_name,
             min_wick_ratio=Constants.MIN_WICK_RATIO
         )
-    
+
         if not is_valid_for_buy and not is_valid_for_sell:
-            logger_pair.debug(
-                f"🚫 KNOX REJECTED | {pair_name} | {error_msg} | "
-                f"Candle: O={candle_info['open']:.4f} C={candle_info['close']:.4f}"
-            )
+            if candle_info:
+                logger_pair.debug(  # Changed to debug as discussed
+                    f"🚫 KNOX REJECTED | {pair_name} | {error_msg} | "
+                    f"Candle: O={candle_info['open']:.4f} C={candle_info['close']:.4f}"
+                )
+            else:
+                logger_pair.debug(
+                    f"🚫 KNOX REJECTED | {pair_name} | {error_msg} | "
+                    f"No candle info available"
+                )
             return None
     
         o = candle_info["open"]
@@ -3726,7 +3732,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.debug(
                         f"✅ Alert FIRED: {alert_key} | "
                         f"buy_common={buy_common} sell_common={sell_common} | "
-                        f"buy_passed={buy_candle_passed} sell_passed={sell_candle_passed} | "
+                        f"is_valid_for_buy={is_valid_for_buy} is_valid_for_sell={is_valid_for_sell} | "
                         f"Wick ratios: buy={buy_wick_ratio*100:.1f}% sell={sell_wick_ratio*100:.1f}% | "
                         f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                     )
@@ -3836,7 +3842,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
             if not base_buy_trend:
                 reasons.append("PPO>0 blocked: base_buy_trend=False")
-            elif not buy_candle_passed:
+            elif not is_valid_for_buy:
                 reasons.append("PPO>0 blocked: candle quality failed")
             elif not is_green:
                 reasons.append(f"PPO>0 blocked: candle not green (C={close_curr:.5f}, O={open_curr:.5f})")
@@ -3844,7 +3850,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
             if not base_sell_trend:
                 reasons.append("PPO<0 blocked: base_sell_trend=False")
-            elif not sell_candle_passed:
+            elif not is_valid_for_sell:  # Changed from sell_candle_passed
                 reasons.append("PPO<0 blocked: candle quality failed")
             elif not is_red:
                 reasons.append(f"PPO<0 blocked: candle not red (C={close_curr:.5f}, O={open_curr:.5f})")
