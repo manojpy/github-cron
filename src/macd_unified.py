@@ -2072,11 +2072,9 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
         logger.warning(
-            "[%s] Target %dm open %s not found. last_ts=%s count=%d last5=%s",
-            pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time),
-            format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A',
-            ts_normalized.size,
-            [format_ist_time(t) for t in ts_normalized[-5:]]
+            f"[{pair_name or '?'}] Target {interval_minutes}m open {format_ist_time(expected_ts_open_time)} not found. "
+            f"last_ts={format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'} "
+            f"count={ts_normalized.size} last5={[format_ist_time(t) for t in ts_normalized[-5:]}"
         )
         return None
 
