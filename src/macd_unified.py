@@ -4108,7 +4108,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     knox_rejected = len(pairs_to_process) - knox_approved
     
     logger_main.info(
-        f"�����🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
+        f"🎯🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
         f"({len(pairs_to_process)} total evaluated)"
     )
     return valid_results
