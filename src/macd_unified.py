@@ -1883,7 +1883,6 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         "lower_wick": lower_wick,
         "upper_wick_ratio": upper_wick_ratio,
         "lower_wick_ratio": lower_wick_ratio,
-        "candle_age_seconds": time_since_candle_closed,
         "time_since_closed": time_since_candle_closed,
         "is_valid_for_buy": is_valid_for_buy,
         "is_valid_for_sell": is_valid_for_sell,
@@ -2066,6 +2065,8 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         )
         return None
 
+
+
     logger.debug(
         "[%s] Selected %dm candle idx=%d open=%s close=%s age_since_close=%ds",
         pair_name or "?", interval_minutes, last_closed_idx,
@@ -2074,7 +2075,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
 
     return last_closed_idx
-
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
