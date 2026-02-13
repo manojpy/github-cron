@@ -1819,18 +1819,16 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if not (l <= o <= h and l <= c <= h):
         return False, False, None, f"Invalid OHLC: relationships broken (O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f})"
     
-    interval_seconds = 15 * 60  # 15 minutes
-    candle_age = reference_time - ts  # Time since candle opened
+    interval_seconds = 15 * 60
+    candle_age = reference_time - ts
     
     candle_close_time = ts + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
-    
-    MIN_TIME_PAST_CLOSE = 60
-    
-    if time_since_candle_closed < MIN_TIME_PAST_CLOSE:
+     
+    if time_since_candle_closed < cfg.CANDLE_MIN_AGE_BUFFER:
         return False, False, None, (
             f"Candle closed only {time_since_candle_closed}s ago "
-            f"(need {MIN_TIME_PAST_CLOSE}s). This may be the forming candle!"
+            f"(need {cfg.CANDLE_MIN_AGE_BUFFER}s). This may be the forming candle!"
         )
     
     if candle_index + 1 < len(data_15m["timestamp"]):
