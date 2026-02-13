@@ -669,86 +669,6 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
 
     return adx
 
-@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)", nogil=True, cache=True)
-def vectorized_wick_check_buy(open_p, high_p, low_p, close_p, min_wick_ratio, 
-                               atr_short, atr_long, rvol_threshold, adx, enable_adx, adx_threshold):    
-    n = len(close_p)
-    result = np.zeros(n, dtype=np.bool_)
-    
-    for i in range(n):
-        if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
-            continue
-        
-        rvol_pass = True
-        if rvol_threshold > 0.0:
-            if atr_short[i] <= (atr_long[i] * rvol_threshold):
-                rvol_pass = False
-        
-        adx_pass = True
-        if enable_adx:
-            if np.isnan(adx[i]) or adx[i] <= adx_threshold:
-                adx_pass = False
-        
-        if not (rvol_pass or adx_pass):
-            continue
-        
-        candle_range = high_p[i] - low_p[i]
-        if candle_range <= 1e-9:
-            continue
-        
-        if close_p[i] <= open_p[i]:
-            continue
-        
-        upper_wick = high_p[i] - close_p[i]
-        
-        if upper_wick < 0:
-            continue
-        
-        wick_ratio = upper_wick / candle_range
-        result[i] = wick_ratio < min_wick_ratio
-    
-    return result
-
-@njit("b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)", nogil=True, cache=True)
-def vectorized_wick_check_sell(open_p, high_p, low_p, close_p, min_wick_ratio, 
-                                atr_short, atr_long, rvol_threshold, adx, enable_adx, adx_threshold):
-    n = len(close_p)
-    result = np.zeros(n, dtype=np.bool_)
-    
-    for i in range(n):
-        if np.isnan(atr_short[i]) or np.isnan(atr_long[i]):
-            continue
-        
-        rvol_pass = True
-        if rvol_threshold > 0.0:
-            if atr_short[i] <= (atr_long[i] * rvol_threshold):
-                rvol_pass = False
-        
-        adx_pass = True
-        if enable_adx:
-            if np.isnan(adx[i]) or adx[i] <= adx_threshold:
-                adx_pass = False
-        
-        if not (rvol_pass or adx_pass):
-            continue
-      
-        candle_range = high_p[i] - low_p[i]
-        if candle_range <= 1e-9:
-            continue
-        
-        if close_p[i] >= open_p[i]:
-            continue
-        
-        lower_wick = close_p[i] - low_p[i]
-        
-        if lower_wick < 0:
-            continue
-        
-        wick_ratio = lower_wick / candle_range
-        result[i] = wick_ratio < min_wick_ratio
-    
-    return result
-
 # ============================================================================
 # AOT EXPORT CONFIGURATION
 # ============================================================================
@@ -775,13 +695,11 @@ EXPORT_CONFIG = {
     'calculate_rsi_core': 'f8[:](f8[:], i4)',
     'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',
     'calculate_adx_core': 'f8[:](f8[:], f8[:], f8[:], i4, i4)',
-    'vectorized_wick_check_buy': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)',
-    'vectorized_wick_check_sell': 'b1[:](f8[:], f8[:], f8[:], f8[:], f8, f8[:], f8[:], f8, f8[:], b1, f8)',
 }
 
 __all__ = list(EXPORT_CONFIG.keys())
 
-expected_min_functions = 22
+expected_min_functions = 20
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

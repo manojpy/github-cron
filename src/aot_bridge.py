@@ -149,8 +149,6 @@ def initialize_jit_fallback() -> None:
             calculate_rsi_core,
             calculate_atr_rma,
             calculate_adx_core,
-            vectorized_wick_check_buy,
-            vectorized_wick_check_sell,
         )
 
         # Store in dictionary for dispatch
@@ -176,8 +174,6 @@ def initialize_jit_fallback() -> None:
             'calculate_rsi_core': calculate_rsi_core,
             'calculate_atr_rma': calculate_atr_rma,
             'calculate_adx_core': calculate_adx_core,
-            'vectorized_wick_check_buy': vectorized_wick_check_buy,
-            'vectorized_wick_check_sell': vectorized_wick_check_sell,
         }
 
     except ImportError as e:
@@ -221,8 +217,6 @@ def ensure_initialized() -> None:
             'calculate_rsi_core': _aot_module.calculate_rsi_core,
             'calculate_atr_rma': _aot_module.calculate_atr_rma,
             'calculate_adx_core': _aot_module.calculate_adx_core,
-            'vectorized_wick_check_buy': _aot_module.vectorized_wick_check_buy,
-            'vectorized_wick_check_sell': _aot_module.vectorized_wick_check_sell,
         }
     else:
         _fallback_reason = reason
@@ -318,24 +312,6 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
 def calculate_adx_core(high: np.ndarray, low: np.ndarray, close: np.ndarray, di_length: int, adx_length: int) -> np.ndarray:
     return _dispatch['calculate_adx_core'](high, low, close, di_length, adx_length)
 
-def vectorized_wick_check_buy(open_arr: np.ndarray, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray,
-                              min_wick_ratio: float, atr_short: np.ndarray, atr_long: np.ndarray, rvol_threshold: float,
-                              adx: np.ndarray, enable_adx: bool, adx_threshold: float) -> np.ndarray:
-    return _dispatch['vectorized_wick_check_buy'](
-        open_arr, high_arr, low_arr, close_arr, min_wick_ratio,
-        atr_short, atr_long, rvol_threshold,
-        adx, enable_adx, adx_threshold
-    )
-
-def vectorized_wick_check_sell(open_arr: np.ndarray, high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray,
-                               min_wick_ratio: float, atr_short: np.ndarray, atr_long: np.ndarray, rvol_threshold: float,
-                               adx: np.ndarray, enable_adx: bool, adx_threshold: float) -> np.ndarray:
-    return _dispatch['vectorized_wick_check_sell'](
-        open_arr, high_arr, low_arr, close_arr, min_wick_ratio,
-        atr_short, atr_long, rvol_threshold,
-        adx, enable_adx, adx_threshold
-    )
-
 
 # ============================================================================
 # MODULE EXPORTS
@@ -384,8 +360,6 @@ __all__ = [
     # Pattern Recognition
     'calculate_atr_rma',
     'calculate_adx_core', 
-    'vectorized_wick_check_buy',
-    'vectorized_wick_check_sell',
 ]
 
 # Auto-initialize on import
