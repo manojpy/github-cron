@@ -218,7 +218,7 @@ class BotConfig(BaseModel):
     CB_RECOVERY_TIMEOUT: int = Field(default=60, ge=10, le=600)  # Circuit breaker recovery wait time (seconds)
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
     MIN_CANDLES_PER_DAY: int = Field(default=94, ge=50, le=100)  # Minimum candles for complete day (94=23h for 15m candles)
-    CANDLE_MIN_AGE_BUFFER: int = Field(default=45, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
+    CANDLE_MIN_AGE_BUFFER: int = Field(default=90, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -1809,28 +1809,17 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         ts = int(data_15m["timestamp"][candle_index])
     except (IndexError, KeyError, ValueError, TypeError) as e:
         return False, False, None, f"Data access error: {e}"
-    
-    if any(np.isnan([o, h, l, c])) or any(np.isinf([o, h, l, c])):
-        return False, False, None, f"Invalid OHLC: contains NaN or Inf"
-    
-    if any(x <= 0 for x in [o, h, l, c]):
-        return False, False, None, f"Invalid OHLC: non-positive values"
-    
-    if not (l <= o <= h and l <= c <= h):
-        return False, False, None, f"Invalid OHLC: relationships broken (O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f})"
-    
+
     interval_seconds = 15 * 60
-    candle_age = reference_time - ts
-    
     candle_close_time = ts + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
-     
+
     if time_since_candle_closed < cfg.CANDLE_MIN_AGE_BUFFER:
         return False, False, None, (
             f"Candle closed only {time_since_candle_closed}s ago "
-            f"(need {cfg.CANDLE_MIN_AGE_BUFFER}s). This may be the forming candle!"
+            f"(need {cfg.CANDLE_MIN_AGE_BUFFER}s). Skipping forming candle!"
         )
-    
+ 
     if candle_index + 1 < len(data_15m["timestamp"]):
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
@@ -1894,7 +1883,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         "lower_wick": lower_wick,
         "upper_wick_ratio": upper_wick_ratio,
         "lower_wick_ratio": lower_wick_ratio,
-        "candle_age_seconds": candle_age,
+        "candle_age_seconds": time_since_candle_closed,
         "time_since_closed": time_since_candle_closed,
         "is_valid_for_buy": is_valid_for_buy,
         "is_valid_for_sell": is_valid_for_sell,
@@ -2059,44 +2048,33 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         logger.error("[%s] Timestamp normalization failed: %s", pair_name or "?", e)
         return None
 
-    if ts_normalized.size >= 2 and np.any(np.diff(ts_normalized) <= 0):
-        target_area_mask = np.abs(ts_normalized - expected_ts_open_time) <= interval_seconds
-        if np.any(np.diff(ts_normalized[target_area_mask]) <= 0):
-            logger.warning("[%s] Timestamps corrupted near target candle; rejecting.", pair_name or "?")
-            return None
-        else:
-            logger.info("[%s] Duplicate timestamps exist in data, but not near target candle.", pair_name or "?")
-
     matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
-        logger.warning(
-            "[%s] Target %dm open %s not found. last_ts=%s count=%d last5=%s",
-            pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time),
-            format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A',
-            int(ts_normalized.size),  # <-- Convert to int
-            str([format_ist_time(t) for t in ts_normalized[-5:]])  # <-- Convert list to string
-        )
+        logger.warning("[%s] Target %dm open %s not found", pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time))
         return None
 
     last_closed_idx = int(matches[-1])
     actual_candle_open = int(ts_normalized[last_closed_idx])
+    candle_close_time = actual_candle_open + interval_seconds
 
-    minimum_required_age = interval_seconds + getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60)
-    candle_age = reference_time - actual_candle_open
-    if candle_age < minimum_required_age:
+    time_since_candle_closed = reference_time - candle_close_time
+    if time_since_candle_closed < getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60):
         logger.warning(
-            "[%s] Candle at %s is only %ds old; needs %ds. Skipping.",
-            pair_name or "?", format_ist_time(actual_candle_open), candle_age, minimum_required_age
+            "[%s] Candle at %s closed only %ds ago; need %ds. Skipping forming candle.",
+            pair_name or "?", format_ist_time(candle_close_time),
+            time_since_candle_closed, cfg.CANDLE_MIN_AGE_BUFFER
         )
         return None
 
     logger.debug(
-        "[%s] Selected %dm candle idx=%d expected_open=%s actual_open=%s age_s=%d",
+        "[%s] Selected %dm candle idx=%d open=%s close=%s age_since_close=%ds",
         pair_name or "?", interval_minutes, last_closed_idx,
-        format_ist_time(expected_ts_open_time), format_ist_time(actual_candle_open), candle_age
+        format_ist_time(actual_candle_open), format_ist_time(candle_close_time),
+        time_since_candle_closed
     )
 
     return last_closed_idx
+
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
