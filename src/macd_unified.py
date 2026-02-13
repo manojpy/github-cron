@@ -3414,6 +3414,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         low_curr = l
         close_curr = c
         candle_range = h - l
+
+        close_15m = data_15m["close"]
+        open_15m = data_15m["open"]
+        timestamps_15m = data_15m["timestamp"]
     
         logger_pair.debug(
             f"✅ KNOX APPROVED | {pair_name} | "
