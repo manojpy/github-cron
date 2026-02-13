@@ -2041,7 +2041,9 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         )
         return None
 
-def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, reference_time: Optional[int] = None, pair_name: Optional[str] = None) -> Optional[int]:
+def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, 
+                                     reference_time: Optional[int] = None, 
+                                     pair_name: Optional[str] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 1:
         return None
 
@@ -2050,8 +2052,21 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     reference_time = normalize_timestamp(reference_time)
 
     interval_seconds = interval_minutes * 60
+    
     current_period_start = (reference_time // interval_seconds) * interval_seconds
     expected_ts_open_time = current_period_start - interval_seconds
+    
+    candle_close_time = expected_ts_open_time + interval_seconds
+    time_since_candle_closed = reference_time - candle_close_time
+    
+    buffer_seconds = getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60)
+    if time_since_candle_closed < buffer_seconds:
+        logger.warning(
+            "[%s] Candle %s-%s closed only %ds ago (need %ds buffer). Data may not be finalized. Skipping.",
+            pair_name or "?", format_ist_time(expected_ts_open_time), 
+            format_ist_time(candle_close_time), time_since_candle_closed, buffer_seconds
+        )
+        return None
 
     try:
         ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
@@ -2073,27 +2088,28 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
             "[%s] Target %dm open %s not found. last_ts=%s count=%d last5=%s",
             pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time),
             format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A',
-            int(ts_normalized.size),  # <-- Convert to int
-            str([format_ist_time(t) for t in ts_normalized[-5:]])  # <-- Convert list to string
+            int(ts_normalized.size),
+            str([format_ist_time(t) for t in ts_normalized[-5:]])
         )
         return None
 
     last_closed_idx = int(matches[-1])
     actual_candle_open = int(ts_normalized[last_closed_idx])
 
-    minimum_required_age = interval_seconds + getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60)
-    candle_age = reference_time - actual_candle_open
-    if candle_age < minimum_required_age:
-        logger.warning(
-            "[%s] Candle at %s is only %ds old; needs %ds. Skipping.",
-            pair_name or "?", format_ist_time(actual_candle_open), candle_age, minimum_required_age
+    actual_candle_close = actual_candle_open + interval_seconds
+    if reference_time < actual_candle_close:
+        logger.error(
+            "[%s] LOGIC ERROR: Selected candle hasn't closed yet! "
+            "Closes at %s, ref time is %s",
+            pair_name or "?", format_ist_time(actual_candle_close), format_ist_time(reference_time)
         )
         return None
 
-    logger.debug(
-        "[%s] Selected %dm candle idx=%d expected_open=%s actual_open=%s age_s=%d",
+    logger.info(
+        "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
         pair_name or "?", interval_minutes, last_closed_idx,
-        format_ist_time(expected_ts_open_time), format_ist_time(actual_candle_open), candle_age
+        format_ist_time(actual_candle_open), format_ist_time(actual_candle_close),
+        time_since_candle_closed
     )
 
     return last_closed_idx
@@ -3356,6 +3372,14 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, alignment_cache: Dict[str, int]) -> Optional[Tuple[str, Dict[str, Any]]]:
+    
+    if reference_time is None:
+        reference_time = get_trigger_timestamp()   
+    logger.info(
+        f"[{pair_name}] === EVALUATION START === "
+        f"reference_time={format_ist_time(reference_time)} "
+        f"(expecting 15m candle: {format_ist_time(((reference_time // 900) * 900) - 900)})"
+    )
     
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
