@@ -3391,7 +3391,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         )
     
         if not is_valid_for_buy and not is_valid_for_sell:
-            logger_pair.warning(
+            logger_pair.debug(
                 f"🚫 KNOX REJECTED | {pair_name} | {error_msg} | "
                 f"Candle: O={candle_info['open']:.4f} C={candle_info['close']:.4f}"
             )
