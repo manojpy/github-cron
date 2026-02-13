@@ -3390,7 +3390,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     
     if reference_time is None:
         reference_time = get_trigger_timestamp()   
-    logger.info(
+    logger.debug(
         f"[{pair_name}] === EVALUATION START === "
         f"reference_time={format_ist_time(reference_time)} "
         f"(expecting 15m candle: {format_ist_time(((reference_time // 900) * 900) - 900)})"
@@ -4113,7 +4113,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     knox_rejected = len(pairs_to_process) - knox_approved
     
     logger_main.info(
-        f"🔐🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
+        f"���🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
         f"({len(pairs_to_process)} total evaluated)"
     )
     return valid_results
