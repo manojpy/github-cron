@@ -3392,17 +3392,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             min_wick_ratio=Constants.MIN_WICK_RATIO
         )
 
+        
         if not is_valid_for_buy and not is_valid_for_sell:
-            if candle_info:
-                logger_pair.debug(  # Changed to debug as discussed
-                    f"🚫 KNOX REJECTED | {pair_name} | {error_msg} | "
-                    f"Candle: O={candle_info['open']:.4f} C={candle_info['close']:.4f}"
-                )
-            else:
-                logger_pair.debug(
-                    f"🚫 KNOX REJECTED | {pair_name} | {error_msg} | "
-                    f"No candle info available"
-                )
             return None
     
         o = candle_info["open"]
@@ -3425,17 +3416,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
     
-        logger_pair.debug(
-            f"✅ KNOX APPROVED | {pair_name} | "
-            f"{candle_info['color']} candle | "
-            f"Valid for: {'BUY' if is_valid_for_buy else ''} "
-            f"{'SELL' if is_valid_for_sell else ''} | "
-            f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
-            f"Upper wick: {buy_wick_ratio*100:.1f}% | "
-            f"Lower wick: {sell_wick_ratio*100:.1f}% | "
-            f"Age: {candle_info['candle_age_seconds']}s"
-        )
-
         ts_15m_val = data_15m["timestamp"][i15]
         ts_5m_arr = data_5m["timestamp"]
         idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
@@ -4092,10 +4072,13 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             f"Possible memory leak?"
         )
 
+    knox_approved = len(valid_results)
+    knox_rejected = len(pairs_to_process) - knox_approved
+    
     logger_main.info(
-        f"🧠 Worker pool complete: {len(valid_results)}/{len(pairs_to_process)} pairs evaluated"
+        f"🔐🧠 Knox: {knox_approved} approved, {knox_rejected} rejected "
+        f"({len(pairs_to_process)} total evaluated)"
     )
-
     return valid_results
 
 async def run_once() -> bool:
