@@ -2059,7 +2059,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     candle_close_time = expected_ts_open_time + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
    
-    buffer_seconds = getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60)
+    buffer_seconds = cfg.CANDLE_MIN_AGE_BUFFER
     if time_since_candle_closed < buffer_seconds:
         logger.warning(
             "[%s] Candle %s-%s closed only %ds ago (need %ds buffer). Skipping.",
@@ -2127,7 +2127,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
 
     return last_closed_idx
-
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
