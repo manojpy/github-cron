@@ -3429,6 +3429,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"Lower wick: {sell_wick_ratio*100:.1f}% | "
             f"Age: {candle_info['candle_age_seconds']}s"
         )
+
+        ts_15m_val = data_15m["timestamp"][i15]
+        ts_5m_arr = data_5m["timestamp"]
+        idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
+        i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
+        if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
+            return None
       
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily, reference_time
