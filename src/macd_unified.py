@@ -2055,16 +2055,19 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     
     current_period_start = (reference_time // interval_seconds) * interval_seconds
     expected_ts_open_time = current_period_start - interval_seconds
-    
+   
     candle_close_time = expected_ts_open_time + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
-    
+   
     buffer_seconds = getattr(cfg, "CANDLE_MIN_AGE_BUFFER", 60)
     if time_since_candle_closed < buffer_seconds:
         logger.warning(
-            "[%s] Candle %s-%s closed only %ds ago (need %ds buffer). Data may not be finalized. Skipping.",
-            pair_name or "?", format_ist_time(expected_ts_open_time), 
-            format_ist_time(candle_close_time), time_since_candle_closed, buffer_seconds
+            "[%s] Candle %s-%s closed only %ds ago (need %ds buffer). Skipping.",
+            pair_name or "?", 
+            format_ist_time(expected_ts_open_time), 
+            format_ist_time(candle_close_time), 
+            int(time_since_candle_closed), 
+            int(buffer_seconds)
         )
         return None
 
@@ -2077,42 +2080,54 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     if ts_normalized.size >= 2 and np.any(np.diff(ts_normalized) <= 0):
         target_area_mask = np.abs(ts_normalized - expected_ts_open_time) <= interval_seconds
         if np.any(np.diff(ts_normalized[target_area_mask]) <= 0):
-            logger.warning("[%s] Timestamps corrupted near target candle; rejecting.", pair_name or "?")
+            logger.warning("[%s] Timestamps corrupted near target; rejecting.", pair_name or "?")
             return None
         else:
-            logger.info("[%s] Duplicate timestamps exist in data, but not near target candle.", pair_name or "?")
+            logger.info("[%s] Duplicates exist but not near target.", pair_name or "?")
 
     matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
+        last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
+        count = int(ts_normalized.size)
+        last5_list = [format_ist_time(t) for t in ts_normalized[-5:]]
+        last5_str = str(last5_list)
+        
         logger.warning(
-            "[%s] Target %dm open %s not found. last_ts=%s count=%d last5=%s",
-            pair_name or "?", interval_minutes, format_ist_time(expected_ts_open_time),
-            format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A',
-            int(ts_normalized.size),
-            str([format_ist_time(t) for t in ts_normalized[-5:]])
+            "[%s] Target %dm open %s not found. last_ts=%s count=%s last5=%s",
+            pair_name or "?", 
+            int(interval_minutes), 
+            format_ist_time(expected_ts_open_time),
+            last_ts,
+            count,
+            last5_str
         )
         return None
 
     last_closed_idx = int(matches[-1])
     actual_candle_open = int(ts_normalized[last_closed_idx])
 
-    actual_candle_close = actual_candle_open + interval_seconds
-    if reference_time < actual_candle_close:
+    actual_close = actual_candle_open + interval_seconds
+    if reference_time < actual_close:
         logger.error(
-            "[%s] LOGIC ERROR: Selected candle hasn't closed yet! "
-            "Closes at %s, ref time is %s",
-            pair_name or "?", format_ist_time(actual_candle_close), format_ist_time(reference_time)
+            "[%s] LOGIC ERROR: Candle not closed! Closes %s, ref %s",
+            pair_name or "?",
+            format_ist_time(actual_close),
+            format_ist_time(reference_time)
         )
         return None
 
-    logger.info(
+    logger.debug(
         "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
-        pair_name or "?", interval_minutes, last_closed_idx,
-        format_ist_time(actual_candle_open), format_ist_time(actual_candle_close),
-        time_since_candle_closed
+        pair_name or "?",
+        int(interval_minutes),
+        last_closed_idx,
+        format_ist_time(actual_candle_open),
+        format_ist_time(actual_close),
+        int(time_since_candle_closed)
     )
 
     return last_closed_idx
+
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
