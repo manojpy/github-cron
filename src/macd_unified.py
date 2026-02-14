@@ -132,6 +132,8 @@ class Constants:
     CANDLE_FETCH_BUFFER_PERIODS = 3 
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
+    MIN_CANDLE_AGE_FROM_OPEN = 850
+    MAX_CANDLE_AGE_FROM_OPEN = 1200
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -1830,7 +1832,20 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             f"Candle closed only {time_since_candle_closed}s ago "
             f"(need {cfg.CANDLE_MIN_AGE_BUFFER}s). This may be the forming candle!"
         )
+   
+    if candle_age < Constants.MIN_CANDLE_AGE_FROM_OPEN:
+        return False, False, None, (
+            f"Candle age {candle_age}s from open is < {Constants.MIN_CANDLE_AGE_FROM_OPEN}s. "
+            f"This is likely the currently forming candle! "
+            f"(Opened: {format_ist_time(ts)}, Current: {format_ist_time(reference_time)})"
+        )
     
+    if candle_age > Constants.MAX_CANDLE_AGE_FROM_OPEN:
+        return False, False, None, (
+            f"Candle age {candle_age}s from open is > {Constants.MAX_CANDLE_AGE_FROM_OPEN}s. "
+            f"This is a stale candle from a previous period! "
+            f"(Opened: {format_ist_time(ts)}, Current: {format_ist_time(reference_time)})"
+        )
     if candle_index + 1 < len(data_15m["timestamp"]):
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
