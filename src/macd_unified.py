@@ -1846,6 +1846,12 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             f"This is a stale candle from a previous period! "
             f"(Opened: {format_ist_time(ts)}, Current: {format_ist_time(reference_time)})"
         )
+    if cfg.DEBUG_MODE:
+        logger.debug(
+            f"[{pair_name}] Validating candle at index {candle_index}: "
+            f"Open={format_ist_time(ts)}, Age={candle_age}s, "
+            f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
+        )
     if candle_index + 1 < len(data_15m["timestamp"]):
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
@@ -2100,7 +2106,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         else:
             logger.info("[%s] Duplicates exist but not near target.", pair_name or "?")
 
-    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
+    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 0)
     if matches.size == 0:
         last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
         count = int(ts_normalized.size)
@@ -2120,6 +2126,16 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     last_closed_idx = int(matches[-1])
     actual_candle_open = int(ts_normalized[last_closed_idx])
+    current_period_start = (reference_time // interval_seconds) * interval_seconds
+    if actual_candle_open >= current_period_start:
+        logger.error(
+            "[%s] REJECTED: Selected candle is the FORMING candle! "
+            "Open %s >= current period start %s. This should never happen!",
+            pair_name or "?",
+            format_ist_time(actual_candle_open),
+            format_ist_time(current_period_start)
+        )
+        return None
 
     actual_close = actual_candle_open + interval_seconds
     if reference_time < actual_close:
@@ -3452,6 +3468,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         buy_wick_ratio = candle_info["upper_wick_ratio"]
         sell_wick_ratio = candle_info["lower_wick_ratio"]
     
+        if is_valid_for_buy and not is_green:
+            logger.error(
+                f"[{pair_name}] CRITICAL MISMATCH: is_valid_for_buy=True but candle is NOT GREEN! "
+                f"is_green={is_green}, is_red={is_red}. Rejecting to prevent false alert."
+            )
+            return None
+    
+        if is_valid_for_sell and not is_red:
+            logger.error(
+                f"[{pair_name}] CRITICAL MISMATCH: is_valid_for_sell=True but candle is NOT RED! "
+                f"is_green={is_green}, is_red={is_red}. Rejecting to prevent false alert."
+            )
+            return None
+
         open_curr = o
         high_curr = h
         low_curr = l
@@ -3585,7 +3615,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell)
     
         if not is_valid_for_buy and not is_valid_for_sell:
-            logger_pair.error(f"🚨 KNOX VIOLATION: Neither buy nor sell valid but code continued!")
+            logger.debug(
+                f"[{pair_name}] Knox rejected: is_valid_for_buy={is_valid_for_buy}, "
+                f"is_valid_for_sell={is_valid_for_sell}, reason={error_msg}"
+            )
             return None
 
         if not has_valid_mmh:
