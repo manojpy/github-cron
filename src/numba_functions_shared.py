@@ -225,27 +225,36 @@ def calc_mmh_momentum_smoothing(momentum_arr, rows):
     return result
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
-def ema_loop(data, alpha_or_period):
-    """Exponential Moving Average in O(n) with first-valid-index init"""
+def ema_loop(data, length_float):
+    
     n = len(data)
-    alpha = 2.0 / (alpha_or_period + 1.0) if alpha_or_period > 1.0 else alpha_or_period
+    length = int(length_float)
+    alpha = 2.0 / (length + 1)
     out = np.full(n, np.nan, dtype=np.float64)
     
-    first_valid_idx = -1
+    start_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
-            first_valid_idx = i
+            start_idx = i
             break
-    
-    if first_valid_idx == -1:
+            
+    if start_idx == -1 or n < (start_idx + length):
         return out
+        
+    sum_val = 0.0
+    for i in range(start_idx, start_idx + length):
+        sum_val += data[i]
     
-    out[first_valid_idx] = data[first_valid_idx]
+    seed_idx = start_idx + length - 1
+    out[seed_idx] = sum_val / length
     
-    for i in range(first_valid_idx + 1, n):
+    for i in range(seed_idx + 1, n):
         curr = data[i]
-        out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
-    
+        if np.isnan(curr):
+            out[i] = out[i-1]
+        else:
+            out[i] = alpha * curr + (1.0 - alpha) * out[i-1]
+            
     return out
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
@@ -290,13 +299,28 @@ def ema_loop_alpha(data, alpha):
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    """Range filter - with proper initialization"""
+    
     n = len(x)
-    filt = np.empty(n, dtype=np.float64)
+    filt = np.full(n, np.nan, dtype=np.float64)
+    start_idx = -1
+    for i in range(n):
+        if not np.isnan(r[i]):
+            prev_val = 0.0 
+            curr_x = x[i]
+            curr_r = r[i]
+            
+            if curr_x > prev_val:
+                filt[i] = max(prev_val, curr_x - curr_r)
+            else:
+                filt[i] = min(prev_val, curr_x + curr_r)
+                
+            start_idx = i + 1
+            break
+            
+    if start_idx == -1:
+        return filt
 
-    filt[0] = x[0] if not np.isnan(x[0]) else 0.0
-
-    for i in range(1, n):
+    for i in range(start_idx, n):
         curr_x = x[i]
         curr_r = r[i]
         prev = filt[i - 1]
@@ -316,61 +340,39 @@ def rng_filter_loop(x, r):
 
 @njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
 def smooth_range(close, t, m):
-    """Calculate smoothed range - with explicit type handling"""
+    
     n = len(close)
-
-    diff = np.empty(n, dtype=np.float64)
-    diff[0] = 0.0
+    diff = np.full(n, np.nan, dtype=np.float64)
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i - 1])
 
-    alpha_t = 2.0 / (float(t) + 1.0)
-    avrng = np.empty(n, dtype=np.float64)
-    avrng[0] = diff[0]
-    for i in range(1, n):
-        curr = diff[i]
-        avrng[i] = (alpha_t * curr + (1.0 - alpha_t) * avrng[i-1]) if not np.isnan(curr) else avrng[i-1]
+    avrng = ema_loop(diff, float(t))
 
     wper = t * 2 - 1
-    alpha_w = 2.0 / (float(wper) + 1.0)
-    smoothrng = np.empty(n, dtype=np.float64)
-    smoothrng[0] = avrng[0]
-    for i in range(1, n):
-        curr = avrng[i]
-        smoothrng[i] = (alpha_w * curr + (1.0 - alpha_w) * smoothrng[i-1]) if not np.isnan(curr) else smoothrng[i-1]
+    smoothrng = ema_loop(avrng, float(wper))
 
     return smoothrng * float(m)
 
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):
-    """Determine cloud up/down states in O(n) - single pass"""
+    
     n = len(filt_x1)
-    upw = np.empty(n, dtype=np.bool_)
-    dnw = np.empty(n, dtype=np.bool_)
+    upw = np.zeros(n, dtype=np.bool_)
+    dnw = np.zeros(n, dtype=np.bool_)
 
-    if filt_x1[0] < filt_x12[0]:
-        upw[0] = True
-        dnw[0] = False
-    elif filt_x1[0] > filt_x12[0]:
-        upw[0] = False
-        dnw[0] = True
-    else:
-        upw[0] = True
-        dnw[0] = False
-
-    for i in range(1, n):
-        if filt_x1[i] < filt_x12[i]:
-            upw[i] = True
-            dnw[i] = False
-        elif filt_x1[i] > filt_x12[i]:
+    for i in range(n):
+        f1 = filt_x1[i]
+        f2 = filt_x12[i]
+        
+        if np.isnan(f1) or np.isnan(f2):
             upw[i] = False
-            dnw[i] = True
-        else:
-            upw[i] = upw[i - 1]
-            dnw[i] = dnw[i - 1]
+            dnw[i] = False
+            continue
+
+        upw[i] = f1 < f2
+        dnw[i] = f1 > f2
 
     return upw, dnw
-
 
 @njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
@@ -475,49 +477,19 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps, reference_time, buffer_secon
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
-    """Calculate PPO in O(n) - three EMA passes"""
     n = len(close)
-    fast_alpha = 2.0 / (fast + 1.0)
-    slow_alpha = 2.0 / (slow + 1.0)
 
-    fast_ma = np.full(n, np.nan, dtype=np.float64)
-    slow_ma = np.full(n, np.nan, dtype=np.float64)
+    fast_ma = ema_loop(close, float(fast))
+    slow_ma = ema_loop(close, float(slow))
 
-    first_valid_idx = -1
+    ppo = np.full(n, np.nan, dtype=np.float64)
     for i in range(n):
-        if not np.isnan(close[i]):
-            first_valid_idx = i
-            break
-    
-    if first_valid_idx == -1:
-        return np.full(n, np.nan, dtype=np.float64), np.full(n, np.nan, dtype=np.float64)
+        f = fast_ma[i]
+        s = slow_ma[i]
+        if not np.isnan(f) and not np.isnan(s) and s != 0.0:
+            ppo[i] = ((f - s) / s) * 100.0
 
-    fast_ma[first_valid_idx] = close[first_valid_idx]
-    slow_ma[first_valid_idx] = close[first_valid_idx]
-
-    for i in range(first_valid_idx + 1, n):
-        c = close[i]
-        if np.isnan(c):
-            fast_ma[i] = fast_ma[i-1]
-            slow_ma[i] = slow_ma[i-1]
-        else:
-            fast_ma[i] = fast_alpha * c + (1.0 - fast_alpha) * fast_ma[i-1]
-            slow_ma[i] = slow_alpha * c + (1.0 - slow_alpha) * slow_ma[i-1]
-
-    ppo = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        if slow_ma[i] != 0.0 and not np.isnan(slow_ma[i]):
-            ppo[i] = ((fast_ma[i] - slow_ma[i]) / slow_ma[i]) * 100.0
-        else:
-            ppo[i] = 0.0
-
-    sig_alpha = 2.0 / (signal + 1.0)
-    ppo_sig = np.full(n, np.nan, dtype=np.float64)
-    ppo_sig[first_valid_idx] = ppo[first_valid_idx]
-
-    for i in range(first_valid_idx + 1, n):
-        p = ppo[i]
-        ppo_sig[i] = ppo_sig[i-1] if np.isnan(p) else (sig_alpha * p + (1.0 - sig_alpha) * ppo_sig[i-1])
+    ppo_sig = ema_loop(ppo, float(signal))
 
     return ppo, ppo_sig
 

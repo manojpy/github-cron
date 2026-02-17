@@ -786,17 +786,18 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
             logger.warning(f"PPO: Insufficient data")
             default_len = len(close) if close is not None else 1
             return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
-        
+
         ppo, ppo_sig = calculate_ppo_core(close, fast, slow, signal)
-        
+
         if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
-            ppo = sanitize_array_numba_parallel(ppo, 0.0)
-            ppo_sig = sanitize_array_numba_parallel(ppo_sig, 0.0)
+            ppo     = sanitize_array_numba_parallel(ppo,     np.nan)
+            ppo_sig = sanitize_array_numba_parallel(ppo_sig, np.nan)
         else:
-            ppo = sanitize_array_numba(ppo, 0.0)
-            ppo_sig = sanitize_array_numba(ppo_sig, 0.0)
-        
+            ppo     = sanitize_array_numba(ppo,     np.nan)
+            ppo_sig = sanitize_array_numba(ppo_sig, np.nan)
+
         return ppo, ppo_sig
+
     except Exception as e:
         logger.error(f"PPO calculation failed: {e}")
         default_len = len(close) if close is not None else 1
@@ -821,45 +822,42 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
         if data is None or len(data) < period:
-            return np.zeros_like(data) if data is not None else np.array([0.0]) 
-   
+            return np.zeros_like(data) if data is not None else np.array([0.0])
+
         alpha = 1.0 / period
         rma = ema_loop_alpha(data, alpha)
-        rma = sanitize_array_numba(rma, 0.0)
-        return rma       
+        rma = sanitize_array_numba(rma, np.nan)   # ← was 0.0
+        return rma
     except Exception as e:
         logger.error(f"RMA calculation failed: {e}")
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
 def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     try:
-        if close is None or len(close) < max(cfg.X1, cfg.X3):
-            default_len = len(close) if close is not None else 1
-            return (
-                np.zeros(default_len, dtype=bool),
-                np.zeros(default_len, dtype=bool),
-                np.zeros(default_len, dtype=np.float64),
-                np.zeros(default_len, dtype=np.float64)
-            )
-        close = np.asarray(close, dtype=np.float64)
+        if close is None or len(close) < 1:
+            return (np.array([False]), np.array([False]), np.array([0.0]), np.array([0.0]))
         
-        smrng_x1 = smooth_range(close, cfg.X1, cfg.X2)
-        smrng_x2 = smooth_range(close, cfg.X3, cfg.X4)
-        filt_x1 = rng_filter_loop(close, smrng_x1)
-        filt_x12 = rng_filter_loop(close, smrng_x2)
+        close_arr = np.asarray(close, dtype=np.float64)
+        
+        smrng_x1 = smooth_range(close_arr, cfg.X1, cfg.X2)
+        smrng_x2 = smooth_range(close_arr, cfg.X3, cfg.X4)
+        
+        filt_x1 = rng_filter_loop(close_arr, smrng_x1)
+        filt_x12 = rng_filter_loop(close_arr, smrng_x2)
 
         upw, dnw = calculate_trends_with_state(filt_x1, filt_x12)   
+        
         return upw, dnw, filt_x1, filt_x12
         
     except Exception as e:
-        default_len = len(close) if close is not None else 1
+        length = len(close) if close is not None else 1
         return (
-            np.zeros(default_len, dtype=bool),
-            np.zeros(default_len, dtype=bool),
-            np.zeros(default_len, dtype=np.float64),
-            np.zeros(default_len, dtype=np.float64)
+            np.zeros(length, dtype=np.bool_),
+            np.zeros(length, dtype=np.bool_),
+            np.zeros(length, dtype=np.float64),
+            np.zeros(length, dtype=np.float64)
         )
-        
+
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 55, responsiveness: float = 0.9) -> np.ndarray:  
     try:
         if close is None or len(close) < period:
@@ -1069,6 +1067,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             )
         else:
             results["vwap"] = np.full(n_15m, np.nan)
+
         mmh = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)    
         results['mmh'] = mmh
         
@@ -1088,7 +1087,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         )
 
         results['atr_long'] = calculate_atr_rma(
-           data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
+            data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
 
         results['adx'] = calculate_adx_core(
@@ -1133,14 +1132,31 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         else:
             results['pivots'] = {}
 
-        for key in ['ppo', 'ppo_signal', 'smooth_rsi', 'mmh', 'rma50_15', 'rma200_5', 'adx']:
+        SANITIZE_KEYS = [
+            'ppo', 'ppo_signal', 'smooth_rsi', 'mmh',
+            'rma50_15', 'rma200_5', 'adx',
+            'atr_short', 'atr_long',
+        ]
+
+        for key in SANITIZE_KEYS:
             arr = results[key]
-            if np.any(~np.isfinite(arr)):  # Check both NaN and Inf
-                if cfg.DEBUG_MODE:
-                    inf_count = np.sum(np.isinf(arr))
-                    nan_count = np.sum(np.isnan(arr))
-                    logger.warning(f"{key}: {inf_count} infs, {nan_count} nans - clamping")
-                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP) 
+
+            # Pass 1: Inf — clamp and warn (genuine corruption)
+            if np.any(np.isinf(arr)):
+                inf_count = int(np.sum(np.isinf(arr)))
+                logger.warning(f"{key}: {inf_count} inf value(s) detected — clamping")
+                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
+                arr = results[key]  # refresh reference after clip
+
+            # Pass 2: NaN — debug log only (expected warm-up, not a fault)
+            if cfg.DEBUG_MODE:
+                nan_count = int(np.sum(np.isnan(arr)))
+                if nan_count > 0:
+                    logger.debug(
+                        f"{key}: {nan_count} NaN warm-up bar(s) — "
+                        f"normal EMA/RMA initialisation, downstream must guard with isnan()"
+                    )
+
         return results    
    
     except Exception as e:
