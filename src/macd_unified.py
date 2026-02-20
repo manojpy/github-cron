@@ -532,42 +532,6 @@ def validate_runtime_config() -> None:
     )    
     _VALIDATION_DONE = True
 
-def calculate_wick_ratio(open_val: float, high_val: float, low_val: float, 
-                        close_val: float, is_buy: bool) -> float:
-    candle_range = high_val - low_val   
-    
-    if candle_range < 1e-9:
-        return 0.0
-    
-    try:
-        if is_buy:
-            upper_wick = high_val - close_val
-            
-            if upper_wick < 0:
-                logger.warning(
-                    f"Negative upper wick (buy): H={high_val:.5f}, C={close_val:.5f}"
-                )
-                return 0.0
-            
-            wick_ratio = upper_wick / candle_range
-        
-        else:
-            lower_wick = close_val - low_val
-            
-            if lower_wick < 0:
-                logger.warning(
-                    f"Negative lower wick (sell): C={close_val:.5f}, L={low_val:.5f}"
-                )
-                return 0.0
-            
-            wick_ratio = lower_wick / candle_range
-        
-        return max(0.0, min(1.0, wick_ratio))
-        
-    except (ValueError, ZeroDivisionError) as e:
-        logger.error(f"Error calculating wick ratio: {e}")
-        return 0.0
-
 def validate_indicator_array(arr: Optional[np.ndarray], name: str, 
                             min_valid_values: int = 1) -> Tuple[bool, Optional[str]]:    
     if arr is None:
@@ -3127,10 +3091,10 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
         return {
             "key": f"pivot_up_{level}",
             "title": f"🟢⬆️ Cross above {level}",
-            "check_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                ctx.get("buy_common", False) and 
-                get_pivot_alert_info(ctx, level, is_buy=True)[0]
-            ),
+        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
+            ctx.get("buy_common", False) and
+            get_pivot_alert_info(ctx, level, is_buy=True)[0]
+        ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
@@ -3141,10 +3105,10 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
         return {
             "key": f"pivot_down_{level}",
             "title": f"🔴⬇️ Cross below {level}",
-            "check_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                ctx.get("sell_common", False) and 
-                get_pivot_alert_info(ctx, level, is_buy=False)[0]
-            ),
+        "check_fn": lambda ctx, ppo, ppo_sig, rsi: (
+            ctx.get("sell_common", False) and
+            get_pivot_alert_info(ctx, level, is_buy=False)[0]
+        ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
@@ -3615,27 +3579,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
-        adx_15m = calculate_adx_core(
-            data_15m["high"], data_15m["low"], data_15m["close"],
-            cfg.ADX_DI_LENGTH, cfg.ADX_SMOOTHING_LENGTH
-        )
-        rvol_threshold = cfg.RVOL_THRESHOLD if cfg.ENABLE_RVOL_ALERT else 0.0
-        
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
         confirmation_buy = (mmh_curr > 0) and cloud_up
         confirmation_sell = (mmh_curr < 0) and cloud_down
 
-        buy_common = (base_buy_trend and confirmation_buy and is_valid_for_buy)
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell)
-    
-        if not is_valid_for_buy and not is_valid_for_sell:
-            logger.debug(
-                f"[{pair_name}] Knox rejected: is_valid_for_buy={is_valid_for_buy}, "
-                f"is_valid_for_sell={is_valid_for_sell}, reason={error_msg}"
-            )
-            return None
+        adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
+        adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
+
+        if cfg.ENABLE_RVOL_ALERT:
+            atr_short_val = indicators['atr_short'][i15]
+            atr_long_val  = indicators['atr_long'][i15]
+            if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
+                rvol_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
+            else:
+                rvol_ok = True  # fail-open if data unavailable
+        else:
+            rvol_ok = True
+
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok))
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok))      
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3714,9 +3678,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             key = ALERT_KEYS[alert_key]
             trigger = False
 
-            is_buy_signal = any(x in alert_key for x in ["up", "buy"])
-            is_sell_signal = any(x in alert_key for x in ["down", "sell"])
-
             if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
                 level = alert_key.split("_")[-1]
                 is_buy = alert_key.startswith("pivot_up_")
@@ -3746,27 +3707,32 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 trigger = False
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-        
+
                     if cfg.DEBUG_MODE:
-                        is_buy = (alert_key == "vwap_up")
-                        valid_cross, reason = _validate_vwap_cross(context, is_buy, previous_states)
+                        is_buy_log = (alert_key == "vwap_up")
+                        valid_cross, reason = validate_vwap_cross(
+                            context["close_prev"], context["close_curr"],
+                            context["vwap_prev"],  context["vwap_curr"],
+                            is_buy_log
+                        )
                         if trigger:
                             logger_pair.debug(
                                 f"✅ {alert_key}: Close={context['close_curr']:.2f}, "
-                                f"VWAP={context['vwap_curr']:.2f}, "
+                                f"VWAP={context['vwap_curr']:.2f}, cross_valid={valid_cross}, "
                                 f"buy_common={context.get('buy_common', False)}, "
                                 f"sell_common={context.get('sell_common', False)}"
                             )
                         else:
-                            logger_pair.debug(f"❌ {alert_key}: buy_common or sell_common not met")
-    
+                            logger_pair.debug(
+                                f"❌ {alert_key}: Not triggered — cross_valid={valid_cross}, "
+                                f"reason={reason}"
+                            )
+
                 except Exception as e:
                     logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
             else:
                 trigger = False
-                trigger_error = None
-                
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
@@ -3777,7 +3743,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         logger_pair.error(f"Alert check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
-                    trigger_error = str(e)
 
             if trigger and not previous_states.get(key, False):
                 extra = ""
@@ -3874,8 +3839,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         filtered_alerts = []
         for alert_title, alert_extra, alert_key in alerts_to_send:
-            cooldown_key = f"{pair_name}:{alert_key}:last_sent"
-      
             should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
             if not should_send:
                 logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
@@ -3921,6 +3884,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("PPO>0 blocked: confirmation_buy=False (MMH or cloud)")
             elif not is_valid_for_buy:
                 reasons.append("PPO>0 blocked: Knox rejected candle (wick/color/timing)")
+            else:
+                reasons.append(
+                    f"PPO>0 blocked: market filter "
+                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                    f"rvol_ok={rvol_ok})"
+                )
         
         if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
             if not base_sell_trend:
@@ -3929,6 +3898,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("PPO<0 blocked: confirmation_sell=False (MMH or cloud)")
             elif not is_valid_for_sell:
                 reasons.append("PPO<0 blocked: Knox rejected candle (wick/color/timing)")
+            else:
+                reasons.append(
+                    f"PPO<0 blocked: market filter "
+                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                    f"rvol_ok={rvol_ok})"
+                )
        
         if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
             if not base_buy_trend:
@@ -3937,6 +3912,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("PPO>+0.11 blocked: confirmation_buy=False")
             elif not is_valid_for_buy:
                 reasons.append("PPO>+0.11 blocked: Knox rejected candle")
+            else:
+                reasons.append(
+                    f"PPO>+0.11 blocked: market filter "
+                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                    f"rvol_ok={rvol_ok})"
+                )
         
         if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
             if not base_sell_trend:
@@ -3945,6 +3926,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("PPO<-0.11 blocked: confirmation_sell=False")
             elif not is_valid_for_sell:
                 reasons.append("PPO<-0.11 blocked: Knox rejected candle")
+            else:
+                reasons.append(
+                    f"PPO<-0.11 blocked: market filter "
+                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                    f"rvol_ok={rvol_ok})"
+                )
         
         if rsi_prev <= Constants.RSI_THRESHOLD and rsi_curr > Constants.RSI_THRESHOLD:
             if ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
@@ -3956,6 +3943,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     reasons.append("RSI>50 blocked: confirmation_buy=False")
                 elif not is_valid_for_buy:
                     reasons.append("RSI>50 blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"RSI>50 blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
         
         if rsi_prev >= Constants.RSI_THRESHOLD and rsi_curr < Constants.RSI_THRESHOLD:
             if ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
@@ -3967,6 +3960,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     reasons.append("RSI<50 blocked: confirmation_sell=False")
                 elif not is_valid_for_sell:
                     reasons.append("RSI<50 blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"RSI<50 blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
         
         if cfg.ENABLE_VWAP and vwap_available:
             if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
@@ -3976,6 +3975,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     reasons.append("VWAP up-cross blocked: confirmation_buy=False")
                 elif not is_valid_for_buy:
                     reasons.append("VWAP up-cross blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"VWAP up-cross blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
             
             if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
                 if not base_sell_trend:
@@ -3984,6 +3989,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     reasons.append("VWAP down-cross blocked: confirmation_sell=False")
                 elif not is_valid_for_sell:
                     reasons.append("VWAP down-cross blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"VWAP down-cross blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
         
         failed_conditions = [
             name for name, val in [
@@ -4021,7 +4032,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e} | "
             f"Correlation: {correlation_id}"
         )
-        return None
+        return None      
 
     finally:
         PAIR_ID.set("")
