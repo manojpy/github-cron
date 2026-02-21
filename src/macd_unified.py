@@ -1684,6 +1684,28 @@ class DataFetcher:
 
             return None
 
+    def get_stats(self) -> Dict[str, Any]:
+        stats = {
+            "products": self.fetch_stats["products"].copy(),
+            "candles": self.fetch_stats["candles"].copy(),
+            "circuit_breaker_blocks": self.fetch_stats["circuit_breaker_blocks"],
+            "rate_limiter": self.rate_limiter.get_stats(),
+        }
+        
+        total_products = stats["products"]["success"] + stats["products"]["failed"]
+        total_candles = stats["candles"]["success"] + stats["candles"]["failed"]
+        
+        if total_products > 0:
+            stats["products"]["success_rate"] = round(
+                stats["products"]["success"] / total_products * 100, 1
+            )
+        
+        if total_candles > 0:
+            stats["candles"]["success_rate"] = round(
+                stats["candles"]["success"] / total_candles * 100, 1
+            )        
+        return stats
+
     async def fetch_candles_batch(self, requests: List[Tuple[str, str, int]], reference_time: Optional[int] = None) -> Dict[str, Optional[Dict[str, Any]]]:
         if reference_time is None:
             reference_time = get_trigger_timestamp()
