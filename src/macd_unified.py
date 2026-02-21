@@ -2719,6 +2719,72 @@ class TelegramQueue:
                     await asyncio.sleep(min((cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)), 30))
         return False
 
+    async def send_batch(self, messages: List[str]) -> bool:   
+        if not messages:
+            return True
+
+        def _safe_truncate_utf8(text: str, max_bytes: int) -> str:
+            encoded = text.encode('utf-8')
+            if len(encoded) <= max_bytes:
+                return text
+            return encoded[:max_bytes].decode('utf-8', errors='ignore')
+
+        MAX_LEN = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
+        SAFETY_MARGIN = 100  # Account for URL encoding overhead
+        EFFECTIVE_MAX = MAX_LEN - SAFETY_MARGIN
+        SEPARATOR = "\n\n"
+        SEP_BYTES = len(SEPARATOR.encode('utf-8'))
+
+        batches: List[List[str]] = []
+        current: List[str] = []
+        current_bytes: int = 0
+
+        for msg in messages:
+            try:
+                msg_bytes = len(msg.encode('utf-8'))
+            except Exception as e:
+                logger.warning(f"Failed to encode message: {e}, skipping")
+                continue
+
+            estimated_encoded = int(msg_bytes * 1.15)
+    
+            needed = estimated_encoded
+            if current:
+                needed += SEP_BYTES
+
+            if estimated_encoded > EFFECTIVE_MAX:
+                if current:
+                    batches.append(current)
+                    current = []
+                    current_bytes = 0
+                truncated = _safe_truncate_utf8(msg, EFFECTIVE_MAX)
+                batches.append([truncated])
+                continue
+
+            if current_bytes + needed > EFFECTIVE_MAX:
+                batches.append(current)
+                current = []
+                current_bytes = 0
+
+            current.append(msg)
+            current_bytes += needed
+
+        if current:
+            batches.append(current)
+
+        if len(batches) > 1:
+            logger.info(f"Split alerts into {len(batches)} Telegram messages")
+
+        results = []
+        for idx, batch in enumerate(batches):
+            text = SEPARATOR.join(batch)
+            results.append(await self.send(text))
+
+            if idx < len(batches) - 1:
+                await asyncio.sleep(Constants.INTER_BATCH_DELAY)
+
+        return all(results)
+
 def build_single_msg(title, pair, price, ts, extra=None):
     """Build a clean, formatted alert message."""
     if not title: 
@@ -3827,7 +3893,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     )
 
     fetch_elapsed = time.time() - fetch_start
-    logger_main.info(f"✅ Phase 1 complete: {fetch_elapsed:.1f}s")
+    logger_main.info(f"��� Phase 1 complete: {fetch_elapsed:.1f}s")
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
