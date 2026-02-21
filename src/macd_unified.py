@@ -113,7 +113,6 @@ class Constants:
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
-    CANDLE_PUBLICATION_LAG_SEC = int(os.getenv("CANDLE_PUBLICATION_LAG_SEC", 20))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     VWAP_MAX_DISTANCE_PCT = 1.0
@@ -127,7 +126,6 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
-    MAX_CANDLE_AGE_FROM_OPEN = 1200
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -1798,8 +1796,8 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             f"This is likely the currently forming candle! "
             f"(Opened: {format_ist_time(ts)}, Current: {format_ist_time(reference_time)})"
         )
-    
-    if candle_age > Constants.MAX_CANDLE_AGE_FROM_OPEN:
+   
+    if candle_age > cfg.MAX_CANDLE_STALENESS_SEC:
         return False, False, None, (
             f"Candle age {candle_age}s from open is > {Constants.MAX_CANDLE_AGE_FROM_OPEN}s. "
             f"This is a stale candle from a previous period! "
@@ -2065,7 +2063,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         else:
             logger.info("[%s] Duplicates exist but not near target.", pair_name or "?")
 
-    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 0)
+    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 30)
     if matches.size == 0:
         last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
         count = int(ts_normalized.size)
@@ -4341,7 +4339,7 @@ if __name__ == "__main__":
     
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
-        logger.warning("⚠️ AOT not available, using JIT fallback. Reason: %s", reason)
+        logger.warning("��️ AOT not available, using JIT fallback. Reason: %s", reason)
         logger.warning("⚠️ Performance may be degraded. First run may be slow.")
 
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
