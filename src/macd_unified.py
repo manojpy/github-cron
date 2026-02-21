@@ -3891,7 +3891,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     )
 
     fetch_elapsed = time.time() - fetch_start
-    logger_main.info(f"��� Phase 1 complete: {fetch_elapsed:.1f}s")
+    logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
