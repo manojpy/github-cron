@@ -93,12 +93,6 @@ def normalize_timestamp(ts: Union[int, float]) -> int:
     
     return ts_int
 
-def validate_timestamp_format(ts: Union[int, float], name: str = "timestamp") -> Tuple[bool, str]:
-    ts_sec = normalize_timestamp(ts)
-    if ts_sec < 1577836800 or ts_sec > 4102444799:
-        return False, f"{name} {ts_sec} out of valid range [1577836800, 4102444799]"
-    return True, "Valid"
-
 __version__ = "1.8.0-stable"
 
 class Constants:
@@ -274,9 +268,6 @@ class BotConfig(BaseModel):
         
         errors = []
         warnings = []
-
-        if self.PPO_FAST >= self.PPO_SLOW:
-            errors.append('PPO_FAST must be less than PPO_SLOW')
 
         if self.RUN_TIMEOUT_SECONDS < self.MIN_RUN_TIMEOUT:
             errors.append(
@@ -482,16 +473,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         return str(dt_or_ts)
 
 shutdown_event = asyncio.Event()
-
-def debug_if(condition: bool, logger_obj: logging.Logger, msg_fn: Callable[[], str]) -> None:
-    if condition and logger_obj.isEnabledFor(logging.DEBUG):
-        logger_obj.debug(msg_fn())
-        
-def info_if_important(logger_obj: logging.Logger, is_important: bool, msg: str) -> None:
-    if is_important:
-        logger_obj.info(msg)
-    elif cfg.DEBUG_MODE:
-        logger_obj.debug(msg)
 
 _VALIDATION_DONE = False
 
@@ -897,9 +878,6 @@ def warmup_if_needed() -> None:
         warmup_elapsed = time.time() - warmup_start
         logger.warning(f"🚫 Warmup failed (non-fatal, {warmup_elapsed:.2f}s): {e}")
 
-async def calculate_indicator_threaded(func: Callable, *args, **kwargs) -> Any:
-    return await asyncio.to_thread(func, *args, **kwargs)
-
 def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, timestamps_daily: np.ndarray, timestamps_15m: np.ndarray, reference_time: int) -> Dict[str, float]:   
     piv = {k: 0.0 for k in ["P", "R1", "R2", "R3", "S1", "S2", "S3"]}
     
@@ -984,7 +962,12 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         close_5m = data_5m["close"]
         n_15m = len(close_15m)
         n_5m = len(close_5m)
-        
+
+        ok, msg = _validate_ohlc_arrays(data_15m, n_15m)
+        if not ok:
+            logger.error(f"calculate_all_indicators_numpy: OHLC validation failed — {msg}")
+            return None
+
         results = { 
             'ppo': np.empty(n_15m, dtype=np.float64),
             'ppo_signal': np.empty(n_15m, dtype=np.float64),
@@ -1032,8 +1015,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         else:
             results["vwap"] = np.full(n_15m, np.nan)
 
-        mmh = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)    
-        results['mmh'] = mmh
+        results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
         
         if cfg.CIRRUS_CLOUD_ENABLED:
             upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_15m)
@@ -1049,10 +1031,16 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['atr_short'] = calculate_atr_rma(
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_SHORT
         )
-
         results['atr_long'] = calculate_atr_rma(
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
+
+        ok, msg = _validate_atr_arrays(results['atr_short'], results['atr_long'], n_15m)
+        if not ok:
+            logger.warning(
+                f"calculate_all_indicators_numpy: ATR validation failed — {msg}. "
+                f"RVOL filter may be unreliable this run."
+            )
 
         results['adx'] = calculate_adx_core(
             data_15m["high"],
@@ -1065,25 +1053,25 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         if cfg.ENABLE_PIVOT and data_daily is not None:
             last_close = float(close_15m[-1])
             daily_high = float(data_daily["high"][-1])
-            daily_low = float(data_daily["low"][-1])   
+            daily_low = float(data_daily["low"][-1])
             daily_range = daily_high - daily_low
-    
+
             should_calculate = False
             if daily_range > 1e-9:
                 distance_from_high = abs(last_close - daily_high)
                 distance_from_low = abs(last_close - daily_low)
                 should_calculate = (
-                    distance_from_high < daily_range * 0.5 or 
+                    distance_from_high < daily_range * 0.5 or
                     distance_from_low < daily_range * 0.5
                 )
-    
+
             if should_calculate:
                 results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"],      
+                    data_daily["high"],
                     data_daily["low"],
                     data_daily["close"],
-                    data_daily["timestamp"], 
-                    data_15m["timestamp"],  
+                    data_daily["timestamp"],
+                    data_15m["timestamp"],
                     reference_time
                 )
             else:
@@ -1105,14 +1093,12 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         for key in SANITIZE_KEYS:
             arr = results[key]
 
-            # Pass 1: Inf — clamp and warn (genuine corruption)
             if np.any(np.isinf(arr)):
                 inf_count = int(np.sum(np.isinf(arr)))
                 logger.warning(f"{key}: {inf_count} inf value(s) detected — clamping")
                 results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
                 arr = results[key]  # refresh reference after clip
 
-            # Pass 2: NaN — debug log only (expected warm-up, not a fault)
             if cfg.DEBUG_MODE:
                 nan_count = int(np.sum(np.isnan(arr)))
                 if nan_count > 0:
@@ -1121,8 +1107,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                         f"normal EMA/RMA initialisation, downstream must guard with isnan()"
                     )
 
-        return results    
-   
+        return results
+
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
         
@@ -1138,7 +1124,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 "calculate_all_indicators_numpy: Cannot determine data length - aborting"
             )
             return None
-        
+
         logger.warning(
             f"calculate_all_indicators_numpy: Returning NaN arrays ({n} elements) "
             f"due to calculation failure"
@@ -1174,7 +1160,6 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
             return False, f"Length mismatch in '{key}': {len(arr)} != {expected_len}"
     
     return True, None
-
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
@@ -1513,35 +1498,29 @@ class RateLimitedFetcher:
         self.last_request_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
-        async with self.lock:
-            now = time.time()
-            while self.requests and now - self.requests[0] > 60.0:
-                self.requests.popleft()
-            if len(self.requests) >= self.max_per_minute:
-                oldest_request_age = now - self.requests[0]
-                wait_needed = max(0.0, 60.0 - oldest_request_age)
-                
-                jitter = random.uniform(0.05, 0.2)
-                total_sleep = wait_needed + jitter
-                
-                self.total_waits += 1
-                self.total_wait_time += total_sleep
-                
-                logger.debug(
-                    f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
-                    f"sleeping {total_sleep:.2f}s | Total waits: {self.total_waits}"
-                )
-                
-                await asyncio.sleep(total_sleep)
-                
+        while True:
+            sleep_needed = 0.0
+            async with self.lock:
                 now = time.time()
                 while self.requests and now - self.requests[0] > 60.0:
                     self.requests.popleft()
-        
-        async with self.lock:
-            self.requests.append(time.time())
-            self.last_request_time = time.time()
-        
+                if len(self.requests) < self.max_per_minute:
+                    # Slot available — claim it inside the lock
+                    self.requests.append(time.time())
+                    self.last_request_time = time.time()
+                    break
+                else:
+                    oldest_request_age = now - self.requests[0]
+                    wait_needed = max(0.0, 60.0 - oldest_request_age)
+                    sleep_needed = wait_needed + random.uniform(0.05, 0.2)
+                    self.total_waits += 1
+                    self.total_wait_time += sleep_needed
+                    logger.debug(
+                        f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
+                        f"sleeping {sleep_needed:.2f}s | Total waits: {self.total_waits}"
+                    )
+            await asyncio.sleep(sleep_needed)
+
         async with self.semaphore:
             return await func(*args, **kwargs)
 
@@ -1704,28 +1683,6 @@ class DataFetcher:
                 self.circuit_breaker.record_failure()
 
             return None
-
-    def get_stats(self) -> Dict[str, Any]:
-        stats = {
-            "products": self.fetch_stats["products"].copy(),
-            "candles": self.fetch_stats["candles"].copy(),
-            "circuit_breaker_blocks": self.fetch_stats["circuit_breaker_blocks"],
-            "rate_limiter": self.rate_limiter.get_stats(),
-        }
-        
-        total_products = stats["products"]["success"] + stats["products"]["failed"]
-        total_candles = stats["candles"]["success"] + stats["candles"]["failed"]
-        
-        if total_products > 0:
-            stats["products"]["success_rate"] = round(
-                stats["products"]["success"] / total_products * 100, 1
-            )
-        
-        if total_candles > 0:
-            stats["candles"]["success_rate"] = round(
-                stats["candles"]["success"] / total_candles * 100, 1
-            )        
-        return stats
 
     async def fetch_candles_batch(self, requests: List[Tuple[str, str, int]], reference_time: Optional[int] = None) -> Dict[str, Optional[Dict[str, Any]]]:
         if reference_time is None:
@@ -2153,19 +2110,6 @@ def build_products_map_from_cfg() -> Dict[str, dict]:
     )
     return products_map
 
-async def fetch_all_pairs_candles(fetcher: DataFetcher, reference_time: int) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-    requests = []
-    for pair in cfg.PAIRS:
-        requests.append((pair, "15", cfg.MIN_CANDLES_FOR_INDICATORS))
-        requests.append((pair, "5", cfg.MIN_CANDLES_FOR_INDICATORS))
-        requests.append((pair, "D", cfg.MIN_CANDLES_FOR_INDICATORS))
-    return await fetcher.fetch_all_candles_truly_parallel(
-        [(pair, [("15", cfg.MIN_CANDLES_FOR_INDICATORS),
-                 ("5", cfg.MIN_CANDLES_FOR_INDICATORS),
-                 ("D", cfg.MIN_CANDLES_FOR_INDICATORS)]) for pair in cfg.PAIRS],
-        reference_time
-    )
-
 class RedisKeyPrefix:
     """Centralized Redis key prefixes"""
     PAIR_STATE = "pair_state:"
@@ -2431,86 +2375,6 @@ class RedisStateStore:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
 
-    async def batch_get_and_set_alerts(self, pair: str, alert_keys: List[str], updates: List[Tuple[str, Any, Optional[int]]]) -> Dict[str, Optional[Dict[str, Any]]]:
-        
-        if not self._redis or self.degraded:
-            return {k: None for k in alert_keys}
-
-        try:
-            async with self._redis.pipeline(transaction=True) as pipe:
-                state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-                pipe.mget(state_keys)
-
-                now = int(time.time())
-
-                serialized_updates: List[Tuple[str, str]] = []
-                for full_key, state_value, custom_ts in updates:
-                    ts = custom_ts if custom_ts is not None else now
-                    try:
-                        data = json_dumps({"state": state_value, "ts": ts})
-                        serialized_updates.append((full_key, data))
-                    except Exception as e:
-                        logger.error(f"Failed to serialize state for {full_key}: {e}")
-
-                for full_key, data in serialized_updates:
-                    if not full_key.startswith(self.state_prefix):
-                        redis_key = f"{self.state_prefix}{full_key}"
-                    else:
-                        redis_key = full_key
-
-                    if self.expiry_seconds > 0:
-                        pipe.set(redis_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(redis_key, data)
-
-                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-
-            mget_results = results[0] if results else []
-
-            parsed: Dict[str, Optional[Dict[str, Any]]] = {}
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-
-                if val is None:
-                    parsed[key] = None
-                    continue
-
-                try:
-                    if isinstance(val, bytes):
-                        val_str = val.decode("utf-8")
-                    elif isinstance(val, str):
-                        val_str = val
-                    else:
-                        logger.warning(f"Unexpected Redis type for {pair}:{key} -> {type(val)}")
-                        parsed[key] = None
-                        continue
-
-                    parsed[key] = json_loads(val_str)
-
-                except (JSONDecodeError, UnicodeDecodeError) as e:
-                    logger.warning(f"Failed to parse Redis value for {pair}:{key}: {e}")
-                    parsed[key] = None
-                except Exception as e:
-                    logger.error(f"Unexpected error parsing {pair}:{key}: {e}")
-                    parsed[key] = None
-
-            if cfg.DEBUG_MODE and logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"batch_get_and_set_alerts completed | pair={pair} | "
-                    f"retrieved={sum(1 for v in parsed.values() if v is not None)}/{len(alert_keys)} | "
-                    f"updated={len(updates)}"
-                )
-
-            return parsed
-
-        except asyncio.TimeoutError:
-            logger.error(f"batch_get_and_set_alerts timeout for {pair}")
-            return {k: None for k in alert_keys}
-
-        except Exception as e:
-            logger.error(f"batch_get_and_set_alerts failed for {pair}: {e}")
-            return {k: None for k in alert_keys}
-
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         
         if not self._redis or self.degraded or not alert_keys:
@@ -2559,115 +2423,6 @@ class RedisStateStore:
         except Exception as e:
             logger.error(f"batch_get_all_alert_states failed for {pair}: {e}")
             return {k: False for k in alert_keys}
-
-    async def _pipeline_ops(self, pair: str, alert_keys: List[str], state_updates: List[Tuple[str, Any, Optional[int]]], dedup_checks: List[Tuple[str, str, int]]) -> Tuple[Dict[str, bool], Dict[str, bool]]:    
-        if not self._redis:
-            raise RedisConnectionError("Redis unavailable")
-
-        try:
-            async with self._redis.pipeline() as pipe:
-                state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-                pipe.mget(state_keys)
-
-                now = int(time.time())
-                for key, state, custom_ts in state_updates:
-                    ts = custom_ts if custom_ts is not None else now
-                    try:
-                        data = json_dumps({"state": state, "ts": ts})
-                    except Exception as e:
-                        logger.error(f"Failed to serialize state for {key}: {e}")
-                        continue
-                
-                    if not key.startswith(self.state_prefix):
-                        full_key = f"{self.state_prefix}{key}"
-                    else:
-                        full_key = key
-
-                    if self.expiry_seconds > 0:
-                        pipe.set(full_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(full_key, data)
-
-                dedup_keys_ordered: List[Tuple[str, str]] = []
-            
-                for pair_name, alert_key, ts in dedup_checks:
-                    window = (ts // Constants.ALERT_DEDUP_WINDOW_SEC) * Constants.ALERT_DEDUP_WINDOW_SEC
-                    recent_key = f"recent_alert:{pair_name}:{alert_key}:{window}"
-                    composite_key = f"{pair_name}:{alert_key}"
-                    dedup_keys_ordered.append((recent_key, composite_key))
-                    pipe.set(recent_key, "1", nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC)
-                
-                results = await asyncio.wait_for(pipe.execute(), timeout=5.0)
-
-            num_gets = 1
-            num_sets = len(state_updates)
-            num_dedups = len(dedup_keys_ordered)
-        
-            if not results or len(results) < (num_gets + num_sets + num_dedups):
-                logger.warning("Pipeline returned incomplete results")
-                return (
-                    {k: False for k in alert_keys},
-                    {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-                )
-        
-            mget_results = results[0] if results else []
-
-            prev_states: Dict[str, bool] = {}
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-                
-                if val is None:
-                    prev_states[key] = False
-                    continue
-                
-                try:
-                    if isinstance(val, bytes):
-                        val_str = val.decode("utf-8")
-                    elif isinstance(val, str):
-                        val_str = val
-                    else:
-                        prev_states[key] = False
-                        continue
-
-                    parsed_state = json_loads(val_str)
-                    prev_states[key] = parsed_state.get("state") == "ACTIVE"
-                    
-                except (JSONDecodeError, TypeError) as e:
-                    if cfg.DEBUG_MODE:
-                        logger.debug(f"Failed to parse state for {key}: {e}")
-                    prev_states[key] = False
-                except Exception as e:
-                    logger.error(f"Unexpected error parsing state for {key}: {e}")
-                    prev_states[key] = False
-
-            dedup_results: Dict[str, bool] = {}
-            dedup_start_idx = num_gets + num_sets
-            
-            for idx, (recent_key, composite_key) in enumerate(dedup_keys_ordered):
-                result_idx = dedup_start_idx + idx
-                
-                should_send = bool(results[result_idx]) if result_idx < len(results) else True
-                dedup_results[composite_key] = should_send
-
-            if cfg.DEBUG_MODE:
-                duplicates = sum(1 for v in dedup_results.values() if not v)
-                if duplicates > 0:
-                    logger.debug(f"Pipeline dedup: {duplicates}/{len(dedup_checks)} duplicates filtered")
-
-            return prev_states, dedup_results
-
-        except asyncio.TimeoutError:
-            logger.error("Pipeline operation timeout")
-            return (
-                {k: False for k in alert_keys},
-                {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-            )
-        except Exception as e:
-            logger.error(f"Pipeline operation failed: {e}")
-            return (
-                {k: False for k in alert_keys},
-                {f"{p}:{ak}": True for p, ak, _ in dedup_checks}
-            )
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
         """
@@ -2874,19 +2629,6 @@ class RedisLock:
         finally:
             self.token = None
 
-    def get_status(self) -> Dict[str, Any]:
-        return {
-            "lock_key": self.lock_key,
-            "acquired_by_me": self.acquired_by_me,
-            "lost": self.lost,
-            "has_token": self.token is not None,
-            "token_prefix": self.token[:8] + "..." if self.token else None,
-            "last_extend_time": self.last_extend_time,
-            "time_since_extend": time.time() - self.last_extend_time if self.last_extend_time else None,
-            "expire_seconds": self.expire,
-            "redis_available": self.redis is not None,
-        }
-
     def __repr__(self) -> str:
         status = "HELD" if self.acquired_by_me else ("LOST" if self.lost else "RELEASED")
         token_display = self.token[:8] + "..." if self.token else "None"
@@ -2954,72 +2696,6 @@ class TelegramQueue:
                 if attempt < cfg.TELEGRAM_RETRIES:
                     await asyncio.sleep(min((cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)), 30))
         return False
-
-    async def send_batch(self, messages: List[str]) -> bool:   
-        if not messages:
-            return True
-
-        def _safe_truncate_utf8(text: str, max_bytes: int) -> str:
-            encoded = text.encode('utf-8')
-            if len(encoded) <= max_bytes:
-                return text
-            return encoded[:max_bytes].decode('utf-8', errors='ignore')
-
-        MAX_LEN = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
-        SAFETY_MARGIN = 100  # Account for URL encoding overhead
-        EFFECTIVE_MAX = MAX_LEN - SAFETY_MARGIN
-        SEPARATOR = "\n\n"
-        SEP_BYTES = len(SEPARATOR.encode('utf-8'))
-
-        batches: List[List[str]] = []
-        current: List[str] = []
-        current_bytes: int = 0
-
-        for msg in messages:
-            try:
-                msg_bytes = len(msg.encode('utf-8'))
-            except Exception as e:
-                logger.warning(f"Failed to encode message: {e}, skipping")
-                continue
-
-            estimated_encoded = int(msg_bytes * 1.15)
-    
-            needed = estimated_encoded
-            if current:
-                needed += SEP_BYTES
-
-            if estimated_encoded > EFFECTIVE_MAX:
-                if current:
-                    batches.append(current)
-                    current = []
-                    current_bytes = 0
-                truncated = _safe_truncate_utf8(msg, EFFECTIVE_MAX)
-                batches.append([truncated])
-                continue
-
-            if current_bytes + needed > EFFECTIVE_MAX:
-                batches.append(current)
-                current = []
-                current_bytes = 0
-
-            current.append(msg)
-            current_bytes += needed
-
-        if current:
-            batches.append(current)
-
-        if len(batches) > 1:
-            logger.info(f"Split alerts into {len(batches)} Telegram messages")
-
-        results = []
-        for idx, batch in enumerate(batches):
-            text = SEPARATOR.join(batch)
-            results.append(await self.send(text))
-
-            if idx < len(batches) - 1:
-                await asyncio.sleep(Constants.INTER_BATCH_DELAY)
-
-        return all(results)
 
 def build_single_msg(title, pair, price, ts, extra=None):
     """Build a clean, formatted alert message."""
@@ -4003,7 +3679,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ] if not val
         ]
         
-        # Debug logging when no alerts sent
         if not alerts_to_send:
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
             logger_pair.debug(
@@ -4427,19 +4102,6 @@ async def run_once() -> bool:
                     break
 
                 alerts_sent += extra_alerts
-
-        if alerts_sent >= MAX_ALERTS_PER_RUN:
-            logger_run.critical(
-                "ALERT VOLUME EXCEEDED: %d/%d", alerts_sent, MAX_ALERTS_PER_RUN
-            )
-            await telegram_queue.send(
-                escape_markdown_v2(
-                    f"⚠️ HIGH ALERT VOLUME\n"
-                    f"Alerts sent: {alerts_sent} (limit: {MAX_ALERTS_PER_RUN})\n"
-                    f"Please review configuration for excessive signals.\n"
-                    f"Time: {format_ist_time()}"
-                )
-            )
 
         if fetcher is None:
             logger_run.error("❌ Fetcher is None - cannot get stats")
