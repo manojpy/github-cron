@@ -408,12 +408,14 @@ class SafeFormatter(logging.Formatter):
         
         formatted = super().format(record)
         return self._apply_all_redactions(formatted)
-    
+  
     @staticmethod
     def _mask_secret(value: Any) -> Any:
-        """Mask sensitive values."""
+        """Mask sensitive values while preserving numeric types for %d/%f format specifiers."""
         if value is None:
             return value
+        if isinstance(value, (int, float, bool)):
+            return value  # ← don't stringify numbers
         return SafeFormatter._apply_all_redactions(str(value))
 
 def setup_logging() -> logging.Logger:
