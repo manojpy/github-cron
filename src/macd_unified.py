@@ -1801,7 +1801,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
    
     if candle_age > cfg.MAX_CANDLE_STALENESS_SEC:
         return False, False, None, (
-            f"Candle age {candle_age}s from open is > {Constants.MAX_CANDLE_AGE_FROM_OPEN}s. "
+            f"Candle age {candle_age}s from open is > {cfg.MAX_CANDLE_STALENESS_SEC}s. "
             f"This is a stale candle from a previous period! "
             f"(Opened: {format_ist_time(ts)}, Current: {format_ist_time(reference_time)})"
         )
