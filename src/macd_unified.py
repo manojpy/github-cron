@@ -3541,43 +3541,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
                     )
         
-        if not sdb.degraded:
-            conditional_alert_keys = [
-                ALERT_KEYS['ppo_signal_up'],
-                ALERT_KEYS['ppo_signal_down'],
-                ALERT_KEYS['ppo_zero_up'],
-                ALERT_KEYS['ppo_zero_down'],
-                ALERT_KEYS['ppo_011_up'],
-                ALERT_KEYS['ppo_011_down'],
-                ALERT_KEYS['rsi_50_up'],
-                ALERT_KEYS['rsi_50_down'],
-            ]
+        conditional_states = previous_states
     
-            if cfg.ENABLE_VWAP and vwap_available:
-                conditional_alert_keys.extend([
-                    ALERT_KEYS['vwap_up'],
-                    ALERT_KEYS['vwap_down'],
-                ])
-    
-            if has_valid_mmh:
-                conditional_alert_keys.extend([
-                    ALERT_KEYS['mmh_buy'],
-                    ALERT_KEYS['mmh_sell'],
-                ])
-    
-            if cfg.ENABLE_PIVOT and piv:
-                for level_name in piv.keys():
-                    up_key = f"pivot_up_{level_name}"
-                    down_key = f"pivot_down_{level_name}"
-                    if up_key in ALERT_KEYS:
-                        conditional_alert_keys.append(ALERT_KEYS[up_key])
-                    if down_key in ALERT_KEYS:
-                        conditional_alert_keys.append(ALERT_KEYS[down_key])
-    
-            conditional_states = await sdb.batch_get_all_alert_states(pair_name, conditional_alert_keys)
-        else:
-            conditional_states = {}
-            
         resets_to_apply = []
         resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
