@@ -260,9 +260,8 @@ def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     return _dispatch['kalman_loop'](src, length, R, Q)
 
-def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray, 
-                         reference_time: int, buffer_seconds: int) -> np.ndarray:
-    return _dispatch['vwap_daily_loop_safe'](hlc3, volumes, timestamps, reference_time, buffer_seconds)
+def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    return _dispatch['vwap_daily_loop_safe'](hlc3, volumes, timestamps)
 
 def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
     return _dispatch['rng_filter_loop'](x, r)

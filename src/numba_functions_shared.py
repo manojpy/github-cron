@@ -4,10 +4,12 @@
 
 import numpy as np
 from numba import njit, prange, types
-from numba.types import Tuple, bool_
+from typing import Dict, Optional, Tuple, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+
 
 
 # ============================================================================
@@ -415,27 +417,25 @@ def kalman_loop(src, length, R, Q):
 
     return result
 
-@njit("f8[:](f8[:], f8[:], i8[:], i8, i4)", nogil=True, cache=True)
-def vwap_daily_loop_safe(hlc3, volumes, timestamps, reference_time, buffer_seconds):
+@njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
+def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     n = len(hlc3)
     vwap = np.empty(n, dtype=np.float64)
-
     cum_pv = 0.0
     cum_vol = 0.0
-    last_day_number = -1
+    last_day = -1
 
     for i in range(n):
-        candle_day_number = timestamps[i] // 86400
-
-        if candle_day_number != last_day_number:
+        day = timestamps[i] // 86400
+        if day != last_day:
             cum_pv = 0.0
             cum_vol = 0.0
-            last_day_number = candle_day_number
-
+            last_day = day
+        
         cum_pv += hlc3[i] * volumes[i]
         cum_vol += volumes[i]
         vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
-
+    
     return vwap
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
@@ -624,7 +624,7 @@ EXPORT_CONFIG = {
     'smooth_range': 'f8[:](f8[:], i4, i4)',
     'calculate_trends_with_state': 'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
     'kalman_loop': 'f8[:](f8[:], i4, f8, f8)',
-    'vwap_daily_loop_safe': 'f8[:](f8[:], f8[:], i8[:], i8, i4)',
+    'vwap_daily_loop_safe': 'f8[:](f8[:], f8[:], i8[:])',
     'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
     'calculate_rsi_core': 'f8[:](f8[:], i4)',
     'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',

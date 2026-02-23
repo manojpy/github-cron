@@ -579,48 +579,37 @@ def is_previous_day_complete(timestamps: np.ndarray, current_time: int, min_cand
     
     return True, "Complete"
 
-def validate_vwap_cross(close_prev: float, close_curr: float,
-                        vwap_prev: float, vwap_curr: float,
-                        is_buy: bool) -> Tuple[bool, Optional[str]]:
+def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
+    min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
+    """
+    Validate price crossing VWAP with minimum separation threshold.
+    """
+    vals = [close_prev, close_curr, vwap_prev, vwap_curr]
     
-    if any(np.isnan(v) for v in [close_prev, close_curr, vwap_prev, vwap_curr]):
-        return False, "NaN in price or VWAP data"
-
-    if any(v <= 0 for v in [close_prev, close_curr, vwap_prev, vwap_curr]):
-        return False, "Non-positive price or VWAP value"
-
-    MIN_CROSS_DEVIATION = 0.001
+    if any(np.isnan(v) for v in vals):
+        return False, "NaN in inputs"
+    
+    if any(v <= 0 for v in vals):
+        return False, "Non-positive values"
 
     if is_buy:
-        crossed_above = (close_prev <= vwap_prev) and (close_curr > vwap_curr)
-        if not crossed_above:
-            return False, (
-                f"No cross up: "
-                f"prev close={close_prev:.4f}/vwap={vwap_prev:.4f}, "
-                f"curr close={close_curr:.4f}/vwap={vwap_curr:.4f}"
-            )
-        separation = (close_curr - vwap_curr) / vwap_curr
-        if separation < MIN_CROSS_DEVIATION:
-            return False, (
-                f"Cross up too small: {separation*100:.3f}% "
-                f"(min {MIN_CROSS_DEVIATION*100:.1f}%)"
-            )
+        crossed = (close_prev <= vwap_prev) and (close_curr > vwap_curr)
+        if not crossed:
+            return False, "No bullish cross"
+        
+        sep = (close_curr - vwap_curr) / vwap_curr
+        if sep < min_deviation:
+            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
         return True, None
-
+    
     else:
-        crossed_below = (close_prev >= vwap_prev) and (close_curr < vwap_curr)
-        if not crossed_below:
-            return False, (
-                f"No cross down: "
-                f"prev close={close_prev:.4f}/vwap={vwap_prev:.4f}, "
-                f"curr close={close_curr:.4f}/vwap={vwap_curr:.4f}"
-            )
-        separation = (vwap_curr - close_curr) / vwap_curr
-        if separation < MIN_CROSS_DEVIATION:
-            return False, (
-                f"Cross down too small: {separation*100:.3f}% "
-                f"(min {MIN_CROSS_DEVIATION*100:.1f}%)"
-            )
+        crossed = (close_prev >= vwap_prev) and (close_curr < vwap_curr)
+        if not crossed:
+            return False, "No bearish cross"
+        
+        sep = (vwap_curr - close_curr) / vwap_curr
+        if sep < min_deviation:
+            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
         return True, None
 
 def get_utc_date_key(timestamp: int) -> str:
@@ -758,41 +747,48 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                         volume: np.ndarray, timestamps: np.ndarray,
-                         reference_time: int) -> np.ndarray:
-    
+
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray,
+    reference_time: Optional[int] = None, unused) -> np.ndarray:
     try:
         hlc3 = (high + low + close) / 3.0
-
-        buffer_seconds = (
-            cfg.DAILY_RESET_BUFFER_SEC
-            if hasattr(cfg, 'DAILY_RESET_BUFFER_SEC')
-            else 300
-        )
-
-        current_day_start = (reference_time // 86400) * 86400
-        candles_today = int(np.sum(timestamps >= current_day_start))
-
-        if candles_today == 0:
-            logger.warning(
-                f"VWAP: no candles found for today UTC "
-                f"(day start {format_ist_time(current_day_start)}). "
-                f"VWAP will reflect yesterday's data only."
-            )
-        elif cfg.DEBUG_MODE:
-            logger.debug(
-                f"VWAP: {candles_today} candles since UTC midnight "
-                f"({format_ist_time(current_day_start)})"
-            )
-
-        return vwap_daily_loop_safe(
-            hlc3, volume, timestamps, reference_time, buffer_seconds
-        )
-
+        return vwap_daily_loop_safe(hlc3, volume, timestamps)
     except Exception as e:
         logger.error(f"VWAP calculation failed: {e}", exc_info=True)
         return np.full(len(close), np.nan, dtype=np.float64)
+
+def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
+    min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
+    """
+    Validate price crossing VWAP with minimum separation threshold.
+    """
+    vals = [close_prev, close_curr, vwap_prev, vwap_curr]
+    
+    if any(np.isnan(v) for v in vals):
+        return False, "NaN in inputs"
+    
+    if any(v <= 0 for v in vals):
+        return False, "Non-positive values"
+
+    if is_buy:
+        crossed = (close_prev <= vwap_prev) and (close_curr > vwap_curr)
+        if not crossed:
+            return False, "No bullish cross"
+        
+        sep = (close_curr - vwap_curr) / vwap_curr
+        if sep < min_deviation:
+            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
+        return True, None
+    
+    else:
+        crossed = (close_prev >= vwap_prev) and (close_curr < vwap_curr)
+        if not crossed:
+            return False, "No bearish cross"
+        
+        sep = (vwap_curr - close_curr) / vwap_curr
+        if sep < min_deviation:
+            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
+        return True, None
 
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
@@ -898,7 +894,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
-        _ = aot_bridge.vwap_daily_loop_safe(test_data, test_data, test_ts, now_ts, 300)
+        _ = aot_bridge.vwap_daily_loop_safe(test_data, test_data, test_ts)
         
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
@@ -985,7 +981,7 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
     return piv
 
-def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Dict[str, np.ndarray]:
+def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Optional[Dict[str, np.ndarray]]:
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
@@ -1029,6 +1025,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             volume_15m = data_15m["volume"]
             ts_15m = data_15m["timestamp"]
             
+            # Preserve debug logging from original
             if cfg.DEBUG_MODE and len(ts_15m) > 0:
                 logger.debug(
                     f"VWAP input | "
@@ -1042,7 +1039,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 reference_time
             )
         else:
-            results["vwap"] = np.full(n_15m, np.nan)
+            results["vwap"] = np.full(n_15m, np.nan, dtype=np.float64)  # Original style
 
         results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
         
@@ -1140,24 +1137,14 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
-        
         try:
             n = len(data_15m.get("close", []))
             if n == 0:
-                logger.critical(
-                    "calculate_all_indicators_numpy: No close data available - cannot proceed"
-                )
                 return None
         except Exception:
-            logger.critical(
-                "calculate_all_indicators_numpy: Cannot determine data length - aborting"
-            )
             return None
 
-        logger.warning(
-            f"calculate_all_indicators_numpy: Returning NaN arrays ({n} elements) "
-            f"due to calculation failure"
-        )
+        logger.warning(f"Returning NaN arrays ({n} elements) due to calculation failure")
         return {
             'ppo': np.full(n, np.nan, dtype=np.float64),
             'ppo_signal': np.full(n, np.nan, dtype=np.float64),
