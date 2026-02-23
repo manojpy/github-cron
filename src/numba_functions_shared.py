@@ -446,33 +446,23 @@ def vwap_daily_loop(hlc3, volumes, timestamps):
 def vwap_daily_loop_safe(hlc3, volumes, timestamps, reference_time, buffer_seconds):
     n = len(hlc3)
     vwap = np.empty(n, dtype=np.float64)
-    
+
     cum_pv = 0.0
     cum_vol = 0.0
     last_day_number = -1
-    
-    current_day_number = reference_time // 86400
-    seconds_into_day = reference_time % 86400
-    reset_allowed = (seconds_into_day >= buffer_seconds)
-    
+
     for i in range(n):
         candle_day_number = timestamps[i] // 86400
-        
+
         if candle_day_number != last_day_number:
-            is_not_today = candle_day_number < current_day_number
-            should_reset = is_not_today or reset_allowed
-            
-            if should_reset:
-                cum_pv = 0.0
-                cum_vol = 0.0
-            
+            cum_pv = 0.0
+            cum_vol = 0.0
             last_day_number = candle_day_number
-        
+
         cum_pv += hlc3[i] * volumes[i]
         cum_vol += volumes[i]
-        
         vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
-    
+
     return vwap
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)

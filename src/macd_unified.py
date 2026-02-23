@@ -580,37 +580,48 @@ def is_previous_day_complete(timestamps: np.ndarray, current_time: int, min_cand
     
     return True, "Complete"
 
-def validate_vwap_cross(close_prev: float, close_curr: float, 
-                        vwap_prev: float, vwap_curr: float, 
+def validate_vwap_cross(close_prev: float, close_curr: float,
+                        vwap_prev: float, vwap_curr: float,
                         is_buy: bool) -> Tuple[bool, Optional[str]]:
-    if np.isnan(close_prev) or np.isnan(close_curr) or np.isnan(vwap_prev) or np.isnan(vwap_curr):
+    
+    if any(np.isnan(v) for v in [close_prev, close_curr, vwap_prev, vwap_curr]):
         return False, "NaN in price or VWAP data"
-    
-    if close_prev <= 0 or close_curr <= 0 or vwap_prev <= 0 or vwap_curr <= 0:
-        return False, "Non-positive price values"
-    
+
+    if any(v <= 0 for v in [close_prev, close_curr, vwap_prev, vwap_curr]):
+        return False, "Non-positive price or VWAP value"
+
+    MIN_CROSS_DEVIATION = 0.001
+
     if is_buy:
         crossed_above = (close_prev <= vwap_prev) and (close_curr > vwap_curr)
-        
         if not crossed_above:
             return False, (
                 f"No cross up: "
-                f"prev_close={close_prev:.2f} vs prev_vwap={vwap_prev:.2f}, "
-                f"curr_close={close_curr:.2f} vs curr_vwap={vwap_curr:.2f}"
+                f"prev close={close_prev:.4f}/vwap={vwap_prev:.4f}, "
+                f"curr close={close_curr:.4f}/vwap={vwap_curr:.4f}"
             )
-        
+        separation = (close_curr - vwap_curr) / vwap_curr
+        if separation < MIN_CROSS_DEVIATION:
+            return False, (
+                f"Cross up too small: {separation*100:.3f}% "
+                f"(min {MIN_CROSS_DEVIATION*100:.1f}%)"
+            )
         return True, None
-        
+
     else:
         crossed_below = (close_prev >= vwap_prev) and (close_curr < vwap_curr)
-        
         if not crossed_below:
             return False, (
                 f"No cross down: "
-                f"prev_close={close_prev:.2f} vs prev_vwap={vwap_prev:.2f}, "
-                f"curr_close={close_curr:.2f} vs curr_vwap={vwap_curr:.2f}"
+                f"prev close={close_prev:.4f}/vwap={vwap_prev:.4f}, "
+                f"curr close={close_curr:.4f}/vwap={vwap_curr:.4f}"
             )
-        
+        separation = (vwap_curr - close_curr) / vwap_curr
+        if separation < MIN_CROSS_DEVIATION:
+            return False, (
+                f"Cross down too small: {separation*100:.3f}% "
+                f"(min {MIN_CROSS_DEVIATION*100:.1f}%)"
+            )
         return True, None
 
 def get_utc_date_key(timestamp: int) -> str:
@@ -748,18 +759,38 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray, reference_time: int) -> np.ndarray:
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+                         volume: np.ndarray, timestamps: np.ndarray,
+                         reference_time: int) -> np.ndarray:
+    
     try:
         hlc3 = (high + low + close) / 3.0
-        
+
         buffer_seconds = (
-            cfg.DAILY_RESET_BUFFER_SEC 
-            if hasattr(cfg, 'DAILY_RESET_BUFFER_SEC') 
+            cfg.DAILY_RESET_BUFFER_SEC
+            if hasattr(cfg, 'DAILY_RESET_BUFFER_SEC')
             else 300
         )
-        
-        return vwap_daily_loop_safe(hlc3, volume, timestamps, reference_time, buffer_seconds)
-        
+
+        current_day_start = (reference_time // 86400) * 86400
+        candles_today = int(np.sum(timestamps >= current_day_start))
+
+        if candles_today == 0:
+            logger.warning(
+                f"VWAP: no candles found for today UTC "
+                f"(day start {format_ist_time(current_day_start)}). "
+                f"VWAP will reflect yesterday's data only."
+            )
+        elif cfg.DEBUG_MODE:
+            logger.debug(
+                f"VWAP: {candles_today} candles since UTC midnight "
+                f"({format_ist_time(current_day_start)})"
+            )
+
+        return vwap_daily_loop_safe(
+            hlc3, volume, timestamps, reference_time, buffer_seconds
+        )
+
     except Exception as e:
         logger.error(f"VWAP calculation failed: {e}", exc_info=True)
         return np.full(len(close), np.nan, dtype=np.float64)
@@ -3299,22 +3330,70 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 vwap_curr = vwap[i15]
                 vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
 
-                if not (np.isnan(vwap_curr) or np.isnan(vwap_prev) or vwap_curr <= 0 or vwap_prev <= 0):
-                    vwap_available = True
+                if (not np.isnan(vwap_curr) and not np.isnan(vwap_prev)
+                        and vwap_curr > 0 and vwap_prev > 0):
+
+                    midnight_utc = (reference_time // 86400) * 86400
+                    today_mask = data_15m["timestamp"] >= midnight_utc
+                    today_volumes = data_15m["volume"][today_mask]
+
+                    if len(today_volumes) == 0:
+                        logger_pair.warning(
+                            f"[{pair_name}] VWAP suppressed: no candles found "
+                            f"for today (UTC midnight {format_ist_time(midnight_utc)}). "
+                            f"VWAP reflects yesterday only."
+                        )
+                        vwap_available = False
+                        vwap_curr = None
+                        vwap_prev = None
+
+                    else:
+                        total_vol = today_volumes.sum()
+                        max_vol   = today_volumes.max()
+                        max_vol_share = max_vol / (total_vol + 1e-9)
+
+                        FLASH_CRASH_THRESHOLD = 0.60
+
+                        if max_vol_share > FLASH_CRASH_THRESHOLD:
+                            logger_pair.warning(
+                                f"[{pair_name}] VWAP suppressed: single candle owns "
+                                f"{max_vol_share*100:.0f}% of today's volume "
+                                f"(threshold {FLASH_CRASH_THRESHOLD*100:.0f}%). "
+                                f"Flash crash/spike detected. "
+                                f"VWAP={vwap_curr:.4f} is unreliable."
+                            )
+                            vwap_available = False
+                            vwap_curr = None
+                            vwap_prev = None
+                        else:
+                            vwap_available = True
+                            if cfg.DEBUG_MODE:
+                                logger_pair.debug(
+                                    f"[{pair_name}] VWAP OK: curr={vwap_curr:.4f}, "
+                                    f"prev={vwap_prev:.4f}, "
+                                    f"today_candles={int(np.sum(today_mask))}, "
+                                    f"max_vol_share={max_vol_share*100:.1f}%"
+                                )
+
                 else:
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"VWAP data invalid: curr={vwap_curr}, prev={vwap_prev}")
+                        logger_pair.debug(
+                            f"[{pair_name}] VWAP invalid: "
+                            f"curr={vwap_curr}, prev={vwap_prev}"
+                        )
                     vwap_curr = None
                     vwap_prev = None
+
             except (IndexError, TypeError) as e:
-                logger_pair.warning(f"Error accessing VWAP data: {e}")
+                logger_pair.warning(f"[{pair_name}] VWAP access error: {e}")
                 vwap_curr = None
                 vwap_prev = None
         else:
             if vwap_enabled and cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"VWAP unavailable: enabled={vwap_enabled}, "
-                    f"vwap_is_none={vwap is None}, len={len(vwap) if vwap is not None else 0}, "
+                    f"[{pair_name}] VWAP unavailable: enabled={vwap_enabled}, "
+                    f"vwap_is_none={vwap is None}, "
+                    f"len={len(vwap) if vwap is not None else 0}, "
                     f"i15={i15}"
                 )
 
@@ -3465,35 +3544,41 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             elif alert_key in ("vwap_up", "vwap_down"):
                 if not vwap_available:
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: VWAP data unavailable")
+                        logger_pair.debug(f"Skipping {alert_key}: VWAP unavailable")
                     continue
 
                 trigger = False
                 try:
-                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    is_buy_side = (alert_key == "vwap_up")
 
-                    if cfg.DEBUG_MODE:
-                        is_buy_log = (alert_key == "vwap_up")
-                        valid_cross, reason = validate_vwap_cross(
-                            context["close_prev"], context["close_curr"],
-                            context["vwap_prev"],  context["vwap_curr"],
-                            is_buy_log
-                        )
-                        if trigger:
+                    valid_cross, cross_reason = validate_vwap_cross(
+                        context["close_prev"], context["close_curr"],
+                        context["vwap_prev"],  context["vwap_curr"],
+                        is_buy_side
+                    )
+
+                    if valid_cross:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                        if cfg.DEBUG_MODE:
                             logger_pair.debug(
-                                f"✅ {alert_key}: Close={context['close_curr']:.2f}, "
-                                f"VWAP={context['vwap_curr']:.2f}, cross_valid={valid_cross}, "
-                                f"buy_common={context.get('buy_common', False)}, "
-                                f"sell_common={context.get('sell_common', False)}"
+                                f"{'✅' if trigger else '❌'} {alert_key}: "
+                                f"cross_valid=True, trigger={trigger}, "
+                                f"close={context['close_curr']:.4f}, "
+                                f"vwap={context['vwap_curr']:.4f}, "
+                                f"buy_common={context.get('buy_common')}, "
+                                f"sell_common={context.get('sell_common')}"
                             )
-                        else:
+                    else:
+                        trigger = False
+                        if cfg.DEBUG_MODE:
                             logger_pair.debug(
-                                f"❌ {alert_key}: Not triggered — cross_valid={valid_cross}, "
-                                f"reason={reason}"
+                                f"❌ {alert_key}: cross rejected — {cross_reason}"
                             )
 
                 except Exception as e:
-                    logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
+                    logger_pair.error(
+                        f"VWAP check failed for {alert_key}: {e}", exc_info=True
+                    )
                     trigger = False
             else:
                 trigger = False
