@@ -612,6 +612,7 @@ def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, 
             return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
         return True, None
 
+
 def get_utc_date_key(timestamp: int) -> str:
     utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     return utc_dt.date().isoformat()
@@ -756,39 +757,6 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
     except Exception as e:
         logger.error(f"VWAP calculation failed: {e}", exc_info=True)
         return np.full(len(close), np.nan, dtype=np.float64)
-
-def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
-    min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
-    """
-    Validate price crossing VWAP with minimum separation threshold.
-    """
-    vals = [close_prev, close_curr, vwap_prev, vwap_curr]
-    
-    if any(np.isnan(v) for v in vals):
-        return False, "NaN in inputs"
-    
-    if any(v <= 0 for v in vals):
-        return False, "Non-positive values"
-
-    if is_buy:
-        crossed = (close_prev <= vwap_prev) and (close_curr > vwap_curr)
-        if not crossed:
-            return False, "No bullish cross"
-        
-        sep = (close_curr - vwap_curr) / vwap_curr
-        if sep < min_deviation:
-            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
-        return True, None
-    
-    else:
-        crossed = (close_prev >= vwap_prev) and (close_curr < vwap_curr)
-        if not crossed:
-            return False, "No bearish cross"
-        
-        sep = (vwap_curr - close_curr) / vwap_curr
-        if sep < min_deviation:
-            return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
-        return True, None
 
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
