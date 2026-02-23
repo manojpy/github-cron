@@ -126,14 +126,13 @@ def initialize_jit_fallback() -> None:
     global _jit_functions, _fallback_reason
 
     try:
-        # Import all 21 functions (already cached by Python)
+        # Import all 20 functions (already cached by Python)
         from numba_functions_shared import (
             sanitize_array_numba,
             sanitize_array_numba_parallel,
             ema_loop,
             ema_loop_alpha,
             kalman_loop,
-            vwap_daily_loop,
             vwap_daily_loop_safe, 
             rng_filter_loop,
             smooth_range,
@@ -158,7 +157,6 @@ def initialize_jit_fallback() -> None:
             'ema_loop': ema_loop,
             'ema_loop_alpha': ema_loop_alpha,
             'kalman_loop': kalman_loop,
-            'vwap_daily_loop': vwap_daily_loop,
             'vwap_daily_loop_safe': vwap_daily_loop_safe,
             'rng_filter_loop': rng_filter_loop,
             'smooth_range': smooth_range,
@@ -201,7 +199,6 @@ def ensure_initialized() -> None:
             'ema_loop': _aot_module.ema_loop,
             'ema_loop_alpha': _aot_module.ema_loop_alpha,
             'kalman_loop': _aot_module.kalman_loop,
-            'vwap_daily_loop': _aot_module.vwap_daily_loop,
             'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
             'rng_filter_loop': _aot_module.rng_filter_loop,
             'smooth_range': _aot_module.smooth_range,
@@ -262,9 +259,6 @@ def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
 
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     return _dispatch['kalman_loop'](src, length, R, Q)
-
-def vwap_daily_loop(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
-    return _dispatch['vwap_daily_loop'](hlc3, volumes, timestamps)
 
 def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray, 
                          reference_time: int, buffer_seconds: int) -> np.ndarray:
@@ -339,7 +333,6 @@ __all__ = [
     'calculate_trends_with_state',
 
     # Market Indicators
-    'vwap_daily_loop',
     'vwap_daily_loop_safe',
 
     # Statistical

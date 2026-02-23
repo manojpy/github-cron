@@ -415,33 +415,6 @@ def kalman_loop(src, length, R, Q):
 
     return result
 
-@njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
-def vwap_daily_loop(hlc3, volumes, timestamps):
-    n = len(hlc3)
-    vwap = np.empty(n, dtype=np.float64)
-    
-    cum_pv = 0.0
-    cum_vol = 0.0
-    last_day_number = -1
-    
-    for i in range(n):
-        current_day_number = timestamps[i] // 86400
-        
-        if current_day_number != last_day_number:
-            cum_pv = 0.0
-            cum_vol = 0.0
-            last_day_number = current_day_number
-        
-        cum_pv += hlc3[i] * volumes[i]
-        cum_vol += volumes[i]
-        
-        if cum_vol > 0.0:
-            vwap[i] = cum_pv / cum_vol
-        else:
-            vwap[i] = hlc3[i]
-    
-    return vwap
-
 @njit("f8[:](f8[:], f8[:], i8[:], i8, i4)", nogil=True, cache=True)
 def vwap_daily_loop_safe(hlc3, volumes, timestamps, reference_time, buffer_seconds):
     n = len(hlc3)
@@ -651,7 +624,6 @@ EXPORT_CONFIG = {
     'smooth_range': 'f8[:](f8[:], i4, i4)',
     'calculate_trends_with_state': 'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
     'kalman_loop': 'f8[:](f8[:], i4, f8, f8)',
-    'vwap_daily_loop': 'f8[:](f8[:], f8[:], i8[:])',
     'vwap_daily_loop_safe': 'f8[:](f8[:], f8[:], i8[:], i8, i4)',
     'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
     'calculate_rsi_core': 'f8[:](f8[:], i4)',
@@ -661,7 +633,7 @@ EXPORT_CONFIG = {
 
 __all__ = list(EXPORT_CONFIG.keys())
 
-expected_min_functions = 20
+expected_min_functions = 19
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

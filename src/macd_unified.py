@@ -38,7 +38,6 @@ from aot_bridge import (
     ema_loop,
     ema_loop_alpha,
     kalman_loop,
-    vwap_daily_loop,
     vwap_daily_loop_safe,
     rng_filter_loop,
     smooth_range,
@@ -899,7 +898,6 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
-        _ = aot_bridge.vwap_daily_loop(test_data, test_data, test_ts)
         _ = aot_bridge.vwap_daily_loop_safe(test_data, test_data, test_ts, now_ts, 300)
         
         warmup_elapsed = time.time() - warmup_start
