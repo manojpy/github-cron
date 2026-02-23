@@ -748,9 +748,8 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
 
-
 def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray,
-    reference_time: Optional[int] = None, unused) -> np.ndarray:
+    reference_time: Optional[int] = None) -> np.ndarray:
     try:
         hlc3 = (high + low + close) / 3.0
         return vwap_daily_loop_safe(hlc3, volume, timestamps)
