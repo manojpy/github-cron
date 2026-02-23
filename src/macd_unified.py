@@ -3330,49 +3330,47 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 if (not np.isnan(vwap_curr) and not np.isnan(vwap_prev)
                         and vwap_curr > 0 and vwap_prev > 0):
+                    VWAP_VOL_LOOKBACK   = 8
+                    FLASH_CRASH_THRESHOLD = 0.60
 
-                    midnight_utc = (reference_time // 86400) * 86400
-                    today_mask = data_15m["timestamp"] >= midnight_utc
-                    today_volumes = data_15m["volume"][today_mask]
+                    window_start   = max(0, i15 - VWAP_VOL_LOOKBACK + 1)
+                    window_volumes = data_15m["volume"][window_start : i15 + 1]
+                    total_vol      = window_volumes.sum()
+                    max_vol        = window_volumes.max()
+                    max_vol_share  = max_vol / (total_vol + 1e-9)
 
-                    if len(today_volumes) == 0:
+                    if total_vol <= 0:
                         logger_pair.warning(
-                            f"[{pair_name}] VWAP suppressed: no candles found "
-                            f"for today (UTC midnight {format_ist_time(midnight_utc)}). "
-                            f"VWAP reflects yesterday only."
+                            f"[{pair_name}] VWAP suppressed: zero volume in "
+                            f"last {VWAP_VOL_LOOKBACK} candles."
+                        )
+                        vwap_available = False
+                        vwap_curr = None
+                        vwap_prev = None
+
+                    elif max_vol_share > FLASH_CRASH_THRESHOLD:
+                        logger_pair.warning(
+                            f"[{pair_name}] VWAP suppressed: single candle owns "
+                            f"{max_vol_share*100:.0f}% of last {VWAP_VOL_LOOKBACK} "
+                            f"candles volume (threshold {FLASH_CRASH_THRESHOLD*100:.0f}%). "
+                            f"Flash crash/spike detected. "
+                            f"VWAP={vwap_curr:.4f} unreliable. "
+                            f"Resumes automatically in "
+                            f"~{VWAP_VOL_LOOKBACK * 15} min."
                         )
                         vwap_available = False
                         vwap_curr = None
                         vwap_prev = None
 
                     else:
-                        total_vol = today_volumes.sum()
-                        max_vol   = today_volumes.max()
-                        max_vol_share = max_vol / (total_vol + 1e-9)
-
-                        FLASH_CRASH_THRESHOLD = 0.60
-
-                        if max_vol_share > FLASH_CRASH_THRESHOLD:
-                            logger_pair.warning(
-                                f"[{pair_name}] VWAP suppressed: single candle owns "
-                                f"{max_vol_share*100:.0f}% of today's volume "
-                                f"(threshold {FLASH_CRASH_THRESHOLD*100:.0f}%). "
-                                f"Flash crash/spike detected. "
-                                f"VWAP={vwap_curr:.4f} is unreliable."
+                        vwap_available = True
+                        if cfg.DEBUG_MODE:
+                            logger_pair.debug(
+                                f"[{pair_name}] VWAP OK: "
+                                f"curr={vwap_curr:.4f}, prev={vwap_prev:.4f}, "
+                                f"window={VWAP_VOL_LOOKBACK} candles, "
+                                f"max_vol_share={max_vol_share*100:.1f}%"
                             )
-                            vwap_available = False
-                            vwap_curr = None
-                            vwap_prev = None
-                        else:
-                            vwap_available = True
-                            if cfg.DEBUG_MODE:
-                                logger_pair.debug(
-                                    f"[{pair_name}] VWAP OK: curr={vwap_curr:.4f}, "
-                                    f"prev={vwap_prev:.4f}, "
-                                    f"today_candles={int(np.sum(today_mask))}, "
-                                    f"max_vol_share={max_vol_share*100:.1f}%"
-                                )
-
                 else:
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(
