@@ -2979,12 +2979,18 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
 
 def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+    
     if not context.get("vwap_available", False):
+        if not sell_common and conditional_states.get(ALERT_KEYS['vwap_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+        if not buy_common and conditional_states.get(ALERT_KEYS['vwap_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
         return resets
-
+    
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     vwap_curr, vwap_prev = context["vwap_curr"], context["vwap_prev"]
-    buy_common, sell_common = context["buy_common"], context["sell_common"]
 
     if close_prev > vwap_prev and close_curr <= vwap_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
@@ -2995,6 +3001,26 @@ def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) 
         resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
     elif not sell_common and conditional_states.get(ALERT_KEYS['vwap_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+
+    return resets
+
+def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    mmh_curr, mmh_m1 = context["mmh_curr"], context["mmh_m1"]
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+
+    if (mmh_curr > 1e-8) and (mmh_curr <= mmh_m1):
+        if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS["mmh_buy"], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
+
+    if (mmh_curr < -1e-8) and (mmh_curr >= mmh_m1):
+        if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS["mmh_sell"], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
     return resets
 
@@ -3022,20 +3048,6 @@ def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict)
                 resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
             elif not sell_common and conditional_states.get(ALERT_KEYS[down_key], False):
                 resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
-
-    return resets
-
-def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
-    mmh_curr, mmh_m1 = context["mmh_curr"], context["mmh_m1"]
-
-    if (mmh_curr > 0) and (mmh_curr <= mmh_m1):
-        if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
-
-    if (mmh_curr < 0) and (mmh_curr >= mmh_m1):
-        if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
     return resets
 
@@ -3180,11 +3192,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pair_name=pair_name,
             min_wick_ratio=Constants.MIN_WICK_RATIO
         )
-
-        
+   
         if not is_valid_for_buy and not is_valid_for_sell:
-            return None
-    
+            if candle_info is None:
+                logger_pair.debug(
+                    f"[{pair_name}] Hard-rejecting candle: {error_msg}"
+                )
+                return None
+            logger_pair.debug(
+                f"[{pair_name}] Wick-rejected candle — will run resets only. Reason: {error_msg}"
+            )
+            wick_rejected = True
+        else:
+            wick_rejected = False
+
         o = candle_info["open"]
         h = candle_info["high"]
         l = candle_info["low"]
@@ -3440,21 +3461,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 is_buy = alert_key.startswith("pivot_up_")
 
                 try:
+                    # Pre-validate the cross so we can log suppression reason
                     valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-
                     if not valid_cross and reason and piv:
                         context["pivot_suppressions"].append(f"{alert_key}: {reason}")
 
-                    trigger = (
-                        (is_buy and buy_common) or (not is_buy and sell_common)
-                    ) and valid_cross
+                    # Call check_fn as the single source of truth — it checks
+                    # sell_common/buy_common AND the cross via get_pivot_alert_info
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
                     logger_pair.error(
                         f"Pivot alert check failed for {alert_key}: {e}",
                         exc_info=True
                     )
                     trigger = False
-
+                
             elif alert_key in ("vwap_up", "vwap_down"):
                 if not vwap_available:
                     if cfg.DEBUG_MODE:
@@ -3553,6 +3574,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
+
+        if wick_rejected:
+            logger_pair.debug(
+                f"[{pair_name}] Wick-rejected: resets applied, no new alerts sent."
+            )
+            return pair_name, {
+                "state": "NO_SIGNAL",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                    "mmh_hist": round(mmh_curr, 4),
+                    "suppression": f"Wick rejected: {error_msg}"
+                }
+            }
 
         alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
