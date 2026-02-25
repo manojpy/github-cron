@@ -213,6 +213,7 @@ class BotConfig(BaseModel):
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
     MIN_CANDLES_PER_DAY: int = Field(default=94, ge=50, le=100)  # Minimum candles for complete day (94=23h for 15m candles)
     CANDLE_MIN_AGE_BUFFER: int = Field(default=45, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
+    REJECT_HIGH_DEVIATION: bool = Field( default=False, description="Reject candles where close is >50% from High-Low midpoint (potential data anomaly)" )
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -1769,17 +1770,10 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     candle_close_time = ts + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
      
-    if time_since_candle_closed < cfg.CANDLE_MIN_AGE_BUFFER:
+    if not candle_is_stable(ts, reference_time, interval_minutes=15):
         return False, False, None, (
-            f"Candle closed only {time_since_candle_closed}s ago "
-            f"(need {cfg.CANDLE_MIN_AGE_BUFFER}s). This may be the forming candle!"
-        )
-   
-    if candle_age < Constants.MIN_CANDLE_AGE_FROM_OPEN:
-        return False, False, None, (
-            f"Candle age {candle_age}s from open is < {Constants.MIN_CANDLE_AGE_FROM_OPEN}s. "
-            f"This is likely the currently forming candle! "
-            f"(Opened: {format_ist_time(ts)}, Current: {format_ist_time(reference_time)})"
+            f"Candle at {format_ist_time(ts)} not stable yet "
+            f"(buffer {cfg.CANDLE_MIN_AGE_BUFFER}s, min age {Constants.MIN_CANDLE_AGE_FROM_OPEN}s)"
         )
    
     if candle_age > cfg.MAX_CANDLE_STALENESS_SEC:
@@ -1798,12 +1792,12 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
         
-        if abs(next_candle_ts - expected_next_ts) > 30:  # Allow 30s tolerance
-            return False, False, None, (
-                f"Gap detected: Expected next candle at {expected_next_ts} "
-                f"but found at {next_candle_ts}. Data may be incomplete."
+        if abs(next_candle_ts - expected_next_ts) > (interval_seconds // 2): 
+            return False, False, None, ( 
+                f"Gap detected: Expected next candle at {format_ist_time(expected_next_ts)} " 
+                f"but found at {format_ist_time(next_candle_ts)} " f"(diff={abs(next_candle_ts - expected_next_ts)}s). Data may be incomplete." 
             )
-    
+
     candle_range = h - l
     
     if candle_range < 1e-9:
@@ -1952,22 +1946,23 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
         deviation_mask = close_deviation > 0.5
         deviation_count = np.sum(deviation_mask)
-    
-        if deviation_count > 0:
-            logger.warning(
-                f"parse_candles_to_numpy: Found {deviation_count} candle(s) with "
-                f"Close >50% from High-Low midpoint (potential data anomaly) | "
-                f"These candles are kept but flagged for review"
-            )
-        
-            if cfg.DEBUG_MODE and deviation_count <= 5:
-                dev_indices = np.where(deviation_mask)[0]
-                for idx in dev_indices:
-                    dev_pct = close_deviation[idx] * 100
-                    logger.debug(
-                        f"  Index {idx}: Deviation {dev_pct:.1f}% | "
-                        f"Mid={(h[idx]+l[idx])/2:.2f} Close={c[idx]:.2f}"
-                    )
+ 
+        if deviation_count > 0: 
+            dev_indices = np.where(deviation_mask)[0].tolist() 
+            logger.warning( 
+                f"parse_candles_to_numpy: {deviation_count} candle(s) with " 
+                f"close >50% from H-L midpoint | Indices: {dev_indices[:5]}" 
+            ) 
+            if cfg.DEBUG_MODE and deviation_count <= 5: 
+                for idx in dev_indices: 
+                    dev_pct = close_deviation[idx] * 100 
+                    logger.debug( 
+                        f" Index {idx}: Deviation {dev_pct:.1f}% | " 
+                        f"Mid={(h[idx]+l[idx])/2:.2f} Close={c[idx]:.2f}" 
+                    ) 
+            if cfg.REJECT_HIGH_DEVIATION: 
+                logger.warning("Rejecting candle data due to high deviation (REJECT_HIGH_DEVIATION=True)") 
+                return None
     
         if n > 1:
             ts_diffs = np.diff(data["timestamp"])
@@ -2004,6 +1999,16 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         )
         return None
 
+def candle_is_stable(ts_open: int, reference_time: int, interval_minutes: int = 15) -> bool:
+    """Check if a candle is fully closed and past the safety buffer."""
+    interval_seconds = interval_minutes * 60
+    time_since_closed = reference_time - (ts_open + interval_seconds)
+    age_from_open = reference_time - ts_open
+    return (
+        time_since_closed >= cfg.CANDLE_MIN_AGE_BUFFER
+        and age_from_open >= Constants.MIN_CANDLE_AGE_FROM_OPEN
+    )
+
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, 
                                      reference_time: Optional[int] = None, 
                                      pair_name: Optional[str] = None) -> Optional[int]:
@@ -2021,16 +2026,13 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
    
     candle_close_time = expected_ts_open_time + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
-   
-    buffer_seconds = cfg.CANDLE_MIN_AGE_BUFFER
-    if time_since_candle_closed < buffer_seconds:
+ 
+    if not candle_is_stable(expected_ts_open_time, reference_time, interval_minutes):
         logger.warning(
-            "[%s] Candle %s-%s closed only %ds ago (need %ds buffer). Skipping.",
-            pair_name or "?", 
-            format_ist_time(expected_ts_open_time), 
-            format_ist_time(candle_close_time), 
-            int(time_since_candle_closed), 
-            int(buffer_seconds)
+            "[%s] Candle %dm open %s not stable (buffer/age check failed). Skipping.",
+            pair_name or "?",
+            int(interval_minutes),
+            format_ist_time(expected_ts_open_time),
         )
         return None
 
@@ -2048,7 +2050,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         else:
             logger.info("[%s] Duplicates exist but not near target.", pair_name or "?")
 
-    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 30)
+    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 5)
     if matches.size == 0:
         last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
         count = int(ts_normalized.size)
@@ -3075,6 +3077,7 @@ ALERT_KEYS: Dict[str, str] = {
 }
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
+
 def validate_alert_definitions() -> None:
     errors = []
     
@@ -3111,6 +3114,18 @@ def validate_alert_definitions() -> None:
     logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
 
 validate_alert_definitions()
+
+BUY_ALERT_KEYS: Set[str] = {
+    "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
+    "rsi_50_up", "vwap_up", "mmh_buy",
+}
+BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
+
+SELL_ALERT_KEYS: Set[str] = {
+    "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
+    "rsi_50_down", "vwap_down", "mmh_sell",
+}
+SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
     """Store alert state in Redis for dedup"""
@@ -3184,7 +3199,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time, pair_name)
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
-    
+
+        if not candle_is_stable(data_15m["timestamp"][i15], reference_time, interval_minutes=15):
+            logger_pair.debug(f"[{pair_name}] Selected candle not stable, skipping alerts.")
+            return None
+ 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m,
             candle_index=i15,
@@ -3239,11 +3258,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         close_15m = data_15m["close"]
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
-    
-        ts_15m_val = data_15m["timestamp"][i15]
-        ts_5m_arr = data_5m["timestamp"]
+
+
+        ts_15m_val = int(normalize_timestamp(int(data_15m["timestamp"][i15])))
+        ts_5m_arr = np.array([normalize_timestamp(int(t)) for t in data_5m["timestamp"]], dtype=np.int64)
         idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
         i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
+        if i5 < 0:
+            logger_pair.error(
+                f"[{pair_name}] No 5m candle aligned to 15m ts={ts_15m_val}. Skipping."
+            )
+            return None
+
         if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
             return None
       
@@ -3273,6 +3299,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
         close_prev = close_15m[i15 - 1]
+
+        if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
+            logger_pair.warning(
+                f"[{pair_name}] Previous candle has invalid close={close_prev}. "
+                f"Using close_curr as fallback."
+            )
+            close_prev = close_curr
+
         open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
         high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
         low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
@@ -3360,8 +3394,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
-        confirmation_buy = (mmh_curr > 0) and cloud_up
-        confirmation_sell = (mmh_curr < 0) and cloud_down
+        if has_valid_mmh:
+            confirmation_buy  = (mmh_curr > 0) and cloud_up
+            confirmation_sell = (mmh_curr < 0) and cloud_down
+        else:
+            confirmation_buy  = False
+            confirmation_sell = False
 
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
@@ -3453,6 +3491,35 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not def_:
                 continue
 
+            if alert_key in BUY_ALERT_KEYS and not is_valid_for_buy:
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"Skipping {alert_key}: not valid for buy "
+                        f"(is_green={is_green}, upper_wick={buy_wick_ratio*100:.1f}%)"
+                    )
+                continue
+            if alert_key in SELL_ALERT_KEYS and not is_valid_for_sell:
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"Skipping {alert_key}: not valid for sell "
+                        f"(is_red={is_red}, lower_wick={sell_wick_ratio*100:.1f}%)"
+                    )
+                continue
+
+            if is_green and alert_key.startswith("pivot_down"):
+                logger_pair.error(
+                    f"[{pair_name}] LOGIC ERROR: GREEN candle firing pivot_down '{alert_key}'. "
+                    f"Skipping to prevent false alert."
+                )
+                continue
+
+            if is_red and alert_key.startswith("pivot_up"):
+                logger_pair.error(
+                    f"[{pair_name}] LOGIC ERROR: RED candle firing pivot_up '{alert_key}'. "
+                    f"Skipping to prevent false alert."
+                )
+                continue
+
             key = ALERT_KEYS[alert_key]
             trigger = False
 
@@ -3461,13 +3528,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 is_buy = alert_key.startswith("pivot_up_")
 
                 try:
-                    # Pre-validate the cross so we can log suppression reason
                     valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
                     if not valid_cross and reason and piv:
                         context["pivot_suppressions"].append(f"{alert_key}: {reason}")
 
-                    # Call check_fn as the single source of truth — it checks
-                    # sell_common/buy_common AND the cross via get_pivot_alert_info
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
                     logger_pair.error(
