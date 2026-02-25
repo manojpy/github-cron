@@ -2050,7 +2050,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         else:
             logger.info("[%s] Duplicates exist but not near target.", pair_name or "?")
 
-    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 5)
+    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 30)
     if matches.size == 0:
         last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
         count = int(ts_normalized.size)
@@ -3600,10 +3600,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     ohlc_debug = (
                         f" {candle_type} (O:{open_curr:.4f} H:{high_curr:.4f} "
                         f"L:{low_curr:.4f} C:{close_curr:.4f})"
+                    )               
+                    ts_debug = (
+                        f" [Evaluated: {format_ist_time(ts_curr)} candle"
+                        f" (opened {format_ist_time(ts_curr)},"
+                        f" closed {format_ist_time(ts_curr + 900)},"
+                        f" {'🟢' if is_green else '🔴'} i15={i15})]"
                     )
-                    
-                    ts_debug = f" [i15={i15}, {format_ist_time(ts_curr)}]"
-                    
                     extra = f"{base_extra}{ohlc_debug}{ts_debug}"
                     
                 except Exception as e:
