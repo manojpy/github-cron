@@ -1791,8 +1791,8 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if candle_index + 1 < len(data_15m["timestamp"]):
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
-        
-        if abs(next_candle_ts - expected_next_ts) > (interval_seconds // 2): 
+
+        if abs(next_candle_ts - expected_next_ts) > 30:
             return False, False, None, ( 
                 f"Gap detected: Expected next candle at {format_ist_time(expected_next_ts)} " 
                 f"but found at {format_ist_time(next_candle_ts)} " f"(diff={abs(next_candle_ts - expected_next_ts)}s). Data may be incomplete." 
