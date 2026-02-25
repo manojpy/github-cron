@@ -3596,19 +3596,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 extra = ""
                 try:
                     base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
-                    candle_type = "🟢" if is_green else "🔴" if is_red else "⚪"
-                    ohlc_debug = (
-                        f" {candle_type} (O:{open_curr:.4f} H:{high_curr:.4f} "
-                        f"L:{low_curr:.4f} C:{close_curr:.4f})"
-                    )               
-                    ts_debug = (
-                        f" [Evaluated: {format_ist_time(ts_curr)} candle"
-                        f" (opened {format_ist_time(ts_curr)},"
-                        f" closed {format_ist_time(ts_curr + 900)},"
-                        f" {'🟢' if is_green else '🔴'} i15={i15})]"
-                    )
-                    extra = f"{base_extra}{ohlc_debug}{ts_debug}"
-                    
+                    extra = base_extra
+
                 except Exception as e:
                     logger_pair.error(
                         f"Alert extra_fn failed for {alert_key}: {e}",
