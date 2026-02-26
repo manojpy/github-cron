@@ -202,7 +202,7 @@ class BotConfig(BaseModel):
     ENABLE_VWAP: bool = Field(default=True)
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
-    CPR_THRESHOLD_PCT: float = Field(default%=0.010, ge=0.001, le=0.10)
+    CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
