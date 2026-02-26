@@ -214,7 +214,7 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False)
     NUMBA_PARALLEL: bool = Field(default=True)
     SKIP_WARMUP: bool = Field(default=False)
-    REJECT_HIGH_DEVIATION: bool = Field( default=False
+    REJECT_HIGH_DEVIATION: bool = Field( default=False)
 
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
