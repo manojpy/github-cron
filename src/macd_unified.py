@@ -199,9 +199,9 @@ class BotConfig(BaseModel):
     LOG_LEVEL: str = "INFO"
     ENABLE_ADX_FILTER: bool = Field(default=True)
     ENABLE_RVOL_ALERT: bool = Field(default=True)
-    ENABLE_VWAP: bool = True
-    ENABLE_PIVOT: bool = True
-    ENABLE_CPR: bool = True
+    ENABLE_VWAP: bool = Field(default=True)
+    ENABLE_PIVOT: bool = Field(default=True)
+    ENABLE_CPR: bool = Field(default=False)
     CPR_THRESHOLD: float = Field(default=1.0, ge=0.0, le=100.0)
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
