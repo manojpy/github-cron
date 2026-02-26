@@ -202,7 +202,7 @@ class BotConfig(BaseModel):
     ENABLE_VWAP: bool = Field(default=True)
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
-    CPR_THRESHOLD: float = Field(default=1.0, ge=0.0, le=100.0)
+    CPR_THRESHOLD_PCT: float = Field(default%=0.010, ge=0.001, le=0.10)
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
@@ -3514,20 +3514,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"(candle not ready yet or guard failure; "
                         f"retry next run)"
                     )
-            elif nr_cpr < cfg.CPR_THRESHOLD:
-                cpr_ok = True
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"[{pair_name}] CPR OK — NR_CPR={nr_cpr:.4f} "
-                        f"< threshold={cfg.CPR_THRESHOLD:.4f}"
-                    )
             else:
-                cpr_ok = False
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"[{pair_name}] CPR blocked — NR_CPR={nr_cpr:.4f} "
-                        f">= threshold={cfg.CPR_THRESHOLD:.4f} (CPR too wide)"
-                    )
+                cpr_threshold = close_curr * cfg.CPR_THRESHOLD_PCT
+                if nr_cpr < cpr_threshold:
+                    cpr_ok = True
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"[{pair_name}] CPR OK — NR_CPR={nr_cpr:.4f} "
+                            f"< threshold={cpr_threshold:.4f} "
+                            f"({cfg.CPR_THRESHOLD_PCT*100:.1f}% of {close_curr:.4f})"
+                        )
+                else:
+                    cpr_ok = False
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"[{pair_name}] CPR blocked — NR_CPR={nr_cpr:.4f} "
+                            f">= threshold={cpr_threshold:.4f} "
+                            f"({cfg.CPR_THRESHOLD_PCT*100:.1f}% of {close_curr:.4f}) — CPR too wide"
+                        )
+
         else:
             cpr_ok = True
 
