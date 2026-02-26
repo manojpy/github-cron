@@ -92,6 +92,21 @@ def normalize_timestamp(ts: Union[int, float]) -> int:
     
     return ts_int
 
+class CprNotReadyError(Exception):
+    """
+    Raised by _find_closed_daily_candle() when yesterday's daily candle
+    is not yet present in the fetched data array.
+
+    This is a normal, expected condition in the minutes immediately after
+    00:00 UTC before the exchange/API emits the new daily bar.
+
+    The caller should:
+      - Set nr_cpr = nan  (cpr_ok = False -> alerts silently blocked)
+      - NOT log a warning (this is not an error)
+      - Let the 15-minute scheduler retry on the next run automatically
+    """
+    pass
+
 __version__ = "1.8.0-stable"
 
 class Constants:
@@ -186,6 +201,8 @@ class BotConfig(BaseModel):
     ENABLE_RVOL_ALERT: bool = Field(default=True)
     ENABLE_VWAP: bool = True
     ENABLE_PIVOT: bool = True
+    ENABLE_CPR: bool = True
+    CPR_THRESHOLD: float = Field(default=1.0, ge=0.0, le=100.0)
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
@@ -197,6 +214,7 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False)
     NUMBA_PARALLEL: bool = Field(default=True)
     SKIP_WARMUP: bool = Field(default=False)
+    REJECT_HIGH_DEVIATION: bool = Field( default=False
 
     MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -213,8 +231,7 @@ class BotConfig(BaseModel):
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
     MIN_CANDLES_PER_DAY: int = Field(default=94, ge=50, le=100)  # Minimum candles for complete day (94=23h for 15m candles)
     CANDLE_MIN_AGE_BUFFER: int = Field(default=45, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
-    REJECT_HIGH_DEVIATION: bool = Field( default=False, description="Reject candles where close is >50% from High-Low midpoint (potential data anomaly)" )
-
+        
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
@@ -415,7 +432,7 @@ class SafeFormatter(logging.Formatter):
         if value is None:
             return value
         if isinstance(value, (int, float, bool)):
-            return value  # ← don't stringify numbers
+            return value
         return SafeFormatter._apply_all_redactions(str(value))
 
 def setup_logging() -> logging.Logger:
@@ -579,6 +596,55 @@ def is_previous_day_complete(timestamps: np.ndarray, current_time: int, min_cand
         return False, "Last candle has wrong day number"
     
     return True, "Complete"
+
+def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time: int):
+    if data_daily is None:
+        raise CprNotReadyError("data_daily is None")
+
+    ts_arr = data_daily.get("timestamp")
+    hi_arr = data_daily.get("high")
+    lo_arr = data_daily.get("low")
+    cl_arr = data_daily.get("close")
+
+    for name, arr in (("timestamp", ts_arr), ("high", hi_arr),
+                      ("low", lo_arr), ("close", cl_arr)):
+        if arr is None or len(arr) == 0:
+            raise CprNotReadyError(f"daily {name} array empty or missing")
+
+    for name, arr in (("high", hi_arr), ("low", lo_arr), ("close", cl_arr)):
+        if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+            raise ValueError(f"daily {name} contains NaN/Inf — data corrupt")
+
+    day_numbers   = ts_arr // 86400
+    yesterday_num = (reference_time // 86400) - 1
+
+    mask = (day_numbers == yesterday_num)
+    if not np.any(mask):
+        yesterday_date = datetime.fromtimestamp(
+            yesterday_num * 86400, tz=timezone.utc
+        ).date()
+        raise CprNotReadyError(
+            f"Yesterday's candle ({yesterday_date}) not yet in daily array "
+            f"({len(ts_arr)} candles, newest day={int(day_numbers[-1])}). "
+            f"Will retry next run."
+        )
+
+    idx       = int(np.where(mask)[0][-1])  # last bar of that day
+    candle_ts = int(ts_arr[idx])
+    d_high    = float(hi_arr[idx])
+    d_low     = float(lo_arr[idx])
+    d_close   = float(cl_arr[idx])
+
+    if d_high < d_low:
+        raise ValueError(f"Corrupt candle: high({d_high}) < low({d_low})")
+    if d_low <= 0 or d_high <= 0 or d_close <= 0:
+        raise ValueError(f"Non-positive OHLC: H={d_high} L={d_low} C={d_close}")
+    if (d_high - d_low) < 1e-8:
+        raise ValueError(f"Degenerate candle: range={d_high - d_low:.2e}")
+    if not (d_low <= d_close <= d_high):
+        raise ValueError(f"Close outside H/L: H={d_high} L={d_low} C={d_close}")
+
+    return d_high, d_low, d_close, candle_ts
 
 def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
     min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
@@ -975,8 +1041,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'atr_short': np.empty(n_15m, dtype=np.float64),
             'atr_long': np.empty(n_15m, dtype=np.float64),
             'adx': np.empty(n_15m, dtype=np.float64),
+            'nr_cpr': float('nan'),   # set below if ENABLE_CPR and daily data available
         }
-
         ppo, ppo_signal = calculate_ppo_numpy(
             close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
@@ -1078,6 +1144,39 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         else:
             results['pivots'] = {}
 
+        if cfg.ENABLE_CPR and data_daily is not None:
+            try:
+                d_high, d_low, d_close, d_ts = _find_closed_daily_candle(
+                    data_daily,
+                    reference_time,
+                )
+                _pivot = (d_high + d_low + d_close) / 3.0
+                _bc    = (d_high + d_low) / 2.0
+                _tc    = (_pivot - _bc) + _pivot
+                results['nr_cpr'] = abs(_tc - _bc)
+
+                if cfg.DEBUG_MODE:
+                    logger.debug(
+                        f"CPR OK | candle="
+                        f"{datetime.fromtimestamp(d_ts, tz=timezone.utc).date()} "
+                        f"H={d_high:.4f} L={d_low:.4f} C={d_close:.4f} "
+                        f"NR_CPR={results['nr_cpr']:.4f}"
+                    )
+
+            except CprNotReadyError as e:
+                logger.debug(f"CPR not ready, will retry next run: {e}")
+                results['nr_cpr'] = float('nan')
+
+            except ValueError as e:
+                logger.warning(f"CPR skipped — bad candle: {e}")
+                results['nr_cpr'] = float('nan')
+
+            except Exception as e:
+                logger.error(f"CPR unexpected error: {e}", exc_info=True)
+                results['nr_cpr'] = float('nan')
+        else:
+            results['nr_cpr'] = float('nan')
+ 
         SANITIZE_KEYS = [
             'ppo', 'ppo_signal', 'smooth_rsi', 'mmh',
             'rma50_15', 'rma200_5', 'adx',
@@ -1127,8 +1226,9 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
             'adx': np.full(n, np.nan, dtype=np.float64),
+            'nr_cpr': float('nan'),
         }
-
+        
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
                          expected_len: int) -> Tuple[bool, Optional[str]]:  
     required_keys = ["open", "high", "low", "close"]    
@@ -3404,6 +3504,33 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
 
+        nr_cpr = indicators.get('nr_cpr', float('nan'))
+        if cfg.ENABLE_CPR:
+            if np.isnan(nr_cpr):
+                cpr_ok = False
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"[{pair_name}] CPR blocked — nr_cpr=NaN "
+                        f"(candle not ready yet or guard failure; "
+                        f"retry next run)"
+                    )
+            elif nr_cpr < cfg.CPR_THRESHOLD:
+                cpr_ok = True
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"[{pair_name}] CPR OK — NR_CPR={nr_cpr:.4f} "
+                        f"< threshold={cfg.CPR_THRESHOLD:.4f}"
+                    )
+            else:
+                cpr_ok = False
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"[{pair_name}] CPR blocked — NR_CPR={nr_cpr:.4f} "
+                        f">= threshold={cfg.CPR_THRESHOLD:.4f} (CPR too wide)"
+                    )
+        else:
+            cpr_ok = True
+
         if cfg.ENABLE_RVOL_ALERT:
             atr_short_val = indicators['atr_short'][i15]
             atr_long_val  = indicators['atr_long'][i15]
@@ -3414,8 +3541,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             rvol_ok = True
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok))
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok))      
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok)
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok)
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3452,8 +3579,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "is_green": is_green, "is_red": is_red,
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
+            "nr_cpr": nr_cpr,
+            "cpr_ok": cpr_ok,
         }
-
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
@@ -3885,9 +4013,11 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     
     try:
         data_15m = parse_candles_to_numpy(candles.get("15"))
-        data_5m = parse_candles_to_numpy(candles.get("5"))
-        data_daily = parse_candles_to_numpy(candles.get("D")) if cfg.ENABLE_PIVOT else None
-        
+        data_5m = parse_candles_to_numpy(candles.get("5"))      
+        data_daily = parse_candles_to_numpy(candles.get("D")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+
+
+
         if data_15m is None:
             logger_main.warning(f"Skipping {p_name}: 15m parse failed")
             return None
@@ -3927,7 +4057,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     limit_15m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
-    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if cfg.ENABLE_PIVOT else 0
+    daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
 
     pair_requests = []
     valid_tasks = []
@@ -3938,7 +4068,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         symbol = product_info["symbol"]
         resolutions = [("15", limit_15m), ("5", limit_5m)]
-        if cfg.ENABLE_PIVOT:
+
+        if cfg.ENABLE_PIVOT or cfg.ENABLE_CPR:
             resolutions.append(("D", daily_limit))
 
         pair_requests.append((symbol, resolutions))
