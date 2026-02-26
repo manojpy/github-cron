@@ -9,6 +9,7 @@
   "SEND_TEST_MESSAGE": false,
   "ENABLE_RVOL_ALERT": true,
   "ENABLE_ADX_FILTER": true,
+  "ENABLE_CPR": true,
    
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
