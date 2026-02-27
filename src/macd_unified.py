@@ -135,7 +135,7 @@ class Constants:
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
     MIN_CLOSED_CANDLES_15M = 4          
-    MIN_ALIGNED_5M_CANDLES = 2               
+    MIN_ALIGNED_5M_CANDLES = 200               
     CANDLE_FETCH_BUFFER_PERIODS = 3 
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
@@ -3359,20 +3359,54 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
 
+        interval_5m_sec = 5 * 60
+        expected_5m_open = (reference_time // interval_5m_sec) * interval_5m_sec - interval_5m_sec
 
-        ts_15m_val = int(normalize_timestamp(int(data_15m["timestamp"][i15])))
         ts_5m_arr = np.array([normalize_timestamp(int(t)) for t in data_5m["timestamp"]], dtype=np.int64)
-        idx = np.searchsorted(ts_5m_arr, ts_15m_val, side='right') - 1
-        i5 = int(max(0, min(idx, len(ts_5m_arr) - 1)))
-        if i5 < 0:
-            logger_pair.error(
-                f"[{pair_name}] No 5m candle aligned to 15m ts={ts_15m_val}. Skipping."
+
+        matches_5m = np.flatnonzero(np.abs(ts_5m_arr - expected_5m_open) <= 30)
+        if matches_5m.size == 0:
+            logger_pair.warning(
+                f"[{pair_name}] 5m candle not found at {format_ist_time(expected_5m_open)}. "
+                f"Range: {format_ist_time(int(ts_5m_arr[0]))} to {format_ist_time(int(ts_5m_arr[-1]))}"
             )
             return None
 
+        i5 = int(matches_5m[-1])
+        actual_5m_ts = int(ts_5m_arr[i5])
+
+        time_since_5m_closed = reference_time - (actual_5m_ts + interval_5m_sec)
+        if time_since_5m_closed < cfg.CANDLE_MIN_AGE_BUFFER:
+            logger_pair.warning(
+                f"[{pair_name}] 5m candle at {format_ist_time(actual_5m_ts)} not stable yet "
+                f"(closed {time_since_5m_closed}s ago, need {cfg.CANDLE_MIN_AGE_BUFFER}s). Skipping."
+            )
+            return None
+
+        ts_15m_val = int(normalize_timestamp(int(data_15m["timestamp"][i15])))
+
+        if actual_5m_ts < ts_15m_val or actual_5m_ts >= ts_15m_val + 900:
+            logger_pair.error(
+                f"[{pair_name}] 5m/15m misalignment: 5m={format_ist_time(actual_5m_ts)} "
+                f"outside 15m period {format_ist_time(ts_15m_val)}-{format_ist_time(ts_15m_val + 900)}"
+            )
+            return None
+
+        expected_last_5m = ts_15m_val + 600
+        if actual_5m_ts != expected_last_5m:
+            logger_pair.debug(
+                f"[{pair_name}] Non-last 5m candle: got {format_ist_time(actual_5m_ts)}, "
+                f"expected {format_ist_time(expected_last_5m)}"
+            )
+
         if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
             return None
-      
+
+        logger_pair.debug(
+            f"[{pair_name}] 5m candle selected | "
+            f"Open={format_ist_time(actual_5m_ts)} | i5={i5} | "
+            f"Close={data_5m['close'][i5]:.2f}"
+        )   
         indicators = await asyncio.to_thread(
             calculate_all_indicators_numpy, data_15m, data_5m, data_daily, reference_time
         )
