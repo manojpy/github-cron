@@ -14,7 +14,7 @@
   "PAIRS": [
     "BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD",
     "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD",
-    "AAVEUSD", "SOLUSD"
+    "AAVEUSD", "SOLUSD", "PAXGUSD"
   ],
 
   "PPO_FAST": 7,
