@@ -3527,10 +3527,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
-
+     
         if has_valid_mmh:
-            confirmation_buy  = (mmh_curr > 0) and cloud_up
-            confirmation_sell = (mmh_curr < 0) and cloud_down
+            confirmation_buy  = cloud_up
+            confirmation_sell = cloud_down
+
         else:
             confirmation_buy  = False
             confirmation_sell = False
@@ -4054,8 +4055,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         data_15m = parse_candles_to_numpy(candles.get("15"))
         data_5m = parse_candles_to_numpy(candles.get("5"))      
         data_daily = parse_candles_to_numpy(candles.get("D")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
-
-
 
         if data_15m is None:
             logger_main.warning(f"Skipping {p_name}: 15m parse failed")
