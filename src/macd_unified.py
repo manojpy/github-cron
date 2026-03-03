@@ -170,7 +170,7 @@ class BotConfig(BaseModel):
     PPO_SIGNAL: int = Field(default=5, ge=1, le=20, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
-    MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")
+    MMH_PERIOD: int = Field(default=89, ge=20, le=200, description="MMH calculation period")
     CIRRUS_CLOUD_ENABLED: bool = True
     X1: int = 22
     X2: int = 9
@@ -863,7 +863,7 @@ def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndar
             np.zeros(length, dtype=np.float64)
         )
 
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:  
+def calculate_magical_momentum_hist(close: np.ndarray, period: int = 89, responsiveness: float = 0.9) -> np.ndarray:  
     try:
         if close is None or len(close) < period:
             return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
@@ -1073,7 +1073,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 reference_time
             )
         else:
-            results["vwap"] = np.full(n_15m, np.nan, dtype=np.float64)  # Original style
+            results["vwap"] = np.full(n_15m, np.nan, dtype=np.float64)
 
         results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
         
