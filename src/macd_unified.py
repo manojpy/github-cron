@@ -183,9 +183,9 @@ class BotConfig(BaseModel):
     ATR_LONG: int = 14
     LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
-    HTTP_TIMEOUT: int = 6
-    CANDLE_FETCH_RETRIES: int = 1
-    CANDLE_FETCH_BACKOFF: float = 1
+    HTTP_TIMEOUT: int = 15
+    CANDLE_FETCH_RETRIES: int = 3
+    CANDLE_FETCH_BACKOFF: float = 1.5
     JITTER_MIN: float = 0.1
     JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
@@ -195,7 +195,7 @@ class BotConfig(BaseModel):
     TELEGRAM_RETRIES: int = 3
     TELEGRAM_BACKOFF_BASE: float = 2.0
     MEMORY_LIMIT_BYTES: int = 400_000_000
-    STATE_EXPIRY_DAYS: int = 30
+    STATE_EXPIRY_DAYS: int = 11
     LOG_LEVEL: str = "INFO"
     ENABLE_ADX_FILTER: bool = Field(default=True)
     ENABLE_RVOL_ALERT: bool = Field(default=True)
@@ -216,7 +216,7 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
 
-    MIN_RUN_TIMEOUT: int = Field(default=300, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
+    MIN_RUN_TIMEOUT: int = Field(default=420, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     PRODUCTS_CACHE_TTL: int = Field(default=28800)  # Products cache TTL in seconds (8h default)
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5)  # Max distance from pivot to trigger alert (1.5%)
@@ -372,9 +372,10 @@ def load_config() -> BotConfig:
         env_value = os.getenv(key)
         if env_value:
             data[key] = env_value
-        if not data.get(key) or data.get(key) == "__SET_IN_GITLAB_CI__":
+        val = data.get(key, "")
+        if not val or val.startswith("__SET_IN_"):
             print(f"❌ ERROR: Missing required config: {key}", file=sys.stderr)
-            print(f"❌ Set this in GitLab CI/CD Settings → Variables", file=sys.stderr)
+            print(f"❌ Set this in your CI/CD secrets (GitHub Actions → Secrets, GitLab → Variables)", file=sys.stderr)
             sys.exit(1)
     try:
         return BotConfig(**data)
@@ -4093,7 +4094,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
 
-    limit_15m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
+    limit_15m = 1000
     limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
 
