@@ -137,7 +137,7 @@ def rolling_min_max_numba(arr, period):
     return min_arr, max_arr
 
 
-@njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Calculate worm array - Pine's exact logic"""
     worm_arr = np.empty(rows, dtype=np.float64)
