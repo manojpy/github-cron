@@ -4096,7 +4096,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
 
-    limit_15m = 1000
+    limit_15m = 500
     limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
 
