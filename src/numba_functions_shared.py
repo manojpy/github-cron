@@ -1,5 +1,5 @@
 # ============================================================================
-# Shared Numba Function Definitions - Single Source of Truth 
+# Shared Numba Function Definitions - Single Source of Truth
 # ============================================================================
 
 import numpy as np
@@ -8,8 +8,6 @@ from typing import Dict, Optional, Tuple, Any
 import logging
 
 logger = logging.getLogger(__name__)
-
-
 
 
 # ============================================================================
@@ -35,6 +33,7 @@ def sanitize_array_numba_parallel(arr, default):
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
+
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
     """
@@ -50,18 +49,16 @@ def rolling_std(close, period, responsiveness):
 
     for i in range(period - 1, n):
         window = close[i - period + 1 : i + 1]
-        
         valid_window = window[~np.isnan(window)]
-        
         if len(valid_window) >= 2:
             sd[i] = np.std(valid_window) * resp
         else:
             sd[i] = 0.0
-            
+
     mask = np.isnan(sd)
     sd[mask] = 0.0
-    
     return sd
+
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
@@ -78,19 +75,17 @@ def rolling_mean_numba(data, period):
 
     for i in range(n):
         curr = data[i]
-
         if i >= period:
             old_val = queue[queue_idx]
             window_sum -= old_val
-
         window_sum += curr
         queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-
         if i >= period - 1:
             out[i] = window_sum / period
 
     return out
+
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
@@ -141,38 +136,33 @@ def rolling_min_max_numba(arr, period):
 
     return min_arr, max_arr
 
-@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
+
+@njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Calculate worm array - Pine's exact logic"""
     worm_arr = np.empty(rows, dtype=np.float64)
-    
     worm_arr[0] = close_arr[0]
-
     for i in range(1, rows):
         src = close_arr[i]
         prev_worm = worm_arr[i - 1]
         diff = src - prev_worm
         sd_i = sd_arr[i]
-
         if np.abs(diff) > sd_i:
             delta = np.sign(diff) * sd_i
         else:
             delta = diff
-
         worm_arr[i] = prev_worm + delta
-
     return worm_arr
+
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
     """Corrected value loop with NaN propagation to match Pine Script recursion"""
     value_arr = np.full(rows, np.nan, dtype=np.float64)
-    
     for i in range(rows):
         raw = raw_arr[i]
         mn = min_arr[i]
         mx = max_arr[i]
-        
         denom = mx - mn
         if np.isnan(raw) or np.isnan(mn) or np.isnan(mx) or np.abs(denom) < 1e-10:
             temp = np.nan
@@ -184,20 +174,18 @@ def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
         else:
             prev_v = value_arr[i-1] if i > 0 else np.nan
             prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
-            
             v = 1.0 * (temp - 0.5 + 0.5 * prev_v_safe)
-            
             if v > 0.9999: v = 0.9999
             if v < -0.9999: v = -0.9999
             value_arr[i] = v
-            
+
     return value_arr
+
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(value_arr, rows):
     """Corrected momentum transform (log-odds)"""
     momentum = np.full(rows, np.nan, dtype=np.float64)
-    
     for i in range(rows):
         v = value_arr[i]
         if np.isnan(v):
@@ -206,76 +194,135 @@ def calc_mmh_momentum_loop(value_arr, rows):
             val_clamped = max(-0.99999, min(0.99999, v))
             temp2 = (1.0 + val_clamped) / (1.0 - val_clamped)
             momentum[i] = 0.25 * np.log(temp2)
-            
     return momentum
+
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_momentum_smoothing(momentum_arr, rows):
     """Corrected final smoothing with NaN propagation"""
     result = np.full(rows, np.nan, dtype=np.float64)
-    
     for i in range(rows):
         curr = momentum_arr[i]
-        
         if np.isnan(curr):
             result[i] = np.nan
         else:
             prev = result[i-1] if i > 0 else np.nan
             prev_safe = 0.0 if np.isnan(prev) else prev
             result[i] = curr + 0.5 * prev_safe
-            
     return result
+
+
+# ============================================================================
+# 2. EMA FUNCTIONS
+# ============================================================================
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, length_float):
-    
+    """
+    EMA with SMA seed (classic textbook / TA-Lib style).
+    Seeds on bar (start_idx + length - 1) using SMA of first `length` bars.
+    Used by PPO, RSI helpers, and any indicator that does NOT need
+    to mirror Pine Script's ta.ema exactly.
+    """
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
     out = np.full(n, np.nan, dtype=np.float64)
-    
+
     start_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
             start_idx = i
             break
-            
+
     if start_idx == -1 or n < (start_idx + length):
         return out
-        
+
     sum_val = 0.0
     for i in range(start_idx, start_idx + length):
         sum_val += data[i]
-    
+
     seed_idx = start_idx + length - 1
     out[seed_idx] = sum_val / length
-    
+
     for i in range(seed_idx + 1, n):
         curr = data[i]
         if np.isnan(curr):
             out[i] = out[i-1]
         else:
             out[i] = alpha * curr + (1.0 - alpha) * out[i-1]
-            
+
     return out
+
+
+@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
+def ema_loop_pine(data, length_float):
+    """
+    EMA matching Pine Script's ta.ema exactly.
+
+    Pine Script behavior:
+        ta.ema(src, length) uses nz(ema[1], src) on the first bar,
+        meaning the very first valid bar seeds the EMA directly with
+        src[first_valid], NOT an SMA average.  Every subsequent bar
+        uses the standard EMA formula:
+            ema = alpha * src + (1 - alpha) * ema[prev]
+
+    Why this matters for Cirrus Cloud:
+        smooth_range calls ema_loop_pine TWICE (inner period t, outer
+        period 2*t-1).  With SMA seeding (ema_loop) each call delays
+        the first valid output by `length` bars, so the outer EMA
+        produces NaN for the first (t + 2*t-1 - 1) = 3*t - 2 bars.
+        For t=22 that is 64 bars of silence before rng_filter even
+        starts.  Pine produces a valid filter value from bar 1.
+
+    Use this function wherever Pine's ta.ema is the reference.
+    Use ema_loop for indicators that intentionally use SMA seeding.
+    """
+    n = len(data)
+    length = int(length_float)
+    alpha = 2.0 / (length + 1)
+    out = np.full(n, np.nan, dtype=np.float64)
+
+    # Find first non-NaN input
+    start_idx = -1
+    for i in range(n):
+        if not np.isnan(data[i]):
+            start_idx = i
+            break
+
+    if start_idx == -1:
+        return out
+
+    # Pine: nz(ema[1], src) — seed with the first valid src value, no SMA
+    out[start_idx] = data[start_idx]
+
+    for i in range(start_idx + 1, n):
+        curr = data[i]
+        if np.isnan(curr):
+            out[i] = out[i-1]   # carry forward on gaps
+        else:
+            out[i] = alpha * curr + (1.0 - alpha) * out[i-1]
+
+    return out
+
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
-    """EMA with explicit alpha parameter - with proper SMA initialization for RMA"""
+    """EMA with explicit alpha parameter - with proper SMA initialisation for RMA."""
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
-    
+
     first_valid_idx = -1
     for i in range(n):
         if not np.isnan(data[i]):
             first_valid_idx = i
             break
-    
+
     if first_valid_idx == -1:
         return out
-    
+
     period = int(1.0 / alpha + 0.5)
-    
+
     if first_valid_idx + period <= n:
         sma_sum = 0.0
         valid_count = 0
@@ -284,80 +331,127 @@ def ema_loop_alpha(data, alpha):
                 sma_sum += data[i]
                 valid_count += 1
         sma_init = sma_sum / valid_count if valid_count > 0 else data[first_valid_idx]
-        
+
         for i in range(first_valid_idx, first_valid_idx + period):
             out[i] = sma_init
-        
+
         start_idx = first_valid_idx + period
     else:
         out[first_valid_idx] = data[first_valid_idx]
         start_idx = first_valid_idx + 1
-    
+
     for i in range(start_idx, n):
         curr = data[i]
         out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
-    
+
     return out
+
+
+# ============================================================================
+# 3. CIRRUS CLOUD HELPERS  (Pine-exact versions)
+# ============================================================================
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    
+    """
+    Range Filter matching Pine Script's rngfiltx1x1 exactly.
+
+    Pine Script:
+        rngfiltx1x1(x, r) =>
+            rngfiltx1x1 = x                         // bar 0: seed = close
+            rngfiltx1x1 := x > nz(rngfiltx1x1[1])
+                ? x - r < nz(rngfiltx1x1[1])
+                    ? nz(rngfiltx1x1[1])
+                    : x - r
+                : x + r > nz(rngfiltx1x1[1])
+                    ? nz(rngfiltx1x1[1])
+                    : x + r
+
+    Critical fix vs old code:
+        Old code used prev_val = 0.0 on the first valid bar, which compared
+        close against ZERO.  For any real asset close > 0, this always took
+        the "uptrend" branch and set filt[0] = max(0, close - r), undershooting
+        by a full range value.  That wrong seed then corrupted every subsequent
+        bar via the prev = filt[i-1] carry-forward.
+
+        Correct behaviour: filt[first_valid] = x[first_valid] with NO range
+        logic applied — exactly mirroring Pine's "rngfiltx1x1 = x" initialiser.
+    """
     n = len(x)
     filt = np.full(n, np.nan, dtype=np.float64)
-    start_idx = -1
+
+    # Find first bar where both price and range are valid
+    first_valid = -1
     for i in range(n):
-        if not np.isnan(r[i]):
-            prev_val = 0.0 
-            curr_x = x[i]
-            curr_r = r[i]
-            
-            if curr_x > prev_val:
-                filt[i] = max(prev_val, curr_x - curr_r)
-            else:
-                filt[i] = min(prev_val, curr_x + curr_r)
-                
-            start_idx = i + 1
+        if not np.isnan(x[i]) and not np.isnan(r[i]):
+            first_valid = i
             break
-            
-    if start_idx == -1:
+
+    if first_valid == -1:
         return filt
 
-    for i in range(start_idx, n):
-        curr_x = x[i]
-        curr_r = r[i]
-        prev = filt[i - 1]
+    # Pine: rngfiltx1x1 = x  →  seed is the close price, no filtering
+    filt[first_valid] = x[first_valid]
 
-        if np.isnan(curr_x) or np.isnan(curr_r):
-            filt[i] = prev
+    # Subsequent bars: standard range-filter logic
+    for i in range(first_valid + 1, n):
+        if np.isnan(x[i]) or np.isnan(r[i]):
+            filt[i] = filt[i-1]
             continue
 
-        if curr_x > prev:
-            new_val = curr_x - curr_r
-            filt[i] = prev if new_val < prev else new_val
+        curr_x = x[i]
+        curr_r = r[i]
+        prev_filt = filt[i-1]
+
+        if curr_x > prev_filt:
+            # Uptrend: move up, but never below prev
+            candidate = curr_x - curr_r
+            filt[i] = prev_filt if candidate < prev_filt else candidate
         else:
-            new_val = curr_x + curr_r
-            filt[i] = prev if new_val > prev else new_val
+            # Downtrend: move down, but never above prev
+            candidate = curr_x + curr_r
+            filt[i] = prev_filt if candidate > prev_filt else candidate
 
     return filt
 
+
 @njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
 def smooth_range(close, t, m):
-    
+    """
+    Smooth range matching Pine Script's smoothrngX1 exactly.
+
+    Pine:
+        smoothrngX1(x, t, m) =>
+            wper   = t * 2 - 1
+            avrng  = ta.ema(math.abs(x - x[1]), t)     ← ta.ema = Pine-style
+            smoothrng = ta.ema(avrng, wper) * m         ← ta.ema = Pine-style
+
+    Uses ema_loop_pine (first-bar seeding) not ema_loop (SMA seeding).
+    With SMA seeding the double-EMA chain would delay valid output by
+    (t + wper - 1) = 3*t - 2 bars.  For t=22 that is 64 bars.
+    Pine produces valid output from bar 1.
+    """
     n = len(close)
     diff = np.full(n, np.nan, dtype=np.float64)
     for i in range(1, n):
         diff[i] = abs(close[i] - close[i - 1])
+    # diff[0] stays NaN — mirrors Pine's na on bar 0 (x - x[1] undefined)
 
-    avrng = ema_loop(diff, float(t))
+    avrng = ema_loop_pine(diff, float(t))
 
     wper = t * 2 - 1
-    smoothrng = ema_loop(avrng, float(wper))
+    smoothrng = ema_loop_pine(avrng, float(wper))
 
     return smoothrng * float(m)
 
+
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):
-    
+    """
+    Trend direction flags matching Pine's:
+        trend_up = filtx1 < filtx12
+        trend_dn = filtx1 > filtx12
+    """
     n = len(filt_x1)
     upw = np.zeros(n, dtype=np.bool_)
     dnw = np.zeros(n, dtype=np.bool_)
@@ -365,16 +459,19 @@ def calculate_trends_with_state(filt_x1, filt_x12):
     for i in range(n):
         f1 = filt_x1[i]
         f2 = filt_x12[i]
-        
         if np.isnan(f1) or np.isnan(f2):
             upw[i] = False
             dnw[i] = False
             continue
-
         upw[i] = f1 < f2
         dnw[i] = f1 > f2
 
     return upw, dnw
+
+
+# ============================================================================
+# 4. KALMAN / VWAP
+# ============================================================================
 
 @njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
@@ -387,7 +484,7 @@ def kalman_loop(src, length, R, Q):
         if not np.isnan(src[i]):
             first_valid_idx = i
             break
-    
+
     if first_valid_idx == -1:
         return result
 
@@ -404,11 +501,9 @@ def kalman_loop(src, length, R, Q):
 
     for i in range(first_valid_idx + 1, n):
         current = src[i]
-
         if np.isnan(current):
             result[i] = estimate
             continue
-
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
         estimate = prediction + kalman_gain * (current - estimate)
@@ -417,8 +512,9 @@ def kalman_loop(src, length, R, Q):
 
     return result
 
+
 @njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
-def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+def vwap_daily_loop_safe(hlc3, volumes, timestamps):
     n = len(hlc3)
     vwap = np.empty(n, dtype=np.float64)
     cum_pv = 0.0
@@ -431,17 +527,26 @@ def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.n
             cum_pv = 0.0
             cum_vol = 0.0
             last_day = day
-        
         cum_pv += hlc3[i] * volumes[i]
         cum_vol += volumes[i]
         vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
-    
+
     return vwap
+
+
+# ============================================================================
+# 5. OSCILLATORS AND TECHNICAL INDICATORS
+# ============================================================================
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
+    """
+    PPO uses ema_loop (SMA-seeded) — deliberate.
+    Pine's ta.ema and most charting platforms agree for PPO
+    because the SMA warmup is transparent once enough bars are in.
+    Changing to ema_loop_pine here would shift PPO crossover timing.
+    """
     n = len(close)
-
     fast_ma = ema_loop(close, float(fast))
     slow_ma = ema_loop(close, float(slow))
 
@@ -453,7 +558,6 @@ def calculate_ppo_core(close, fast, slow, signal):
             ppo[i] = ((f - s) / s) * 100.0
 
     ppo_sig = ema_loop(ppo, float(signal))
-
     return ppo, ppo_sig
 
 
@@ -462,7 +566,7 @@ def calculate_rsi_core(close, period):
     """Calculate RSI in O(n) - single pass gains/losses, then EMA"""
     n = len(close)
     rsi = np.full(n, 50.0, dtype=np.float64)
-    
+
     if n <= period:
         return rsi
 
@@ -473,7 +577,7 @@ def calculate_rsi_core(close, period):
             first_valid_idx = i
             last_valid_close = close[i]
             break
-    
+
     if first_valid_idx == -1:
         return rsi
 
@@ -504,7 +608,7 @@ def calculate_rsi_core(close, period):
         if not np.isnan(close[i]):
             avg_gain = (gain[i] * alpha) + (avg_gain * (1.0 - alpha))
             avg_loss = (loss[i] * alpha) + (avg_loss * (1.0 - alpha))
-        
+
         if avg_loss == 0.0:
             rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
         else:
@@ -513,37 +617,33 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
+
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
-def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
-    
+def calculate_atr_rma(high, low, close, period):
     n = len(close)
     if n < period:
         return np.full(n, np.nan, dtype=np.float64)
-    
+
     tr = np.empty(n, dtype=np.float64)
     tr[0] = high[0] - low[0]
-    
+
     for i in range(1, n):
         h = high[i]
         l = low[i]
-        c = close[i - 1]  # Previous close
-        
+        c = close[i - 1]
         tr1 = h - l
         tr2 = abs(h - c)
         tr3 = abs(l - c)
         tr[i] = max(tr1, tr2, tr3)
-    
+
     alpha = 1.0 / float(period)
     atr = ema_loop_alpha(tr, alpha)
-    
     return atr
+
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
-    """
-    Calculate ADX in O(n) using Pine Script equivalent logic.
-    Requires Close for accurate True Range calculation.
-    """
+    """Calculate ADX in O(n) using Pine Script equivalent logic."""
     n = len(high)
     adx = np.full(n, np.nan, dtype=np.float64)
 
@@ -554,30 +654,25 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     minus_dm = np.zeros(n, dtype=np.float64)
     tr = np.zeros(n, dtype=np.float64)
 
-    # First bar TR is just high-low
     tr[0] = high[0] - low[0]
-    
+
     for i in range(1, n):
         h = high[i]
         l = low[i]
         prev_h = high[i - 1]
         prev_l = low[i - 1]
-        prev_c = close[i - 1] # Corrected: Use prev close for TR
+        prev_c = close[i - 1]
 
-        # True Range Calculation
         tr1 = h - l
         tr2 = abs(h - prev_c)
         tr3 = abs(l - prev_c)
         tr[i] = max(tr1, tr2, tr3)
 
-        # Directional Movement Calculation
         up = h - prev_h
         down = prev_l - l
-
         plus_dm[i] = up if (up > down and up > 0) else 0.0
         minus_dm[i] = down if (down > up and down > 0) else 0.0
 
-    # RMA Smoothing (alpha = 1/length)
     alpha_di = 1.0 / float(di_length)
     plus_dm_smooth = ema_loop_alpha(plus_dm, alpha_di)
     minus_dm_smooth = ema_loop_alpha(minus_dm, alpha_di)
@@ -585,7 +680,7 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
 
     plus_di = np.full(n, np.nan, dtype=np.float64)
     minus_di = np.full(n, np.nan, dtype=np.float64)
-    
+
     for i in range(n):
         if tr_smooth[i] > 0.0 and not np.isnan(tr_smooth[i]):
             plus_di[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
@@ -598,42 +693,43 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     di_sum = plus_di + minus_di
     raw_adx = np.where(di_sum == 0.0, 0.0, 100.0 * di_diff / di_sum)
 
-    # Final ADX Smoothing
     alpha_adx = 1.0 / float(adx_length)
     adx = ema_loop_alpha(raw_adx, alpha_adx)
-
     return adx
+
 
 # ============================================================================
 # AOT EXPORT CONFIGURATION
 # ============================================================================
 
 EXPORT_CONFIG = {
-    'sanitize_array_numba': 'f8[:](f8[:], f8)',
+    'sanitize_array_numba':          'f8[:](f8[:], f8)',
     'sanitize_array_numba_parallel': 'f8[:](f8[:], f8)',
-    'rolling_std': 'f8[:](f8[:], i4, f8)',
-    'rolling_mean_numba': 'f8[:](f8[:], i4)',
-    'rolling_min_max_numba': 'Tuple((f8[:], f8[:]))(f8[:], i4)',
-    'calc_mmh_worm_loop': 'f8[:](f8[:], f8[:], i8)',
-    'calc_mmh_value_loop': 'f8[:](f8[:], f8[:], f8[:], i4)',
-    'calc_mmh_momentum_loop': 'f8[:](f8[:], i4)',
-    'calc_mmh_momentum_smoothing': 'f8[:](f8[:], i4)',
-    'ema_loop': 'f8[:](f8[:], f8)',
-    'ema_loop_alpha': 'f8[:](f8[:], f8)',
-    'rng_filter_loop': 'f8[:](f8[:], f8[:])',
-    'smooth_range': 'f8[:](f8[:], i4, i4)',
-    'calculate_trends_with_state': 'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
-    'kalman_loop': 'f8[:](f8[:], i4, f8, f8)',
-    'vwap_daily_loop_safe': 'f8[:](f8[:], f8[:], i8[:])',
-    'calculate_ppo_core': 'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
-    'calculate_rsi_core': 'f8[:](f8[:], i4)',
-    'calculate_atr_rma': 'f8[:](f8[:], f8[:], f8[:], i4)',
-    'calculate_adx_core': 'f8[:](f8[:], f8[:], f8[:], i4, i4)',
+    'rolling_std':                   'f8[:](f8[:], i4, f8)',
+    'rolling_mean_numba':            'f8[:](f8[:], i4)',
+    'rolling_min_max_numba':         'Tuple((f8[:], f8[:]))(f8[:], i4)',
+    'calc_mmh_worm_loop':            'f8[:](f8[:], f8[:], i8)',
+    'calc_mmh_value_loop':           'f8[:](f8[:], f8[:], f8[:], i4)',
+    'calc_mmh_momentum_loop':        'f8[:](f8[:], i4)',
+    'calc_mmh_momentum_smoothing':   'f8[:](f8[:], i4)',
+    'ema_loop':                      'f8[:](f8[:], f8)',
+    'ema_loop_pine':                 'f8[:](f8[:], f8)',          # NEW
+    'ema_loop_alpha':                'f8[:](f8[:], f8)',
+    'rng_filter_loop':               'f8[:](f8[:], f8[:])',
+    'smooth_range':                  'f8[:](f8[:], i4, i4)',
+    'calculate_trends_with_state':   'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
+    'kalman_loop':                   'f8[:](f8[:], i4, f8, f8)',
+    'vwap_daily_loop_safe':          'f8[:](f8[:], f8[:], i8[:])',
+    'calculate_ppo_core':            'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
+    'calculate_rsi_core':            'f8[:](f8[:], i4)',
+    'calculate_atr_rma':             'f8[:](f8[:], f8[:], f8[:], i4)',
+    'calculate_adx_core':            'f8[:](f8[:], f8[:], f8[:], i4, i4)',
 }
 
 __all__ = list(EXPORT_CONFIG.keys())
 
-expected_min_functions = 19
+# Guard: raise immediately at import if count drops unexpectedly
+expected_min_functions = 21   # was 19; +2 for ema_loop_pine
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

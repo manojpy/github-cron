@@ -132,6 +132,7 @@ def initialize_jit_fallback() -> None:
             sanitize_array_numba_parallel,
             ema_loop,
             ema_loop_alpha,
+            ema_loop_pine, 
             kalman_loop,
             vwap_daily_loop_safe, 
             rng_filter_loop,
@@ -156,6 +157,7 @@ def initialize_jit_fallback() -> None:
             'sanitize_array_numba_parallel': sanitize_array_numba_parallel,
             'ema_loop': ema_loop,
             'ema_loop_alpha': ema_loop_alpha,
+            'ema_loop_pine': ema_loop_pine, 
             'kalman_loop': kalman_loop,
             'vwap_daily_loop_safe': vwap_daily_loop_safe,
             'rng_filter_loop': rng_filter_loop,
@@ -198,6 +200,7 @@ def ensure_initialized() -> None:
             'sanitize_array_numba_parallel': _aot_module.sanitize_array_numba_parallel,
             'ema_loop': _aot_module.ema_loop,
             'ema_loop_alpha': _aot_module.ema_loop_alpha,
+            'ema_loop_pine': _aot_module.ema_loop_pine,
             'kalman_loop': _aot_module.kalman_loop,
             'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
             'rng_filter_loop': _aot_module.rng_filter_loop,
@@ -256,6 +259,10 @@ def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
 
 def ema_loop_alpha(data: np.ndarray, alpha: float) -> np.ndarray:
     return _dispatch['ema_loop_alpha'](data, alpha)
+
+def ema_loop_pine(data: np.ndarray, length: float) -> np.ndarray:
+    """Pine-style EMA: seeds on first bar (nz(ema[1], src)). Used for Cirrus Cloud."""
+    return _dispatch['ema_loop_pine'](data, length)
 
 def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
     return _dispatch['kalman_loop'](src, length, R, Q)
@@ -324,6 +331,7 @@ __all__ = [
     # Moving Averages
     'ema_loop',
     'ema_loop_alpha',
+    'ema_loop_pine',
 
     # Filters
     'kalman_loop',
