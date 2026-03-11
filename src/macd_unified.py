@@ -183,7 +183,7 @@ class BotConfig(BaseModel):
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
     LOG_FILE: str = "macd_bot.log"
-    MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
+    MAX_PARALLEL_FETCH: int = Field(9, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
