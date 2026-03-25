@@ -3450,9 +3450,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             close_prev = close_curr
 
-        open_prev = open_15m[i15 - 1] if i15 >= 1 else open_curr
-        high_prev = data_15m["high"][i15 - 1] if i15 >= 1 else high_curr
-        low_prev = data_15m["low"][i15 - 1] if i15 >= 1 else low_curr
         close_5m_val = data_5m["close"][i5]
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
