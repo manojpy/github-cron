@@ -166,7 +166,7 @@ jobs:
       # PHASE 3: SECURITY SCANNING
       - name: 🛡️ Run Trivy Vulnerability Scan
         if: github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
-        uses: aquasecurity/trivy-action@v0.29.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: 'sarif'
