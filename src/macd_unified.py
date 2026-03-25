@@ -3345,6 +3345,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             return None
     
+
         if is_valid_for_sell and not is_red:
             logger.error(
                 f"[{pair_name}] CRITICAL MISMATCH: is_valid_for_sell=True but candle is NOT RED! "
@@ -3352,6 +3353,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             return None
 
+        # ✅ ADD THIS LOG LINE
+        logger_pair.debug(
+            f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
+            f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
+            f"ValidBuy={is_valid_for_buy} ValidSell={is_valid_for_sell}"
+        )
         open_curr = o
         high_curr = h
         low_curr = l
@@ -3657,137 +3664,112 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         all_state_changes = []
 
-        for alert_key in alert_keys_to_check:
-            def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-            if not def_:
-                continue
-
-            if alert_key in BUY_ALERT_KEYS and not is_valid_for_buy:
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"Skipping {alert_key}: not valid for buy "
-                        f"(is_green={is_green}, upper_wick={buy_wick_ratio*100:.1f}%)"
-                    )
-                continue
-            if alert_key in SELL_ALERT_KEYS and not is_valid_for_sell:
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"Skipping {alert_key}: not valid for sell "
-                        f"(is_red={is_red}, lower_wick={sell_wick_ratio*100:.1f}%)"
-                    )
-                continue
-
-            if is_green and alert_key.startswith("pivot_down"):
-                logger_pair.error(
-                    f"[{pair_name}] LOGIC ERROR: GREEN candle firing pivot_down '{alert_key}'. "
-                    f"Skipping to prevent false alert."
-                )
-                continue
-
-            if is_red and alert_key.startswith("pivot_up"):
-                logger_pair.error(
-                    f"[{pair_name}] LOGIC ERROR: RED candle firing pivot_up '{alert_key}'. "
-                    f"Skipping to prevent false alert."
-                )
-                continue
-
-            key = ALERT_KEYS[alert_key]
-            trigger = False
-
-            if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
-                level = alert_key.split("_")[-1]
-                is_buy = alert_key.startswith("pivot_up_")
-
-                try:
-                    valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
-                    if not valid_cross and reason and piv:
-                        context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-
-                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except Exception as e:
-                    logger_pair.error(
-                        f"Pivot alert check failed for {alert_key}: {e}",
-                        exc_info=True
-                    )
-                    trigger = False
-                
-            elif alert_key in ("vwap_up", "vwap_down"):
-                if not vwap_available:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: VWAP unavailable")
+        if wick_rejected:
+            logger_pair.info(f"[{pair_name}] Alert loop skipped (wick_rejected=True)")
+        else:
+            for alert_key in alert_keys_to_check:  # ← Loop starts
+                def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
+                if not def_:
                     continue
 
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "vwap_up")
-
-                    valid_cross, cross_reason = validate_vwap_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["vwap_prev"],  context["vwap_curr"],
-                        is_buy_side
-                    )
-
-                    if valid_cross:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                # ✅ EXPLICIT COLOR CHECKS (Defense in Depth)
+                if alert_key in BUY_ALERT_KEYS:
+                    if not is_green:
+                        logger_pair.error(
+                            f"[{pair_name}] 🚫 BLOCKED BUY: {alert_key} on RED candle! "
+                            f"O={open_curr:.2f} C={close_curr:.2f}"
+                        )
+                        continue
+                    if not is_valid_for_buy:
                         if cfg.DEBUG_MODE:
-                            logger_pair.debug(
-                                f"{'✅' if trigger else '❌'} {alert_key}: "
-                                f"cross_valid=True, trigger={trigger}, "
-                                f"close={context['close_curr']:.4f}, "
-                                f"vwap={context['vwap_curr']:.4f}, "
-                                f"buy_common={context.get('buy_common')}, "
-                                f"sell_common={context.get('sell_common')}"
-                            )
-                    else:
-                        trigger = False
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(
-                                f"❌ {alert_key}: cross rejected — {cross_reason}"
-                            )
-
-                except Exception as e:
-                    logger_pair.error(
-                        f"VWAP check failed for {alert_key}: {e}", exc_info=True
-                    )
-                    trigger = False
-            else:
-                trigger = False
-                try:
-                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except Exception as e:
-                    if isinstance(e, KeyError):
-                        logger_pair.error(f"Missing context key for {alert_key}: {e}")
-                    elif isinstance(e, TypeError):
-                        logger_pair.error(f"Type error in {alert_key}: {e}")
-                    else:
-                        logger_pair.error(f"Alert check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
-
-            if trigger and not previous_states.get(key, False):
-                extra = ""
-                try:
-                    base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
-                    extra = base_extra
-
-                except Exception as e:
-                    logger_pair.error(
-                        f"Alert extra_fn failed for {alert_key}: {e}",
-                        exc_info=cfg.DEBUG_MODE
-                    )
-                    extra = f"(Error: {str(e)[:100]})"
-
-                raw_alerts.append((def_["title"], extra, def_["key"]))
-                all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
-
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"✅ Alert FIRED: {alert_key} | "
-                        f"buy_common={buy_common} sell_common={sell_common} | "
-                        f"is_valid_for_buy={is_valid_for_buy} is_valid_for_sell={is_valid_for_sell} | "
-                        f"Wick ratios: buy={buy_wick_ratio*100:.1f}% sell={sell_wick_ratio*100:.1f}% | "
-                        f"Candle: O={open_curr:.2f} H={high_curr:.2f} L={low_curr:.2f} C={close_curr:.2f}"
-                    )
+                            logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
+                        continue
         
+                if alert_key in SELL_ALERT_KEYS:
+                    if not is_red:
+                        logger_pair.error(
+                            f"[{pair_name}] 🚫 BLOCKED SELL: {alert_key} on GREEN candle! "
+                            f"O={open_curr:.2f} C={close_curr:.2f}"
+                        )
+                        continue
+                    if not is_valid_for_sell:
+                        if cfg.DEBUG_MODE:
+                            logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
+                        continue
+
+                if is_green and alert_key.startswith("pivot_down"):
+                    logger_pair.error(
+                        f"[{pair_name}] LOGIC ERROR: GREEN candle firing pivot_down '{alert_key}'. "
+                        f"Skipping to prevent false alert."
+                    )
+                    continue
+
+                if is_red and alert_key.startswith("pivot_up"):
+                    logger_pair.error(
+                        f"[{pair_name}] LOGIC ERROR: RED candle firing pivot_up '{alert_key}'. "
+                        f"Skipping to prevent false alert."
+                    )
+                    continue
+
+                key = ALERT_KEYS[alert_key]
+                trigger = False
+
+                if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
+                    level = alert_key.split("_")[-1]
+                    is_buy = alert_key.startswith("pivot_up_")
+                    try:
+                        valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
+                        if not valid_cross and reason and piv:
+                             context["pivot_suppressions"].append(f"{alert_key}: {reason}")
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    except Exception as e:
+                        logger_pair.error(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
+                        trigger = False
+            
+                elif alert_key in ("vwap_up", "vwap_down"):
+                    if not vwap_available:
+                        if cfg.DEBUG_MODE:
+                            logger_pair.debug(f"Skipping {alert_key}: VWAP unavailable")
+                        continue
+                    trigger = False
+                    try:
+                        is_buy_side = (alert_key == "vwap_up")
+                        valid_cross, cross_reason = validate_vwap_cross(
+                            context["close_prev"], context["close_curr"],
+                            context["vwap_prev"], context["vwap_curr"],
+                            is_buy_side
+                        )
+                        if valid_cross:
+                            trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    except Exception as e:
+                        logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
+                        trigger = False
+                else:
+                    try:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    except Exception as e:
+                        logger_pair.error(f"Alert check failed for {alert_key}: {e}", exc_info=True)
+                        trigger = False
+
+                if trigger and not previous_states.get(key, False):
+                    extra = ""
+                    try:
+                        base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
+                        extra = base_extra
+                    except Exception as e:
+                        logger_pair.error(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
+                        extra = f"(Error: {str(e)[:100]})"
+
+                    raw_alerts.append((def_["title"], extra, def_["key"]))
+                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
+            
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"✅ Alert FIRED: {alert_key} | "
+                            f"buy_common={buy_common} sell_common={sell_common} | "
+                            f"Candle: O={open_curr:.2f} C={close_curr:.2f}"
+                        )
+
         conditional_states = previous_states
     
         resets_to_apply = []
