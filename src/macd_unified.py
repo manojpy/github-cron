@@ -3337,21 +3337,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         is_red = candle_info["is_red"]
         buy_wick_ratio = candle_info["upper_wick_ratio"]
         sell_wick_ratio = candle_info["lower_wick_ratio"]
-    
+  
         if is_valid_for_buy and not is_green:
-            logger.error(
-                f"[{pair_name}] CRITICAL MISMATCH: is_valid_for_buy=True but candle is NOT GREEN! "
-                f"is_green={is_green}, is_red={is_red}. Rejecting to prevent false alert."
+            raise RuntimeError(
+                f"[{pair_name}] INVARIANT VIOLATED: is_valid_for_buy=True on non-green candle | "
+                f"O={o:.2f} C={c:.2f}"
             )
-            return None
-    
-
         if is_valid_for_sell and not is_red:
-            logger.error(
-                f"[{pair_name}] CRITICAL MISMATCH: is_valid_for_sell=True but candle is NOT RED! "
-                f"is_green={is_green}, is_red={is_red}. Rejecting to prevent false alert."
+            raise RuntimeError(
+                f"[{pair_name}] INVARIANT VIOLATED: is_valid_for_sell=True on non-red candle | "
+                f"O={o:.2f} C={c:.2f}"
             )
-            return None
 
         logger_pair.debug(
             f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
@@ -3994,12 +3990,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
 
+    except RuntimeError as e:
+        logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
+        return pair_name, {
+            "state": "INVARIANT_VIOLATION",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": 0,
+                "cloud": "neutral",
+                "mmh_hist": 0.0,
+                "error": str(e)
+            }
+        }
+
     except Exception as e:
         logger_pair.exception(
             f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e} | "
             f"Correlation: {correlation_id}"
         )
-        return None      
+        return None
 
     finally:
         PAIR_ID.set("")
