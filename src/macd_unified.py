@@ -3353,7 +3353,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             return None
 
-        # ✅ ADD THIS LOG LINE
         logger_pair.debug(
             f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
             f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
@@ -3665,17 +3664,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         all_state_changes = []
 
         if wick_rejected:
-            logger_pair.info(f"[{pair_name}] Alert loop skipped (wick_rejected=True)")
+            logger_pair.debug(f"[{pair_name}] Alert loop skipped (wick_rejected=True)")
         else:
             for alert_key in alert_keys_to_check:  # ← Loop starts
                 def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
                 if not def_:
                     continue
 
-                # ✅ EXPLICIT COLOR CHECKS (Defense in Depth)
                 if alert_key in BUY_ALERT_KEYS:
                     if not is_green:
-                        logger_pair.error(
+                        logger_pair.debug(
                             f"[{pair_name}] 🚫 BLOCKED BUY: {alert_key} on RED candle! "
                             f"O={open_curr:.2f} C={close_curr:.2f}"
                         )
@@ -3687,7 +3685,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         
                 if alert_key in SELL_ALERT_KEYS:
                     if not is_red:
-                        logger_pair.error(
+                        logger_pair.debug(
                             f"[{pair_name}] 🚫 BLOCKED SELL: {alert_key} on GREEN candle! "
                             f"O={open_curr:.2f} C={close_curr:.2f}"
                         )
@@ -3698,14 +3696,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         continue
 
                 if is_green and alert_key.startswith("pivot_down"):
-                    logger_pair.error(
+                    logger_pair.debug(
                         f"[{pair_name}] LOGIC ERROR: GREEN candle firing pivot_down '{alert_key}'. "
                         f"Skipping to prevent false alert."
                     )
                     continue
 
                 if is_red and alert_key.startswith("pivot_up"):
-                    logger_pair.error(
+                    logger_pair.debug(
                         f"[{pair_name}] LOGIC ERROR: RED candle firing pivot_up '{alert_key}'. "
                         f"Skipping to prevent false alert."
                     )
@@ -3723,7 +3721,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                              context["pivot_suppressions"].append(f"{alert_key}: {reason}")
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     except Exception as e:
-                        logger_pair.error(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
+                        logger_pair.debug(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
                         trigger = False
             
                 elif alert_key in ("vwap_up", "vwap_down"):
@@ -3742,13 +3740,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         if valid_cross:
                             trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     except Exception as e:
-                        logger_pair.error(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
+                        logger_pair.debug(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
                         trigger = False
                 else:
                     try:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     except Exception as e:
-                        logger_pair.error(f"Alert check failed for {alert_key}: {e}", exc_info=True)
+                        logger_pair.debug(f"Alert check failed for {alert_key}: {e}", exc_info=True)
                         trigger = False
 
                 if trigger and not previous_states.get(key, False):
@@ -3757,7 +3755,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
                         extra = base_extra
                     except Exception as e:
-                        logger_pair.error(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
+                        logger_pair.debug(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
                         extra = f"(Error: {str(e)[:100]})"
 
                     raw_alerts.append((def_["title"], extra, def_["key"]))
