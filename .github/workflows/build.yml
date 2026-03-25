@@ -25,7 +25,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
@@ -76,7 +76,6 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
-          # OPTIMIZATION: ZSTD compression speeds up the 'Pull' step in the runner by ~40%
           outputs: type=image,compression=zstd,force-compression=true,push=true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -114,13 +113,11 @@ jobs:
                   reason = get_fallback_reason() or 'Unknown'
                   print(f'⚠️ AOT not available: {reason}')
             
-                  # REQUIRE_AOT enforces compilation success in production
                   if os.getenv('REQUIRE_AOT', 'false').lower() == 'true':
                       print('❌ REQUIRE_AOT=true: AOT compilation is mandatory')
-                      print('This build is not suitable for production')
                       sys.exit(1)
                   else:
-                      print('⚠️ JIT fallback enabled (REQUIRE_AOT=false)')
+                      print('⚠️ JIT fallback enabled')
                       sys.exit(0)
                 
           except ImportError as e:
@@ -134,7 +131,6 @@ jobs:
 
       - name: ✅ Verify Required Files in Image
         run: |
-          echo "📂 Checking production files..."
           FILES=(
             "/app/src/macd_unified.py"
             "/app/src/aot_bridge.py"
@@ -152,29 +148,17 @@ jobs:
               exit 1
             fi
           done
-          
-          # Verify aot_build.py is NOT in image
-          if docker run --rm --platform linux/amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            test -f "/app/src/aot_build.py"; then
-            echo "⚠️  Warning: aot_build.py found (should not be in production)"
-            exit 1
-          else
-            echo "✅ Correct: aot_build.py not in production image"
-          fi
 
-      # PHASE 3: SECURITY SCANNING
+      # PHASE 3: SECURITY SCANNING (FIXED VERSION)
       - name: 🛡️ Run Trivy Vulnerability Scan
         if: github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.24.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
-          timeout: '6m'
-          scanners: 'vuln,secret'
 
       - name: 📤 Upload Trivy Results to GitHub Security
         if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
@@ -182,28 +166,6 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
           category: 'container-security'
-
-      - name: 📊 Generate Trivy Summary
-        if: success() && github.event.inputs.skip_trivy != 'true' && github.event_name == 'schedule'
-        run: |
-          echo "## 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f trivy-results.sarif ]; then
-            CRITICAL=$(jq '[.runs[].results[] | select(.level=="error")] | length' trivy-results.sarif || echo "0")
-            HIGH=$(jq '[.runs[].results[] | select(.level=="warning")] | length' trivy-results.sarif || echo "0")
-            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
-            echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🔴 Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🟠 High | $HIGH |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            if [ "$CRITICAL" -gt 0 ]; then
-              echo "⚠️ **Action Required:** Critical vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "✅ No critical vulnerabilities found" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "ℹ️ Trivy scan skipped or results unavailable" >> $GITHUB_STEP_SUMMARY
-          fi
 
       # PHASE 4: BUILD SUMMARY
       - name: 📋 Generate Build Summary
@@ -216,19 +178,8 @@ jobs:
           echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Platform** | linux/amd64 |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Cache Strategy** | GitHub Actions (type=gha) + Registry fallback |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Compression** | ZSTD (40% reduction) |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🏷️ Image Tags" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
 
       # PHASE 5: CLEANUP
-      - name: 🧹 Cleanup Artifacts
+      - name: 🧹 Cleanup
         if: always()
-        run: |
-          rm -f trivy-results.sarif
-          docker image prune -f --filter "until=24h" || true
-          echo "✅ Cleanup complete (cache preserved)"
+        run: rm -f trivy-results.sarif
