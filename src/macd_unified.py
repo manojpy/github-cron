@@ -165,7 +165,7 @@ class BotConfig(BaseModel):
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
-    PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "WLDUSD" ], min_length=1) 
+    PAIRS: List[str] = Field(default=["BTCUSD", "ETHUSD", "AVAXUSD", "BCHUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "ZECUSD", "WLDUSD" ], min_length=1) 
     PPO_FAST: int = Field(default=12, ge=1, le=50, description="PPO fast period")
     PPO_SLOW: int = Field(default=26, ge=2, le=100, description="PPO slow period")
     PPO_SIGNAL: int = Field(default=9, ge=1, le=20, description="PPO signal period")
