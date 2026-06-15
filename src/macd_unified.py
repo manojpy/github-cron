@@ -217,7 +217,7 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
 
-    MIN_RUN_TIMEOUT: int = Field(default=420, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
+    MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     PRODUCTS_CACHE_TTL: int = Field(default=28800)  # Products cache TTL in seconds (8h default)
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5)  # Max distance from pivot to trigger alert (1.5%)
