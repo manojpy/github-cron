@@ -16,7 +16,7 @@ import psutil
 import math
 import gc
 import json
-from collections import deque, defaultdict, OrderedDict 
+from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -573,7 +573,13 @@ def is_previous_day_complete(timestamps: np.ndarray, current_time: int, min_cand
     
     days = timestamps // 86400
     current_day_number = current_time // 86400
-    previous_day_number = current_day_number - 1
+    unique_days = np.unique(days)
+    past_days = unique_days[unique_days < current_day_number]
+    
+    if len(past_days) == 0:
+        return False, f"No previous days found before {current_day_number}"
+        
+    previous_day_number = past_days[-1]
     
     previous_day_mask = (days == previous_day_number)
     previous_day_candles = timestamps[previous_day_mask]
@@ -966,7 +972,14 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
         days = timestamps_daily // 86400
         current_day_number = reference_time // 86400
-        yesterday_day_number = current_day_number - 1
+        unique_days = np.unique(days)
+        past_days = unique_days[unique_days < current_day_number]
+        
+        if len(past_days) == 0:
+            logger.warning(f"No daily candles found before day #{current_day_number}")
+            return piv
+            
+        yesterday_day_number = past_days[-1]
 
         yesterday_mask = (days == yesterday_day_number)
         
@@ -1030,22 +1043,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             logger.error(f"calculate_all_indicators_numpy: OHLC validation failed — {msg}")
             return None
 
-        results = { 
-            'ppo': np.empty(n_15m, dtype=np.float64),
-            'ppo_signal': np.empty(n_15m, dtype=np.float64),
-            'smooth_rsi': np.empty(n_15m, dtype=np.float64),
-            'vwap': np.empty(n_15m, dtype=np.float64),
-            'mmh': np.empty(n_15m, dtype=np.float64),
-            'upw': np.zeros(n_15m, dtype=bool),
-            'dnw': np.zeros(n_15m, dtype=bool),
-            'rma50_15': np.empty(n_15m, dtype=np.float64),
-            'rma200_5': np.empty(n_5m, dtype=np.float64),
-            'pivots': {},
-            'atr_short': np.empty(n_15m, dtype=np.float64),
-            'atr_long': np.empty(n_15m, dtype=np.float64),
-            'adx': np.empty(n_15m, dtype=np.float64),
-            'nr_cpr': float('nan'),   # set below if ENABLE_CPR and daily data available
-        }
+        results = {} 
         ppo, ppo_signal = calculate_ppo_numpy(
             close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
@@ -1085,8 +1083,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results['upw'] = upw
             results['dnw'] = dnw
         else:
-            results['upw'].fill(False)
-            results['dnw'].fill(False)
+            results['upw'] = np.zeros(n_15m, dtype=bool)
+            results['dnw'] = np.zeros(n_15m, dtype=bool)
         
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
@@ -3273,8 +3271,8 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int, alignment_cache: Dict[str, int]) -> Optional[Tuple[str, Dict[str, Any]]]:
-    
+    reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
+
     if reference_time is None:
         reference_time = get_trigger_timestamp()   
      
@@ -4034,7 +4032,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         except Exception:
             pass
 
-async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, alignment_cache: Dict[str, int]):  
+async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time):  
     p_name, candles = task_data
     data_15m = None
     data_5m = None
@@ -4055,9 +4053,9 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
-            state_db, telegram_queue, correlation_id, reference_time, alignment_cache
+            state_db, telegram_queue, correlation_id, reference_time
         )
-        
+
         return result
     
     except asyncio.CancelledError:
@@ -4076,8 +4074,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
     correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
-
-    alignment_cache: Dict[str, int] = OrderedDict()
 
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
@@ -4120,12 +4116,11 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
-
     results = await asyncio.gather( 
         *[ 
             guarded_eval(
                 t, state_db, telegram_queue, correlation_id, 
-                reference_time, alignment_cache, 
+                reference_time
             ) for t in prepared_tasks], 
         return_exceptions=True, 
     )
