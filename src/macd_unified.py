@@ -165,7 +165,7 @@ class BotConfig(BaseModel):
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
-    PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "ZECUSD", "LABUSD", "MOVEUSD", "BEATUSD", "LAYERUSD", "WLDUSD" ], min_length=1) 
+    PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSDT","EDENUSD", "ZECUSD", "LABUSD", "MOVEUSD", "BEATUSD", "LAYERUSD", "WLDUSD" ], min_length=1) 
     PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
     PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
     PPO_SIGNAL: int = Field(default=5, ge=1, le=20, description="PPO signal period")
@@ -183,7 +183,7 @@ class BotConfig(BaseModel):
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
     LOG_FILE: str = "macd_bot.log"
-    MAX_PARALLEL_FETCH: int = Field(9, ge=1, le=20)
+    MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
@@ -329,7 +329,7 @@ class BotConfig(BaseModel):
                 f'HTTP_TIMEOUT={self.HTTP_TIMEOUT}s is outside recommended range (5-60s)'
             )
 
-        if len(self.PAIRS) > 20:
+        if len(self.PAIRS) > 25:
             warnings.append(
                 f'Large number of pairs ({len(self.PAIRS)}) may exceed timeout limits'
             )
@@ -4321,7 +4321,7 @@ async def run_once() -> bool:
         lock_acquired = await lock.acquire(timeout=5.0)
         if not lock_acquired:
             logger_run.warning(
-                "⏸️ Another instance is running (Redis lock held) - exiting gracefully"
+                "���️ Another instance is running (Redis lock held) - exiting gracefully"
             )
             return False
 
