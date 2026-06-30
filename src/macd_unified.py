@@ -183,7 +183,7 @@ class BotConfig(BaseModel):
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
     LOG_FILE: str = "macd_bot.log"
-    MAX_PARALLEL_FETCH: int = Field(12, ge=1, le=20)
+    MAX_PARALLEL_FETCH: int = Field(15, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
@@ -226,7 +226,7 @@ class BotConfig(BaseModel):
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
     ADX_THRESHOLD: float = Field(default=18.0, ge=5.0, le=50.0)  # ADX trend strength threshold (18=moderate, higher=stronger)   
     MAX_CANDLE_STALENESS_SEC: int = Field(default=1200, ge=600, le=3600)  # Max candle age in seconds (10-60 min)
-    RATE_LIMIT_PER_MINUTE: int = Field(default=60, ge=10, le=120)  # Max API requests per minute
+    RATE_LIMIT_PER_MINUTE: int = Field(default=90, ge=10, le=120)  # Max API requests per minute
     CB_FAILURE_THRESHOLD: int = Field(default=3, ge=1, le=10)  # Failures before circuit breaker opens
     CB_RECOVERY_TIMEOUT: int = Field(default=60, ge=10, le=600)  # Circuit breaker recovery wait time (seconds)
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
