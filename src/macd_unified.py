@@ -166,9 +166,9 @@ class BotConfig(BaseModel):
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
     PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "MOVEUSD", "BEATUSD", "LAYERUSD", "WLDUSD" ], min_length=1) 
-    PPO_FAST: int = Field(default=8, ge=1, le=50, description="PPO fast period")
-    PPO_SLOW: int = Field(default=21, ge=2, le=100, description="PPO slow period")
-    PPO_SIGNAL: int = Field(default=5, ge=1, le=20, description="PPO signal period")
+    PPO_FAST: int = Field(default=32, ge=1, le=50, description="PPO fast period")
+    PPO_SLOW: int = Field(default=84, ge=2, le=100, description="PPO slow period")
+    PPO_SIGNAL: int = Field(default=20, ge=1, le=25, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")
