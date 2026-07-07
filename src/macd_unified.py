@@ -1491,13 +1491,13 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
             async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status == 429:
                     retry_after = resp.headers.get('Retry-After')
-                    wait_sec = min(
-                        int(retry_after) if retry_after else 2,
-                        Constants.CIRCUIT_BREAKER_MAX_WAIT
-                    )
+                    try:
+                        retry_val = int(retry_after) if retry_after else 2
+                    except (ValueError, TypeError):
+                        retry_val = 5
+                    wait_sec = min(retry_val, Constants.CIRCUIT_BREAKER_MAX_WAIT)
                     jitter = random.uniform(0.1, 0.5)
-                    total_wait = wait_sec + jitter
-                    
+                    total_wait = wait_sec + jitter             
                     retry_stats[RetryCategory.RATE_LIMIT] += 1
                     logger.warning(
                         f"Rate limited (429) | URL: {url[:80]} | "
@@ -4123,7 +4123,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     fetch_start = time.time()
 
     limit_15m = 500
-    limit_5m = Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER
+    limit_5m = max(
+        Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER,
+        cfg.RMA_200_PERIOD * 3 
+    )
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
 
     pair_requests = []
