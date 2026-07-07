@@ -26,6 +26,12 @@
   "X3": 15,
   "X4": 5,
 
+  "ENABLE_PPO_GATE": true,
+  "PPO_GATE_FAST": 32,
+  "PPO_GATE_SLOW": 84,
+  "PPO_GATE_SIGNAL": 20,
+
+
   "SRSI_RSI_LEN": 21,
   "SRSI_KALMAN_LEN": 5,
   "RVOL_THRESHOLD": 1.0,
