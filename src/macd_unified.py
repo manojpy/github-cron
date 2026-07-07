@@ -171,7 +171,11 @@ class BotConfig(BaseModel):
     PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
-    MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")
+    MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")  
+    ENABLE_PPO_GATE: bool = Field(default=True, description="Enable PPO(32,84,20) as trend gate")
+    PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
+    PPO_GATE_SLOW: int = Field(default=84, ge=2, le=200, description="Gate PPO slow period")
+    PPO_GATE_SIGNAL: int = Field(default=20, ge=1, le=50, description="Gate PPO signal period")
     CIRRUS_CLOUD_ENABLED: bool = True
     X1: int = 22
     X2: int = 9
@@ -277,6 +281,12 @@ class BotConfig(BaseModel):
                 f'PPO_FAST ({self.PPO_FAST}) must be strictly less than '
                 f'PPO_SLOW ({self.PPO_SLOW})'
             )
+        if self.PPO_GATE_FAST >= self.PPO_GATE_SLOW:
+            raise ValueError(
+                f'PPO_GATE_FAST ({self.PPO_GATE_FAST}) must be strictly less than '
+                f'PPO_GATE_SLOW ({self.PPO_GATE_SLOW})'
+            )
+
         return self
 
     @model_validator(mode='after')
@@ -1049,6 +1059,16 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         )
         results['ppo'] = ppo
         results['ppo_signal'] = ppo_signal
+
+        if cfg.ENABLE_PPO_GATE:
+            ppo_gate, ppo_gate_signal = calculate_ppo_numpy(
+                close_15m, cfg.PPO_GATE_FAST, cfg.PPO_GATE_SLOW, cfg.PPO_GATE_SIGNAL
+            )
+            results['ppo_gate'] = ppo_gate
+            results['ppo_gate_signal'] = ppo_gate_signal
+        else:
+            results['ppo_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['ppo_gate_signal'] = np.full(n_15m, np.nan, dtype=np.float64)
         
         results['smooth_rsi'] = calculate_smooth_rsi_numpy(
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
@@ -1182,6 +1202,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ppo', 'ppo_signal', 'smooth_rsi', 'mmh',
             'rma50_15', 'rma200_5', 'adx',
             'atr_short', 'atr_long',
+            'ppo_gate', 'ppo_gate_signal',
         ]
 
         for key in SANITIZE_KEYS:
@@ -1228,6 +1249,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'atr_long': np.full(n, np.nan, dtype=np.float64),
             'adx': np.full(n, np.nan, dtype=np.float64),
             'nr_cpr': float('nan'),
+            'ppo_gate': np.full(n, np.nan, dtype=np.float64),
+            'ppo_gate_signal': np.full(n, np.nan, dtype=np.float64),
         }
         
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
@@ -3432,6 +3455,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         dnw = indicators["dnw"]
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
+        ppo_gate_arr = indicators["ppo_gate"]
+        ppo_gate_signal_arr = indicators["ppo_gate_signal"] 
         piv = indicators["pivots"]
         cloud_up = bool(upw[i15]) and not bool(dnw[i15])
         cloud_down = bool(dnw[i15]) and not bool(upw[i15])
@@ -3455,6 +3480,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
+        ppo_gate_curr = ppo_gate_arr[i15]
+        ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
+        ppo_gate_sig_curr = ppo_gate_signal_arr[i15]
+        ppo_gate_sig_prev = ppo_gate_signal_arr[i15 - 1] if i15 >= 1 else ppo_gate_signal_arr[i15]
+
     
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
@@ -3581,8 +3611,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             rvol_ok = True
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok)
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok)
+        if cfg.ENABLE_PPO_GATE and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
+            ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
+            ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
+        else:
+            ppo_gate_ok_buy = True
+            ppo_gate_ok_sell = True
+
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_buy)
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_sell)
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3608,7 +3645,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "vwap_curr": vwap_curr, "vwap_prev": vwap_prev,
             "mmh_curr": mmh_curr, "mmh_m1": mmh_m1, "mmh_m2": mmh_m2, "mmh_m3": mmh_m3,
             "rma50_15_val": rma50_15_val, "rma200_5_val": rma200_5_val,
-    
+            "ppo_gate_curr": ppo_gate_curr, "ppo_gate_prev": ppo_gate_prev,
+            "ppo_gate_sig_curr": ppo_gate_sig_curr, "ppo_gate_sig_prev": ppo_gate_sig_prev,
             "cloud_up": cloud_up, "cloud_down": cloud_down,
             "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell,
             "buy_common": buy_common, "sell_common": sell_common,
@@ -3928,7 +3966,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                         f"rvol_ok={rvol_ok})"
                     )
-        
+             
         if cfg.ENABLE_VWAP and vwap_available:
             if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
                 if not base_buy_trend:
@@ -3957,7 +3995,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                         f"rvol_ok={rvol_ok})"
                     )
-        
+
+        if cfg.ENABLE_PPO_GATE:
+            if not ppo_gate_ok_buy:
+                reasons.append(f"PPO Gate buy: Gate({ppo_gate_curr:.2f}) <= Signal({ppo_gate_sig_curr:.2f})")
+            if not ppo_gate_ok_sell:
+                reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
+   
         failed_conditions = [
             name for name, val in [
                 ("buy_common", buy_common),
