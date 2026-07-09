@@ -4364,7 +4364,7 @@ async def run_once() -> bool:
         lock_acquired = await lock.acquire(timeout=5.0)
         if not lock_acquired:
             logger_run.warning(
-                "���️ Another instance is running (Redis lock held) - exiting gracefully"
+                "❌ Another instance is running (Redis lock held) - exiting gracefully"
             )
             return False
 
