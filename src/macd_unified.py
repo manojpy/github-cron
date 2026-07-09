@@ -166,9 +166,9 @@ class BotConfig(BaseModel):
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
     PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "MOVEUSD", "BEATUSD", "LAYERUSD", "WLDUSD" ], min_length=1) 
-    PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
-    PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
-    PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
+    PPO_FAST: int = Field(default=12, ge=1, le=50, description="PPO fast period")
+    PPO_SLOW: int = Field(default=26, ge=2, le=100, description="PPO slow period")
+    PPO_SIGNAL: int = Field(default=9, ge=1, le=25, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")  
@@ -1055,7 +1055,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
         results = {} 
         ppo, ppo_signal = calculate_ppo_numpy(
-            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+            close_5m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
         results['ppo'] = ppo
         results['ppo_signal'] = ppo_signal
@@ -1227,7 +1227,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
         try:
-            n = len(data_15m.get("close", []))
+            n = len(data_15m.get("close", [])) if data_15m else 0
+            n_5m = len(data_5m.get("close", [])) if data_5m else 0
             if n == 0:
                 return None
         except Exception:
@@ -1235,15 +1236,15 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
         logger.warning(f"Returning NaN arrays ({n} elements) due to calculation failure")
         return {
-            'ppo': np.full(n, np.nan, dtype=np.float64),
-            'ppo_signal': np.full(n, np.nan, dtype=np.float64),
+            'ppo': np.full(n_5m, np.nan, dtype=np.float64),
+            'ppo_signal': np.full(n_5m, np.nan, dtype=np.float64),
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
             'upw': np.zeros(n, dtype=bool),
             'dnw': np.zeros(n, dtype=bool),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
-            'rma200_5': np.full(len(data_5m.get("close", [])), np.nan, dtype=np.float64),
+            'rma200_5': np.full(n_5m, np.nan, dtype=np.float64),
             'pivots': {},
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
@@ -3470,14 +3471,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             close_prev = close_curr
 
         close_5m_val = data_5m["close"][i5]
-        ppo_sig_curr = ppo_signal[i15]
-        ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
+        ppo_sig_curr = ppo_signal[i5]
+        ppo_sig_prev = ppo_signal[i5 - 1] if i5 >= 1 else ppo_signal[i5]
         vwap_enabled = cfg.ENABLE_VWAP
         vwap_available = False
         vwap_curr = None
         vwap_prev = None
-        ppo_curr = ppo[i15]
-        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
+        ppo_curr = ppo[i5]
+        ppo_prev = ppo[i5 - 1] if i5 >= 1 else ppo[i5]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
         ppo_gate_curr = ppo_gate_arr[i15]
