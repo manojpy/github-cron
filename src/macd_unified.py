@@ -1100,12 +1100,12 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
         
         if cfg.CIRRUS_CLOUD_ENABLED:
-            upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_15m)
+            upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_5m)
             results['upw'] = upw
             results['dnw'] = dnw
         else:
-            results['upw'] = np.zeros(n_15m, dtype=bool)
-            results['dnw'] = np.zeros(n_15m, dtype=bool)
+            results['upw'] = np.zeros(n_5m, dtype=bool)
+            results['dnw'] = np.zeros(n_5m, dtype=bool)
         
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
@@ -1242,8 +1242,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
-            'upw': np.zeros(n, dtype=bool),
-            'dnw': np.zeros(n, dtype=bool),
+            'upw': np.zeros(n_5m, dtype=bool),
+            'dnw': np.zeros(n_5m, dtype=bool),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
             'rma200_5': np.full(n_5m, np.nan, dtype=np.float64),
             'pivots': {},
@@ -3460,8 +3460,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_gate_arr = indicators["ppo_gate"]
         ppo_gate_signal_arr = indicators["ppo_gate_signal"] 
         piv = indicators["pivots"]
-        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
-        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
+        cloud_up = bool(upw[i5]) and not bool(dnw[i5])
+        cloud_down = bool(dnw[i5]) and not bool(upw[i5])
         close_prev = close_15m[i15 - 1]
 
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
@@ -3546,13 +3546,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(mmh_m3)
         )
 
-        if not has_valid_mmh:
-            if cfg.DEBUG_MODE:
-                skip_reason = (
-                    f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
-                    else f"MMH NaN (idx={i15})"
-                )
-                logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
+        if not has_valid_mmh and cfg.DEBUG_MODE:
+            skip_reason = (
+                f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
+                else f"MMH NaN (idx={i15})"
+            )
+            logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
@@ -3560,13 +3559,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
      
-        if has_valid_mmh:
-            confirmation_buy  = cloud_up
-            confirmation_sell = cloud_down
-
-        else:
-            confirmation_buy  = False
-            confirmation_sell = False
+        confirmation_buy  = cloud_up
+        confirmation_sell = cloud_down
 
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
