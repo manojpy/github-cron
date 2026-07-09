@@ -937,7 +937,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.ema_loop(test_data, 7.0)
         _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
         _ = aot_bridge.ema_loop_pine(test_data, 7.0) 
-        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
+        _ = aot_bridge.calculate_ppo_core(test_data, 12, 26, 9)
         _ = aot_bridge.calculate_rsi_core(test_data, 21)
         _ = aot_bridge.rolling_std(test_data, 14, 0.5)
         _ = aot_bridge.rolling_mean_numba(test_data, 14)
