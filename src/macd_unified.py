@@ -141,6 +141,9 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
+    INTER_BATCH_DELAY: float = 0.5
+
+
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -3544,13 +3547,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(mmh_m3)
         )
 
-        if not has_valid_mmh:
-            if cfg.DEBUG_MODE:
-                skip_reason = (
-                    f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
-                    else f"MMH NaN (idx={i15})"
-                )
-                logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
+        if not has_valid_mmh and cfg.DEBUG_MODE:
+            skip_reason = (
+                f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
+                else f"MMH NaN (idx={i15})"
+            )
+            logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
@@ -3558,13 +3560,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
      
-        if has_valid_mmh:
-            confirmation_buy  = cloud_up
-            confirmation_sell = cloud_down
-
-        else:
-            confirmation_buy  = False
-            confirmation_sell = False
+        confirmation_buy  = cloud_up
+        confirmation_sell = cloud_down
 
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
