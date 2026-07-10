@@ -36,10 +36,7 @@ def sanitize_array_numba_parallel(arr, default):
 
 @njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
-    """
-    STABLE Population Standard Deviation matching Pine Script's ta.stdev.
-    Uses slicing to prevent floating-point catastrophic cancellation on high-price assets.
-    """
+    
     n = len(close)
     sd = np.full(n, np.nan, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -218,12 +215,7 @@ def calc_mmh_momentum_smoothing(momentum_arr, rows):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, length_float):
-    """
-    EMA with SMA seed (classic textbook / TA-Lib style).
-    Seeds on bar (start_idx + length - 1) using SMA of first `length` bars.
-    Used by PPO, RSI helpers, and any indicator that does NOT need
-    to mirror Pine Script's ta.ema exactly.
-    """
+
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
@@ -257,27 +249,7 @@ def ema_loop(data, length_float):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_pine(data, length_float):
-    """
-    EMA matching Pine Script's ta.ema exactly.
-
-    Pine Script behavior:
-        ta.ema(src, length) uses nz(ema[1], src) on the first bar,
-        meaning the very first valid bar seeds the EMA directly with
-        src[first_valid], NOT an SMA average.  Every subsequent bar
-        uses the standard EMA formula:
-            ema = alpha * src + (1 - alpha) * ema[prev]
-
-    Why this matters for Cirrus Cloud:
-        smooth_range calls ema_loop_pine TWICE (inner period t, outer
-        period 2*t-1).  With SMA seeding (ema_loop) each call delays
-        the first valid output by `length` bars, so the outer EMA
-        produces NaN for the first (t + 2*t-1 - 1) = 3*t - 2 bars.
-        For t=22 that is 64 bars of silence before rng_filter even
-        starts.  Pine produces a valid filter value from bar 1.
-
-    Use this function wherever Pine's ta.ema is the reference.
-    Use ema_loop for indicators that intentionally use SMA seeding.
-    """
+    
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
@@ -293,13 +265,12 @@ def ema_loop_pine(data, length_float):
     if start_idx == -1:
         return out
 
-    # Pine: nz(ema[1], src) — seed with the first valid src value, no SMA
     out[start_idx] = data[start_idx]
 
     for i in range(start_idx + 1, n):
         curr = data[i]
         if np.isnan(curr):
-            out[i] = out[i-1]   # carry forward on gaps
+            out[i] = out[i-1]
         else:
             out[i] = alpha * curr + (1.0 - alpha) * out[i-1]
 
@@ -353,30 +324,7 @@ def ema_loop_alpha(data, alpha):
 
 @njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
 def rng_filter_loop(x, r):
-    """
-    Range Filter matching Pine Script's rngfiltx1x1 exactly.
-
-    Pine Script:
-        rngfiltx1x1(x, r) =>
-            rngfiltx1x1 = x                         // bar 0: seed = close
-            rngfiltx1x1 := x > nz(rngfiltx1x1[1])
-                ? x - r < nz(rngfiltx1x1[1])
-                    ? nz(rngfiltx1x1[1])
-                    : x - r
-                : x + r > nz(rngfiltx1x1[1])
-                    ? nz(rngfiltx1x1[1])
-                    : x + r
-
-    Critical fix vs old code:
-        Old code used prev_val = 0.0 on the first valid bar, which compared
-        close against ZERO.  For any real asset close > 0, this always took
-        the "uptrend" branch and set filt[0] = max(0, close - r), undershooting
-        by a full range value.  That wrong seed then corrupted every subsequent
-        bar via the prev = filt[i-1] carry-forward.
-
-        Correct behaviour: filt[first_valid] = x[first_valid] with NO range
-        logic applied — exactly mirroring Pine's "rngfiltx1x1 = x" initialiser.
-    """
+    
     n = len(x)
     filt = np.full(n, np.nan, dtype=np.float64)
 
@@ -417,20 +365,7 @@ def rng_filter_loop(x, r):
 
 @njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
 def smooth_range(close, t, m):
-    """
-    Smooth range matching Pine Script's smoothrngX1 exactly.
-
-    Pine:
-        smoothrngX1(x, t, m) =>
-            wper   = t * 2 - 1
-            avrng  = ta.ema(math.abs(x - x[1]), t)     ← ta.ema = Pine-style
-            smoothrng = ta.ema(avrng, wper) * m         ← ta.ema = Pine-style
-
-    Uses ema_loop_pine (first-bar seeding) not ema_loop (SMA seeding).
-    With SMA seeding the double-EMA chain would delay valid output by
-    (t + wper - 1) = 3*t - 2 bars.  For t=22 that is 64 bars.
-    Pine produces valid output from bar 1.
-    """
+    
     n = len(close)
     diff = np.full(n, np.nan, dtype=np.float64)
     for i in range(1, n):
@@ -447,11 +382,7 @@ def smooth_range(close, t, m):
 
 @njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
 def calculate_trends_with_state(filt_x1, filt_x12):
-    """
-    Trend direction flags matching Pine's:
-        trend_up = filtx1 < filtx12
-        trend_dn = filtx1 > filtx12
-    """
+    
     n = len(filt_x1)
     upw = np.zeros(n, dtype=np.bool_)
     dnw = np.zeros(n, dtype=np.bool_)
