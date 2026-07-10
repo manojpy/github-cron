@@ -117,8 +117,8 @@ class Constants:
     RSI_THRESHOLD = 50
     PPO_RSI_GUARD_BUY = 0.30
     PPO_RSI_GUARD_SELL = -0.30
-    PPO_011_THRESHOLD = 0.18
-    PPO_011_THRESHOLD_SELL = -0.18
+    PPO_011_THRESHOLD = 0.11
+    PPO_011_THRESHOLD_SELL = -0.11
     STARTUP_GRACE_PERIOD = int(os.getenv('STARTUP_GRACE_PERIOD', 300))
     REDIS_LOCK_EXPIRY = max(int(os.getenv('REDIS_LOCK_EXPIRY', 900)), 900)
     CIRCUIT_BREAKER_MAX_WAIT = 300
@@ -141,7 +141,6 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
-    INTER_BATCH_DELAY: float = 0.5
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -167,9 +166,9 @@ class BotConfig(BaseModel):
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
     PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "BTCUSD", "BEATUSD", "BCHUSD", "WLDUSD" ], min_length=1) 
-    PPO_FAST: int = Field(default=12, ge=1, le=50, description="PPO fast period")
-    PPO_SLOW: int = Field(default=26, ge=2, le=100, description="PPO slow period")
-    PPO_SIGNAL: int = Field(default=9, ge=1, le=25, description="PPO signal period")
+    PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
+    PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
+    PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")  
@@ -938,7 +937,7 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.ema_loop(test_data, 7.0)
         _ = aot_bridge.ema_loop_alpha(test_data, 0.2)
         _ = aot_bridge.ema_loop_pine(test_data, 7.0) 
-        _ = aot_bridge.calculate_ppo_core(test_data, 12, 26, 9)
+        _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
         _ = aot_bridge.calculate_rsi_core(test_data, 21)
         _ = aot_bridge.rolling_std(test_data, 14, 0.5)
         _ = aot_bridge.rolling_mean_numba(test_data, 14)
@@ -1056,7 +1055,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
         results = {} 
         ppo, ppo_signal = calculate_ppo_numpy(
-            close_5m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
         )
         results['ppo'] = ppo
         results['ppo_signal'] = ppo_signal
@@ -1100,12 +1099,12 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
         
         if cfg.CIRRUS_CLOUD_ENABLED:
-            upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_5m)
+            upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_15m)
             results['upw'] = upw
             results['dnw'] = dnw
         else:
-            results['upw'] = np.zeros(n_5m, dtype=bool)
-            results['dnw'] = np.zeros(n_5m, dtype=bool)
+            results['upw'] = np.zeros(n_15m, dtype=bool)
+            results['dnw'] = np.zeros(n_15m, dtype=bool)
         
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
@@ -1228,8 +1227,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
     except Exception as e:
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
         try:
-            n = len(data_15m.get("close", [])) if data_15m else 0
-            n_5m = len(data_5m.get("close", [])) if data_5m else 0
+            n = len(data_15m.get("close", []))
             if n == 0:
                 return None
         except Exception:
@@ -1237,15 +1235,15 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
         logger.warning(f"Returning NaN arrays ({n} elements) due to calculation failure")
         return {
-            'ppo': np.full(n_5m, np.nan, dtype=np.float64),
-            'ppo_signal': np.full(n_5m, np.nan, dtype=np.float64),
+            'ppo': np.full(n, np.nan, dtype=np.float64),
+            'ppo_signal': np.full(n, np.nan, dtype=np.float64),
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
-            'upw': np.zeros(n_5m, dtype=bool),
-            'dnw': np.zeros(n_5m, dtype=bool),
+            'upw': np.zeros(n, dtype=bool),
+            'dnw': np.zeros(n, dtype=bool),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
-            'rma200_5': np.full(n_5m, np.nan, dtype=np.float64),
+            'rma200_5': np.full(len(data_5m.get("close", [])), np.nan, dtype=np.float64),
             'pivots': {},
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
@@ -3003,8 +3001,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
     {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
+    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
     {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
@@ -3460,8 +3458,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_gate_arr = indicators["ppo_gate"]
         ppo_gate_signal_arr = indicators["ppo_gate_signal"] 
         piv = indicators["pivots"]
-        cloud_up = bool(upw[i5]) and not bool(dnw[i5])
-        cloud_down = bool(dnw[i5]) and not bool(upw[i5])
+        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
         close_prev = close_15m[i15 - 1]
 
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
@@ -3472,14 +3470,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             close_prev = close_curr
 
         close_5m_val = data_5m["close"][i5]
-        ppo_sig_curr = ppo_signal[i5]
-        ppo_sig_prev = ppo_signal[i5 - 1] if i5 >= 1 else ppo_signal[i5]
+        ppo_sig_curr = ppo_signal[i15]
+        ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
         vwap_enabled = cfg.ENABLE_VWAP
         vwap_available = False
         vwap_curr = None
         vwap_prev = None
-        ppo_curr = ppo[i5]
-        ppo_prev = ppo[i5 - 1] if i5 >= 1 else ppo[i5]
+        ppo_curr = ppo[i15]
+        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
         ppo_gate_curr = ppo_gate_arr[i15]
@@ -3546,12 +3544,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(mmh_m3)
         )
 
-        if not has_valid_mmh and cfg.DEBUG_MODE:
-            skip_reason = (
-                f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
-                else f"MMH NaN (idx={i15})"
-            )
-            logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
+        if not has_valid_mmh:
+            if cfg.DEBUG_MODE:
+                skip_reason = (
+                    f"MMH warmup" if i15 < MIN_MMH_BARS_VALID 
+                    else f"MMH NaN (idx={i15})"
+                )
+                logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
 
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
@@ -3559,8 +3558,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
      
-        confirmation_buy  = cloud_up
-        confirmation_sell = cloud_down
+        if has_valid_mmh:
+            confirmation_buy  = cloud_up
+            confirmation_sell = cloud_down
+
+        else:
+            confirmation_buy  = False
+            confirmation_sell = False
 
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
@@ -3903,28 +3907,28 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
        
         if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
             if not base_buy_trend:
-                reasons.append("PPO>+0.18 blocked: base_buy_trend=False")
+                reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
             elif not confirmation_buy:
-                reasons.append("PPO>+0.18 blocked: confirmation_buy=False")
+                reasons.append("PPO>+0.11 blocked: confirmation_buy=False")
             elif not is_valid_for_buy:
-                reasons.append("PPO>+0.18 blocked: Knox rejected candle")
+                reasons.append("PPO>+0.11 blocked: Knox rejected candle")
             else:
                 reasons.append(
-                    f"PPO>+0.18 blocked: market filter "
+                    f"PPO>+0.11 blocked: market filter "
                     f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                     f"rvol_ok={rvol_ok})"
                 )
         
         if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
             if not base_sell_trend:
-                reasons.append("PPO<-0.18 blocked: base_sell_trend=False")
+                reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
             elif not confirmation_sell:
-                reasons.append("PPO<-0.18 blocked: confirmation_sell=False")
+                reasons.append("PPO<-0.11 blocked: confirmation_sell=False")
             elif not is_valid_for_sell:
-                reasons.append("PPO<-0.18 blocked: Knox rejected candle")
+                reasons.append("PPO<-0.11 blocked: Knox rejected candle")
             else:
                 reasons.append(
-                    f"PPO<-0.18 blocked: market filter "
+                    f"PPO<-0.11 blocked: market filter "
                     f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                     f"rvol_ok={rvol_ok})"
                 )
@@ -4359,7 +4363,7 @@ async def run_once() -> bool:
         lock_acquired = await lock.acquire(timeout=5.0)
         if not lock_acquired:
             logger_run.warning(
-                "❌ Another instance is running (Redis lock held) - exiting gracefully"
+                "���️ Another instance is running (Redis lock held) - exiting gracefully"
             )
             return False
 
