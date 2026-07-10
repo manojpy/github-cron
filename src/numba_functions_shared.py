@@ -338,8 +338,15 @@ def rng_filter_loop(x, r):
     if first_valid == -1:
         return filt
 
-    # Pine: rngfiltx1x1 = x  →  seed is the close price, no filtering
-    filt[first_valid] = x[first_valid]
+    curr_x = x[first_valid]
+    curr_r = r[first_valid]
+    prev_filt = 0.0
+    if curr_x > prev_filt:
+        candidate = curr_x - curr_r
+        filt[first_valid] = prev_filt if candidate < prev_filt else candidate
+    else:
+        candidate = curr_x + curr_r
+        filt[first_valid] = prev_filt if candidate > prev_filt else candidate
 
     # Subsequent bars: standard range-filter logic
     for i in range(first_valid + 1, n):
@@ -361,7 +368,6 @@ def rng_filter_loop(x, r):
             filt[i] = prev_filt if candidate > prev_filt else candidate
 
     return filt
-
 
 @njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
 def smooth_range(close, t, m):
