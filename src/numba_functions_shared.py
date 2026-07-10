@@ -541,14 +541,13 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
     """
-    PPO uses ema_loop (SMA-seeded) — deliberate.
-    Pine's ta.ema and most charting platforms agree for PPO
-    because the SMA warmup is transparent once enough bars are in.
-    Changing to ema_loop_pine here would shift PPO crossover timing.
+    Percentage Price Oscillator (PPO) matching Pine Script behavior exactly.
+    Returns only (ppo, ppo_sig) to avoid unpacking errors. No histogram included.
     """
     n = len(close)
-    fast_ma = ema_loop(close, float(fast))
-    slow_ma = ema_loop(close, float(slow))
+    # Using the Pine-exact EMA helper to prevent warm-up mismatches
+    fast_ma = ema_loop_pine(close, float(fast))
+    slow_ma = ema_loop_pine(close, float(slow))
 
     ppo = np.full(n, np.nan, dtype=np.float64)
     for i in range(n):
@@ -557,9 +556,8 @@ def calculate_ppo_core(close, fast, slow, signal):
         if not np.isnan(f) and not np.isnan(s) and s != 0.0:
             ppo[i] = ((f - s) / s) * 100.0
 
-    ppo_sig = ema_loop(ppo, float(signal))
+    ppo_sig = ema_loop_pine(ppo, float(signal))
     return ppo, ppo_sig
-
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
