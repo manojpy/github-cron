@@ -317,95 +317,6 @@ def ema_loop_alpha(data, alpha):
 
     return out
 
-
-# ============================================================================
-# 3. CIRRUS CLOUD HELPERS  (Pine-exact versions)
-# ============================================================================
-
-@njit("f8[:](f8[:], f8[:])", nogil=True, cache=True)
-def rng_filter_loop(x, r):
-    
-    n = len(x)
-    filt = np.full(n, np.nan, dtype=np.float64)
-
-    # Find first bar where both price and range are valid
-    first_valid = -1
-    for i in range(n):
-        if not np.isnan(x[i]) and not np.isnan(r[i]):
-            first_valid = i
-            break
-
-    if first_valid == -1:
-        return filt
-
-    curr_x = x[first_valid]
-    curr_r = r[first_valid]
-    prev_filt = 0.0
-    if curr_x > prev_filt:
-        candidate = curr_x - curr_r
-        filt[first_valid] = prev_filt if candidate < prev_filt else candidate
-    else:
-        candidate = curr_x + curr_r
-        filt[first_valid] = prev_filt if candidate > prev_filt else candidate
-
-    # Subsequent bars: standard range-filter logic
-    for i in range(first_valid + 1, n):
-        if np.isnan(x[i]) or np.isnan(r[i]):
-            filt[i] = filt[i-1]
-            continue
-
-        curr_x = x[i]
-        curr_r = r[i]
-        prev_filt = filt[i-1]
-
-        if curr_x > prev_filt:
-            # Uptrend: move up, but never below prev
-            candidate = curr_x - curr_r
-            filt[i] = prev_filt if candidate < prev_filt else candidate
-        else:
-            # Downtrend: move down, but never above prev
-            candidate = curr_x + curr_r
-            filt[i] = prev_filt if candidate > prev_filt else candidate
-
-    return filt
-
-@njit("f8[:](f8[:], i4, i4)", nogil=True, cache=True)
-def smooth_range(close, t, m):
-    
-    n = len(close)
-    diff = np.full(n, np.nan, dtype=np.float64)
-    for i in range(1, n):
-        diff[i] = abs(close[i] - close[i - 1])
-    # diff[0] stays NaN — mirrors Pine's na on bar 0 (x - x[1] undefined)
-
-    avrng = ema_loop_pine(diff, float(t))
-
-    wper = t * 2 - 1
-    smoothrng = ema_loop_pine(avrng, float(wper))
-
-    return smoothrng * float(m)
-
-
-@njit("Tuple((b1[:], b1[:]))(f8[:], f8[:])", nogil=True, cache=True)
-def calculate_trends_with_state(filt_x1, filt_x12):
-    
-    n = len(filt_x1)
-    upw = np.zeros(n, dtype=np.bool_)
-    dnw = np.zeros(n, dtype=np.bool_)
-
-    for i in range(n):
-        f1 = filt_x1[i]
-        f2 = filt_x12[i]
-        if np.isnan(f1) or np.isnan(f2):
-            upw[i] = False
-            dnw[i] = False
-            continue
-        upw[i] = f1 < f2
-        dnw[i] = f1 > f2
-
-    return upw, dnw
-
-
 # ============================================================================
 # 4. KALMAN / VWAP
 # ============================================================================
@@ -649,10 +560,7 @@ EXPORT_CONFIG = {
     'calc_mmh_momentum_smoothing':   'f8[:](f8[:], i4)',
     'ema_loop':                      'f8[:](f8[:], f8)',
     'ema_loop_pine':                 'f8[:](f8[:], f8)',          # NEW
-    'ema_loop_alpha':                'f8[:](f8[:], f8)',
-    'rng_filter_loop':               'f8[:](f8[:], f8[:])',
-    'smooth_range':                  'f8[:](f8[:], i4, i4)',
-    'calculate_trends_with_state':   'Tuple((b1[:], b1[:]))(f8[:], f8[:])',
+    'ema_loop_alpha':                'f8[:](f8[:], f8)', 
     'kalman_loop':                   'f8[:](f8[:], i4, f8, f8)',
     'vwap_daily_loop_safe':          'f8[:](f8[:], f8[:], i8[:])',
     'calculate_ppo_core':            'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
@@ -664,7 +572,7 @@ EXPORT_CONFIG = {
 __all__ = list(EXPORT_CONFIG.keys())
 
 # Guard: raise immediately at import if count drops unexpectedly
-expected_min_functions = 21   # was 19; +2 for ema_loop_pine
+expected_min_functions = 18
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "
