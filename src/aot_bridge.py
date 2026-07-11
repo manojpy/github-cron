@@ -135,6 +135,9 @@ def initialize_jit_fallback() -> None:
             ema_loop_pine, 
             kalman_loop,
             vwap_daily_loop_safe, 
+            rng_filter_loop,
+            smooth_range,
+            calculate_trends_with_state,
             calc_mmh_worm_loop,
             calc_mmh_value_loop,
             calc_mmh_momentum_loop,
@@ -157,6 +160,9 @@ def initialize_jit_fallback() -> None:
             'ema_loop_pine': ema_loop_pine, 
             'kalman_loop': kalman_loop,
             'vwap_daily_loop_safe': vwap_daily_loop_safe,
+            'rng_filter_loop': rng_filter_loop,
+            'smooth_range': smooth_range,
+            'calculate_trends_with_state': calculate_trends_with_state,
             'calc_mmh_worm_loop': calc_mmh_worm_loop,
             'calc_mmh_value_loop': calc_mmh_value_loop,
             'calc_mmh_momentum_loop': calc_mmh_momentum_loop,
@@ -197,6 +203,9 @@ def ensure_initialized() -> None:
             'ema_loop_pine': _aot_module.ema_loop_pine,
             'kalman_loop': _aot_module.kalman_loop,
             'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
+            'rng_filter_loop': _aot_module.rng_filter_loop,
+            'smooth_range': _aot_module.smooth_range,
+            'calculate_trends_with_state': _aot_module.calculate_trends_with_state,
             'calc_mmh_worm_loop': _aot_module.calc_mmh_worm_loop,
             'calc_mmh_value_loop': _aot_module.calc_mmh_value_loop,
             'calc_mmh_momentum_loop': _aot_module.calc_mmh_momentum_loop,
@@ -261,6 +270,15 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
 def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     return _dispatch['vwap_daily_loop_safe'](hlc3, volumes, timestamps)
 
+def rng_filter_loop(x: np.ndarray, r: np.ndarray) -> np.ndarray:
+    return _dispatch['rng_filter_loop'](x, r)
+
+def smooth_range(close: np.ndarray, t: int, m: int) -> np.ndarray:
+    return _dispatch['smooth_range'](close, t, m)
+
+def calculate_trends_with_state(filt_x1: np.ndarray, filt_x12: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    return _dispatch['calculate_trends_with_state'](filt_x1, filt_x12)
+
 def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
     return _dispatch['calc_mmh_worm_loop'](close_arr, sd_arr, rows)
 
@@ -317,6 +335,9 @@ __all__ = [
 
     # Filters
     'kalman_loop',
+    'rng_filter_loop',
+    'smooth_range',
+    'calculate_trends_with_state',
 
     # Market Indicators
     'vwap_daily_loop_safe',

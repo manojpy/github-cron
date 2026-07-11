@@ -40,6 +40,9 @@ from aot_bridge import (
     ema_loop_pine,
     kalman_loop,
     vwap_daily_loop_safe,
+    rng_filter_loop,
+    smooth_range,
+    calculate_trends_with_state, 
     calc_mmh_worm_loop,
     calc_mmh_value_loop,
     calc_mmh_momentum_loop,
@@ -139,7 +142,8 @@ class Constants:
     MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
     INTER_BATCH_DELAY: float = 0.5
-    
+
+
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -175,6 +179,11 @@ class BotConfig(BaseModel):
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
     PPO_GATE_SLOW: int = Field(default=84, ge=2, le=200, description="Gate PPO slow period")
     PPO_GATE_SIGNAL: int = Field(default=20, ge=1, le=50, description="Gate PPO signal period")
+    CIRRUS_CLOUD_ENABLED: bool = True
+    X1: int = 22
+    X2: int = 9
+    X3: int = 15
+    X4: int = 5
     SRSI_RSI_LEN: int = 21
     SRSI_KALMAN_LEN: int = 5
     SRSI_EMA_LEN: int = 5
@@ -214,11 +223,6 @@ class BotConfig(BaseModel):
     NUMBA_PARALLEL: bool = Field(default=True)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
-    ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
-    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Ichimoku conversion line length")
-    ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Ichimoku base line length")
-    ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Ichimoku leading span B length")
-    ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Ichimoku cloud forward displacement")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -854,70 +858,31 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         logger.error(f"RMA calculation failed: {e}")
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
-def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                             conversion_periods: int = 23,
-                             base_periods: int = 65,
-                             span_b_periods: int = 130,
-                             displacement: int = 65) -> Dict[str, np.ndarray]:
+def calculate_cirrus_cloud_numba(close: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     try:
-        n = len(high)
-        if n == 0:
-            raise ValueError("Empty input arrays")
+        if close is None or len(close) < 1:
+            return (np.array([False]), np.array([False]), np.array([0.0]), np.array([0.0]))
+        
+        close_arr = np.asarray(close, dtype=np.float64)
+        
+        smrng_x1 = smooth_range(close_arr, cfg.X1, cfg.X2)
+        smrng_x2 = smooth_range(close_arr, cfg.X3, cfg.X4)
+        
+        filt_x1 = rng_filter_loop(close_arr, smrng_x1)
+        filt_x12 = rng_filter_loop(close_arr, smrng_x2)
 
-        # Conversion Line (Tenkan-sen): (highest high + lowest low) / 2
-        _, hh_conv = rolling_min_max_numba(high, conversion_periods)
-        ll_conv, _ = rolling_min_max_numba(low, conversion_periods)
-        conversion_line = (hh_conv + ll_conv) / 2.0
-
-        # Base Line (Kijun-sen): (highest high + lowest low) / 2
-        _, hh_base = rolling_min_max_numba(high, base_periods)
-        ll_base, _ = rolling_min_max_numba(low, base_periods)
-        base_line = (hh_base + ll_base) / 2.0
-
-        # Leading Span A (Senkou Span A): (Conversion + Base) / 2
-        lead_line1 = (conversion_line + base_line) / 2.0
-
-        # Leading Span B (Senkou Span B): (highest high + lowest low) / 2
-        _, hh_spanb = rolling_min_max_numba(high, span_b_periods)
-        ll_spanb, _ = rolling_min_max_numba(low, span_b_periods)
-        lead_line2 = (hh_spanb + ll_spanb) / 2.0
-
-        # Displace cloud forward (Pine: offset = displacement - 1)
-        lag = displacement - 1
-        cloud_upper = np.full(n, np.nan, dtype=np.float64)
-        cloud_lower = np.full(n, np.nan, dtype=np.float64)
-
-        if lag > 0 and n > lag:
-            cloud_upper[lag:] = np.maximum(lead_line1[:-lag], lead_line2[:-lag])
-            cloud_lower[lag:] = np.minimum(lead_line1[:-lag], lead_line2[:-lag])
-        elif lag == 0:
-            cloud_upper[:] = np.maximum(lead_line1, lead_line2)
-            cloud_lower[:] = np.minimum(lead_line1, lead_line2)
-
-        return {
-            'cloud_upper': cloud_upper,
-            'cloud_lower': cloud_lower,
-            'future_green': lead_line1 > lead_line2,
-            'future_red': lead_line1 < lead_line2,
-            'conversion_line': conversion_line,
-            'base_line': base_line,
-            'lead_line1': lead_line1,
-            'lead_line2': lead_line2,
-        }
-
+        upw, dnw = calculate_trends_with_state(filt_x1, filt_x12)   
+        
+        return upw, dnw, filt_x1, filt_x12
+        
     except Exception as e:
-        logger.error(f"Ichimoku calculation failed: {e}", exc_info=True)
-        n = len(high) if high is not None else 1
-        return {
-            'cloud_upper': np.full(n, np.nan, dtype=np.float64),
-            'cloud_lower': np.full(n, np.nan, dtype=np.float64),
-            'future_green': np.zeros(n, dtype=bool),
-            'future_red': np.zeros(n, dtype=bool),
-            'conversion_line': np.full(n, np.nan, dtype=np.float64),
-            'base_line': np.full(n, np.nan, dtype=np.float64),
-            'lead_line1': np.full(n, np.nan, dtype=np.float64),
-            'lead_line2': np.full(n, np.nan, dtype=np.float64),
-        }
+        length = len(close) if close is not None else 1
+        return (
+            np.zeros(length, dtype=np.bool_),
+            np.zeros(length, dtype=np.bool_),
+            np.zeros(length, dtype=np.float64),
+            np.zeros(length, dtype=np.float64)
+        )
 
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 55, responsiveness: float = 0.9) -> np.ndarray:  
     try:
@@ -980,7 +945,9 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.rolling_std(test_data, 14, 0.5)
         _ = aot_bridge.rolling_mean_numba(test_data, 14)
         _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
-        _ = aot_bridge.rolling_min_max_numba(test_data, 23)
+        _ = aot_bridge.smooth_range(test_data, 22, 2)
+        _ = aot_bridge.rng_filter_loop(test_data, test_data * 0.5)
+        _ = aot_bridge.calculate_trends_with_state(test_data, test_data * 0.9)
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
         _ = aot_bridge.vwap_daily_loop_safe(test_data, test_data, test_ts)
@@ -1134,25 +1101,14 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
         results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
         
-        # ── Ichimoku Cloud (23, 65, 130, 65) ──
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
-            ichimoku = calculate_ichimoku_numpy(
-                data_15m["high"], data_15m["low"], close_15m,
-                cfg.ICHIMOKU_CONVERSION_PERIODS,
-                cfg.ICHIMOKU_BASE_PERIODS,
-                cfg.ICHIMOKU_SPANB_PERIODS,
-                cfg.ICHIMOKU_DISPLACEMENT
-            )
-            results['ichimoku_cloud_upper'] = ichimoku['cloud_upper']
-            results['ichimoku_cloud_lower'] = ichimoku['cloud_lower']
-            results['ichimoku_future_green'] = ichimoku['future_green']
-            results['ichimoku_future_red'] = ichimoku['future_red']
+        if cfg.CIRRUS_CLOUD_ENABLED:
+            upw, dnw, _, _ = calculate_cirrus_cloud_numba(close_15m)
+            results['upw'] = upw
+            results['dnw'] = dnw
         else:
-            results['ichimoku_cloud_upper'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['ichimoku_cloud_lower'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['ichimoku_future_green'] = np.zeros(n_15m, dtype=bool)
-            results['ichimoku_future_red'] = np.zeros(n_15m, dtype=bool)
-
+            results['upw'] = np.zeros(n_15m, dtype=bool)
+            results['dnw'] = np.zeros(n_15m, dtype=bool)
+        
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
@@ -1287,10 +1243,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_cloud_upper': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_cloud_lower': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_future_green': np.zeros(n, dtype=bool),
-            'ichimoku_future_red': np.zeros(n, dtype=bool),
+            'upw': np.zeros(n, dtype=bool),
+            'dnw': np.zeros(n, dtype=bool),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
             'rma200_5': np.full(len(data_5m.get("close", [])), np.nan, dtype=np.float64),
             'pivots': {},
@@ -3361,6 +3315,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     smooth_rsi = None
     vwap = None
     mmh = None
+    upw = None
+    dnw = None
     rma50_15 = None
     rma200_5 = None
     piv = None
@@ -3498,30 +3454,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         smooth_rsi = indicators["smooth_rsi"]
         vwap = indicators["vwap"]
         mmh = indicators["mmh"]
-
-        ichimoku_cloud_upper = indicators["ichimoku_cloud_upper"]
-        ichimoku_cloud_lower = indicators["ichimoku_cloud_lower"]
-        ichimoku_future_green = indicators["ichimoku_future_green"]
-        ichimoku_future_red   = indicators["ichimoku_future_red"]
-
+        upw = indicators["upw"]
+        dnw = indicators["dnw"]
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
         ppo_gate_arr = indicators["ppo_gate"]
         ppo_gate_signal_arr = indicators["ppo_gate_signal"] 
         piv = indicators["pivots"]
-        close_prev = close_15m[i15 - 1] 
-
-        # ── Ichimoku Cloud Filter ──
-        # Future cloud direction (current values = what will be plotted ahead)
-        future_green = bool(ichimoku_future_green[i15])
-        future_red   = bool(ichimoku_future_red[i15])
-
-        # Price vs current cloud (displaced values from 65 bars ago)
-        above_cloud = close_curr > ichimoku_cloud_upper[i15]
-        below_cloud = close_curr < ichimoku_cloud_lower[i15]
-
-        cloud_up   = future_green and above_cloud
-        cloud_down = future_red   and below_cloud
+        cloud_up = bool(upw[i15]) and not bool(dnw[i15])
+        cloud_down = bool(dnw[i15]) and not bool(upw[i15])
+        close_prev = close_15m[i15 - 1]
 
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
             logger_pair.warning(
