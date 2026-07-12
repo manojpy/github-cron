@@ -20,7 +20,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  BOT_TIMEOUT: 300
+  BOT_TIMEOUT: 540
   WORKFLOW_TIMEOUT: 6
 
 jobs:
