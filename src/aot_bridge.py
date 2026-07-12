@@ -35,18 +35,42 @@ _dispatch: Dict[str, Callable] = {}
 # JIT function storage (for fallback)
 _jit_functions: Dict[str, Callable] = {}
 
+# ============================================================================
+# REQUIRED FUNCTIONS
+# ============================================================================
+
+REQUIRED_AOT_FUNCTIONS = [
+    'sanitize_array_numba',
+    'sanitize_array_numba_parallel',
+    'ema_loop',
+    'ema_loop_alpha',
+    'ema_loop_pine',
+    'kalman_loop',
+    'vwap_daily_loop_safe',
+    'calc_mmh_worm_loop',
+    'calc_mmh_value_loop',
+    'calc_mmh_momentum_loop',
+    'rolling_std',
+    'rolling_mean_numba',
+    'calc_mmh_momentum_smoothing',
+    'rolling_min_max_numba',
+    'calculate_ppo_core',
+    'calculate_rsi_core',
+    'calculate_atr_rma',
+    'calculate_adx_core',
+]
+
 
 def get_library_extension() -> str:
-    """Get platform-specific shared library extension"""
-    system = platform.system()
-    if system == "Linux":
-        return ".so"
-    elif system == "Darwin":
-        return ".dylib"
-    elif system == "Windows":
-        return ".dll"
-    else:
-        return ".so"  # Fallback
+    """Extension for compiled Python extension modules.
+
+    Mirrors exactly what aot_build.py's compile_module() produces: .pyd on
+    Windows, .so everywhere else. macOS Python C-extensions use .so (not
+    .dylib) even though the underlying binary is a Mach-O dylib -- using
+    .dylib here would mean find_aot_library() never finds a real AOT build
+    on macOS and silently falls back to JIT on every run.
+    """
+    return ".pyd" if platform.system() == "Windows" else ".so"
 
 
 def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
@@ -62,7 +86,7 @@ def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
     for search_dir in search_paths:
         if not search_dir.exists():
             continue
-            
+
         # Try exact matches first
         for name in [f"{module_name}{extension}", f"{module_name}.cpython-311{extension}"]:
             p = search_dir / name
@@ -94,7 +118,13 @@ def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") 
 
 
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
-    """Attempt to initialize AOT module and verify critical functions exist"""
+    """Attempt to initialize AOT module and verify ALL required functions exist.
+
+    Verifying every function in REQUIRED_AOT_FUNCTIONS (rather than a small
+    sample) guarantees that once this returns success=True, the dispatch
+    dictionary in ensure_initialized() can safely reference every AOT
+    attribute directly without risking an AttributeError from a stale build.
+    """
     global _aot_module, _using_aot, _fallback_reason
 
     library_path = find_aot_library(module_name)
@@ -105,17 +135,10 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
     if _aot_module is None:
         return False, f"Failed to import AOT module at {library_path}"
 
-    # Verify critical functions exist
-    critical_functions = [
-        'sanitize_array_numba',
-        'ema_loop',
-        'calculate_ppo_core',
-        'calc_mmh_momentum_smoothing',
-    ]
-
-    missing = [fn for fn in critical_functions if not hasattr(_aot_module, fn)]
+    # Verify every function the dispatch table needs, not just a handful.
+    missing = [fn for fn in REQUIRED_AOT_FUNCTIONS if not hasattr(_aot_module, fn)]
     if missing:
-        return False, f"AOT library missing critical function: {missing[0]}"
+        return False, f"AOT library missing {len(missing)} function(s): {missing}"
 
     _using_aot = True
     return True, None
@@ -126,15 +149,15 @@ def initialize_jit_fallback() -> None:
     global _jit_functions, _fallback_reason
 
     try:
-        # Import all 20 functions (already cached by Python)
+        # Import all 18 functions (already cached by Python)
         from numba_functions_shared import (
             sanitize_array_numba,
             sanitize_array_numba_parallel,
             ema_loop,
             ema_loop_alpha,
-            ema_loop_pine, 
+            ema_loop_pine,
             kalman_loop,
-            vwap_daily_loop_safe, 
+            vwap_daily_loop_safe,
             calc_mmh_worm_loop,
             calc_mmh_value_loop,
             calc_mmh_momentum_loop,
@@ -154,7 +177,7 @@ def initialize_jit_fallback() -> None:
             'sanitize_array_numba_parallel': sanitize_array_numba_parallel,
             'ema_loop': ema_loop,
             'ema_loop_alpha': ema_loop_alpha,
-            'ema_loop_pine': ema_loop_pine, 
+            'ema_loop_pine': ema_loop_pine,
             'kalman_loop': kalman_loop,
             'vwap_daily_loop_safe': vwap_daily_loop_safe,
             'calc_mmh_worm_loop': calc_mmh_worm_loop,
@@ -175,6 +198,33 @@ def initialize_jit_fallback() -> None:
         raise RuntimeError(f"Cannot initialize JIT fallback: {e}")
 
 
+def _build_aot_dispatch() -> Dict[str, Callable]:
+    """Build the AOT dispatch dict. Isolated in its own function so
+    ensure_initialized() can safely try/except around it as a defense-in-depth
+    safety net (belt-and-suspenders on top of the REQUIRED_AOT_FUNCTIONS
+    check in initialize_aot())."""
+    return {
+        'sanitize_array_numba': _aot_module.sanitize_array_numba,
+        'sanitize_array_numba_parallel': _aot_module.sanitize_array_numba_parallel,
+        'ema_loop': _aot_module.ema_loop,
+        'ema_loop_alpha': _aot_module.ema_loop_alpha,
+        'ema_loop_pine': _aot_module.ema_loop_pine,
+        'kalman_loop': _aot_module.kalman_loop,
+        'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
+        'calc_mmh_worm_loop': _aot_module.calc_mmh_worm_loop,
+        'calc_mmh_value_loop': _aot_module.calc_mmh_value_loop,
+        'calc_mmh_momentum_loop': _aot_module.calc_mmh_momentum_loop,
+        'rolling_std': _aot_module.rolling_std,
+        'rolling_mean_numba': _aot_module.rolling_mean_numba,
+        'calc_mmh_momentum_smoothing': _aot_module.calc_mmh_momentum_smoothing,
+        'rolling_min_max_numba': _aot_module.rolling_min_max_numba,
+        'calculate_ppo_core': _aot_module.calculate_ppo_core,
+        'calculate_rsi_core': _aot_module.calculate_rsi_core,
+        'calculate_atr_rma': _aot_module.calculate_atr_rma,
+        'calculate_adx_core': _aot_module.calculate_adx_core,
+    }
+
+
 def ensure_initialized() -> None:
     """Initialize dispatch table with either AOT or JIT functions"""
     global _initialized, _fallback_reason, _using_aot, _dispatch
@@ -185,35 +235,27 @@ def ensure_initialized() -> None:
     success, reason = initialize_aot()
 
     if success:
-        _using_aot = True
-        _fallback_reason = None
-        
-        # Dispatch directly to AOT functions
-        _dispatch = {
-            'sanitize_array_numba': _aot_module.sanitize_array_numba,
-            'sanitize_array_numba_parallel': _aot_module.sanitize_array_numba_parallel,
-            'ema_loop': _aot_module.ema_loop,
-            'ema_loop_alpha': _aot_module.ema_loop_alpha,
-            'ema_loop_pine': _aot_module.ema_loop_pine,
-            'kalman_loop': _aot_module.kalman_loop,
-            'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
-            'calc_mmh_worm_loop': _aot_module.calc_mmh_worm_loop,
-            'calc_mmh_value_loop': _aot_module.calc_mmh_value_loop,
-            'calc_mmh_momentum_loop': _aot_module.calc_mmh_momentum_loop,
-            'rolling_std': _aot_module.rolling_std,
-            'rolling_mean_numba': _aot_module.rolling_mean_numba,
-            'calc_mmh_momentum_smoothing': _aot_module.calc_mmh_momentum_smoothing,
-            'rolling_min_max_numba': _aot_module.rolling_min_max_numba,
-            'calculate_ppo_core': _aot_module.calculate_ppo_core,
-            'calculate_rsi_core': _aot_module.calculate_rsi_core,
-            'calculate_atr_rma': _aot_module.calculate_atr_rma,
-            'calculate_adx_core': _aot_module.calculate_adx_core,
-        }
+
+        try:
+            _dispatch = _build_aot_dispatch()
+            _using_aot = True
+            _fallback_reason = None
+        except AttributeError as e:
+            warnings.warn(
+                f"AOT module unexpectedly missing an attribute ({e}) despite "
+                f"passing verification -- falling back to JIT. Check that "
+                f"REQUIRED_AOT_FUNCTIONS in aot_bridge.py matches EXPORT_CONFIG "
+                f"in numba_functions_shared.py."
+            )
+            _using_aot = False
+            _fallback_reason = f"AOT dispatch build failed: {e}"
+            initialize_jit_fallback()
+            _dispatch = _jit_functions
     else:
         _fallback_reason = reason
         _using_aot = False
         initialize_jit_fallback()
-        
+
         # Dispatch to JIT functions
         _dispatch = _jit_functions
 
@@ -338,7 +380,7 @@ __all__ = [
 
     # Pattern Recognition
     'calculate_atr_rma',
-    'calculate_adx_core', 
+    'calculate_adx_core',
 ]
 
 # Auto-initialize on import

@@ -41,13 +41,13 @@ def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
     # Set the target filename (Numba handles extensions based on platform)
     output_base = output_dir / module_name
     
-    # Trigger compilation
-    # Note: cc.compile() generates the file in the current directory or specified path
-    os.chdir(output_dir)
-    cc.compile()
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(output_dir)
+        cc.compile()
+    finally:
+        os.chdir(original_cwd)
     
-    # Find the produced library (handles platform differences .so, .pyd, .dylib)
-    # and potential Python version tags (e.g. .cpython-311-x86_64-linux-gnu.so)
     ext = ".pyd" if platform.system() == "Windows" else ".so"
     libraries = list(output_dir.glob(f"{module_name}*{ext}"))
     
