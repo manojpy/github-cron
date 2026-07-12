@@ -2555,6 +2555,16 @@ class RedisStateStore:
             logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
             return True
 
+    async def release_recent_alert(self, pair: str, alert_key: str) -> None:
+        """Undo a dedup claim if the message didn't actually get delivered."""
+        if self.degraded:
+            return
+        recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+        try:
+            await asyncio.wait_for(self._redis.delete(recent_key), timeout=1.0)
+        except Exception as e:
+            logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
+
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         
         if not self._redis or self.degraded or not alert_keys:
@@ -3902,6 +3912,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             filtered_alerts.append((alert_title, alert_extra, alert_key))
         alerts_to_send = filtered_alerts
 
+
         if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
@@ -3915,6 +3926,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     send_success = await telegram_queue.send(msg)
                     if not send_success:
                         logger_pair.error(f"Alert dispatch failed | {pair_name}")
+                        for _, _, alert_key in alerts_to_send:
+                            await sdb.release_recent_alert(pair_name, alert_key)
                 else:
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
@@ -3924,6 +3937,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
+                for _, _, alert_key in alerts_to_send:
+                    await sdb.release_recent_alert(pair_name, alert_key)
 
         reasons = []
         if not buy_common and not sell_common:
@@ -4418,7 +4433,7 @@ async def run_once() -> bool:
         lock_acquired = await lock.acquire(timeout=5.0)
         if not lock_acquired:
             logger_run.warning(
-                "���️ Another instance is running (Redis lock held) - exiting gracefully"
+                "⚠️ Another instance is running (Redis lock held) - exiting gracefully"
             )
             return False
 
@@ -4459,9 +4474,15 @@ async def run_once() -> bool:
             
                 except asyncio.CancelledError:
                     break
+
+
                 except Exception as e:
                     logger_run.error(f"Lock extension task error: {e}")
                     await asyncio.sleep(60)
+
+        lock_extension_task = asyncio.create_task(
+            extend_lock_periodically(lock, telegram_queue)
+        )
 
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
