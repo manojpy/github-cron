@@ -3058,7 +3058,7 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
         ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
-                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%]"
             ),
             "requires": ["pivots"]
         }
@@ -3072,7 +3072,7 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
         ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
                 f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
-                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['close_curr']*100:.2f}%]"
+                f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%]"
             ),
             "requires": ["pivots"]
         }
@@ -3840,7 +3840,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     level = alert_key.split("_")[-1]
                     is_buy = alert_key.startswith("pivot_up_")
                     try:
-                        valid_cross, reason = _validate_pivot_cross(context, level, is_buy)
+
+                        valid_cross, reason = get_pivot_alert_info(context, level, is_buy)
                         if not valid_cross and reason and piv:
                              context["pivot_suppressions"].append(f"{alert_key}: {reason}")
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
