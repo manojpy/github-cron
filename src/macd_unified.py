@@ -124,11 +124,10 @@ class Constants:
     INFINITY_CLAMP = 1e8
     LOCK_EXTEND_INTERVAL = 540
     LOCK_EXTEND_JITTER_MAX = 120
-    ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 600))
+    ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 1800))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     VWAP_MAX_DISTANCE_PCT = 1.0
-    PIVOT_MAX_DISTANCE_PCT = 0.5
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
@@ -138,7 +137,6 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
-    INTER_BATCH_DELAY: float = 0.5
     
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
@@ -223,7 +221,7 @@ class BotConfig(BaseModel):
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     PRODUCTS_CACHE_TTL: int = Field(default=28800)  # Products cache TTL in seconds (8h default)
-    PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.5)  # Max distance from pivot to trigger alert (1.5%)
+    PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.0)  # Max distance from pivot to trigger alert (1.5%)
     RVOL_THRESHOLD: float = Field(default=1.0, ge=0.5, le=2.0)  # Volatility expansion threshold (1.0=baseline, 1.5=50% expansion required)   
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX directional movement calculation period
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
@@ -2953,8 +2951,21 @@ class TelegramQueue:
 
         return all(results)
 
-def build_single_msg(title, pair, price, ts, extra=None):
-    """Build a clean, formatted alert message."""
+def _clean_extra_text(extra: Optional[str]) -> str:
+    """Helper to strip emojis, OHLC data, and technical metadata."""
+    if not extra:
+        return ""
+    extra_clean = re.sub(r'[🟢🔴🔵🟣]', '', extra)  
+    extra_clean = re.sub(r'\(O:[\d.]+ H:[\d.]+ L:[\d.]+ C:[\d.]+\)', '', extra_clean)  
+    extra_clean = re.sub(r'\[i15=\d+,\s*[\d-]+\s+[\d:]+\s+IST\]', '', extra_clean)  
+    return extra_clean.strip()
+
+def _format_price(price: Any) -> str:
+    """Safely format price to 2 decimal places."""
+    return f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
+
+def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None) -> str:
+    """Build a beautifully formatted Telegram single alert using MarkdownV2."""
     if not title: 
         title = "ALERT"
     
@@ -2962,60 +2973,78 @@ def build_single_msg(title, pair, price, ts, extra=None):
     symbols = parts[0]
     description = parts[1] if len(parts) == 2 else title
     
-    price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
-    
-    line1 = f"{symbols} {pair} - {price_str}"
-    
-    if extra:
-        extra_clean = extra
-        extra_clean = re.sub(r'🟢|🔴', '', extra_clean)  # Remove color emojis
-        extra_clean = re.sub(r'\(O:[\d.]+ H:[\d.]+ L:[\d.]+ C:[\d.]+\)', '', extra_clean)  # Remove OHLC
-        extra_clean = re.sub(r'\[i15=\d+,\s*[\d-]+\s+[\d:]+\s+IST\]', '', extra_clean)  # Remove index info
-        extra_clean = extra_clean.strip()
-        line2 = f"{description} : {extra_clean}"
-    else:
-        line2 = description
-    
+    # 1. Format the raw strings
+    price_str = _format_price(price)
+    extra_clean = _clean_extra_text(extra)
     date_str = format_ist_time(ts, '%d-%m-%Y')
     time_str = format_ist_time(ts, '%H:%M IST')
-    spacing = " " * 15
-    line3 = f"📅 {date_str}{spacing}⏰ {time_str}"
     
-    return escape_markdown_v2(f"{line1}\n{line2}\n{line3}")
+    # 2. ESCAPE INDIVIDUAL DATA (Crucial for MarkdownV2 stability)
+    e_symbols = escape_markdown_v2(symbols)
+    e_pair = escape_markdown_v2(pair)
+    e_price = escape_markdown_v2(price_str)
+    e_desc = escape_markdown_v2(description)
+    e_extra = escape_markdown_v2(extra_clean)
+    e_date = escape_markdown_v2(date_str)
+    e_time = escape_markdown_v2(time_str)
+    
+    # 3. APPLY TELEGRAM LAYOUT TAGS
+    # Bold pair and bold price. Note: Literal hyphens '\-' must be escaped in MarkdownV2.
+    line1 = f"{e_symbols} *{e_pair}* \\- *{e_price}*"
+    
+    # Bold the alert type, italicize the extra context details
+    if e_extra:
+        line2 = f"*{e_desc}* : _{e_extra}_"
+    else:
+        line2 = f"*{e_desc}*"
+    
+    spacing = " " * 12
+    line3 = f"📅 {e_date}{spacing}⏰ {e_time}"
+    
+    # Return the raw composite string (do NOT wrap this in escape_markdown_v2)
+    return f"{line1}\n{line2}\n{line3}"
         
-def build_batched_msg(pair: str, price: float, ts: int, items: List[Tuple[str, str]]) -> str:
-    """Build a batched alert message when multiple alerts fire for same pair."""
+        
+def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]]) -> str:
+    """Build a beautifully formatted Telegram batched alert using MarkdownV2."""
+    price_str = _format_price(price)
+    date_str = format_ist_time(ts, '%d-%m-%Y')
+    time_str = format_ist_time(ts, '%H:%M IST')
+    
+    e_pair = escape_markdown_v2(pair)
+    e_price = escape_markdown_v2(price_str)
+    e_date = escape_markdown_v2(date_str)
+    e_time = escape_markdown_v2(time_str)
+    spacing = " " * 12
+    
     if not items:
-        date_str = format_ist_time(ts, '%d-%m-%Y')
-        time_str = format_ist_time(ts, '%H:%M IST')
-        spacing = " " * 15
-        return escape_markdown_v2(f"{pair} - ${price:,.2f}\n🗓️ {date_str}{spacing}🕙 {time_str}")
+        return f"*{e_pair}* \\- *{e_price}*\n🗓️ {e_date}{spacing}🕙 {e_time}"
     
     headline_emoji = items[0][0].split(" ", 1)[0] if items[0][0] else "📊"
+    e_headline_emoji = escape_markdown_v2(headline_emoji)
     
-    line1 = f"{headline_emoji} {pair} - ${price:,.2f}"
+    line1 = f"{e_headline_emoji} *{e_pair}* \\- *{e_price}*"
     
     alert_lines = []
     for idx, (title, extra) in enumerate(items):
         parts = title.split(" ", 1)
         description = parts[1] if len(parts) == 2 else title
+        extra_clean = _clean_extra_text(extra)
         
-        extra_clean = extra
-        extra_clean = re.sub(r'🟢|🔴', '', extra_clean)
-        extra_clean = re.sub(r'\(O:[\d.]+ H:[\d.]+ L:[\d.]+ C:[\d.]+\)', '', extra_clean)
-        extra_clean = re.sub(r'\[i15=\d+,\s*[\d-]+\s+[\d:]+\s+IST\]', '', extra_clean)
-        extra_clean = extra_clean.strip()
+        e_desc = escape_markdown_v2(description)
+        e_extra = escape_markdown_v2(extra_clean)
         
         prefix = "└➤" if idx == len(items) - 1 else "├➤"
-        alert_lines.append(f"{prefix} {description} : {extra_clean}")
-    
-    date_str = format_ist_time(ts, '%d-%m-%Y')
-    time_str = format_ist_time(ts, '%H:%M IST')
-    spacing = " " * 15
-    datetime_line = f"📅 {date_str}{spacing}⏰ {time_str}"
+        
+        if e_extra:
+            alert_lines.append(f"{prefix} *{e_desc}* : _{e_extra}_")
+        else:
+            alert_lines.append(f"{prefix} *{e_desc}*")
     
     body = "\n".join(alert_lines)
-    return escape_markdown_v2(f"{line1}\n{body}\n{datetime_line}")
+    datetime_line = f"📅 {e_date}{spacing}⏰ {e_time}"
+    
+    return f"{line1}\n{body}\n{datetime_line}"
 
 def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
     """Factory function to create pivot alert definition without lambdas"""
@@ -3070,7 +3099,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
 
-def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]: 
+def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots:
         return False, "No pivot data"
@@ -3082,9 +3111,10 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     close_curr = ctx.get("close_curr")
     close_prev = ctx.get("close_prev")
 
-    if close_curr is None or close_prev is None:
-        return False, "Missing close data"
+    if close_curr is None or close_prev is None or np.isnan(close_curr) or np.isnan(close_prev):
+        return False, "Missing or invalid close data"
 
+    # Precise cross verification
     if is_buy:
         crossed = close_prev <= level_value < close_curr
     else:
@@ -3093,15 +3123,14 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     if not crossed:
         return False, "No pivot cross"
 
-    try:
-        price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
-    except ZeroDivisionError:
-        return False, "Pivot invalid (zero)"
+    # Math is safe; level_value is guaranteed > 0 here
+    price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
+    max_distance = cfg.PIVOT_MAX_DISTANCE_PCT
 
-    if price_diff_pct > Constants.PIVOT_MAX_DISTANCE_PCT:
+    if price_diff_pct > max_distance:
         return False, (
             f"Pivot too far: price {close_curr:.2f} is {price_diff_pct:.2f}% "
-            f"away from {level} pivot {level_value:.2f}"
+            f"away from {level} pivot {level_value:.2f} (max {max_distance}%)"
         )
 
     return True, None
@@ -3353,7 +3382,8 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int) -> Optional[Tuple[str, Dict[str, Any]]]:
+    reference_time: int, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    max_alerts_per_run: int = 50) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     if reference_time is None:
         reference_time = get_trigger_timestamp()   
@@ -3729,6 +3759,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
 
+        # Build keys to CHECK this run (may exclude some due to missing requirements)
         alert_keys_to_check = []
         for d in ALERT_DEFINITIONS:
             key = d["key"]
@@ -3749,12 +3780,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not skip:
                 alert_keys_to_check.append(key)
 
-        redis_alert_keys = [ALERT_KEYS[k] for k in alert_keys_to_check]
-
+        # Fetch ALL alert states so resets work even for alerts whose requirements disappeared
+        all_redis_alert_keys = list(ALERT_KEYS.values())
         previous_states = await sdb.batch_get_all_alert_states(
-            pair_name, redis_alert_keys
+            pair_name, all_redis_alert_keys
         )
-
         all_state_changes = []
 
         if wick_rejected:
@@ -3863,6 +3893,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         )
 
         conditional_states = previous_states
+        all_state_changes: List[Tuple[str, str, Optional[int]]] = []
     
         resets_to_apply = []
         resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
@@ -3912,6 +3943,26 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             filtered_alerts.append((alert_title, alert_extra, alert_key))
         alerts_to_send = filtered_alerts
 
+        # Enforce global per-run alert limit BEFORE sending
+        if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
+            async with alerts_sent_lock:
+                current_total = alerts_sent_ref[0]
+                if current_total >= max_alerts_per_run:
+                    logger_pair.warning(
+                        f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
+                        f"skipping {len(alerts_to_send)} alerts for {pair_name}"
+                    )
+                    return pair_name, {
+                        "state": "LIMIT_REACHED",
+                        "ts": int(time.time()),
+                        "summary": {
+                            "alerts": 0,
+                            "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "mmh_hist": round(mmh_curr, 4),
+                            "suppression": f"Global limit {max_alerts_per_run} reached"
+                        }
+                    }
+                alerts_sent_ref[0] += len(alerts_to_send)
 
         if alerts_to_send:
             try:
@@ -4146,7 +4197,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         except Exception:
             pass
 
-async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time):  
+async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time,
+                       alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=50):
+
     p_name, candles = task_data
     data_15m = None
     data_5m = None
@@ -4164,10 +4217,11 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         if data_5m is None:
             logger_main.warning(f"Skipping {p_name}: 5m parse failed")
             return None
-        
+   
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
-            state_db, telegram_queue, correlation_id, reference_time
+            state_db, telegram_queue, correlation_id, reference_time,
+            alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
         )
 
         return result
@@ -4187,7 +4241,9 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
-    correlation_id: str, lock: RedisLock, reference_time: int) -> List[Tuple[str, Dict[str, Any]]]:
+    correlation_id: str, lock: RedisLock, reference_time: int,
+    alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    max_alerts_per_run: int = 50) -> List[Tuple[str, Dict[str, Any]]]:
 
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
@@ -4237,7 +4293,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         *[ 
             guarded_eval(
                 t, state_db, telegram_queue, correlation_id, 
-                reference_time
+                reference_time, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
             ) for t in prepared_tasks], 
         return_exceptions=True, 
     )
@@ -4319,6 +4375,9 @@ async def run_once() -> bool:
     lock_acquired = False
     lock_extension_task: Optional[asyncio.Task] = None
     alerts_sent = 0
+    MAX_ALERTS_PER_RUN = 50
+    alerts_sent_lock = asyncio.Lock()  # ADD THIS LINE
+
     
     products_map: Optional[Dict[str, dict]] = None
     pairs_to_process: List[str] = []
@@ -4499,29 +4558,15 @@ async def run_once() -> bool:
         logger_run.info("Starting evaluation phase...")
         logger_run.debug("Garbage collection disabled during evaluation loop...")
         
-        all_results = await process_pairs_with_workers(fetcher, products_map, pairs_to_process, sdb, telegram_queue, correlation_id, lock, reference_time)
+        alerts_sent_ref = [0] 
+        all_results = await process_pairs_with_workers(
+            fetcher, products_map, pairs_to_process, sdb, telegram_queue, 
+            correlation_id, lock, reference_time,
+            alerts_sent_ref, alerts_sent_lock, MAX_ALERTS_PER_RUN
+        )
         gc.collect()
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
-
-        for _, state in all_results:
-            if state.get("state") == "ALERT_SENT":
-                extra_alerts = state.get("summary", {}).get("alerts", 0)
-
-                if alerts_sent > MAX_ALERTS_PER_RUN:
-                    logger_run.warning(
-                        f"Alert limit exceeded ({alerts_sent}/{MAX_ALERTS_PER_RUN}), "
-                        f"skipping remaining alerts"
-                    )
-                    break
-
-                if alerts_sent + extra_alerts > MAX_ALERTS_PER_RUN:
-                    logger_run.warning(
-                        f"Alert limit would be exceeded, skipping {extra_alerts} alerts"
-                    )
-                    break
-
-                alerts_sent += extra_alerts
 
         if fetcher is None:
             logger_run.error("❌ Fetcher is None - cannot get stats")
@@ -4555,16 +4600,16 @@ async def run_once() -> bool:
             f"🎯🌏 RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
-            f"Alerts: {alerts_sent} | "
+            f"Alerts: {alerts_sent_ref[0]} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
         logger_run.info(summary)
 
-        if alerts_sent > MAX_ALERTS_PER_RUN:
+        if alerts_sent_ref[0] > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"
-                f"Alerts sent: {alerts_sent}\n"
+                f"Alerts sent: {alerts_sent_ref[0]}\n"
                 f"Pairs processed: {len(all_results)}\n"
                 f"Time: {format_ist_time()}"
             ))
