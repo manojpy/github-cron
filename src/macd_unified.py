@@ -1290,7 +1290,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ichimoku_future_green': np.zeros(n, dtype=bool),
             'ichimoku_future_red': np.zeros(n, dtype=bool),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
-            'rma200_5': np.full(len(data_5m.get("close", [])), np.nan, dtype=np.float64),
+            'rma200_5': np.full(n_5m, np.nan, dtype=np.float64), 
             'pivots': {},
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
@@ -1963,7 +1963,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
 
-        if abs(next_candle_ts - expected_next_ts) > 30:
+        if abs(next_candle_ts - expected_next_ts) > 60:
             return False, False, None, ( 
                 f"Gap detected: Expected next candle at {format_ist_time(expected_next_ts)} " 
                 f"but found at {format_ist_time(next_candle_ts)} " f"(diff={abs(next_candle_ts - expected_next_ts)}s). Data may be incomplete." 
@@ -2354,7 +2354,8 @@ class RedisStateStore:
             async with RedisStateStore._pool_lock:
                 existing_pool = RedisStateStore._global_pools.get(self.redis_url)
                 if existing_pool and not existing_pool.closed:
-                    await self._redis.aclose()
+                    if self._redis and self._redis is not existing_pool:
+                        await self._redis.aclose()
                     self._redis = existing_pool
                     logger.debug("Using pool created by another coroutine")
                 else:
@@ -2688,7 +2689,7 @@ class RedisLock:
                 self.token = token
                 self.acquired_by_me = True
                 self.lost = False
-                self.last_extend_time = time.time()
+                self.last_extend_time = time.monotonic()
                 
                 logger.info(
                     f"🔐 Lock acquired: {self.lock_key.replace('lock:', '')} ({self.expire}s)"
@@ -2741,7 +2742,7 @@ class RedisLock:
             )
             
             if expire_ok:
-                self.last_extend_time = time.time()
+                self.last_extend_time = time.monotonic()
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Extended Redis lock: {self.lock_key} (now {self.expire}s)")
                 return True
@@ -2772,7 +2773,7 @@ class RedisLock:
             return False
 
         extend_threshold = self.__class__.get_lock_extend_interval()       
-        elapsed = max(0, time.time() - self.last_extend_time)   
+        elapsed = time.monotonic() - self.last_extend_time 
         should_extend = elapsed >= extend_threshold
         
         if cfg.DEBUG_MODE and should_extend:
@@ -2893,8 +2894,12 @@ class TelegramQueue:
             encoded = text.encode('utf-8')
             if len(encoded) <= max_bytes:
                 return text
-            return encoded[:max_bytes].decode('utf-8', errors='ignore')
-
+            truncated = encoded[:max_bytes]
+            # Strip continuation bytes (0x80-0xBF) from the tail
+            while truncated and truncated[-1] & 0xC0 == 0x80:
+                truncated = truncated[:-1]
+            return truncated.decode('utf-8', errors='ignore')
+   
         MAX_LEN = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
         SAFETY_MARGIN = 100  # Account for URL encoding overhead
         EFFECTIVE_MAX = MAX_LEN - SAFETY_MARGIN
@@ -3003,7 +3008,6 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     
     # Return the raw composite string (do NOT wrap this in escape_markdown_v2)
     return f"{line1}\n{line2}\n{line3}"
-        
         
 def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]]) -> str:
     """Build a beautifully formatted Telegram batched alert using MarkdownV2."""
@@ -4506,36 +4510,26 @@ async def run_once() -> bool:
                         if success:
                             logger_run.debug("🔒 Lock extended successfully")
                         else:
-                            logger_run.critical(
-                                "✘ Lock extension failed - possible takeover by another instance. "
-                                "Initiating shutdown to prevent duplicate execution."
-                            )
+                            logger_run.critical("✘ Lock extension failed...")
                             try:
-                                await telegram_queue.send(escape_markdown_v2(
-                                    f"⚠️ LOCK FAILURE\nBot: {cfg.BOT_NAME}\n"
-                                    f"Time: {format_ist_time()}\n"
-                                    f"Action: Shutting down to prevent duplicate alerts"
-                                ))
+                                await telegram_queue.send(escape_markdown_v2(...))
                             except Exception as e:
                                 logger_run.error(f"Failed to send lock failure alert: {e}")
                             shutdown_event.set()
                             return
-            
-                    time_since_extend = time.time() - lock_obj.last_extend_time
+
+                    time_since_extend = time.monotonic() - lock_obj.last_extend_time
                     time_until_threshold = max(0, lock_obj.get_lock_extend_interval() - time_since_extend)
-                    sleep_time = max(30, min(180, int(time_until_threshold * 0.75)))  # 75% of remaining buffer
-            
-                    if cfg.DEBUG_MODE:
-                        logger_run.debug(
-                            f"Next lock check in {sleep_time}s | "
-                            f"Time since extend: {time_since_extend:.0f}s"
-                        )
-            
-                    await asyncio.sleep(sleep_time)
-            
+                    sleep_time = max(30, min(180, int(time_until_threshold * 0.75)))
+
+                    for _ in range(max(1, sleep_time // 5)):
+                        if shutdown_event.is_set():
+                            return
+                        await asyncio.sleep(5)
+                    await asyncio.sleep(sleep_time % 5)
+
                 except asyncio.CancelledError:
                     break
-
 
                 except Exception as e:
                     logger_run.error(f"Lock extension task error: {e}")
@@ -4715,12 +4709,13 @@ try:
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
-if __name__ == "__main__":
+
+if __name__ == "__main__":  
     aot_bridge.ensure_initialized()
     
     if not aot_bridge.is_using_aot():
         reason = aot_bridge.get_fallback_reason() or "Unknown"
-        logger.warning("��️ AOT not available, using JIT fallback. Reason: %s", reason)
+        logger.warning("❌ AOT not available, using JIT fallback. Reason: %s", reason)
         logger.warning("⚠️ Performance may be degraded. First run may be slow.")
 
         if os.getenv("REQUIRE_AOT", "false").lower() == "true":
