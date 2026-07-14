@@ -3884,7 +3884,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         extra = f"(Error: {str(e)[:100]})"
 
                     raw_alerts.append((def_["title"], extra, def_["key"]))
-                    all_state_changes.append((f"{pair_name}:{key}", "ACTIVE", None))
             
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(
@@ -3893,9 +3892,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             f"Candle: O={open_curr:.2f} C={close_curr:.2f}"
                         )
 
+
         conditional_states = previous_states
-        all_state_changes: List[Tuple[str, str, Optional[int]]] = []
-    
+
         resets_to_apply = []
         resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
@@ -3905,10 +3904,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         all_state_changes.extend(resets_to_apply)  
 
-        if all_state_changes:
-            await sdb.atomic_batch_update(all_state_changes)
-
         if wick_rejected:
+            if all_state_changes:
+                await sdb.atomic_batch_update(all_state_changes)
             logger_pair.debug(
                 f"[{pair_name}] Wick-rejected: resets applied, no new alerts sent."
             )
@@ -3963,9 +3961,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             "suppression": f"Global limit {max_alerts_per_run} reached"
                         }
                     }
-                alerts_sent_ref[0] += len(alerts_to_send)
+            alerts_sent_ref[0] += len(alerts_to_send)
 
-        if alerts_to_send:
+        for _, _, alert_key in alerts_to_send:
+            all_state_changes.append((f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None))
+
+        if all_state_changes:
+            await sdb.atomic_batch_update(all_state_changes)
+
+        if alerts_to_send:          
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
@@ -4375,9 +4379,7 @@ async def run_once() -> bool:
     telegram_queue: Optional[TelegramQueue] = None
     lock_acquired = False
     lock_extension_task: Optional[asyncio.Task] = None
-    alerts_sent = 0
-    MAX_ALERTS_PER_RUN = 50
-    alerts_sent_lock = asyncio.Lock()  # ADD THIS LINE
+    alerts_sent_lock = asyncio.Lock()
 
     
     products_map: Optional[Dict[str, dict]] = None
