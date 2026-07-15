@@ -1273,12 +1273,13 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
         try:
             n = len(data_15m.get("close", []))
-            if n == 0:
+            n_5m = len(data_5m.get("close", [])) if data_5m else 0
+            if n == 0 or n_5m == 0:
                 return None
         except Exception:
             return None
-
-        logger.warning(f"Returning NaN arrays ({n} elements) due to calculation failure")
+    
+        # FALLBACK: Return NaN-filled dict so downstream doesn't crash
         return {
             'ppo': np.full(n, np.nan, dtype=np.float64),
             'ppo_signal': np.full(n, np.nan, dtype=np.float64),
@@ -1290,7 +1291,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ichimoku_future_green': np.zeros(n, dtype=bool),
             'ichimoku_future_red': np.zeros(n, dtype=bool),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
-            'rma200_5': np.full(n_5m, np.nan, dtype=np.float64), 
+            'rma200_5': np.full(n_5m, np.nan, dtype=np.float64),
             'pivots': {},
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
@@ -1299,7 +1300,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ppo_gate': np.full(n, np.nan, dtype=np.float64),
             'ppo_gate_signal': np.full(n, np.nan, dtype=np.float64),
         }
-        
+
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
                          expected_len: int) -> Tuple[bool, Optional[str]]:  
     required_keys = ["open", "high", "low", "close"]    
@@ -2671,7 +2672,7 @@ class RedisLock:
         self.token: Optional[str] = None
         self.lost = False
         self.acquired_by_me = False
-        self.last_extend_time = 0.0
+        self.last_extend_time = time.monotonic() 
 
     async def acquire(self, timeout: float = 5.0) -> bool:  
         if not self.redis:
