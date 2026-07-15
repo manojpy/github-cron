@@ -336,7 +336,7 @@ class BotConfig(BaseModel):
                 f'HTTP_TIMEOUT={self.HTTP_TIMEOUT}s is outside recommended range (5-60s)'
             )
 
-        if len(self.PAIRS) > 25:
+        if len(self.PAIRS) > 35:
             warnings.append(
                 f'Large number of pairs ({len(self.PAIRS)}) may exceed timeout limits'
             )
