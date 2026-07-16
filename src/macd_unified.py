@@ -1221,28 +1221,39 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 _tc    = (_pivot - _bc) + _pivot
                 results['nr_cpr'] = abs(_tc - _bc)
 
+                # Anchor threshold to the SAME fixed daily close nr_cpr came from —
+                # not the live intraday close. This makes cpr_ok a true once-per-day
+                # value that cannot flip until tomorrow's daily candle closes.
+                cpr_threshold = d_close * cfg.CPR_THRESHOLD_PCT
+                results['cpr_ok'] = results['nr_cpr'] < cpr_threshold
+
                 if cfg.DEBUG_MODE:
                     logger.debug(
                         f"CPR OK | candle="
                         f"{datetime.fromtimestamp(d_ts, tz=timezone.utc).date()} "
                         f"H={d_high:.4f} L={d_low:.4f} C={d_close:.4f} "
-                        f"NR_CPR={results['nr_cpr']:.4f}"
+                        f"NR_CPR={results['nr_cpr']:.4f} | threshold={cpr_threshold:.4f} "
+                        f"| cpr_ok={results['cpr_ok']}"
                     )
 
             except CprNotReadyError as e:
                 logger.debug(f"CPR not ready, will retry next run: {e}")
                 results['nr_cpr'] = float('nan')
+                results['cpr_ok'] = False
 
             except ValueError as e:
                 logger.warning(f"CPR skipped — bad candle: {e}")
                 results['nr_cpr'] = float('nan')
+                results['cpr_ok'] = False
 
             except Exception as e:
                 logger.error(f"CPR unexpected error: {e}", exc_info=True)
                 results['nr_cpr'] = float('nan')
+                results['cpr_ok'] = False
         else:
             results['nr_cpr'] = float('nan')
- 
+            results['cpr_ok'] = True  
+
         SANITIZE_KEYS = [
             'ppo', 'ppo_signal', 'smooth_rsi', 'mmh',
             'rma50_15', 'rma200_5', 'adx',
@@ -1296,7 +1307,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'atr_short': np.full(n, np.nan, dtype=np.float64),
             'atr_long': np.full(n, np.nan, dtype=np.float64),
             'adx': np.full(n, np.nan, dtype=np.float64),
-            'nr_cpr': float('nan'),
+            'nr_cpr': float('nan'), 
+            'cpr_ok': False,  
             'ppo_gate': np.full(n, np.nan, dtype=np.float64),
             'ppo_gate_signal': np.full(n, np.nan, dtype=np.float64),
         }
@@ -3723,35 +3735,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
 
-        nr_cpr = indicators.get('nr_cpr', float('nan'))
-        if cfg.ENABLE_CPR:
-            if np.isnan(nr_cpr):
-                cpr_ok = False
-                if cfg.DEBUG_MODE:
-                    logger_pair.debug(
-                        f"[{pair_name}] CPR blocked — nr_cpr=NaN "
-                        f"(candle not ready yet or guard failure; "
-                        f"retry next run)"
-                    )
-            else:
-                cpr_threshold = close_curr * cfg.CPR_THRESHOLD_PCT
-                if nr_cpr < cpr_threshold:
-                    cpr_ok = True
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(
-                            f"[{pair_name}] CPR OK — NR_CPR={nr_cpr:.4f} "
-                            f"< threshold={cpr_threshold:.4f} "
-                            f"({cfg.CPR_THRESHOLD_PCT*100:.1f}% of {close_curr:.4f})"
-                        )
-                else:
-                    cpr_ok = False
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(
-                            f"[{pair_name}] CPR blocked — NR_CPR={nr_cpr:.4f} "
-                            f">= threshold={cpr_threshold:.4f} "
-                            f"({cfg.CPR_THRESHOLD_PCT*100:.1f}% of {close_curr:.4f}) — CPR too wide"
-                        )
-
+        cpr_ok = indicators.get('cpr_ok', not cfg.ENABLE_CPR)
+        if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
+            nr_cpr_dbg = indicators.get('nr_cpr', float('nan'))
+            logger_pair.debug(
+                f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} — "
+                f"NR_CPR={nr_cpr_dbg:.4f} (fixed daily threshold)"
+            )
         else:
             cpr_ok = True
 
