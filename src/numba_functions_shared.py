@@ -59,53 +59,27 @@ def rolling_std(close, period, responsiveness):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """
-    Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1) bars.
-    FIXED: Uses a robust tracking queue to prevent NaNs from permanently poisoning 
-    the running window sum.
-    """
+    """Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1) bars."""
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
 
-    if period <= 0 or n < period:
+    if period <= 0:
         return out
 
     window_sum = 0.0
-    nan_count = 0
     queue = np.zeros(period, dtype=np.float64)
-    queue_nan = np.zeros(period, dtype=np.bool_)
     queue_idx = 0
 
     for i in range(n):
         curr = data[i]
-        curr_is_nan = np.isnan(curr)
-
-        # Remove oldest element sliding out of the window
         if i >= period:
-            old_idx = queue_idx
-            old_val = queue[old_idx]
-            old_is_nan = queue_nan[old_idx]
-            if old_is_nan:
-                nan_count -= 1
-            else:
-                window_sum -= old_val
-
-        # Add newest element sliding into the window
-        queue[queue_idx] = 0.0 if curr_is_nan else curr
-        queue_nan[queue_idx] = curr_is_nan
-        if curr_is_nan:
-            nan_count += 1
-        else:
-            window_sum += curr
-
+            old_val = queue[queue_idx]
+            window_sum -= old_val
+        window_sum += curr
+        queue[queue_idx] = curr
         queue_idx = (queue_idx + 1) % period
-
-        # Fill output only if the entire sliding window is valid
         if i >= period - 1:
-            if nan_count == 0:
-                out[i] = window_sum / period
-            else:
-                out[i] = np.nan
+            out[i] = window_sum / period
 
     return out
 
@@ -303,11 +277,7 @@ def ema_loop_pine(data, length_float):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
-    """
-    EMA with explicit alpha parameter.
-    FIXED: Implements true Wilder's RMA/EMA startup logic. Avoids flatline backfilling 
-    by waiting until 'period' valid bars have occurred before emitting the SMA seed.
-    """
+    """EMA with explicit alpha parameter - with proper SMA initialisation for RMA."""
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
 
@@ -322,31 +292,26 @@ def ema_loop_alpha(data, alpha):
 
     period = int(1.0 / alpha + 0.5)
 
-    # Track window counts precisely to align with Pine Script's RMA startup
-    valid_count = 0
-    sma_sum = 0.0
-    init_idx = -1
-    
-    for i in range(first_valid_idx, n):
-        if not np.isnan(data[i]):
-            valid_count += 1
-            sma_sum += data[i]
-            if valid_count == period:
-                init_idx = i
-                break
+    if first_valid_idx + period <= n:
+        sma_sum = 0.0
+        valid_count = 0
+        for i in range(first_valid_idx, first_valid_idx + period):
+            if not np.isnan(data[i]):
+                sma_sum += data[i]
+                valid_count += 1
+        sma_init = sma_sum / valid_count if valid_count > 0 else data[first_valid_idx]
 
-    if init_idx == -1:
-        return out
+        for i in range(first_valid_idx, first_valid_idx + period):
+            out[i] = sma_init
 
-    # Start RMA with SMA calculation on the 'period'-th valid index
-    out[init_idx] = sma_sum / period
+        start_idx = first_valid_idx + period
+    else:
+        out[first_valid_idx] = data[first_valid_idx]
+        start_idx = first_valid_idx + 1
 
-    for i in range(init_idx + 1, n):
+    for i in range(start_idx, n):
         curr = data[i]
-        if np.isnan(curr):
-            out[i] = out[i-1]
-        else:
-            out[i] = alpha * curr + (1.0 - alpha) * out[i-1]
+        out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
 
     return out
 
@@ -356,11 +321,7 @@ def ema_loop_alpha(data, alpha):
 
 @njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
-    """
-    Kalman filter in O(n)
-    FIXED: Updates state uncertainty variables even when encountering NaNs to 
-    prevent the tracker from treating stale confidence as ground truth.
-    """
+    """Kalman filter in O(n) - FIXED: applies formula on first valid bar"""
     n = len(src)
     result = np.full(n, np.nan, dtype=np.float64)
 
@@ -387,14 +348,11 @@ def kalman_loop(src, length, R, Q):
     for i in range(first_valid_idx + 1, n):
         current = src[i]
         if np.isnan(current):
-            # FIXED: Propagate prediction but inflate uncertainty/error covariance!
-            error_est = error_est + Q_div_length
             result[i] = estimate
             continue
-        
         prediction = estimate
         kalman_gain = error_est / (error_est + error_meas)
-        estimate = prediction + kalman_gain * (current - prediction)
+        estimate = prediction + kalman_gain * (current - estimate)
         error_est = (1.0 - kalman_gain) * error_est + Q_div_length
         result[i] = estimate
 
@@ -403,23 +361,14 @@ def kalman_loop(src, length, R, Q):
 
 @njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop_safe(hlc3, volumes, timestamps):
-    """
-    FIXED: Automatically detects and normalizes Millisecond vs Second timestamps,
-    preventing intra-day VWAP resets every 86 seconds on millisecond scale formats.
-    """
     n = len(hlc3)
     vwap = np.empty(n, dtype=np.float64)
     cum_pv = 0.0
     cum_vol = 0.0
     last_day = -1
 
-    divisor = 86400
-    # Dynamically detect if timestamps are in milliseconds (e.g. > 10^10)
-    if n > 0 and timestamps[0] > 5 * 10**10:
-        divisor = 86400000
-
     for i in range(n):
-        day = timestamps[i] // divisor
+        day = timestamps[i] // 86400
         if day != last_day:
             cum_pv = 0.0
             cum_vol = 0.0
@@ -429,6 +378,7 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
         vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
 
     return vwap
+
 
 # ============================================================================
 # 5. OSCILLATORS AND TECHNICAL INDICATORS
@@ -457,12 +407,9 @@ def calculate_ppo_core(close, fast, slow, signal):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
-    """
-    Calculate RSI in O(n) with robust NaN gap handling.
-    FIXED: Baseline defaults to standard NaN to avoid false warm-up baselines.
-    """
+    """Calculate RSI in O(n) - single pass gains/losses, then EMA"""
     n = len(close)
-    rsi = np.full(n, np.nan, dtype=np.float64)
+    rsi = np.full(n, 50.0, dtype=np.float64)
 
     if n <= period:
         return rsi
@@ -493,46 +440,27 @@ def calculate_rsi_core(close, period):
 
     avg_gain = 0.0
     avg_loss = 0.0
-    valid_count = 0
-    seed_idx = -1
-
-    for i in range(first_valid_idx + 1, n):
-        if not np.isnan(close[i]):
-            valid_count += 1
-            avg_gain += gain[i]
-            avg_loss += loss[i]
-            if valid_count == period:
-                seed_idx = i
-                break
-
-    if seed_idx == -1:
-        return rsi
-
+    for i in range(first_valid_idx + 1, min(first_valid_idx + period + 1, n)):
+        avg_gain += gain[i]
+        avg_loss += loss[i]
     avg_gain /= period
     avg_loss /= period
 
-    if avg_loss == 0.0:
-        rsi[seed_idx] = 100.0 if avg_gain > 0.0 else 50.0
-    else:
-        rs = avg_gain / avg_loss
-        rsi[seed_idx] = 100.0 - (100.0 / (1.0 + rs))
-
     alpha = 1.0 / period
 
-    for i in range(seed_idx + 1, n):
+    for i in range(first_valid_idx + period, n):
         if not np.isnan(close[i]):
             avg_gain = (gain[i] * alpha) + (avg_gain * (1.0 - alpha))
             avg_loss = (loss[i] * alpha) + (avg_loss * (1.0 - alpha))
 
-            if avg_loss == 0.0:
-                rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+        if avg_loss == 0.0:
+            rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
         else:
-            rsi[i] = rsi[i-1]
+            rs = avg_gain / avg_loss
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
+
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
@@ -559,10 +487,7 @@ def calculate_atr_rma(high, low, close, period):
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
-    """
-    Calculate ADX in O(n) matching Pine Script logic.
-    FIXED: Bypasses non-vectorized np.where allocations with an optimized manual loop.
-    """
+    """Calculate ADX in O(n) using Pine Script equivalent logic."""
     n = len(high)
     adx = np.full(n, np.nan, dtype=np.float64)
 
@@ -608,24 +533,13 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
             plus_di[i] = 0.0
             minus_di[i] = 0.0
 
-    raw_adx = np.full(n, np.nan, dtype=np.float64)
-    for i in range(n):
-        p_di = plus_di[i]
-        m_di = minus_di[i]
-        if np.isnan(p_di) or np.isnan(m_di):
-            raw_adx[i] = np.nan
-        else:
-            di_sum = p_di + m_di
-            if di_sum == 0.0:
-                raw_adx[i] = 0.0
-            else:
-                raw_adx[i] = 100.0 * abs(p_di - m_di) / di_sum
+    di_diff = np.abs(plus_di - minus_di)
+    di_sum = plus_di + minus_di
+    raw_adx = np.where(di_sum == 0.0, 0.0, 100.0 * di_diff / di_sum)
 
     alpha_adx = 1.0 / float(adx_length)
     adx = ema_loop_alpha(raw_adx, alpha_adx)
     return adx
-
-
 
 
 # ============================================================================
