@@ -3801,7 +3801,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "is_green": is_green, "is_red": is_red,
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
-            "nr_cpr": nr_cpr,
+            "nr_cpr": indicators.get('nr_cpr', float('nan')),
             "cpr_ok": cpr_ok,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
