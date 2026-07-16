@@ -4274,7 +4274,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=50):
 
-    p_name, candles = task_data
+    p_name, symbol, candles = task_data
     data_15m = None
     data_5m = None
     data_daily = None
@@ -4357,7 +4357,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     prepared_tasks = []
     for pair_name, symbol in valid_tasks:
         candles = all_candles.get(symbol, {})
-        prepared_tasks.append((pair_name, candles))
+        prepared_tasks.append((pair_name, symbol, candles))
 
     logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
 
