@@ -4001,15 +4001,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             filtered_alerts.append((alert_title, alert_extra, alert_key))
         alerts_to_send = filtered_alerts
 
-                if alerts_to_send:
-                    confirmed = await confirm_candle_unchanged(
-                        fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
-                    )
-                    if not confirmed:
-                        for _, _, alert_key in alerts_to_send:
-                            await sdb.release_recent_alert(pair_name, alert_key)
-                        logger_pair.info(f"[{pair_name}] Alert(s) suppressed pending re-confirmation next run")
-                        alerts_to_send = []
+            if alerts_to_send:
+                confirmed = await confirm_candle_unchanged(
+                    fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
+                )
+                if not confirmed:
+                    for _, _, alert_key in alerts_to_send:
+                        await sdb.release_recent_alert(pair_name, alert_key)
+                    logger_pair.info(f"[{pair_name}] Alert(s) suppressed pending re-confirmation next run")
+                    alerts_to_send = []
 
         # Enforce global per-run alert limit BEFORE sending
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
