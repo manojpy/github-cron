@@ -127,7 +127,7 @@ class Constants:
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 1800))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
-    VWAP_MAX_DISTANCE_PCT = 1.0
+    VWAP_MAX_DISTANCE_PCT = 2.0
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
     CANDLE_SAFETY_BUFFER = 100
@@ -662,10 +662,8 @@ def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time:
     return d_high, d_low, d_close, candle_ts
 
 def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
-    min_deviation: float = 0.001) -> Tuple[bool, Optional[str]]:
-    """
-    Validate price crossing VWAP with minimum separation threshold.
-    """
+    min_deviation: float = 0.001, max_deviation_pct: float = Constants.VWAP_MAX_DISTANCE_PCT) -> Tuple[bool, Optional[str]]:
+ 
     vals = [close_prev, close_curr, vwap_prev, vwap_curr]
     
     if any(np.isnan(v) for v in vals):
@@ -682,6 +680,8 @@ def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, 
         sep = (close_curr - vwap_curr) / vwap_curr
         if sep < min_deviation:
             return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
+        if sep * 100 > max_deviation_pct:
+            return False, f"Separation {sep*100:.3f}% > max {max_deviation_pct:.1f}% — likely bad candle"
         return True, None
     
     else:
@@ -692,8 +692,9 @@ def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, 
         sep = (vwap_curr - close_curr) / vwap_curr
         if sep < min_deviation:
             return False, f"Separation {sep*100:.3f}% < {min_deviation*100:.1f}%"
+        if sep * 100 > max_deviation_pct:
+            return False, f"Separation {sep*100:.3f}% > max {max_deviation_pct:.1f}% — likely bad candle"
         return True, None
-
 
 def get_utc_date_key(timestamp: int) -> str:
     utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -1177,36 +1178,14 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         )
 
         if cfg.ENABLE_PIVOT and data_daily is not None:
-            last_close = float(close_15m[-1])
-            daily_high = float(data_daily["high"][-1])
-            daily_low = float(data_daily["low"][-1])
-            daily_range = daily_high - daily_low
-
-            should_calculate = False
-            if daily_range > 1e-9:
-                distance_from_high = abs(last_close - daily_high)
-                distance_from_low = abs(last_close - daily_low)
-                should_calculate = (
-                    distance_from_high < daily_range * 0.5 or
-                    distance_from_low < daily_range * 0.5
-                )
-
-            if should_calculate:
-                results['pivots'] = calculate_pivot_levels_numpy(
-                    data_daily["high"],
-                    data_daily["low"],
-                    data_daily["close"],
-                    data_daily["timestamp"],
-                    data_15m["timestamp"],
-                    reference_time
-                )
-            else:
-                results['pivots'] = {}
-                if cfg.DEBUG_MODE:
-                    logger.debug(
-                        f"Skipped pivot calc (price {last_close:.2f} far from range "
-                        f"{daily_low:.2f}-{daily_high:.2f})"
-                    )
+            results['pivots'] = calculate_pivot_levels_numpy(
+                data_daily["high"],
+                data_daily["low"],
+                data_daily["close"],
+                data_daily["timestamp"],
+                data_15m["timestamp"],
+                reference_time
+            )
         else:
             results['pivots'] = {}
 
