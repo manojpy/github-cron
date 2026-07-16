@@ -232,7 +232,7 @@ class BotConfig(BaseModel):
     CB_RECOVERY_TIMEOUT: int = Field(default=60, ge=10, le=600)  # Circuit breaker recovery wait time (seconds)
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
     MIN_CANDLES_PER_DAY: int = Field(default=94, ge=50, le=100)  # Minimum candles for complete day (94=23h for 15m candles)
-    CANDLE_MIN_AGE_BUFFER: int = Field(default=45, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
+    CANDLE_MIN_AGE_BUFFER: int = Field(default=60, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
         
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
@@ -2275,6 +2275,47 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     return last_closed_idx
 
+async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
+    ts_curr: int, o: float, h: float, l: float, c: float, reference_time: int, logger_pair: logging.Logger) -> bool:
+    """Re-fetch the just-evaluated 15m candle right before dispatch and confirm
+    OHLC hasn't shifted since the original fetch. Guards against exchange kline
+    data still settling in the seconds right after candle close."""
+    try:
+        raw = await fetcher.fetch_candles(
+            symbol, "15", limit=3, reference_time=reference_time, expected_open_15=ts_curr
+        )
+        fresh = parse_candles_to_numpy(raw)
+        if fresh is None:
+            logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — holding alert back this run")
+            return False
+
+        ts_arr = fresh["timestamp"]
+        matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 30)
+        if matches.size == 0:
+            logger_pair.warning(f"[{pair_name}] Confirmation candle {format_ist_time(ts_curr)} not found in re-fetch")
+            return False
+
+        idx = int(matches[-1])
+        fo, fh, fl, fc = (float(fresh["open"][idx]), float(fresh["high"][idx]),
+                          float(fresh["low"][idx]), float(fresh["close"][idx]))
+
+        EPS = 1e-6
+        if (abs(fo - o) > EPS or abs(fh - h) > EPS or
+            abs(fl - l) > EPS or abs(fc - c) > EPS):
+            logger_pair.warning(
+                f"[{pair_name}] 🔁 Candle CHANGED since first fetch — repaint detected, suppressing alert | "
+                f"First: O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                f"Now:   O={fo:.4f} H={fh:.4f} L={fl:.4f} C={fc:.4f}"
+            )
+            return False
+
+        return True
+
+    except Exception as e:
+        logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
+        return False
+
+
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
     for pair in cfg.PAIRS:
@@ -3387,7 +3428,7 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
     max_alerts_per_run: int = 50) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     if reference_time is None:
@@ -3960,6 +4001,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             filtered_alerts.append((alert_title, alert_extra, alert_key))
         alerts_to_send = filtered_alerts
 
+                if alerts_to_send:
+                    confirmed = await confirm_candle_unchanged(
+                        fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
+                    )
+                    if not confirmed:
+                        for _, _, alert_key in alerts_to_send:
+                            await sdb.release_recent_alert(pair_name, alert_key)
+                        logger_pair.info(f"[{pair_name}] Alert(s) suppressed pending re-confirmation next run")
+                        alerts_to_send = []
+
         # Enforce global per-run alert limit BEFORE sending
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
@@ -4220,7 +4271,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         except Exception:
             pass
 
-async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time,
+async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=50):
 
     p_name, candles = task_data
@@ -4243,7 +4294,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
    
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
-            state_db, telegram_queue, correlation_id, reference_time,
+            state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
             alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
         )
 
@@ -4312,13 +4363,13 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
-    results = await asyncio.gather( 
-        *[ 
+    results = await asyncio.gather(
+        *[
             guarded_eval(
-                t, state_db, telegram_queue, correlation_id, 
-                reference_time, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
-            ) for t in prepared_tasks], 
-        return_exceptions=True, 
+                t, state_db, telegram_queue, correlation_id,
+                reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
+            ) for t in prepared_tasks],
+        return_exceptions=True,
     )
 
     eval_elapsed = time.time() - eval_start
