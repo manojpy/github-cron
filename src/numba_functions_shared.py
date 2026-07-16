@@ -1,5 +1,5 @@
 # ============================================================================
-# Shared Numba Function Definitions - Single Source of Truth (Corrected)
+# Shared Numba Function Definitions - Single Source of Truth
 # ============================================================================
 
 import numpy as np
@@ -9,39 +9,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Define explicit Numba Type Objects to bypass signature string-parsing errors
-f8 = types.float64
-i4 = types.int32
-i8 = types.int64
-f8_arr = types.float64[:]
-i8_arr = types.int64[:]
-
-# Signatures for clean compilation and AOT exporting
-sig_sanitize_array_numba = f8_arr(f8_arr, f8)
-sig_sanitize_array_numba_parallel = f8_arr(f8_arr, f8)
-sig_rolling_std = f8_arr(f8_arr, i4, f8)
-sig_rolling_mean_numba = f8_arr(f8_arr, i4)
-sig_rolling_min_max_numba = types.Tuple((f8_arr, f8_arr))(f8_arr, i4)
-sig_calc_mmh_worm_loop = f8_arr(f8_arr, f8_arr, i8)
-sig_calc_mmh_value_loop = f8_arr(f8_arr, f8_arr, f8_arr, i4)
-sig_calc_mmh_momentum_loop = f8_arr(f8_arr, i4)
-sig_calc_mmh_momentum_smoothing = f8_arr(f8_arr, i4)
-sig_ema_loop = f8_arr(f8_arr, f8)
-sig_ema_loop_pine = f8_arr(f8_arr, f8)
-sig_ema_loop_alpha = f8_arr(f8_arr, f8)
-sig_kalman_loop = f8_arr(f8_arr, i4, f8, f8)
-sig_vwap_daily_loop_safe = f8_arr(f8_arr, f8_arr, i8_arr)
-sig_calculate_ppo_core = types.Tuple((f8_arr, f8_arr))(f8_arr, i4, i4, i4)
-sig_calculate_rsi_core = f8_arr(f8_arr, i4)
-sig_calculate_atr_rma = f8_arr(f8_arr, f8_arr, f8_arr, i4)
-sig_calculate_adx_core = f8_arr(f8_arr, f8_arr, f8_arr, i4, i4)
-
 
 # ============================================================================
 # 1. SANITIZATION
 # ============================================================================
 
-@njit(sig_sanitize_array_numba, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
     """Replace NaN and Inf with default value - O(n)"""
     out = np.empty_like(arr)
@@ -51,7 +24,7 @@ def sanitize_array_numba(arr, default):
     return out
 
 
-@njit(sig_sanitize_array_numba_parallel, nogil=True, parallel=True, cache=True)
+@njit("f8[:](f8[:], f8)", nogil=True, parallel=True, cache=True)
 def sanitize_array_numba_parallel(arr, default):
     """Replace NaN and Inf with default value (parallel) - O(n)"""
     out = np.empty_like(arr)
@@ -61,8 +34,9 @@ def sanitize_array_numba_parallel(arr, default):
     return out
 
 
-@njit(sig_rolling_std, nogil=True, cache=True)
+@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
 def rolling_std(close, period, responsiveness):
+    
     n = len(close)
     sd = np.full(n, np.nan, dtype=np.float64)
     resp = max(0.00001, min(1.0, responsiveness))
@@ -83,7 +57,7 @@ def rolling_std(close, period, responsiveness):
     return sd
 
 
-@njit(sig_rolling_mean_numba, nogil=True, cache=True)
+@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
     """
     Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1) bars.
@@ -135,8 +109,7 @@ def rolling_mean_numba(data, period):
 
     return out
 
-
-@njit(sig_rolling_min_max_numba, nogil=True, cache=True)
+@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
     """Match Pine's ta.lowest/ta.highest: output na unless full window of non-nan values."""
     n = len(arr)
@@ -185,8 +158,7 @@ def rolling_min_max_numba(arr, period):
 
     return min_arr, max_arr
 
-
-@njit(sig_calc_mmh_worm_loop, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
 def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     """Calculate worm array - Pine's exact logic"""
     worm_arr = np.empty(rows, dtype=np.float64)
@@ -204,7 +176,7 @@ def calc_mmh_worm_loop(close_arr, sd_arr, rows):
     return worm_arr
 
 
-@njit(sig_calc_mmh_value_loop, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
     """Corrected value loop with NaN propagation to match Pine Script recursion"""
     value_arr = np.full(rows, np.nan, dtype=np.float64)
@@ -231,7 +203,7 @@ def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
     return value_arr
 
 
-@njit(sig_calc_mmh_momentum_loop, nogil=True, cache=True)
+@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_momentum_loop(value_arr, rows):
     """Corrected momentum transform (log-odds)"""
     momentum = np.full(rows, np.nan, dtype=np.float64)
@@ -246,7 +218,7 @@ def calc_mmh_momentum_loop(value_arr, rows):
     return momentum
 
 
-@njit(sig_calc_mmh_momentum_smoothing, nogil=True, cache=True)
+@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calc_mmh_momentum_smoothing(momentum_arr, rows):
     """Corrected final smoothing with NaN propagation"""
     result = np.full(rows, np.nan, dtype=np.float64)
@@ -265,8 +237,9 @@ def calc_mmh_momentum_smoothing(momentum_arr, rows):
 # 2. EMA FUNCTIONS
 # ============================================================================
 
-@njit(sig_ema_loop, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, length_float):
+
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
@@ -298,8 +271,9 @@ def ema_loop(data, length_float):
     return out
 
 
-@njit(sig_ema_loop_pine, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_pine(data, length_float):
+    
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
@@ -327,7 +301,7 @@ def ema_loop_pine(data, length_float):
     return out
 
 
-@njit(sig_ema_loop_alpha, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
     """
     EMA with explicit alpha parameter.
@@ -376,12 +350,11 @@ def ema_loop_alpha(data, alpha):
 
     return out
 
-
 # ============================================================================
 # 4. KALMAN / VWAP
 # ============================================================================
 
-@njit(sig_kalman_loop, nogil=True, cache=True)
+@njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
     """
     Kalman filter in O(n)
@@ -428,7 +401,7 @@ def kalman_loop(src, length, R, Q):
     return result
 
 
-@njit(sig_vwap_daily_loop_safe, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop_safe(hlc3, volumes, timestamps):
     """
     FIXED: Automatically detects and normalizes Millisecond vs Second timestamps,
@@ -457,18 +430,18 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
 
     return vwap
 
-
 # ============================================================================
 # 5. OSCILLATORS AND TECHNICAL INDICATORS
 # ============================================================================
 
-@njit(sig_calculate_ppo_core, nogil=True, cache=True)
+@njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
     """
     Percentage Price Oscillator (PPO) matching Pine Script behavior exactly.
-    Returns (ppo, ppo_sig).
+    Returns only (ppo, ppo_sig) to avoid unpacking errors. No histogram included.
     """
     n = len(close)
+    # Using the Pine-exact EMA helper to prevent warm-up mismatches
     fast_ma = ema_loop_pine(close, float(fast))
     slow_ma = ema_loop_pine(close, float(slow))
 
@@ -482,8 +455,7 @@ def calculate_ppo_core(close, fast, slow, signal):
     ppo_sig = ema_loop_pine(ppo, float(signal))
     return ppo, ppo_sig
 
-
-@njit(sig_calculate_rsi_core, nogil=True, cache=True)
+@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
     """
     Calculate RSI in O(n) with robust NaN gap handling.
@@ -562,8 +534,7 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
-
-@njit(sig_calculate_atr_rma, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
     n = len(close)
     if n < period:
@@ -586,7 +557,7 @@ def calculate_atr_rma(high, low, close, period):
     return atr
 
 
-@njit(sig_calculate_adx_core, nogil=True, cache=True)
+@njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
     """
     Calculate ADX in O(n) matching Pine Script logic.
@@ -655,29 +626,31 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     return adx
 
 
+
+
 # ============================================================================
-# AOT EXPORT CONFIGURATION (Corrected Using Typed Signatures)
+# AOT EXPORT CONFIGURATION
 # ============================================================================
 
 EXPORT_CONFIG = {
-    'sanitize_array_numba':          sig_sanitize_array_numba,
-    'sanitize_array_numba_parallel': sig_sanitize_array_numba_parallel,
-    'rolling_std':                   sig_rolling_std,
-    'rolling_mean_numba':            sig_rolling_mean_numba,
-    'rolling_min_max_numba':         sig_rolling_min_max_numba,
-    'calc_mmh_worm_loop':            sig_calc_mmh_worm_loop,
-    'calc_mmh_value_loop':           sig_calc_mmh_value_loop,
-    'calc_mmh_momentum_loop':        sig_calc_mmh_momentum_loop,
-    'calc_mmh_momentum_smoothing':   sig_calc_mmh_momentum_smoothing,
-    'ema_loop':                      sig_ema_loop,
-    'ema_loop_pine':                 sig_ema_loop_pine,
-    'ema_loop_alpha':                sig_ema_loop_alpha,
-    'kalman_loop':                   sig_kalman_loop,
-    'vwap_daily_loop_safe':          sig_vwap_daily_loop_safe,
-    'calculate_ppo_core':            sig_calculate_ppo_core,
-    'calculate_rsi_core':            sig_calculate_rsi_core,
-    'calculate_atr_rma':             sig_calculate_atr_rma,
-    'calculate_adx_core':            sig_calculate_adx_core,
+    'sanitize_array_numba':          'f8[:](f8[:], f8)',
+    'sanitize_array_numba_parallel': 'f8[:](f8[:], f8)',
+    'rolling_std':                   'f8[:](f8[:], i4, f8)',
+    'rolling_mean_numba':            'f8[:](f8[:], i4)',
+    'rolling_min_max_numba':         'Tuple((f8[:], f8[:]))(f8[:], i4)',
+    'calc_mmh_worm_loop':            'f8[:](f8[:], f8[:], i8)',
+    'calc_mmh_value_loop':           'f8[:](f8[:], f8[:], f8[:], i4)',
+    'calc_mmh_momentum_loop':        'f8[:](f8[:], i4)',
+    'calc_mmh_momentum_smoothing':   'f8[:](f8[:], i4)',
+    'ema_loop':                      'f8[:](f8[:], f8)',
+    'ema_loop_pine':                 'f8[:](f8[:], f8)',          # NEW
+    'ema_loop_alpha':                'f8[:](f8[:], f8)', 
+    'kalman_loop':                   'f8[:](f8[:], i4, f8, f8)',
+    'vwap_daily_loop_safe':          'f8[:](f8[:], f8[:], i8[:])',
+    'calculate_ppo_core':            'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
+    'calculate_rsi_core':            'f8[:](f8[:], i4)',
+    'calculate_atr_rma':             'f8[:](f8[:], f8[:], f8[:], i4)',
+    'calculate_adx_core':            'f8[:](f8[:], f8[:], f8[:], i4, i4)',
 }
 
 __all__ = list(EXPORT_CONFIG.keys())
