@@ -146,7 +146,7 @@ PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
 
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
-    ESCAPE_MARKDOWN = re.compile(r'[_*\[\]()~`>#+-=|{}.!]')
+    ESCAPE_MARKDOWN = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]') 
     SECRET_TOKEN = re.compile(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b')
     CHAT_ID = re.compile(r'chat_id=\d+')
     REDIS_CREDS = re.compile(r'(redis://[^@]+@)')
@@ -220,6 +220,7 @@ class BotConfig(BaseModel):
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
+    MAX_ALERTS_PER_RUN: int = Field(default=50, ge=10, le=200)  
     PRODUCTS_CACHE_TTL: int = Field(default=28800)  # Products cache TTL in seconds (8h default)
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.0)  # Max distance from pivot to trigger alert (1.5%)
     RVOL_THRESHOLD: float = Field(default=1.0, ge=0.5, le=2.0)  # Volatility expansion threshold (1.0=baseline, 1.5=50% expansion required)   
@@ -1200,9 +1201,6 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 _tc    = (_pivot - _bc) + _pivot
                 results['nr_cpr'] = abs(_tc - _bc)
 
-                # Anchor threshold to the SAME fixed daily close nr_cpr came from —
-                # not the live intraday close. This makes cpr_ok a true once-per-day
-                # value that cannot flip until tomorrow's daily candle closes.
                 cpr_threshold = d_close * cfg.CPR_THRESHOLD_PCT
                 results['cpr_ok'] = results['nr_cpr'] < cpr_threshold
 
@@ -2081,9 +2079,9 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
                 )
                 return None
     
-        if data["timestamp"][-1] > 1_000_000_000_000:
+        if data["timestamp"][-1] > 1_000_000_000_000 and data["timestamp"][0] > 1_000_000_000_000:
             data["timestamp"] //= 1000
-    
+
         o, h, l, c = data["open"], data["high"], data["low"], data["close"]
     
         error_mask = (
@@ -2763,8 +2761,11 @@ class RedisLock:
                 self.acquired_by_me = False
                 return False
 
-            current_token = str(raw_val) if isinstance(raw_val, bytes) else str(raw_val)
-            
+            if isinstance(raw_val, bytes):
+                current_token = raw_val.decode('utf-8')
+            else:
+                current_token = str(raw_val)
+
             if current_token != self.token:
                 logger.warning(
                     f"Lock token mismatch on extend | "
@@ -3427,7 +3428,7 @@ async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
-    max_alerts_per_run: int = 50) -> Optional[Tuple[str, Dict[str, Any]]]:
+    max_alerts_per_run: int =cfg.MAX_ALERTS_PER_RUN) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     if reference_time is None:
         reference_time = get_trigger_timestamp()   
@@ -3985,7 +3986,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.info(f"[{pair_name}] Alert(s) suppressed pending re-confirmation next run")
                 alerts_to_send = []
 
-        # Enforce global per-run alert limit BEFORE sending
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
                 current_total = alerts_sent_ref[0]
@@ -4004,7 +4004,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             "suppression": f"Global limit {max_alerts_per_run} reached"
                         }
                     }
-            alerts_sent_ref[0] += len(alerts_to_send)
+                alerts_sent_ref[0] += len(alerts_to_send)
 
         for _, _, alert_key in alerts_to_send:
             all_state_changes.append((f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None))
@@ -4246,7 +4246,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pass
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
-                       alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=50):
+                       alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN ):
 
     p_name, symbol, candles = task_data
     data_15m = None
@@ -4286,12 +4286,12 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         data_15m = None
         data_5m = None
         data_daily = None
-        
+
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
-    pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue, 
+    pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
     correlation_id: str, lock: RedisLock, reference_time: int,
     alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
-    max_alerts_per_run: int = 50) -> List[Tuple[str, Dict[str, Any]]]:
+    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> List[Tuple[str, Dict[str, Any]]]:
 
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
@@ -4410,7 +4410,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     return valid_results
 
 async def run_once() -> bool:
-    MAX_ALERTS_PER_RUN = 50
+    MAX_ALERTS_PER_RUN = cfg.MAX_ALERTS_PER_RUN
     all_results: List[Tuple[str, Dict[str, Any]]] = []
     correlation_id = uuid.uuid4().hex[:8]
     TRACE_ID.set(correlation_id)
@@ -4552,7 +4552,9 @@ async def run_once() -> bool:
                         else:
                             logger_run.critical("✘ Lock extension failed...")
                             try:
-                                await telegram_queue.send(escape_markdown_v2(...))
+                                await telegram_queue.send(escape_markdown_v2(
+                                    f"⚠️ Lock extension failed for {lock_obj.lock_key}"
+                                ))
                             except Exception as e:
                                 logger_run.error(f"Failed to send lock failure alert: {e}")
                             shutdown_event.set()
@@ -4562,12 +4564,11 @@ async def run_once() -> bool:
                     time_until_threshold = max(0, lock_obj.get_lock_extend_interval() - time_since_extend)
                     sleep_time = max(30, min(180, int(time_until_threshold * 0.75)))
 
-                    for _ in range(max(1, sleep_time // 5)):
-                        if shutdown_event.is_set():
-                            return
-                        await asyncio.sleep(5)
-                    await asyncio.sleep(sleep_time % 5)
-
+                    try:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_time)
+                    except asyncio.TimeoutError:
+                        pass
+            
                 except asyncio.CancelledError:
                     break
 
