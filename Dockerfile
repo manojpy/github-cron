@@ -38,6 +38,7 @@ FROM deps-builder AS aot-builder
 WORKDIR /build
 
 # ✅ Copy in order of change frequency (maximize cache hits)
+COPY src/aot_version.py ./
 COPY src/numba_functions_shared.py ./
 COPY src/aot_bridge.py ./
 COPY src/aot_build.py ./
@@ -45,6 +46,7 @@ COPY src/macd_unified.py ./
 
 # ✅ Verify files exist before compilation
 RUN ls -la *.py && \
+    test -f aot_version.py || (echo "❌ Missing aot_version.py" && exit 1) && \
     test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
     test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1) && \
     test -f aot_bridge.py || (echo "❌ Missing aot_bridge.py" && exit 1) && \
@@ -99,10 +101,12 @@ WORKDIR /app/src
 # ✅ Copy Python dependencies from deps-builder
 COPY --from=deps-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-# ✅ Copy AOT binary from aot-builder
+# ✅ Copy AOT binary + version stamp from aot-builder
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
+COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version ./
 
 # ✅ Copy source files in order of change frequency
+COPY --chown=appuser:appuser src/aot_version.py ./
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
