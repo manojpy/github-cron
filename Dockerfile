@@ -99,8 +99,9 @@ WORKDIR /app/src
 # ✅ Copy Python dependencies from deps-builder
 COPY --from=deps-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-# ✅ Copy AOT binary from aot-builder
+# ✅ Copy AOT binary + version stamp from aot-builder
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
+COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version ./
 
 # ✅ Copy source files in order of change frequency
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
