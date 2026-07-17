@@ -3728,8 +3728,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} — "
                 f"NR_CPR={nr_cpr_dbg:.4f} (fixed daily threshold)"
             )
-        else:
-            cpr_ok = True
 
         if cfg.ENABLE_RVOL_ALERT:
             atr_short_val = indicators['atr_short'][i15]
