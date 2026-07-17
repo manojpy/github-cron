@@ -26,15 +26,15 @@ env:
   # This must always stay comfortably ABOVE RUN_TIMEOUT_SECONDS -- if you ever
   # change that constant in macd_unified.py, update this too.
   BOT_TIMEOUT: 660
-  # FIX: was defined but never actually used anywhere -- the job below used a
-  # hardcoded, inconsistent value instead. Now wired into `timeout-minutes` via
-  # fromJSON() so this is the single source of truth.
-  WORKFLOW_TIMEOUT: 16
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(env.WORKFLOW_TIMEOUT) }}
+    # FIX: job-level timeout-minutes cannot reference the `env` context (only
+    # `vars`/`github`/etc. are available here -- env is step-scoped). Must be
+    # a plain literal. Keep in sync with BOT_TIMEOUT above + kill-after grace
+    # + step overhead below if you ever change either.
+    timeout-minutes: 16
     permissions:
       contents: read
       packages: read
