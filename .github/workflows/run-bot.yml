@@ -20,21 +20,13 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  # FIX: was 300s, but macd_unified.py's own RUN_TIMEOUT_SECONDS is 600s. A
-  # tighter external timeout SIGTERMs the bot mid-run before its own graceful
-  # shutdown logic (Redis unlock, final log line, etc.) ever gets to execute.
-  # This must always stay comfortably ABOVE RUN_TIMEOUT_SECONDS -- if you ever
-  # change that constant in macd_unified.py, update this too.
-  BOT_TIMEOUT: 660
-  # FIX: was defined but never actually used anywhere -- the job below used a
-  # hardcoded, inconsistent value instead. Now wired into `timeout-minutes` via
-  # fromJSON() so this is the single source of truth.
-  WORKFLOW_TIMEOUT: 16
+  BOT_TIMEOUT: 300
+  WORKFLOW_TIMEOUT: 6
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(env.WORKFLOW_TIMEOUT) }}
+    timeout-minutes: 8
     permissions:
       contents: read
       packages: read
@@ -55,10 +47,8 @@ jobs:
           fi
           echo "✅ All required secrets configured"
 
-      # OPTIMIZATION: Config created from Secret (Instant) or GitHub API (Fast)
-      # Replaces slow 'git clone' actions. NOTE: there is deliberately no
-      # actions/checkout step in this workflow, so a "check repo root folder"
-      # fallback would never find anything -- removed for clarity.
+      # OPTIMIZATION: Config created from Secret (Instant) or Root Folder or GitHub API (Fast)
+      # Replaces slow 'git clone' actions
       - name: 🔨 Create Config
         env:
           # CRITICAL FIX: Map secret to env var to avoid "too many arguments" error
@@ -70,21 +60,29 @@ jobs:
             echo "✅ Config loaded from Secret (Fast)"
           else
             echo "⚠️ Secret MACD_CONFIG_JSON missing."
-            echo "🔥 Falling back to GitHub API download..."
-
-            # Use GitHub API to fetch raw file - faster/safer than git clone
-            HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3.raw" \
-              -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
-              -o config_macd.json)
-
-            if [ "$HTTP_STATUS" != "200" ]; then
-              echo "❌ Failed to load config from all sources:"
-              echo "   1. Secret MACD_CONFIG_JSON: Not available"
-              echo "   2. GitHub API download: Failed (HTTP $HTTP_STATUS)"
-              exit 1
+            echo "🔍 Checking for config_macd.json in root folder..."
+            
+            if [ -f "config_macd.json" ]; then
+              echo "✅ Config found in root folder"
+            else
+              echo "⚠️ Config not found in root folder."
+              echo "🔥 Falling back to GitHub API download..."
+              
+              # Use GitHub API to fetch raw file - faster/safer than git clone
+              HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3.raw" \
+                -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
+                -o config_macd.json)
+                
+              if [ "$HTTP_STATUS" != "200" ]; then
+                echo "❌ Failed to load config from all sources:"
+                echo "   1. Secret MACD_CONFIG_JSON: Not available"
+                echo "   2. Root folder config_macd.json: Not found"
+                echo "   3. GitHub API download: Failed (HTTP $HTTP_STATUS)"
+                exit 1
+              fi
+              echo "✅ Config downloaded via API"
             fi
-            echo "✅ Config downloaded via API"
           fi
 
       - name: 🐳 Log in to GHCR
@@ -105,7 +103,7 @@ jobs:
       # PHASE 2: BOT EXECUTION
       - name: 🚀 Execute MACD Bot
         id: bot_run
-        timeout-minutes: 12
+        timeout-minutes: 7
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
