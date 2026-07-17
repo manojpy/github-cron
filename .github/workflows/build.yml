@@ -134,8 +134,10 @@ jobs:
           FILES=(
             "/app/src/macd_unified.py"
             "/app/src/aot_bridge.py"
+            "/app/src/aot_version.py"
             "/app/src/numba_functions_shared.py"
             "/app/src/macd_aot_compiled.so"
+            "/app/src/macd_aot_compiled.version"
           )
           
           for file in "${FILES[@]}"; do
