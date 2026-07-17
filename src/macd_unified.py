@@ -1229,9 +1229,16 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 logger.error(f"CPR unexpected error: {e}", exc_info=True)
                 results['nr_cpr'] = float('nan')
                 results['cpr_ok'] = False
-        else:
+
+        elif not cfg.ENABLE_CPR:
+            # Feature intentionally disabled -> do not gate alerts on it.
             results['nr_cpr'] = float('nan')
-            results['cpr_ok'] = True  
+            results['cpr_ok'] = True
+
+        else:
+            logger.warning("CPR gate: ENABLE_CPR=True but data_daily is None — blocking alerts (fail-closed)")
+            results['nr_cpr'] = float('nan')
+            results['cpr_ok'] = False
 
         SANITIZE_KEYS = [
             'ppo', 'ppo_signal', 'smooth_rsi', 'mmh',
