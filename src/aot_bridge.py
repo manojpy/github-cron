@@ -18,12 +18,12 @@ from typing import Optional, Any, Callable, Dict, Tuple
 import importlib.util
 import numpy as np
 
-# Needed (cheap -- njit decorators don't compile until first called) to compare
-# against the version stamp written by aot_build.py, so a stale .so can be
-# detected instead of silently trusted forever. See SOURCE_VERSION comment in
-# numba_functions_shared.py.
+# Needed on every run (including the AOT-success path) to detect a stale .so.
+# Deliberately imported from the tiny, numba-free aot_version.py -- NOT from
+# numba_functions_shared.py -- so this check never forces a `numba` import
+# when AOT is active. See aot_version.py for the full rationale.
 try:
-    from numba_functions_shared import SOURCE_VERSION as _SHARED_SOURCE_VERSION
+    from aot_version import SOURCE_VERSION as _SHARED_SOURCE_VERSION
 except ImportError:
     _SHARED_SOURCE_VERSION = None
 
