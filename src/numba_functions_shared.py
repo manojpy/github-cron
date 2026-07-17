@@ -607,13 +607,13 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
 
 
 # ============================================================================
-# SOURCE VERSION -- imported from aot_version.py (see that file for why it's
-# kept separate). aot_build.py stamps this into a sidecar file next to the
-# compiled .so, and aot_bridge.py refuses to trust an AOT library whose stamp
-# doesn't match this live value -- preventing a stale compiled binary from
-# silently running old logic forever.
+# SOURCE VERSION -- bump this any time you change the LOGIC of any function in
+# EXPORT_CONFIG (not needed for signature-only or comment changes). aot_build.py
+# stamps this into a sidecar file next to the compiled .so, and aot_bridge.py
+# refuses to trust an AOT library whose stamp doesn't match this live value --
+# preventing a stale compiled binary from silently running old logic forever.
 # ============================================================================
-from aot_version import SOURCE_VERSION  # noqa: E402
+SOURCE_VERSION = "2026-07-17.1"  # nan-poisoning / warm-up / kalman-gap fixes
 
 # ============================================================================
 # AOT EXPORT CONFIGURATION
