@@ -59,7 +59,16 @@ def rolling_std(close, period, responsiveness):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1) bars."""
+    """Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1)
+    bars AND for any window that contains a NaN (full valid window required).
+
+    FIX: the previous version accumulated a plain running sum. A single NaN entering
+    the window poisoned window_sum permanently -- even after that NaN aged out of the
+    window, `window_sum -= old_val` (NaN - NaN) kept the sum (and every bar after it)
+    as NaN forever. This version tracks NaNs in the circular buffer explicitly so the
+    poisoning clears correctly once the NaN leaves the window, and correctly emits NaN
+    only while a NaN is actually inside the window.
+    """
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
 
@@ -67,19 +76,36 @@ def rolling_mean_numba(data, period):
         return out
 
     window_sum = 0.0
+    nan_count = 0
     queue = np.zeros(period, dtype=np.float64)
+    is_nan_queue = np.zeros(period, dtype=np.bool_)
     queue_idx = 0
 
     for i in range(n):
         curr = data[i]
+        curr_is_nan = np.isnan(curr)
+
         if i >= period:
             old_val = queue[queue_idx]
-            window_sum -= old_val
-        window_sum += curr
-        queue[queue_idx] = curr
+            old_is_nan = is_nan_queue[queue_idx]
+            if old_is_nan:
+                nan_count -= 1
+            else:
+                window_sum -= old_val
+
+        if curr_is_nan:
+            nan_count += 1
+            queue[queue_idx] = 0.0
+            is_nan_queue[queue_idx] = True
+        else:
+            window_sum += curr
+            queue[queue_idx] = curr
+            is_nan_queue[queue_idx] = False
+
         queue_idx = (queue_idx + 1) % period
+
         if i >= period - 1:
-            out[i] = window_sum / period
+            out[i] = np.nan if nan_count > 0 else (window_sum / period)
 
     return out
 
@@ -277,7 +303,19 @@ def ema_loop_pine(data, length_float):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
-    """EMA with explicit alpha parameter - with proper SMA initialisation for RMA."""
+    """EMA with explicit alpha parameter - with proper SMA initialisation for RMA.
+
+    FIX: the previous version wrote the same fabricated `sma_init` constant into
+    EVERY position of the seed window, including positions where the source data
+    itself was NaN (a real gap). That produced a false flatline during warm-up on
+    sparse data. Now, seed-window bars with real data still get `sma_init` (this is
+    unchanged from before, and is the behavior already validated against Pine's
+    ta.rma/ta.ema seeding), but seed-window bars that were genuinely NaN in the
+    source stay NaN in the output instead of being papered over. Recursion after
+    the seed window uses a separate `prev` anchor (not out[i-1]) so this doesn't
+    break the EMA chain when the last seed bar happens to be one of those NaNs.
+    When there are no NaNs in the seed window, output is identical to before.
+    """
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
 
@@ -302,16 +340,24 @@ def ema_loop_alpha(data, alpha):
         sma_init = sma_sum / valid_count if valid_count > 0 else data[first_valid_idx]
 
         for i in range(first_valid_idx, first_valid_idx + period):
-            out[i] = sma_init
+            if not np.isnan(data[i]):
+                out[i] = sma_init
+            # else: leave as NaN -- no fabricated flatline over a real data gap
 
         start_idx = first_valid_idx + period
+        prev = sma_init  # internal recursion anchor, independent of what's exposed in out[]
     else:
         out[first_valid_idx] = data[first_valid_idx]
         start_idx = first_valid_idx + 1
+        prev = data[first_valid_idx]
 
     for i in range(start_idx, n):
         curr = data[i]
-        out[i] = out[i-1] if np.isnan(curr) else (alpha * curr + (1.0 - alpha) * out[i-1])
+        if np.isnan(curr):
+            out[i] = prev
+        else:
+            out[i] = alpha * curr + (1.0 - alpha) * prev
+        prev = out[i]
 
     return out
 
@@ -348,6 +394,14 @@ def kalman_loop(src, length, R, Q):
     for i in range(first_valid_idx + 1, n):
         current = src[i]
         if np.isnan(current):
+            # FIX: predict-only step during a data gap. Previously error_est was
+            # frozen while a gap was skipped, so the filter stayed artificially
+            # confident in a stale estimate and was slow to react once real data
+            # resumed. Growing error_est here (same process-noise term used on a
+            # normal step) lets confidence decay across the gap, so kalman_gain is
+            # naturally higher on the next real observation. No effect when there
+            # are no gaps, since this branch is only reached on NaN input.
+            error_est = error_est + Q_div_length
             result[i] = estimate
             continue
         prediction = estimate
@@ -407,9 +461,19 @@ def calculate_ppo_core(close, fast, slow, signal):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
-    """Calculate RSI in O(n) - single pass gains/losses, then EMA"""
+    """Calculate RSI in O(n) - single pass gains/losses, then EMA.
+
+    FIX: default fill changed from 50.0 to NaN. Bars before RSI has enough history
+    now correctly report "no value yet" instead of a fabricated midline reading.
+    This matters because downstream chains (e.g. smooth_rsi = kalman_loop(rsi, ...))
+    treat NaN as a genuine gap (see kalman_loop fix above) instead of treating the
+    old fake 50.0 as a real observation that anchors the filter during warm-up.
+    Callers that need a non-NaN array for display/alerting already sanitize the
+    final output back to 50.0 downstream, so this only affects the intermediate
+    warm-up bars, not the values used once the indicator is actually live.
+    """
     n = len(close)
-    rsi = np.full(n, 50.0, dtype=np.float64)
+    rsi = np.full(n, np.nan, dtype=np.float64)
 
     if n <= period:
         return rsi
@@ -541,6 +605,15 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     adx = ema_loop_alpha(raw_adx, alpha_adx)
     return adx
 
+
+# ============================================================================
+# SOURCE VERSION -- bump this any time you change the LOGIC of any function in
+# EXPORT_CONFIG (not needed for signature-only or comment changes). aot_build.py
+# stamps this into a sidecar file next to the compiled .so, and aot_bridge.py
+# refuses to trust an AOT library whose stamp doesn't match this live value --
+# preventing a stale compiled binary from silently running old logic forever.
+# ============================================================================
+SOURCE_VERSION = "2026-07-17.1"  # nan-poisoning / warm-up / kalman-gap fixes
 
 # ============================================================================
 # AOT EXPORT CONFIGURATION

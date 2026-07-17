@@ -18,6 +18,15 @@ from typing import Optional, Any, Callable, Dict, Tuple
 import importlib.util
 import numpy as np
 
+# Needed (cheap -- njit decorators don't compile until first called) to compare
+# against the version stamp written by aot_build.py, so a stale .so can be
+# detected instead of silently trusted forever. See SOURCE_VERSION comment in
+# numba_functions_shared.py.
+try:
+    from numba_functions_shared import SOURCE_VERSION as _SHARED_SOURCE_VERSION
+except ImportError:
+    _SHARED_SOURCE_VERSION = None
+
 # Suppress Numba/pcparser warnings at import time
 #warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*parsing methods must have __doc__.*")
 #warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -93,9 +102,14 @@ def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
             if p.exists():
                 return p
 
-        # Wildcard fallback for ABI-tagged names
+        # Wildcard fallback for ABI-tagged names. FIX: glob() order is not
+        # guaranteed, so if more than one matching build artifact is ever left in
+        # the same directory (e.g. a stale file from a prior build), the old
+        # `found[0]` could silently load the wrong (stale) library. Sort by mtime
+        # descending so the most recently built .so always wins.
         found = list(search_dir.glob(f"{module_name}*{extension}"))
         if found:
+            found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             return found[0]
 
     return None
@@ -117,6 +131,33 @@ def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") 
         return None
 
 
+def check_aot_version_stamp(library_path: Path, module_name: str) -> Tuple[bool, Optional[str]]:
+    """Compare the `.version` sidecar written by aot_build.py against the live
+    SOURCE_VERSION in numba_functions_shared.py.
+
+    Returns (ok, reason). A missing sidecar is treated as unverifiable-but-OK
+    (not fatal), so upgrading aot_bridge.py doesn't break a build made before
+    version stamping existed -- but any mismatch is treated as a hard failure,
+    because that's exactly the "stale .so silently running old logic" scenario
+    this check exists to catch.
+    """
+    version_path = library_path.parent / f"{module_name}.version"
+    if not version_path.exists():
+        return True, None
+    if _SHARED_SOURCE_VERSION is None:
+        return True, None
+
+    stamped = version_path.read_text().strip()
+    if stamped != _SHARED_SOURCE_VERSION:
+        return False, (
+            f"AOT library is STALE: compiled from SOURCE_VERSION '{stamped}' but the "
+            f"current source is '{_SHARED_SOURCE_VERSION}'. Rebuild with aot_build.py "
+            f"and redeploy the .so -- falling back to JIT in the meantime so results "
+            f"stay correct."
+        )
+    return True, None
+
+
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
     """Attempt to initialize AOT module and verify ALL required functions exist.
 
@@ -130,6 +171,11 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
     library_path = find_aot_library(module_name)
     if library_path is None:
         return False, f"AOT library {module_name}{get_library_extension()} not found"
+
+    version_ok, version_reason = check_aot_version_stamp(library_path, module_name)
+    if not version_ok:
+        warnings.warn(version_reason)
+        return False, version_reason
 
     _aot_module = load_aot_module(library_path, module_name)
     if _aot_module is None:

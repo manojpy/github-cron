@@ -31,12 +31,30 @@ except ImportError as e:
     sys.exit(1)
 
 
+def write_version_stamp(output_dir: Path, module_name: str) -> Path:
+    """Write a sidecar file recording the SOURCE_VERSION this library was built
+    from, so aot_bridge.py can detect a stale .so at load time (see FIX note in
+    numba_functions_shared.py above SOURCE_VERSION)."""
+    version_path = output_dir / f"{module_name}.version"
+    version_path.write_text(shared.SOURCE_VERSION.strip())
+    print(f"🏷️  Stamped version: {shared.SOURCE_VERSION} -> {version_path.name}")
+    return version_path
+
+
 def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
     """Execute the compilation process."""
     print(f"🛠️ Starting compilation for module: {module_name}...")
     
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove old build artifacts first so a stale .so can never linger alongside
+    # the new one (belt-and-suspenders with the mtime-sort fix in aot_bridge.py's
+    # find_aot_library()).
+    ext = ".pyd" if platform.system() == "Windows" else ".so"
+    for old_file in output_dir.glob(f"{module_name}*{ext}"):
+        print(f"🧹 Removing stale artifact: {old_file.name}")
+        old_file.unlink()
     
     # Set the target filename (Numba handles extensions based on platform)
     output_base = output_dir / module_name
@@ -113,13 +131,16 @@ def main():
 
         # Step 2: Run Compilation
         library_path = compile_module(cc, output_dir, args.module_name)
-        
-        # Step 3: Show artifacts
+
+        # Step 3: Stamp the version so aot_bridge.py can detect staleness later
+        write_version_stamp(output_dir, args.module_name)
+
+        # Step 4: Show artifacts
         print(f"\n📂 Build artifacts in {output_dir}:")
         size_mb = library_path.stat().st_size / 1024 / 1024
         print(f"   {library_path.name} ({size_mb:.2f} MB)")
         
-        # Step 4: Verification
+        # Step 5: Verification
         if args.verify:
             verify_compilation(library_path)
         
