@@ -217,6 +217,7 @@ class BotConfig(BaseModel):
     ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Ichimoku base line length")
     ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Ichimoku leading span B length")
     ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Ichimoku cloud forward displacement")
+    ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -1133,9 +1134,9 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results["vwap"] = np.full(n_15m, np.nan, dtype=np.float64)
 
         results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
-        
+
         # ── Ichimoku Cloud (23, 65, 130, 65) ──
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
+        if cfg.ICHIMOKU_CLOUD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED:
             ichimoku = calculate_ichimoku_numpy(
                 data_15m["high"], data_15m["low"], close_15m,
                 cfg.ICHIMOKU_CONVERSION_PERIODS,
@@ -1147,11 +1148,16 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results['ichimoku_cloud_lower'] = ichimoku['cloud_lower']
             results['ichimoku_future_green'] = ichimoku['future_green']
             results['ichimoku_future_red'] = ichimoku['future_red']
+            results['ichimoku_conversion_line'] = ichimoku['conversion_line']
+            results['ichimoku_base_line'] = ichimoku['base_line']
         else:
             results['ichimoku_cloud_upper'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['ichimoku_cloud_lower'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['ichimoku_future_green'] = np.zeros(n_15m, dtype=bool)
             results['ichimoku_future_red'] = np.zeros(n_15m, dtype=bool)
+            results['ichimoku_conversion_line'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['ichimoku_base_line'] = np.full(n_15m, np.nan, dtype=np.float64)
+
 
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
@@ -1285,6 +1291,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ichimoku_cloud_lower': np.full(n, np.nan, dtype=np.float64),
             'ichimoku_future_green': np.zeros(n, dtype=bool),
             'ichimoku_future_red': np.zeros(n, dtype=bool),
+            'ichimoku_conversion_line': np.full(n, np.nan, dtype=np.float64),
+            'ichimoku_base_line': np.full(n, np.nan, dtype=np.float64),
             'rma50_15': np.full(n, np.nan, dtype=np.float64),
             'rma200_5': np.full(n_5m, np.nan, dtype=np.float64),
             'pivots': {},
@@ -3601,6 +3609,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ichimoku_cloud_lower = indicators["ichimoku_cloud_lower"]
         ichimoku_future_green = indicators["ichimoku_future_green"]
         ichimoku_future_red   = indicators["ichimoku_future_red"]
+        ichimoku_conversion_line = indicators["ichimoku_conversion_line"]
+        ichimoku_base_line       = indicators["ichimoku_base_line"]
 
         rma50_15 = indicators["rma50_15"]
         rma200_5 = indicators["rma200_5"]
@@ -3620,6 +3630,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         cloud_up   = future_green and above_cloud
         cloud_down = future_red   and below_cloud
+
+        tk_conversion_curr = ichimoku_conversion_line[i15]
+        tk_base_curr = ichimoku_base_line[i15]
+        tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
+
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_valid:
+            tk_guard_ok_buy  = tk_conversion_curr >= tk_base_curr
+            tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
+        else:
+            tk_guard_ok_buy  = True
+            tk_guard_ok_sell = True
 
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
             logger_pair.warning(
@@ -3747,8 +3768,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ppo_gate_ok_buy = True
             ppo_gate_ok_sell = True
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_buy)
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_sell)
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_buy  and tk_guard_ok_buy)
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_sell and tk_guard_ok_sell)
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3777,6 +3798,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ppo_gate_curr": ppo_gate_curr, "ppo_gate_prev": ppo_gate_prev,
             "ppo_gate_sig_curr": ppo_gate_sig_curr, "ppo_gate_sig_prev": ppo_gate_sig_prev,
             "cloud_up": cloud_up, "cloud_down": cloud_down,
+            "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
+            "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
             "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell,
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available, "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
