@@ -1811,7 +1811,7 @@ class DataFetcher:
 
                         if diff > Constants.API_TIMESTAMP_TOLERANCE_SEC:
                             if last_open < expected_open_ts:
-                                logger.warning(
+                                logger.debug(
                                     f"⚠️ API DELAY | {symbol} {resolution} | "
                                     f"Expected: {format_ist_time(expected_open_ts)} | "
                                     f"Got: {format_ist_time(last_open)} "
@@ -2225,7 +2225,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         last5_list = [format_ist_time(t) for t in ts_normalized[-5:]]
         last5_str = str(last5_list)
         
-        logger.warning(
+        logger.debug(
             "[%s] Target %dm open %s not found. last_ts=%s count=%s last5=%s",
             pair_name or "?", 
             int(interval_minutes), 
