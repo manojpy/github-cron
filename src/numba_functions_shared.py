@@ -113,6 +113,8 @@ def rolling_mean_numba(data, period):
 def rolling_min_max_numba(arr, period):
     """Match Pine's ta.lowest/ta.highest: output na unless full window of non-nan values."""
     n = len(arr)
+    if period <= 0:
+        return np.full(n, np.nan, dtype=np.float64), np.full(n, np.nan, dtype=np.float64)
     min_arr = np.full(n, np.nan, dtype=np.float64)
     max_arr = np.full(n, np.nan, dtype=np.float64)
 

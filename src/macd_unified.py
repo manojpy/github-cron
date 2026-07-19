@@ -920,7 +920,7 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
             'lead_line2': np.full(n, np.nan, dtype=np.float64),
         }
 
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 55, responsiveness: float = 0.9) -> np.ndarray:  
+def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:  
     try:
         if close is None or len(close) < period:
             return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
