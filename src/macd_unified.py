@@ -3768,8 +3768,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ppo_gate_ok_buy = True
             ppo_gate_ok_sell = True
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_buy  and tk_guard_ok_buy)
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_sell and tk_guard_ok_sell)
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok and (ppo_gate_ok_buy  or tk_guard_ok_buy))
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok and ppo_gate_ok_sell or tk_guard_ok_sell))
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
