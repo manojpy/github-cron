@@ -200,6 +200,8 @@ class BotConfig(BaseModel):
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
+    ENABLE_CPR_ADX_RVOL_BYPASS: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
+    ADX_RISING_LOOKBACK: int = Field(default=1, ge=1, le=5, description="Bars back to confirm ADX is rising")
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
@@ -3743,13 +3745,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
 
+        adx_rising = False
+        if cfg.ENABLE_CPR_ADX_RVOL_BYPASS:
+            lb = cfg.ADX_RISING_LOOKBACK
+            if i15 >= lb:
+                adx_prev_val = indicators['adx'][i15 - lb]
+                if not np.isnan(adx_prev_val):
+                    adx_rising = adx_val > adx_prev_val
+
         cpr_ok = indicators.get('cpr_ok', not cfg.ENABLE_CPR)
-        if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
-            nr_cpr_dbg = indicators.get('nr_cpr', float('nan'))
-            logger_pair.debug(
-                f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} — "
-                f"NR_CPR={nr_cpr_dbg:.4f} (fixed daily threshold)"
-            )
 
         if cfg.ENABLE_RVOL_ALERT:
             atr_short_val = indicators['atr_short'][i15]
@@ -3761,6 +3765,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             rvol_ok = True
 
+        cpr_bypass_ok = (
+            cfg.ENABLE_CPR_ADX_RVOL_BYPASS
+            and adx_ok and adx_rising and rvol_ok
+        )
+        effective_cpr_ok = cpr_ok or cpr_bypass_ok
+
+        if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
+            nr_cpr_dbg = indicators.get('nr_cpr', float('nan'))
+            logger_pair.debug(
+                f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} "
+                f"(bypass={cpr_bypass_ok}, adx={adx_val:.1f} rising={adx_rising}) "
+                f"NR_CPR={nr_cpr_dbg:.4f}"
+            )
+
         if cfg.ENABLE_PPO_GATE and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
             ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
             ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
@@ -3768,8 +3786,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ppo_gate_ok_buy = True
             ppo_gate_ok_sell = True
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and cpr_ok and (ppo_gate_ok_buy  or tk_guard_ok_buy))
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and cpr_ok and (ppo_gate_ok_sell or tk_guard_ok_sell))
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and effective_cpr_ok and (ppo_gate_ok_buy  or tk_guard_ok_buy))
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and effective_cpr_ok and (ppo_gate_ok_sell or tk_guard_ok_sell))
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3810,7 +3828,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
             "nr_cpr": indicators.get('nr_cpr', float('nan')),
-            "cpr_ok": cpr_ok,
+            "cpr_ok": effective_cpr_ok,
+            "cpr_bypass_ok": cpr_bypass_ok,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -4456,7 +4475,14 @@ async def run_once() -> bool:
         f"🎯 Run started | Correlation ID: {correlation_id} | "
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
-
+    if cfg.ENABLE_CPR:
+        bypass_status = "ON" if cfg.ENABLE_CPR_ADX_RVOL_BYPASS else "OFF"
+        logger_run.info(
+            f"CPR gate active | threshold={cfg.CPR_THRESHOLD_PCT} | "
+            f"ADX+RVOL bypass={bypass_status}"
+        )
+    else:
+        logger_run.info("CPR gate disabled")
     try:
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
