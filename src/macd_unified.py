@@ -162,7 +162,7 @@ class BotConfig(BaseModel):
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
-    PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "BTCUSD", "LINKUSD", "ARBUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BCHUSD", "WLDUSD" ], min_length=1) 
+    PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "MOVEUSD", "LINKUSD", "ARBUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BCHUSD", "BILLUSD", "WLDUSD" ], min_length=1) 
     PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
     PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
     PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
@@ -3786,8 +3786,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ppo_gate_ok_buy = True
             ppo_gate_ok_sell = True
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and effective_cpr_ok and (ppo_gate_ok_buy  or tk_guard_ok_buy))
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and effective_cpr_ok and (ppo_gate_ok_sell or tk_guard_ok_sell))
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and effective_cpr_ok and ppo_gate_ok_buy  and tk_guard_ok_buy)
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and effective_cpr_ok and ppo_gate_ok_sell and tk_guard_ok_sell)
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
