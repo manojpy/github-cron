@@ -168,7 +168,7 @@ class BotConfig(BaseModel):
     PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
-    MMH_PERIOD: int = Field(default=144, ge=20, le=200, description="MMH calculation period")  
+    MMH_PERIOD: int = Field(default=55, ge=20, le=200, description="MMH calculation period")  
     ENABLE_PPO_GATE: bool = Field(default=True, description="Enable PPO(32,84,20) as trend gate")
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
     PPO_GATE_SLOW: int = Field(default=84, ge=2, le=200, description="Gate PPO slow period")
@@ -922,7 +922,7 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
             'lead_line2': np.full(n, np.nan, dtype=np.float64),
         }
 
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 144, responsiveness: float = 0.9) -> np.ndarray:  
+def calculate_magical_momentum_hist(close: np.ndarray, period: int = 55, responsiveness: float = 0.9) -> np.ndarray:  
     try:
         if close is None or len(close) < period:
             return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
