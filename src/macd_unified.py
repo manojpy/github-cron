@@ -173,8 +173,12 @@ class BotConfig(BaseModel):
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
     PPO_GATE_SLOW: int = Field(default=84, ge=2, le=200, description="Gate PPO slow period")
     PPO_GATE_SIGNAL: int = Field(default=20, ge=1, le=50, description="Gate PPO signal period")
-    SRSI_RSI_LEN: int = 21
-    SRSI_KALMAN_LEN: int = 5
+    RSI_GUARD_ENABLED: bool = Field(default=False, description="Enable RSI(89) Kalman-smoothed vs EMA(50) as an alternate trend gate, OR'd with PPO gate")
+    RSI_GUARD_RSI_LEN: int = Field(default=89, ge=2, le=200, description="RSI Guard RSI length")
+    RSI_GUARD_KALMAN_LEN: int = Field(default=9, ge=1, le=50, description="RSI Guard Kalman smoothing length")
+    RSI_GUARD_EMA_LEN: int = Field(default=50, ge=1, le=200, description="RSI Guard EMA length applied to Kalman-smoothed RSI")
+    SRSI_RSI_LEN: int = 14
+    SRSI_KALMAN_LEN: int = 9
     SRSI_EMA_LEN: int = 5
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
@@ -922,6 +926,36 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
             'lead_line2': np.full(n, np.nan, dtype=np.float64),
         }
 
+def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    try:
+        if close is None or len(close) < rsi_len + kalman_len + ema_len:
+            default_len = len(close) if close is not None else 1
+            logger.warning(
+                f"RSI Guard: Insufficient data (len={default_len}, "
+                f"required={rsi_len + kalman_len + ema_len})"
+            )
+            return (np.full(default_len, np.nan, dtype=np.float64),
+                    np.full(default_len, np.nan, dtype=np.float64))
+
+        rsi = calculate_rsi_core(close, rsi_len)
+        smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
+        rsi_ema = ema_loop(smooth_rsi, float(ema_len))
+
+        if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
+            smooth_rsi = sanitize_array_numba_parallel(smooth_rsi, np.nan)
+            rsi_ema    = sanitize_array_numba_parallel(rsi_ema, np.nan)
+        else:
+            smooth_rsi = sanitize_array_numba(smooth_rsi, np.nan)
+            rsi_ema    = sanitize_array_numba(rsi_ema, np.nan)
+
+        return smooth_rsi, rsi_ema
+
+    except Exception as e:
+        logger.error(f"RSI Guard calculation failed: {e}")
+        default_len = len(close) if close is not None else 1
+        return (np.full(default_len, np.nan, dtype=np.float64),
+                np.full(default_len, np.nan, dtype=np.float64))
+
 def calculate_magical_momentum_hist(close: np.ndarray, period: int = 55, responsiveness: float = 0.9) -> np.ndarray:  
     try:
         if close is None or len(close) < period:
@@ -1113,6 +1147,16 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
         )
 
+        if cfg.RSI_GUARD_ENABLED:
+            rsi_guard_smooth, rsi_guard_ema = calculate_rsi_guard_numpy(
+                close_15m, cfg.RSI_GUARD_RSI_LEN, cfg.RSI_GUARD_KALMAN_LEN, cfg.RSI_GUARD_EMA_LEN
+            )
+            results['rsi_guard_smooth'] = rsi_guard_smooth
+            results['rsi_guard_ema'] = rsi_guard_ema
+        else:
+            results['rsi_guard_smooth'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['rsi_guard_ema'] = np.full(n_15m, np.nan, dtype=np.float64)
+
         if cfg.ENABLE_VWAP:
             high_15m = data_15m["high"]
             low_15m = data_15m["low"]
@@ -1251,6 +1295,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'rma50_15', 'rma200_5', 'adx',
             'atr_short', 'atr_long',
             'ppo_gate', 'ppo_gate_signal',
+            'rsi_guard_smooth', 'rsi_guard_ema',
         ]
 
         for key in SANITIZE_KEYS:
@@ -1305,6 +1350,8 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'cpr_ok': False,  
             'ppo_gate': np.full(n, np.nan, dtype=np.float64),
             'ppo_gate_signal': np.full(n, np.nan, dtype=np.float64),
+            'rsi_guard_smooth': np.full(n, np.nan, dtype=np.float64),
+            'rsi_guard_ema': np.full(n, np.nan, dtype=np.float64),
         }
 
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
@@ -3614,6 +3661,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rma200_5 = indicators["rma200_5"]
         ppo_gate_arr = indicators["ppo_gate"]
         ppo_gate_signal_arr = indicators["ppo_gate_signal"] 
+        rsi_guard_smooth_arr = indicators["rsi_guard_smooth"]
+        rsi_guard_ema_arr = indicators["rsi_guard_ema"]
         piv = indicators["pivots"]
         close_prev = close_15m[i15 - 1] 
 
@@ -3662,8 +3711,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
         ppo_gate_sig_curr = ppo_gate_signal_arr[i15]
         ppo_gate_sig_prev = ppo_gate_signal_arr[i15 - 1] if i15 >= 1 else ppo_gate_signal_arr[i15]
+        rsi_guard_smooth_curr = rsi_guard_smooth_arr[i15]
+        rsi_guard_ema_curr = rsi_guard_ema_arr[i15]
 
-    
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
             'rsi_curr': rsi_curr, 'rsi_prev': rsi_prev,
@@ -3775,15 +3825,36 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"NR_CPR={nr_cpr_dbg:.4f}"
             )
 
-        if cfg.ENABLE_PPO_GATE and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
-            ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
-            ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
+        if cfg.ENABLE_PPO_GATE:
+            if not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
+                ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
+                ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
+            else:
+                ppo_gate_ok_buy = False 
+                ppo_gate_ok_sell = False
         else:
-            ppo_gate_ok_buy = not cfg.ENABLE_PPO_GATE
-            ppo_gate_ok_sell = not cfg.ENABLE_PPO_GATE
+            ppo_gate_ok_buy = None 
+            ppo_gate_ok_sell = None
 
-        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and effective_cpr_ok and ppo_gate_ok_buy  and tk_guard_ok_buy)
-        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and effective_cpr_ok and ppo_gate_ok_sell and tk_guard_ok_sell)
+        if cfg.RSI_GUARD_ENABLED:
+            if not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_ema_curr):
+                rsi_guard_ok_buy = rsi_guard_smooth_curr > rsi_guard_ema_curr
+                rsi_guard_ok_sell = rsi_guard_smooth_curr < rsi_guard_ema_curr
+            else:
+                rsi_guard_ok_buy = False
+                rsi_guard_ok_sell = False
+        else:
+            rsi_guard_ok_buy = None
+            rsi_guard_ok_sell = None
+
+        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy) if g is not None]
+        trend_gate_ok_buy = any(active_buy_gates) if active_buy_gates else True
+
+        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell) if g is not None]
+        trend_gate_ok_sell = any(active_sell_gates) if active_sell_gates else True
+
+        buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and effective_cpr_ok and trend_gate_ok_buy  and tk_guard_ok_buy)
+        sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and effective_cpr_ok and trend_gate_ok_sell and tk_guard_ok_sell)
 
         if not has_valid_mmh:
             if cfg.DEBUG_MODE:
@@ -3811,6 +3882,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "rma50_15_val": rma50_15_val, "rma200_5_val": rma200_5_val,
             "ppo_gate_curr": ppo_gate_curr, "ppo_gate_prev": ppo_gate_prev,
             "ppo_gate_sig_curr": ppo_gate_sig_curr, "ppo_gate_sig_prev": ppo_gate_sig_prev,
+            "rsi_guard_smooth_curr": rsi_guard_smooth_curr, "rsi_guard_ema_curr": rsi_guard_ema_curr,
+            "trend_gate_ok_buy": trend_gate_ok_buy, "trend_gate_ok_sell": trend_gate_ok_sell, 
             "cloud_up": cloud_up, "cloud_down": cloud_down,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
@@ -4220,7 +4293,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append(f"PPO Gate buy: Gate({ppo_gate_curr:.2f}) <= Signal({ppo_gate_sig_curr:.2f})")
             if not ppo_gate_ok_sell:
                 reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
-   
+
+        if cfg.RSI_GUARD_ENABLED:
+            if not rsi_guard_ok_buy:
+                reasons.append(f"RSI Guard buy: RSI({rsi_guard_smooth_curr:.2f}) <= EMA({rsi_guard_ema_curr:.2f})")
+            if not rsi_guard_ok_sell:
+                reasons.append(f"RSI Guard sell: RSI({rsi_guard_smooth_curr:.2f}) >= EMA({rsi_guard_ema_curr:.2f})")
+
         failed_conditions = [
             name for name, val in [
                 ("buy_common", buy_common),
@@ -4711,7 +4790,7 @@ async def run_once() -> bool:
         return True
 
     except asyncio.TimeoutError:
-        logger_run.error("⏱️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
+        logger_run.error("⏱�� Run timed out - exceeded RUN_TIMEOUT_SECONDS")
         return False
 
     except asyncio.CancelledError:
