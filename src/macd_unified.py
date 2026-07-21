@@ -3279,17 +3279,13 @@ def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -
     buy_common = context.get("buy_common", False)
     sell_common = context.get("sell_common", False)
 
-    if (mmh_curr > 1e-8) and (mmh_curr <= mmh_m1):
-        if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
+    if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
+        if not buy_common or mmh_curr <= 1e-8 or mmh_curr <= mmh_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS["mmh_buy"], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
 
-    if (mmh_curr < -1e-8) and (mmh_curr >= mmh_m1):
-        if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
+    if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
+        if not sell_common or mmh_curr >= -1e-8 or mmh_curr >= mmh_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS["mmh_sell"], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
     return resets
 
@@ -4028,6 +4024,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.info(f"[{pair_name}] Alert(s) suppressed pending re-confirmation next run")
                 alerts_to_send = []
 
+        # Build new alert activations separately — do NOT add to all_state_changes yet
+        new_alert_activations = []
+        for _, _, alert_key in alerts_to_send:
+            new_alert_activations.append(
+                (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
+            )
+
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
                 current_total = alerts_sent_ref[0]
@@ -4036,6 +4039,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
                         f"skipping {len(alerts_to_send)} alerts for {pair_name}"
                     )
+                    # Persist ONLY resets (all_state_changes has no ACTIVE yet)
+                    if all_state_changes:
+                        await sdb.atomic_batch_update(all_state_changes)
+                    # Release dedup claims so these alerts can retry next run
+                    for _, _, alert_key in alerts_to_send:
+                        await sdb.release_recent_alert(pair_name, alert_key)
                     return pair_name, {
                         "state": "LIMIT_REACHED",
                         "ts": int(time.time()),
@@ -4048,9 +4057,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     }
                 alerts_sent_ref[0] += len(alerts_to_send)
 
-        for _, _, alert_key in alerts_to_send:
-            all_state_changes.append((f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None))
-
+        # Now safe to persist activations
+        all_state_changes.extend(new_alert_activations)
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
 
