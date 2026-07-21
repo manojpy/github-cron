@@ -28,7 +28,7 @@
 
   "RMA_50_PERIOD": 50,
   "RMA_200_PERIOD": 200,
-  "MMH_PERIOD": 144,
+  "MMH_PERIOD": 55,
 
   "ENABLE_PPO_GATE": true,
   "PPO_GATE_FAST": 32,
