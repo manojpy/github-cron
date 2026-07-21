@@ -3761,7 +3761,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
                 rvol_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
             else:
-                rvol_ok = True  # fail-open if data unavailable
+                rvol_ok = False 
         else:
             rvol_ok = True
 
