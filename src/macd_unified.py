@@ -3779,8 +3779,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
             ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
         else:
-            ppo_gate_ok_buy = True
-            ppo_gate_ok_sell = True
+            ppo_gate_ok_buy = not cfg.ENABLE_PPO_GATE
+            ppo_gate_ok_sell = not cfg.ENABLE_PPO_GATE
 
         buy_common  = (base_buy_trend and confirmation_buy  and is_valid_for_buy  and (adx_ok or rvol_ok) and effective_cpr_ok and ppo_gate_ok_buy  and tk_guard_ok_buy)
         sell_common = (base_sell_trend and confirmation_sell and is_valid_for_sell and (adx_ok or rvol_ok) and effective_cpr_ok and ppo_gate_ok_sell and tk_guard_ok_sell)
