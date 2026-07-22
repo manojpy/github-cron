@@ -1334,7 +1334,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ppo': np.full(n, np.nan, dtype=np.float64),
             'ppo_signal': np.full(n, np.nan, dtype=np.float64),
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
-            'smooth_rsi_ema': np.full(n, np.nan, dtype=np.float64),
+            'smooth_rsi_ema': np.full(n, np.nan, dtype=np.float64), 
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
             'ichimoku_cloud_upper': np.full(n, np.nan, dtype=np.float64),
@@ -2139,8 +2139,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
                 )
                 return None
     
-        if data["timestamp"][-1] > 1_000_000_000_000 and data["timestamp"][0] > 1_000_000_000_000:
-            data["timestamp"] //= 1000
+        data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // 1000, data["timestamp"])
 
         o, h, l, c = data["open"], data["high"], data["low"], data["close"]
     
@@ -4048,7 +4047,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             f"Candle: O={open_curr:.2f} C={close_curr:.2f}"
                         )
 
-
         conditional_states = previous_states
 
         resets_to_apply = []
@@ -4535,7 +4533,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         )
 
     logger_main.debug("🧹 Released all fetch-phase data (all_candles, results, etc)")
-    gc.collect()
+    await asyncio.to_thread(gc.collect)
 
     current_memory_mb, limit_mb, usage_pct = log_memory_usage("💾 Memory after batch cleanup")
     if current_memory_mb and current_memory_mb > limit_mb * 0.8:
@@ -4752,7 +4750,7 @@ async def run_once() -> bool:
             correlation_id, lock, reference_time,
             alerts_sent_ref, alerts_sent_lock, MAX_ALERTS_PER_RUN
         )
-        gc.collect()
+        await asyncio.to_thread(gc.collect) 
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
 
