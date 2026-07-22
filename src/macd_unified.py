@@ -111,7 +111,8 @@ class Constants:
     MIN_WICK_RATIO = 0.2
     PPO_THRESHOLD_BUY = 0.20
     PPO_THRESHOLD_SELL = -0.20
-    RSI_THRESHOLD = 50
+    RSI_SRSI_BUY_MAX = 60.0
+    RSI_SRSI_SELL_MIN = 40.0
     PPO_RSI_GUARD_BUY = 0.30
     PPO_RSI_GUARD_SELL = -0.30
     PPO_011_THRESHOLD = 0.11
@@ -787,34 +788,35 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError, OverflowError):
         return default
 
-def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int) -> np.ndarray:
+def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None:
             logger.warning("Smooth RSI: Input close array is None")
-            return np.full(1, 50.0, dtype=np.float64)
-        
-        if len(close) < rsi_len + kalman_len:
-            logger.warning(
-                f"Smooth RSI: Insufficient data (len={len(close)}, "
-                f"required={rsi_len + kalman_len})"
-            )
-            return np.full(len(close), 50.0, dtype=np.float64)
+            flat = np.full(1, 50.0, dtype=np.float64)
+            return flat, flat.copy()
 
-        rsi = calculate_rsi_core(close, rsi_len)     
-        smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)      
-        smooth_rsi = ema_loop(smooth_rsi, float(cfg.SRSI_EMA_LEN))
-        
+        if len(close) < rsi_len + kalman_len + ema_len:
+            logger.warning(f"Smooth RSI: Insufficient data (len={len(close)}, required={rsi_len + kalman_len + ema_len})")
+            flat = np.full(len(close), 50.0, dtype=np.float64)
+            return flat, flat.copy()
+
+        rsi = calculate_rsi_core(close, rsi_len)
+        smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
+        rsi_ema = ema_loop(smooth_rsi, float(ema_len))
+
         if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
             smooth_rsi = sanitize_array_numba_parallel(smooth_rsi, 50.0)
+            rsi_ema    = sanitize_array_numba_parallel(rsi_ema, 50.0)
         else:
             smooth_rsi = sanitize_array_numba(smooth_rsi, 50.0)
-        
-        return smooth_rsi
-        
+            rsi_ema    = sanitize_array_numba(rsi_ema, 50.0)
+
+        return smooth_rsi, rsi_ema
     except Exception as e:
         logger.error(f"Smooth RSI calculation failed: {e}")
         default_len = len(close) if close is not None else 1
-        return np.full(default_len, 50.0, dtype=np.float64)
+        flat = np.full(default_len, 50.0, dtype=np.float64)
+        return flat, flat.copy()
 
 def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
@@ -1143,10 +1145,10 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results['ppo_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['ppo_gate_signal'] = np.full(n_15m, np.nan, dtype=np.float64)
         
-        results['smooth_rsi'] = calculate_smooth_rsi_numpy(
-            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN
+        results['smooth_rsi'], results['smooth_rsi_ema'] = calculate_smooth_rsi_numpy(
+            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN, cfg.SRSI_EMA_LEN
         )
-
+        
         if cfg.RSI_GUARD_ENABLED:
             rsi_guard_smooth, rsi_guard_ema = calculate_rsi_guard_numpy(
                 close_15m, cfg.RSI_GUARD_RSI_LEN, cfg.RSI_GUARD_KALMAN_LEN, cfg.RSI_GUARD_EMA_LEN
@@ -1291,7 +1293,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results['cpr_ok'] = False
 
         SANITIZE_KEYS = [
-            'ppo', 'ppo_signal', 'smooth_rsi', 'mmh',
+            'ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'mmh',
             'rma50_15', 'rma200_5', 'adx',
             'atr_short', 'atr_long',
             'ppo_gate', 'ppo_gate_signal',
@@ -1332,6 +1334,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ppo': np.full(n, np.nan, dtype=np.float64),
             'ppo_signal': np.full(n, np.nan, dtype=np.float64),
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
+            'smooth_rsi_ema': np.full(n, np.nan, dtype=np.float64)
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
             'ichimoku_cloud_upper': np.full(n, np.nan, dtype=np.float64),
@@ -3193,8 +3196,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
     {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
     {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"rsi_50_up","title":"🟢 RSI cross above 50 (PPO < 0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)>Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
-    {"key":"rsi_50_down","title":"🔴 RSI cross below 50 (PPO > -0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=Constants.RSI_THRESHOLD) and (rsi.get("curr",50)<Constants.RSI_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
+    {"key":"rsi_50_up","title":"🟢 RSI cross above EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
+    {"key":"rsi_50_down","title":"🔴 RSI cross below EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
     {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -3278,17 +3281,18 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -
 def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
+    rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
     buy_common, sell_common = context["buy_common"], context["sell_common"]
     ppo_curr = context["ppo_curr"]
 
-    if rsi_prev > Constants.RSI_THRESHOLD and rsi_curr <= Constants.RSI_THRESHOLD:
+    if rsi_prev > rsi_ema_prev and rsi_curr <= rsi_ema_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['rsi_50_up'], False):
+    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr >= Constants.RSI_SRSI_BUY_MAX) and conditional_states.get(ALERT_KEYS['rsi_50_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
 
-    if rsi_prev < Constants.RSI_THRESHOLD and rsi_curr >= Constants.RSI_THRESHOLD:
+    if rsi_prev < rsi_ema_prev and rsi_curr >= rsi_ema_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['rsi_50_down'], False):
+    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr <= Constants.RSI_SRSI_SELL_MIN) and conditional_states.get(ALERT_KEYS['rsi_50_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
 
     return resets
@@ -3638,7 +3642,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.error(f"Skipping {pair_name}: all indicators failed to calculate")
             return None
 
-        critical_indicators = ["ppo", "ppo_signal", "smooth_rsi"]
+        critical_indicators = ["ppo", "ppo_signal", "smooth_rsi", "smooth_rsi_ema"]
         is_valid, msg = validate_indicators_dict(indicators, critical_indicators)
         if not is_valid:
             logger_pair.warning(f"Skipping {pair_name}: {msg}")
@@ -3647,6 +3651,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo = indicators["ppo"]
         ppo_signal = indicators["ppo_signal"]
         smooth_rsi = indicators["smooth_rsi"]
+        smooth_rsi_ema = indicators["smooth_rsi_ema"] 
         vwap = indicators["vwap"]
         mmh = indicators["mmh"]
 
@@ -3707,6 +3712,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
+        rsi_ema_curr = smooth_rsi_ema[i15]            
+        rsi_ema_prev = smooth_rsi_ema[i15 - 1] if i15 >= 1 else smooth_rsi_ema[i15]
+
         ppo_gate_curr = ppo_gate_arr[i15]
         ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
         ppo_gate_sig_curr = ppo_gate_signal_arr[i15]
@@ -3717,6 +3725,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
             'rsi_curr': rsi_curr, 'rsi_prev': rsi_prev,
+            'rsi_ema_curr': rsi_ema_curr, 'rsi_ema_prev': rsi_ema_prev,
             'ppo_sig_curr': ppo_sig_curr, 'ppo_sig_prev': ppo_sig_prev,
         }
         is_valid, msg = validate_indicator_values(values_to_check, list(values_to_check.keys()))
@@ -3877,6 +3886,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
             "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
+            "rsi_ema_curr": rsi_ema_curr, "rsi_ema_prev": rsi_ema_prev,
             "vwap_curr": vwap_curr, "vwap_prev": vwap_prev,
             "mmh_curr": mmh_curr, "mmh_m1": mmh_m1, "mmh_m2": mmh_m2, "mmh_m3": mmh_m3,
             "rma50_15_val": rma50_15_val, "rma200_5_val": rma200_5_val,
@@ -3902,7 +3912,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
-        rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev}
+
+        rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev, "ema_curr": rsi_ema_curr, "ema_prev": rsi_ema_prev}
 
         # Build keys to CHECK this run (may exclude some due to missing requirements)
         alert_keys_to_check = []
@@ -4225,40 +4236,44 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"rvol_ok={rvol_ok})"
                 )
         
-        if rsi_prev <= Constants.RSI_THRESHOLD and rsi_curr > Constants.RSI_THRESHOLD:
-            if ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
-                reasons.append(f"RSI>50 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
+        if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
+            if rsi_curr >= Constants.RSI_SRSI_BUY_MAX:
+                reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {Constants.RSI_SRSI_BUY_MAX}")
+            elif ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
+                reasons.append(f"RSI>EMA5 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
             elif not buy_common:
                 if not base_buy_trend:
-                    reasons.append("RSI>50 blocked: base_buy_trend=False")
+                    reasons.append("RSI>EMA5 blocked: base_buy_trend=False")
                 elif not confirmation_buy:
-                    reasons.append("RSI>50 blocked: confirmation_buy=False")
+                    reasons.append("RSI>EMA5 blocked: confirmation_buy=False")
                 elif not is_valid_for_buy:
-                    reasons.append("RSI>50 blocked: Knox rejected candle")
+                    reasons.append("RSI>EMA5 blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"RSI>50 blocked: market filter "
+                        f"RSI>EMA5 blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                         f"rvol_ok={rvol_ok})"
                     )
-        
-        if rsi_prev >= Constants.RSI_THRESHOLD and rsi_curr < Constants.RSI_THRESHOLD:
-            if ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
-                reasons.append(f"RSI<50 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
+
+        if rsi_prev >= rsi_ema_prev and rsi_curr < rsi_ema_curr:
+            if rsi_curr <= Constants.RSI_SRSI_SELL_MIN:
+                reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {Constants.RSI_SRSI_SELL_MIN}")
+            elif ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
+                reasons.append(f"RSI<EMA5 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
             elif not sell_common:
                 if not base_sell_trend:
-                    reasons.append("RSI<50 blocked: base_sell_trend=False")
+                    reasons.append("RSI<EMA5 blocked: base_sell_trend=False")
                 elif not confirmation_sell:
-                    reasons.append("RSI<50 blocked: confirmation_sell=False")
+                    reasons.append("RSI<EMA5 blocked: confirmation_sell=False")
                 elif not is_valid_for_sell:
-                    reasons.append("RSI<50 blocked: Knox rejected candle")
+                    reasons.append("RSI<EMA5 blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"RSI<50 blocked: market filter "
+                        f"RSI<EMA5 blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                         f"rvol_ok={rvol_ok})"
                     )
-             
+       
         if cfg.ENABLE_VWAP and vwap_available:
             if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
                 if not base_buy_trend:
