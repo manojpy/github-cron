@@ -1334,7 +1334,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ppo': np.full(n, np.nan, dtype=np.float64),
             'ppo_signal': np.full(n, np.nan, dtype=np.float64),
             'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
-            'smooth_rsi_ema': np.full(n, np.nan, dtype=np.float64)
+            'smooth_rsi_ema': np.full(n, np.nan, dtype=np.float64),
             'vwap': np.full(n, np.nan, dtype=np.float64),
             'mmh': np.full(n, np.nan, dtype=np.float64),
             'ichimoku_cloud_upper': np.full(n, np.nan, dtype=np.float64),
