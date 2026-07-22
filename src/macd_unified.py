@@ -138,6 +138,7 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
+    MIN_BODY_RATIO = 0.30
     
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
@@ -1980,6 +1981,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         l = float(data_15m["low"][candle_index])
         c = float(data_15m["close"][candle_index])
         ts = int(data_15m["timestamp"][candle_index])
+        vol = float(data_15m["volume"][candle_index])
     except (IndexError, KeyError, ValueError, TypeError) as e:
         return False, False, None, f"Data access error: {e}"
     
@@ -1991,6 +1993,9 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     
     if not (l <= o <= h and l <= c <= h):
         return False, False, None, f"Invalid OHLC: relationships broken (O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f})"
+    
+    if vol <= 0:
+        return False, False, None, "Zero volume candle — likely exchange placeholder or maintenance window"
     
     interval_seconds = 15 * 60
     candle_age = reference_time - ts
@@ -2016,6 +2021,16 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             f"Open={format_ist_time(ts)}, Age={candle_age}s, "
             f"O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f}"
         )
+    if candle_index > 0:
+        prev_candle_ts = int(data_15m["timestamp"][candle_index - 1])
+        expected_prev_ts = ts - interval_seconds
+        if abs(prev_candle_ts - expected_prev_ts) > 60:
+            return False, False, None, (
+                f"Gap before signal candle: expected prev at {format_ist_time(expected_prev_ts)} "
+                f"but found {format_ist_time(prev_candle_ts)} "
+                f"(diff={abs(prev_candle_ts - expected_prev_ts)}s). Crossover data unreliable."
+            )
+
     if candle_index + 1 < len(data_15m["timestamp"]):
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
@@ -2035,21 +2050,23 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         is_green = True
         is_red = False
         candle_color = "GREEN"
+        upper_wick = h - c
+        lower_wick = o - l
+        body = c - o
     elif c < o:
         is_green = False
         is_red = True
         candle_color = "RED"
-    else:
-        return False, False, None, f"Doji candle (C={c:.4f} == O={o:.4f})"
-    
-    if is_green:
-        upper_wick = h - c
-        lower_wick = o - l
-        body = c - o
-    else:  
         upper_wick = h - o
         lower_wick = c - l
         body = o - c
+    else:
+        is_green = False
+        is_red = False
+        candle_color = "DOJI"
+        upper_wick = h - o
+        lower_wick = c - l
+        body = 0.0
     
     calculated_range = upper_wick + body + lower_wick
     if abs(calculated_range - candle_range) > 1e-6:
@@ -2058,11 +2075,15 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             f"!= range={candle_range:.6f}"
         )
     
+    body_ratio = body / candle_range
+    if body_ratio < 0.02:
+        return False, False, None, f"Doji-like candle (body {body_ratio*100:.1f}% of range, < 2%)"
+    
     upper_wick_ratio = upper_wick / candle_range
     lower_wick_ratio = lower_wick / candle_range
     
-    is_valid_for_buy = (is_green and c > o and upper_wick_ratio < min_wick_ratio)   
-    is_valid_for_sell = (is_red and c < o and lower_wick_ratio < min_wick_ratio)
+    is_valid_for_buy = (is_green and upper_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO)
+    is_valid_for_sell = (is_red and lower_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO)
     
     candle_info = {
         "timestamp": ts,
@@ -2070,11 +2091,13 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         "high": h,
         "low": l,
         "close": c,
+        "volume": vol,
         "range": candle_range,
         "color": candle_color,
         "is_green": is_green,
         "is_red": is_red,
         "body": body,
+        "body_ratio": body_ratio,
         "upper_wick": upper_wick,
         "lower_wick": lower_wick,
         "upper_wick_ratio": upper_wick_ratio,
@@ -2087,9 +2110,15 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     
     if not is_valid_for_buy and not is_valid_for_sell:
         if is_green:
-            reason = f"GREEN candle but upper wick {upper_wick_ratio*100:.1f}% >= {min_wick_ratio*100:.0f}%"
+            reason = (
+                f"GREEN candle rejected: upper wick {upper_wick_ratio*100:.1f}% "
+                f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
+            )
         else:
-            reason = f"RED candle but lower wick {lower_wick_ratio*100:.1f}% >= {min_wick_ratio*100:.0f}%"
+            reason = (
+                f"RED candle rejected: lower wick {lower_wick_ratio*100:.1f}% "
+                f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
+            )
         return False, False, candle_info, reason
     
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
@@ -2354,9 +2383,16 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
         fo, fh, fl, fc = (float(fresh["open"][idx]), float(fresh["high"][idx]),
                           float(fresh["low"][idx]), float(fresh["close"][idx]))
 
-        EPS = 1e-6
-        if (abs(fo - o) > EPS or abs(fh - h) > EPS or
-            abs(fl - l) > EPS or abs(fc - c) > EPS):
+        def _price_match(a: float, b: float) -> bool:
+            abs_diff = abs(a - b)
+            if abs_diff <= 1e-6:
+                return True
+            rel_diff = abs_diff / max(abs(a), abs(b), 1e-12)
+            return rel_diff <= 1e-6
+
+        if (not _price_match(fo, o) or not _price_match(fh, h) or
+            not _price_match(fl, l) or not _price_match(fc, c)):
+
             logger_pair.warning(
                 f"[{pair_name}] 🔁 Candle CHANGED since first fetch — repaint detected, suppressing alert | "
                 f"First: O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
@@ -2369,7 +2405,6 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     except Exception as e:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
         return False
-
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
@@ -3528,7 +3563,33 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.debug(
                     f"[{pair_name}] Hard-rejecting candle: {error_msg}"
                 )
-                return None
+                # ── Fail-safe state reset: we cannot verify conditions, so clear all active states ──
+                all_redis_alert_keys = list(ALERT_KEYS.values())
+                previous_states = await sdb.batch_get_all_alert_states(
+                    pair_name, all_redis_alert_keys
+                )
+                hard_resets = []
+                for redis_key in all_redis_alert_keys:
+                    if previous_states.get(redis_key, False):
+                        hard_resets.append((f"{pair_name}:{redis_key}", "INACTIVE", None))
+                
+                if hard_resets:
+                    await sdb.atomic_batch_update(hard_resets)
+                    logger_pair.info(
+                        f"[{pair_name}] Hard-reject reset: cleared {len(hard_resets)} "
+                        f"active alert state(s) from Redis"
+                    )
+                
+                return pair_name, {
+                    "state": "HARD_REJECT",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "cloud": "neutral",
+                        "mmh_hist": 0.0,
+                        "suppression": f"Hard reject: {error_msg}"
+                    }
+                }
             logger_pair.debug(
                 f"[{pair_name}] Wick-rejected candle — will run resets only. Reason: {error_msg}"
             )
@@ -3675,7 +3736,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         future_green = bool(ichimoku_future_green[i15])
         future_red   = bool(ichimoku_future_red[i15])
 
-        # Price vs current cloud (displaced values from 65 bars ago)
+        cloud_upper_val = ichimoku_cloud_upper[i15]
+        cloud_lower_val = ichimoku_cloud_lower[i15]
+
+        if np.isnan(cloud_upper_val) or np.isnan(cloud_lower_val):
+            logger_pair.warning(
+                f"[{pair_name}] Ichimoku cloud NaN at i15={i15} (warmup/gap). "
+                f"Cannot determine cloud position — skipping."
+            )
+            return None
+
         above_cloud = close_curr > ichimoku_cloud_upper[i15]
         below_cloud = close_curr < ichimoku_cloud_lower[i15]
 
@@ -3690,15 +3760,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             tk_guard_ok_buy  = tk_conversion_curr >= tk_base_curr
             tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
         else:
+            if cfg.ICHIMOKU_TK_GUARD_ENABLED and not tk_guard_valid:
+                logger_pair.debug(
+                    f"[{pair_name}] TK lines not ready at i15={i15}. "
+                    f"TK guard bypassed this run."
+                )
             tk_guard_ok_buy  = True
             tk_guard_ok_sell = True
 
+        close_prev_invalid = False
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
             logger_pair.warning(
-                f"[{pair_name}] Previous candle has invalid close={close_prev}. "
-                f"Using close_curr as fallback."
+                f"[{pair_name}] Previous candle close invalid ({close_prev}). "
+                f"VWAP cross check disabled this run; other alert types unaffected."
             )
-            close_prev = close_curr
+            close_prev_invalid = True
 
         close_5m_val = data_5m["close"][i5]
         ppo_sig_curr = ppo_signal[i15]
@@ -3732,7 +3808,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(msg)
             return None
 
-        if vwap_enabled and vwap is not None and len(vwap) > i15:
+        if vwap_enabled and not close_prev_invalid and vwap is not None and len(vwap) > i15:
             try:
                 vwap_curr = vwap[i15]
                 vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
