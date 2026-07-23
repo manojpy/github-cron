@@ -221,10 +221,10 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
-    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Ichimoku conversion line length")
-    ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
-    ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
-    ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
+    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Ichimoku conversion line length")
+    ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Ichimoku base line length")
+    ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Ichimoku leading span B length")
+    ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Ichimoku cloud forward displacement")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
@@ -907,8 +907,8 @@ def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarra
         return {
             'cloud_upper': cloud_upper,
             'cloud_lower': cloud_lower,
-            'future_green': lead_line1 > lead_line2,
-            'future_red': lead_line1 < lead_line2,
+            'future_green': lead_line1 >= lead_line2,
+            'future_red': lead_line1 <= lead_line2,
             'conversion_line': conversion_line,
             'base_line': base_line,
             'lead_line1': lead_line1,
