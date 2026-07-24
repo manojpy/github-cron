@@ -1160,7 +1160,8 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
     return piv
 
-def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Optional[Dict[str, np.ndarray]]:
+def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Optional[Dict[str, np.ndarray]]:
+    """Cheap indicators needed ONLY for the main buy/sell gate."""
     try:
         close_15m = data_15m["close"]
         close_5m = data_5m["close"]
@@ -1169,72 +1170,23 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
 
         ok, msg = _validate_ohlc_arrays(data_15m, n_15m)
         if not ok:
-            logger.error(f"calculate_all_indicators_numpy: OHLC validation failed — {msg}")
+            logger.error(f"Gate indicators: OHLC validation failed — {msg}")
             return None
 
-        results = {} 
-        ppo, ppo_signal = calculate_ppo_numpy(
-            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
-        )
-        results['ppo'] = ppo
-        results['ppo_signal'] = ppo_signal
+        results: Dict[str, Any] = {}
 
-        if cfg.ENABLE_PPO_GATE:
-            ppo_gate, ppo_gate_signal = calculate_ppo_numpy(
-                close_15m, cfg.PPO_GATE_FAST, cfg.PPO_GATE_SLOW, cfg.PPO_GATE_SIGNAL
-            )
-            results['ppo_gate'] = ppo_gate
-            results['ppo_gate_signal'] = ppo_gate_signal
-        else:
-            results['ppo_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['ppo_gate_signal'] = np.full(n_15m, np.nan, dtype=np.float64)
-        
-        results['smooth_rsi'], results['smooth_rsi_ema'] = calculate_smooth_rsi_numpy(
-            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN, cfg.SRSI_EMA_LEN
-        )
-        
-        if cfg.RSI_GUARD_ENABLED:
-            rsi_guard_smooth, rsi_guard_ema = calculate_rsi_guard_numpy(
-                close_15m, cfg.RSI_GUARD_RSI_LEN, cfg.RSI_GUARD_KALMAN_LEN, cfg.RSI_GUARD_EMA_LEN
-            )
-            results['rsi_guard_smooth'] = rsi_guard_smooth
-            results['rsi_guard_ema'] = rsi_guard_ema
-        else:
-            results['rsi_guard_smooth'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['rsi_guard_ema'] = np.full(n_15m, np.nan, dtype=np.float64)
+        # ── Trend: RMA 50/200 ──
+        results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
+        results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
-        if cfg.ENABLE_VWAP:
-            high_15m = data_15m["high"]
-            low_15m = data_15m["low"]
-            volume_15m = data_15m["volume"]
-            ts_15m = data_15m["timestamp"]
-            
-            # Preserve debug logging from original
-            if cfg.DEBUG_MODE and len(ts_15m) > 0:
-                logger.debug(
-                    f"VWAP input | "
-                    f"First ts: {ts_15m[0]} ({format_ist_time(ts_15m[0])}) | "
-                    f"Last ts: {ts_15m[-1]} ({format_ist_time(ts_15m[-1])}) | "
-                    f"Bars: {len(ts_15m)}"
-                )
-            
-            results["vwap"] = calculate_vwap_numpy(
-                high_15m, low_15m, close_15m, volume_15m, ts_15m,
-                reference_time
-            )
-        else:
-            results["vwap"] = np.full(n_15m, np.nan, dtype=np.float64)
-
-        results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
-
-        # ── Ichimoku Cloud (23, 65, 130, 65) ──
+        # ── Ichimoku (cloud + TK guard) ──
         if cfg.ICHIMOKU_CLOUD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED:
             ichimoku = calculate_ichimoku_numpy(
                 data_15m["high"], data_15m["low"], close_15m,
                 cfg.ICHIMOKU_CONVERSION_PERIODS,
                 cfg.ICHIMOKU_BASE_PERIODS,
                 cfg.ICHIMOKU_SPANB_PERIODS,
-                cfg.ICHIMOKU_DISPLACEMENT
+                cfg.ICHIMOKU_DISPLACEMENT,
             )
             results['ichimoku_cloud_upper'] = ichimoku['cloud_upper']
             results['ichimoku_cloud_lower'] = ichimoku['cloud_lower']
@@ -1243,176 +1195,185 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results['ichimoku_conversion_line'] = ichimoku['conversion_line']
             results['ichimoku_base_line'] = ichimoku['base_line']
         else:
-            results['ichimoku_cloud_upper'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['ichimoku_cloud_lower'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['ichimoku_future_green'] = np.zeros(n_15m, dtype=bool)
-            results['ichimoku_future_red'] = np.zeros(n_15m, dtype=bool)
-            results['ichimoku_conversion_line'] = np.full(n_15m, np.nan, dtype=np.float64)
-            results['ichimoku_base_line'] = np.full(n_15m, np.nan, dtype=np.float64)
+            nan_arr = np.full(n_15m, np.nan, dtype=np.float64)
+            bool_arr = np.zeros(n_15m, dtype=bool)
+            results['ichimoku_cloud_upper'] = nan_arr.copy()
+            results['ichimoku_cloud_lower'] = nan_arr.copy()
+            results['ichimoku_future_green'] = bool_arr.copy()
+            results['ichimoku_future_red'] = bool_arr.copy()
+            results['ichimoku_conversion_line'] = nan_arr.copy()
+            results['ichimoku_base_line'] = nan_arr.copy()
 
-
-        results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
-        results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-
+        # ── Volatility: ATR + ADX ──
         results['atr_short'] = calculate_atr_rma(
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_SHORT
         )
         results['atr_long'] = calculate_atr_rma(
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
-    
+        results['adx'] = calculate_adx_core(
+            data_15m["high"], data_15m["low"], data_15m["close"],
+            cfg.ADX_DI_LENGTH, cfg.ADX_SMOOTHING_LENGTH
+        )
+
         ok, msg = _validate_atr_arrays(results['atr_short'], results['atr_long'], n_15m)
         if not ok:
-            logger.warning(
-                f"calculate_all_indicators_numpy: ATR validation failed — {msg}. "
-                f"RVOL filter may be unreliable this run."
-            )
+            logger.warning(f"Gate indicators: ATR validation — {msg}")
 
+        # ── Volume EMA (used by CPR bypass) ──
         results['volume_ema'] = calculate_volume_ema_numpy(
             data_15m["volume"], cfg.VOLUME_EMA_LENGTH
         )
-        results['adx'] = calculate_adx_core(
-            data_15m["high"],
-            data_15m["low"],
-            data_15m["close"],
-            cfg.ADX_DI_LENGTH,
-            cfg.ADX_SMOOTHING_LENGTH
-        )
 
-        if cfg.ENABLE_PIVOT and data_daily is not None:
-            results['pivots'] = calculate_pivot_levels_numpy(
-                data_daily["high"],
-                data_daily["low"],
-                data_daily["close"],
-                data_daily["timestamp"],
-                data_15m["timestamp"],
-                reference_time
+        # ── Trend gates ──
+        if cfg.ENABLE_PPO_GATE:
+            pg, pgs = calculate_ppo_numpy(
+                close_15m, cfg.PPO_GATE_FAST, cfg.PPO_GATE_SLOW, cfg.PPO_GATE_SIGNAL
             )
+            results['ppo_gate'] = pg
+            results['ppo_gate_signal'] = pgs
         else:
-            results['pivots'] = {}
+            results['ppo_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['ppo_gate_signal'] = np.full(n_15m, np.nan, dtype=np.float64)
 
+        if cfg.RSI_GUARD_ENABLED:
+            rgs, rge = calculate_rsi_guard_numpy(
+                close_15m, cfg.RSI_GUARD_RSI_LEN,
+                cfg.RSI_GUARD_KALMAN_LEN, cfg.RSI_GUARD_EMA_LEN
+            )
+            results['rsi_guard_smooth'] = rgs
+            results['rsi_guard_ema'] = rge
+        else:
+            results['rsi_guard_smooth'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['rsi_guard_ema'] = np.full(n_15m, np.nan, dtype=np.float64)
+
+        # ── CPR (daily) ──
         if cfg.ENABLE_CPR and data_daily is not None:
             try:
                 d_high, d_low, d_close, d_ts = _find_closed_daily_candle(
-                    data_daily,
-                    reference_time,
+                    data_daily, reference_time
                 )
                 _pivot = (d_high + d_low + d_close) / 3.0
-                _bc    = (d_high + d_low) / 2.0
-                _tc    = (_pivot - _bc) + _pivot
+                _bc = (d_high + d_low) / 2.0
+                _tc = (_pivot - _bc) + _pivot
                 results['nr_cpr'] = abs(_tc - _bc)
-
-                cpr_threshold = d_close * cfg.CPR_THRESHOLD_PCT
-                results['cpr_ok'] = results['nr_cpr'] < cpr_threshold
-
-                if cfg.DEBUG_MODE:
-                    logger.debug(
-                        f"CPR OK | candle="
-                        f"{datetime.fromtimestamp(d_ts, tz=timezone.utc).date()} "
-                        f"H={d_high:.4f} L={d_low:.4f} C={d_close:.4f} "
-                        f"NR_CPR={results['nr_cpr']:.4f} | threshold={cpr_threshold:.4f} "
-                        f"| cpr_ok={results['cpr_ok']}"
-                    )
-
+                results['cpr_ok'] = results['nr_cpr'] < (d_close * cfg.CPR_THRESHOLD_PCT)
             except CprNotReadyError as e:
-                logger.debug(f"CPR not ready, will retry next run: {e}")
+                logger.debug(f"CPR not ready: {e}")
                 results['nr_cpr'] = float('nan')
                 results['cpr_ok'] = False
-
             except ValueError as e:
                 logger.warning(f"CPR skipped — bad candle: {e}")
                 results['nr_cpr'] = float('nan')
                 results['cpr_ok'] = False
-
             except Exception as e:
                 logger.error(f"CPR unexpected error: {e}", exc_info=True)
                 results['nr_cpr'] = float('nan')
                 results['cpr_ok'] = False
-
         elif not cfg.ENABLE_CPR:
-            # Feature intentionally disabled -> do not gate alerts on it.
             results['nr_cpr'] = float('nan')
             results['cpr_ok'] = True
-
         else:
-            logger.warning("CPR gate: ENABLE_CPR=True but data_daily is None — blocking alerts (fail-closed)")
+            logger.warning("CPR gate: ENABLE_CPR=True but data_daily is None")
             results['nr_cpr'] = float('nan')
             results['cpr_ok'] = False
 
+        # Today UTC open (for wide-CPR bypass % move)
         if cfg.ENABLE_CPR and data_daily is not None:
-            today_open = _find_today_daily_open(data_daily, reference_time)
-            results['today_utc_open'] = today_open if today_open is not None else float('nan')
-            if cfg.DEBUG_MODE:
-                logger.debug(f"Today's UTC 00:00 open: {results['today_utc_open']}")
+            to = _find_today_daily_open(data_daily, reference_time)
+            results['today_utc_open'] = to if to is not None else float('nan')
         else:
             results['today_utc_open'] = float('nan')
 
-        SANITIZE_KEYS = [
-            'ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'mmh',
-            'rma50_15', 'rma200_5', 'adx',
-            'atr_short', 'atr_long',
-            'ppo_gate', 'ppo_gate_signal',
-            'rsi_guard_smooth', 'rsi_guard_ema', 'volume_ema', 
-        ]
-
-        for key in SANITIZE_KEYS:
+        # Sanitize
+        for key in ('rma50_15', 'rma200_5', 'adx', 'atr_short', 'atr_long',
+                    'ppo_gate', 'ppo_gate_signal', 'rsi_guard_smooth',
+                    'rsi_guard_ema', 'volume_ema'):
             arr = results[key]
-
             if np.any(np.isinf(arr)):
-                inf_count = int(np.sum(np.isinf(arr)))
-                logger.warning(f"{key}: {inf_count} inf value(s) detected — clamping")
                 results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
-                arr = results[key]  # refresh reference after clip
-
-            if cfg.DEBUG_MODE:
-                nan_count = int(np.sum(np.isnan(arr)))
-                if nan_count > 0:
-                    logger.debug(
-                        f"{key}: {nan_count} NaN warm-up bar(s) — "
-                        f"normal EMA/RMA initialisation, downstream must guard with isnan()"
-                    )
 
         return results
 
     except Exception as e:
-        logger.error(f"calculate_all_indicators_numpy failed: {e}", exc_info=True)
-        try:
-            n = len(data_15m.get("close", []))
-            n_5m = len(data_5m.get("close", [])) if data_5m else 0
-            if n == 0 or n_5m == 0:
-                return None
-        except Exception:
-            return None
-    
-        # FALLBACK: Return NaN-filled dict so downstream doesn't crash
-        return {
-            'ppo': np.full(n, np.nan, dtype=np.float64),
-            'ppo_signal': np.full(n, np.nan, dtype=np.float64),
-            'smooth_rsi': np.full(n, np.nan, dtype=np.float64),
-            'smooth_rsi_ema': np.full(n, np.nan, dtype=np.float64), 
-            'vwap': np.full(n, np.nan, dtype=np.float64),
-            'mmh': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_cloud_upper': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_cloud_lower': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_future_green': np.zeros(n, dtype=bool),
-            'ichimoku_future_red': np.zeros(n, dtype=bool),
-            'ichimoku_conversion_line': np.full(n, np.nan, dtype=np.float64),
-            'ichimoku_base_line': np.full(n, np.nan, dtype=np.float64),
-            'rma50_15': np.full(n, np.nan, dtype=np.float64),
-            'rma200_5': np.full(n_5m, np.nan, dtype=np.float64),
-            'pivots': {},
-            'atr_short': np.full(n, np.nan, dtype=np.float64),
-            'atr_long': np.full(n, np.nan, dtype=np.float64),
-            'adx': np.full(n, np.nan, dtype=np.float64),
-            'nr_cpr': float('nan'), 
-            'cpr_ok': False,  
-            'ppo_gate': np.full(n, np.nan, dtype=np.float64),
-            'ppo_gate_signal': np.full(n, np.nan, dtype=np.float64),
-            'rsi_guard_smooth': np.full(n, np.nan, dtype=np.float64),
-            'rsi_guard_ema': np.full(n, np.nan, dtype=np.float64),
-            'volume_ema': np.full(n, np.nan, dtype=np.float64),
-            'today_utc_open': float('nan'),
-        }
+        logger.error(f"calculate_gate_indicators_numpy failed: {e}", exc_info=True)
+        return None
+
+def calculate_alert_indicators_numpy(
+    data_15m: Dict[str, np.ndarray],
+    data_5m: Dict[str, np.ndarray],
+    data_daily: Optional[Dict[str, np.ndarray]],
+    reference_time: int,
+) -> Optional[Dict[str, np.ndarray]]:
+    """Expensive indicators needed ONLY when a pair passes the main gate."""
+    try:
+        close_15m = data_15m["close"]
+        n_15m = len(close_15m)
+
+        results: Dict[str, Any] = {}
+
+        # PPO (fast) — used by alert triggers
+        ppo, ppo_signal = calculate_ppo_numpy(
+            close_15m, cfg.PPO_FAST, cfg.PPO_SLOW, cfg.PPO_SIGNAL
+        )
+        results['ppo'] = ppo
+        results['ppo_signal'] = ppo_signal
+
+        # Smooth RSI — used by alert triggers
+        results['smooth_rsi'], results['smooth_rsi_ema'] = calculate_smooth_rsi_numpy(
+            close_15m, cfg.SRSI_RSI_LEN, cfg.SRSI_KALMAN_LEN, cfg.SRSI_EMA_LEN
+        )
+
+        # VWAP — used by VWAP alerts
+        if cfg.ENABLE_VWAP:
+            results['vwap'] = calculate_vwap_numpy(
+                data_15m["high"], data_15m["low"], close_15m,
+                data_15m["volume"], data_15m["timestamp"], reference_time
+            )
+        else:
+            results['vwap'] = np.full(n_15m, np.nan, dtype=np.float64)
+
+        # MMH — used by MMH alerts (heaviest of all)
+        results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
+
+        # Pivots — used by pivot alerts
+        if cfg.ENABLE_PIVOT and data_daily is not None:
+            results['pivots'] = calculate_pivot_levels_numpy(
+                data_daily["high"], data_daily["low"], data_daily["close"],
+                data_daily["timestamp"], data_15m["timestamp"], reference_time
+            )
+        else:
+            results['pivots'] = {}
+
+        # Sanitize
+        for key in ('ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'mmh'):
+            arr = results[key]
+            if np.any(np.isinf(arr)):
+                results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
+
+        return results
+
+    except Exception as e:
+        logger.error(f"calculate_alert_indicators_numpy failed: {e}", exc_info=True)
+        return None
+
+async def _blanket_reset_pair(
+    sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger
+) -> int:
+    """Reset every active alert state for a pair without computing per-indicator logic."""
+    all_keys = list(ALERT_KEYS.values())
+    previous_states = await sdb.batch_get_all_alert_states(pair_name, all_keys)
+    resets = [
+        (f"{pair_name}:{rk}", "INACTIVE", None)
+        for rk in all_keys
+        if previous_states.get(rk, False)
+    ]
+    if resets:
+        await sdb.atomic_batch_update(resets)
+        logger_pair.debug(
+            f"[{pair_name}] Blanket reset: {len(resets)} active state(s) cleared"
+        )
+    return len(resets)
 
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
                          expected_len: int) -> Tuple[bool, Optional[str]]:  
@@ -3625,23 +3586,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 logger_pair.debug(
                     f"[{pair_name}] Hard-rejecting candle: {error_msg}"
                 )
-                # ── Fail-safe state reset: we cannot verify conditions, so clear all active states ──
-                all_redis_alert_keys = list(ALERT_KEYS.values())
-                previous_states = await sdb.batch_get_all_alert_states(
-                    pair_name, all_redis_alert_keys
-                )
-                hard_resets = []
-                for redis_key in all_redis_alert_keys:
-                    if previous_states.get(redis_key, False):
-                        hard_resets.append((f"{pair_name}:{redis_key}", "INACTIVE", None))
-                
-                if hard_resets:
-                    await sdb.atomic_batch_update(hard_resets)
-                    logger_pair.info(
-                        f"[{pair_name}] Hard-reject reset: cleared {len(hard_resets)} "
-                        f"active alert state(s) from Redis"
-                    )
-                
+                await _blanket_reset_pair(sdb, pair_name, logger_pair)
                 return pair_name, {
                     "state": "HARD_REJECT",
                     "ts": int(time.time()),
@@ -3653,12 +3598,19 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     }
                 }
             logger_pair.debug(
-                f"[{pair_name}] Wick-rejected candle — will run resets only. Reason: {error_msg}"
+                f"[{pair_name}] Wick-rejected candle — blanket reset only. Reason: {error_msg}"
             )
-            wick_rejected = True
-        else:
-            wick_rejected = False
-
+            await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            return pair_name, {
+                "state": "NO_SIGNAL",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "cloud": "neutral",
+                    "mmh_hist": 0.0,
+                    "suppression": f"Wick rejected: {error_msg}"
+                }
+            }
         o = candle_info["open"]
         h = candle_info["high"]
         l = candle_info["low"]
@@ -3757,47 +3709,40 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"Close={data_5m['close'][i5]:.2f}"
         )
 
-        indicators = await asyncio.to_thread(
-            calculate_all_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+        # ═══════════════════════════════════════════════════════
+        # PHASE 1 — Gate indicators only (cheap)
+        # ═══════════════════════════════════════════════════════
+        gate_indicators = await asyncio.to_thread(
+            calculate_gate_indicators_numpy, data_15m, data_5m, data_daily, reference_time
         )
-        if indicators is None:
-            logger_pair.error(f"Skipping {pair_name}: all indicators failed to calculate")
+        if gate_indicators is None:
+            logger_pair.error(f"Skipping {pair_name}: gate indicators failed")
             return None
 
-        critical_indicators = ["ppo", "ppo_signal", "smooth_rsi", "smooth_rsi_ema"]
-        is_valid, msg = validate_indicators_dict(indicators, critical_indicators)
-        if not is_valid:
-            logger_pair.warning(f"Skipping {pair_name}: {msg}")
-            return None
-
-        ppo = indicators["ppo"]
-        ppo_signal = indicators["ppo_signal"]
-        smooth_rsi = indicators["smooth_rsi"]
-        smooth_rsi_ema = indicators["smooth_rsi_ema"] 
-        vwap = indicators["vwap"]
-        mmh = indicators["mmh"]
-
-        ichimoku_cloud_upper = indicators["ichimoku_cloud_upper"]
-        ichimoku_cloud_lower = indicators["ichimoku_cloud_lower"]
-        ichimoku_future_green = indicators["ichimoku_future_green"]
-        ichimoku_future_red   = indicators["ichimoku_future_red"]
-        ichimoku_conversion_line = indicators["ichimoku_conversion_line"]
-        ichimoku_base_line       = indicators["ichimoku_base_line"]
-
-        rma50_15 = indicators["rma50_15"]
-        rma200_5 = indicators["rma200_5"]
-        ppo_gate_arr = indicators["ppo_gate"]
-        ppo_gate_signal_arr = indicators["ppo_gate_signal"] 
-        rsi_guard_smooth_arr = indicators["rsi_guard_smooth"]
-        rsi_guard_ema_arr = indicators["rsi_guard_ema"]
-        piv = indicators["pivots"]
-        close_prev = close_15m[i15 - 1] 
+        # ── Extract gate values ──
+        rma50_15 = gate_indicators["rma50_15"]
+        rma200_5 = gate_indicators["rma200_5"]
+        ichimoku_cloud_upper = gate_indicators["ichimoku_cloud_upper"]
+        ichimoku_cloud_lower = gate_indicators["ichimoku_cloud_lower"]
+        ichimoku_future_green = gate_indicators["ichimoku_future_green"]
+        ichimoku_future_red = gate_indicators["ichimoku_future_red"]
+        ichimoku_conversion_line = gate_indicators["ichimoku_conversion_line"]
+        ichimoku_base_line = gate_indicators["ichimoku_base_line"]
+        adx_arr = gate_indicators["adx"]
+        atr_short_arr = gate_indicators["atr_short"]
+        atr_long_arr = gate_indicators["atr_long"]
+        volume_ema_arr = gate_indicators["volume_ema"]
+        ppo_gate_arr = gate_indicators["ppo_gate"]
+        ppo_gate_signal_arr = gate_indicators["ppo_gate_signal"]
+        rsi_guard_smooth_arr = gate_indicators["rsi_guard_smooth"]
+        rsi_guard_ema_arr = gate_indicators["rsi_guard_ema"]
+        cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
+        nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
+        today_utc_open = gate_indicators.get('today_utc_open', float('nan'))
 
         # ── Ichimoku Cloud Filter ──
-        # Future cloud direction (current values = what will be plotted ahead)
         future_green = bool(ichimoku_future_green[i15])
-        future_red   = bool(ichimoku_future_red[i15])
-
+        future_red = bool(ichimoku_future_red[i15])
         cloud_upper_val = ichimoku_cloud_upper[i15]
         cloud_lower_val = ichimoku_cloud_lower[i15]
 
@@ -3808,18 +3753,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             return None
 
-        above_cloud = close_curr > ichimoku_cloud_upper[i15]
-        below_cloud = close_curr < ichimoku_cloud_lower[i15]
-
-        cloud_up   = future_green and above_cloud
-        cloud_down = future_red   and below_cloud
+        above_cloud = close_curr > cloud_upper_val
+        below_cloud = close_curr < cloud_lower_val
+        cloud_up = future_green and above_cloud
+        cloud_down = future_red and below_cloud
 
         tk_conversion_curr = ichimoku_conversion_line[i15]
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
 
         if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_valid:
-            tk_guard_ok_buy  = tk_conversion_curr >= tk_base_curr
+            tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
             tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
         else:
             if cfg.ICHIMOKU_TK_GUARD_ENABLED and not tk_guard_valid:
@@ -3827,9 +3771,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"[{pair_name}] TK lines not ready at i15={i15}. "
                     f"TK guard bypassed this run."
                 )
-            tk_guard_ok_buy  = True
+            tk_guard_ok_buy = True
             tk_guard_ok_sell = True
 
+        close_prev = close_15m[i15 - 1]
         close_prev_invalid = False
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
             logger_pair.warning(
@@ -3839,18 +3784,66 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             close_prev_invalid = True
 
         close_5m_val = data_5m["close"][i5]
-        ppo_sig_curr = ppo_signal[i15]
-        ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
-        vwap_enabled = cfg.ENABLE_VWAP
-        vwap_available = False
-        vwap_curr = None
-        vwap_prev = None
-        ppo_curr = ppo[i15]
-        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
-        rsi_curr = smooth_rsi[i15]
-        rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
-        rsi_ema_curr = smooth_rsi_ema[i15]            
-        rsi_ema_prev = smooth_rsi_ema[i15 - 1] if i15 >= 1 else smooth_rsi_ema[i15]
+        rma50_15_val = rma50_15[i15]
+        rma200_5_val = rma200_5[i5]
+
+        base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
+        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
+
+        confirmation_buy = cloud_up
+        confirmation_sell = cloud_down
+
+        adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
+        adx_ok = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
+
+        if cfg.ENABLE_RVOL_ALERT:
+            atr_short_val = atr_short_arr[i15]
+            atr_long_val = atr_long_arr[i15]
+            if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
+                rvol_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
+            else:
+                rvol_ok = False
+        else:
+            rvol_ok = True
+
+        adx_bypass_ok = adx_val >= cfg.ADX_THRESHOLD
+        atr_short_val = atr_short_arr[i15]
+        atr_long_val = atr_long_arr[i15]
+        if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
+            rvol_bypass_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
+        else:
+            rvol_bypass_ok = False
+
+        volume_curr = data_15m["volume"][i15]
+        volume_ema_curr = volume_ema_arr[i15]
+        if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
+            volume_above_ema_ok = volume_curr > volume_ema_curr
+        else:
+            volume_above_ema_ok = False
+
+        if not np.isnan(today_utc_open) and today_utc_open > 0:
+            pct_move_from_open = abs(close_curr - today_utc_open) / today_utc_open * 100.0
+            pct_move_ok = pct_move_from_open >= cfg.CPR_WIDE_MIN_PCT_MOVE
+        else:
+            pct_move_from_open = float('nan')
+            pct_move_ok = False
+
+        cpr_bypass_ok = (
+            cfg.ENABLE_CPR_ADX_RVOL_BYPASS
+            and adx_bypass_ok and rvol_bypass_ok
+            and volume_above_ema_ok and pct_move_ok
+        )
+        effective_cpr_ok = cpr_ok or cpr_bypass_ok
+
+        if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
+            logger_pair.debug(
+                f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} "
+                f"(bypass={cpr_bypass_ok}, adx={adx_val:.1f} vs {cfg.ADX_THRESHOLD} [{adx_bypass_ok}], "
+                f"rvol_ok={rvol_bypass_ok}, "
+                f"vol={volume_curr:.2f} vs EMA{cfg.VOLUME_EMA_LENGTH}={volume_ema_curr:.2f} [{volume_above_ema_ok}], "
+                f"move_from_utc_open={pct_move_from_open:.2f}% vs {cfg.CPR_WIDE_MIN_PCT_MOVE}% [{pct_move_ok}]) "
+                f"NR_CPR={nr_cpr:.4f}"
+            )
 
         ppo_gate_curr = ppo_gate_arr[i15]
         ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
@@ -3858,6 +3851,180 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_gate_sig_prev = ppo_gate_signal_arr[i15 - 1] if i15 >= 1 else ppo_gate_signal_arr[i15]
         rsi_guard_smooth_curr = rsi_guard_smooth_arr[i15]
         rsi_guard_ema_curr = rsi_guard_ema_arr[i15]
+
+        if cfg.ENABLE_PPO_GATE:
+            if not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
+                ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
+                ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
+            else:
+                ppo_gate_ok_buy = False
+                ppo_gate_ok_sell = False
+        else:
+            ppo_gate_ok_buy = None
+            ppo_gate_ok_sell = None
+
+        if cfg.RSI_GUARD_ENABLED:
+            if not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_ema_curr):
+                rsi_guard_ok_buy = rsi_guard_smooth_curr > rsi_guard_ema_curr
+                rsi_guard_ok_sell = rsi_guard_smooth_curr < rsi_guard_ema_curr
+            else:
+                rsi_guard_ok_buy = False
+                rsi_guard_ok_sell = False
+        else:
+            rsi_guard_ok_buy = None
+            rsi_guard_ok_sell = None
+
+        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy) if g is not None]
+        trend_gate_ok_buy = any(active_buy_gates) if active_buy_gates else True
+
+        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell) if g is not None]
+        trend_gate_ok_sell = any(active_sell_gates) if active_sell_gates else True
+
+        buy_common = (
+            base_buy_trend and confirmation_buy and is_valid_for_buy
+            and (adx_ok or rvol_ok) and effective_cpr_ok
+            and trend_gate_ok_buy and tk_guard_ok_buy
+        )
+        sell_common = (
+            base_sell_trend and confirmation_sell and is_valid_for_sell
+            and (adx_ok or rvol_ok) and effective_cpr_ok
+            and trend_gate_ok_sell and tk_guard_ok_sell
+        )
+
+        # ═══════════════════════════════════════════════════════
+        # EARLY EXIT — Skip expensive indicators if gate is closed
+        # ═══════════════════════════════════════════════════════
+        if not buy_common and not sell_common:
+            await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            reasons = []
+            if not base_buy_trend and not base_sell_trend:
+                reasons.append("base_trend=False")
+            if not confirmation_buy and not confirmation_sell:
+                reasons.append("cloud_align=False")
+            if not (adx_ok or rvol_ok):
+                reasons.append(f"market_filter=False (adx={adx_val:.1f})")
+            if not effective_cpr_ok:
+                reasons.append("cpr=False")
+            if not trend_gate_ok_buy and not trend_gate_ok_sell:
+                reasons.append("trend_gate=False")
+            if not tk_guard_ok_buy and not tk_guard_ok_sell:
+                reasons.append("tk_guard=False")
+            logger_pair.debug(
+                f"😒 {pair_name} | Gate blocked | "
+                f"Suppression: {', '.join(reasons)}"
+            )
+            return pair_name, {
+                "state": "NO_SIGNAL",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                    "mmh_hist": 0.0,
+                    "suppression": f"Gate blocked: {', '.join(reasons)}"
+                }
+            }
+
+        # ═══════════════════════════════════════════════════════
+        # PHASE 2 — Expensive indicators only for gate-passed pairs
+        # ═══════════════════════════════════════════════════════
+        alert_indicators = await asyncio.to_thread(
+            calculate_alert_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+        )
+        if alert_indicators is None:
+            logger_pair.error(f"Skipping {pair_name}: alert indicators failed")
+            return None
+
+        # Merge into a single dict so downstream code stays unchanged
+        indicators = {**gate_indicators, **alert_indicators}
+
+        critical_indicators = ["ppo", "ppo_signal", "smooth_rsi", "smooth_rsi_ema"]
+        is_valid, msg = validate_indicators_dict(indicators, critical_indicators)
+        if not is_valid:
+            logger_pair.warning(f"Skipping {pair_name}: {msg}")
+            return None
+
+        ppo = indicators["ppo"]
+        ppo_signal = indicators["ppo_signal"]
+        smooth_rsi = indicators["smooth_rsi"]
+        smooth_rsi_ema = indicators["smooth_rsi_ema"]
+        vwap = indicators["vwap"]
+        mmh = indicators["mmh"]
+        piv = indicators.get("pivots", {})
+
+        ppo_sig_curr = ppo_signal[i15]
+        ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
+        ppo_curr = ppo[i15]
+        ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
+        rsi_curr = smooth_rsi[i15]
+        rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
+        rsi_ema_curr = smooth_rsi_ema[i15]
+        rsi_ema_prev = smooth_rsi_ema[i15 - 1] if i15 >= 1 else smooth_rsi_ema[i15]
+
+        vwap_enabled = cfg.ENABLE_VWAP
+        vwap_available = False
+        vwap_curr = None
+        vwap_prev = None
+        if vwap_enabled and not close_prev_invalid and vwap is not None and len(vwap) > i15:
+            try:
+                vwap_curr = vwap[i15]
+                vwap_prev = vwap[i15 - 1] if i15 >= 1 else vwap[i15]
+                if (not np.isnan(vwap_curr) and not np.isnan(vwap_prev)
+                        and vwap_curr > 0 and vwap_prev > 0):
+                    vwap_available = True
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"[{pair_name}] VWAP OK: curr={vwap_curr:.4f}, prev={vwap_prev:.4f}"
+                        )
+                else:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(
+                            f"[{pair_name}] VWAP invalid: curr={vwap_curr}, prev={vwap_prev}"
+                        )
+                    vwap_curr = None
+                    vwap_prev = None
+            except (IndexError, TypeError) as e:
+                logger_pair.warning(f"[{pair_name}] VWAP access error: {e}")
+                vwap_curr = None
+                vwap_prev = None
+        else:
+            if vwap_enabled and cfg.DEBUG_MODE:
+                logger_pair.debug(
+                    f"[{pair_name}] VWAP unavailable: enabled={vwap_enabled}, "
+                    f"vwap_is_none={vwap is None}, "
+                    f"len={len(vwap) if vwap is not None else 0}, i15={i15}"
+                )
+
+        mmh_curr = mmh[i15]
+        mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
+        mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
+        mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
+
+        MIN_MMH_BARS_VALID = 160
+        has_valid_mmh = (
+            i15 >= MIN_MMH_BARS_VALID and
+            not np.isnan(mmh_curr) and not np.isnan(mmh_m1) and
+            not np.isnan(mmh_m2) and not np.isnan(mmh_m3)
+        )
+
+        if not has_valid_mmh and cfg.DEBUG_MODE:
+            skip_reason = (
+                f"MMH warmup" if i15 < MIN_MMH_BARS_VALID
+                else f"MMH NaN (idx={i15})"
+            )
+            logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
+
+        if not has_valid_mmh:
+            mmh_reversal_buy = False
+            mmh_reversal_sell = False
+        else:
+            mmh_reversal_buy = (
+                buy_common and mmh_curr > 0
+                and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
+            )
+            mmh_reversal_sell = (
+                sell_common and mmh_curr < 0
+                and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
+            )
 
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
@@ -4099,110 +4266,107 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         )
         all_state_changes = []
 
-        if wick_rejected:
-            logger_pair.debug(f"[{pair_name}] Alert loop skipped (wick_rejected=True)")
-        else:
-            for alert_key in alert_keys_to_check:  # ← Loop starts
-                def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
-                if not def_:
-                    continue
+        for alert_key in alert_keys_to_check:
+            def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
+            if not def_:
+                continue
 
-                if alert_key in BUY_ALERT_KEYS:
-                    if not is_green:
-                        logger_pair.debug(
-                            f"[{pair_name}] 🚫 BLOCKED BUY: {alert_key} on RED candle! "
-                            f"O={open_curr:.2f} C={close_curr:.2f}"
-                        )
-                        continue
-                    if not is_valid_for_buy:
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
-                        continue
-        
-                if alert_key in SELL_ALERT_KEYS:
-                    if not is_red:
-                        logger_pair.debug(
-                            f"[{pair_name}] 🚫 BLOCKED SELL: {alert_key} on GREEN candle! "
-                            f"O={open_curr:.2f} C={close_curr:.2f}"
-                        )
-                        continue
-                    if not is_valid_for_sell:
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
-                        continue
-
-                if is_green and alert_key.startswith("pivot_down"):
+            if alert_key in BUY_ALERT_KEYS:
+                if not is_green:
                     logger_pair.debug(
-                        f"[{pair_name}] LOGIC ERROR: GREEN candle firing pivot_down '{alert_key}'. "
-                        f"Skipping to prevent false alert."
+                        f"[{pair_name}] 🚫 BLOCKED BUY: {alert_key} on RED candle! "
+                        f"O={open_curr:.2f} C={close_curr:.2f}"
                     )
                     continue
-
-                if is_red and alert_key.startswith("pivot_up"):
-                    logger_pair.debug(
-                        f"[{pair_name}] LOGIC ERROR: RED candle firing pivot_up '{alert_key}'. "
-                        f"Skipping to prevent false alert."
-                    )
-                    continue
-
-                key = ALERT_KEYS[alert_key]
-                trigger = False
-
-                if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
-                    level = alert_key.split("_")[-1]
-                    is_buy = alert_key.startswith("pivot_up_")
-                    try:
-
-                        valid_cross, reason = get_pivot_alert_info(context, level, is_buy)
-                        if not valid_cross and reason and piv:
-                             context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    except Exception as e:
-                        logger_pair.debug(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
-                        trigger = False
-            
-                elif alert_key in ("vwap_up", "vwap_down"):
-                    if not vwap_available:
-                        if cfg.DEBUG_MODE:
-                            logger_pair.debug(f"Skipping {alert_key}: VWAP unavailable")
-                        continue
-                    trigger = False
-                    try:
-                        is_buy_side = (alert_key == "vwap_up")
-                        valid_cross, cross_reason = validate_vwap_cross(
-                            context["close_prev"], context["close_curr"],
-                            context["vwap_prev"], context["vwap_curr"],
-                            is_buy_side
-                        )
-                        if valid_cross:
-                            trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    except Exception as e:
-                        logger_pair.debug(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
-                        trigger = False
-                else:
-                    try:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    except Exception as e:
-                        logger_pair.debug(f"Alert check failed for {alert_key}: {e}", exc_info=True)
-                        trigger = False
-
-                if trigger and not previous_states.get(key, False):
-                    extra = ""
-                    try:
-                        base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
-                        extra = base_extra
-                    except Exception as e:
-                        logger_pair.debug(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
-                        extra = f"(Error: {str(e)[:100]})"
-
-                    raw_alerts.append((def_["title"], extra, def_["key"]))
-            
+                if not is_valid_for_buy:
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(
-                            f"✅ Alert FIRED: {alert_key} | "
-                            f"buy_common={buy_common} sell_common={sell_common} | "
-                            f"Candle: O={open_curr:.2f} C={close_curr:.2f}"
-                        )
+                        logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
+                    continue
+        
+            if alert_key in SELL_ALERT_KEYS:
+                if not is_red:
+                    logger_pair.debug(
+                        f"[{pair_name}] 🚫 BLOCKED SELL: {alert_key} on GREEN candle! "
+                        f"O={open_curr:.2f} C={close_curr:.2f}"
+                    )
+                    continue
+                if not is_valid_for_sell:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
+                    continue
+
+            if is_green and alert_key.startswith("pivot_down"):
+                logger_pair.debug(
+                    f"[{pair_name}] LOGIC ERROR: GREEN candle firing pivot_down '{alert_key}'. "
+                    f"Skipping to prevent false alert."
+                )
+                continue
+
+            if is_red and alert_key.startswith("pivot_up"):
+                logger_pair.debug(
+                    f"[{pair_name}] LOGIC ERROR: RED candle firing pivot_up '{alert_key}'. "
+                    f"Skipping to prevent false alert."
+                )
+                continue
+
+            key = ALERT_KEYS[alert_key]
+            trigger = False
+
+            if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
+                level = alert_key.split("_")[-1]
+                is_buy = alert_key.startswith("pivot_up_")
+                try:
+
+                    valid_cross, reason = get_pivot_alert_info(context, level, is_buy)
+                    if not valid_cross and reason and piv:
+                         context["pivot_suppressions"].append(f"{alert_key}: {reason}")
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
+            
+            elif alert_key in ("vwap_up", "vwap_down"):
+                if not vwap_available:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: VWAP unavailable")
+                    continue
+                trigger = False
+                try:
+                    is_buy_side = (alert_key == "vwap_up")
+                    valid_cross, cross_reason = validate_vwap_cross(
+                        context["close_prev"], context["close_curr"],
+                        context["vwap_prev"], context["vwap_curr"],
+                        is_buy_side
+                    )
+                    if valid_cross:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
+            else:
+                try:
+                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"Alert check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
+
+            if trigger and not previous_states.get(key, False):
+                extra = ""
+                try:
+                    base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
+                    extra = base_extra
+                except Exception as e:
+                    logger_pair.debug(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
+                    extra = f"(Error: {str(e)[:100]})"
+
+                raw_alerts.append((def_["title"], extra, def_["key"]))
+            
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(
+                        f"✅ Alert FIRED: {alert_key} | "
+                        f"buy_common={buy_common} sell_common={sell_common} | "
+                        f"Candle: O={open_curr:.2f} C={close_curr:.2f}"
+                    )
 
         conditional_states = previous_states
 
@@ -4214,23 +4378,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_mmh_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
-
-        if wick_rejected:
-            if all_state_changes:
-                await sdb.atomic_batch_update(all_state_changes)
-            logger_pair.debug(
-                f"[{pair_name}] Wick-rejected: resets applied, no new alerts sent."
-            )
-            return pair_name, {
-                "state": "NO_SIGNAL",
-                "ts": int(time.time()),
-                "summary": {
-                    "alerts": 0,
-                    "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                    "mmh_hist": round(mmh_curr, 4),
-                    "suppression": f"Wick rejected: {error_msg}"
-                }
-            }
 
         alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
