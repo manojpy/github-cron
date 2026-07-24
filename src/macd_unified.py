@@ -164,12 +164,13 @@ class BotConfig(BaseModel):
     DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
-    PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "BTCUSD", "LINKUSD", "ARBUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BCHUSD", "WLDUSD" ], min_length=1) 
+    PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "BTCUSD", "LINKUSD", "ARBUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BILLUSD", "BCHUSD", "WLDUSD" ], min_length=1) 
     PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
     PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
     PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
+    VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
     MMH_PERIOD: int = Field(default=55, ge=20, le=200, description="MMH calculation period")  
     ENABLE_PPO_GATE: bool = Field(default=True, description="Enable PPO(32,84,20) as trend gate")
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
@@ -207,7 +208,6 @@ class BotConfig(BaseModel):
     ENABLE_CPR: bool = Field(default=False)
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
     ENABLE_CPR_ADX_RVOL_BYPASS: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
-    ADX_RISING_LOOKBACK: int = Field(default=1, ge=1, le=5, description="Bars back to confirm ADX is rising")
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
@@ -819,6 +819,26 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int,
         flat = np.full(default_len, 50.0, dtype=np.float64)
         return flat, flat.copy()
 
+def calculate_volume_ema_numpy(volume: np.ndarray, length: int) -> np.ndarray:
+    try:
+        if volume is None or len(volume) < length:
+            logger.warning(f"Volume EMA: Insufficient data (len={len(volume) if volume is not None else 0}, required={length})")
+            default_len = len(volume) if volume is not None else 1
+            return np.full(default_len, np.nan, dtype=np.float64)
+
+        vol_ema = ema_loop(volume.astype(np.float64), float(length))
+
+        if cfg.NUMBA_PARALLEL and len(vol_ema) >= 200:
+            vol_ema = sanitize_array_numba_parallel(vol_ema, np.nan)
+        else:
+            vol_ema = sanitize_array_numba(vol_ema, np.nan)
+
+        return vol_ema
+    except Exception as e:
+        logger.error(f"Volume EMA calculation failed: {e}")
+        default_len = len(volume) if volume is not None else 1
+        return np.full(default_len, np.nan, dtype=np.float64)
+
 def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None or len(close) < max(fast, slow):
@@ -1218,6 +1238,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
 
+        
         ok, msg = _validate_atr_arrays(results['atr_short'], results['atr_long'], n_15m)
         if not ok:
             logger.warning(
@@ -1225,6 +1246,9 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
                 f"RVOL filter may be unreliable this run."
             )
 
+        results['volume_ema'] = calculate_volume_ema_numpy(
+            data_15m["volume"], cfg.VOLUME_EMA_LENGTH
+        )
         results['adx'] = calculate_adx_core(
             data_15m["high"],
             data_15m["low"],
@@ -1298,7 +1322,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'rma50_15', 'rma200_5', 'adx',
             'atr_short', 'atr_long',
             'ppo_gate', 'ppo_gate_signal',
-            'rsi_guard_smooth', 'rsi_guard_ema',
+            'rsi_guard_smooth', 'rsi_guard_ema', 'volume_ema', 
         ]
 
         for key in SANITIZE_KEYS:
@@ -1356,6 +1380,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'ppo_gate_signal': np.full(n, np.nan, dtype=np.float64),
             'rsi_guard_smooth': np.full(n, np.nan, dtype=np.float64),
             'rsi_guard_ema': np.full(n, np.nan, dtype=np.float64),
+            'volume_ema': np.full(n, np.nan, dtype=np.float64),
         }
 
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
@@ -3872,16 +3897,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_buy  = cloud_up
         confirmation_sell = cloud_down
 
+
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
-
-        adx_rising = False
-        if cfg.ENABLE_CPR_ADX_RVOL_BYPASS:
-            lb = cfg.ADX_RISING_LOOKBACK
-            if i15 >= lb:
-                adx_prev_val = indicators['adx'][i15 - lb]
-                if not np.isnan(adx_prev_val):
-                    adx_rising = adx_val > adx_prev_val
 
         cpr_ok = indicators.get('cpr_ok', not cfg.ENABLE_CPR)
 
@@ -3895,9 +3913,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             rvol_ok = True
 
+        volume_curr = data_15m["volume"][i15]
+        volume_ema_curr = indicators['volume_ema'][i15]
+        if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
+            volume_above_ema_ok = volume_curr > volume_ema_curr
+        else:
+            volume_above_ema_ok = False
+
         cpr_bypass_ok = (
             cfg.ENABLE_CPR_ADX_RVOL_BYPASS
-            and adx_ok and adx_rising and rvol_ok
+            and adx_ok and rvol_ok and volume_above_ema_ok
         )
         effective_cpr_ok = cpr_ok or cpr_bypass_ok
 
@@ -3905,8 +3930,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             nr_cpr_dbg = indicators.get('nr_cpr', float('nan'))
             logger_pair.debug(
                 f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} "
-                f"(bypass={cpr_bypass_ok}, adx={adx_val:.1f} rising={adx_rising}) "
-                f"NR_CPR={nr_cpr_dbg:.4f}"
+                f"(bypass={cpr_bypass_ok}, adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                f"rvol_ok={rvol_ok}, vol={volume_curr:.2f} vs EMA{cfg.VOLUME_EMA_LENGTH}={volume_ema_curr:.2f} "
+                f"(vol_ok={volume_above_ema_ok})) NR_CPR={nr_cpr_dbg:.4f}"
             )
 
         if cfg.ENABLE_PPO_GATE:
@@ -4863,7 +4889,7 @@ async def run_once() -> bool:
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent_ref[0]} | "
-            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
+            f"Memory: {int(final_memory_mb)}MB (��{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
         logger_run.info(summary)
