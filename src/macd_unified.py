@@ -238,7 +238,8 @@ class BotConfig(BaseModel):
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
     ADX_THRESHOLD: float = Field(default=18.0, ge=5.0, le=50.0)  # ADX trend strength threshold (18=moderate, higher=stronger)   
     MAX_CANDLE_STALENESS_SEC: int = Field(default=1200, ge=600, le=3600)  # Max candle age in seconds (10-60 min)
-    RATE_LIMIT_PER_MINUTE: int = Field(default=90, ge=10, le=120)  # Max API requests per minute
+    RATE_LIMIT_PER_MINUTE: int = Field(default=90, ge=10, le=120)
+    CONFIRM_RATE_LIMIT_PER_MINUTE: int = Field(default=20, ge=5, le=60)
     CB_FAILURE_THRESHOLD: int = Field(default=3, ge=1, le=10)  # Failures before circuit breaker opens
     CB_RECOVERY_TIMEOUT: int = Field(default=60, ge=10, le=600)  # Circuit breaker recovery wait time (seconds)
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
@@ -1859,6 +1860,10 @@ class DataFetcher:
             max_per_minute=cfg.RATE_LIMIT_PER_MINUTE,
             concurrency=max_parallel,
         )
+        self.confirm_rate_limiter = RateLimitedFetcher(
+            max_per_minute=cfg.CONFIRM_RATE_LIMIT_PER_MINUTE,
+            concurrency=2,
+        )
         self.circuit_breaker = APICircuitBreaker(
             failure_threshold=cfg.CB_FAILURE_THRESHOLD,
             recovery_timeout=cfg.CB_RECOVERY_TIMEOUT,
@@ -1876,7 +1881,7 @@ class DataFetcher:
             return self._external_session
         return await SessionManager.get_session()
   
-    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
         can_proceed, reason = self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
@@ -1903,9 +1908,10 @@ class DataFetcher:
             "to": int(to_time),
         }
         url = f"{self.api_base}/v2/chart/history"
+        limiter = self.confirm_rate_limiter if for_confirmation else self.rate_limiter
 
         async with self.semaphore:
-            data = await self.rate_limiter.call(
+            data = await limiter.call(
                 async_fetch_json,
                 url,
                 params=params,
@@ -1913,7 +1919,7 @@ class DataFetcher:
                 backoff=cfg.CANDLE_FETCH_BACKOFF,
                 timeout=self.timeout,
             )
-
+        
             if data:
                 result = data.get("result", {})
                 if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
@@ -2421,7 +2427,8 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     data still settling in the seconds right after candle close."""
     try:
         raw = await fetcher.fetch_candles(
-            symbol, "15", limit=3, reference_time=reference_time, expected_open_15=ts_curr
+            symbol, "15", limit=3, reference_time=reference_time, expected_open_15=ts_curr,
+            for_confirmation=True
         )
         fresh = parse_candles_to_numpy(raw)
         if fresh is None:
