@@ -171,6 +171,7 @@ class BotConfig(BaseModel):
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
+    CPR_WIDE_MIN_PCT_MOVE: float = Field(default=2.0, ge=0.1, le=20.0, description="Minimum % move from today's UTC 00:00 open required for wide-CPR bypass")
     MMH_PERIOD: int = Field(default=55, ge=20, le=200, description="MMH calculation period")  
     ENABLE_PPO_GATE: bool = Field(default=True, description="Enable PPO(32,84,20) as trend gate")
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
@@ -670,6 +671,27 @@ def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time:
         raise ValueError(f"Close outside H/L: H={d_high} L={d_low} C={d_close}")
 
     return d_high, d_low, d_close, candle_ts
+
+def _find_today_daily_open(data_daily: Dict[str, np.ndarray], reference_time: int) -> Optional[float]:
+    ts_arr = data_daily.get("timestamp")
+    op_arr = data_daily.get("open")
+    if ts_arr is None or op_arr is None or len(ts_arr) == 0:
+        return None
+
+    day_numbers = ts_arr // 86400
+    today_num = reference_time // 86400
+
+    mask = (day_numbers == today_num)
+    if not np.any(mask):
+        return None
+
+    idx = int(np.where(mask)[0][-1])
+    open_val = float(op_arr[idx])
+
+    if np.isnan(open_val) or np.isinf(open_val) or open_val <= 0:
+        return None
+
+    return open_val
 
 def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
     min_deviation: float = 0.001, max_deviation_pct: float = Constants.VWAP_MAX_DISTANCE_PCT) -> Tuple[bool, Optional[str]]:
@@ -1237,8 +1259,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
         results['atr_long'] = calculate_atr_rma(
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
-
-        
+    
         ok, msg = _validate_atr_arrays(results['atr_short'], results['atr_long'], n_15m)
         if not ok:
             logger.warning(
@@ -1317,6 +1338,14 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             results['nr_cpr'] = float('nan')
             results['cpr_ok'] = False
 
+        if cfg.ENABLE_CPR and data_daily is not None:
+            today_open = _find_today_daily_open(data_daily, reference_time)
+            results['today_utc_open'] = today_open if today_open is not None else float('nan')
+            if cfg.DEBUG_MODE:
+                logger.debug(f"Today's UTC 00:00 open: {results['today_utc_open']}")
+        else:
+            results['today_utc_open'] = float('nan')
+
         SANITIZE_KEYS = [
             'ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'mmh',
             'rma50_15', 'rma200_5', 'adx',
@@ -1381,6 +1410,7 @@ def calculate_all_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dic
             'rsi_guard_smooth': np.full(n, np.nan, dtype=np.float64),
             'rsi_guard_ema': np.full(n, np.nan, dtype=np.float64),
             'volume_ema': np.full(n, np.nan, dtype=np.float64),
+            'today_utc_open': float('nan'),
         }
 
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
@@ -3897,7 +3927,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_buy  = cloud_up
         confirmation_sell = cloud_down
 
-
         adx_val = indicators['adx'][i15] if not np.isnan(indicators['adx'][i15]) else 0.0
         adx_ok  = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
 
@@ -3912,6 +3941,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 rvol_ok = False 
         else:
             rvol_ok = True
+        adx_bypass_ok = adx_val >= cfg.ADX_THRESHOLD
+
+        atr_short_val = indicators['atr_short'][i15]
+        atr_long_val  = indicators['atr_long'][i15]
+        if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
+            rvol_bypass_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
+        else:
+            rvol_bypass_ok = False  # can't confirm RVOL -> fail closed, no bypass
 
         volume_curr = data_15m["volume"][i15]
         volume_ema_curr = indicators['volume_ema'][i15]
@@ -3920,9 +3957,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             volume_above_ema_ok = False
 
+        today_utc_open = indicators.get('today_utc_open', float('nan'))
+        if not np.isnan(today_utc_open) and today_utc_open > 0:
+            pct_move_from_open = abs(close_curr - today_utc_open) / today_utc_open * 100.0
+            pct_move_ok = pct_move_from_open >= cfg.CPR_WIDE_MIN_PCT_MOVE
+        else:
+            pct_move_from_open = float('nan')
+            pct_move_ok = False  # can't confirm move -> fail closed, no bypass
+
         cpr_bypass_ok = (
             cfg.ENABLE_CPR_ADX_RVOL_BYPASS
-            and adx_ok and rvol_ok and volume_above_ema_ok
+            and adx_bypass_ok and rvol_bypass_ok
+            and volume_above_ema_ok and pct_move_ok
         )
         effective_cpr_ok = cpr_ok or cpr_bypass_ok
 
@@ -3930,11 +3976,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             nr_cpr_dbg = indicators.get('nr_cpr', float('nan'))
             logger_pair.debug(
                 f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} "
-                f"(bypass={cpr_bypass_ok}, adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                f"rvol_ok={rvol_ok}, vol={volume_curr:.2f} vs EMA{cfg.VOLUME_EMA_LENGTH}={volume_ema_curr:.2f} "
-                f"(vol_ok={volume_above_ema_ok})) NR_CPR={nr_cpr_dbg:.4f}"
+                f"(bypass={cpr_bypass_ok}, adx={adx_val:.1f} vs {cfg.ADX_THRESHOLD} [{adx_bypass_ok}], "
+                f"rvol_ok={rvol_bypass_ok}, "
+                f"vol={volume_curr:.2f} vs EMA{cfg.VOLUME_EMA_LENGTH}={volume_ema_curr:.2f} [{volume_above_ema_ok}], "
+                f"move_from_utc_open={pct_move_from_open:.2f}% vs {cfg.CPR_WIDE_MIN_PCT_MOVE}% [{pct_move_ok}]) "
+                f"NR_CPR={nr_cpr_dbg:.4f}"
             )
-
+        
         if cfg.ENABLE_PPO_GATE:
             if not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
                 ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
