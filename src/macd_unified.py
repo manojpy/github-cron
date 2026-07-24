@@ -4937,7 +4937,7 @@ async def run_once() -> bool:
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent_ref[0]} | "
-            f"Memory: {int(final_memory_mb)}MB (��{memory_delta:+.0f}MB) | "
+            f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
         logger_run.info(summary)
