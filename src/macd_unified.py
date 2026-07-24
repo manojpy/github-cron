@@ -4037,12 +4037,44 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(msg)
             return None
 
+        context = {
+            "close_curr": close_curr, "close_prev": close_prev,
+            "open_curr": open_curr, "high_curr": high_curr, "low_curr": low_curr,
+            "ts_curr": ts_curr, "close_5m_val": close_5m_val,
+
+            "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
+            "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
+            "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
+            "rsi_ema_curr": rsi_ema_curr, "rsi_ema_prev": rsi_ema_prev,
+            "vwap_curr": vwap_curr, "vwap_prev": vwap_prev,
+            "mmh_curr": mmh_curr, "mmh_m1": mmh_m1, "mmh_m2": mmh_m2, "mmh_m3": mmh_m3,
+            "rma50_15_val": rma50_15_val, "rma200_5_val": rma200_5_val,
+            "ppo_gate_curr": ppo_gate_curr, "ppo_gate_prev": ppo_gate_prev,
+            "ppo_gate_sig_curr": ppo_gate_sig_curr, "ppo_gate_sig_prev": ppo_gate_sig_prev,
+            "rsi_guard_smooth_curr": rsi_guard_smooth_curr, "rsi_guard_ema_curr": rsi_guard_ema_curr,
+            "trend_gate_ok_buy": trend_gate_ok_buy, "trend_gate_ok_sell": trend_gate_ok_sell,
+            "cloud_up": cloud_up, "cloud_down": cloud_down,
+            "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
+            "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
+            "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell,
+            "buy_common": buy_common, "sell_common": sell_common,
+            "vwap_available": vwap_available,
+            "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
+
+            "buy_wick_ratio": buy_wick_ratio,
+            "sell_wick_ratio": sell_wick_ratio,
+            "is_green": is_green, "is_red": is_red,
+            "pivots": piv if piv else {},
+            "pivot_suppressions": [],
+            "nr_cpr": indicators.get('nr_cpr', float('nan')),
+            "cpr_ok": effective_cpr_ok,
+            "cpr_bypass_ok": cpr_bypass_ok,
+        }
+
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
-
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev, "ema_curr": rsi_ema_curr, "ema_prev": rsi_ema_prev}
 
-        # Build keys to CHECK this run (may exclude some due to missing requirements)
         alert_keys_to_check = []
         for d in ALERT_DEFINITIONS:
             key = d["key"]
