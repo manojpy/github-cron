@@ -172,6 +172,7 @@ class BotConfig(BaseModel):
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
     CPR_WIDE_MIN_PCT_MOVE: float = Field(default=2.0, ge=0.1, le=20.0, description="Minimum % move from today's UTC 00:00 open required for wide-CPR bypass")
+    ENABLE_MMH: bool = Field(default=True, description="Enable MMH reversal alerts (Magical Momentum Histogram)")
     MMH_PERIOD: int = Field(default=55, ge=20, le=200, description="MMH calculation period")  
     ENABLE_PPO_GATE: bool = Field(default=True, description="Enable PPO(32,84,20) as trend gate")
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
@@ -1333,8 +1334,10 @@ def calculate_alert_indicators_numpy(
         else:
             results['vwap'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        # MMH — used by MMH alerts (heaviest of all)
-        results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
+        if cfg.ENABLE_MMH:
+            results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
+        else:
+            results['mmh'] = np.full(n_15m, np.nan, dtype=np.float64)
 
         # Pivots — used by pivot alerts
         if cfg.ENABLE_PIVOT and data_daily is not None:
@@ -3253,6 +3256,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
     {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"ppohist_buy","title":"🟢🔥 PPO Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ppohist_sell","title":"🔴🔥 PPO Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -3391,6 +3396,22 @@ def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -
 
     return resets
 
+def _reset_ppohist_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    ppohist_curr, ppohist_m1 = context["ppohist_curr"], context["ppohist_m1"]
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+
+    if conditional_states.get(ALERT_KEYS["ppohist_buy"], False):
+        if not buy_common or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1:
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_buy']}", "INACTIVE", None))
+
+    if conditional_states.get(ALERT_KEYS["ppohist_sell"], False):
+        if not sell_common or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1:
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_sell']}", "INACTIVE", None))
+
+    return resets
+
 def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     piv = context.get("pivots", {})
@@ -3482,14 +3503,16 @@ validate_alert_definitions()
 
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
-    "rsi_50_up", "vwap_up", "mmh_buy",
+    "rsi_50_up", "vwap_up", "mmh_buy", "ppohist_buy",
 }
+
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
-    "rsi_50_down", "vwap_down", "mmh_sell",
+    "rsi_50_down", "vwap_down", "mmh_sell", "ppohist_sell",
 }
+
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
 async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
@@ -3949,6 +3972,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
         ppo_curr = ppo[i15]
         ppo_prev = ppo[i15 - 1] if i15 >= 1 else ppo[i15]
+        ppohist_curr = ppo_gate_curr - ppo_gate_sig_curr
         rsi_curr = smooth_rsi[i15]
         rsi_prev = smooth_rsi[i15 - 1] if i15 >= 1 else smooth_rsi[i15]
         rsi_ema_curr = smooth_rsi_ema[i15]
@@ -3993,14 +4017,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
         mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
 
+        ppohist_m1 = (ppo_gate_arr[i15-1] - ppo_gate_signal_arr[i15-1]) if i15 >= 1 else 0.0
+        ppohist_m2 = (ppo_gate_arr[i15-2] - ppo_gate_signal_arr[i15-2]) if i15 >= 2 else 0.0
+        ppohist_m3 = (ppo_gate_arr[i15-3] - ppo_gate_signal_arr[i15-3]) if i15 >= 3 else 0.0
+
+
         MIN_MMH_BARS_VALID = 160
         has_valid_mmh = (
+            cfg.ENABLE_MMH and
             i15 >= MIN_MMH_BARS_VALID and
             not np.isnan(mmh_curr) and not np.isnan(mmh_m1) and
             not np.isnan(mmh_m2) and not np.isnan(mmh_m3)
         )
 
-        if not has_valid_mmh and cfg.DEBUG_MODE:
+        if not has_valid_mmh and cfg.DEBUG_MODE and cfg.ENABLE_MMH:
             skip_reason = (
                 f"MMH warmup" if i15 < MIN_MMH_BARS_VALID
                 else f"MMH NaN (idx={i15})"
@@ -4018,6 +4048,27 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             mmh_reversal_sell = (
                 sell_common and mmh_curr < 0
                 and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
+            )
+
+        MIN_PPOHIST_BARS_VALID = 160
+        has_valid_ppohist = (
+            cfg.ENABLE_PPO_GATE and
+            i15 >= MIN_PPOHIST_BARS_VALID and
+            not np.isnan(ppohist_curr) and not np.isnan(ppohist_m1) and
+            not np.isnan(ppohist_m2) and not np.isnan(ppohist_m3)
+        )
+
+        if not has_valid_ppohist:
+            ppohist_reversal_buy = False
+            ppohist_reversal_sell = False
+        else:
+            ppohist_reversal_buy = (
+                buy_common and ppohist_curr > 0
+                and ppohist_m3 > ppohist_m2 > ppohist_m1 and ppohist_curr > ppohist_m1
+        )
+            ppohist_reversal_sell = (
+                sell_common and ppohist_curr < 0
+                and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1
             )
 
         values_to_check = {
@@ -4054,6 +4105,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
+            "ppohist_curr": ppohist_curr, "ppohist_m1": ppohist_m1,
+            "ppohist_m2": ppohist_m2, "ppohist_m3": ppohist_m3,
+            "ppohist_reversal_buy": ppohist_reversal_buy, "ppohist_reversal_sell": ppohist_reversal_sell,
 
             "buy_wick_ratio": buy_wick_ratio,
             "sell_wick_ratio": sell_wick_ratio,
@@ -4206,6 +4260,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_vwap_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_mmh_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
 
