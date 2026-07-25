@@ -4818,14 +4818,22 @@ async def run_once() -> bool:
 
         if telegram_queue is None:
             telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
-        
-        lock = RedisLock(sdb._redis, "macd_bot_run")
-        lock_acquired = await lock.acquire(timeout=5.0)
-        if not lock_acquired:
+
+        if sdb.degraded:
             logger_run.warning(
-                "⚠️ Another instance is running (Redis lock held) - exiting gracefully"
+                "⚠️ Redis degraded — skipping distributed lock, proceeding without "
+                "duplicate-run protection (core alerting still runs)"
             )
-            return False
+            lock = None
+            lock_acquired = False
+        else:
+            lock = RedisLock(sdb._redis, "macd_bot_run")
+            lock_acquired = await lock.acquire(timeout=5.0)
+            if not lock_acquired:
+                logger_run.warning(
+                    "⚠️ Another instance is running (Redis lock held) - exiting gracefully"
+                )
+                return False
 
         async def extend_lock_periodically(lock_obj: RedisLock, telegram_queue: TelegramQueue):
             while not shutdown_event.is_set():
@@ -4861,10 +4869,10 @@ async def run_once() -> bool:
                     logger_run.error(f"Lock extension task error: {e}")
                     await asyncio.sleep(60)
 
-        lock_extension_task = asyncio.create_task(
-            extend_lock_periodically(lock, telegram_queue)
+        lock_extension_task = (
+            asyncio.create_task(extend_lock_periodically(lock, telegram_queue))
+            if lock is not None else None
         )
-
         if cfg.SEND_TEST_MESSAGE:
             await telegram_queue.send(escape_markdown_v2(
                 f"🔥 {cfg.BOT_NAME} - Run Started\n"
