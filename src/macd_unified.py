@@ -2689,25 +2689,19 @@ class RedisStateStore:
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
         if self.degraded:
             return True
-    
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
             result = await asyncio.wait_for(
-                self._redis.set(
-                    recent_key,
-                    "1",
-                    nx=True,
-                    ex=Constants.ALERT_DEDUP_WINDOW_SEC
-                ),
-                timeout=1.0
+                self._redis.set(recent_key, str(ts), nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
+                timeout=3.0
             )
             should_send = bool(result)
             if cfg.DEBUG_MODE and not should_send:
                 logger.debug(f"Dedup: Skipping duplicate {pair}:{alert_key}")
             return should_send
         except Exception as e:
-            logger.warning(f"Dedup check failed for {pair}:{alert_key}: {e}")
-            return True
+            logger.error(f"Dedup check FAILED for {pair}:{alert_key}: {e}")
+            return False   # fail-closed, not fail-open
 
     async def release_recent_alert(self, pair: str, alert_key: str) -> None:
         """Undo a dedup claim if the message didn't actually get delivered."""
@@ -3010,7 +3004,7 @@ class TelegramQueue:
 
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
-            await asyncio.wait_for(self._send_impl(message), timeout=30.0)
+            await asyncio.wait_for(self._send_impl(message), timeout=45.0)
             return True
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
@@ -4241,11 +4235,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
             )
             if not confirmed:
-                for _, _, alert_key in alerts_to_send:
-                    await sdb.release_recent_alert(pair_name, alert_key)
-                logger_pair.info(f"[{pair_name}] Alert(s) suppressed pending re-confirmation next run")
+                logger_pair.warning(
+                    f"[{pair_name}] Candle unconfirmed — alert suppressed, dedup key KEPT to prevent duplicates"
+                )
                 alerts_to_send = []
-
+       
         # Build new alert activations separately — do NOT add to all_state_changes yet
         new_alert_activations = []
         for _, _, alert_key in alerts_to_send:
@@ -4296,16 +4290,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if not cfg.DRY_RUN_MODE:
                     send_success = await telegram_queue.send(msg)
                     if not send_success:
-                        logger_pair.error(f"Alert dispatch failed | {pair_name}")
-                        for _, _, alert_key in alerts_to_send:
-                            await sdb.release_recent_alert(pair_name, alert_key)
+                        logger_pair.error(
+                            f"Alert dispatch failed | {pair_name} | "
+                            f"Dedup claim retained (delivery status unknown, not releasing)"
+                        )
+                    else:
+                        logger_pair.info(
+                            f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                            f"Keys: {[ak for _, _, ak in alerts_to_send]}"
+                        )
                 else:
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
-                logger_pair.info(
-                    f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
-                    f"Keys: {[ak for _, _, ak in alerts_to_send]}"
-                )
             except Exception as e:
                 logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
                 for _, _, alert_key in alerts_to_send:
@@ -4943,7 +4939,7 @@ async def run_once() -> bool:
         return True
 
     except asyncio.TimeoutError:
-        logger_run.error("⏱�� Run timed out - exceeded RUN_TIMEOUT_SECONDS")
+        logger_run.error("⚠️ Run timed out - exceeded RUN_TIMEOUT_SECONDS")
         return False
 
     except asyncio.CancelledError:
