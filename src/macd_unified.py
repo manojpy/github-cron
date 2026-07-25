@@ -3216,16 +3216,16 @@ class AlertDefinition(TypedDict):
     requires: List[str]
  
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo"]},
-    {"key":"rsi_50_up","title":"🟢 RSI cross above EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
-    {"key":"rsi_50_down","title":"🔴 RSI cross below EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
-    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
+    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"rsi_50_up","title":"🟢 RSI cross above EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"rsi_50_down","title":"🔴 RSI cross below EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
+    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"hist_rma_sell","title":"🟣⬇️ RMA Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_buy","title":"🟢🔥 PPO Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -4293,7 +4293,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         "summary": {
                             "alerts": 0,
                             "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                            "hist_rma": round(hist_curr, 4) 
+                            "hist_rma": round(hist_curr, 4), 
                             "suppression": f"Global limit {max_alerts_per_run} reached"
                         }
                     }
@@ -4339,12 +4339,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         
         if context.get("pivot_suppressions"):
             reasons.extend(context["pivot_suppressions"])
-        
+
         if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
             if not base_buy_trend:
                 reasons.append("PPO>0 blocked: base_buy_trend=False")
             elif not confirmation_buy:
-                reasons.append("PPO>0 blocked: confirmation_buy=False (MMH or cloud)")
+                reasons.append("PPO>0 blocked: confirmation_buy=False (future cloud)")
             elif not is_valid_for_buy:
                 reasons.append("PPO>0 blocked: Knox rejected candle (wick/color/timing)")
             else:
@@ -4358,7 +4358,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_sell_trend:
                 reasons.append("PPO<0 blocked: base_sell_trend=False")
             elif not confirmation_sell:
-                reasons.append("PPO<0 blocked: confirmation_sell=False (MMH or cloud)")
+                reasons.append("PPO<0 blocked: confirmation_sell=False (future cloud)")
             elif not is_valid_for_sell:
                 reasons.append("PPO<0 blocked: Knox rejected candle (wick/color/timing)")
             else:
@@ -4372,7 +4372,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_buy_trend:
                 reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
             elif not confirmation_buy:
-                reasons.append("PPO>+0.11 blocked: confirmation_buy=False")
+                reasons.append("PPO>+0.11 blocked: confirmation_buy=False (future cloud)")
             elif not is_valid_for_buy:
                 reasons.append("PPO>+0.11 blocked: Knox rejected candle")
             else:
@@ -4386,7 +4386,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_sell_trend:
                 reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
             elif not confirmation_sell:
-                reasons.append("PPO<-0.11 blocked: confirmation_sell=False")
+                reasons.append("PPO<-0.11 blocked: confirmation_sell=False (future cloud)")
             elif not is_valid_for_sell:
                 reasons.append("PPO<-0.11 blocked: Knox rejected candle")
             else:
@@ -4405,7 +4405,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if not base_buy_trend:
                     reasons.append("RSI>EMA5 blocked: base_buy_trend=False")
                 elif not confirmation_buy:
-                    reasons.append("RSI>EMA5 blocked: confirmation_buy=False")
+                    reasons.append("RSI>EMA5 blocked: confirmation_buy=False (future cloud)")
                 elif not is_valid_for_buy:
                     reasons.append("RSI>EMA5 blocked: Knox rejected candle")
                 else:
@@ -4424,7 +4424,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if not base_sell_trend:
                     reasons.append("RSI<EMA5 blocked: base_sell_trend=False")
                 elif not confirmation_sell:
-                    reasons.append("RSI<EMA5 blocked: confirmation_sell=False")
+                    reasons.append("RSI<EMA5 blocked: confirmation_sell=False (future cloud)")
                 elif not is_valid_for_sell:
                     reasons.append("RSI<EMA5 blocked: Knox rejected candle")
                 else:
@@ -4474,20 +4474,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if np.isnan(hist_curr):
                     reasons.append("Hist RMA buy: NaN")
                 elif hist_curr <= 0:
-                    reasons.append(f"Hist RMA buy: hist_curr={hist_curr:.4f} <= 0")
+                    reasons.append(f"Hist RMA buy: hist_curr={hist_curr:.2f} <= 0")
                 elif not (hist_m3 > hist_m2 > hist_m1):
-                    reasons.append(f"Hist RMA buy: sequence not rising ({hist_m3:.4f} > {hist_m2:.4f} > {hist_m1:.4f})")
+                    reasons.append(f"Hist RMA buy: sequence not rising ({hist_m3:.2f} > {hist_m2:.2f} > {hist_m1:.2f})")
                 elif not (hist_curr > hist_m1):
-                    reasons.append(f"Hist RMA buy: no acceleration ({hist_curr:.4f} <= {hist_m1:.4f})")
+                    reasons.append(f"Hist RMA buy: no acceleration ({hist_curr:.2f} <= {hist_m1:.2f})")
             if sell_common and not hist_reversal_sell:
                 if np.isnan(hist_curr):
                     reasons.append("Hist RMA sell: NaN")
                 elif hist_curr >= 0:
-                    reasons.append(f"Hist RMA sell: hist_curr={hist_curr:.4f} >= 0")
+                    reasons.append(f"Hist RMA sell: hist_curr={hist_curr:.2f} >= 0")
                 elif not (hist_m3 < hist_m2 < hist_m1):
-                    reasons.append(f"Hist RMA sell: sequence not falling ({hist_m3:.4f} < {hist_m2:.4f} < {hist_m1:.4f})")
+                    reasons.append(f"Hist RMA sell: sequence not falling ({hist_m3:.2f} < {hist_m2:.2f} < {hist_m1:.2f})")
                 elif not (hist_curr < hist_m1):
-                    reasons.append(f"Hist RMA sell: no acceleration ({hist_curr:.4f} >= {hist_m1:.4f})")
+                    reasons.append(f"Hist RMA sell: no acceleration ({hist_curr:.2f} >= {hist_m1:.2f})")
 
         if cfg.RSI_GUARD_ENABLED:
             if not rsi_guard_ok_buy:
@@ -4506,7 +4506,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
             logger_pair.debug(
                 f"😒 {pair_name} | "
-                f"cloud={cloud_state} mmh={mmh_curr:.2f} | "
+                f"cloud={cloud_state}| "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
         
@@ -4516,7 +4516,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "summary": {
                 "alerts": len(alerts_to_send),
                 "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                "hist_rma": round(hist_curr, 4) 
+                "hist_rma": round(hist_curr, 4), 
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
