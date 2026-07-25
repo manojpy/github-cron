@@ -33,30 +33,6 @@ def sanitize_array_numba_parallel(arr, default):
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-
-@njit("f8[:](f8[:], i4, f8)", nogil=True, cache=True)
-def rolling_std(close, period, responsiveness):
-    
-    n = len(close)
-    sd = np.full(n, np.nan, dtype=np.float64)
-    resp = max(0.00001, min(1.0, responsiveness))
-
-    if n < 2 or period < 2:
-        return np.zeros(n, dtype=np.float64)
-
-    for i in range(period - 1, n):
-        window = close[i - period + 1 : i + 1]
-        valid_window = window[~np.isnan(window)]
-        if len(valid_window) >= 2:
-            sd[i] = np.std(valid_window) * resp
-        else:
-            sd[i] = 0.0
-
-    mask = np.isnan(sd)
-    sd[mask] = 0.0
-    return sd
-
-
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
     """Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1)
@@ -159,81 +135,6 @@ def rolling_min_max_numba(arr, period):
             max_arr[i] = arr[max_deque[max_h % period]]
 
     return min_arr, max_arr
-
-@njit("f8[:](f8[:], f8[:], i8)", nogil=True, cache=True)
-def calc_mmh_worm_loop(close_arr, sd_arr, rows):
-    """Calculate worm array - Pine's exact logic"""
-    worm_arr = np.empty(rows, dtype=np.float64)
-    worm_arr[0] = close_arr[0]
-    for i in range(1, rows):
-        src = close_arr[i]
-        prev_worm = worm_arr[i - 1]
-        diff = src - prev_worm
-        sd_i = sd_arr[i]
-        if np.abs(diff) > sd_i:
-            delta = np.sign(diff) * sd_i
-        else:
-            delta = diff
-        worm_arr[i] = prev_worm + delta
-    return worm_arr
-
-
-@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
-def calc_mmh_value_loop(raw_arr, min_arr, max_arr, rows):
-    """Corrected value loop with NaN propagation to match Pine Script recursion"""
-    value_arr = np.full(rows, np.nan, dtype=np.float64)
-    for i in range(rows):
-        raw = raw_arr[i]
-        mn = min_arr[i]
-        mx = max_arr[i]
-        denom = mx - mn
-        if np.isnan(raw) or np.isnan(mn) or np.isnan(mx) or np.abs(denom) < 1e-10:
-            temp = np.nan
-        else:
-            temp = (raw - mn) / denom
-
-        if np.isnan(temp):
-            value_arr[i] = np.nan
-        else:
-            prev_v = value_arr[i-1] if i > 0 else np.nan
-            prev_v_safe = 0.0 if np.isnan(prev_v) else prev_v
-            v = 1.0 * (temp - 0.5 + 0.5 * prev_v_safe)
-            if v > 0.9999: v = 0.9999
-            if v < -0.9999: v = -0.9999
-            value_arr[i] = v
-
-    return value_arr
-
-
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def calc_mmh_momentum_loop(value_arr, rows):
-    """Corrected momentum transform (log-odds)"""
-    momentum = np.full(rows, np.nan, dtype=np.float64)
-    for i in range(rows):
-        v = value_arr[i]
-        if np.isnan(v):
-            momentum[i] = np.nan
-        else:
-            val_clamped = max(-0.99999, min(0.99999, v))
-            temp2 = (1.0 + val_clamped) / (1.0 - val_clamped)
-            momentum[i] = 0.25 * np.log(temp2)
-    return momentum
-
-
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
-def calc_mmh_momentum_smoothing(momentum_arr, rows):
-    """Corrected final smoothing with NaN propagation"""
-    result = np.full(rows, np.nan, dtype=np.float64)
-    for i in range(rows):
-        curr = momentum_arr[i]
-        if np.isnan(curr):
-            result[i] = np.nan
-        else:
-            prev = result[i-1] if i > 0 else np.nan
-            prev_safe = 0.0 if np.isnan(prev) else prev
-            result[i] = curr + 0.5 * prev_safe
-    return result
-
 
 # ============================================================================
 # 2. EMA FUNCTIONS
@@ -624,13 +525,8 @@ from aot_version import SOURCE_VERSION  # noqa: E402
 EXPORT_CONFIG = {
     'sanitize_array_numba':          'f8[:](f8[:], f8)',
     'sanitize_array_numba_parallel': 'f8[:](f8[:], f8)',
-    'rolling_std':                   'f8[:](f8[:], i4, f8)',
     'rolling_mean_numba':            'f8[:](f8[:], i4)',
     'rolling_min_max_numba':         'Tuple((f8[:], f8[:]))(f8[:], i4)',
-    'calc_mmh_worm_loop':            'f8[:](f8[:], f8[:], i8)',
-    'calc_mmh_value_loop':           'f8[:](f8[:], f8[:], f8[:], i4)',
-    'calc_mmh_momentum_loop':        'f8[:](f8[:], i4)',
-    'calc_mmh_momentum_smoothing':   'f8[:](f8[:], i4)',
     'ema_loop':                      'f8[:](f8[:], f8)',
     'ema_loop_pine':                 'f8[:](f8[:], f8)',          # NEW
     'ema_loop_alpha':                'f8[:](f8[:], f8)', 
@@ -645,7 +541,7 @@ EXPORT_CONFIG = {
 __all__ = list(EXPORT_CONFIG.keys())
 
 # Guard: raise immediately at import if count drops unexpectedly
-expected_min_functions = 18
+expected_min_functions = 13
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

@@ -18,10 +18,6 @@ from typing import Optional, Any, Callable, Dict, Tuple
 import importlib.util
 import numpy as np
 
-# Needed on every run (including the AOT-success path) to detect a stale .so.
-# Deliberately imported from the tiny, numba-free aot_version.py -- NOT from
-# numba_functions_shared.py -- so this check never forces a `numba` import
-# when AOT is active. See aot_version.py for the full rationale.
 try:
     from aot_version import SOURCE_VERSION as _SHARED_SOURCE_VERSION
 except ImportError:
@@ -56,12 +52,7 @@ REQUIRED_AOT_FUNCTIONS = [
     'ema_loop_pine',
     'kalman_loop',
     'vwap_daily_loop_safe',
-    'calc_mmh_worm_loop',
-    'calc_mmh_value_loop',
-    'calc_mmh_momentum_loop',
-    'rolling_std',
     'rolling_mean_numba',
-    'calc_mmh_momentum_smoothing',
     'rolling_min_max_numba',
     'calculate_ppo_core',
     'calculate_rsi_core',
@@ -204,12 +195,7 @@ def initialize_jit_fallback() -> None:
             ema_loop_pine,
             kalman_loop,
             vwap_daily_loop_safe,
-            calc_mmh_worm_loop,
-            calc_mmh_value_loop,
-            calc_mmh_momentum_loop,
-            rolling_std,
             rolling_mean_numba,
-            calc_mmh_momentum_smoothing,
             rolling_min_max_numba,
             calculate_ppo_core,
             calculate_rsi_core,
@@ -226,12 +212,7 @@ def initialize_jit_fallback() -> None:
             'ema_loop_pine': ema_loop_pine,
             'kalman_loop': kalman_loop,
             'vwap_daily_loop_safe': vwap_daily_loop_safe,
-            'calc_mmh_worm_loop': calc_mmh_worm_loop,
-            'calc_mmh_value_loop': calc_mmh_value_loop,
-            'calc_mmh_momentum_loop': calc_mmh_momentum_loop,
-            'rolling_std': rolling_std,
             'rolling_mean_numba': rolling_mean_numba,
-            'calc_mmh_momentum_smoothing': calc_mmh_momentum_smoothing,
             'rolling_min_max_numba': rolling_min_max_numba,
             'calculate_ppo_core': calculate_ppo_core,
             'calculate_rsi_core': calculate_rsi_core,
@@ -257,12 +238,8 @@ def _build_aot_dispatch() -> Dict[str, Callable]:
         'ema_loop_pine': _aot_module.ema_loop_pine,
         'kalman_loop': _aot_module.kalman_loop,
         'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
-        'calc_mmh_worm_loop': _aot_module.calc_mmh_worm_loop,
-        'calc_mmh_value_loop': _aot_module.calc_mmh_value_loop,
-        'calc_mmh_momentum_loop': _aot_module.calc_mmh_momentum_loop,
         'rolling_std': _aot_module.rolling_std,
         'rolling_mean_numba': _aot_module.rolling_mean_numba,
-        'calc_mmh_momentum_smoothing': _aot_module.calc_mmh_momentum_smoothing,
         'rolling_min_max_numba': _aot_module.rolling_min_max_numba,
         'calculate_ppo_core': _aot_module.calculate_ppo_core,
         'calculate_rsi_core': _aot_module.calculate_rsi_core,
@@ -349,21 +326,6 @@ def kalman_loop(src: np.ndarray, length: int, R: float, Q: float) -> np.ndarray:
 def vwap_daily_loop_safe(hlc3: np.ndarray, volumes: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     return _dispatch['vwap_daily_loop_safe'](hlc3, volumes, timestamps)
 
-def calc_mmh_worm_loop(close_arr: np.ndarray, sd_arr: np.ndarray, rows: int) -> np.ndarray:
-    return _dispatch['calc_mmh_worm_loop'](close_arr, sd_arr, rows)
-
-def calc_mmh_value_loop(temp_arr: np.ndarray, min_med: np.ndarray, max_med: np.ndarray, rows: int) -> np.ndarray:
-    return _dispatch['calc_mmh_value_loop'](temp_arr, min_med, max_med, rows)
-
-def calc_mmh_momentum_loop(momentum_arr: np.ndarray, rows: int) -> np.ndarray:
-    return _dispatch['calc_mmh_momentum_loop'](momentum_arr, rows)
-
-def calc_mmh_momentum_smoothing(momentum: np.ndarray, rows: int) -> np.ndarray:
-    return _dispatch['calc_mmh_momentum_smoothing'](momentum, rows)
-
-def rolling_std(close: np.ndarray, period: int, responsiveness: float) -> np.ndarray:
-    return _dispatch['rolling_std'](close, period, responsiveness)
-
 def rolling_mean_numba(data: np.ndarray, period: int) -> np.ndarray:
     return _dispatch['rolling_mean_numba'](data, period)
 
@@ -410,19 +372,12 @@ __all__ = [
     'vwap_daily_loop_safe',
 
     # Statistical
-    'rolling_std',
     'rolling_mean_numba',
-    'calc_mmh_momentum_smoothing',
     'rolling_min_max_numba',
 
     # Oscillators
     'calculate_ppo_core',
     'calculate_rsi_core',
-
-    # MMH Components
-    'calc_mmh_worm_loop',
-    'calc_mmh_value_loop',
-    'calc_mmh_momentum_loop',
 
     # Pattern Recognition
     'calculate_atr_rma',

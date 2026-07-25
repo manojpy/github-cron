@@ -40,11 +40,6 @@ from aot_bridge import (
     ema_loop_pine,
     kalman_loop,
     vwap_daily_loop_safe,
-    calc_mmh_worm_loop,
-    calc_mmh_value_loop,
-    calc_mmh_momentum_loop,
-    rolling_std,
-    calc_mmh_momentum_smoothing,
     rolling_mean_numba,
     rolling_min_max_numba,
     calculate_ppo_core,
@@ -172,8 +167,9 @@ class BotConfig(BaseModel):
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
     CPR_WIDE_MIN_PCT_MOVE: float = Field(default=2.0, ge=0.1, le=20.0, description="Minimum % move from today's UTC 00:00 open required for wide-CPR bypass")
-    ENABLE_MMH: bool = Field(default=True, description="Enable MMH reversal alerts (Magical Momentum Histogram)")
-    MMH_PERIOD: int = Field(default=55, ge=20, le=200, description="MMH calculation period")  
+    ENABLE_HIST_RMA: bool = Field(default=True, description="Enable RMA 10/30 histogram reversal alerts")
+    HIST_RMA_FAST: int = Field(default=10, ge=2, le=100, description="Histogram RMA fast period")
+    HIST_RMA_SLOW: int = Field(default=30, ge=5, le=200, description="Histogram RMA slow period")
     ENABLE_PPO_GATE: bool = Field(default=True, description="Enable PPO(32,84,20) as trend gate")
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
     PPO_GATE_SLOW: int = Field(default=84, ge=2, le=200, description="Gate PPO slow period")
@@ -295,6 +291,12 @@ class BotConfig(BaseModel):
             raise ValueError(
                 f'PPO_GATE_FAST ({self.PPO_GATE_FAST}) must be strictly less than '
                 f'PPO_GATE_SLOW ({self.PPO_GATE_SLOW})'
+            )
+
+        if self.ENABLE_HIST_RMA and self.HIST_RMA_FAST >= self.HIST_RMA_SLOW:
+            raise ValueError(
+                f'HIST_RMA_FAST ({self.HIST_RMA_FAST}) must be strictly less than '
+                f'HIST_RMA_SLOW ({self.HIST_RMA_SLOW})'
             )
 
         return self
@@ -1003,37 +1005,6 @@ def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, 
         return (np.full(default_len, np.nan, dtype=np.float64),
                 np.full(default_len, np.nan, dtype=np.float64))
 
-def calculate_magical_momentum_hist(close: np.ndarray, period: int = 55, responsiveness: float = 0.9) -> np.ndarray:  
-    try:
-        if close is None or len(close) < period:
-            return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
-
-        rows = len(close)
-        resp_clamped = max(0.00001, min(1.0, float(responsiveness)))
-        close_c = np.ascontiguousarray(close, dtype=np.float64)
-
-        sd = rolling_std(close_c, 50, resp_clamped)
-        worm_arr = calc_mmh_worm_loop(close_c, sd, rows)
-        ma = rolling_mean_numba(close_c, period)
-        raw = np.empty(rows, dtype=np.float64)
-        nonzero_mask = np.abs(worm_arr) >= 1e-10
-        raw[nonzero_mask] = (
-            (worm_arr[nonzero_mask] - ma[nonzero_mask]) 
-            / worm_arr[nonzero_mask]
-        )
-
-        raw[~nonzero_mask] = np.nan
-        min_med, max_med = rolling_min_max_numba(raw, period)
-        value_arr = calc_mmh_value_loop(raw, min_med, max_med, rows)
-        momentum = calc_mmh_momentum_loop(value_arr, rows)
-        momentum = calc_mmh_momentum_smoothing(momentum, rows)
-
-        return momentum
-
-    except Exception as e:
-        traceback.print_exc()
-        return np.full(len(close) if close is not None else 1, np.nan, dtype=np.float64)
-
 def warmup_if_needed() -> None:
     """Hybrid warmup with comprehensive coverage & better logging"""
    
@@ -1334,12 +1305,13 @@ def calculate_alert_indicators_numpy(
         else:
             results['vwap'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        if cfg.ENABLE_MMH:
-            results['mmh'] = calculate_magical_momentum_hist(close_15m, period=cfg.MMH_PERIOD)
+        if cfg.ENABLE_HIST_RMA:
+            rma_fast = calculate_rma_numpy(close_15m, cfg.HIST_RMA_FAST)
+            rma_slow = calculate_rma_numpy(close_15m, cfg.HIST_RMA_SLOW)
+            results['hist_rma'] = rma_fast - rma_slow
         else:
-            results['mmh'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['hist_rma'] = np.full(n_15m, np.nan, dtype=np.float64)
 
-        # Pivots — used by pivot alerts
         if cfg.ENABLE_PIVOT and data_daily is not None:
             results['pivots'] = calculate_pivot_levels_numpy(
                 data_daily["high"], data_daily["low"], data_daily["close"],
@@ -1349,7 +1321,7 @@ def calculate_alert_indicators_numpy(
             results['pivots'] = {}
 
         # Sanitize
-        for key in ('ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'mmh'):
+        for key in ('ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'hist_rma'):
             arr = results[key]
             if np.any(np.isinf(arr)):
                 results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
@@ -3254,8 +3226,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"rsi_50_down","title":"🔴 RSI cross below EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["ppo","rsi"]},
     {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | MMH ({ctx.get('mmh_curr',0):.2f})","requires":["vwap"]},
-    {"key":"mmh_buy","title":"🔵⬆️ MMH Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("mmh_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"mmh_sell","title":"🟣⬇️ MMH Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("mmh_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"MMH ({ctx.get('mmh_curr',0):.2f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"hist_rma_buy","title":"🔵⬆️ RMA Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"hist_rma_sell","title":"🟣⬇️ RMA Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_buy","title":"🟢🔥 PPO Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_sell","title":"🔴🔥 PPO Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
@@ -3380,19 +3352,19 @@ def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) 
 
     return resets
 
-def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
-    mmh_curr, mmh_m1 = context["mmh_curr"], context["mmh_m1"]
+    hist_curr, hist_m1 = context["hist_curr"], context["hist_m1"]
     buy_common = context.get("buy_common", False)
     sell_common = context.get("sell_common", False)
 
-    if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
-        if not buy_common or np.isnan(mmh_curr) or mmh_curr <= 1e-8 or mmh_curr <= mmh_m1:
-            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
+    if conditional_states.get(ALERT_KEYS["hist_rma_buy"], False):
+        if not buy_common or np.isnan(hist_curr) or hist_curr <= 0 or hist_curr <= hist_m1:
+            resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_buy']}", "INACTIVE", None))
 
-    if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
-        if not sell_common or np.isnan(mmh_curr) or mmh_curr >= -1e-8 or mmh_curr >= mmh_m1:
-            resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
+    if conditional_states.get(ALERT_KEYS["hist_rma_sell"], False):
+        if not sell_common or np.isnan(hist_curr) or hist_curr >= 0 or hist_curr >= hist_m1:
+            resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_sell']}", "INACTIVE", None))
 
     return resets
 
@@ -3503,14 +3475,14 @@ validate_alert_definitions()
 
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
-    "rsi_50_up", "vwap_up", "mmh_buy", "ppohist_buy",
+    "rsi_50_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
 }
 
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
-    "rsi_50_down", "vwap_down", "mmh_sell", "ppohist_sell",
+    "rsi_50_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
 }
 
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
@@ -3575,7 +3547,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     ppo_signal = None
     smooth_rsi = None
     vwap = None
-    mmh = None
+    hist_rma = None
     rma50_15 = None
     rma200_5 = None
     piv = None
@@ -3610,7 +3582,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     "summary": {
                         "alerts": 0,
                         "cloud": "neutral",
-                        "mmh_hist": 0.0,
+                        "hist_rma": 0.0,
                         "suppression": f"Hard reject: {error_msg}"
                     }
                 }
@@ -3624,7 +3596,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "summary": {
                     "alerts": 0,
                     "cloud": "neutral",
-                    "mmh_hist": 0.0,
+                    "hist_rma": 0.0,
                     "suppression": f"Wick rejected: {error_msg}"
                 }
             }
@@ -3936,7 +3908,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "summary": {
                     "alerts": 0,
                     "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                    "mmh_hist": 0.0,
+                    "hist_rma": 0.0,
                     "suppression": f"Gate blocked: {', '.join(reasons)}"
                 }
             }
@@ -3965,7 +3937,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         smooth_rsi = indicators["smooth_rsi"]
         smooth_rsi_ema = indicators["smooth_rsi_ema"]
         vwap = indicators["vwap"]
-        mmh = indicators["mmh"]
+        hist_rma = indicators["hist_rma"]
         piv = indicators.get("pivots", {})
 
         ppo_sig_curr = ppo_signal[i15]
@@ -4012,42 +3984,42 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"len={len(vwap) if vwap is not None else 0}, i15={i15}"
                 )
 
-        mmh_curr = mmh[i15]
-        mmh_m1 = mmh[i15 - 1] if i15 >= 1 else 0.0
-        mmh_m2 = mmh[i15 - 2] if i15 >= 2 else 0.0
-        mmh_m3 = mmh[i15 - 3] if i15 >= 3 else 0.0
+        hist_curr = hist_rma[i15]
+        hist_m1 = hist_rma[i15 - 1] if i15 >= 1 else 0.0
+        hist_m2 = hist_rma[i15 - 2] if i15 >= 2 else 0.0
+        hist_m3 = hist_rma[i15 - 3] if i15 >= 3 else 0.0
 
         ppohist_m1 = (ppo_gate_arr[i15-1] - ppo_gate_signal_arr[i15-1]) if i15 >= 1 else 0.0
         ppohist_m2 = (ppo_gate_arr[i15-2] - ppo_gate_signal_arr[i15-2]) if i15 >= 2 else 0.0
         ppohist_m3 = (ppo_gate_arr[i15-3] - ppo_gate_signal_arr[i15-3]) if i15 >= 3 else 0.0
 
 
-        MIN_MMH_BARS_VALID = 160
-        has_valid_mmh = (
-            cfg.ENABLE_MMH and
-            i15 >= MIN_MMH_BARS_VALID and
-            not np.isnan(mmh_curr) and not np.isnan(mmh_m1) and
-            not np.isnan(mmh_m2) and not np.isnan(mmh_m3)
+        MIN_HIST_RMA_BARS_VALID = cfg.HIST_RMA_SLOW + 10
+        has_valid_hist_rma = (
+            cfg.ENABLE_HIST_RMA and
+            i15 >= MIN_HIST_RMA_BARS_VALID and
+            not np.isnan(hist_curr) and not np.isnan(hist_m1) and
+            not np.isnan(hist_m2) and not np.isnan(hist_m3)
         )
 
-        if not has_valid_mmh and cfg.DEBUG_MODE and cfg.ENABLE_MMH:
+        if not has_valid_hist_rma and cfg.DEBUG_MODE and cfg.ENABLE_HIST_RMA:
             skip_reason = (
-                f"MMH warmup" if i15 < MIN_MMH_BARS_VALID
-                else f"MMH NaN (idx={i15})"
+                f"Hist RMA warmup" if i15 < MIN_HIST_RMA_BARS_VALID
+                else f"Hist RMA NaN (idx={i15})"
             )
-            logger_pair.debug(f"Skipping MMH alerts: {skip_reason}")
+            logger_pair.debug(f"Skipping Hist RMA alerts: {skip_reason}")
 
-        if not has_valid_mmh:
-            mmh_reversal_buy = False
-            mmh_reversal_sell = False
+        if not has_valid_hist_rma:
+            hist_reversal_buy = False
+            hist_reversal_sell = False
         else:
-            mmh_reversal_buy = (
-                buy_common and mmh_curr > 0
-                and mmh_m3 > mmh_m2 > mmh_m1 and mmh_curr > mmh_m1
+            hist_reversal_buy = (
+                buy_common and hist_curr > 0
+                and hist_m3 > hist_m2 > hist_m1 and hist_curr > hist_m1
             )
-            mmh_reversal_sell = (
-                sell_common and mmh_curr < 0
-                and mmh_m3 < mmh_m2 < mmh_m1 and mmh_curr < mmh_m1
+            hist_reversal_sell = (
+                sell_common and hist_curr < 0
+                and hist_m3 < hist_m2 < hist_m1 and hist_curr < hist_m1
             )
 
         MIN_PPOHIST_BARS_VALID = 160
@@ -4086,13 +4058,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "close_curr": close_curr, "close_prev": close_prev,
             "open_curr": open_curr, "high_curr": high_curr, "low_curr": low_curr,
             "ts_curr": ts_curr, "close_5m_val": close_5m_val,
-
             "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
             "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
             "rsi_ema_curr": rsi_ema_curr, "rsi_ema_prev": rsi_ema_prev,
             "vwap_curr": vwap_curr, "vwap_prev": vwap_prev,
-            "mmh_curr": mmh_curr, "mmh_m1": mmh_m1, "mmh_m2": mmh_m2, "mmh_m3": mmh_m3,
+            "hist_curr": hist_curr, "hist_m1": hist_m1, "hist_m2": hist_m2, "hist_m3": hist_m3,
+            "hist_reversal_buy": hist_reversal_buy, "hist_reversal_sell": hist_reversal_sell,
             "rma50_15_val": rma50_15_val, "rma200_5_val": rma200_5_val,
             "ppo_gate_curr": ppo_gate_curr, "ppo_gate_prev": ppo_gate_prev,
             "ppo_gate_sig_curr": ppo_gate_sig_curr, "ppo_gate_sig_prev": ppo_gate_sig_prev,
@@ -4101,7 +4073,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_up": cloud_up, "cloud_down": cloud_down,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
-            "mmh_reversal_buy": mmh_reversal_buy, "mmh_reversal_sell": mmh_reversal_sell,
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
@@ -4259,7 +4230,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_vwap_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_mmh_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
@@ -4322,7 +4293,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         "summary": {
                             "alerts": 0,
                             "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                            "mmh_hist": round(mmh_curr, 4),
+                            "hist_rma": round(hist_curr, 4) 
                             "suppression": f"Global limit {max_alerts_per_run} reached"
                         }
                     }
@@ -4498,6 +4469,26 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not ppo_gate_ok_sell:
                 reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
 
+        if cfg.ENABLE_HIST_RMA:
+            if buy_common and not hist_reversal_buy:
+                if np.isnan(hist_curr):
+                    reasons.append("Hist RMA buy: NaN")
+                elif hist_curr <= 0:
+                    reasons.append(f"Hist RMA buy: hist_curr={hist_curr:.4f} <= 0")
+                elif not (hist_m3 > hist_m2 > hist_m1):
+                    reasons.append(f"Hist RMA buy: sequence not rising ({hist_m3:.4f} > {hist_m2:.4f} > {hist_m1:.4f})")
+                elif not (hist_curr > hist_m1):
+                    reasons.append(f"Hist RMA buy: no acceleration ({hist_curr:.4f} <= {hist_m1:.4f})")
+            if sell_common and not hist_reversal_sell:
+                if np.isnan(hist_curr):
+                    reasons.append("Hist RMA sell: NaN")
+                elif hist_curr >= 0:
+                    reasons.append(f"Hist RMA sell: hist_curr={hist_curr:.4f} >= 0")
+                elif not (hist_m3 < hist_m2 < hist_m1):
+                    reasons.append(f"Hist RMA sell: sequence not falling ({hist_m3:.4f} < {hist_m2:.4f} < {hist_m1:.4f})")
+                elif not (hist_curr < hist_m1):
+                    reasons.append(f"Hist RMA sell: no acceleration ({hist_curr:.4f} >= {hist_m1:.4f})")
+
         if cfg.RSI_GUARD_ENABLED:
             if not rsi_guard_ok_buy:
                 reasons.append(f"RSI Guard buy: RSI({rsi_guard_smooth_curr:.2f}) <= EMA({rsi_guard_ema_curr:.2f})")
@@ -4525,7 +4516,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "summary": {
                 "alerts": len(alerts_to_send),
                 "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                "mmh_hist": round(mmh_curr, 4),
+                "hist_rma": round(hist_curr, 4) 
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
@@ -4542,7 +4533,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "summary": {
                 "alerts": 0,
                 "cloud": "neutral",
-                "mmh_hist": 0.0,
+                "hist_rma": 0.0,
                 "error": str(e)
             }
         }
