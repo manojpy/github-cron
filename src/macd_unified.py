@@ -3387,11 +3387,11 @@ def _reset_mmh_alerts(pair_name: str, context: dict, conditional_states: dict) -
     sell_common = context.get("sell_common", False)
 
     if conditional_states.get(ALERT_KEYS["mmh_buy"], False):
-        if not buy_common or mmh_curr <= 1e-8 or mmh_curr <= mmh_m1:
+        if not buy_common or np.isnan(mmh_curr) or mmh_curr <= 1e-8 or mmh_curr <= mmh_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['mmh_buy']}", "INACTIVE", None))
 
     if conditional_states.get(ALERT_KEYS["mmh_sell"], False):
-        if not sell_common or mmh_curr >= -1e-8 or mmh_curr >= mmh_m1:
+        if not sell_common or np.isnan(mmh_curr) or mmh_curr >= -1e-8 or mmh_curr >= mmh_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['mmh_sell']}", "INACTIVE", None))
 
     return resets
@@ -3403,11 +3403,11 @@ def _reset_ppohist_alerts(pair_name: str, context: dict, conditional_states: dic
     sell_common = context.get("sell_common", False)
 
     if conditional_states.get(ALERT_KEYS["ppohist_buy"], False):
-        if not buy_common or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1:
+        if not buy_common or np.isnan(ppohist_curr) or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_buy']}", "INACTIVE", None))
 
     if conditional_states.get(ALERT_KEYS["ppohist_sell"], False):
-        if not sell_common or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1:
+        if not sell_common or np.isnan(ppohist_curr) or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_sell']}", "INACTIVE", None))
 
     return resets
