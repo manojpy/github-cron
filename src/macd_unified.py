@@ -4303,10 +4303,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
             except Exception as e:
-                logger_pair.error(f"Error sending alerts: {e}", exc_info=False)
-                for _, _, alert_key in alerts_to_send:
-                    await sdb.release_recent_alert(pair_name, alert_key)
-
+                logger_pair.error(
+                    f"Alert dispatch exception for {pair_name}: {e} | "
+                    f"Dedup key retained — will not retry until window expires"
+                )
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
