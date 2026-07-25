@@ -186,7 +186,7 @@ def initialize_jit_fallback() -> None:
     global _jit_functions, _fallback_reason
 
     try:
-        # Import all 18 functions (already cached by Python)
+        # Import all 13 functions (already cached by Python)
         from numba_functions_shared import (
             sanitize_array_numba,
             sanitize_array_numba_parallel,
@@ -238,7 +238,6 @@ def _build_aot_dispatch() -> Dict[str, Callable]:
         'ema_loop_pine': _aot_module.ema_loop_pine,
         'kalman_loop': _aot_module.kalman_loop,
         'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
-        'rolling_std': _aot_module.rolling_std,
         'rolling_mean_numba': _aot_module.rolling_mean_numba,
         'rolling_min_max_numba': _aot_module.rolling_min_max_numba,
         'calculate_ppo_core': _aot_module.calculate_ppo_core,
