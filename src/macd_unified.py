@@ -1032,7 +1032,6 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.ema_loop_pine(test_data, 7.0) 
         _ = aot_bridge.calculate_ppo_core(test_data, 7, 16, 5)
         _ = aot_bridge.calculate_rsi_core(test_data, 21)
-        _ = aot_bridge.rolling_std(test_data, 14, 0.5)
         _ = aot_bridge.rolling_mean_numba(test_data, 14)
         _ = aot_bridge.kalman_loop(test_data, 10, 0.1, 0.01)
         _ = aot_bridge.rolling_min_max_numba(test_data, 23)
@@ -3188,7 +3187,7 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
             get_pivot_alert_info(ctx, level, is_buy=True)[0]
         ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+                f"${ctx['pivots'][level]:,.2f}"
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%]"
             ),
             "requires": ["pivots"]
@@ -3202,7 +3201,7 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
             get_pivot_alert_info(ctx, level, is_buy=False)[0]
         ),
             "extra_fn": lambda ctx, ppo, ppo_sig, rsi, _: (
-                f"${ctx['pivots'][level]:,.2f} | MMH ({ctx['mmh_curr']:.2f}) "
+                f"${ctx['pivots'][level]:,.2f}"
                 f"[Dist: {abs(ctx['pivots'][level] - ctx['close_curr'])/ctx['pivots'][level]*100:.2f}%]"
             ),
             "requires": ["pivots"]
@@ -3359,11 +3358,11 @@ def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: di
     sell_common = context.get("sell_common", False)
 
     if conditional_states.get(ALERT_KEYS["hist_rma_buy"], False):
-        if not buy_common or np.isnan(hist_curr) or hist_curr <= 0 or hist_curr <= hist_m1:
+        if not buy_common or np.isnan(hist_curr) or hist_curr <= 1e-8 or hist_curr <= hist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_buy']}", "INACTIVE", None))
 
     if conditional_states.get(ALERT_KEYS["hist_rma_sell"], False):
-        if not sell_common or np.isnan(hist_curr) or hist_curr >= 0 or hist_curr >= hist_m1:
+        if not sell_common or np.isnan(hist_curr) or hist_curr >= -1e-8 or hist_curr >= hist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_sell']}", "INACTIVE", None))
 
     return resets
@@ -3994,7 +3993,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppohist_m3 = (ppo_gate_arr[i15-3] - ppo_gate_signal_arr[i15-3]) if i15 >= 3 else 0.0
 
 
-        MIN_HIST_RMA_BARS_VALID = cfg.HIST_RMA_SLOW + 10
+        MIN_HIST_RMA_BARS_VALID = cfg.HIST_RMA_SLOW * 3
         has_valid_hist_rma = (
             cfg.ENABLE_HIST_RMA and
             i15 >= MIN_HIST_RMA_BARS_VALID and
