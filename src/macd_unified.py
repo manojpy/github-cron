@@ -3580,7 +3580,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     "ts": int(time.time()),
                     "summary": {
                         "alerts": 0,
-                        "cloud": "neutral",
+                        "future_cloud": "neutral",
                         "hist_rma": 0.0,
                         "suppression": f"Hard reject: {error_msg}"
                     }
@@ -3594,7 +3594,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "ts": int(time.time()),
                 "summary": {
                     "alerts": 0,
-                    "cloud": "neutral",
+                    "future_cloud": "neutral",
                     "hist_rma": 0.0,
                     "suppression": f"Wick rejected: {error_msg}"
                 }
@@ -3750,17 +3750,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
 
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_valid:
-            tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
-            tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
-        else:
-            if cfg.ICHIMOKU_TK_GUARD_ENABLED and not tk_guard_valid:
+
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED:
+            if tk_guard_valid:
+                tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
+                tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
+            else:
                 logger_pair.debug(
                     f"[{pair_name}] TK lines not ready at i15={i15}. "
-                    f"TK guard bypassed this run."
+                    f"TK guard contributes False (OR'd) this run."
                 )
-            tk_guard_ok_buy = True
-            tk_guard_ok_sell = True
+                tk_guard_ok_buy = False
+                tk_guard_ok_sell = False
+        else:
+            tk_guard_ok_buy = None
+            tk_guard_ok_sell = None
 
         close_prev = close_15m[i15 - 1]
         close_prev_invalid = False
@@ -3862,22 +3866,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
-        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy) if g is not None]
+        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
         trend_gate_ok_buy = any(active_buy_gates) if active_buy_gates else True
 
-        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell) if g is not None]
+        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
         trend_gate_ok_sell = any(active_sell_gates) if active_sell_gates else True
 
         buy_common = (
             base_buy_trend and confirmation_buy and is_valid_for_buy
             and (adx_ok or rvol_ok) and effective_cpr_ok
-            and trend_gate_ok_buy and tk_guard_ok_buy
+            and trend_gate_ok_buy
         )
         sell_common = (
             base_sell_trend and confirmation_sell and is_valid_for_sell
             and (adx_ok or rvol_ok) and effective_cpr_ok
-            and trend_gate_ok_sell and tk_guard_ok_sell
-        )
+            and trend_gate_ok_sell
+        )   
 
         # ═══════════════════════════════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
@@ -3895,8 +3899,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("cpr=False")
             if not trend_gate_ok_buy and not trend_gate_ok_sell:
                 reasons.append("trend_gate=False")
-            if not tk_guard_ok_buy and not tk_guard_ok_sell:
-                reasons.append("tk_guard=False")
             logger_pair.debug(
                 f"😒 {pair_name} | Gate blocked | "
                 f"Suppression: {', '.join(reasons)}"
@@ -4291,7 +4293,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         "ts": int(time.time()),
                         "summary": {
                             "alerts": 0,
-                            "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                             "hist_rma": round(hist_curr, 4), 
                             "suppression": f"Global limit {max_alerts_per_run} reached"
                         }
@@ -4502,10 +4504,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ]
         
         if not alerts_to_send:
-            cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
+            future_cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
             logger_pair.debug(
                 f"😒 {pair_name} | "
-                f"cloud={cloud_state}| "
+                f"future_cloud={future_cloud_state}| "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
         
@@ -4514,12 +4516,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ts": int(time.time()),
             "summary": {
                 "alerts": len(alerts_to_send),
-                "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                 "hist_rma": round(hist_curr, 4), 
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
-
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
