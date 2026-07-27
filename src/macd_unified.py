@@ -3862,23 +3862,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
-        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy) if g is not None]
+        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
         trend_gate_ok_buy = any(active_buy_gates) if active_buy_gates else True
 
-        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell) if g is not None]
+        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
         trend_gate_ok_sell = any(active_sell_gates) if active_sell_gates else True
 
         buy_common = (
             base_buy_trend and confirmation_buy and is_valid_for_buy
             and (adx_ok or rvol_ok) and effective_cpr_ok
-            and trend_gate_ok_buy and tk_guard_ok_buy
+            and trend_gate_ok_buy
         )
         sell_common = (
             base_sell_trend and confirmation_sell and is_valid_for_sell
             and (adx_ok or rvol_ok) and effective_cpr_ok
-            and trend_gate_ok_sell and tk_guard_ok_sell
-        )
-
+            and trend_gate_ok_sell
+        )      
         # ═══════════════════════════════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
         # ═══════════════════════════════════════════════════════
@@ -3895,8 +3894,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("cpr=False")
             if not trend_gate_ok_buy and not trend_gate_ok_sell:
                 reasons.append("trend_gate=False")
-            if not tk_guard_ok_buy and not tk_guard_ok_sell:
-                reasons.append("tk_guard=False")
             logger_pair.debug(
                 f"😒 {pair_name} | Gate blocked | "
                 f"Suppression: {', '.join(reasons)}"
