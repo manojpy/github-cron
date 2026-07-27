@@ -4532,7 +4532,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ts": int(time.time()),
             "summary": {
                 "alerts": 0,
-                "cloud": "neutral",
+                "future_cloud": "neutral",
                 "hist_rma": 0.0,
                 "error": str(e)
             }
