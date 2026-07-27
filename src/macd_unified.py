@@ -163,6 +163,7 @@ class BotConfig(BaseModel):
     PPO_FAST: int = Field(default=7, ge=1, le=50, description="PPO fast period")
     PPO_SLOW: int = Field(default=16, ge=2, le=100, description="PPO slow period")
     PPO_SIGNAL: int = Field(default=5, ge=1, le=25, description="PPO signal period")
+    RMA_FILTER_FAST_PERIOD: int = Field(default=20, ge=2, le=100, description="Fast RMA period for 15m trend filter (vs RMA_50_PERIOD)")
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
@@ -218,13 +219,6 @@ class BotConfig(BaseModel):
     NUMBA_PARALLEL: bool = Field(default=True)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
-    ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
-    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Ichimoku conversion line length")
-    ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
-    ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
-    ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
-    ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
-
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     MAX_ALERTS_PER_RUN: int = Field(default=50, ge=10, le=200)  
@@ -326,6 +320,7 @@ class BotConfig(BaseModel):
             errors.append('PIVOT_MAX_DISTANCE_PCT should be >= 1.0 for meaningful alerts')
 
         ranges = {
+            'RMA_FILTER_FAST_PERIOD': (self.RMA_FILTER_FAST_PERIOD, 5, 50),
             'RMA_50_PERIOD': (self.RMA_50_PERIOD, 20, 100),
             'RMA_200_PERIOD': (self.RMA_200_PERIOD, 100, 300),
             'SRSI_RSI_LEN': (self.SRSI_RSI_LEN, 5, 50),
@@ -910,71 +905,6 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         logger.error(f"RMA calculation failed: {e}")
         return np.zeros_like(data) if data is not None else np.array([0.0])
 
-def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                             conversion_periods: int = 23,
-                             base_periods: int = 65,
-                             span_b_periods: int = 130,
-                             displacement: int = 65) -> Dict[str, np.ndarray]:
-    try:
-        n = len(high)
-        if n == 0:
-            raise ValueError("Empty input arrays")
-
-        # Conversion Line (Tenkan-sen): (highest high + lowest low) / 2
-        _, hh_conv = rolling_min_max_numba(high, conversion_periods)
-        ll_conv, _ = rolling_min_max_numba(low, conversion_periods)
-        conversion_line = (hh_conv + ll_conv) / 2.0
-
-        # Base Line (Kijun-sen): (highest high + lowest low) / 2
-        _, hh_base = rolling_min_max_numba(high, base_periods)
-        ll_base, _ = rolling_min_max_numba(low, base_periods)
-        base_line = (hh_base + ll_base) / 2.0
-
-        # Leading Span A (Senkou Span A): (Conversion + Base) / 2
-        lead_line1 = (conversion_line + base_line) / 2.0
-
-        # Leading Span B (Senkou Span B): (highest high + lowest low) / 2
-        _, hh_spanb = rolling_min_max_numba(high, span_b_periods)
-        ll_spanb, _ = rolling_min_max_numba(low, span_b_periods)
-        lead_line2 = (hh_spanb + ll_spanb) / 2.0
-
-        # Displace cloud forward (Pine: offset = displacement - 1)
-        lag = displacement - 1
-        cloud_upper = np.full(n, np.nan, dtype=np.float64)
-        cloud_lower = np.full(n, np.nan, dtype=np.float64)
-
-        if lag > 0 and n > lag:
-            cloud_upper[lag:] = np.maximum(lead_line1[:-lag], lead_line2[:-lag])
-            cloud_lower[lag:] = np.minimum(lead_line1[:-lag], lead_line2[:-lag])
-        elif lag == 0:
-            cloud_upper[:] = np.maximum(lead_line1, lead_line2)
-            cloud_lower[:] = np.minimum(lead_line1, lead_line2)
-
-        return {
-            'cloud_upper': cloud_upper,
-            'cloud_lower': cloud_lower,
-            'future_green': lead_line1 >= lead_line2,
-            'future_red': lead_line1 <= lead_line2,
-            'conversion_line': conversion_line,
-            'base_line': base_line,
-            'lead_line1': lead_line1,
-            'lead_line2': lead_line2,
-        }
-
-    except Exception as e:
-        logger.error(f"Ichimoku calculation failed: {e}", exc_info=True)
-        n = len(high) if high is not None else 1
-        return {
-            'cloud_upper': np.full(n, np.nan, dtype=np.float64),
-            'cloud_lower': np.full(n, np.nan, dtype=np.float64),
-            'future_green': np.zeros(n, dtype=bool),
-            'future_red': np.zeros(n, dtype=bool),
-            'conversion_line': np.full(n, np.nan, dtype=np.float64),
-            'base_line': np.full(n, np.nan, dtype=np.float64),
-            'lead_line1': np.full(n, np.nan, dtype=np.float64),
-            'lead_line2': np.full(n, np.nan, dtype=np.float64),
-        }
-
 def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
         if close is None or len(close) < rsi_len + kalman_len + ema_len:
@@ -1149,32 +1079,8 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         # ── Trend: RMA 50/200 ──
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
-
-        # ── Ichimoku (cloud + TK guard) ──
-        if cfg.ICHIMOKU_CLOUD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED:
-            ichimoku = calculate_ichimoku_numpy(
-                data_15m["high"], data_15m["low"], close_15m,
-                cfg.ICHIMOKU_CONVERSION_PERIODS,
-                cfg.ICHIMOKU_BASE_PERIODS,
-                cfg.ICHIMOKU_SPANB_PERIODS,
-                cfg.ICHIMOKU_DISPLACEMENT,
-            )
-            results['ichimoku_cloud_upper'] = ichimoku['cloud_upper']
-            results['ichimoku_cloud_lower'] = ichimoku['cloud_lower']
-            results['ichimoku_future_green'] = ichimoku['future_green']
-            results['ichimoku_future_red'] = ichimoku['future_red']
-            results['ichimoku_conversion_line'] = ichimoku['conversion_line']
-            results['ichimoku_base_line'] = ichimoku['base_line']
-        else:
-            nan_arr = np.full(n_15m, np.nan, dtype=np.float64)
-            bool_arr = np.zeros(n_15m, dtype=bool)
-            results['ichimoku_cloud_upper'] = nan_arr.copy()
-            results['ichimoku_cloud_lower'] = nan_arr.copy()
-            results['ichimoku_future_green'] = bool_arr.copy()
-            results['ichimoku_future_red'] = bool_arr.copy()
-            results['ichimoku_conversion_line'] = nan_arr.copy()
-            results['ichimoku_base_line'] = nan_arr.copy()
-
+        results['rma_fast_15'] = calculate_rma_numpy(close_15m, cfg.RMA_FILTER_FAST_PERIOD) 
+        
         # ── Volatility: ATR + ADX ──
         results['atr_short'] = calculate_atr_rma(
             data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_SHORT
@@ -1257,9 +1163,10 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['today_utc_open'] = float('nan')
 
         # Sanitize
-        for key in ('rma50_15', 'rma200_5', 'adx', 'atr_short', 'atr_long',
-                    'ppo_gate', 'ppo_gate_signal', 'rsi_guard_smooth',
-                    'rsi_guard_ema', 'volume_ema'):
+
+        for key in ('rma50_15', 'rma200_5', 'rma_fast_15', 'adx', 'atr_short', 'atr_long',
+            'ppo_gate', 'ppo_gate_signal', 'rsi_guard_smooth',
+            'rsi_guard_ema', 'volume_ema'):
             arr = results[key]
             if np.any(np.isinf(arr)):
                 results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
@@ -3557,6 +3464,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 
+        min_rma_bars = max(cfg.RMA_FILTER_FAST_PERIOD, cfg.RMA_50_PERIOD)
+        if i15 < min_rma_bars:
+            logger_pair.debug(f"[{pair_name}] RMA warmup: i15={i15} < {min_rma_bars}")
+            return None
+
         if not candle_is_stable(data_15m["timestamp"][i15], reference_time, interval_minutes=15):
             logger_pair.debug(f"[{pair_name}] Selected candle not stable, skipping alerts.")
             return None
@@ -3710,12 +3622,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # ── Extract gate values ──
         rma50_15 = gate_indicators["rma50_15"]
         rma200_5 = gate_indicators["rma200_5"]
-        ichimoku_cloud_upper = gate_indicators["ichimoku_cloud_upper"]
-        ichimoku_cloud_lower = gate_indicators["ichimoku_cloud_lower"]
-        ichimoku_future_green = gate_indicators["ichimoku_future_green"]
-        ichimoku_future_red = gate_indicators["ichimoku_future_red"]
-        ichimoku_conversion_line = gate_indicators["ichimoku_conversion_line"]
-        ichimoku_base_line = gate_indicators["ichimoku_base_line"]
+        rma_fast_15 = gate_indicators["rma_fast_15"]
         adx_arr = gate_indicators["adx"]
         atr_short_arr = gate_indicators["atr_short"]
         atr_long_arr = gate_indicators["atr_long"]
@@ -3727,40 +3634,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         today_utc_open = gate_indicators.get('today_utc_open', float('nan'))
+ 
+        # ── RMA(20/50) Trend Filter (15m) — replaces Ichimoku cloud ──
+        rma_fast_15_val = rma_fast_15[i15]
+        rma50_15_val = rma50_15[i15]
 
-        # ── Ichimoku Cloud Filter ──
-        future_green = bool(ichimoku_future_green[i15])
-        future_red = bool(ichimoku_future_red[i15])
-        cloud_upper_val = ichimoku_cloud_upper[i15]
-        cloud_lower_val = ichimoku_cloud_lower[i15]
-
-        if np.isnan(cloud_upper_val) or np.isnan(cloud_lower_val):
+        if np.isnan(rma_fast_15_val) or np.isnan(rma50_15_val):
             logger_pair.warning(
-                f"[{pair_name}] Ichimoku cloud NaN at i15={i15} (warmup/gap). "
-                f"Cannot determine cloud position — skipping."
+                f"[{pair_name}] RMA filter NaN at i15={i15} (warmup/gap). "
+                f"Cannot determine RMA alignment — skipping."
             )
             return None
 
-        above_cloud = close_curr > cloud_upper_val
-        below_cloud = close_curr < cloud_lower_val
-        cloud_up = future_green and above_cloud
-        cloud_down = future_red and below_cloud
-
-        tk_conversion_curr = ichimoku_conversion_line[i15]
-        tk_base_curr = ichimoku_base_line[i15]
-        tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
-
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_valid:
-            tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
-            tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
-        else:
-            if cfg.ICHIMOKU_TK_GUARD_ENABLED and not tk_guard_valid:
-                logger_pair.debug(
-                    f"[{pair_name}] TK lines not ready at i15={i15}. "
-                    f"TK guard bypassed this run."
-                )
-            tk_guard_ok_buy = True
-            tk_guard_ok_sell = True
+        trend_up = rma_fast_15_val > rma50_15_val
+        trend_down = rma_fast_15_val < rma50_15_val
 
         close_prev = close_15m[i15 - 1]
         close_prev_invalid = False
@@ -3772,14 +3659,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             close_prev_invalid = True
 
         close_5m_val = data_5m["close"][i5]
-        rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
         base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
         base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
 
-        confirmation_buy = cloud_up
-        confirmation_sell = cloud_down
+        confirmation_buy = trend_up
+        confirmation_sell = trend_down
+
 
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_ok = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
@@ -3871,17 +3758,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         buy_common = (
             base_buy_trend and confirmation_buy and is_valid_for_buy
             and (adx_ok or rvol_ok) and effective_cpr_ok
-            and trend_gate_ok_buy and tk_guard_ok_buy
+            and trend_gate_ok_buy
         )
         sell_common = (
             base_sell_trend and confirmation_sell and is_valid_for_sell
             and (adx_ok or rvol_ok) and effective_cpr_ok
-            and trend_gate_ok_sell and tk_guard_ok_sell
+            and trend_gate_ok_sell
         )
 
-        # ═══════════════════════════════════════════════════════
+
+        # ═══════════════════════���═══════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
-        # ═══════════════════════════════════════════════════════
+        # ═��═════════════════════════════════════════════════════
         if not buy_common and not sell_common:
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             reasons = []
@@ -3895,8 +3783,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("cpr=False")
             if not trend_gate_ok_buy and not trend_gate_ok_sell:
                 reasons.append("trend_gate=False")
-            if not tk_guard_ok_buy and not tk_guard_ok_sell:
-                reasons.append("tk_guard=False")
             logger_pair.debug(
                 f"😒 {pair_name} | Gate blocked | "
                 f"Suppression: {', '.join(reasons)}"
@@ -3906,7 +3792,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "ts": int(time.time()),
                 "summary": {
                     "alerts": 0,
-                    "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                    "cloud": "bullish" if trend_up else "bearish" if trend_down else "neutral",
                     "hist_rma": 0.0,
                     "suppression": f"Gate blocked: {', '.join(reasons)}"
                 }
@@ -4069,9 +3955,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ppo_gate_sig_curr": ppo_gate_sig_curr, "ppo_gate_sig_prev": ppo_gate_sig_prev,
             "rsi_guard_smooth_curr": rsi_guard_smooth_curr, "rsi_guard_ema_curr": rsi_guard_ema_curr,
             "trend_gate_ok_buy": trend_gate_ok_buy, "trend_gate_ok_sell": trend_gate_ok_sell,
-            "cloud_up": cloud_up, "cloud_down": cloud_down,
-            "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
-            "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
+            "trend_up": trend_up, "trend_down": trend_down,
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
@@ -4291,7 +4175,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         "ts": int(time.time()),
                         "summary": {
                             "alerts": 0,
-                            "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                            "cloud": "bullish" if trend_up else "bearish" if trend_down else "neutral",
                             "hist_rma": round(hist_curr, 4), 
                             "suppression": f"Global limit {max_alerts_per_run} reached"
                         }
@@ -4343,7 +4227,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_buy_trend:
                 reasons.append("PPO>0 blocked: base_buy_trend=False")
             elif not confirmation_buy:
-                reasons.append("PPO>0 blocked: confirmation_buy=False (future cloud)")
+                reasons.append(" PPO>0 blocked: confirmation_buy=False (RMA20<RMA50)")
             elif not is_valid_for_buy:
                 reasons.append("PPO>0 blocked: Knox rejected candle (wick/color/timing)")
             else:
@@ -4357,7 +4241,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_sell_trend:
                 reasons.append("PPO<0 blocked: base_sell_trend=False")
             elif not confirmation_sell:
-                reasons.append("PPO<0 blocked: confirmation_sell=False (future cloud)")
+                reasons.append("PPO<0 blocked: confirmation_sell=False (RMA20>RMA50)")
             elif not is_valid_for_sell:
                 reasons.append("PPO<0 blocked: Knox rejected candle (wick/color/timing)")
             else:
@@ -4371,7 +4255,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_buy_trend:
                 reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
             elif not confirmation_buy:
-                reasons.append("PPO>+0.11 blocked: confirmation_buy=False (future cloud)")
+                reasons.append("PPO>+0.11 blocked: confirmation_buy=False (RMA20<RMA50)")
             elif not is_valid_for_buy:
                 reasons.append("PPO>+0.11 blocked: Knox rejected candle")
             else:
@@ -4385,7 +4269,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not base_sell_trend:
                 reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
             elif not confirmation_sell:
-                reasons.append("PPO<-0.11 blocked: confirmation_sell=False (future cloud)")
+                reasons.append("PPO<-0.11 blocked: confirmation_sell=False (RMA20>RMA50)")
             elif not is_valid_for_sell:
                 reasons.append("PPO<-0.11 blocked: Knox rejected candle")
             else:
@@ -4404,7 +4288,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if not base_buy_trend:
                     reasons.append("RSI>EMA5 blocked: base_buy_trend=False")
                 elif not confirmation_buy:
-                    reasons.append("RSI>EMA5 blocked: confirmation_buy=False (future cloud)")
+                    reasons.append("RSI>EMA5 blocked: confirmation_buy=False (RMA20<RMA50)")
                 elif not is_valid_for_buy:
                     reasons.append("RSI>EMA5 blocked: Knox rejected candle")
                 else:
@@ -4423,7 +4307,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 if not base_sell_trend:
                     reasons.append("RSI<EMA5 blocked: base_sell_trend=False")
                 elif not confirmation_sell:
-                    reasons.append("RSI<EMA5 blocked: confirmation_sell=False (future cloud)")
+                    reasons.append("RSI<EMA5 blocked: confirmation_sell=False (RMA20>RMA50)")
                 elif not is_valid_for_sell:
                     reasons.append("RSI<EMA5 blocked: Knox rejected candle")
                 else:
@@ -4502,10 +4386,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ]
         
         if not alerts_to_send:
-            cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
+            trend_state = "bullish" if trend_up else "bearish" if trend_down else "neutral"
             logger_pair.debug(
                 f"😒 {pair_name} | "
-                f"cloud={cloud_state}| "
+                f"trend={trend_state}| "
                 f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
             )
         
@@ -4514,7 +4398,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ts": int(time.time()),
             "summary": {
                 "alerts": len(alerts_to_send),
-                "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                "cloud": "bullish" if trend_up else "bearish" if trend_down else "neutral",
                 "hist_rma": round(hist_curr, 4), 
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
