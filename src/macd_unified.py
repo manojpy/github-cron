@@ -46,28 +46,36 @@ from aot_bridge import (
 )
 
 try:
-    import orjson  
-    def _ensure_str_keys(obj: Any) -> Any:
-        """Recursively convert dict keys to strings."""
-        if isinstance(obj, dict):
-            return {str(k): _ensure_str_keys(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [_ensure_str_keys(item) for item in obj]
-        return obj
-    
+    import orjson
+
     def json_dumps(obj: Any) -> str:
-        obj = _ensure_str_keys(obj)
-        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY).decode('utf-8')
+        """Fast path: orjson natively handles NumPy types and string keys."""
+        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8")
 
     def json_loads(s: str | bytes) -> Any:
         return orjson.loads(s)
-    
+
     JSONDecodeError = orjson.JSONDecodeError
     JSON_BACKEND = "orjson"
+
 except ImportError:
     import json
-    json_dumps = json.dumps
-    json_loads = json.loads
+
+    class _NumpyFallbackEncoder(json.JSONEncoder):
+        """Ensures stdlib json does not crash on NumPy types if orjson is missing."""
+        def default(self, obj: Any) -> Any:
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, np.generic):
+                return obj.item()
+            return super().default(obj)
+
+    def json_dumps(obj: Any) -> str:
+        return json.dumps(obj, cls=_NumpyFallbackEncoder)
+
+    def json_loads(s: str | bytes) -> Any:
+        return json.loads(s)
+
     JSONDecodeError = json.JSONDecodeError
     JSON_BACKEND = "stdlib"
 
@@ -220,7 +228,7 @@ class BotConfig(BaseModel):
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
     ADX_THRESHOLD: float = Field(default=18.0, ge=5.0, le=50.0)  # ADX trend strength threshold (18=moderate, higher=stronger)   
     MAX_CANDLE_STALENESS_SEC: int = Field(default=1200, ge=600, le=3600)  # Max candle age in seconds (10-60 min)
-    RATE_LIMIT_PER_MINUTE: int = Field(default=90, ge=10, le=120)
+    RATE_LIMIT_PER_MINUTE: int = Field(default=400, ge=90, le=600)
     CONFIRM_RATE_LIMIT_PER_MINUTE: int = Field(default=20, ge=5, le=60)
     CB_FAILURE_THRESHOLD: int = Field(default=3, ge=1, le=10)  # Failures before circuit breaker opens
     CB_RECOVERY_TIMEOUT: int = Field(default=60, ge=10, le=600)  # Circuit breaker recovery wait time (seconds)
@@ -394,19 +402,6 @@ def load_config() -> BotConfig:
 
 cfg = load_config()
 
-class SecretFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = str(record.getMessage())
-            if any(x in msg for x in ("TOKEN", "redis://", "chat_id")):
-                msg = re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', '[REDACTED_TELEGRAM_TOKEN]', msg)
-                msg = re.sub(r'chat_id=\d+', '[REDACTED_CHAT_ID]', msg)
-                msg = re.sub(r'(redis://[^@]+@)', 'redis://[REDACTED]@', msg)
-                record.msg = msg
-        except Exception:
-            pass
-        return True
-
 class TraceContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.trace_id = TRACE_ID.get()
@@ -416,7 +411,9 @@ class TraceContextFilter(logging.Filter):
 class SafeFormatter(logging.Formatter):
     @staticmethod
     def _apply_all_redactions(text: str) -> str:
-        """Apply all redaction patterns to text in one pass."""
+        if not any(s in text for s in (':', 'redis://', 'chat_id')):
+            return text
+    
         text = CompiledPatterns.SECRET_TOKEN.sub("[REDACTED_TOKEN]", text)
         text = CompiledPatterns.CHAT_ID.sub("chat_id=[REDACTED]", text)
         text = CompiledPatterns.REDIS_CREDS.sub("redis://[REDACTED]", text)
