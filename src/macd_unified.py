@@ -1225,12 +1225,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         logger.error(f"calculate_gate_indicators_numpy failed: {e}", exc_info=True)
         return None
 
-def calculate_alert_indicators_numpy(
-    data_15m: Dict[str, np.ndarray],
-    data_5m: Dict[str, np.ndarray],
-    data_daily: Optional[Dict[str, np.ndarray]],
-    reference_time: int,
-) -> Optional[Dict[str, np.ndarray]]:
+def calculate_alert_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Optional[Dict[str, np.ndarray]]:
     """Expensive indicators needed ONLY when a pair passes the main gate."""
     try:
         close_15m = data_15m["close"]
