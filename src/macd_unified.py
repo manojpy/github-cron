@@ -454,15 +454,14 @@ def setup_logging() -> logging.Logger:
     console.setFormatter(SafeFormatter(
         fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | [%(trace_id)s] | %(funcName)s:%(lineno)d | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
-    ))    
-    console.addFilter(SecretFilter())
+    ))
+    # REMOVED: console.addFilter(SecretFilter())  -- SafeFormatter already redacts
     console.addFilter(TraceContextFilter())  
-    logger.addHandler(console)    
+    logger.addHandler(console)
     logger.debug(
         f"Logging configured | Level: {logging.getLevelName(level)} | "
         f"Format: structured with trace_id | Output: stdout"
     )
-
     return logger
 
 logger = setup_logging()
