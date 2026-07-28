@@ -13,23 +13,19 @@ import re
 import uuid
 import argparse
 import psutil
-import math
 import gc
 import json
-from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 import aiohttp
-from aiohttp import web
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
-import contextlib 
 import traceback
 
 from aot_bridge import (
@@ -112,17 +108,11 @@ class Constants:
     PPO_RSI_GUARD_SELL = -0.30
     PPO_011_THRESHOLD = 0.11
     PPO_011_THRESHOLD_SELL = -0.11
-    STARTUP_GRACE_PERIOD = int(os.getenv('STARTUP_GRACE_PERIOD', 300))
     REDIS_LOCK_EXPIRY = max(int(os.getenv('REDIS_LOCK_EXPIRY', 900)), 900)
     CIRCUIT_BREAKER_MAX_WAIT = 300
-    MAX_PRICE_CHANGE_PERCENT = 50.0
-    MAX_CANDLE_GAP_MULTIPLIER = 2.0
     INFINITY_CLAMP = 1e8
-    LOCK_EXTEND_INTERVAL = 540
-    LOCK_EXTEND_JITTER_MAX = 120
     ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 1800))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-    TELEGRAM_MESSAGE_PREVIEW_LENGTH = 50
     VWAP_MAX_DISTANCE_PCT = 2.0
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
@@ -131,7 +121,6 @@ class Constants:
     MIN_ALIGNED_5M_CANDLES = 200               
     CANDLE_FETCH_BUFFER_PERIODS = 3 
     API_TIMESTAMP_TOLERANCE_SEC = 300
-    MAX_ALIGNMENT_CACHE = 500
     MIN_CANDLE_AGE_FROM_OPEN = 850
     MIN_BODY_RATIO = 0.30
     
@@ -188,10 +177,7 @@ class BotConfig(BaseModel):
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
-    JITTER_MIN: float = 0.1
-    JITTER_MAX: float = 0.8
     RUN_TIMEOUT_SECONDS: int = 600
-    BATCH_SIZE: int = 4
     TCP_CONN_LIMIT: int = 16
     TCP_CONN_LIMIT_PER_HOST: int = 12
     TELEGRAM_RETRIES: int = 3
@@ -213,7 +199,6 @@ class BotConfig(BaseModel):
     TELEGRAM_BURST_SIZE: int = 5
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
-    INDICATOR_THREAD_LIMIT: int = 3   
     DRY_RUN_MODE: bool = Field(default=False)
     NUMBA_PARALLEL: bool = Field(default=True)
     SKIP_WARMUP: bool = Field(default=False)
@@ -228,7 +213,6 @@ class BotConfig(BaseModel):
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     MAX_ALERTS_PER_RUN: int = Field(default=50, ge=10, le=200)  
-    PRODUCTS_CACHE_TTL: int = Field(default=28800)  # Products cache TTL in seconds (8h default)
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.0)  # Max distance from pivot to trigger alert (1.5%)
     RVOL_THRESHOLD: float = Field(default=1.0, ge=0.5, le=2.0)  # Volatility expansion threshold (1.0=baseline, 1.5=50% expansion required)   
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX directional movement calculation period
@@ -756,18 +740,6 @@ def _sync_signal_handler(sig: int, frame: Any) -> None:
 signal.signal(signal.SIGTERM, _sync_signal_handler)
 signal.signal(signal.SIGINT, _sync_signal_handler)
 
-async def cancel_all_tasks(grace_seconds: int = 5) -> None:
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    if not tasks:
-        return
-    logger.info(f"Cancelling {len(tasks)} tasks...")
-    for t in tasks:
-        t.cancel()
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=grace_seconds)
-    except asyncio.TimeoutError:
-        logger.warning("Timeout while cancelling tasks")
-
 _STARTUP_BANNER_PRINTED = False
 def print_startup_banner_once() -> None:
     global _STARTUP_BANNER_PRINTED
@@ -806,14 +778,6 @@ def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: i
 
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
-
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
-            return default
-        return float(value)
-    except (ValueError, TypeError, OverflowError):
-        return default
 
 def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
@@ -1529,43 +1493,6 @@ def categorize_exception(exc: Exception) -> str:
     elif isinstance(exc, (ClientError, aiohttp.ClientError)):
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
-
-async def retry_async(fn: Callable, *args, retries: int = 3, base_backoff: float = 0.8, cap: float = 30.0, jitter_min: float = 0.05, jitter_max: float = 0.5, on_error: Optional[Callable[[Exception, int, str], None]] = None, **kwargs):
-    last_exc: Optional[Exception] = None
-
-    for attempt in range(1, retries + 1):
-        if shutdown_event.is_set():
-            raise asyncio.CancelledError()
-
-        try:
-            return await fn(*args, **kwargs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            last_exc = e
-            category = categorize_exception(e)
-
-            if on_error:
-                try:
-                    on_error(e, attempt, category)
-                except Exception:
-                    pass
-
-            if attempt >= retries:
-                break
-
-            base_delay = min(cap, base_backoff * (2 ** (attempt - 1)))
-            jitter = base_delay * random.uniform(jitter_min, jitter_max)
-            sleep_time = base_delay + jitter
-
-            logger.debug(
-                f"Retry attempt {attempt}/{retries} after {sleep_time:.2f}s | "
-                f"Category: {category} | Error: {str(e)[:100]}"
-            )
-
-            await asyncio.sleep(sleep_time)
-
-    raise last_exc or RuntimeError("retry_async: unknown failure")
 
 async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Optional[Dict[str, Any]]:   
     session = await SessionManager.get_session()    
@@ -3223,8 +3150,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
     {"key":"rsi_50_up","title":"🟢 RSI cross above EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
     {"key":"rsi_50_down","title":"🔴 RSI cross below EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
-    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("close_prev",0)<=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)>ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("close_prev",0)>=ctx.get("vwap_prev",0)) and (ctx.get("close_curr",0)<ctx.get("vwap_curr",0))),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
+    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
+    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"hist_rma_sell","title":"🟣⬇️ RMA Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_buy","title":"🟢🔥 PPO Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -3486,47 +3413,6 @@ SELL_ALERT_KEYS: Set[str] = {
 
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
-async def set_alert_state(sdb: RedisStateStore, pair: str, key: str, active: bool) -> None:
-    """Store alert state in Redis for dedup"""
-    if sdb.degraded:
-        return
-    
-    state_key = f"{pair}:{key}"
-    ts = int(time.time())
-    
-    state_data = {
-        "state": "ACTIVE" if active else "INACTIVE",
-        "timestamp": ts,
-        "pair": pair,
-        "alert_key": key
-    }
-    
-    await sdb.set(state_key, state_data, ts)
-    
-async def was_alert_active(sdb: RedisStateStore, pair: str, key: str) -> bool:
-    """Check if alert was recently active (for dedup)"""
-    if sdb.degraded:
-        return False
-    
-    state_key = f"{pair}:{key}"
-    
-    try:
-        st = await sdb.get(state_key)
-        if st is None:
-            return False
-        
-        if isinstance(st, dict):
-            return st.get("state") == "ACTIVE"
-        elif isinstance(st, str):
-            return st == "ACTIVE"
-        else:
-            logger.warning(f"Unexpected state type for {state_key}: {type(st)}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error checking alert state for {state_key}: {e}")
-        return False
-
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
@@ -3539,7 +3425,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     PAIR_ID.set(pair_name)
     raw_alerts: List[Tuple[str, str, str]] = []
     close_15m = None
-    open_15m = None
     timestamps_15m = None
     indicators = None
     ppo = None
@@ -3633,7 +3518,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         candle_range = h - l
 
         close_15m = data_15m["close"]
-        open_15m = data_15m["open"]
         timestamps_15m = data_15m["timestamp"]
 
         interval_5m_sec = 5 * 60
@@ -3785,26 +3669,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_buy = cloud_up
         confirmation_sell = cloud_down
 
+
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
-        adx_ok = (adx_val >= cfg.ADX_THRESHOLD) if cfg.ENABLE_ADX_FILTER else True
+        adx_raw_check = adx_val >= cfg.ADX_THRESHOLD
+        adx_ok = adx_raw_check if cfg.ENABLE_ADX_FILTER else True
+        adx_bypass_ok = adx_raw_check
 
-        if cfg.ENABLE_RVOL_ALERT:
-            atr_short_val = atr_short_arr[i15]
-            atr_long_val = atr_long_arr[i15]
-            if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
-                rvol_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
-            else:
-                rvol_ok = False
-        else:
-            rvol_ok = True
-
-        adx_bypass_ok = adx_val >= cfg.ADX_THRESHOLD
         atr_short_val = atr_short_arr[i15]
         atr_long_val = atr_long_arr[i15]
         if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
-            rvol_bypass_ok = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
+            rvol_raw_check = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
         else:
-            rvol_bypass_ok = False
+            rvol_raw_check = False
+
+        rvol_ok = rvol_raw_check if cfg.ENABLE_RVOL_ALERT else True
+        rvol_bypass_ok = rvol_raw_check
 
         volume_curr = data_15m["volume"][i15]
         volume_ema_curr = volume_ema_arr[i15]
@@ -4944,10 +4823,6 @@ async def run_once() -> bool:
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
 
-        if fetcher is None:
-            logger_run.error("❌ Fetcher is None - cannot get stats")
-            return False
-
         fetcher_stats = fetcher.get_stats()
 
         total_required = fetcher_stats['candles']['success'] + fetcher_stats['candles']['failed']
@@ -5135,21 +5010,7 @@ if __name__ == "__main__":
         logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
-        try:
-            return await run_once()
-        finally:
-            logger.info("🧹 Shutting down persistent connections...")
-            try:
-                await RedisStateStore.shutdown_global_pool()
-                logger.debug("🌈 Redis pool closed")
-            except Exception as e:
-                logger.error(f"Error closing Redis pool: {e}")
-
-            try:
-                await SessionManager.close_session()
-                logger.debug("⏰ HTTP session closed")
-            except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
+        return await run_once()
 
     try:
         success = asyncio.run(main_with_cleanup())
