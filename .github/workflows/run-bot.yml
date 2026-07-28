@@ -11,29 +11,15 @@ on:
         options:
           - 'false'
           - 'true'
-      skip_alerts:
-        description: 'Skip Telegram alerts (test mode)'
-        required: false
-        default: 'false'
-        type: boolean
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
-  # FIX: was 300s, but macd_unified.py's own RUN_TIMEOUT_SECONDS is 600s. A
-  # tighter external timeout SIGTERMs the bot mid-run before its own graceful
-  # shutdown logic (Redis unlock, final log line, etc.) ever gets to execute.
-  # This must always stay comfortably ABOVE RUN_TIMEOUT_SECONDS -- if you ever
-  # change that constant in macd_unified.py, update this too.
   BOT_TIMEOUT: 660
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # FIX: job-level timeout-minutes cannot reference the `env` context (only
-    # `vars`/`github`/etc. are available here -- env is step-scoped). Must be
-    # a plain literal. Keep in sync with BOT_TIMEOUT above + kill-after grace
-    # + step overhead below if you ever change either.
     timeout-minutes: 16
     permissions:
       contents: read
@@ -55,13 +41,8 @@ jobs:
           fi
           echo "✅ All required secrets configured"
 
-      # OPTIMIZATION: Config created from Secret (Instant) or GitHub API (Fast)
-      # Replaces slow 'git clone' actions. NOTE: there is deliberately no
-      # actions/checkout step in this workflow, so a "check repo root folder"
-      # fallback would never find anything -- removed for clarity.
       - name: 🔨 Create Config
         env:
-          # CRITICAL FIX: Map secret to env var to avoid "too many arguments" error
           CONFIG_JSON: ${{ secrets.MACD_CONFIG_JSON }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -76,7 +57,6 @@ jobs:
             echo "⚠️ Secret MACD_CONFIG_JSON missing."
             echo "🔥 Falling back to GitHub API download..."
 
-            # Use GitHub API to fetch raw file - faster/safer than git clone
             HTTP_STATUS=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github.v3.raw" \
               -L "https://api.github.com/repos/${{ github.repository }}/contents/config_macd.json" \
@@ -116,7 +96,7 @@ jobs:
         id: bot_run
         timeout-minutes: 12
         env:
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           mkdir -p logs
           echo "::group::🔥 Launch Macd-Unified...🔥"
