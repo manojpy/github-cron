@@ -15,6 +15,7 @@ import argparse
 import psutil
 import gc
 import json
+from collections import deque
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
