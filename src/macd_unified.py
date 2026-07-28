@@ -1190,6 +1190,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
                 _tc = (_pivot - _bc) + _pivot
                 results['nr_cpr'] = abs(_tc - _bc)
                 results['cpr_ok'] = results['nr_cpr'] < (d_close * cfg.CPR_THRESHOLD_PCT)
+                results['prev_day_close'] = d_close
             except CprNotReadyError as e:
                 logger.debug(f"CPR not ready: {e}")
                 results['nr_cpr'] = float('nan')
@@ -1209,13 +1210,6 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             logger.warning("CPR gate: ENABLE_CPR=True but data_daily is None")
             results['nr_cpr'] = float('nan')
             results['cpr_ok'] = False
-
-        # Today UTC open (for wide-CPR bypass % move)
-        if cfg.ENABLE_CPR and data_daily is not None:
-            to = _find_today_daily_open(data_daily, reference_time)
-            results['today_utc_open'] = to if to is not None else float('nan')
-        else:
-            results['today_utc_open'] = float('nan')
 
         # Sanitize
         for key in ('rma50_15', 'rma200_5', 'adx', 'atr_short', 'atr_long',
@@ -3607,7 +3601,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rsi_guard_ema_arr = gate_indicators["rsi_guard_ema"]
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
-        today_utc_open = gate_indicators.get('today_utc_open', float('nan'))
+        prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
         # ── Ichimoku Cloud Filter ──
         future_green = bool(ichimoku_future_green[i15])
@@ -3666,7 +3660,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_buy = cloud_up
         confirmation_sell = cloud_down
 
-
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_raw_check = adx_val >= cfg.ADX_THRESHOLD
         adx_ok = adx_raw_check if cfg.ENABLE_ADX_FILTER else True
@@ -3689,30 +3682,46 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             volume_above_ema_ok = False
 
-        if not np.isnan(today_utc_open) and today_utc_open > 0:
-            pct_move_from_open = abs(close_curr - today_utc_open) / today_utc_open * 100.0
-            pct_move_ok = pct_move_from_open >= cfg.CPR_WIDE_MIN_PCT_MOVE
-        else:
-            pct_move_from_open = float('nan')
-            pct_move_ok = False
-
-        cpr_bypass_ok = (
-            cfg.ENABLE_CPR_ADX_RVOL_BYPASS
-            and adx_bypass_ok and rvol_bypass_ok
-            and volume_above_ema_ok and pct_move_ok
+        # ── CPR momentum conditions ──
+        adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
+        adx_rising = (
+            not np.isnan(adx_val) and not np.isnan(adx_prev)
+            and adx_prev > 0 and adx_val > adx_prev
         )
-        effective_cpr_ok = cpr_ok or cpr_bypass_ok
+
+        momentum_conditions = [
+            adx_bypass_ok,       # ADX >= 18
+            adx_rising,          # ADX is rising
+            rvol_bypass_ok,      # RVOL >= 1.0
+            volume_above_ema_ok, # Volume > Volume EMA 20
+        ]
+        momentum_count = sum(momentum_conditions)
+
+        # Mandatory 2% move from previous day close for wide CPR
+        if not np.isnan(prev_day_close) and prev_day_close > 0:
+            pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
+            move_from_prev_close_ok = pct_move_from_prev_close >= 2.0
+        else:
+            pct_move_from_prev_close = float('nan')
+            move_from_prev_close_ok = False
+
+        if cfg.ENABLE_CPR:
+            if cpr_ok:  # Narrow CPR: any 2 of 4
+                effective_cpr_ok = momentum_count >= 2
+            else:       # Wide CPR: any 3 of 4 + mandatory 2% move from prev close
+                effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
+        else:
+            effective_cpr_ok = True
 
         if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
             logger_pair.debug(
-                f"[{pair_name}] CPR {'OK' if cpr_ok else 'blocked'} "
-                f"(bypass={cpr_bypass_ok}, adx={adx_val:.1f} vs {cfg.ADX_THRESHOLD} [{adx_bypass_ok}], "
-                f"rvol_ok={rvol_bypass_ok}, "
-                f"vol={volume_curr:.2f} vs EMA{cfg.VOLUME_EMA_LENGTH}={volume_ema_curr:.2f} [{volume_above_ema_ok}], "
-                f"move_from_utc_open={pct_move_from_open:.2f}% vs {cfg.CPR_WIDE_MIN_PCT_MOVE}% [{pct_move_ok}]) "
+                f"[{pair_name}] CPR {'narrow' if cpr_ok else 'WIDE'} | "
+                f"effective={effective_cpr_ok} | momentum={momentum_count}/4 "
+                f"(adx={adx_val:.1f}[{adx_bypass_ok},{adx_rising}], "
+                f"rvol={rvol_bypass_ok}, vol_ema={volume_above_ema_ok}) | "
+                f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
                 f"NR_CPR={nr_cpr:.4f}"
             )
-
         ppo_gate_curr = ppo_gate_arr[i15]
         ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
         ppo_gate_sig_curr = ppo_gate_signal_arr[i15]
@@ -3975,7 +3984,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "pivot_suppressions": [],
             "nr_cpr": indicators.get('nr_cpr', float('nan')),
             "cpr_ok": effective_cpr_ok,
-            "cpr_bypass_ok": cpr_bypass_ok,
+            "momentum_count": momentum_count,
+            "move_from_prev_close_ok": move_from_prev_close_ok, 
         }
 
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
