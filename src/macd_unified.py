@@ -3746,11 +3746,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
+
         active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
-        trend_gate_ok_buy = any(active_buy_gates) if active_buy_gates else True
+        if len(active_buy_gates) >= 2:
+            trend_gate_ok_buy = sum(active_buy_gates) >= 2
+        elif active_buy_gates:
+            trend_gate_ok_buy = all(active_buy_gates)
+        else:
+            trend_gate_ok_buy = True
 
         active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
-        trend_gate_ok_sell = any(active_sell_gates) if active_sell_gates else True
+        if len(active_sell_gates) >= 2:
+            trend_gate_ok_sell = sum(active_sell_gates) >= 2
+        elif active_sell_gates:
+            trend_gate_ok_sell = all(active_sell_gates)
+        else:
+            trend_gate_ok_sell = True
 
         buy_common = (
             base_buy_trend and confirmation_buy and is_valid_for_buy
