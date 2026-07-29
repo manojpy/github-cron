@@ -2123,7 +2123,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         hl_mid = (h + l) / 2.0
         candle_range = h - l
 
-
         close_deviation = np.abs(c - hl_mid) / (candle_range + 1e-9)
         deviation_mask = close_deviation > Constants.HIGH_DEVIATION_THRESHOLD
         deviation_count = np.sum(deviation_mask)
@@ -2238,7 +2237,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         last5_list = [format_ist_time(t) for t in ts_normalized[-5:]]
         last5_str = str(last5_list)
         
-        logger.warning(  # ← visible in production
+        logger.debug(
             "[%s] Target %dm open %s not found. last_ts=%s count=%s last5=%s",
             pair_name or "?", 
             int(interval_minutes), 
@@ -2254,7 +2253,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     # Move stability check AFTER finding the actual candle
     if not candle_is_stable(actual_candle_open, reference_time, interval_minutes):
-        logger.warning(
+        logger.debug(
             "[%s] Candle %dm actual open %s not stable. Skipping.",
             pair_name or "?",
             int(interval_minutes),
@@ -2272,7 +2271,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         )
         return None
 
-    logger.info(
+    logger.debug(
         "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
         pair_name or "?",
         int(interval_minutes),
