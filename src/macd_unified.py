@@ -2123,8 +2123,9 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
         hl_mid = (h + l) / 2.0
         candle_range = h - l
 
+
         close_deviation = np.abs(c - hl_mid) / (candle_range + 1e-9)
-        deviation_mask = close_deviation > cfg.HIGH_DEVIATION_THRESHOLD
+        deviation_mask = close_deviation > Constants.HIGH_DEVIATION_THRESHOLD
         deviation_count = np.sum(deviation_mask)
  
         if deviation_count > 0: 
