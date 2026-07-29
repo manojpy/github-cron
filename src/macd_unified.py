@@ -3620,7 +3620,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
 
-
         if cfg.ICHIMOKU_TK_GUARD_ENABLED:
             if tk_guard_valid:
                 tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
@@ -3628,10 +3627,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             else:
                 logger_pair.debug(
                     f"[{pair_name}] TK lines not ready at i15={i15}. "
-                    f"TK guard contributes False (OR'd) this run."
+                    f"TK guard abstains (None) this run — not counted in majority vote."
                 )
-                tk_guard_ok_buy = False
-                tk_guard_ok_sell = False
+                tk_guard_ok_buy = None
+                tk_guard_ok_sell = None
         else:
             tk_guard_ok_buy = None
             tk_guard_ok_sell = None
@@ -3728,8 +3727,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
                 ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
             else:
-                ppo_gate_ok_buy = False
-                ppo_gate_ok_sell = False
+                ppo_gate_ok_buy = None
+                ppo_gate_ok_sell = None
         else:
             ppo_gate_ok_buy = None
             ppo_gate_ok_sell = None
@@ -3739,18 +3738,26 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 rsi_guard_ok_buy = rsi_guard_smooth_curr > rsi_guard_ema_curr
                 rsi_guard_ok_sell = rsi_guard_smooth_curr < rsi_guard_ema_curr
             else:
-                rsi_guard_ok_buy = False
-                rsi_guard_ok_sell = False
+                rsi_guard_ok_buy = None
+                rsi_guard_ok_sell = None
         else:
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
+        any_gate_enabled = (
+            cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
+        )
 
         active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
         if len(active_buy_gates) >= 2:
             trend_gate_ok_buy = sum(active_buy_gates) >= 2
         elif active_buy_gates:
             trend_gate_ok_buy = all(active_buy_gates)
+        elif any_gate_enabled:
+            logger_pair.debug(
+                f"[{pair_name}] Trend gate: all enabled gates abstained (warmup/gap) — buy denied."
+            )
+            trend_gate_ok_buy = False
         else:
             trend_gate_ok_buy = True
 
@@ -3759,8 +3766,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             trend_gate_ok_sell = sum(active_sell_gates) >= 2
         elif active_sell_gates:
             trend_gate_ok_sell = all(active_sell_gates)
+        elif any_gate_enabled:
+            logger_pair.debug(
+                f"[{pair_name}] Trend gate: all enabled gates abstained (warmup/gap) — sell denied."
+            )
+            trend_gate_ok_sell = False
         else:
-            trend_gate_ok_sell = True
+            trend_gate_ok_sell = True    
 
         buy_common = (
             base_buy_trend and confirmation_buy and is_valid_for_buy
