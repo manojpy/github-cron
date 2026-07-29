@@ -363,10 +363,6 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
 
 @njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
-    """
-    Percentage Price Oscillator (PPO) matching Pine Script behavior exactly.
-    Returns only (ppo, ppo_sig) to avoid unpacking errors. No histogram included.
-    """
     n = len(close)
     fast_ma = ema_loop_pine(close, float(fast))
     slow_ma = ema_loop_pine(close, float(slow))
@@ -377,7 +373,12 @@ def calculate_ppo_core(close, fast, slow, signal):
         s = slow_ma[i]
         if not np.isnan(f) and not np.isnan(s) and s != 0.0:
             ppo_val = ((f - s) / s) * 100.0
-            ppo[i] = np.clip(ppo_val, -1000.0, 1000.0)  # Prevent absurd outliers
+            # Scalar clamp — Numba compiles this natively
+            if ppo_val > 1000.0:
+                ppo_val = 1000.0
+            elif ppo_val < -1000.0:
+                ppo_val = -1000.0
+            ppo[i] = ppo_val
 
     ppo_sig = ema_loop_pine(ppo, float(signal))
     return ppo, ppo_sig
