@@ -218,6 +218,7 @@ class BotConfig(BaseModel):
     ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
     ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
+    HIGH_DEVIATION_THRESHOLD = 0.75
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -831,7 +832,7 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         if close is None or len(close) < max(fast, slow):
             logger.warning(f"PPO: Insufficient data")
             default_len = len(close) if close is not None else 1
-            return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
+            return np.full(default_len, np.nan, dtype=np.float64), np.full(default_len, np.nan, dtype=np.float64)
 
         ppo, ppo_sig = calculate_ppo_core(close, fast, slow, signal)
 
@@ -847,12 +848,19 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
     except Exception as e:
         logger.error(f"PPO calculation failed: {e}")
         default_len = len(close) if close is not None else 1
-        return np.zeros(default_len, dtype=np.float64), np.zeros(default_len, dtype=np.float64)
-
+        return np.full(default_len, np.nan, dtype=np.float64), np.full(default_len, np.nan, dtype=np.float64)
+    
 def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray,
     reference_time: Optional[int] = None) -> np.ndarray:
     try:
         hlc3 = (high + low + close) / 3.0
+        
+        # In macd_unified.py before calling:
+        if len(timestamps) > 1 and np.any(np.diff(timestamps) < 0):
+            logger.warning(
+                "[%s] Timestamps not sorted — VWAP may be incorrect",
+                PAIR_ID.get() or "?"
+            )  
         return vwap_daily_loop_safe(hlc3, volume, timestamps)
     except Exception as e:
         logger.error(f"VWAP calculation failed: {e}", exc_info=True)
@@ -861,15 +869,15 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
 def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
     try:
         if data is None or len(data) < period:
-            return np.zeros_like(data) if data is not None else np.array([0.0])
+            return np.full_like(data, np.nan) if data is not None else np.array([np.nan])
 
         alpha = 1.0 / period
         rma = ema_loop_alpha(data, alpha)
-        rma = sanitize_array_numba(rma, np.nan)   # ← was 0.0
+        rma = sanitize_array_numba(rma, np.nan)
         return rma
     except Exception as e:
         logger.error(f"RMA calculation failed: {e}")
-        return np.zeros_like(data) if data is not None else np.array([0.0])
+        return np.full_like(data, np.nan) if data is not None else np.array([np.nan]) 
 
 def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
                              conversion_periods: int = 23,
@@ -1615,6 +1623,7 @@ class RateLimitedFetcher:
         self.last_request_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
+        slot_claimed = False
         while True:
             sleep_needed = 0.0
             async with self.lock:
@@ -1622,21 +1631,23 @@ class RateLimitedFetcher:
                 while self.requests and now - self.requests[0] > 60.0:
                     self.requests.popleft()
                 if len(self.requests) < self.max_per_minute:
-                    # Slot available — claim it inside the lock
                     self.requests.append(time.time())
-                    self.last_request_time = time.time()
+                    slot_claimed = True
                     break
                 else:
                     oldest_request_age = now - self.requests[0]
                     wait_needed = max(0.0, 60.0 - oldest_request_age)
                     sleep_needed = wait_needed + random.uniform(0.05, 0.2)
-                    self.total_waits += 1
-                    self.total_wait_time += sleep_needed
-                    logger.debug(
-                        f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
-                        f"sleeping {sleep_needed:.2f}s | Total waits: {self.total_waits}"
-                    )
             await asyncio.sleep(sleep_needed)
+
+        try:
+            async with self.semaphore:
+                return await func(*args, **kwargs)
+        finally:
+            if slot_claimed:
+                async with self.lock:
+                    if self.requests:
+                        self.requests.pop()
 
         async with self.semaphore:
             return await func(*args, **kwargs)
@@ -1860,7 +1871,10 @@ class DataFetcher:
                 all_tasks.append(task)
                 task_metadata.append((symbol, resolution))
 
-        results = await asyncio.gather(*all_tasks, return_exceptions=True)
+        results = await asyncio.wait_for(
+            asyncio.gather(*all_tasks, return_exceptions=True),
+            timeout=cfg.HTTP_TIMEOUT * 2
+        )
         output = {}
         success_count = 0
         
@@ -1978,7 +1992,8 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         body = 0.0
     
     calculated_range = upper_wick + body + lower_wick
-    if abs(calculated_range - candle_range) > 1e-6:
+
+    if abs(calculated_range - candle_range) > 1e-6 * max(candle_range, 1.0):
         return False, False, None, (
             f"Candle structure error: wicks+body={calculated_range:.6f} "
             f"!= range={candle_range:.6f}"
@@ -2069,13 +2084,11 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             logger.warning("parse_candles_to_numpy: empty candle array (n=0)")
             return None
     
-        for key in ["open", "high", "low", "close", "volume"]:
-            if len(data[key]) != n:
-                logger.error(
-                    f"parse_candles_to_numpy: Array length mismatch in '{key}': "
-                    f"{len(data[key])} != {n}"
-                )
-                return None
+        lengths = {k: len(data[k]) for k in ["open", "high", "low", "close", "volume"]}
+        if len(set(lengths.values())) != 1:
+            bad = {k: v for k, v in lengths.items() if v != n}
+            logger.error(f"Length mismatch: {bad}")
+            return None
     
         data["timestamp"] = np.where(data["timestamp"] > 1_000_000_000_000, data["timestamp"] // 1000, data["timestamp"])
 
@@ -2108,8 +2121,10 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             return None
     
         hl_mid = (h + l) / 2.0
-        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
-        deviation_mask = close_deviation > 0.5
+        candle_range = h - l
+
+        close_deviation = np.abs(c - hl_mid) / (candle_range + 1e-9)
+        deviation_mask = close_deviation > cfg.HIGH_DEVIATION_THRESHOLD
         deviation_count = np.sum(deviation_mask)
  
         if deviation_count > 0: 
@@ -2215,14 +2230,14 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         else:
             logger.info("[%s] Duplicates exist but not near target.", pair_name or "?")
 
-    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 30)
+    matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
         last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
         count = int(ts_normalized.size)
         last5_list = [format_ist_time(t) for t in ts_normalized[-5:]]
         last5_str = str(last5_list)
         
-        logger.debug(
+        logger.warning(  # ← visible in production
             "[%s] Target %dm open %s not found. last_ts=%s count=%s last5=%s",
             pair_name or "?", 
             int(interval_minutes), 
@@ -2235,14 +2250,14 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     last_closed_idx = int(matches[-1])
     actual_candle_open = int(ts_normalized[last_closed_idx])
-    current_period_start = (reference_time // interval_seconds) * interval_seconds
-    if actual_candle_open >= current_period_start:
-        logger.error(
-            "[%s] REJECTED: Selected candle is the FORMING candle! "
-            "Open %s >= current period start %s. This should never happen!",
+
+    # Move stability check AFTER finding the actual candle
+    if not candle_is_stable(actual_candle_open, reference_time, interval_minutes):
+        logger.warning(
+            "[%s] Candle %dm actual open %s not stable. Skipping.",
             pair_name or "?",
+            int(interval_minutes),
             format_ist_time(actual_candle_open),
-            format_ist_time(current_period_start)
         )
         return None
 
@@ -2256,7 +2271,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         )
         return None
 
-    logger.debug(
+    logger.info(
         "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
         pair_name or "?",
         int(interval_minutes),
@@ -2267,7 +2282,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
 
     return last_closed_idx
-
+    
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
     ts_curr: int, o: float, h: float, l: float, c: float, reference_time: int, logger_pair: logging.Logger) -> bool:
     """Re-fetch the just-evaluated 15m candle right before dispatch and confirm
@@ -2284,7 +2299,7 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
             return False
 
         ts_arr = fresh["timestamp"]
-        matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 30)
+        matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 5)
         if matches.size == 0:
             logger_pair.warning(f"[{pair_name}] Confirmation candle {format_ist_time(ts_curr)} not found in re-fetch")
             return False
@@ -2395,12 +2410,24 @@ class RedisStateStore:
 
             async with RedisStateStore._pool_lock:
                 existing_pool = RedisStateStore._global_pools.get(self.redis_url)
-                if existing_pool and not existing_pool.closed:
-                    if self._redis and self._redis is not existing_pool:
+                pool_is_healthy = False
+                if existing_pool:
+                    try:
+                        pool_is_healthy = await asyncio.wait_for(existing_pool.ping(), timeout=1.0)
+                    except Exception:
+                        pool_is_healthy = False
+
+                if existing_pool and pool_is_healthy:
+                    if self._redis is not existing_pool:
                         await self._redis.aclose()
                     self._redis = existing_pool
                     logger.debug("Using pool created by another coroutine")
                 else:
+                    if existing_pool and existing_pool is not self._redis:
+                        try:
+                            await existing_pool.aclose()
+                        except Exception:
+                            pass
                     RedisStateStore._global_pools[self.redis_url] = self._redis
                     RedisStateStore._pool_healthy[self.redis_url] = True
                     RedisStateStore._pool_created_at[self.redis_url] = time.time()
@@ -3599,8 +3626,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
         # ── Ichimoku Cloud Filter ──
-        future_green = bool(ichimoku_future_green[i15])
-        future_red = bool(ichimoku_future_red[i15])
+        future_green = ichimoku_future_green[i15]
+        future_red = ichimoku_future_red[i15]
         cloud_upper_val = ichimoku_cloud_upper[i15]
         cloud_lower_val = ichimoku_cloud_lower[i15]
 
@@ -3640,10 +3667,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if np.isnan(close_prev) or np.isinf(close_prev) or close_prev <= 0:
             logger_pair.warning(
                 f"[{pair_name}] Previous candle close invalid ({close_prev}). "
-                f"VWAP cross check disabled this run; other alert types unaffected."
+                f"Skipping all cross-based alerts this run."
             )
             close_prev_invalid = True
 
+        if close_prev_invalid:
+            logger_pair.warning(
+                f"[{pair_name}] close_prev invalid — skipping all cross alerts"
+            )
+            await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            return pair_name, {
+                "state": "INVALID_PREV_CLOSE",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "future_cloud": "neutral",
+                    "hist_rma": 0.0,
+                    "suppression": "close_prev was NaN/Inf/≤0"
+                }
+            }  
         close_5m_val = data_5m["close"][i5]
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
@@ -4408,12 +4450,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         
         if not alerts_to_send:
             future_cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
-            logger_pair.debug(
-                f"😒 {pair_name} | "
-                f"future_cloud={future_cloud_state}| "
-                f"Suppression: {', '.join(failed_conditions + reasons) if (failed_conditions or reasons) else 'No conditions met'}"
-            )
-        
+            logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
             "ts": int(time.time()),
@@ -4562,6 +4599,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
 
+    del all_candles
+    await asyncio.to_thread(gc.collect) 
+
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
     results = await asyncio.gather(
@@ -4587,13 +4627,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.debug(
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
     )
-
-    results = None
-    all_candles = None
-    prepared_tasks = None
-    pair_requests = None
-    valid_tasks = None
-
+    del results, prepared_tasks, pair_requests, valid_tasks
+    await asyncio.to_thread(gc.collect)
+    
     process = psutil.Process()
 
     def log_memory_usage(stage: str):
@@ -4616,10 +4652,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             f"⚠️ High memory after batch: {peak_memory_mb:.0f}MB / {limit_mb:.0f}MB "
             f"({usage_pct:.0f}%)"
         )
-
-    logger_main.debug("🧹 Released all fetch-phase data (all_candles, results, etc)")
-    await asyncio.to_thread(gc.collect)
-
+    logger_main.debug("🧹 Fetch-phase data deleted, GC forced")
     current_memory_mb, limit_mb, usage_pct = log_memory_usage("💾 Memory after batch cleanup")
     if current_memory_mb and current_memory_mb > limit_mb * 0.8:
         logger_main.warning(

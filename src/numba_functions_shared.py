@@ -44,6 +44,9 @@ def rolling_mean_numba(data, period):
     as NaN forever. This version tracks NaNs in the circular buffer explicitly so the
     poisoning clears correctly once the NaN leaves the window, and correctly emits NaN
     only while a NaN is actually inside the window.
+    
+    OPTIMIZED: Fast path for data with no NaNs uses a simple running sum, avoiding
+    circular buffer overhead entirely.
     """
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
@@ -51,6 +54,25 @@ def rolling_mean_numba(data, period):
     if period <= 0:
         return out
 
+    # Fast path: check for any NaNs
+    has_nan = False
+    for i in range(n):
+        if np.isnan(data[i]):
+            has_nan = True
+            break
+
+    if not has_nan:
+        # Simple running sum — O(n), no circular buffer overhead
+        window_sum = 0.0
+        for i in range(n):
+            window_sum += data[i]
+            if i >= period:
+                window_sum -= data[i - period]
+            if i >= period - 1:
+                out[i] = window_sum / period
+        return out
+
+    # Slow path: original circular buffer with explicit NaN tracking
     window_sum = 0.0
     nan_count = 0
     queue = np.zeros(period, dtype=np.float64)
@@ -240,12 +262,10 @@ def ema_loop_alpha(data, alpha):
             if not np.isnan(data[i]):
                 sma_sum += data[i]
                 valid_count += 1
-        sma_init = sma_sum / valid_count if valid_count > 0 else data[first_valid_idx]
-
+        sma_init = sma_sum / valid_count 
         for i in range(first_valid_idx, first_valid_idx + period):
             if not np.isnan(data[i]):
                 out[i] = sma_init
-            # else: leave as NaN -- no fabricated flatline over a real data gap
 
         start_idx = first_valid_idx + period
         prev = sma_init  # internal recursion anchor, independent of what's exposed in out[]
@@ -348,7 +368,6 @@ def calculate_ppo_core(close, fast, slow, signal):
     Returns only (ppo, ppo_sig) to avoid unpacking errors. No histogram included.
     """
     n = len(close)
-    # Using the Pine-exact EMA helper to prevent warm-up mismatches
     fast_ma = ema_loop_pine(close, float(fast))
     slow_ma = ema_loop_pine(close, float(slow))
 
@@ -357,7 +376,8 @@ def calculate_ppo_core(close, fast, slow, signal):
         f = fast_ma[i]
         s = slow_ma[i]
         if not np.isnan(f) and not np.isnan(s) and s != 0.0:
-            ppo[i] = ((f - s) / s) * 100.0
+            ppo_val = ((f - s) / s) * 100.0
+            ppo[i] = np.clip(ppo_val, -1000.0, 1000.0)  # Prevent absurd outliers
 
     ppo_sig = ema_loop_pine(ppo, float(signal))
     return ppo, ppo_sig
@@ -368,12 +388,9 @@ def calculate_rsi_core(close, period):
 
     FIX: default fill changed from 50.0 to NaN. Bars before RSI has enough history
     now correctly report "no value yet" instead of a fabricated midline reading.
-    This matters because downstream chains (e.g. smooth_rsi = kalman_loop(rsi, ...))
-    treat NaN as a genuine gap (see kalman_loop fix above) instead of treating the
-    old fake 50.0 as a real observation that anchors the filter during warm-up.
-    Callers that need a non-NaN array for display/alerting already sanitize the
-    final output back to 50.0 downstream, so this only affects the intermediate
-    warm-up bars, not the values used once the indicator is actually live.
+    
+    OPTIMIZED: Eliminated full-length gain/loss arrays. Gains/losses are computed
+    on the fly during both the warm-up and smoothing phases, saving 2 * n * 8 bytes.
     """
     n = len(close)
     rsi = np.full(n, np.nan, dtype=np.float64)
@@ -392,33 +409,40 @@ def calculate_rsi_core(close, period):
     if first_valid_idx == -1:
         return rsi
 
-    gain = np.zeros(n, dtype=np.float64)
-    loss = np.zeros(n, dtype=np.float64)
-
-    for i in range(first_valid_idx + 1, n):
-        curr = close[i]
-        if not np.isnan(curr):
-            diff = curr - last_valid_close
-            if diff > 0.0:
-                gain[i] = diff
-            else:
-                loss[i] = -diff
-            last_valid_close = curr
-
+    # Warm-up: accumulate over the first 'period' bars after first_valid_idx
     avg_gain = 0.0
     avg_loss = 0.0
-    for i in range(first_valid_idx + 1, min(first_valid_idx + period + 1, n)):
-        avg_gain += gain[i]
-        avg_loss += loss[i]
+    last_valid = last_valid_close
+    warmup_end = min(first_valid_idx + period + 1, n)
+    for i in range(first_valid_idx + 1, warmup_end):
+        curr = close[i]
+        if not np.isnan(curr):
+            diff = curr - last_valid
+            if diff > 0.0:
+                avg_gain += diff
+            else:
+                avg_loss += -diff
+            last_valid = curr
+        # NaN bars contribute 0, matching original behavior
+
     avg_gain /= period
     avg_loss /= period
 
     alpha = 1.0 / period
 
+    # Smoothing phase
     for i in range(first_valid_idx + period, n):
-        if not np.isnan(close[i]):
-            avg_gain = (gain[i] * alpha) + (avg_gain * (1.0 - alpha))
-            avg_loss = (loss[i] * alpha) + (avg_loss * (1.0 - alpha))
+        curr = close[i]
+        if not np.isnan(curr):
+            diff = curr - last_valid
+            if diff > 0.0:
+                avg_gain = (diff * alpha) + (avg_gain * (1.0 - alpha))
+                avg_loss = (avg_loss * (1.0 - alpha))
+            else:
+                avg_gain = (avg_gain * (1.0 - alpha))
+                avg_loss = (-diff * alpha) + (avg_loss * (1.0 - alpha))
+            last_valid = curr
+        # NaN bars leave averages unchanged, matching original
 
         if avg_loss == 0.0:
             rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
@@ -427,7 +451,6 @@ def calculate_rsi_core(close, period):
             rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
-
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
@@ -451,10 +474,13 @@ def calculate_atr_rma(high, low, close, period):
     atr = ema_loop_alpha(tr, alpha)
     return atr
 
-
 @njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
-    """Calculate ADX in O(n) using Pine Script equivalent logic."""
+    """Calculate ADX in O(n) using Pine Script equivalent logic.
+    
+    OPTIMIZED: Reuses smoothed DM/TR buffers for DI/raw_ADX, cutting
+    temporary allocations from 11 arrays down to 6.
+    """
     n = len(high)
     adx = np.full(n, np.nan, dtype=np.float64)
 
@@ -489,25 +515,24 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     minus_dm_smooth = ema_loop_alpha(minus_dm, alpha_di)
     tr_smooth = ema_loop_alpha(tr, alpha_di)
 
-    plus_di = np.full(n, np.nan, dtype=np.float64)
-    minus_di = np.full(n, np.nan, dtype=np.float64)
-
+    # Reuse plus_dm_smooth / minus_dm_smooth as plus_di / minus_di
     for i in range(n):
         if tr_smooth[i] > 0.0 and not np.isnan(tr_smooth[i]):
-            plus_di[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
-            minus_di[i] = 100.0 * minus_dm_smooth[i] / tr_smooth[i]
+            plus_dm_smooth[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
+            minus_dm_smooth[i] = 100.0 * minus_dm_smooth[i] / tr_smooth[i]
         else:
-            plus_di[i] = 0.0
-            minus_di[i] = 0.0
+            plus_dm_smooth[i] = 0.0
+            minus_dm_smooth[i] = 0.0
 
-    di_diff = np.abs(plus_di - minus_di)
-    di_sum = plus_di + minus_di
-    raw_adx = np.where(di_sum == 0.0, 0.0, 100.0 * di_diff / di_sum)
+    # Reuse tr_smooth as raw_adx buffer
+    for i in range(n):
+        di_diff = abs(plus_dm_smooth[i] - minus_dm_smooth[i])
+        di_sum = plus_dm_smooth[i] + minus_dm_smooth[i]
+        tr_smooth[i] = 0.0 if di_sum == 0.0 else 100.0 * di_diff / di_sum
 
     alpha_adx = 1.0 / float(adx_length)
-    adx = ema_loop_alpha(raw_adx, alpha_adx)
+    adx = ema_loop_alpha(tr_smooth, alpha_adx)
     return adx
-
 
 # ============================================================================
 # SOURCE VERSION -- imported from aot_version.py (see that file for why it's
