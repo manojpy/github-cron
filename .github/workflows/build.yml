@@ -92,7 +92,7 @@ jobs:
           REQUIRE_AOT: true
         run: |
           echo "🧪 Running AOT verification..."
-          docker run --rm --platform linux/amd64 \
+          docker run --rm -i --platform linux/amd64 \
             -e PYTHONPATH=/app/src:$PYTHONPATH \
             -e TZ=Asia/Kolkata \
             -e REQUIRE_AOT=${{ env.REQUIRE_AOT }} \
