@@ -164,7 +164,7 @@ class BotConfig(BaseModel):
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
-    CPR_WIDE_MIN_PCT_MOVE: float = Field(default=2.0, ge=0.1, le=20.0, description="Minimum % move from today's UTC 00:00 open required for wide-CPR bypass")
+    CPR_WIDE_MIN_PCT_MOVE: float = Field(default=2.0, ge=0.1, le=20.0, description="Minimum % move from previous day's close required for wide-CPR bypass")
     ENABLE_HIST_RMA: bool = Field(default=True, description="Enable RMA 10/30 histogram reversal alerts")
     HIST_RMA_FAST: int = Field(default=10, ge=2, le=100, description="Histogram RMA fast period")
     HIST_RMA_SLOW: int = Field(default=30, ge=5, le=200, description="Histogram RMA slow period")
@@ -3685,17 +3685,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         )
 
         momentum_conditions = [
-            adx_bypass_ok,       # ADX >= 18
-            adx_rising,          # ADX is rising
-            rvol_bypass_ok,      # RVOL >= 1.0
-            volume_above_ema_ok, # Volume > Volume EMA 20
+            adx_bypass_ok,
+            adx_rising,
+            rvol_bypass_ok,
+            volume_above_ema_ok,
         ]
         momentum_count = sum(momentum_conditions)
 
-        # Mandatory 2% move from previous day close for wide CPR
         if not np.isnan(prev_day_close) and prev_day_close > 0:
             pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
-            move_from_prev_close_ok = pct_move_from_prev_close >= 2.0
+            move_from_prev_close_ok = pct_move_from_prev_close >= cfg.CPR_WIDE_MIN_PCT_MOVE
         else:
             pct_move_from_prev_close = float('nan')
             move_from_prev_close_ok = False
@@ -3703,7 +3702,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if cfg.ENABLE_CPR:
             if cpr_ok:  # Narrow CPR: any 2 of 4
                 effective_cpr_ok = momentum_count >= 2
-            else:       # Wide CPR: any 3 of 4 + mandatory 2% move from prev close
+            else: 
                 effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
         else:
             effective_cpr_ok = True
