@@ -385,13 +385,13 @@ def calculate_ppo_core(close, fast, slow, signal):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
-    """Calculate RSI in O(n) - single pass gains/losses, then EMA.
+    """Calculate RSI in O(n) - single pass, no full gain/loss arrays.
 
-    FIX: default fill changed from 50.0 to NaN. Bars before RSI has enough history
-    now correctly report "no value yet" instead of a fabricated midline reading.
-    
-    OPTIMIZED: Eliminated full-length gain/loss arrays. Gains/losses are computed
-    on the fly during both the warm-up and smoothing phases, saving 2 * n * 8 bytes.
+    OPTIMIZED: Eliminated full-length gain/loss arrays (saves 2*n*8 bytes).
+    Warm-up and smoothing compute diffs on-the-fly.
+
+    FIX: prev_valid is no longer advanced on the last warm-up iteration,
+    preventing the smoothing loop from computing diff=0 on its first bar.
     """
     n = len(close)
     rsi = np.full(n, np.nan, dtype=np.float64)
@@ -410,40 +410,43 @@ def calculate_rsi_core(close, period):
     if first_valid_idx == -1:
         return rsi
 
-    # Warm-up: accumulate over the first 'period' bars after first_valid_idx
+    # ── Warm-up: accumulate 'period' diffs ──
     avg_gain = 0.0
     avg_loss = 0.0
-    last_valid = last_valid_close
+    prev_valid = last_valid_close
     warmup_end = min(first_valid_idx + period + 1, n)
+
     for i in range(first_valid_idx + 1, warmup_end):
         curr = close[i]
         if not np.isnan(curr):
-            diff = curr - last_valid
+            diff = curr - prev_valid
             if diff > 0.0:
                 avg_gain += diff
             else:
                 avg_loss += -diff
-            last_valid = curr
-        # NaN bars contribute 0, matching original behavior
+            # Don't advance prev_valid on the LAST warm-up bar;
+            # we need it to remain as close[i-1] for the first smoothing step.
+            if i < first_valid_idx + period:
+                prev_valid = curr
 
     avg_gain /= period
     avg_loss /= period
 
     alpha = 1.0 / period
 
-    # Smoothing phase
+    # ── Smoothing phase ──
     for i in range(first_valid_idx + period, n):
         curr = close[i]
         if not np.isnan(curr):
-            diff = curr - last_valid
+            diff = curr - prev_valid
             if diff > 0.0:
                 avg_gain = (diff * alpha) + (avg_gain * (1.0 - alpha))
                 avg_loss = (avg_loss * (1.0 - alpha))
             else:
                 avg_gain = (avg_gain * (1.0 - alpha))
                 avg_loss = (-diff * alpha) + (avg_loss * (1.0 - alpha))
-            last_valid = curr
-        # NaN bars leave averages unchanged, matching original
+            prev_valid = curr
+        # NaN bars leave averages unchanged, matching original behavior
 
         if avg_loss == 0.0:
             rsi[i] = 100.0 if avg_gain > 0.0 else 50.0

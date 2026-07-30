@@ -132,7 +132,7 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MIN_CANDLE_AGE_FROM_OPEN = 850
     MIN_BODY_RATIO = 0.30
-    HIGH_DEVIATION_THRESHOLD = 0.75 
+    HIGH_DEVIATION_THRESHOLD = 0.4
     
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
@@ -1623,7 +1623,6 @@ class RateLimitedFetcher:
         self.last_request_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
-        slot_claimed = False
         while True:
             sleep_needed = 0.0
             async with self.lock:
@@ -1631,27 +1630,29 @@ class RateLimitedFetcher:
                 while self.requests and now - self.requests[0] > 60.0:
                     self.requests.popleft()
                 if len(self.requests) < self.max_per_minute:
-                    self.requests.append(time.time())
-                    slot_claimed = True
+                    self.requests.append(now)
+                    self.last_request_time = now
                     break
                 else:
                     oldest_request_age = now - self.requests[0]
                     wait_needed = max(0.0, 60.0 - oldest_request_age)
                     sleep_needed = wait_needed + random.uniform(0.05, 0.2)
-            await asyncio.sleep(sleep_needed)
-
-        try:
-            async with self.semaphore:
-                return await func(*args, **kwargs)
-        finally:
-            if slot_claimed:
-                async with self.lock:
-                    if self.requests:
-                        self.requests.pop()
+                    self.total_waits += 1
+                    logger.debug(
+                        f"Rate limit reached ({len(self.requests)}/{self.max_per_minute}), "
+                        f"sleeping {sleep_needed:.2f}s | Total waits: {self.total_waits}"
+                    )
+            
+            t0 = time.time()
+            try:
+                await asyncio.sleep(sleep_needed)
+            except asyncio.CancelledError:
+                self.total_wait_time += max(0.0, time.time() - t0)
+                raise
+            self.total_wait_time += time.time() - t0
 
         async with self.semaphore:
             return await func(*args, **kwargs)
-
     def get_stats(self) -> Dict[str, Any]:
         return {
             "total_waits": self.total_waits,
@@ -2131,7 +2132,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             dev_indices = np.where(deviation_mask)[0].tolist() 
             logger.warning( 
                 f"parse_candles_to_numpy: {deviation_count} candle(s) with " 
-                f"close >50% from H-L midpoint | Indices: {dev_indices[:5]}" 
+                f"close/range deviation > {Constants.HIGH_DEVIATION_THRESHOLD} (max possible 0.5) | Indices: {dev_indices[:5]}"
             ) 
             if cfg.DEBUG_MODE and deviation_count <= 5: 
                 for idx in dev_indices: 
