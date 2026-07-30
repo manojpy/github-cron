@@ -132,7 +132,7 @@ class Constants:
     API_TIMESTAMP_TOLERANCE_SEC = 300
     MIN_CANDLE_AGE_FROM_OPEN = 850
     MIN_BODY_RATIO = 0.30
-    HIGH_DEVIATION_THRESHOLD = 0.4
+    HIGH_DEVIATION_THRESHOLD = 0.5
     
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
@@ -2123,26 +2123,26 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
     
         hl_mid = (h + l) / 2.0
         candle_range = h - l
-
-        close_deviation = np.abs(c - hl_mid) / (candle_range + 1e-9)
+        close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
         deviation_mask = close_deviation > Constants.HIGH_DEVIATION_THRESHOLD
         deviation_count = np.sum(deviation_mask)
  
-        if deviation_count > 0: 
-            dev_indices = np.where(deviation_mask)[0].tolist() 
-            logger.warning( 
-                f"parse_candles_to_numpy: {deviation_count} candle(s) with " 
-                f"close/range deviation > {Constants.HIGH_DEVIATION_THRESHOLD} (max possible 0.5) | Indices: {dev_indices[:5]}"
-            ) 
-            if cfg.DEBUG_MODE and deviation_count <= 5: 
-                for idx in dev_indices: 
-                    dev_pct = close_deviation[idx] * 100 
-                    logger.debug( 
-                        f" Index {idx}: Deviation {dev_pct:.1f}% | " 
-                        f"Mid={(h[idx]+l[idx])/2:.2f} Close={c[idx]:.2f}" 
-                    ) 
-            if cfg.REJECT_HIGH_DEVIATION: 
-                logger.warning("Rejecting candle data due to high deviation (REJECT_HIGH_DEVIATION=True)") 
+        if deviation_count > 0:
+            dev_indices = np.where(deviation_mask)[0].tolist()
+            logger.warning(
+                f"parse_candles_to_numpy: {deviation_count} candle(s) with "
+                f"close/price deviation > {Constants.HIGH_DEVIATION_THRESHOLD} "
+                f"| Indices: {dev_indices[:5]}"
+            )
+            if cfg.DEBUG_MODE and deviation_count <= 5:
+                for idx in dev_indices:
+                    dev_pct = close_deviation[idx] * 100
+                    logger.debug(
+                        f" Index {idx}: Deviation {dev_pct:.2f}% | "
+                        f"Mid={hl_mid[idx]:.2f} Close={c[idx]:.2f}"
+                    )
+            if cfg.REJECT_HIGH_DEVIATION:
+                logger.warning("Rejecting candle data due to high deviation (REJECT_HIGH_DEVIATION=True)")
                 return None
     
         if n > 1:
