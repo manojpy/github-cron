@@ -679,6 +679,27 @@ def _find_today_daily_open(data_daily: Dict[str, np.ndarray], reference_time: in
 
     return open_val
 
+def validate_cloud_cross(close_prev: float, close_curr: float,
+    cloud_upper_prev: float, cloud_upper_curr: float,
+    cloud_lower_prev: float, cloud_lower_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
+
+    vals = [close_prev, close_curr, cloud_upper_prev, cloud_upper_curr, cloud_lower_prev, cloud_lower_curr]
+    if any(np.isnan(v) for v in vals):
+        return False, "NaN in inputs"
+    if close_prev <= 0 or close_curr <= 0:
+        return False, "Non-positive close"
+
+    if is_buy:
+        crossed = (close_prev <= cloud_upper_prev) and (close_curr > cloud_upper_curr)
+        if not crossed:
+            return False, "No bullish cloud cross"
+        return True, None
+    else:
+        crossed = (close_prev >= cloud_lower_prev) and (close_curr < cloud_lower_curr)
+        if not crossed:
+            return False, "No bearish cloud cross"
+        return True, None
+
 def validate_vwap_cross(close_prev: float, close_curr: float, vwap_prev: float, vwap_curr: float, is_buy: bool,
     min_deviation: float = 0.001, max_deviation_pct: float = Constants.VWAP_MAX_DISTANCE_PCT) -> Tuple[bool, Optional[str]]:
  
@@ -1653,6 +1674,7 @@ class RateLimitedFetcher:
 
         async with self.semaphore:
             return await func(*args, **kwargs)
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             "total_waits": self.total_waits,
@@ -3170,6 +3192,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"hist_rma_sell","title":"🟣⬇️ RMA Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_buy","title":"🟢🔥 PPO Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_sell","title":"🔴🔥 PPO Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"cloud_cross_up","title":"☁️🟢 Price cross above current cloud","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"cloud_cross_down","title":"☁️🔴 Price cross below current cloud","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -3289,6 +3313,30 @@ def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) 
         resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
     elif not sell_common and conditional_states.get(ALERT_KEYS['vwap_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+
+    return resets
+
+def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    cu_curr, cu_prev = context.get("cloud_upper_curr"), context.get("cloud_upper_prev")
+    cl_curr, cl_prev = context.get("cloud_lower_curr"), context.get("cloud_lower_prev")
+
+    if any(v is None or np.isnan(v) for v in (cu_curr, cu_prev, cl_curr, cl_prev)):
+        return resets
+
+    if close_prev > cu_prev and close_curr <= cu_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_up']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS['cloud_cross_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_up']}", "INACTIVE", None))
+
+    if close_prev < cl_prev and close_curr >= cl_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_down']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS['cloud_cross_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_down']}", "INACTIVE", None))
 
     return resets
 
@@ -3629,8 +3677,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         # ── Ichimoku Cloud Filter ──
         future_green = ichimoku_future_green[i15]
         future_red = ichimoku_future_red[i15]
+
         cloud_upper_val = ichimoku_cloud_upper[i15]
         cloud_lower_val = ichimoku_cloud_lower[i15]
+        cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
+        cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
 
         if np.isnan(cloud_upper_val) or np.isnan(cloud_lower_val):
             logger_pair.warning(
@@ -4017,6 +4068,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "rsi_guard_smooth_curr": rsi_guard_smooth_curr, "rsi_guard_ema_curr": rsi_guard_ema_curr,
             "trend_gate_ok_buy": trend_gate_ok_buy, "trend_gate_ok_sell": trend_gate_ok_sell,
             "cloud_up": cloud_up, "cloud_down": cloud_down,
+            "cloud_upper_curr": cloud_upper_val, "cloud_upper_prev": cloud_upper_prev,
+            "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
             "buy_common": buy_common, "sell_common": sell_common,
@@ -4142,8 +4195,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+
                 except Exception as e:
                     logger_pair.debug(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
+
+            elif alert_key in ("cloud_cross_up", "cloud_cross_down"):
+                trigger = False
+                try:
+                    is_buy_side = (alert_key == "cloud_cross_up")
+                    valid_cross, cross_reason = validate_cloud_cross(
+                        context["close_prev"], context["close_curr"],
+                        context["cloud_upper_prev"], context["cloud_upper_curr"],
+                        context["cloud_lower_prev"], context["cloud_lower_curr"],
+                        is_buy_side
+                    )
+                    if valid_cross:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"Cloud cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
             else:
                 try:
@@ -4179,6 +4249,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_cloud_cross_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
 
