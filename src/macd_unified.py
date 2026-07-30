@@ -3464,15 +3464,15 @@ validate_alert_definitions()
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
     "rsi_50_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
+    "cloud_cross_up", 
 }
-
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
     "rsi_50_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
+    "cloud_cross_down", 
 }
-
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
