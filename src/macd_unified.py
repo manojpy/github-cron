@@ -219,6 +219,7 @@ class BotConfig(BaseModel):
     ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
     ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
+    ENABLE_TK_CONVERSION_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku conversion (Tenkan) line, subject to all other buy/sell common conditions")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -678,6 +679,26 @@ def _find_today_daily_open(data_daily: Dict[str, np.ndarray], reference_time: in
         return None
 
     return open_val
+
+def validate_conversion_cross(close_prev: float, close_curr: float,
+    conv_prev: float, conv_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
+
+    vals = [close_prev, close_curr, conv_prev, conv_curr]
+    if any(np.isnan(v) for v in vals):
+        return False, "NaN in inputs"
+    if close_prev <= 0 or close_curr <= 0:
+        return False, "Non-positive close"
+
+    if is_buy:
+        crossed = (close_prev <= conv_prev) and (close_curr > conv_curr)
+        if not crossed:
+            return False, "No bullish conversion-line cross"
+        return True, None
+    else:
+        crossed = (close_prev >= conv_prev) and (close_curr < conv_curr)
+        if not crossed:
+            return False, "No bearish conversion-line cross"
+        return True, None
 
 def validate_cloud_cross(close_prev: float, close_curr: float,
     cloud_upper_prev: float, cloud_upper_curr: float,
@@ -3173,22 +3194,24 @@ class AlertDefinition(TypedDict):
     requires: List[str]
  
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key":"ppo_signal_up","title":"🟢 PPO cross above signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_signal_down","title":"🔴 PPO cross below signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_zero_up","title":"🟢 PPO cross above 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_zero_down","title":"🔴 PPO cross below 0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross above 0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross below -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"rsi_50_up","title":"🟢 RSI cross above EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
-    {"key":"rsi_50_down","title":"🔴 RSI cross below EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
-    {"key":"vwap_up","title":"🔵▲ Price cross above VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
-    {"key":"vwap_down","title":"🟣▼ Price cross below VWAP","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
-    {"key":"hist_rma_buy","title":"🔵⬆️ RMA Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"hist_rma_sell","title":"🟣⬇️ RMA Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"ppohist_buy","title":"🟢🔥 PPO Hist Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"ppohist_sell","title":"🔴🔥 PPO Hist Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"cloud_cross_up","title":"☁️🟢 Price cross above current cloud","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"cloud_cross_down","title":"☁️🔴 Price cross below current cloud","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_zero_up","title":"🟢 PPO cross ▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_011_up","title":"🟢 PPO cross▲0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_011_down","title":"🔴 PPO cross▼ -0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"rsi_50_up","title":"🟢 RSI▲EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"rsi_50_down","title":"🔴 RSI▼EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
+    {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
+    {"key":"hist_rma_buy","title":"🔵⬆️ RMA Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"hist_rma_sell","title":"🟣⬇️ RMA Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ppohist_buy","title":"🟢🔥 PPO Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
+    {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
+    {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -3335,6 +3358,29 @@ def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states:
 
     return resets
 
+def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    conv_curr, conv_prev = context.get("tk_conversion_curr"), context.get("tk_conversion_prev")
+
+    if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
+        return resets
+
+    if close_prev > conv_prev and close_curr <= conv_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
+    elif not buy_common and conditional_states.get(ALERT_KEYS['tk_conversion_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
+
+    if close_prev < conv_prev and close_curr >= conv_curr:
+        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
+    elif not sell_common and conditional_states.get(ALERT_KEYS['tk_conversion_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
+
+    return resets
+
 def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     hist_curr, hist_m1 = context["hist_curr"], context["hist_m1"]
@@ -3459,14 +3505,14 @@ validate_alert_definitions()
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
     "rsi_50_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", 
+    "cloud_cross_up", "tk_conversion_up",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
     "rsi_50_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", 
+    "cloud_cross_down", "tk_conversion_down",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
@@ -3691,6 +3737,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cloud_down = future_red and below_cloud
 
         tk_conversion_curr = ichimoku_conversion_line[i15]
+        tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
 
@@ -4066,7 +4113,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_upper_curr": cloud_upper_val, "cloud_upper_prev": cloud_upper_prev,
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
-            "tk_conversion_curr": tk_conversion_curr, "tk_base_curr": tk_base_curr,
+            "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr,
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
@@ -4210,6 +4257,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 except Exception as e:
                     logger_pair.debug(f"Cloud cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
+
+            elif alert_key in ("tk_conversion_up", "tk_conversion_down"):
+                if not cfg.ENABLE_TK_CONVERSION_CROSS:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: TK conversion cross disabled")
+                    continue
+                trigger = False
+                try:
+                    is_buy_side = (alert_key == "tk_conversion_up")
+                    valid_cross, cross_reason = validate_conversion_cross(
+                        context["close_prev"], context["close_curr"],
+                        context["tk_conversion_prev"], context["tk_conversion_curr"],
+                        is_buy_side
+                    )
+                    if valid_cross:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"TK conversion cross check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
             else:
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
@@ -4245,6 +4311,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_cloud_cross_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_tk_conversion_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
 
@@ -4481,6 +4548,35 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append(f"PPO Gate buy: Gate({ppo_gate_curr:.2f}) <= Signal({ppo_gate_sig_curr:.2f})")
             if not ppo_gate_ok_sell:
                 reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
+
+        if cfg.ENABLE_TK_CONVERSION_CROSS:
+            if close_prev <= tk_conversion_prev and close_curr > tk_conversion_curr and not buy_common:
+                if not base_buy_trend:
+                    reasons.append("Conversion up-cross blocked: base_buy_trend=False")
+                elif not confirmation_buy:
+                    reasons.append("Conversion up-cross blocked: confirmation_buy=False")
+                elif not is_valid_for_buy:
+                    reasons.append("Conversion up-cross blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"Conversion up-cross blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+
+            if close_prev >= tk_conversion_prev and close_curr < tk_conversion_curr and not sell_common:
+                if not base_sell_trend:
+                    reasons.append("Conversion down-cross blocked: base_sell_trend=False")
+                elif not confirmation_sell:
+                    reasons.append("Conversion down-cross blocked: confirmation_sell=False")
+                elif not is_valid_for_sell:
+                    reasons.append("Conversion down-cross blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"Conversion down-cross blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
 
         if cfg.ENABLE_HIST_RMA:
             if buy_common and not hist_reversal_buy:
