@@ -214,10 +214,10 @@ class BotConfig(BaseModel):
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
-    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Ichimoku conversion line length")
-    ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Ichimoku base line length")
-    ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Ichimoku leading span B length")
-    ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Ichimoku cloud forward displacement")
+    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Ichimoku conversion line length")
+    ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
+    ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
+    ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
@@ -788,8 +788,7 @@ def get_trigger_timestamp() -> int:
     
     return int(datetime.now(timezone.utc).timestamp())
 
-def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int:
-   
+def calculate_expected_candle_timestamp(reference_time: int, interval_minutes: int) -> int: 
     interval_seconds = interval_minutes * 60
     current_interval_open = (reference_time // interval_seconds) * interval_seconds
     last_closed_candle_open = current_interval_open - interval_seconds
@@ -900,11 +899,7 @@ def calculate_rma_numpy(data: np.ndarray, period: int) -> np.ndarray:
         logger.error(f"RMA calculation failed: {e}")
         return np.full_like(data, np.nan) if data is not None else np.array([np.nan]) 
 
-def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                             conversion_periods: int = 23,
-                             base_periods: int = 65,
-                             span_b_periods: int = 130,
-                             displacement: int = 65) -> Dict[str, np.ndarray]:
+def calculate_ichimoku_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, conversion_periods: int = 9, base_periods: int = 26, span_b_periods: int = 52, displacement: int = 26) -> Dict[str, np.ndarray]:
     try:
         n = len(high)
         if n == 0:
