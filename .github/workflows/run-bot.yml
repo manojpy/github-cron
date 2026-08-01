@@ -11,11 +11,17 @@ on:
         options:
           - 'false'
           - 'true'
+      clear_states:
+        description: 'Clear all Redis states before running'
+        required: false
+        default: false
+        type: boolean
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
+  CLEAR_ALL_STATES: ${{ github.event.inputs.clear_states || 'false' }}
 
 jobs:
   run-bot:
@@ -138,6 +144,7 @@ jobs:
             -e TZ=Asia/Kolkata \
             -e PYTHONPATH=/app/src:$PYTHONPATH \
             -e TRIGGER_TIMESTAMP="$START_TIME" \
+            -e CLEAR_ALL_STATES="$CLEAR_ALL_STATES" \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
