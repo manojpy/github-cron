@@ -219,6 +219,8 @@ class BotConfig(BaseModel):
     ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
     ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
+    RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
+    RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
     ENABLE_TK_CONVERSION_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku conversion (Tenkan) line, subject to all other buy/sell common conditions")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
@@ -287,11 +289,16 @@ class BotConfig(BaseModel):
                 f'PPO_GATE_FAST ({self.PPO_GATE_FAST}) must be strictly less than '
                 f'PPO_GATE_SLOW ({self.PPO_GATE_SLOW})'
             )
-
         if self.ENABLE_HIST_RMA and self.HIST_RMA_FAST >= self.HIST_RMA_SLOW:
             raise ValueError(
                 f'HIST_RMA_FAST ({self.HIST_RMA_FAST}) must be strictly less than '
                 f'HIST_RMA_SLOW ({self.HIST_RMA_SLOW})'
+            )
+
+        if self.RMA_CLOUD_ENABLED and self.RMA_CLOUD_FAST_PERIOD >= self.RMA_50_PERIOD:
+            raise ValueError(
+                f'RMA_CLOUD_FAST_PERIOD ({self.RMA_CLOUD_FAST_PERIOD}) must be strictly less than '
+                f'RMA_50_PERIOD ({self.RMA_50_PERIOD}), since the cloud slow leg reuses RMA_50_PERIOD'
             )
 
         return self
@@ -1224,6 +1231,11 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['rsi_guard_smooth'] = np.full(n_15m, np.nan, dtype=np.float64)
             results['rsi_guard_ema'] = np.full(n_15m, np.nan, dtype=np.float64)
 
+        if cfg.RMA_CLOUD_ENABLED:
+            results['rma_cloud_fast_15'] = calculate_rma_numpy(close_15m, cfg.RMA_CLOUD_FAST_PERIOD)
+        else:
+            results['rma_cloud_fast_15'] = np.full(n_15m, np.nan, dtype=np.float64)
+
         # ── CPR (daily) ──
         if cfg.ENABLE_CPR and data_daily is not None:
             try:
@@ -1259,7 +1271,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         # Sanitize
         for key in ('rma50_15', 'rma200_5', 'adx', 'atr_short', 'atr_long',
                     'ppo_gate', 'ppo_gate_signal', 'rsi_guard_smooth',
-                    'rsi_guard_ema', 'volume_ema'):
+                    'rsi_guard_ema', 'volume_ema', 'rma_cloud_fast_15'):
             arr = results[key]
             if np.any(np.isinf(arr)):
                 results[key] = np.clip(arr, -Constants.INFINITY_CLAMP, Constants.INFINITY_CLAMP)
@@ -3744,6 +3756,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_gate_signal_arr = gate_indicators["ppo_gate_signal"]
         rsi_guard_smooth_arr = gate_indicators["rsi_guard_smooth"]
         rsi_guard_ema_arr = gate_indicators["rsi_guard_ema"]
+        rma_cloud_fast_arr = gate_indicators["rma_cloud_fast_15"]
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
@@ -3823,6 +3836,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_buy = cloud_up
         confirmation_sell = cloud_down
 
+        if cfg.ICHIMOKU_CLOUD_ENABLED:
+            ichimoku_gate_ok_buy = cloud_up
+            ichimoku_gate_ok_sell = cloud_down
+        else:
+            ichimoku_gate_ok_buy = None
+            ichimoku_gate_ok_sell = None
+
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_raw_check = adx_val >= cfg.ADX_THRESHOLD
         adx_ok = adx_raw_check if cfg.ENABLE_ADX_FILTER else True
@@ -3890,6 +3910,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppo_gate_sig_prev = ppo_gate_signal_arr[i15 - 1] if i15 >= 1 else ppo_gate_signal_arr[i15]
         rsi_guard_smooth_curr = rsi_guard_smooth_arr[i15]
         rsi_guard_ema_curr = rsi_guard_ema_arr[i15]
+        rma_cloud_fast_curr = rma_cloud_fast_arr[i15]
 
         if cfg.ENABLE_PPO_GATE:
             if not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
@@ -3913,13 +3934,24 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             rsi_guard_ok_buy = None
             rsi_guard_ok_sell = None
 
+        if cfg.RMA_CLOUD_ENABLED:
+            if not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma50_15_val):
+                rma_cloud_ok_buy = rma_cloud_fast_curr > rma50_15_val
+                rma_cloud_ok_sell = rma_cloud_fast_curr < rma50_15_val
+            else:
+                rma_cloud_ok_buy = None
+                rma_cloud_ok_sell = None
+        else:
+            rma_cloud_ok_buy = None
+            rma_cloud_ok_sell = None
+
         any_gate_enabled = (
             cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
+            or cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
         )
-
-        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
-        if len(active_buy_gates) >= 2:
-            trend_gate_ok_buy = sum(active_buy_gates) >= 2
+        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy, rma_cloud_ok_buy, ichimoku_gate_ok_buy) if g is not None]
+        if len(active_buy_gates) >= 3:
+            trend_gate_ok_buy = sum(active_buy_gates) >= 3
         elif active_buy_gates:
             trend_gate_ok_buy = all(active_buy_gates)
         elif any_gate_enabled:
@@ -3930,9 +3962,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             trend_gate_ok_buy = True
 
-        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
-        if len(active_sell_gates) >= 2:
-            trend_gate_ok_sell = sum(active_sell_gates) >= 2
+        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell, rma_cloud_ok_sell, ichimoku_gate_ok_sell) if g is not None]
+        if len(active_sell_gates) >= 3:
+            trend_gate_ok_sell = sum(active_sell_gates) >= 3
         elif active_sell_gates:
             trend_gate_ok_sell = all(active_sell_gates)
         elif any_gate_enabled:
@@ -3944,15 +3976,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             trend_gate_ok_sell = True    
 
         buy_common = (
-            base_buy_trend and confirmation_buy and is_valid_for_buy
+            base_buy_trend and is_valid_for_buy
             and (adx_ok or rvol_ok) and effective_cpr_ok
             and trend_gate_ok_buy
         )
         sell_common = (
-            base_sell_trend and confirmation_sell and is_valid_for_sell
+            base_sell_trend and is_valid_for_sell
             and (adx_ok or rvol_ok) and effective_cpr_ok
             and trend_gate_ok_sell
-        )   
+        )
 
         # ═══════════════════════════════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
@@ -4147,6 +4179,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr,
+            "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
+            "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
+            "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
@@ -4636,6 +4671,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append(f"RSI Guard buy: RSI({rsi_guard_smooth_curr:.2f}) <= EMA({rsi_guard_ema_curr:.2f})")
             if not rsi_guard_ok_sell:
                 reasons.append(f"RSI Guard sell: RSI({rsi_guard_smooth_curr:.2f}) >= EMA({rsi_guard_ema_curr:.2f})")
+
+        if cfg.RMA_CLOUD_ENABLED:
+            if not rma_cloud_ok_buy:
+                reasons.append(f"RMA Cloud buy: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) <= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
+            if not rma_cloud_ok_sell:
+                reasons.append(f"RMA Cloud sell: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) >= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
+
+        if cfg.ICHIMOKU_CLOUD_ENABLED:
+            if not ichimoku_gate_ok_buy:
+                reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
+            if not ichimoku_gate_ok_sell:
+                reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
 
         failed_conditions = [
             name for name, val in [
