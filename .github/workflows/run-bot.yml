@@ -91,7 +91,23 @@ jobs:
           docker pull --quiet --platform linux/amd64 "$IMAGE"
           echo "✅ Image ready in $(( $(date +%s) - START ))s"
 
-      # PHASE 2: BOT EXECUTION
+      - name: ⏱️ Check Dispatch Latency
+        run: |
+          BUFFER=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('CANDLE_MIN_AGE_BUFFER', 60))" 2>/dev/null || echo 60)
+          STALENESS=$(python3 -c "import json; print(json.load(open('config_macd.json')).get('MAX_CANDLE_STALENESS_SEC', 1200))" 2>/dev/null || echo 1200)
+
+          NOW=$(date +%s)
+          LAST_CLOSE=$(( (NOW / 900) * 900 ))  # The :00, :15, :30, :45 boundary
+          AGE=$(( NOW - LAST_CLOSE ))
+
+          echo "🕐 Last 15m candle closed ${AGE}s ago (need ${BUFFER}s buffer, max staleness ${STALENESS}s)"
+
+          if [ "$AGE" -lt "$BUFFER" ]; then
+            echo "⚠️ WARNING: Only ${AGE}s since candle close (buffer=${BUFFER}s) — may be rejected as unstable" >> $GITHUB_STEP_SUMMARY
+          elif [ "$AGE" -gt "$STALENESS" ]; then
+            echo "⚠️ WARNING: Candle is ${AGE}s old (max=${STALENESS}s) — may be rejected as stale" >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: 🚀 Execute MACD Bot
         id: bot_run
         timeout-minutes: 12
@@ -106,6 +122,7 @@ jobs:
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
+          echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(date -u -d @$START_TIME '+%Y-%m-%d %H:%M:%S UTC'))"
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
@@ -120,6 +137,7 @@ jobs:
             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
             -e TZ=Asia/Kolkata \
             -e PYTHONPATH=/app/src:$PYTHONPATH \
+            -e TRIGGER_TIMESTAMP="$START_TIME" \
             -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
