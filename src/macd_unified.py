@@ -2068,19 +2068,19 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         "is_valid_for_sell": is_valid_for_sell,
     }
     if not is_valid_for_buy and not is_valid_for_sell:
-    if is_green:
-        reason = (
-            f"GREEN candle rejected: upper wick {upper_wick_ratio*100:.1f}% "
-            f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
-        )
-    elif is_red:
-        reason = (
-            f"RED candle rejected: lower wick {lower_wick_ratio*100:.1f}% "
-            f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
-        )
-    else:
-        reason = f"DOJI candle rejected: body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
-    return False, False, candle_info, reason
+        if is_green:
+            reason = (
+                f"GREEN candle rejected: upper wick {upper_wick_ratio*100:.1f}% "
+                f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
+            )
+        elif is_red:
+            reason = (
+                f"RED candle rejected: lower wick {lower_wick_ratio*100:.1f}% "
+                f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
+            )
+        else:
+            reason = f"DOJI candle rejected: body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
+        return False, False, candle_info, reason
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
 
