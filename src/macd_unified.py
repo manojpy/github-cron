@@ -3945,35 +3945,59 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             rma_cloud_ok_buy = None
             rma_cloud_ok_sell = None
 
-        any_gate_enabled = (
-            cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
-            or cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
-        )
-        active_buy_gates = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy, rma_cloud_ok_buy, ichimoku_gate_ok_buy) if g is not None]
-        if len(active_buy_gates) >= 3:
-            trend_gate_ok_buy = sum(active_buy_gates) >= 3
-        elif active_buy_gates:
-            trend_gate_ok_buy = all(active_buy_gates)
-        elif any_gate_enabled:
-            logger_pair.debug(
-                f"[{pair_name}] Trend gate: all enabled gates abstained (warmup/gap) — buy denied."
-            )
-            trend_gate_ok_buy = False
-        else:
-            trend_gate_ok_buy = True
+        cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
+        oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
 
-        active_sell_gates = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell, rma_cloud_ok_sell, ichimoku_gate_ok_sell) if g is not None]
-        if len(active_sell_gates) >= 3:
-            trend_gate_ok_sell = sum(active_sell_gates) >= 3
-        elif active_sell_gates:
-            trend_gate_ok_sell = all(active_sell_gates)
-        elif any_gate_enabled:
+        active_cloud_buy = [g for g in (ichimoku_gate_ok_buy, rma_cloud_ok_buy) if g is not None]
+        if active_cloud_buy:
+            cloud_group_ok_buy = sum(active_cloud_buy) >= 1
+        elif cloud_group_enabled:
             logger_pair.debug(
-                f"[{pair_name}] Trend gate: all enabled gates abstained (warmup/gap) — sell denied."
+                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — buy denied."
             )
-            trend_gate_ok_sell = False
+            cloud_group_ok_buy = False
         else:
-            trend_gate_ok_sell = True    
+            cloud_group_ok_buy = True
+
+        active_cloud_sell = [g for g in (ichimoku_gate_ok_sell, rma_cloud_ok_sell) if g is not None]
+        if active_cloud_sell:
+            cloud_group_ok_sell = sum(active_cloud_sell) >= 1
+        elif cloud_group_enabled:
+            logger_pair.debug(
+                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — sell denied."
+            )
+            cloud_group_ok_sell = False
+        else:
+            cloud_group_ok_sell = True
+
+        active_osc_buy = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
+        if len(active_osc_buy) >= 2:
+            oscillator_group_ok_buy = sum(active_osc_buy) >= 2
+        elif active_osc_buy:
+            oscillator_group_ok_buy = all(active_osc_buy)
+        elif oscillator_group_enabled:
+            logger_pair.debug(
+                f"[{pair_name}] Oscillator group: all gates abstained (warmup/gap) — buy denied."
+            )
+            oscillator_group_ok_buy = False
+        else:
+            oscillator_group_ok_buy = True
+
+        active_osc_sell = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
+        if len(active_osc_sell) >= 2:
+            oscillator_group_ok_sell = sum(active_osc_sell) >= 2
+        elif active_osc_sell:
+            oscillator_group_ok_sell = all(active_osc_sell)
+        elif oscillator_group_enabled:
+            logger_pair.debug(
+                f"[{pair_name}] Oscillator group: all gates abstained (warmup/gap) — sell denied."
+            )
+            oscillator_group_ok_sell = False
+        else:
+            oscillator_group_ok_sell = True
+
+        trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
+        trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
 
         buy_common = (
             base_buy_trend and is_valid_for_buy
@@ -4182,6 +4206,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
             "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
             "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
+            "cloud_group_ok_buy": cloud_group_ok_buy, "cloud_group_ok_sell": cloud_group_ok_sell,
+            "oscillator_group_ok_buy": oscillator_group_ok_buy, "oscillator_group_ok_sell": oscillator_group_ok_sell,
             "buy_common": buy_common, "sell_common": sell_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
@@ -4683,6 +4709,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
             if not ichimoku_gate_ok_sell:
                 reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
+
+        if not cloud_group_ok_buy:
+            reasons.append("Cloud group buy: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
+        if not cloud_group_ok_sell:
+            reasons.append("Cloud group sell: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
+        if not oscillator_group_ok_buy:
+            reasons.append("Oscillator group buy: need 2-of-3 (PPO/RSI/TK) — not met")
+        if not oscillator_group_ok_sell:
+            reasons.append("Oscillator group sell: need 2-of-3 (PPO/RSI/TK) — not met")
 
         failed_conditions = [
             name for name, val in [
