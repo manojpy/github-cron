@@ -1344,6 +1344,41 @@ async def _blanket_reset_pair(
         )
     return len(resets)
 
+async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger) -> Tuple[int, int]:
+    """Delete every alert state and dedup key for all pairs.
+    Returns (state_keys_deleted, dedup_keys_deleted).
+    """
+    if sdb.degraded or not sdb._redis:
+        logger.warning("Redis degraded — skipping mass state purge")
+        return 0, 0
+
+    state_keys: List[str] = []
+    dedup_keys: List[str] = []
+
+    for pair in pairs:
+        for alert_key in ALERT_KEYS.values():
+            state_keys.append(f"{sdb.state_prefix}{pair}:{alert_key}")
+            dedup_keys.append(f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}")
+
+    deleted_states = 0
+    deleted_dedups = 0
+
+    try:
+        if state_keys:
+            deleted_states = await sdb._redis.delete(*state_keys)
+        if dedup_keys:
+            deleted_dedups = await sdb._redis.delete(*dedup_keys)
+
+        logger.info(
+            f"🧹 MASS RESET complete | "
+            f"State keys deleted: {deleted_states}/{len(state_keys)} | "
+            f"Dedup keys deleted: {deleted_dedups}/{len(dedup_keys)}"
+        )
+        return deleted_states, deleted_dedups
+    except Exception as e:
+        logger.error(f"Mass reset failed: {e}")
+        return 0, 0
+
 def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray], 
                          expected_len: int) -> Tuple[bool, Optional[str]]:  
     required_keys = ["open", "high", "low", "close"]    
@@ -4888,6 +4923,20 @@ async def run_once() -> bool:
         logger_run.debug("Connecting to Redis...")
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
+
+        if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true":
+            if sdb and not sdb.degraded:
+                logger_run.warning("🚨 CLEAR_ALL_STATES requested — purging all Redis alert states...")
+                st, dd = await _clear_all_redis_states(sdb, pairs_to_process, logger_run)
+                if telegram_queue is None:
+                    telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
+                await telegram_queue.send(escape_markdown_v2(
+                    f"🧹 {cfg.BOT_NAME} — All stored alert states cleared\n"
+                    f"State keys: {st} | Dedup keys: {dd}\n"
+                    f"Time: {format_ist_time()}"
+                ))
+            else:
+                logger_run.error("CLEAR_ALL_STATES=true but Redis is unavailable/degraded")
 
         if sdb.degraded and not sdb.degraded_alerted:
             logger_run.critical(
