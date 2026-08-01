@@ -128,7 +128,7 @@ jobs:
           echo "::endgroup::"
 
           START_TIME=$(date +%s)
-          echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(date -u -d @$START_TIME '+%Y-%m-%d %H:%M:%S UTC'))"
+          echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
             --name macd_bot_runner \
