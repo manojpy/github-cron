@@ -355,9 +355,17 @@ class BotConfig(BaseModel):
                 f'HTTP_TIMEOUT={self.HTTP_TIMEOUT}s is outside recommended range (5-60s)'
             )
 
-        if len(self.PAIRS) > 35:
+        min_batches = -(-len(self.PAIRS) // self.MAX_PARALLEL_FETCH)  # ceil division
+        estimated_runtime = min_batches * Constants.INTER_BATCH_DELAY * 100  # heuristic, recalibrate with observed data
+        safe_fraction = 0.8
+
+        if min_batches > 3 or estimated_runtime > self.RUN_TIMEOUT_SECONDS * safe_fraction:
             warnings.append(
-                f'Large number of pairs ({len(self.PAIRS)}) may exceed timeout limits'
+                f"PAIRS={len(self.PAIRS)} with MAX_PARALLEL_FETCH={self.MAX_PARALLEL_FETCH} "
+                f"requires {min_batches} sequential fetch batches. "
+                f"Estimated runtime ~{int(estimated_runtime)}s may exceed safe window "
+                f"({int(self.RUN_TIMEOUT_SECONDS * safe_fraction)}s of RUN_TIMEOUT_SECONDS={self.RUN_TIMEOUT_SECONDS}s). "
+                f"Verify actual runtime before adding more pairs."  
             )
 
         if self.MEMORY_LIMIT_BYTES < 200_000_000:
@@ -1574,6 +1582,12 @@ def categorize_exception(exc: Exception) -> str:
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
 
+def compute_backoff(base: float, attempt: int, cap: float = 30.0, jitter_range: Tuple[float, float] = (0.1, 0.5)) -> float:
+    """Exponential backoff with jitter. base=starting delay in seconds, attempt=1-indexed retry count."""
+    base_delay = min(base * (2 ** (attempt - 1)), cap)
+    jitter = base_delay * random.uniform(*jitter_range)
+    return base_delay + jitter
+
 async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 3, backoff: float = 1.5, timeout: int = 15) -> Optional[Dict[str, Any]]:   
     session = await SessionManager.get_session()    
     retry_stats = {
@@ -1616,16 +1630,9 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                     logger.warning(
                         f"Server error {resp.status} | URL: {url[:80]} | "
                         f"Attempt: {attempt}/{retries}"
-                    )
-                    
+                    )          
                     if attempt < retries:
-                        base_delay = min(
-                            Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                            backoff * (2 ** (attempt - 1))
-                        )
-                        jitter = base_delay * random.uniform(0.1, 0.5)
-                        total_delay = base_delay + jitter
-                        
+                        total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
                     continue
                 
@@ -1654,15 +1661,8 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                 f"Timeout (attempt {attempt}/{retries}) | "
                 f"URL: {url[:80]} | Timeout configured: {timeout}s"
             )
-            
             if attempt < retries:
-                base_delay = min(
-                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                    backoff * (2 ** (attempt - 1))
-                )
-                jitter = base_delay * random.uniform(0.1, 0.5)
-                total_delay = base_delay + jitter
-                
+                total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                 logger.debug(f"Retrying after {total_delay:.2f}s...")
                 await asyncio.sleep(total_delay)
         
@@ -1675,17 +1675,11 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                 f"Network error (attempt {attempt}/{retries}) | "
                 f"Category: {category} | URL: {url[:80]} | Error: {str(e)[:100]}"
             )
-            
             if attempt < retries:
-                base_delay = min(
-                    Constants.CIRCUIT_BREAKER_MAX_WAIT / 10,
-                    backoff * (2 ** (attempt - 1))
-                )
-                jitter = base_delay * random.uniform(0.1, 0.5)
-                total_delay = base_delay + jitter
-                
+                total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                 logger.debug(f"Retrying after {total_delay:.2f}s...")
-                await asyncio.sleep(total_delay)        
+                await asyncio.sleep(total_delay)
+
         except Exception as e:
             last_error = e
             retry_stats[RetryCategory.UNKNOWN] += 1
@@ -2578,8 +2572,8 @@ class RedisStateStore:
                 return
 
             if attempt < cfg.REDIS_CONNECTION_RETRIES:
-                delay = cfg.REDIS_RETRY_DELAY * attempt
-                logger.warning(f"Retrying Redis connection in {delay}s...")
+                delay = compute_backoff(cfg.REDIS_RETRY_DELAY, attempt)
+                logger.warning(f"Retrying Redis connection in {delay:.1f}s...")
                 await asyncio.sleep(delay)
 
         logger.critical("❌ Redis connection failed after all retries")
@@ -2812,7 +2806,14 @@ class RedisLock:
         return 0
     end
     """
-    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):     
+    EXTEND_LUA = """
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("EXPIRE", KEYS[1], ARGV[2])
+    else
+        return 0
+    end
+    """
+    def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
         self.redis = redis_client
         self.lock_key = f"{RedisKeyPrefix.LOCK}{lock_key}"
         self.expire = expire or Constants.REDIS_LOCK_EXPIRY
@@ -2861,45 +2862,24 @@ class RedisLock:
             return False
         
         try:
-            raw_val = await asyncio.wait_for(
-                self.redis.get(self.lock_key),
+            result = await asyncio.wait_for(
+                self.redis.eval(
+                    self.EXTEND_LUA,
+                    1,
+                    self.lock_key,
+                    self.token,
+                    self.expire,
+                ),
                 timeout=timeout,
             )
-            
-            if raw_val is None:
-                logger.warning("Lock lost during extend (key missing)")
-                self.lost = True
-                self.acquired_by_me = False
-                return False
 
-            if isinstance(raw_val, bytes):
-                current_token = raw_val.decode('utf-8')
-            else:
-                current_token = str(raw_val)
-
-            if current_token != self.token:
-                logger.warning(
-                    f"Lock token mismatch on extend | "
-                    f"Expected: {self.token[:8]}... | "
-                    f"Got: {current_token[:8]}... | "
-                    f"Key: {self.lock_key}"
-                )
-                self.lost = True
-                self.acquired_by_me = False
-                return False
-
-            expire_ok = await asyncio.wait_for(
-                self.redis.expire(self.lock_key, self.expire),
-                timeout=timeout,
-            )
-            
-            if expire_ok:
+            if result:
                 self.last_extend_time = time.monotonic()
                 if cfg.DEBUG_MODE:
                     logger.debug(f"Extended Redis lock: {self.lock_key} (now {self.expire}s)")
                 return True
             else:
-                logger.warning("Lock key disappeared during extend")
+                logger.warning("Lock lost during extend (token mismatch or key missing)")
                 self.lost = True
                 self.acquired_by_me = False
                 return False
@@ -3004,13 +2984,19 @@ class TelegramQueue:
 
     async def send(self, message: str, priority: str = "normal") -> bool:
         try:
-            await asyncio.wait_for(self._send_impl(message), timeout=45.0)
-            return True
+            return bool(
+                await asyncio.wait_for(
+                    self._send_impl(message),
+                    timeout=45.0
+                )
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
-            if not cfg.FAIL_ON_TELEGRAM_DOWN:
-                return False
-            raise
+            if cfg.FAIL_ON_TELEGRAM_DOWN:
+                raise
+            return False
 
     async def _send_impl(self, message: str) -> bool:
         await self.token_bucket.acquire()
@@ -3032,10 +3018,13 @@ class TelegramQueue:
                         logger.error(f"Telegram API error {resp.status} - check token/chat_id")
                         return False
                     raise Exception(f"Telegram API error {resp.status}")
+
             except Exception as e:
                 logger.warning(f"Telegram send attempt {attempt} failed: {e}")
                 if attempt < cfg.TELEGRAM_RETRIES:
-                    await asyncio.sleep(min((cfg.TELEGRAM_BACKOFF_BASE ** (attempt - 1)), 30))
+                    delay = compute_backoff(1.0, attempt)
+                    logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
+                    await asyncio.sleep(delay)
         return False
 
     async def send_batch(self, messages: List[str]) -> bool:   
@@ -5392,10 +5381,17 @@ if __name__ == "__main__":
         logger.info("Skipping Numba warmup (faster startup)")
 
     async def main_with_cleanup():
-        return await run_once()
-
+        try:
+            async with asyncio.timeout(cfg.RUN_TIMEOUT_SECONDS):
+                return await run_once()
+        except TimeoutError:
+            logger.critical(
+                "Run exceeded hard deadline: %ss",
+                cfg.RUN_TIMEOUT_SECONDS
+            )
+            return False
     try:
-        success = asyncio.run(main_with_cleanup())
+        success = asyncio.run(main_with_cleanup()) 
         if success:
             sys.exit(0)
         else:
