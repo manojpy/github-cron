@@ -3290,7 +3290,6 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
     if not crossed:
         return False, "No pivot cross"
 
-    # Math is safe; level_value is guaranteed > 0 here
     price_diff_pct = (abs(level_value - close_curr) / level_value) * 100
     max_distance = cfg.PIVOT_MAX_DISTANCE_PCT
 
@@ -3307,38 +3306,39 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
     ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
     buy_common, sell_common = context["buy_common"], context["sell_common"]
+    ppo_gate_curr = context["ppo_gate_curr"]
 
     if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
+    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
 
     if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
+    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
 
     if ppo_prev > 0 and ppo_curr <= 0:
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
+    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
 
     if ppo_prev < 0 and ppo_curr >= 0:
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
+    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
 
     if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
+    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
 
     if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
+    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
 
-    return resets
+    return resets 
 
 def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
