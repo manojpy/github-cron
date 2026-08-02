@@ -109,14 +109,16 @@ __version__ = "1.8.0-stable"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
-    PPO_THRESHOLD_BUY = 0.20
-    PPO_THRESHOLD_SELL = -0.20
     RSI_SRSI_BUY_MAX = 60.0
     RSI_SRSI_SELL_MIN = 40.0
     PPO_RSI_GUARD_BUY = 0.30
     PPO_RSI_GUARD_SELL = -0.30
     PPO_011_THRESHOLD = 0.18
     PPO_011_THRESHOLD_SELL = -0.18
+    RSI_CROSS55_BUY = 55.0
+    RSI_CROSS65_BUY = 65.0
+    RSI_CROSS45_SELL = 45.0
+    RSI_CROSS35_SELL = 35.0
     REDIS_LOCK_EXPIRY = max(int(os.getenv('REDIS_LOCK_EXPIRY', 900)), 900)
     CIRCUIT_BREAKER_MAX_WAIT = 300
     INFINITY_CLAMP = 1e8
@@ -3239,14 +3241,19 @@ class AlertDefinition(TypedDict):
     requires: List[str]
  
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-    {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_THRESHOLD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_zero_up","title":"🟢 PPO cross ▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross▲0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross▼ -0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"rsi_50_up","title":"🟢 RSI▲EMA5 (RSI<60, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
-    {"key":"rsi_50_down","title":"🔴 RSI▼EMA5 (RSI>40, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} vs EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+
+    {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_011_up","title":"🟢 PPO cross▲0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_011_down","title":"🔴 PPO cross▼ -0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5 (RSI<60, PPO<0.30)", ...
+    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5 (RSI>40, PPO>-0.30)", ...
+    {"key":"rsi_cross_55_up","title":"🟢 RSI▲55 (>EMA5, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS55_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS55_BUY) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲55 | EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"rsi_cross_65_up","title":"🟢 RSI▲65 (>EMA5, PPO<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS65_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS65_BUY) and (ppo.get("curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲65 | EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"rsi_cross_45_down","title":"🔴 RSI▼45 (<EMA5, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS45_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS45_SELL) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼45 | EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
+    {"key":"rsi_cross_35_down","title":"🔴 RSI▼35 (<EMA5, PPO>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS35_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS35_SELL) and (ppo.get("curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼35 | EMA5 {rsi.get('ema_curr',50):.2f} | PPO {ppo.get('curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","rsi"]},
     {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -3341,14 +3348,34 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
     ppo_curr = context["ppo_curr"]
 
     if rsi_prev > rsi_ema_prev and rsi_curr <= rsi_ema_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr >= Constants.RSI_SRSI_BUY_MAX) and conditional_states.get(ALERT_KEYS['rsi_50_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_up']}", "INACTIVE", None))
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
+    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr >= Constants.RSI_SRSI_BUY_MAX) and conditional_states.get(ALERT_KEYS['rsi_ema5_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
 
     if rsi_prev < rsi_ema_prev and rsi_curr >= rsi_ema_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr <= Constants.RSI_SRSI_SELL_MIN) and conditional_states.get(ALERT_KEYS['rsi_50_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_50_down']}", "INACTIVE", None))
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
+    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr <= Constants.RSI_SRSI_SELL_MIN) and conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
+
+    if rsi_prev > Constants.RSI_CROSS55_BUY and rsi_curr <= Constants.RSI_CROSS55_BUY:
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
+    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_55_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
+
+    if rsi_prev > Constants.RSI_CROSS65_BUY and rsi_curr <= Constants.RSI_CROSS65_BUY:
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
+    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_65_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
+
+    if rsi_prev < Constants.RSI_CROSS45_SELL and rsi_curr >= Constants.RSI_CROSS45_SELL:
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
+    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_45_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
+
+    if rsi_prev < Constants.RSI_CROSS35_SELL and rsi_curr >= Constants.RSI_CROSS35_SELL:
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
+    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_35_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
 
     return resets
 
@@ -3549,14 +3576,14 @@ validate_alert_definitions()
 
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
-    "rsi_50_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
+    "rsi_ema5_up", "rsi_cross_55_up", "rsi_cross_65_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
     "cloud_cross_up", "tk_conversion_up",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
-    "rsi_50_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
+    "rsi_ema5_down", "rsi_cross_45_down", "rsi_cross_35_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
     "cloud_cross_down", "tk_conversion_down",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
@@ -3619,7 +3646,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     }
                 }
             logger_pair.debug(
-                f"[{pair_name}] Wick-rejected candle — blanket reset only. Reason: {error_msg}"
+                f"[{pair_name}] Wick-rejected candle ��� blanket reset only. Reason: {error_msg}"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
