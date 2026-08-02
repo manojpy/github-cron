@@ -3788,7 +3788,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
 
-        # ── Ichimoku Cloud Filter ──
         future_green = ichimoku_future_green[i15]
         future_red = ichimoku_future_red[i15]
 
@@ -3797,24 +3796,24 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cloud_upper_prev = ichimoku_cloud_upper[i15 - 1]
         cloud_lower_prev = ichimoku_cloud_lower[i15 - 1]
 
-    ichimoku_cloud_ready = not (
-        np.isnan(cloud_upper_val) or np.isnan(cloud_lower_val)
-        or np.isnan(cloud_upper_prev) or np.isnan(cloud_lower_prev)
-    )
-    if ichimoku_cloud_ready:
-        above_cloud = close_curr > cloud_upper_val
-        below_cloud = close_curr < cloud_lower_val
-        cloud_up = future_green and above_cloud
-        cloud_down = future_red and below_cloud
-    else:
-        logger_pair.debug(
-            f"[{pair_name}] Ichimoku cloud NaN at i15={i15} (warmup/gap). "
-            f"Ichimoku cloud gate abstains (None) — not counted in cloud-group vote."
+        ichimoku_cloud_ready = not (
+            np.isnan(cloud_upper_val) or np.isnan(cloud_lower_val)
+            or np.isnan(cloud_upper_prev) or np.isnan(cloud_lower_prev)
         )
-        above_cloud = None
-        below_cloud = None
-        cloud_up = None
-        cloud_down = None
+        if ichimoku_cloud_ready:
+            above_cloud = close_curr > cloud_upper_val
+            below_cloud = close_curr < cloud_lower_val
+            cloud_up = future_green and above_cloud
+            cloud_down = future_red and below_cloud
+        else:
+            logger_pair.debug(
+                f"[{pair_name}] Ichimoku cloud NaN at i15={i15} (warmup/gap). "
+                f"Ichimoku cloud gate abstains (None) — not counted in cloud-group vote."
+            )
+            above_cloud = None
+            below_cloud = None
+            cloud_up = None
+            cloud_down = None
 
         tk_conversion_curr = ichimoku_conversion_line[i15]
         tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
