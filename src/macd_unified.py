@@ -3345,36 +3345,36 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
     rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
     rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
     buy_common, sell_common = context["buy_common"], context["sell_common"]
-    ppo_curr = context["ppo_curr"]
+    ppo_gate_curr = context["ppo_gate_curr"]
 
     if rsi_prev > rsi_ema_prev and rsi_curr <= rsi_ema_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr >= Constants.RSI_SRSI_BUY_MAX) and conditional_states.get(ALERT_KEYS['rsi_ema5_up'], False):
+    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr >= Constants.RSI_SRSI_BUY_MAX) and conditional_states.get(ALERT_KEYS['rsi_ema5_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
 
     if rsi_prev < rsi_ema_prev and rsi_curr >= rsi_ema_curr:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr <= Constants.RSI_SRSI_SELL_MIN) and conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
+    elif (not sell_common or  ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr <= Constants.RSI_SRSI_SELL_MIN) and conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
 
     if rsi_prev > Constants.RSI_CROSS55_BUY and rsi_curr <= Constants.RSI_CROSS55_BUY:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_55_up'], False):
+    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_55_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
 
     if rsi_prev > Constants.RSI_CROSS65_BUY and rsi_curr <= Constants.RSI_CROSS65_BUY:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_65_up'], False):
+    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_65_up'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
 
     if rsi_prev < Constants.RSI_CROSS45_SELL and rsi_curr >= Constants.RSI_CROSS45_SELL:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_45_down'], False):
+    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_45_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
 
     if rsi_prev < Constants.RSI_CROSS35_SELL and rsi_curr >= Constants.RSI_CROSS35_SELL:
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_35_down'], False):
+    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_35_down'], False):
         resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
 
     return resets
@@ -4606,8 +4606,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
             if rsi_curr >= Constants.RSI_SRSI_BUY_MAX:
                 reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {Constants.RSI_SRSI_BUY_MAX}")
-            elif ppo_curr >= Constants.PPO_RSI_GUARD_BUY:
-                reasons.append(f"RSI>EMA5 blocked: PPO={ppo_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
+            elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
+                reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
             elif not buy_common:
                 if not base_buy_trend:
                     reasons.append("RSI>EMA5 blocked: base_buy_trend=False")
@@ -4625,8 +4625,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if rsi_prev >= rsi_ema_prev and rsi_curr < rsi_ema_curr:
             if rsi_curr <= Constants.RSI_SRSI_SELL_MIN:
                 reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {Constants.RSI_SRSI_SELL_MIN}")
-            elif ppo_curr <= Constants.PPO_RSI_GUARD_SELL:
-                reasons.append(f"RSI<EMA5 blocked: PPO={ppo_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
+            elif ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
+                reasons.append(f"RSI<EMA5 blocked: PPO={ppo_gate_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
             elif not sell_common:
                 if not base_sell_trend:
                     reasons.append("RSI<EMA5 blocked: base_sell_trend=False")
