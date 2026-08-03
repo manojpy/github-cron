@@ -221,6 +221,14 @@ class BotConfig(BaseModel):
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
     ENABLE_TK_CONVERSION_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku conversion (Tenkan) line, subject to all other buy/sell common conditions")
+    ENABLE_CLOUD_CROSS_ALERT: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku cloud (23,65,130,65), subject to all other buy/sell common conditions")
+
+    ENABLE_FAST_TK_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses Fast Tenkan (9,26,52,26), gated by PPO gate threshold")
+    ENABLE_FAST_CLOUD_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses Fast Ichimoku cloud (9,26,52,26), gated by PPO gate threshold")
+    FAST_ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Fast Ichimoku conversion (Tenkan) length")
+    FAST_ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Fast Ichimoku base (Kijun) length")
+    FAST_ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Fast Ichimoku leading span B length")
+    FAST_ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Fast Ichimoku cloud forward displacement")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -1177,6 +1185,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_future_red'] = ichimoku['future_red']
             results['ichimoku_conversion_line'] = ichimoku['conversion_line']
             results['ichimoku_base_line'] = ichimoku['base_line']
+        
         else:
             nan_arr = np.full(n_15m, np.nan, dtype=np.float64)
             bool_arr = np.zeros(n_15m, dtype=bool)
@@ -1186,6 +1195,23 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_future_red'] = bool_arr.copy()
             results['ichimoku_conversion_line'] = nan_arr.copy()
             results['ichimoku_base_line'] = nan_arr.copy()
+
+        if cfg.ENABLE_FAST_TK_CROSS or cfg.ENABLE_FAST_CLOUD_CROSS:
+            fast_ichimoku = calculate_ichimoku_numpy(
+                data_15m["high"], data_15m["low"], close_15m,
+                cfg.FAST_ICHIMOKU_CONVERSION_PERIODS,
+                cfg.FAST_ICHIMOKU_BASE_PERIODS,
+                cfg.FAST_ICHIMOKU_SPANB_PERIODS,
+                cfg.FAST_ICHIMOKU_DISPLACEMENT,
+            )
+            results['fast_ichimoku_cloud_upper'] = fast_ichimoku['cloud_upper']
+            results['fast_ichimoku_cloud_lower'] = fast_ichimoku['cloud_lower']
+            results['fast_ichimoku_conversion_line'] = fast_ichimoku['conversion_line']
+        else:
+            nan_arr2 = np.full(n_15m, np.nan, dtype=np.float64)
+            results['fast_ichimoku_cloud_upper'] = nan_arr2.copy()
+            results['fast_ichimoku_cloud_lower'] = nan_arr2.copy()
+            results['fast_ichimoku_conversion_line'] = nan_arr2.copy()
 
         # ── Volatility: ATR + ADX ──
         results['atr_short'] = calculate_atr_rma(
@@ -3278,7 +3304,11 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
+    {"key":"fast_tk_cross_up","title":"⚡🟢 Fast Tenkan Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastTK {ctx.get('fast_tk_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"fast_tk_cross_down","title":"⚡🔴 Fast Tenkan Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastTK {ctx.get('fast_tk_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"fast_cloud_cross_up","title":"☁️🟢 Fast Cloud Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloudUpper {ctx.get('fast_cloud_upper_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"fast_cloud_cross_down","title":"☁️🔴 Fast Cloud Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloudLower {ctx.get('fast_cloud_lower_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]} 
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -3468,6 +3498,28 @@ def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_state
 
     return resets
 
+def _reset_fast_tk_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+    ppo_gate_curr = context.get("ppo_gate_curr", np.nan)
+    if (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['fast_tk_cross_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['fast_tk_cross_up']}", "INACTIVE", None))
+    if (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['fast_tk_cross_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['fast_tk_cross_down']}", "INACTIVE", None))
+    return resets
+
+def _reset_fast_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    resets = []
+    buy_common = context.get("buy_common", False)
+    sell_common = context.get("sell_common", False)
+    ppo_gate_curr = context.get("ppo_gate_curr", np.nan)
+    if (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['fast_cloud_cross_up'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_up']}", "INACTIVE", None))
+    if (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['fast_cloud_cross_down'], False):
+        resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_down']}", "INACTIVE", None))
+    return resets
+
 def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     hist_curr, hist_m1 = context["hist_curr"], context["hist_m1"]
@@ -3592,14 +3644,14 @@ validate_alert_definitions()
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
     "rsi_ema5_up", "rsi_cross_55_up", "rsi_cross_65_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", "tk_conversion_up",
+    "cloud_cross_up", "tk_conversion_up", "fast_tk_cross_up", "fast_cloud_cross_up",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
     "rsi_ema5_down", "rsi_cross_45_down", "rsi_cross_35_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", "tk_conversion_down",
+    "cloud_cross_down", "tk_conversion_down", "fast_tk_cross_down", "fast_cloud_cross_down",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
@@ -3790,6 +3842,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ichimoku_future_red = gate_indicators["ichimoku_future_red"]
         ichimoku_conversion_line = gate_indicators["ichimoku_conversion_line"]
         ichimoku_base_line = gate_indicators["ichimoku_base_line"]
+        fast_ichimoku_cloud_upper = gate_indicators["fast_ichimoku_cloud_upper"]
+        fast_ichimoku_cloud_lower = gate_indicators["fast_ichimoku_cloud_lower"]
+        fast_ichimoku_conversion_line = gate_indicators["fast_ichimoku_conversion_line"]
+        adx_arr = gate_indicators["adx"]
         adx_arr = gate_indicators["adx"]
         atr_short_arr = gate_indicators["atr_short"]
         atr_long_arr = gate_indicators["atr_long"]
@@ -3834,6 +3890,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
+
+        fast_tk_curr = fast_ichimoku_conversion_line[i15]
+        fast_tk_prev = fast_ichimoku_conversion_line[i15 - 1]
+        fast_cloud_upper_curr = fast_ichimoku_cloud_upper[i15]
+        fast_cloud_upper_prev = fast_ichimoku_cloud_upper[i15 - 1]
+        fast_cloud_lower_curr = fast_ichimoku_cloud_lower[i15]
+        fast_cloud_lower_prev = fast_ichimoku_cloud_lower[i15 - 1]
 
         if cfg.ICHIMOKU_TK_GUARD_ENABLED:
             if tk_guard_valid:
@@ -4251,6 +4314,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr,
+            "fast_tk_curr": fast_tk_curr, "fast_tk_prev": fast_tk_prev,
+            "fast_cloud_upper_curr": fast_cloud_upper_curr, "fast_cloud_upper_prev": fast_cloud_upper_prev,
+            "fast_cloud_lower_curr": fast_cloud_lower_curr, "fast_cloud_lower_prev": fast_cloud_lower_prev,
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
             "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
             "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
@@ -4385,6 +4451,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     trigger = False
 
             elif alert_key in ("cloud_cross_up", "cloud_cross_down"):
+                if not cfg.ENABLE_CLOUD_CROSS_ALERT:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: Cloud cross alert disabled")
+                    continue
                 trigger = False
                 try:
                     is_buy_side = (alert_key == "cloud_cross_up")
@@ -4417,6 +4487,45 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                 except Exception as e:
                     logger_pair.debug(f"TK conversion cross check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
+
+            elif alert_key in ("fast_tk_cross_up", "fast_tk_cross_down"):
+                if not cfg.ENABLE_FAST_TK_CROSS:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: Fast TK cross disabled")
+                    continue
+                trigger = False
+                try:
+                    is_buy_side = (alert_key == "fast_tk_cross_up")
+                    valid_cross, cross_reason = validate_conversion_cross(
+                        context["close_prev"], context["close_curr"],
+                        context["fast_tk_prev"], context["fast_tk_curr"],
+                        is_buy_side
+                    )
+                    if valid_cross:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"Fast TK cross check failed for {alert_key}: {e}", exc_info=True)
+                    trigger = False
+
+            elif alert_key in ("fast_cloud_cross_up", "fast_cloud_cross_down"):
+                if not cfg.ENABLE_FAST_CLOUD_CROSS:
+                    if cfg.DEBUG_MODE:
+                        logger_pair.debug(f"Skipping {alert_key}: Fast cloud cross disabled")
+                    continue
+                trigger = False
+                try:
+                    is_buy_side = (alert_key == "fast_cloud_cross_up")
+                    valid_cross, cross_reason = validate_cloud_cross(
+                        context["close_prev"], context["close_curr"],
+                        context["fast_cloud_upper_prev"], context["fast_cloud_upper_curr"],
+                        context["fast_cloud_lower_prev"], context["fast_cloud_lower_curr"],
+                        is_buy_side
+                    )
+                    if valid_cross:
+                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                except Exception as e:
+                    logger_pair.debug(f"Fast cloud cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
             else:
                 try:
@@ -4454,6 +4563,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_cloud_cross_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_tk_conversion_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_fast_tk_cross_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_fast_cloud_cross_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
 
