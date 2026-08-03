@@ -23,38 +23,13 @@ def sanitize_array_numba(arr, default):
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-
-@njit("f8[:](f8[:], f8)", nogil=True, parallel=True, cache=True)
-def sanitize_array_numba_parallel(arr, default):
-    """Replace NaN and Inf with default value (parallel) - O(n)"""
-    out = np.empty_like(arr)
-    for i in prange(len(arr)):
-        val = arr[i]
-        out[i] = default if (np.isnan(val) or np.isinf(val)) else val
-    return out
-
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def rolling_mean_numba(data, period):
-    """Calculate rolling mean matching Pine's ta.sma: returns NaN for first (period - 1)
-    bars AND for any window that contains a NaN (full valid window required).
-
-    FIX: the previous version accumulated a plain running sum. A single NaN entering
-    the window poisoned window_sum permanently -- even after that NaN aged out of the
-    window, `window_sum -= old_val` (NaN - NaN) kept the sum (and every bar after it)
-    as NaN forever. This version tracks NaNs in the circular buffer explicitly so the
-    poisoning clears correctly once the NaN leaves the window, and correctly emits NaN
-    only while a NaN is actually inside the window.
-    
-    OPTIMIZED: Fast path for data with no NaNs uses a simple running sum, avoiding
-    circular buffer overhead entirely.
-    """
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
 
     if period <= 0:
         return out
-
-    # Fast path: check for any NaNs
     has_nan = False
     for i in range(n):
         if np.isnan(data[i]):
@@ -62,7 +37,6 @@ def rolling_mean_numba(data, period):
             break
 
     if not has_nan:
-        # Simple running sum — O(n), no circular buffer overhead
         window_sum = 0.0
         for i in range(n):
             window_sum += data[i]
@@ -72,7 +46,6 @@ def rolling_mean_numba(data, period):
                 out[i] = window_sum / period
         return out
 
-    # Slow path: original circular buffer with explicit NaN tracking
     window_sum = 0.0
     nan_count = 0
     queue = np.zeros(period, dtype=np.float64)
@@ -164,7 +137,6 @@ def rolling_min_max_numba(arr, period):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop(data, length_float):
-
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
@@ -198,7 +170,6 @@ def ema_loop(data, length_float):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_pine(data, length_float):
-    
     n = len(data)
     length = int(length_float)
     alpha = 2.0 / (length + 1)
@@ -228,19 +199,6 @@ def ema_loop_pine(data, length_float):
 
 @njit("f8[:](f8[:], f8)", nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
-    """EMA with explicit alpha parameter - with proper SMA initialisation for RMA.
-
-    FIX: the previous version wrote the same fabricated `sma_init` constant into
-    EVERY position of the seed window, including positions where the source data
-    itself was NaN (a real gap). That produced a false flatline during warm-up on
-    sparse data. Now, seed-window bars with real data still get `sma_init` (this is
-    unchanged from before, and is the behavior already validated against Pine's
-    ta.rma/ta.ema seeding), but seed-window bars that were genuinely NaN in the
-    source stay NaN in the output instead of being papered over. Recursion after
-    the seed window uses a separate `prev` anchor (not out[i-1]) so this doesn't
-    break the EMA chain when the last seed bar happens to be one of those NaNs.
-    When there are no NaNs in the seed window, output is identical to before.
-    """
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
 
@@ -317,13 +275,6 @@ def kalman_loop(src, length, R, Q):
     for i in range(first_valid_idx + 1, n):
         current = src[i]
         if np.isnan(current):
-            # FIX: predict-only step during a data gap. Previously error_est was
-            # frozen while a gap was skipped, so the filter stayed artificially
-            # confident in a stale estimate and was slow to react once real data
-            # resumed. Growing error_est here (same process-noise term used on a
-            # normal step) lets confidence decay across the gap, so kalman_gain is
-            # naturally higher on the next real observation. No effect when there
-            # are no gaps, since this branch is only reached on NaN input.
             error_est = error_est + Q_div_length
             result[i] = estimate
             continue
@@ -334,7 +285,6 @@ def kalman_loop(src, length, R, Q):
         result[i] = estimate
 
     return result
-
 
 @njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
 def vwap_daily_loop_safe(hlc3, volumes, timestamps):
@@ -356,7 +306,6 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
 
     return vwap
 
-
 # ============================================================================
 # 5. OSCILLATORS AND TECHNICAL INDICATORS
 # ============================================================================
@@ -373,7 +322,6 @@ def calculate_ppo_core(close, fast, slow, signal):
         s = slow_ma[i]
         if not np.isnan(f) and not np.isnan(s) and s != 0.0:
             ppo_val = ((f - s) / s) * 100.0
-            # Scalar clamp — Numba compiles this natively
             if ppo_val > 1000.0:
                 ppo_val = 1000.0
             elif ppo_val < -1000.0:
@@ -385,14 +333,6 @@ def calculate_ppo_core(close, fast, slow, signal):
 
 @njit("f8[:](f8[:], i4)", nogil=True, cache=True)
 def calculate_rsi_core(close, period):
-    """Calculate RSI in O(n) - single pass, no full gain/loss arrays.
-
-    OPTIMIZED: Eliminated full-length gain/loss arrays (saves 2*n*8 bytes).
-    Warm-up and smoothing compute diffs on-the-fly.
-
-    FIX: prev_valid is no longer advanced on the last warm-up iteration,
-    preventing the smoothing loop from computing diff=0 on its first bar.
-    """
     n = len(close)
     rsi = np.full(n, np.nan, dtype=np.float64)
 
@@ -410,7 +350,6 @@ def calculate_rsi_core(close, period):
     if first_valid_idx == -1:
         return rsi
 
-    # ── Warm-up: accumulate 'period' diffs ──
     avg_gain = 0.0
     avg_loss = 0.0
     prev_valid = last_valid_close
@@ -424,8 +363,6 @@ def calculate_rsi_core(close, period):
                 avg_gain += diff
             else:
                 avg_loss += -diff
-            # Don't advance prev_valid on the LAST warm-up bar;
-            # we need it to remain as close[i-1] for the first smoothing step.
             if i < first_valid_idx + period:
                 prev_valid = curr
 
@@ -434,7 +371,6 @@ def calculate_rsi_core(close, period):
 
     alpha = 1.0 / period
 
-    # ── Smoothing phase ──
     for i in range(first_valid_idx + period, n):
         curr = close[i]
         if not np.isnan(curr):
@@ -446,7 +382,6 @@ def calculate_rsi_core(close, period):
                 avg_gain = (avg_gain * (1.0 - alpha))
                 avg_loss = (-diff * alpha) + (avg_loss * (1.0 - alpha))
             prev_valid = curr
-        # NaN bars leave averages unchanged, matching original behavior
 
         if avg_loss == 0.0:
             rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
@@ -480,11 +415,6 @@ def calculate_atr_rma(high, low, close, period):
 
 @njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
-    """Calculate ADX in O(n) using Pine Script equivalent logic.
-    
-    OPTIMIZED: Reuses smoothed DM/TR buffers for DI/raw_ADX, cutting
-    temporary allocations from 11 arrays down to 6.
-    """
     n = len(high)
     adx = np.full(n, np.nan, dtype=np.float64)
 
@@ -519,7 +449,6 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     minus_dm_smooth = ema_loop_alpha(minus_dm, alpha_di)
     tr_smooth = ema_loop_alpha(tr, alpha_di)
 
-    # Reuse plus_dm_smooth / minus_dm_smooth as plus_di / minus_di
     for i in range(n):
         if tr_smooth[i] > 0.0 and not np.isnan(tr_smooth[i]):
             plus_dm_smooth[i] = 100.0 * plus_dm_smooth[i] / tr_smooth[i]
@@ -528,7 +457,6 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
             plus_dm_smooth[i] = 0.0
             minus_dm_smooth[i] = 0.0
 
-    # Reuse tr_smooth as raw_adx buffer
     for i in range(n):
         di_diff = abs(plus_dm_smooth[i] - minus_dm_smooth[i])
         di_sum = plus_dm_smooth[i] + minus_dm_smooth[i]
@@ -538,13 +466,6 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     adx = ema_loop_alpha(tr_smooth, alpha_adx)
     return adx
 
-# ============================================================================
-# SOURCE VERSION -- imported from aot_version.py (see that file for why it's
-# kept separate). aot_build.py stamps this into a sidecar file next to the
-# compiled .so, and aot_bridge.py refuses to trust an AOT library whose stamp
-# doesn't match this live value -- preventing a stale compiled binary from
-# silently running old logic forever.
-# ============================================================================
 from aot_version import SOURCE_VERSION  # noqa: E402
 
 # ============================================================================
@@ -553,7 +474,6 @@ from aot_version import SOURCE_VERSION  # noqa: E402
 
 EXPORT_CONFIG = {
     'sanitize_array_numba':          'f8[:](f8[:], f8)',
-    'sanitize_array_numba_parallel': 'f8[:](f8[:], f8)',
     'rolling_mean_numba':            'f8[:](f8[:], i4)',
     'rolling_min_max_numba':         'Tuple((f8[:], f8[:]))(f8[:], i4)',
     'ema_loop':                      'f8[:](f8[:], f8)',
@@ -570,7 +490,7 @@ EXPORT_CONFIG = {
 __all__ = list(EXPORT_CONFIG.keys())
 
 # Guard: raise immediately at import if count drops unexpectedly
-expected_min_functions = 13
+expected_min_functions = 12
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

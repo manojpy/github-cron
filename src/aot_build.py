@@ -48,9 +48,6 @@ def compile_module(cc: CC, output_dir: Path, module_name: str) -> Path:
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Remove old build artifacts first so a stale .so can never linger alongside
-    # the new one (belt-and-suspenders with the mtime-sort fix in aot_bridge.py's
-    # find_aot_library()).
     ext = ".pyd" if platform.system() == "Windows" else ".so"
     for old_file in output_dir.glob(f"{module_name}*{ext}"):
         print(f"🧹 Removing stale artifact: {old_file.name}")

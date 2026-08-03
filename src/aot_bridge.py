@@ -46,7 +46,6 @@ _jit_functions: Dict[str, Callable] = {}
 
 REQUIRED_AOT_FUNCTIONS = [
     'sanitize_array_numba',
-    'sanitize_array_numba_parallel',
     'ema_loop',
     'ema_loop_alpha',
     'ema_loop_pine',
@@ -60,16 +59,8 @@ REQUIRED_AOT_FUNCTIONS = [
     'calculate_adx_core',
 ]
 
-
 def get_library_extension() -> str:
-    """Extension for compiled Python extension modules.
-
-    Mirrors exactly what aot_build.py's compile_module() produces: .pyd on
-    Windows, .so everywhere else. macOS Python C-extensions use .so (not
-    .dylib) even though the underlying binary is a Mach-O dylib -- using
-    .dylib here would mean find_aot_library() never finds a real AOT build
-    on macOS and silently falls back to JIT on every run.
-    """
+    
     return ".pyd" if platform.system() == "Windows" else ".so"
 
 
@@ -93,18 +84,12 @@ def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
             if p.exists():
                 return p
 
-        # Wildcard fallback for ABI-tagged names. FIX: glob() order is not
-        # guaranteed, so if more than one matching build artifact is ever left in
-        # the same directory (e.g. a stale file from a prior build), the old
-        # `found[0]` could silently load the wrong (stale) library. Sort by mtime
-        # descending so the most recently built .so always wins.
         found = list(search_dir.glob(f"{module_name}*{extension}"))
         if found:
             found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             return found[0]
 
     return None
-
 
 def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") -> Optional[Any]:
     """Load AOT compiled module from shared library"""
@@ -121,17 +106,7 @@ def load_aot_module(library_path: Path, module_name: str = "macd_aot_compiled") 
         warnings.warn(f"Failed to import AOT module {library_path}: {e}")
         return None
 
-
 def check_aot_version_stamp(library_path: Path, module_name: str) -> Tuple[bool, Optional[str]]:
-    """Compare the `.version` sidecar written by aot_build.py against the live
-    SOURCE_VERSION in numba_functions_shared.py.
-
-    Returns (ok, reason). A missing sidecar is treated as unverifiable-but-OK
-    (not fatal), so upgrading aot_bridge.py doesn't break a build made before
-    version stamping existed -- but any mismatch is treated as a hard failure,
-    because that's exactly the "stale .so silently running old logic" scenario
-    this check exists to catch.
-    """
     version_path = library_path.parent / f"{module_name}.version"
     if not version_path.exists():
         return True, None
@@ -150,13 +125,6 @@ def check_aot_version_stamp(library_path: Path, module_name: str) -> Tuple[bool,
 
 
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
-    """Attempt to initialize AOT module and verify ALL required functions exist.
-
-    Verifying every function in REQUIRED_AOT_FUNCTIONS (rather than a small
-    sample) guarantees that once this returns success=True, the dispatch
-    dictionary in ensure_initialized() can safely reference every AOT
-    attribute directly without risking an AttributeError from a stale build.
-    """
     global _aot_module, _using_aot, _fallback_reason
 
     library_path = find_aot_library(module_name)
@@ -186,10 +154,9 @@ def initialize_jit_fallback() -> None:
     global _jit_functions, _fallback_reason
 
     try:
-        # Import all 13 functions (already cached by Python)
+        # Import all 12 functions (already cached by Python)
         from numba_functions_shared import (
             sanitize_array_numba,
-            sanitize_array_numba_parallel,
             ema_loop,
             ema_loop_alpha,
             ema_loop_pine,
@@ -206,7 +173,6 @@ def initialize_jit_fallback() -> None:
         # Store in dictionary for dispatch
         _jit_functions = {
             'sanitize_array_numba': sanitize_array_numba,
-            'sanitize_array_numba_parallel': sanitize_array_numba_parallel,
             'ema_loop': ema_loop,
             'ema_loop_alpha': ema_loop_alpha,
             'ema_loop_pine': ema_loop_pine,
@@ -232,7 +198,6 @@ def _build_aot_dispatch() -> Dict[str, Callable]:
     check in initialize_aot())."""
     return {
         'sanitize_array_numba': _aot_module.sanitize_array_numba,
-        'sanitize_array_numba_parallel': _aot_module.sanitize_array_numba_parallel,
         'ema_loop': _aot_module.ema_loop,
         'ema_loop_alpha': _aot_module.ema_loop_alpha,
         'ema_loop_pine': _aot_module.ema_loop_pine,
@@ -257,7 +222,6 @@ def ensure_initialized() -> None:
     success, reason = initialize_aot()
 
     if success:
-
         try:
             _dispatch = _build_aot_dispatch()
             _using_aot = True
@@ -305,9 +269,6 @@ def requires_warmup() -> bool:
 
 def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
     return _dispatch['sanitize_array_numba'](arr, default)
-
-def sanitize_array_numba_parallel(arr: np.ndarray, default: float) -> np.ndarray:
-    return _dispatch['sanitize_array_numba_parallel'](arr, default)
 
 def ema_loop(data: np.ndarray, alpha_or_period: float) -> np.ndarray:
     return _dispatch['ema_loop'](data, alpha_or_period)
@@ -357,7 +318,6 @@ __all__ = [
 
     # Sanitization
     'sanitize_array_numba',
-    'sanitize_array_numba_parallel',
 
     # Moving Averages
     'ema_loop',

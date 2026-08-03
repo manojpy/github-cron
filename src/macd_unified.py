@@ -31,7 +31,6 @@ import traceback
 
 from aot_bridge import (
     sanitize_array_numba,
-    sanitize_array_numba_parallel,
     ema_loop,
     ema_loop_alpha,
     ema_loop_pine,
@@ -212,7 +211,6 @@ class BotConfig(BaseModel):
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
     DRY_RUN_MODE: bool = Field(default=False)
-    NUMBA_PARALLEL: bool = Field(default=True)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
