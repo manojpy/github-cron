@@ -118,10 +118,8 @@ class Constants:
     RSI_CROSS65_BUY = 65.0
     RSI_CROSS45_SELL = 45.0
     RSI_CROSS35_SELL = 35.0
-    REDIS_LOCK_EXPIRY = max(int(os.getenv('REDIS_LOCK_EXPIRY', 900)), 900)
     CIRCUIT_BREAKER_MAX_WAIT = 300
     INFINITY_CLAMP = 1e8
-    ALERT_DEDUP_WINDOW_SEC = int(os.getenv("ALERT_DEDUP_WINDOW_SEC", 1800))
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     VWAP_MAX_DISTANCE_PCT = 2.0
     INTER_BATCH_DELAY: float = 0.5
@@ -134,7 +132,6 @@ class Constants:
     MIN_CANDLE_AGE_FROM_OPEN = 850
     MIN_BODY_RATIO = 0.30
     HIGH_DEVIATION_THRESHOLD = 0.5
-    
     
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -210,6 +207,8 @@ class BotConfig(BaseModel):
     TELEGRAM_BURST_SIZE: int = 5
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
+    REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
+    ALERT_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0, description="Dedup window for repeat alerts")
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
@@ -315,9 +314,9 @@ class BotConfig(BaseModel):
                 f'MIN_RUN_TIMEOUT ({self.MIN_RUN_TIMEOUT}s)'
             )
 
-        if self.RUN_TIMEOUT_SECONDS >= Constants.REDIS_LOCK_EXPIRY:
+        if self.RUN_TIMEOUT_SECONDS >= self.REDIS_LOCK_EXPIRY:
             errors.append(
-                f'REDIS_LOCK_EXPIRY ({Constants.REDIS_LOCK_EXPIRY}s) must be > '
+                f'REDIS_LOCK_EXPIRY ({self.REDIS_LOCK_EXPIRY}s) must be > '
                 f'RUN_TIMEOUT_SECONDS ({self.RUN_TIMEOUT_SECONDS}s)'
             )
 
@@ -401,10 +400,19 @@ def load_config() -> BotConfig:
     else:
         print(f"⚠️ WARNING: Config file {config_file} not found, using environment variables only", file=sys.stderr)
 
+    for field_name, field_info in BotConfig.model_fields.items():
+        env_value = os.getenv(field_name)
+        if env_value is None:
+            continue
+        if field_info.annotation is str:
+            data[field_name] = env_value  # never JSON-decode str fields (e.g. all-digit chat IDs)
+        else:
+            try:
+                data[field_name] = json_loads(env_value)
+            except Exception:
+                data[field_name] = env_value
+
     for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "REDIS_URL", "DELTA_API_BASE"):
-        env_value = os.getenv(key)
-        if env_value:
-            data[key] = env_value
         val = data.get(key, "")
         if not val or val.startswith("__SET_IN_"):
             print(f"❌ ERROR: Missing required config: {key}", file=sys.stderr)
@@ -806,9 +814,8 @@ def print_startup_banner_once() -> None:
     _STARTUP_BANNER_PRINTED = True
     logger.info(
         f"📡 Bot v{__version__} | Pairs: {len(cfg.PAIRS)} | Workers: {cfg.MAX_PARALLEL_FETCH} | "
-        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {Constants.REDIS_LOCK_EXPIRY}s"
+        f"Timeout: {cfg.RUN_TIMEOUT_SECONDS}s | Redis Lock: {cfg.REDIS_LOCK_EXPIRY}s"
     )
-
 print_startup_banner_once()
 
 def get_trigger_timestamp() -> int:
@@ -2473,6 +2480,22 @@ class RedisStateStore:
                 f"Metadata TTL: 7d"
             )
 
+async def _record_redis_failure(self, operation: str, exc: Exception) -> None:
+        logger.error(f"Redis operation '{operation}' failed: {exc}")
+        if self.degraded:
+            return
+        self.degraded = True
+        logger.warning(f"Redis marked degraded after failure in '{operation}' — attempting one reconnect")
+        try:
+            reconnected = await self._attempt_connect(timeout=5.0)
+            if reconnected:
+                logger.info(f"Redis reconnected after failure in '{operation}'")
+                self.degraded = False
+            else:
+                logger.critical(f"Redis reconnect failed after '{operation}' — staying degraded for remainder of run")
+        except Exception as reconnect_exc:
+            logger.critical(f"Redis reconnect attempt itself failed: {reconnect_exc} — staying degraded")
+
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
             self._redis = redis.from_url(
@@ -2691,7 +2714,7 @@ class RedisStateStore:
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         try:
             result = await asyncio.wait_for(
-                self._redis.set(recent_key, str(ts), nx=True, ex=Constants.ALERT_DEDUP_WINDOW_SEC),
+                self._redis.set(recent_key, str(ts), nx=True, ex=cfg.ALERT_DEDUP_WINDOW_SEC),
                 timeout=3.0
             )
             should_send = bool(result)
@@ -2753,12 +2776,11 @@ class RedisStateStore:
                     states[key] = False
 
             return states
-
-        except asyncio.TimeoutError:
-            logger.error(f"batch_get_all_alert_states timeout for {pair}")
+        except asyncio.TimeoutError as e:
+            await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
             return {k: False for k in alert_keys}
         except Exception as e:
-            logger.error(f"batch_get_all_alert_states failed for {pair}: {e}")
+            await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
             return {k: False for k in alert_keys}
 
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
@@ -2796,11 +2818,12 @@ class RedisStateStore:
 
                 await asyncio.wait_for(pipe.execute(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
-            logger.error("Atomic batch update timeout")
+
+        except asyncio.TimeoutError as e:
+            await self._record_redis_failure("atomic_batch_update", e)
             return False
         except Exception as e:
-            logger.error(f"Atomic batch update failed: {e}")
+            await self._record_redis_failure("atomic_batch_update", e)
             return False
 
 class RedisLock:    
@@ -2821,8 +2844,7 @@ class RedisLock:
     def __init__(self, redis_client: Optional[redis.Redis], lock_key: str, expire: int | None = None):
         self.redis = redis_client
         self.lock_key = f"{RedisKeyPrefix.LOCK}{lock_key}"
-        self.expire = expire or Constants.REDIS_LOCK_EXPIRY
-        
+        self.expire = expire or cfg.REDIS_LOCK_EXPIRY
         self.token: Optional[str] = None
         self.lost = False
         self.acquired_by_me = False
@@ -2864,8 +2886,7 @@ class RedisLock:
     async def extend(self, timeout: float = 3.0) -> bool:     
         if not self.token or not self.redis or not self.acquired_by_me:
             self.lost = True
-            return False
-        
+            return False    
         try:
             result = await asyncio.wait_for(
                 self.redis.eval(
@@ -2902,8 +2923,8 @@ class RedisLock:
 
     @classmethod
     def get_lock_extend_interval(cls) -> int:    
-        extend_at = int(Constants.REDIS_LOCK_EXPIRY * 0.7)
-        return max(60, min(extend_at, 540))
+        extend_at = int(cfg.REDIS_LOCK_EXPIRY * 0.7)
+        return max(60, min(extend_at, 540)) 
 
     def should_extend(self) -> bool:     
         if not self.acquired_by_me or self.lost:
@@ -4480,8 +4501,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
                         f"skipping {len(alerts_to_send)} alerts for {pair_name}"
                     )
-                    if all_state_changes:
-                        await sdb.atomic_batch_update(all_state_changes)
+
+                if all_state_changes:
+                    persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                    if not persist_ok:
+                        logger_pair.error(
+                            f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                        )
                     for _, _, alert_key in alerts_to_send:
                         await sdb.release_recent_alert(pair_name, alert_key)
                     return pair_name, {
