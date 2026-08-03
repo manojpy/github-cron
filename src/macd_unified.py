@@ -208,7 +208,7 @@ class BotConfig(BaseModel):
     REDIS_CONNECTION_RETRIES: int = 3
     REDIS_RETRY_DELAY: float = 2.0
     REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
-    ALERT_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0, description="Dedup window for repeat alerts")
+    ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
@@ -3289,12 +3289,12 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
     {"key":"ppo_011_up","title":"🟢 PPO cross▲0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
     {"key":"ppo_011_down","title":"🔴 PPO cross▼ -0.18","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5 (RSI<60, PPOgate<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5 (RSI>40, PPOgate>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_55_up","title":"🟢 RSI▲55 (>EMA5, PPOgate<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS55_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS55_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲55 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_65_up","title":"🟢 RSI▲65 (>EMA5, PPOgate<0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS65_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS65_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲65 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_45_down","title":"🔴 RSI▼45 (<EMA5, PPOgate>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS45_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS45_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼45 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_35_down","title":"🔴 RSI▼35 (<EMA5, PPOgate>-0.30)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS35_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS35_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼35 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_cross_55_up","title":"🟢 RSI▲55","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS55_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS55_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲55 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_cross_65_up","title":"🟢 RSI▲65","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS65_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS65_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲65 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_cross_45_down","title":"🔴 RSI▼45","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS45_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS45_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼45 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_cross_35_down","title":"🔴 RSI▼35","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS35_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS35_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼35 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
     {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -3305,10 +3305,10 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"fast_tk_cross_up","title":"⚡🟢 Fast Tenkan Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastTK {ctx.get('fast_tk_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"fast_tk_cross_down","title":"⚡🔴 Fast Tenkan Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastTK {ctx.get('fast_tk_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"fast_cloud_cross_up","title":"☁️🟢 Fast Cloud Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloudUpper {ctx.get('fast_cloud_upper_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"fast_cloud_cross_down","title":"☁️🔴 Fast Cloud Cross (9,26,52,26)","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloudLower {ctx.get('fast_cloud_lower_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]} 
+    {"key":"fast_tk_cross_up","title":"⚡🟢 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastTK {ctx.get('fast_tk_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"fast_tk_cross_down","title":"⚡🔴 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastTK {ctx.get('fast_tk_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"fast_cloud_cross_up","title":"☁️🟢 Fast Cloud Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloudUpper {ctx.get('fast_cloud_upper_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"fast_cloud_cross_down","title":"☁️🔴 Fast Cloud Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloudLower {ctx.get('fast_cloud_lower_curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]} 
 ]
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -3350,112 +3350,89 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -
     resets = []
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
     ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
-    buy_common, sell_common = context["buy_common"], context["sell_common"]
-    ppo_gate_curr = context["ppo_gate_curr"]
 
     if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
 
     if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
 
     if ppo_prev > 0 and ppo_curr <= 0:
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
 
     if ppo_prev < 0 and ppo_curr >= 0:
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
 
     if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
 
     if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
 
-    return resets 
+    return resets
 
 def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
     rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
-    buy_common, sell_common = context["buy_common"], context["sell_common"]
-    ppo_gate_curr = context["ppo_gate_curr"]
 
     if rsi_prev > rsi_ema_prev and rsi_curr <= rsi_ema_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr >= Constants.RSI_SRSI_BUY_MAX) and conditional_states.get(ALERT_KEYS['rsi_ema5_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['rsi_ema5_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
 
     if rsi_prev < rsi_ema_prev and rsi_curr >= rsi_ema_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
-    elif (not sell_common or  ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr <= Constants.RSI_SRSI_SELL_MIN) and conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
 
     if rsi_prev > Constants.RSI_CROSS55_BUY and rsi_curr <= Constants.RSI_CROSS55_BUY:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_55_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['rsi_cross_55_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
 
     if rsi_prev > Constants.RSI_CROSS65_BUY and rsi_curr <= Constants.RSI_CROSS65_BUY:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
-    elif (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY or rsi_curr <= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_65_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['rsi_cross_65_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
 
     if rsi_prev < Constants.RSI_CROSS45_SELL and rsi_curr >= Constants.RSI_CROSS45_SELL:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_45_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['rsi_cross_45_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
 
     if rsi_prev < Constants.RSI_CROSS35_SELL and rsi_curr >= Constants.RSI_CROSS35_SELL:
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
-    elif (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL or rsi_curr >= rsi_ema_curr) and conditional_states.get(ALERT_KEYS['rsi_cross_35_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['rsi_cross_35_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
 
     return resets
 
 def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
-    
+
     if not context.get("vwap_available", False):
-        if not sell_common and conditional_states.get(ALERT_KEYS['vwap_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-        if not buy_common and conditional_states.get(ALERT_KEYS['vwap_up'], False):
+        if conditional_states.get(ALERT_KEYS['vwap_up'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['vwap_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
         return resets
-    
+
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     vwap_curr, vwap_prev = context["vwap_curr"], context["vwap_prev"]
 
     if close_prev > vwap_prev and close_curr <= vwap_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['vwap_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['vwap_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
 
     if close_prev < vwap_prev and close_curr >= vwap_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['vwap_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['vwap_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
 
     return resets
 
 def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
-
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     cu_curr, cu_prev = context.get("cloud_upper_curr"), context.get("cloud_upper_prev")
     cl_curr, cl_prev = context.get("cloud_lower_curr"), context.get("cloud_lower_prev")
@@ -3464,22 +3441,17 @@ def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states:
         return resets
 
     if close_prev > cu_prev and close_curr <= cu_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['cloud_cross_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['cloud_cross_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_up']}", "INACTIVE", None))
 
     if close_prev < cl_prev and close_curr >= cl_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['cloud_cross_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['cloud_cross_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_down']}", "INACTIVE", None))
 
     return resets
 
 def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
-
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     conv_curr, conv_prev = context.get("tk_conversion_curr"), context.get("tk_conversion_prev")
 
@@ -3487,51 +3459,62 @@ def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_state
         return resets
 
     if close_prev > conv_prev and close_curr <= conv_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['tk_conversion_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['tk_conversion_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
 
     if close_prev < conv_prev and close_curr >= conv_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['tk_conversion_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
+        if conditional_states.get(ALERT_KEYS['tk_conversion_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
 
     return resets
 
 def _reset_fast_tk_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
-    ppo_gate_curr = context.get("ppo_gate_curr", np.nan)
-    if (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['fast_tk_cross_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['fast_tk_cross_up']}", "INACTIVE", None))
-    if (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['fast_tk_cross_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['fast_tk_cross_down']}", "INACTIVE", None))
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    fast_tk_curr, fast_tk_prev = context.get("fast_tk_curr"), context.get("fast_tk_prev")
+
+    if fast_tk_curr is None or fast_tk_prev is None or np.isnan(fast_tk_curr) or np.isnan(fast_tk_prev):
+        return resets
+
+    if close_prev > fast_tk_prev and close_curr <= fast_tk_curr:
+        if conditional_states.get(ALERT_KEYS['fast_tk_cross_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['fast_tk_cross_up']}", "INACTIVE", None))
+
+    if close_prev < fast_tk_prev and close_curr >= fast_tk_curr:
+        if conditional_states.get(ALERT_KEYS['fast_tk_cross_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['fast_tk_cross_down']}", "INACTIVE", None))
+
     return resets
 
 def _reset_fast_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
-    ppo_gate_curr = context.get("ppo_gate_curr", np.nan)
-    if (not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY) and conditional_states.get(ALERT_KEYS['fast_cloud_cross_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_up']}", "INACTIVE", None))
-    if (not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL) and conditional_states.get(ALERT_KEYS['fast_cloud_cross_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_down']}", "INACTIVE", None))
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    fcu_curr, fcu_prev = context.get("fast_cloud_upper_curr"), context.get("fast_cloud_upper_prev")
+    fcl_curr, fcl_prev = context.get("fast_cloud_lower_curr"), context.get("fast_cloud_lower_prev")
+
+    if any(v is None or np.isnan(v) for v in (fcu_curr, fcu_prev, fcl_curr, fcl_prev)):
+        return resets
+
+    if close_prev > fcu_prev and close_curr <= fcu_curr:
+        if conditional_states.get(ALERT_KEYS['fast_cloud_cross_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_up']}", "INACTIVE", None))
+
+    if close_prev < fcl_prev and close_curr >= fcl_curr:
+        if conditional_states.get(ALERT_KEYS['fast_cloud_cross_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_down']}", "INACTIVE", None))
+
     return resets
 
 def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     hist_curr, hist_m1 = context["hist_curr"], context["hist_m1"]
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
 
     if conditional_states.get(ALERT_KEYS["hist_rma_buy"], False):
-        if not buy_common or np.isnan(hist_curr) or hist_curr <= 1e-8 or hist_curr <= hist_m1:
+        if np.isnan(hist_curr) or hist_curr <= 1e-8 or hist_curr <= hist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_buy']}", "INACTIVE", None))
 
     if conditional_states.get(ALERT_KEYS["hist_rma_sell"], False):
-        if not sell_common or np.isnan(hist_curr) or hist_curr >= -1e-8 or hist_curr >= hist_m1:
+        if np.isnan(hist_curr) or hist_curr >= -1e-8 or hist_curr >= hist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_sell']}", "INACTIVE", None))
 
     return resets
@@ -3539,15 +3522,13 @@ def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: di
 def _reset_ppohist_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     ppohist_curr, ppohist_m1 = context["ppohist_curr"], context["ppohist_m1"]
-    buy_common = context.get("buy_common", False)
-    sell_common = context.get("sell_common", False)
 
     if conditional_states.get(ALERT_KEYS["ppohist_buy"], False):
-        if not buy_common or np.isnan(ppohist_curr) or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1:
+        if np.isnan(ppohist_curr) or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_buy']}", "INACTIVE", None))
 
     if conditional_states.get(ALERT_KEYS["ppohist_sell"], False):
-        if not sell_common or np.isnan(ppohist_curr) or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1:
+        if np.isnan(ppohist_curr) or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1:
             resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_sell']}", "INACTIVE", None))
 
     return resets
@@ -3559,7 +3540,6 @@ def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict)
         return resets
 
     close_curr, close_prev = context["close_curr"], context["close_prev"]
-    buy_common, sell_common = context["buy_common"], context["sell_common"]
 
     for level_name, level_value in piv.items():
         up_key = f"pivot_up_{level_name}"
@@ -3567,15 +3547,13 @@ def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict)
 
         if up_key in ALERT_KEYS:
             if close_prev > level_value and close_curr <= level_value:
-                resets.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
-            elif not buy_common and conditional_states.get(ALERT_KEYS[up_key], False):
-                resets.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
+                if conditional_states.get(ALERT_KEYS[up_key], False):
+                    resets.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
 
         if down_key in ALERT_KEYS:
             if close_prev < level_value and close_curr >= level_value:
-                resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
-            elif not sell_common and conditional_states.get(ALERT_KEYS[down_key], False):
-                resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
+                if conditional_states.get(ALERT_KEYS[down_key], False):
+                    resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
 
     return resets
 
