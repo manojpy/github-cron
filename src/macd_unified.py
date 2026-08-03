@@ -3882,17 +3882,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
 
-        ichimoku_alt_conversion_line = indicators.get("ichimoku_alt_conversion_line")
-        ichimoku_alt_base_line = indicators.get("ichimoku_alt_base_line")
-
-        if cfg.ENABLE_TK_CROSS_ALT and ichimoku_alt_conversion_line is not None and ichimoku_alt_base_line is not None:
-            alt_tk_conv_curr = float(ichimoku_alt_conversion_line[i15])
-            alt_tk_conv_prev = float(ichimoku_alt_conversion_line[i15 - 1]) if i15 >= 1 else float(ichimoku_alt_conversion_line[i15])
-            alt_tk_base_curr = float(ichimoku_alt_base_line[i15])
-            alt_tk_base_prev = float(ichimoku_alt_base_line[i15 - 1]) if i15 >= 1 else float(ichimoku_alt_base_line[i15])
-        else:
-            alt_tk_conv_curr = alt_tk_conv_prev = alt_tk_base_curr = alt_tk_base_prev = float('nan')
-
         if cfg.ICHIMOKU_TK_GUARD_ENABLED:
             if tk_guard_valid:
                 tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
@@ -4189,7 +4178,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         vwap = indicators["vwap"]
         hist_rma = indicators["hist_rma"]
         piv = indicators.get("pivots", {})
-
+        ichimoku_alt_conversion_line = indicators.get("ichimoku_alt_conversion_line")
+        ichimoku_alt_base_line = indicators.get("ichimoku_alt_base_line")
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
         ppo_curr = ppo[i15]
@@ -4233,6 +4223,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"vwap_is_none={vwap is None}, "
                     f"len={len(vwap) if vwap is not None else 0}, i15={i15}"
                 )
+
+        if cfg.ENABLE_TK_CROSS_ALT and ichimoku_alt_conversion_line is not None and ichimoku_alt_base_line is not None:
+            alt_tk_conv_curr = float(ichimoku_alt_conversion_line[i15])
+            alt_tk_conv_prev = float(ichimoku_alt_conversion_line[i15 - 1]) if i15 >= 1 else float(ichimoku_alt_conversion_line[i15])
+            alt_tk_base_curr = float(ichimoku_alt_base_line[i15])
+            alt_tk_base_prev = float(ichimoku_alt_base_line[i15 - 1]) if i15 >= 1 else float(ichimoku_alt_base_line[i15])
+        else:
+            alt_tk_conv_curr = alt_tk_conv_prev = alt_tk_base_curr = alt_tk_base_prev = float('nan')
 
         hist_curr = hist_rma[i15]
         hist_m1 = hist_rma[i15 - 1] if i15 >= 1 else 0.0
