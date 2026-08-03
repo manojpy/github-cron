@@ -2480,7 +2480,7 @@ class RedisStateStore:
                 f"Metadata TTL: 7d"
             )
 
-async def _record_redis_failure(self, operation: str, exc: Exception) -> None:
+    async def _record_redis_failure(self, operation: str, exc: Exception) -> None:
         logger.error(f"Redis operation '{operation}' failed: {exc}")
         if self.degraded:
             return
