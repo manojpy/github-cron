@@ -3296,10 +3296,10 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"alt_tenkan_cross_up","title":"🌐🟢 Alt Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("alt_tenkan_cross_buy",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltTenkan {ctx.get('alt_tk_conv_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"alt_tenkan_cross_down","title":"🌐🔴 Alt Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("alt_tenkan_cross_sell",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltTenkan {ctx.get('alt_tk_conv_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"alt_kijun_cross_up","title":"🌐🟢 Alt Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("alt_kijun_cross_buy",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltKijun {ctx.get('alt_tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"alt_kijun_cross_down","title":"🌐🔴 Alt Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("alt_kijun_cross_sell",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltKijun {ctx.get('alt_tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+    {"key":"alt_tenkan_cross_up","title":"🌐🟢 Tenkan Cross▲","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("alt_tenkan_cross_buy",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltTenkan {ctx.get('alt_tk_conv_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"alt_tenkan_cross_down","title":"🌐🔴 Tenkan Cross▼","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("alt_tenkan_cross_sell",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltTenkan {ctx.get('alt_tk_conv_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"alt_kijun_cross_up","title":"🌐🟢 Kijun Cross▲","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("alt_kijun_cross_buy",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltKijun {ctx.get('alt_tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"alt_kijun_cross_down","title":"🌐🔴 Kijun Cross▼","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("alt_kijun_cross_sell",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltKijun {ctx.get('alt_tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ] 
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
@@ -3850,8 +3850,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
-        ichimoku_alt_conversion_line = indicators.get("ichimoku_alt_conversion_line")
-        ichimoku_alt_base_line = indicators.get("ichimoku_alt_base_line")
         future_green = ichimoku_future_green[i15]
         future_red = ichimoku_future_red[i15]
 
@@ -3883,6 +3881,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         tk_conversion_prev = ichimoku_conversion_line[i15 - 1]
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
+
+        ichimoku_alt_conversion_line = indicators.get("ichimoku_alt_conversion_line")
+        ichimoku_alt_base_line = indicators.get("ichimoku_alt_base_line")
 
         if cfg.ENABLE_TK_CROSS_ALT and ichimoku_alt_conversion_line is not None and ichimoku_alt_base_line is not None:
             alt_tk_conv_curr = float(ichimoku_alt_conversion_line[i15])
