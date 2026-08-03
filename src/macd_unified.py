@@ -220,7 +220,11 @@ class BotConfig(BaseModel):
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
-    ENABLE_TK_CONVERSION_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku conversion (Tenkan) line, subject to all other buy/sell common conditions")
+    ENABLE_TK_CROSS_ALT: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the alt Ichimoku (9,26,52,26) Tenkan or Kijun line, subject to all other buy/sell common conditions")
+    ICHIMOKU_ALT_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Alt Ichimoku conversion line length (9)")
+    ICHIMOKU_ALT_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Alt Ichimoku base line length (26)")
+    ICHIMOKU_ALT_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Alt Ichimoku leading span B length (52)")
+    ICHIMOKU_ALT_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Alt Ichimoku cloud forward displacement (26)")
 
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -1324,6 +1328,21 @@ def calculate_alert_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: D
             )
         else:
             results['pivots'] = {}
+        
+        if cfg.ENABLE_TK_CROSS_ALT:
+            ichimoku_alt = calculate_ichimoku_numpy(
+                data_15m["high"], data_15m["low"], close_15m,
+                cfg.ICHIMOKU_ALT_CONVERSION_PERIODS,
+                cfg.ICHIMOKU_ALT_BASE_PERIODS,
+                cfg.ICHIMOKU_ALT_SPANB_PERIODS,
+                cfg.ICHIMOKU_ALT_DISPLACEMENT,
+            )
+            results['ichimoku_alt_conversion_line'] = ichimoku_alt['conversion_line']
+            results['ichimoku_alt_base_line'] = ichimoku_alt['base_line']
+        else:
+            nan_arr = np.full(n_15m, np.nan, dtype=np.float64)
+            results['ichimoku_alt_conversion_line'] = nan_arr
+            results['ichimoku_alt_base_line'] = nan_arr
 
         # Sanitize
         for key in ('ppo', 'ppo_signal', 'smooth_rsi', 'smooth_rsi_ema', 'hist_rma'):
@@ -3277,9 +3296,11 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
-]
+    {"key":"alt_tenkan_cross_up","title":"🌐🟢 Alt Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("alt_tenkan_cross_buy",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltTenkan {ctx.get('alt_tk_conv_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"alt_tenkan_cross_down","title":"🌐🔴 Alt Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("alt_tenkan_cross_sell",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltTenkan {ctx.get('alt_tk_conv_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"alt_kijun_cross_up","title":"🌐🟢 Alt Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("alt_kijun_cross_buy",False) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltKijun {ctx.get('alt_tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"alt_kijun_cross_down","title":"🌐🔴 Alt Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("alt_kijun_cross_sell",False) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"AltKijun {ctx.get('alt_tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+] 
 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
@@ -3445,26 +3466,53 @@ def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states:
 
     return resets
 
-def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+def _reset_alt_tk_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     buy_common = context.get("buy_common", False)
     sell_common = context.get("sell_common", False)
+    close_curr = context["close_curr"]
+    close_prev = context["close_prev"]
+    alt_conv_curr = context.get("alt_tk_conv_curr")
+    alt_conv_prev = context.get("alt_tk_conv_prev")
+    alt_base_curr = context.get("alt_tk_base_curr")
+    alt_base_prev = context.get("alt_tk_base_prev")
+    ppo_gate_curr = context.get("ppo_gate_curr", float('nan'))
 
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    conv_curr, conv_prev = context.get("tk_conversion_curr"), context.get("tk_conversion_prev")
+    # ── Alt Tenkan cross up ──
+    if conditional_states.get(ALERT_KEYS['alt_tenkan_cross_up'], False):
+        tenkan_buy_valid = False
+        if alt_conv_prev is not None and alt_conv_curr is not None and not np.isnan(alt_conv_prev) and not np.isnan(alt_conv_curr):
+            if close_prev <= alt_conv_prev and close_curr > alt_conv_curr:
+                tenkan_buy_valid = True
+        if not tenkan_buy_valid or not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
+            resets.append((f"{pair_name}:{ALERT_KEYS['alt_tenkan_cross_up']}", "INACTIVE", None))
 
-    if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
-        return resets
+    # ── Alt Tenkan cross down ──
+    if conditional_states.get(ALERT_KEYS['alt_tenkan_cross_down'], False):
+        tenkan_sell_valid = False
+        if alt_conv_prev is not None and alt_conv_curr is not None and not np.isnan(alt_conv_prev) and not np.isnan(alt_conv_curr):
+            if close_prev >= alt_conv_prev and close_curr < alt_conv_curr:
+                tenkan_sell_valid = True
+        if not tenkan_sell_valid or not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
+            resets.append((f"{pair_name}:{ALERT_KEYS['alt_tenkan_cross_down']}", "INACTIVE", None))
 
-    if close_prev > conv_prev and close_curr <= conv_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
-    elif not buy_common and conditional_states.get(ALERT_KEYS['tk_conversion_up'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
+    # ── Alt Kijun cross up ──
+    if conditional_states.get(ALERT_KEYS['alt_kijun_cross_up'], False):
+        kijun_buy_valid = False
+        if alt_base_prev is not None and alt_base_curr is not None and not np.isnan(alt_base_prev) and not np.isnan(alt_base_curr):
+            if close_prev <= alt_base_prev and close_curr > alt_base_curr:
+                kijun_buy_valid = True
+        if not kijun_buy_valid or not buy_common or ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
+            resets.append((f"{pair_name}:{ALERT_KEYS['alt_kijun_cross_up']}", "INACTIVE", None))
 
-    if close_prev < conv_prev and close_curr >= conv_curr:
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
-    elif not sell_common and conditional_states.get(ALERT_KEYS['tk_conversion_down'], False):
-        resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
+    # ── Alt Kijun cross down ──
+    if conditional_states.get(ALERT_KEYS['alt_kijun_cross_down'], False):
+        kijun_sell_valid = False
+        if alt_base_prev is not None and alt_base_curr is not None and not np.isnan(alt_base_prev) and not np.isnan(alt_base_curr):
+            if close_prev >= alt_base_prev and close_curr < alt_base_curr:
+                kijun_sell_valid = True
+        if not kijun_sell_valid or not sell_common or ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
+            resets.append((f"{pair_name}:{ALERT_KEYS['alt_kijun_cross_down']}", "INACTIVE", None))
 
     return resets
 
@@ -3592,14 +3640,14 @@ validate_alert_definitions()
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
     "rsi_ema5_up", "rsi_cross_55_up", "rsi_cross_65_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", "tk_conversion_up",
+    "cloud_cross_up", "alt_tenkan_cross_up", "alt_kijun_cross_up",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
     "rsi_ema5_down", "rsi_cross_45_down", "rsi_cross_35_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", "tk_conversion_down",
+    "cloud_cross_down", "alt_tenkan_cross_down", "alt_kijun_cross_down",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
@@ -3802,7 +3850,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
-
+        ichimoku_alt_conversion_line = indicators.get("ichimoku_alt_conversion_line")
+        ichimoku_alt_base_line = indicators.get("ichimoku_alt_base_line")
         future_green = ichimoku_future_green[i15]
         future_red = ichimoku_future_red[i15]
 
@@ -3835,6 +3884,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         tk_base_curr = ichimoku_base_line[i15]
         tk_guard_valid = not (np.isnan(tk_conversion_curr) or np.isnan(tk_base_curr))
 
+        if cfg.ENABLE_TK_CROSS_ALT and ichimoku_alt_conversion_line is not None and ichimoku_alt_base_line is not None:
+            alt_tk_conv_curr = float(ichimoku_alt_conversion_line[i15])
+            alt_tk_conv_prev = float(ichimoku_alt_conversion_line[i15 - 1]) if i15 >= 1 else float(ichimoku_alt_conversion_line[i15])
+            alt_tk_base_curr = float(ichimoku_alt_base_line[i15])
+            alt_tk_base_prev = float(ichimoku_alt_base_line[i15 - 1]) if i15 >= 1 else float(ichimoku_alt_base_line[i15])
+        else:
+            alt_tk_conv_curr = alt_tk_conv_prev = alt_tk_base_curr = alt_tk_base_prev = float('nan')
+
         if cfg.ICHIMOKU_TK_GUARD_ENABLED:
             if tk_guard_valid:
                 tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
@@ -3858,6 +3915,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"Skipping all cross-based alerts this run."
             )
             close_prev_invalid = True
+
+        alt_tenkan_cross_buy = False
+        alt_tenkan_cross_sell = False
+        alt_kijun_cross_buy = False
+        alt_kijun_cross_sell = False
+        if cfg.ENABLE_TK_CROSS_ALT and not close_prev_invalid:
+            if not np.isnan(alt_tk_conv_curr) and not np.isnan(alt_tk_conv_prev):
+                if close_prev <= alt_tk_conv_prev and close_curr > alt_tk_conv_curr:
+                    alt_tenkan_cross_buy = True
+                if close_prev >= alt_tk_conv_prev and close_curr < alt_tk_conv_curr:
+                    alt_tenkan_cross_sell = True
+            if not np.isnan(alt_tk_base_curr) and not np.isnan(alt_tk_base_prev):
+                if close_prev <= alt_tk_base_prev and close_curr > alt_tk_base_curr:
+                    alt_kijun_cross_buy = True
+                if close_prev >= alt_tk_base_prev and close_curr < alt_tk_base_curr:
+                    alt_kijun_cross_sell = True
 
         if close_prev_invalid:
             logger_pair.warning(
@@ -4251,6 +4324,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr,
+            "alt_tk_conv_curr": alt_tk_conv_curr, "alt_tk_conv_prev": alt_tk_conv_prev,
+            "alt_tk_base_curr": alt_tk_base_curr, "alt_tk_base_prev": alt_tk_base_prev,
+            "alt_tenkan_cross_buy": alt_tenkan_cross_buy, "alt_tenkan_cross_sell": alt_tenkan_cross_sell,
+            "alt_kijun_cross_buy": alt_kijun_cross_buy, "alt_kijun_cross_sell": alt_kijun_cross_sell,
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
             "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
             "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
@@ -4399,25 +4476,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 except Exception as e:
                     logger_pair.debug(f"Cloud cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
-
-            elif alert_key in ("tk_conversion_up", "tk_conversion_down"):
-                if not cfg.ENABLE_TK_CONVERSION_CROSS:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: TK conversion cross disabled")
-                    continue
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "tk_conversion_up")
-                    valid_cross, cross_reason = validate_conversion_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["tk_conversion_prev"], context["tk_conversion_curr"],
-                        is_buy_side
-                    )
-                    if valid_cross:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except Exception as e:
-                    logger_pair.debug(f"TK conversion cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
             else:
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
@@ -4453,7 +4511,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_cloud_cross_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_tk_conversion_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_alt_tk_cross_alerts(pair_name, context, conditional_states))
 
         all_state_changes.extend(resets_to_apply)  
 
@@ -4694,31 +4752,60 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not ppo_gate_ok_sell:
                 reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
 
-        if cfg.ENABLE_TK_CONVERSION_CROSS:
-            if close_prev <= tk_conversion_prev and close_curr > tk_conversion_curr and not buy_common:
+        if cfg.ENABLE_TK_CROSS_ALT:
+            # Alt Tenkan up
+            if close_prev <= alt_tk_conv_prev and close_curr > alt_tk_conv_curr and not buy_common:
                 if not base_buy_trend:
-                    reasons.append("Conversion up-cross blocked: base_buy_trend=False")
+                    reasons.append("AltTenkan up-cross blocked: base_buy_trend=False")
                 elif not confirmation_buy:
-                    reasons.append("Conversion up-cross blocked: confirmation_buy=False")
+                    reasons.append("AltTenkan up-cross blocked: confirmation_buy=False")
                 elif not is_valid_for_buy:
-                    reasons.append("Conversion up-cross blocked: Knox rejected candle")
+                    reasons.append("AltTenkan up-cross blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"Conversion up-cross blocked: market filter "
+                        f"AltTenkan up-cross blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                         f"rvol_ok={rvol_ok})"
                     )
-
-            if close_prev >= tk_conversion_prev and close_curr < tk_conversion_curr and not sell_common:
+            # Alt Tenkan down
+            if close_prev >= alt_tk_conv_prev and close_curr < alt_tk_conv_curr and not sell_common:
                 if not base_sell_trend:
-                    reasons.append("Conversion down-cross blocked: base_sell_trend=False")
+                    reasons.append("AltTenkan down-cross blocked: base_sell_trend=False")
                 elif not confirmation_sell:
-                    reasons.append("Conversion down-cross blocked: confirmation_sell=False")
+                    reasons.append("AltTenkan down-cross blocked: confirmation_sell=False")
                 elif not is_valid_for_sell:
-                    reasons.append("Conversion down-cross blocked: Knox rejected candle")
+                    reasons.append("AltTenkan down-cross blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"Conversion down-cross blocked: market filter "
+                        f"AltTenkan down-cross blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+            # Alt Kijun up
+            if close_prev <= alt_tk_base_prev and close_curr > alt_tk_base_curr and not buy_common:
+                if not base_buy_trend:
+                    reasons.append("AltKijun up-cross blocked: base_buy_trend=False")
+                elif not confirmation_buy:
+                    reasons.append("AltKijun up-cross blocked: confirmation_buy=False")
+                elif not is_valid_for_buy:
+                    reasons.append("AltKijun up-cross blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"AltKijun up-cross blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+            # Alt Kijun down
+            if close_prev >= alt_tk_base_prev and close_curr < alt_tk_base_curr and not sell_common:
+                if not base_sell_trend:
+                    reasons.append("AltKijun down-cross blocked: base_sell_trend=False")
+                elif not confirmation_sell:
+                    reasons.append("AltKijun down-cross blocked: confirmation_sell=False")
+                elif not is_valid_for_sell:
+                    reasons.append("AltKijun down-cross blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"AltKijun down-cross blocked: market filter "
                         f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
                         f"rvol_ok={rvol_ok})"
                     )
