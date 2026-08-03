@@ -77,7 +77,6 @@
 
   "MAX_ALERTS_PER_PAIR": 8,
   "SKIP_WARMUP": true,
-  "NUMBA_PARALLEL": false,
 
   "MAX_CANDLE_STALENESS_SEC": 1200,
 
