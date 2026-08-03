@@ -184,12 +184,12 @@ class BotConfig(BaseModel):
     SRSI_EMA_LEN: int = 5
     ATR_SHORT: int = 5
     ATR_LONG: int = 14
-    LOG_FILE: str = "macd_bot.log"
     MAX_PARALLEL_FETCH: int = Field(15, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
     CANDLE_FETCH_BACKOFF: float = 1.5
     RUN_TIMEOUT_SECONDS: int = 600
+    FETCH_PHASE_TIMEOUT_SEC: int = 90
     TCP_CONN_LIMIT: int = 16
     TCP_CONN_LIMIT_PER_HOST: int = 16
     TELEGRAM_RETRIES: int = 3
@@ -514,6 +514,9 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         return str(dt_or_ts)
 
 shutdown_event = asyncio.Event()
+
+_pair_eval_counter = 0
+MEMORY_CHECK_INTERVAL_PAIRS = 5  # only sample RSS every N pair evaluations
 
 _VALIDATION_DONE = False
 
@@ -850,13 +853,8 @@ def calculate_smooth_rsi_numpy(close: np.ndarray, rsi_len: int, kalman_len: int,
         rsi = calculate_rsi_core(close, rsi_len)
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
         rsi_ema = ema_loop(smooth_rsi, float(ema_len))
-
-        if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
-            smooth_rsi = sanitize_array_numba_parallel(smooth_rsi, 50.0)
-            rsi_ema    = sanitize_array_numba_parallel(rsi_ema, 50.0)
-        else:
-            smooth_rsi = sanitize_array_numba(smooth_rsi, 50.0)
-            rsi_ema    = sanitize_array_numba(rsi_ema, 50.0)
+        smooth_rsi = sanitize_array_numba(smooth_rsi, 50.0)
+        rsi_ema    = sanitize_array_numba(rsi_ema, 50.0)
 
         return smooth_rsi, rsi_ema
     except Exception as e:
@@ -873,11 +871,7 @@ def calculate_volume_ema_numpy(volume: np.ndarray, length: int) -> np.ndarray:
             return np.full(default_len, np.nan, dtype=np.float64)
 
         vol_ema = ema_loop(volume.astype(np.float64), float(length))
-
-        if cfg.NUMBA_PARALLEL and len(vol_ema) >= 200:
-            vol_ema = sanitize_array_numba_parallel(vol_ema, np.nan)
-        else:
-            vol_ema = sanitize_array_numba(vol_ema, np.nan)
+        vol_ema = sanitize_array_numba(vol_ema, np.nan)
 
         return vol_ema
     except Exception as e:
@@ -893,13 +887,8 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
             return np.full(default_len, np.nan, dtype=np.float64), np.full(default_len, np.nan, dtype=np.float64)
 
         ppo, ppo_sig = calculate_ppo_core(close, fast, slow, signal)
-
-        if cfg.NUMBA_PARALLEL and len(ppo) >= 200:
-            ppo     = sanitize_array_numba_parallel(ppo,     np.nan)
-            ppo_sig = sanitize_array_numba_parallel(ppo_sig, np.nan)
-        else:
-            ppo     = sanitize_array_numba(ppo,     np.nan)
-            ppo_sig = sanitize_array_numba(ppo_sig, np.nan)
+        ppo     = sanitize_array_numba(ppo,     np.nan)
+        ppo_sig = sanitize_array_numba(ppo_sig, np.nan)
 
         return ppo, ppo_sig
 
@@ -1012,13 +1001,8 @@ def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, 
         rsi = calculate_rsi_core(close, rsi_len)
         smooth_rsi = kalman_loop(rsi, kalman_len, 0.01, 0.1)
         rsi_ema = ema_loop(smooth_rsi, float(ema_len))
-
-        if cfg.NUMBA_PARALLEL and len(smooth_rsi) >= 200:
-            smooth_rsi = sanitize_array_numba_parallel(smooth_rsi, np.nan)
-            rsi_ema    = sanitize_array_numba_parallel(rsi_ema, np.nan)
-        else:
-            smooth_rsi = sanitize_array_numba(smooth_rsi, np.nan)
-            rsi_ema    = sanitize_array_numba(rsi_ema, np.nan)
+        smooth_rsi = sanitize_array_numba(smooth_rsi, np.nan)
+        rsi_ema    = sanitize_array_numba(rsi_ema, np.nan)
 
         return smooth_rsi, rsi_ema
 
@@ -1643,9 +1627,19 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                     )
                     return None
                 
-                data = await resp.json(loads=json_loads)
-                SessionManager.track_request()
-                
+                try:
+                    data = await resp.json(loads=json_loads)
+                except (JSONDecodeError, TypeError, ValueError) as e:
+                    retry_stats[RetryCategory.API_ERROR] += 1
+                    logger.warning(
+                        f"Malformed JSON on 200 OK (attempt {attempt}/{retries}) | "
+                        f"URL: {url[:80]} | Error: {str(e)[:100]}"
+                    )
+                    if attempt < retries:
+                        total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
+                        await asyncio.sleep(total_delay)
+                    continue
+                SessionManager.track_request()         
                 if any(retry_stats.values()):
                     logger.info(
                         f"Fetch succeeded after retries | URL: {url[:80]} | "
@@ -1795,7 +1789,6 @@ class DataFetcher:
         self.api_base = api_base.rstrip("/")
         self._external_session = session
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
-        self.semaphore = asyncio.Semaphore(max_parallel)
         self.timeout = cfg.HTTP_TIMEOUT
         self.rate_limiter = RateLimitedFetcher(
             max_per_minute=cfg.RATE_LIMIT_PER_MINUTE,
@@ -1851,53 +1844,52 @@ class DataFetcher:
         url = f"{self.api_base}/v2/chart/history"
         limiter = self.confirm_rate_limiter if for_confirmation else self.rate_limiter
 
-        async with self.semaphore:
-            data = await limiter.call(
-                async_fetch_json,
-                url,
-                params=params,
-                retries=cfg.CANDLE_FETCH_RETRIES,
-                backoff=cfg.CANDLE_FETCH_BACKOFF,
-                timeout=self.timeout,
-            )
-        
-            if data:
-                result = data.get("result", {})
-                if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                    self.circuit_breaker.record_success()
-                    self.fetch_stats["candles"]["success"] += 1
+        data = await limiter.call(
+            async_fetch_json,
+            url,
+            params=params,
+            retries=cfg.CANDLE_FETCH_RETRIES,
+            backoff=cfg.CANDLE_FETCH_BACKOFF,
+            timeout=self.timeout,
+        )
 
-                    num_candles = len(result.get("t", []))
-                    if num_candles > 0:
-                        last_open = result["t"][-1]
-                        diff = abs(expected_open_ts - last_open)
+        if data:
+            result = data.get("result", {})
+            if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
+                self.circuit_breaker.record_success()
+                self.fetch_stats["candles"]["success"] += 1
 
-                        if diff > Constants.API_TIMESTAMP_TOLERANCE_SEC:
-                            if last_open < expected_open_ts:
-                                logger.debug(
-                                    f"⚠️ API DELAY | {symbol} {resolution} | "
-                                    f"Expected: {format_ist_time(expected_open_ts)} | "
-                                    f"Got: {format_ist_time(last_open)} "
-                                    f"(Diff: {diff}s > tolerance {Constants.API_TIMESTAMP_TOLERANCE_SEC}s)"
-                                )
-                            else:
-                                logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
-                        else:
+                num_candles = len(result.get("t", []))
+                if num_candles > 0:
+                    last_open = result["t"][-1]
+                    diff = abs(expected_open_ts - last_open)
+
+                    if diff > Constants.API_TIMESTAMP_TOLERANCE_SEC:
+                        if last_open < expected_open_ts:
                             logger.debug(
-                                f"✅ Scanned {symbol} {resolution} | "
-                                f"Latest: {format_ist_time(last_open)} | Candles: {num_candles}"
+                                f"⚠️ API DELAY | {symbol} {resolution} | "
+                                f"Expected: {format_ist_time(expected_open_ts)} | "
+                                f"Got: {format_ist_time(last_open)} "
+                                f"(Diff: {diff}s > tolerance {Constants.API_TIMESTAMP_TOLERANCE_SEC}s)"
                             )
-                    return data
-                else:
-                    logger.warning(f"Candles response missing fields | Symbol: {symbol}")
-                    self.fetch_stats["candles"]["failed"] += 1
-                    self.circuit_breaker.record_failure()
+                        else:
+                            logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
+                    else:
+                        logger.debug(
+                            f"✅ Scanned {symbol} {resolution} | "
+                            f"Latest: {format_ist_time(last_open)} | Candles: {num_candles}"
+                        )
+                return data
             else:
-                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+                logger.warning(f"Candles response missing fields | Symbol: {symbol}")
                 self.fetch_stats["candles"]["failed"] += 1
                 self.circuit_breaker.record_failure()
+        else:
+            logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+            self.fetch_stats["candles"]["failed"] += 1
+            self.circuit_breaker.record_failure()
 
-            return None
+        return None
 
     def get_stats(self) -> Dict[str, Any]:
         stats = {
@@ -1952,10 +1944,9 @@ class DataFetcher:
                 )
                 all_tasks.append(task)
                 task_metadata.append((symbol, resolution))
-
         results = await asyncio.wait_for(
             asyncio.gather(*all_tasks, return_exceptions=True),
-            timeout=cfg.HTTP_TIMEOUT * 2
+            timeout=cfg.FETCH_PHASE_TIMEOUT_SEC
         )
         output = {}
         success_count = 0
@@ -2200,6 +2191,21 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             logger.error("parse_candles_to_numpy: Rejecting data due to invalid candles")
             return None
     
+        v = data["volume"]
+        volume_error_mask = ~np.isfinite(v) | (v < 0)
+        volume_error_count = np.sum(volume_error_mask)
+
+        if volume_error_count > 0:
+            logger.error(
+                f"parse_candles_to_numpy: Found {volume_error_count} invalid volume value(s) out of {n} "
+                f"({volume_error_count / n * 100:.1f}%)"
+            )
+            vol_error_indices = np.where(volume_error_mask)[0]
+            for idx in vol_error_indices[:min(5, len(vol_error_indices))]:
+                logger.error(f"  Index {idx}: Volume={v[idx]}")
+            logger.error("parse_candles_to_numpy: Rejecting data due to invalid volume")
+            return None
+
         hl_mid = (h + l) / 2.0
         candle_range = h - l
         close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
@@ -2223,17 +2229,18 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             if cfg.REJECT_HIGH_DEVIATION:
                 logger.warning("Rejecting candle data due to high deviation (REJECT_HIGH_DEVIATION=True)")
                 return None
-    
+
         if n > 1:
             ts_diffs = np.diff(data["timestamp"])
             min_diff = np.min(ts_diffs)
             max_diff = np.max(ts_diffs)
         
             if min_diff <= 0:
-                logger.warning(
-                    f"parse_candles_to_numpy: Found non-monotonic timestamps | "
+                logger.error(
+                    f"parse_candles_to_numpy: Rejecting — non-monotonic/duplicate timestamps | "
                     f"Min diff: {min_diff}s, Max diff: {max_diff}s"
                 )
+                return None
         
             if cfg.DEBUG_MODE:
                 logger.debug(
@@ -4461,8 +4468,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"[{pair_name}] Candle unconfirmed — alert suppressed, dedup key KEPT to prevent duplicates"
                 )
                 alerts_to_send = []
-       
-        # Build new alert activations separately — do NOT add to all_state_changes yet
         new_alert_activations = []
         for _, _, alert_key in alerts_to_send:
             new_alert_activations.append(
@@ -4477,10 +4482,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
                         f"skipping {len(alerts_to_send)} alerts for {pair_name}"
                     )
-                    # Persist ONLY resets (all_state_changes has no ACTIVE yet)
                     if all_state_changes:
                         await sdb.atomic_batch_update(all_state_changes)
-                    # Release dedup claims so these alerts can retry next run
                     for _, _, alert_key in alerts_to_send:
                         await sdb.release_recent_alert(pair_name, alert_key)
                     return pair_name, {
@@ -4495,11 +4498,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     }
                 alerts_sent_ref[0] += len(alerts_to_send)
 
-        # Now safe to persist activations
-        all_state_changes.extend(new_alert_activations)
-        if all_state_changes:
-            await sdb.atomic_batch_update(all_state_changes)
-
         if alerts_to_send:          
             try:
                 if len(alerts_to_send) == 1:
@@ -4511,24 +4509,31 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 if not cfg.DRY_RUN_MODE:
                     send_success = await telegram_queue.send(msg)
-                    if not send_success:
-                        logger_pair.error(
-                            f"Alert dispatch failed | {pair_name} | "
-                            f"Dedup claim retained (delivery status unknown, not releasing)"
-                        )
-                    else:
+                    if send_success:
+                        all_state_changes.extend(new_alert_activations)
                         logger_pair.info(
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
+                    else:
+                        logger_pair.error(
+                            f"Alert dispatch failed | {pair_name} | "
+                            f"State NOT marked ACTIVE, dedup claim retained for retry next run"
+                        )
                 else:
+                    # DRY RUN: mark ACTIVE anyway so this run mirrors production dedup/reset behavior
+                    all_state_changes.extend(new_alert_activations)
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
             except Exception as e:
                 logger_pair.error(
                     f"Alert dispatch exception for {pair_name}: {e} | "
-                    f"Dedup key retained — will not retry until window expires"
+                    f"State NOT marked ACTIVE, dedup key retained — will not retry until window expires"
                 )
+
+        if all_state_changes:
+            await sdb.atomic_batch_update(all_state_changes)
+
         reasons = []
         if not buy_common and not sell_common:
             reasons.append("Trend filter blocked")
@@ -4797,17 +4802,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             indicators = None
         if context is not None:
             context = None
-        try:
-            process = psutil.Process()
-            current_memory_mb = process.memory_info().rss / 1024 / 1024
-            memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-         
-            if current_memory_mb > (memory_limit_mb * 0.8):
-                logger_pair.warning(
-                    f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
-                )
-        except Exception:
-            pass
+
+        global _pair_eval_counter
+        _pair_eval_counter += 1
+        if _pair_eval_counter % MEMORY_CHECK_INTERVAL_PAIRS == 0:
+            try:
+                process = psutil.Process()
+                current_memory_mb = process.memory_info().rss / 1024 / 1024
+                memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
+             
+                if current_memory_mb > (memory_limit_mb * 0.8):
+                    logger_pair.warning(
+                        f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
+                    )
+            except Exception:
+                pass
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN ):
@@ -5181,16 +5190,13 @@ async def run_once() -> bool:
             f"🔔 Processing {len(pairs_to_process)} pairs using optimized parallel architecture"
         )
 
-        logger_run.info("Starting evaluation phase...")
-        logger_run.debug("Garbage collection disabled during evaluation loop...")
-        
+        logger_run.info("Starting evaluation phase...")  
         alerts_sent_ref = [0] 
         all_results = await process_pairs_with_workers(
             fetcher, products_map, pairs_to_process, sdb, telegram_queue, 
             correlation_id, lock, reference_time,
             alerts_sent_ref, alerts_sent_lock, MAX_ALERTS_PER_RUN
-        )
-        await asyncio.to_thread(gc.collect) 
+        ) 
 
         logger_run.debug("Cleanup phase with normal garbage collection...")
 
