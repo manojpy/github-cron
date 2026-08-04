@@ -134,8 +134,7 @@ class Constants:
     MIN_CANDLE_AGE_FROM_OPEN = 850
     MIN_BODY_RATIO = 0.30
     HIGH_DEVIATION_THRESHOLD = 0.5
-    MIN_ATR_PARTICIPATION = 0.25
-
+    
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
@@ -2004,7 +2003,7 @@ def validate_indicator_values(indicators_dict: Dict[str, float], names: List[str
             return False, f"{name} is NaN"
     return True, "OK"
 
-def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: int, reference_time: int, pair_name: str, min_wick_ratio: float = 0.20, indicators: Optional[Dict[str, np.ndarray]] = None, atr_key: str = "atr_long", atr_window: int = 14, min_atr_participation: float = Constants.MIN_ATR_PARTICIPATION) -> Tuple[bool, bool, Optional[Dict[str, Any]], Optional[str]]:
+def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: int, reference_time: int, pair_name: str, min_wick_ratio: float = 0.20) -> Tuple[bool, bool, Optional[Dict[str, Any]], Optional[str]]:
     try:
         o = float(data_15m["open"][candle_index])
         h = float(data_15m["high"][candle_index])
@@ -2076,21 +2075,6 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if candle_range < 1e-9:
         return False, False, None, f"Zero-range candle (H={h:.4f} L={l:.4f})"
     
-    atr_mean = np.nan
-    range_vs_atr = np.nan
-    participation_ok = True  # fail OPEN: no ATR data shouldn't block existing behavior
-
-    if indicators is not None:
-        atr_array = indicators.get(atr_key)
-        if atr_array is not None and len(atr_array) > candle_index:
-            start_idx = max(0, candle_index - atr_window + 1)
-            atr_slice = atr_array[start_idx : candle_index + 1]
-            if len(atr_slice) > 0 and not np.all(np.isnan(atr_slice)):
-                atr_mean = float(np.nanmean(atr_slice))
-                if atr_mean > 0:
-                    range_vs_atr = candle_range / atr_mean
-                    participation_ok = range_vs_atr >= min_atr_participation
-    
     if c > o:
         is_green = True
         is_red = False
@@ -2125,8 +2109,8 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     upper_wick_ratio = upper_wick / candle_range
     lower_wick_ratio = lower_wick / candle_range
 
-    is_valid_for_buy  = (is_green and upper_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO and participation_ok)
-    is_valid_for_sell = (is_red   and lower_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO and participation_ok)
+    is_valid_for_buy  = (is_green and upper_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO)
+    is_valid_for_sell = (is_red   and lower_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO)
 
     candle_info = {
         "timestamp": ts,
@@ -2147,13 +2131,9 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         "lower_wick_ratio": lower_wick_ratio,
         "candle_age_seconds": candle_age,
         "time_since_closed": time_since_candle_closed,
-        "atr_mean": atr_mean,
-        "range_vs_atr": range_vs_atr,
-        "participation_ok": participation_ok,
         "is_valid_for_buy": is_valid_for_buy,
         "is_valid_for_sell": is_valid_for_sell,
     }
-
     if not is_valid_for_buy and not is_valid_for_sell:
         if is_green:
             reason = (
@@ -2167,10 +2147,6 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             )
         else:
             reason = f"DOJI candle rejected: body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
-        
-        if not participation_ok:
-            reason += f" | Low ATR participation: range/ATR={range_vs_atr:.2f} < {min_atr_participation}"
-        
         return False, False, candle_info, reason
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
@@ -3779,22 +3755,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(f"[{pair_name}] Selected candle not stable, skipping alerts.")
             return None
  
-        atr_long_arr = calculate_atr_rma(
-            data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
-        )
-        indicators_for_validation = {"atr_long": atr_long_arr}
-
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m,
             candle_index=i15,
             reference_time=reference_time,
             pair_name=pair_name,
-            min_wick_ratio=Constants.MIN_WICK_RATIO,
-            indicators=indicators_for_validation,
-            atr_key="atr_long",
-            atr_window=14,
-            min_atr_participation=Constants.MIN_ATR_PARTICIPATION
+            min_wick_ratio=Constants.MIN_WICK_RATIO
         )
+   
         if not is_valid_for_buy and not is_valid_for_sell:
             if candle_info is None:
                 logger_pair.debug(
@@ -4677,7 +4645,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
 
-        # ═════════════════════════════════════════════════════════════════════��═
+        # ═══════════════════════════════════════════════════════════════════════
         # DEFENSE-IN-DEPTH: independent re-derivation from raw arrays
         # ═══════════════════════════════════════════════════════════════════════
         alerts_to_send = _dispatch_independent_guard(
