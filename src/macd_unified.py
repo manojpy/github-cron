@@ -2577,7 +2577,7 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
             not _price_match(fl, l) or not _price_match(fc, c)):
 
             logger_pair.warning(
-                f"[{pair_name}] 🔁 Candle CHANGED since first fetch — repaint detected, suppressing alert | "
+                f"[{pair_name}] ���� Candle CHANGED since first fetch — repaint detected, suppressing alert | "
                 f"First: O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
                 f"Now:   O={fo:.4f} H={fh:.4f} L={fl:.4f} C={fc:.4f}"
             )
@@ -3788,6 +3788,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     timestamps_15m = None
     indicators = None
     ppo = None
+    gate_indicators = None
     ppo_signal = None
     smooth_rsi = None
     vwap = None
@@ -3806,6 +3807,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(f"[{pair_name}] Selected candle not stable, skipping alerts.")
             return None
  
+        gate_indicators = await asyncio.to_thread(
+            calculate_gate_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+        )
+        if gate_indicators is None:
+            logger_pair.error(f"Skipping {pair_name}: gate indicators failed")
+            return None
+
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m,
             candle_index=i15,
@@ -3942,16 +3950,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"Close={data_5m['close'][i5]:.2f}"
         )
 
-        # ═══════════════════════════════════════════════════════
-        # PHASE 1 — Gate indicators only (cheap)
-        # ═══════════════════════════════════════════════════════
-        gate_indicators = await asyncio.to_thread(
-            calculate_gate_indicators_numpy, data_15m, data_5m, data_daily, reference_time
-        )
-        if gate_indicators is None:
-            logger_pair.error(f"Skipping {pair_name}: gate indicators failed")
-            return None
-
         # ── Extract gate values ──
         rma50_15 = gate_indicators["rma50_15"]
         rma200_5 = gate_indicators["rma200_5"]
@@ -3964,7 +3962,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         fast_ichimoku_cloud_upper = gate_indicators["fast_ichimoku_cloud_upper"]
         fast_ichimoku_cloud_lower = gate_indicators["fast_ichimoku_cloud_lower"]
         fast_ichimoku_conversion_line = gate_indicators["fast_ichimoku_conversion_line"]
-        adx_arr = gate_indicators["adx"]
         adx_arr = gate_indicators["adx"]
         atr_short_arr = gate_indicators["atr_short"]
         atr_long_arr = gate_indicators["atr_long"]
