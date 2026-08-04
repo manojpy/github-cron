@@ -134,7 +134,8 @@ class Constants:
     MIN_CANDLE_AGE_FROM_OPEN = 850
     MIN_BODY_RATIO = 0.30
     HIGH_DEVIATION_THRESHOLD = 0.5
-    
+    MIN_ATR_PARTICIPATION = 0.5 
+
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
@@ -2003,7 +2004,7 @@ def validate_indicator_values(indicators_dict: Dict[str, float], names: List[str
             return False, f"{name} is NaN"
     return True, "OK"
 
-def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: int, reference_time: int, pair_name: str, min_wick_ratio: float = Constants.MIN_WICK_RATIO, indicators: Optional[Dict[str, np.ndarray]] = None, atr_key: str = "atr_long", atr_window: int = 14) -> Tuple[bool, bool, Optional[Dict[str, Any]], Optional[str]]:
+def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: int, reference_time: int, pair_name: str, min_wick_ratio: float = 0.20, indicators: Optional[Dict[str, np.ndarray]] = None, atr_key: str = "atr_long", atr_window: int = 14, min_atr_participation: float = Constants.MIN_ATR_PARTICIPATION) -> Tuple[bool, bool, Optional[Dict[str, Any]], Optional[str]]:
     try:
         o = float(data_15m["open"][candle_index])
         h = float(data_15m["high"][candle_index])
@@ -2015,10 +2016,10 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         return False, False, None, f"Data access error: {e}"
     
     if any(np.isnan([o, h, l, c])) or any(np.isinf([o, h, l, c])):
-        return False, False, None, "Invalid OHLC: contains NaN or Inf"
+        return False, False, None, f"Invalid OHLC: contains NaN or Inf"
     
     if any(x <= 0 for x in [o, h, l, c]):
-        return False, False, None, "Invalid OHLC: non-positive values"
+        return False, False, None, f"Invalid OHLC: non-positive values"
     
     if not (l <= o <= h and l <= c <= h):
         return False, False, None, f"Invalid OHLC: relationships broken (O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f})"
@@ -2067,14 +2068,28 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         if abs(next_candle_ts - expected_next_ts) > 60:
             return False, False, None, ( 
                 f"Gap detected: Expected next candle at {format_ist_time(expected_next_ts)} " 
-                f"but found at {format_ist_time(next_candle_ts)} "
-                f"(diff={abs(next_candle_ts - expected_next_ts)}s). Data may be incomplete." 
+                f"but found at {format_ist_time(next_candle_ts)} " f"(diff={abs(next_candle_ts - expected_next_ts)}s). Data may be incomplete." 
             )
 
     candle_range = h - l
     
     if candle_range < 1e-9:
         return False, False, None, f"Zero-range candle (H={h:.4f} L={l:.4f})"
+    
+    atr_mean = np.nan
+    range_vs_atr = np.nan
+    participation_ok = True  # fail OPEN: no ATR data shouldn't block existing behavior
+
+    if indicators is not None:
+        atr_array = indicators.get(atr_key)
+        if atr_array is not None and len(atr_array) > candle_index:
+            start_idx = max(0, candle_index - atr_window + 1)
+            atr_slice = atr_array[start_idx : candle_index + 1]
+            if len(atr_slice) > 0 and not np.all(np.isnan(atr_slice)):
+                atr_mean = float(np.nanmean(atr_slice))
+                if atr_mean > 0:
+                    range_vs_atr = candle_range / atr_mean
+                    participation_ok = range_vs_atr >= min_atr_participation
     
     if c > o:
         is_green = True
@@ -2110,40 +2125,8 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     upper_wick_ratio = upper_wick / candle_range
     lower_wick_ratio = lower_wick / candle_range
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # ADAPTIVE THRESHOLDS — ATR regime scaling
-    # ═══════════════════════════════════════════════════════════════════════
-    min_body_threshold = Constants.MIN_BODY_RATIO
-    max_wick_threshold = min_wick_ratio
-    atr_mean = np.nan
-    atr_ratio = np.nan
-
-    if indicators is not None:
-        atr_array = indicators.get(atr_key)
-        if atr_array is not None and len(atr_array) > candle_index:
-            start_idx = max(0, candle_index - atr_window + 1)
-            atr_slice = atr_array[start_idx : candle_index + 1]
-            
-            if len(atr_slice) > 0 and not np.all(np.isnan(atr_slice)):
-                atr_mean = float(np.nanmean(atr_slice))
-                
-                if candle_range > 1e-9 and not np.isnan(atr_mean) and atr_mean > 0:
-                    atr_ratio = atr_mean / candle_range
-                    # Candle smaller than average ATR (tight bar in volatile regime)
-                    if atr_ratio >= 1.0:
-                        min_body_threshold = Constants.MIN_BODY_RATIO * 0.8
-                        max_wick_threshold = min_wick_ratio * 1.2
-
-    is_valid_for_buy  = (
-        is_green
-        and upper_wick_ratio < max_wick_threshold
-        and body_ratio >= min_body_threshold
-    )
-    is_valid_for_sell = (
-        is_red
-        and lower_wick_ratio < max_wick_threshold
-        and body_ratio >= min_body_threshold
-    )
+    is_valid_for_buy  = (is_green and upper_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO and participation_ok)
+    is_valid_for_sell = (is_red   and lower_wick_ratio < min_wick_ratio and body_ratio >= Constants.MIN_BODY_RATIO and participation_ok)
 
     candle_info = {
         "timestamp": ts,
@@ -2164,43 +2147,43 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
         "lower_wick_ratio": lower_wick_ratio,
         "candle_age_seconds": candle_age,
         "time_since_closed": time_since_candle_closed,
+        "atr_mean": atr_mean,
+        "range_vs_atr": range_vs_atr,
+        "participation_ok": participation_ok,
         "is_valid_for_buy": is_valid_for_buy,
         "is_valid_for_sell": is_valid_for_sell,
-        # Adaptive metadata for downstream guards / logging
-        "atr_mean": atr_mean,
-        "atr_ratio": atr_ratio,
-        "min_body_threshold": min_body_threshold,
-        "max_wick_threshold": max_wick_threshold,
     }
 
     if not is_valid_for_buy and not is_valid_for_sell:
         if is_green:
             reason = (
                 f"GREEN candle rejected: upper wick {upper_wick_ratio*100:.1f}% "
-                f"≥ {max_wick_threshold*100:.0f}% or body {body_ratio*100:.1f}% < {min_body_threshold*100:.0f}%"
+                f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
             )
         elif is_red:
             reason = (
                 f"RED candle rejected: lower wick {lower_wick_ratio*100:.1f}% "
-                f"≥ {max_wick_threshold*100:.0f}% or body {body_ratio*100:.1f}% < {min_body_threshold*100:.0f}%"
+                f"≥ {min_wick_ratio*100:.0f}% or body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
             )
         else:
-            reason = f"DOJI candle rejected: body {body_ratio*100:.1f}% < {min_body_threshold*100:.0f}%"
+            reason = f"DOJI candle rejected: body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
+        
+        if not participation_ok:
+            reason += f" | Low ATR participation: range/ATR={range_vs_atr:.2f} < {min_atr_participation}"
+        
         return False, False, candle_info, reason
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
 
-def independent_candle_validation(data_15m: Dict[str, np.ndarray], i15: int, intended_signal: str,  min_body: float = Constants.MIN_BODY_RATIO, max_wick: float = Constants.MIN_WICK_RATIO) -> Tuple[bool, str]:
-    """
-    Defense-in-depth check: Re-derives candle properties directly from raw 
-    data arrays at dispatch time to prevent cache/state bugs.
-    """
+def independent_candle_validation(data_15m: Dict[str, np.ndarray], i15: int, intended_signal: str) -> Tuple[bool, str]:
     try:
+        # 1. Pull directly from raw arrays
         o = float(data_15m["open"][i15])
         h = float(data_15m["high"][i15])
         l = float(data_15m["low"][i15])
         c = float(data_15m["close"][i15])
         
+        # 2. Re-calculate core metrics independently
         candle_range = h - l
         if candle_range < 1e-9:
             return False, "Validation Failed: Zero-range candle."
@@ -2216,6 +2199,11 @@ def independent_candle_validation(data_15m: Dict[str, np.ndarray], i15: int, int
         is_green = c > o
         is_red = c < o
 
+        # 3. Fetch constants directly
+        min_body = Constants.MIN_BODY_RATIO
+        max_wick = Constants.MIN_WICK_RATIO
+
+        # 4. Strict assertion based on intended signal
         if intended_signal == "BUY":
             if not is_green:
                 return False, f"Validation Failed: Intended BUY but candle is not genuinely GREEN (O:{o:.4f}, C:{c:.4f})"
@@ -2241,48 +2229,33 @@ def independent_candle_validation(data_15m: Dict[str, np.ndarray], i15: int, int
         return False, f"Validation crashed: {e}"
 
 def _dispatch_independent_guard(data_15m: Dict[str, np.ndarray], i15: int, alerts: List[Tuple[str, str, str]], cached_candle_info: Dict[str, Any], pair_name: str, logger_pair: logging.Logger) -> List[Tuple[str, str, str]]:
-    """
-    Final air-gap before dedup/dispatch.  Runs independent_candle_validation
-    per-alert.  Logs CRITICAL if cached candle_info disagrees with reality.
-    """
-    filtered: List[Tuple[str, str, str]] = []
+    buy_ok, buy_reason = independent_candle_validation(data_15m, i15, "BUY")
+    sell_ok, sell_reason = independent_candle_validation(data_15m, i15, "SELL")
 
-    # Use the same adaptive thresholds the main validator used
-    min_body = cached_candle_info.get("min_body_threshold", Constants.MIN_BODY_RATIO)
-    max_wick = cached_candle_info.get("max_wick_threshold", Constants.MIN_WICK_RATIO)
+    filtered: List[Tuple[str, str, str]] = []
 
     for title, extra, alert_key in alerts:
         if alert_key in BUY_ALERT_KEYS:
-            intended = "BUY"
+            intended, ok = "BUY", buy_ok
+            cache_flag = cached_candle_info.get("is_valid_for_buy")
         elif alert_key in SELL_ALERT_KEYS:
-            intended = "SELL"
+            intended, ok = "SELL", sell_ok
+            cache_flag = cached_candle_info.get("is_valid_for_sell")
         else:
-            logger_pair.warning(
-                f"[{pair_name}] Independent guard: {alert_key} not in BUY/SELL sets, skipping"
-            )
+            logger_pair.warning(f"[{pair_name}] {alert_key} not in BUY/SELL sets, skipping")
             continue
 
-        ok, reason = independent_candle_validation(
-            data_15m, i15, intended,
-            min_body=min_body,
-            max_wick=max_wick,
-        )
         if not ok:
             logger_pair.critical(
-                f"[{pair_name}] INDEPENDENT GUARD BLOCKED {alert_key}: {reason}"
+                f"[{pair_name}] INDEPENDENT GUARD BLOCKED {alert_key}: {buy_reason if intended=='BUY' else sell_reason}"
             )
             continue
 
-        # Cross-check: detect if cached candle_info has drifted/corrupted
-        if intended == "BUY" and not cached_candle_info.get("is_valid_for_buy"):
+        # Canary: if this fires, you have a state-management bug to fix
+        if not cache_flag:
             logger_pair.critical(
-                f"[{pair_name}] CACHE CORRUPTION DETECTED: independent validation "
-                f"says BUY OK for {alert_key}, but cached is_valid_for_buy=False"
-            )
-        elif intended == "SELL" and not cached_candle_info.get("is_valid_for_sell"):
-            logger_pair.critical(
-                f"[{pair_name}] CACHE CORRUPTION DETECTED: independent validation "
-                f"says SELL OK for {alert_key}, but cached is_valid_for_sell=False"
+                f"[{pair_name}] CACHE MISMATCH for {alert_key}: "
+                f"independent={intended}_OK, cached flag=False — investigate upstream"
             )
 
         filtered.append((title, extra, alert_key))
@@ -2577,7 +2550,7 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
             not _price_match(fl, l) or not _price_match(fc, c)):
 
             logger_pair.warning(
-                f"[{pair_name}] ���� Candle CHANGED since first fetch — repaint detected, suppressing alert | "
+                f"[{pair_name}] 🔁 Candle CHANGED since first fetch — repaint detected, suppressing alert | "
                 f"First: O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
                 f"Now:   O={fo:.4f} H={fh:.4f} L={fl:.4f} C={fc:.4f}"
             )
@@ -3788,7 +3761,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
     timestamps_15m = None
     indicators = None
     ppo = None
-    gate_indicators = None
     ppo_signal = None
     smooth_rsi = None
     vwap = None
@@ -3807,22 +3779,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(f"[{pair_name}] Selected candle not stable, skipping alerts.")
             return None
  
-        gate_indicators = await asyncio.to_thread(
-            calculate_gate_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+        atr_long_arr = calculate_atr_rma(
+            data_15m["high"], data_15m["low"], data_15m["close"], cfg.ATR_LONG
         )
-        if gate_indicators is None:
-            logger_pair.error(f"Skipping {pair_name}: gate indicators failed")
-            return None
+        indicators_for_validation = {"atr_long": atr_long_arr}
 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m,
             candle_index=i15,
             reference_time=reference_time,
             pair_name=pair_name,
-            min_wick_ratio=Constants.MIN_WICK_RATIO, 
-            indicators=gate_indicators, 
+            min_wick_ratio=Constants.MIN_WICK_RATIO,
+            indicators=indicators_for_validation,
+            atr_key="atr_long",
+            atr_window=14,
+            min_atr_participation=Constants.MIN_ATR_PARTICIPATION
         )
-   
         if not is_valid_for_buy and not is_valid_for_sell:
             if candle_info is None:
                 logger_pair.debug(
@@ -3949,6 +3921,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"Open={format_ist_time(actual_5m_ts)} | i5={i5} | "
             f"Close={data_5m['close'][i5]:.2f}"
         )
+
+        # ═══════════════════════════════════════════════════════
+        # PHASE 1 — Gate indicators only (cheap)
+        # ═══════════════════════════════════════════════════════
+        gate_indicators = await asyncio.to_thread(
+            calculate_gate_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+        )
+        if gate_indicators is None:
+            logger_pair.error(f"Skipping {pair_name}: gate indicators failed")
+            return None
 
         # ── Extract gate values ──
         rma50_15 = gate_indicators["rma50_15"]
@@ -4695,7 +4677,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
 
-        # ═══════════════════════════════════════════════════════════════════════
+        # ═════════════════════════════════════════════════════════════════════��═
         # DEFENSE-IN-DEPTH: independent re-derivation from raw arrays
         # ═══════════════════════════════════════════════════════════════════════
         alerts_to_send = _dispatch_independent_guard(
