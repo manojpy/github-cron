@@ -2151,6 +2151,109 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
 
+def independent_candle_validation(
+    data_15m: Dict[str, np.ndarray],
+    i15: int,
+    intended_signal: str
+) -> Tuple[bool, str]:
+    """
+    Defense-in-depth check: Re-derives candle properties directly from raw 
+    data arrays at dispatch time to prevent cache/state bugs.
+    """
+    try:
+        # 1. Pull directly from raw arrays
+        o = float(data_15m["open"][i15])
+        h = float(data_15m["high"][i15])
+        l = float(data_15m["low"][i15])
+        c = float(data_15m["close"][i15])
+        
+        # 2. Re-calculate core metrics independently
+        candle_range = h - l
+        if candle_range < 1e-9:
+            return False, "Validation Failed: Zero-range candle."
+
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+
+        body_ratio = body / candle_range
+        upper_wick_ratio = upper_wick / candle_range
+        lower_wick_ratio = lower_wick / candle_range
+        
+        is_green = c > o
+        is_red = c < o
+
+        # 3. Fetch constants directly
+        min_body = Constants.MIN_BODY_RATIO
+        max_wick = Constants.MIN_WICK_RATIO
+
+        # 4. Strict assertion based on intended signal
+        if intended_signal == "BUY":
+            if not is_green:
+                return False, f"Validation Failed: Intended BUY but candle is not genuinely GREEN (O:{o:.4f}, C:{c:.4f})"
+            if upper_wick_ratio >= max_wick:
+                return False, f"Validation Failed: Intended BUY but upper wick ratio {upper_wick_ratio:.2f} >= {max_wick}"
+            if body_ratio < min_body:
+                return False, f"Validation Failed: Intended BUY but body ratio {body_ratio:.2f} < {min_body}"
+                
+        elif intended_signal == "SELL":
+            if not is_red:
+                return False, f"Validation Failed: Intended SELL but candle is not genuinely RED (O:{o:.4f}, C:{c:.4f})"
+            if lower_wick_ratio >= max_wick:
+                return False, f"Validation Failed: Intended SELL but lower wick ratio {lower_wick_ratio:.2f} >= {max_wick}"
+            if body_ratio < min_body:
+                return False, f"Validation Failed: Intended SELL but body ratio {body_ratio:.2f} < {min_body}"
+        
+        else:
+            return False, f"Validation Failed: Unknown signal type '{intended_signal}'"
+
+        return True, "Passed"
+
+    except (IndexError, KeyError, ValueError, TypeError) as e:
+        return False, f"Validation crashed: {e}"
+
+def _dispatch_independent_guard(
+    data_15m: Dict[str, np.ndarray],
+    i15: int,
+    alerts: List[Tuple[str, str, str]],
+    cached_candle_info: Dict[str, Any],
+    pair_name: str,
+    logger_pair: logging.Logger,
+) -> List[Tuple[str, str, str]]:
+    # Validate each direction exactly once
+    buy_ok, buy_reason = independent_candle_validation(data_15m, i15, "BUY")
+    sell_ok, sell_reason = independent_candle_validation(data_15m, i15, "SELL")
+
+    filtered: List[Tuple[str, str, str]] = []
+
+    for title, extra, alert_key in alerts:
+        if alert_key in BUY_ALERT_KEYS:
+            intended, ok = "BUY", buy_ok
+            cache_flag = cached_candle_info.get("is_valid_for_buy")
+        elif alert_key in SELL_ALERT_KEYS:
+            intended, ok = "SELL", sell_ok
+            cache_flag = cached_candle_info.get("is_valid_for_sell")
+        else:
+            logger_pair.warning(f"[{pair_name}] {alert_key} not in BUY/SELL sets, skipping")
+            continue
+
+        if not ok:
+            logger_pair.critical(
+                f"[{pair_name}] INDEPENDENT GUARD BLOCKED {alert_key}: {buy_reason if intended=='BUY' else sell_reason}"
+            )
+            continue
+
+        # Canary: if this fires, you have a state-management bug to fix
+        if not cache_flag:
+            logger_pair.critical(
+                f"[{pair_name}] CACHE MISMATCH for {alert_key}: "
+                f"independent={intended}_OK, cached flag=False — investigate upstream"
+            )
+
+        filtered.append((title, extra, alert_key))
+
+    return filtered
+
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     try:   
         if not result or not isinstance(result, dict):
@@ -4558,6 +4661,28 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             pivot_alerts = [(t, e, k) for t, e, k in alerts_to_send if k.startswith("pivot_")][:3]
             other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
             alerts_to_send = other_alerts + pivot_alerts
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # DEFENSE-IN-DEPTH: independent re-derivation from raw arrays
+        # ═══════════════════════════════════════════════════════════════════════
+        alerts_to_send = _dispatch_independent_guard(
+            data_15m=data_15m,
+            i15=i15,
+            alerts=alerts_to_send,
+            cached_candle_info=candle_info,  # the dict from validate_candle_for_alerts
+            pair_name=pair_name,
+            logger_pair=logger_pair,
+        )
+
+        # ── Deduplication (only for alerts that survived the independent guard) ──
+        filtered_alerts = []
+        for alert_title, alert_extra, alert_key in alerts_to_send:
+            should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
+            if not should_send:
+                logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
+                continue
+            filtered_alerts.append((alert_title, alert_extra, alert_key))
+        alerts_to_send = filtered_alerts
 
         filtered_alerts = []
         for alert_title, alert_extra, alert_key in alerts_to_send:
