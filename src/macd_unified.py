@@ -155,7 +155,7 @@ class BotConfig(BaseModel):
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     REDIS_URL: str = Field(..., min_length=1)
     DELTA_API_BASE: str = Field(..., min_length=1)
-    DEBUG_MODE: bool = Field(default=False, env='DEBUG_MODE')
+    DEBUG_MODE: bool = Field(default=False)
     SEND_TEST_MESSAGE: bool = Field(default=True, description="Send test message on startup")
     BOT_NAME: str = "Unified Alert Bot"
     PAIRS: List[str] = Field(default=["ETHUSD", "AVAXUSD", "XRPUSD", "BNBUSD", "LTCUSD", "DOTUSD", "ADAUSD", "SUIUSD", "AAVEUSD", "SOLUSD", "PAXGUSD", "PIPPINUSD", "RIVERUSD", "BLESSUSD", "BASEDUSD","SKYAIUSD","HUSD","EDENUSD","XAUTUSD", "ZECUSD", "LABUSD", "BTCUSD", "LINKUSD", "ARBUSD", "KITEUSD", "VVVUSD", "BEATUSD", "BILLUSD", "BCHUSD", "WLDUSD" ], min_length=1) 
