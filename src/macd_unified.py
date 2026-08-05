@@ -4008,19 +4008,53 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         atr_short_val = atr_short_arr[i15]
         atr_long_val = atr_long_arr[i15]
 
-        adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
-        adx_rising = (
-            not np.isnan(adx_val) and not np.isnan(adx_prev)
-            and adx_prev > 0 and adx_val > adx_prev
+        # ── ATR ratio helpers ──
+        atr_ratio_valid = (
+            not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9
         )
+        atr_ratio = (atr_short_val / atr_long_val) if atr_ratio_valid else float('nan')
+
+        # ── Adaptive threshold lookup ──
+        adaptive_threshold = None
+        if cfg.ATR_ADAPTIVE_ENABLED:
+            adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg)
+
+        # ── Volume EMA check (needed for momentum) ──
+        volume_curr = data_15m["volume"][i15]
+        volume_ema_curr = volume_ema_arr[i15]
+        if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
+            volume_above_ema_ok = volume_curr > volume_ema_curr
+        else:
+            volume_above_ema_ok = False
+
+        # ── Static RVOL ──
+        rvol_bypass_ok = atr_ratio_valid and (atr_ratio >= cfg.RVOL_THRESHOLD)
+
+        # ── Adaptive RVOL ──
         adaptive_rvol_check = (
             atr_ratio_valid
             and adaptive_threshold is not None
             and atr_ratio >= adaptive_threshold
         )
 
+        # ── Market volatility filter: ADX OR static RVOL OR adaptive RVOL ──
+        adx_pass = adx_raw_check if cfg.ENABLE_ADX_FILTER else False
+        rvol_static_pass = rvol_bypass_ok if cfg.ENABLE_RVOL_ALERT else False
+        rvol_adaptive_pass = adaptive_rvol_check  # False if ATR_ADAPTIVE_ENABLED=False
+
+        any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
+        volatility_filter_ok = (not any_vol_feature_enabled) or adx_pass or rvol_static_pass or rvol_adaptive_pass
+
+        # ── ADX rising check ──
+        adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
+        adx_rising = (
+            not np.isnan(adx_val) and not np.isnan(adx_prev)
+            and adx_prev > 0 and adx_val > adx_prev
+        )
+
+        # ── CPR momentum conditions (5 total) ──
         momentum_conditions = [
-            adx_bypass_ok,        # 1. ADX >= ADX_THRESHOLD
+            adx_bypass_ok,         # 1. ADX >= threshold
             adx_rising,            # 2. ADX rising vs prior bar
             rvol_bypass_ok,        # 3. Static RVOL >= RVOL_THRESHOLD
             adaptive_rvol_check,   # 4. Adaptive RVOL >= percentile-based threshold
@@ -4036,9 +4070,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             move_from_prev_close_ok = False
 
         if cfg.ENABLE_CPR:
-            if cpr_ok:
+            if cpr_ok:  # Narrow CPR: any 3 of 5
                 effective_cpr_ok = momentum_count >= 3
-            else:  # Wide CPR: 3 of 5 AND >= CPR_WIDE_MIN_PCT_MOVE from prior day's close
+            else:       # Wide CPR: any 3 of 5 + price move threshold
                 effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
         else:
             effective_cpr_ok = True
@@ -4054,52 +4088,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
                 f"NR_CPR={nr_cpr:.4f}"
             )
-        volume_curr = data_15m["volume"][i15]
-        volume_ema_curr = volume_ema_arr[i15]
-        if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
-            volume_above_ema_ok = volume_curr > volume_ema_curr
-        else:
-            volume_above_ema_ok = False
 
-        # ── CPR momentum conditions ──
-        adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
-        adx_rising = (
-            not np.isnan(adx_val) and not np.isnan(adx_prev)
-            and adx_prev > 0 and adx_val > adx_prev
-        )
-
-        momentum_conditions = [
-            adx_bypass_ok,
-            adx_rising,
-            rvol_bypass_ok,
-            volume_above_ema_ok,
-        ]
-        momentum_count = sum(momentum_conditions)
-
-        if not np.isnan(prev_day_close) and prev_day_close > 0:
-            pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
-            move_from_prev_close_ok = pct_move_from_prev_close >= cfg.CPR_WIDE_MIN_PCT_MOVE
-        else:
-            pct_move_from_prev_close = float('nan')
-            move_from_prev_close_ok = False
-
-        if cfg.ENABLE_CPR:
-            if cpr_ok:  # Narrow CPR: any 2 of 4
-                effective_cpr_ok = momentum_count >= 2
-            else: 
-                effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
-        else:
-            effective_cpr_ok = True
-
-        if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
+        if cfg.DEBUG_MODE:
+            ratio_str = f"{atr_ratio:.3f}" if atr_ratio_valid else "n/a"
             logger_pair.debug(
-                f"[{pair_name}] CPR {'narrow' if cpr_ok else 'WIDE'} | "
-                f"effective={effective_cpr_ok} | momentum={momentum_count}/4 "
-                f"(adx={adx_val:.1f}[{adx_bypass_ok},{adx_rising}], "
-                f"rvol={rvol_bypass_ok}, vol_ema={volume_above_ema_ok}) | "
-                f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
-                f"NR_CPR={nr_cpr:.4f}"
+                f"[{pair_name}] Volatility filter | "
+                f"ratio={ratio_str} | "
+                f"static={cfg.RVOL_THRESHOLD:.3f}[{rvol_bypass_ok}] | "
+                f"adaptive={adaptive_threshold:.3f if adaptive_threshold else None}[{adaptive_rvol_check}] | "
+                f"adx={adx_val:.1f}[{adx_pass}] | "
+                f"market_filter={volatility_filter_ok}"
             )
+
         ppo_gate_curr = ppo_gate_arr[i15]
         ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
         ppo_gate_sig_curr = ppo_gate_signal_arr[i15]
