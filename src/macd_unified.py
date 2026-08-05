@@ -4198,17 +4198,18 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
         trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
 
+        volatility_filter_ok = adx_ok or rvol_bypass_ok or adaptive_rvol_check
+
         buy_common = (
             base_buy_trend and is_valid_for_buy
-            and (adx_ok or rvol_ok) and effective_cpr_ok
+            and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_buy
         )
         sell_common = (
             base_sell_trend and is_valid_for_sell
-            and (adx_ok or rvol_ok) and effective_cpr_ok
+            and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_sell
         )
-
         # ═══════════════════════════════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
         # ═══════════════════════════════════════════════════════
@@ -4219,8 +4220,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 reasons.append("base_trend=False")
             if not confirmation_buy and not confirmation_sell:
                 reasons.append("cloud_align=False")
-            if not (adx_ok or rvol_ok):
-                reasons.append(f"market_filter=False (adx={adx_val:.1f})")
+            if not volatility_filter_ok:
+                reasons.append(
+                    f"market_filter=False (adx={adx_val:.1f}, "
+                    f"rvol_static={rvol_bypass_ok}, rvol_adaptive={adaptive_rvol_check})"
+                )
             if not effective_cpr_ok:
                 reasons.append("cpr=False")
             if not trend_gate_ok_buy and not trend_gate_ok_sell:
@@ -5351,7 +5355,7 @@ async def run_once() -> bool:
                     await sdb.set_metadata(day_tracker_key, current_date_str)
                     logger_run.info(f"✅ Daily reset complete ({current_date_str})")
                 except Exception as e:
-                    logger_run.error(f"⚠�� Failed to save reset date: {e}")
+                    logger_run.error(f"⚠��� Failed to save reset date: {e}")
             else:
                 logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
 
