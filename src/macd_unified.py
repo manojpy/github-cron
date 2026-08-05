@@ -236,7 +236,12 @@ class BotConfig(BaseModel):
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     MAX_ALERTS_PER_RUN: int = Field(default=50, ge=10, le=200)  
     PIVOT_MAX_DISTANCE_PCT: float = Field(default=1.0)  # Max distance from pivot to trigger alert (1.5%)
-    RVOL_THRESHOLD: float = Field(default=1.0, ge=0.5, le=2.0)  # Volatility expansion threshold (1.0=baseline, 1.5=50% expansion required)   
+    RVOL_THRESHOLD: float = Field(default=1.0, ge=0.5, le=2.0)  # Volatility expansion threshold (1.0=baseline, 1.5=50% expansion required) 
+    ATR_ADAPTIVE_ENABLED: bool = Field(default=True)
+    ATR_PCTL_LOOKBACK: int = Field(default=96, ge=20, le=500)
+    ATR_PCTL_MIN_HISTORY: int = Field(default=50, ge=10, le=400)
+    ADAPTIVE_MULT_CALM: float = Field(default=0.85, ge=0.1, le=2.0)
+    ADAPTIVE_MULT_VOLATILE: float = Field(default=1.4, ge=0.5, le=3.0)
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX directional movement calculation period
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
     ADX_THRESHOLD: float = Field(default=18.0, ge=5.0, le=50.0)  # ADX trend strength threshold (18=moderate, higher=stronger)   
@@ -285,6 +290,21 @@ class BotConfig(BaseModel):
         if not (1 <= v <= 100):
             raise ValueError(f'PPO parameter must be 1-100, got {v}')
         return v
+
+    @model_validator(mode='after')
+    def validate_adaptive_rvol(self) -> 'BotConfig':
+        if self.ATR_ADAPTIVE_ENABLED:
+            if self.ATR_PCTL_MIN_HISTORY >= self.ATR_PCTL_LOOKBACK:
+                raise ValueError(
+                    f'ATR_PCTL_MIN_HISTORY ({self.ATR_PCTL_MIN_HISTORY}) must be < '
+                    f'ATR_PCTL_LOOKBACK ({self.ATR_PCTL_LOOKBACK})'
+                )
+            if self.ADAPTIVE_MULT_CALM >= self.ADAPTIVE_MULT_VOLATILE:
+                raise ValueError(
+                    f'ADAPTIVE_MULT_CALM ({self.ADAPTIVE_MULT_CALM}) must be < '
+                    f'ADAPTIVE_MULT_VOLATILE ({self.ADAPTIVE_MULT_VOLATILE})'
+                )
+        return self
     
     @model_validator(mode='after')
     def validate_ppo_ordering(self) -> 'BotConfig':
@@ -1433,6 +1453,33 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
             return False, f"Length mismatch in '{key}': {len(arr)} != {expected_len}"
     
     return True, None
+
+def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+    if not cfg.ATR_ADAPTIVE_ENABLED:
+        return None
+
+    lookback = cfg.ATR_PCTL_LOOKBACK
+    start = i15 - lookback
+    if start < 0:
+        return None
+
+    window = atr_long_arr[start:i15]
+    valid = window[~np.isnan(window)]
+    if len(valid) < cfg.ATR_PCTL_MIN_HISTORY:
+        return None
+
+    current = atr_long_arr[i15]
+    if np.isnan(current) or current <= 0:
+        return None
+
+    sorted_valid = np.sort(valid)
+    rank = np.searchsorted(sorted_valid, current, side='right')
+    pctl = rank / len(sorted_valid)  # 0.0 = calmest, 1.0 = most volatile
+
+    mult = cfg.ADAPTIVE_MULT_CALM + pctl * (cfg.ADAPTIVE_MULT_VOLATILE - cfg.ADAPTIVE_MULT_CALM)
+    mult = max(cfg.ADAPTIVE_MULT_CALM, min(cfg.ADAPTIVE_MULT_VOLATILE, mult))
+
+    return mult
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
@@ -4007,13 +4054,36 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         atr_short_val = atr_short_arr[i15]
         atr_long_val = atr_long_arr[i15]
+
+        # ── Adaptive RVOL ──
+        adaptive_threshold = None
+        if cfg.ATR_ADAPTIVE_ENABLED:
+            adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg)
+
+        effective_threshold = adaptive_threshold if adaptive_threshold is not None else cfg.RVOL_THRESHOLD
+        used_fallback = adaptive_threshold is None
+
         if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
-            rvol_raw_check = (atr_short_val / atr_long_val) >= cfg.RVOL_THRESHOLD
+            rvol_raw_check = (atr_short_val / atr_long_val) >= effective_threshold
         else:
             rvol_raw_check = False
 
         rvol_ok = rvol_raw_check if cfg.ENABLE_RVOL_ALERT else True
         rvol_bypass_ok = rvol_raw_check
+
+        if cfg.DEBUG_MODE and cfg.ATR_ADAPTIVE_ENABLED:
+            ratio_str = (
+                f"{atr_short_val/atr_long_val:.3f}"
+                if (not np.isnan(atr_long_val) and atr_long_val > 1e-9) else "n/a"
+            )
+            logger_pair.debug(
+                f"[{pair_name}] RVOL adaptive | "
+                f"atr_s/l={atr_short_val:.4f}/{atr_long_val:.4f} | "
+                f"ratio={ratio_str} | "
+                f"threshold={effective_threshold:.3f} | "
+                f"met={rvol_raw_check} | "
+                f"fallback={used_fallback}"
+            )
 
         volume_curr = data_15m["volume"][i15]
         volume_ema_curr = volume_ema_arr[i15]
