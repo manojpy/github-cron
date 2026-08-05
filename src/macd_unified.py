@@ -200,6 +200,7 @@ class BotConfig(BaseModel):
     ENABLE_VWAP: bool = Field(default=True)
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
+    ENABLE_CPR_ADX_RVOL_BYPASS: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
