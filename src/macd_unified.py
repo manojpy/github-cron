@@ -201,7 +201,6 @@ class BotConfig(BaseModel):
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
-    ENABLE_CPR_ADX_RVOL_BYPASS: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
@@ -4008,39 +4007,52 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         atr_short_val = atr_short_arr[i15]
         atr_long_val = atr_long_arr[i15]
 
-        # ── Adaptive RVOL (scoped to the buy_common/sell_common gate only) ──
-        adaptive_threshold = None
-        if cfg.ATR_ADAPTIVE_ENABLED:
-            adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg)
-
-        effective_threshold = adaptive_threshold if adaptive_threshold is not None else cfg.RVOL_THRESHOLD
-        used_fallback = adaptive_threshold is None
-
-        atr_ratio_valid = (
-            not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9
+        adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
+        adx_rising = (
+            not np.isnan(adx_val) and not np.isnan(adx_prev)
+            and adx_prev > 0 and adx_val > adx_prev
         )
-        atr_ratio = (atr_short_val / atr_long_val) if atr_ratio_valid else float('nan')
+        adaptive_rvol_check = (
+            atr_ratio_valid
+            and adaptive_threshold is not None
+            and atr_ratio >= adaptive_threshold
+        )
 
-        rvol_raw_check = atr_ratio_valid and (atr_ratio >= effective_threshold)
-        rvol_ok = rvol_raw_check if cfg.ENABLE_RVOL_ALERT else True
+        momentum_conditions = [
+            adx_bypass_ok,        # 1. ADX >= ADX_THRESHOLD
+            adx_rising,            # 2. ADX rising vs prior bar
+            rvol_bypass_ok,        # 3. Static RVOL >= RVOL_THRESHOLD
+            adaptive_rvol_check,   # 4. Adaptive RVOL >= percentile-based threshold
+            volume_above_ema_ok,   # 5. Volume > EMA(volume)
+        ]
+        momentum_count = sum(momentum_conditions)
 
-        rvol_static_check = atr_ratio_valid and (atr_ratio >= cfg.RVOL_THRESHOLD)
-        rvol_bypass_ok = rvol_static_check    
+        if not np.isnan(prev_day_close) and prev_day_close > 0:
+            pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
+            move_from_prev_close_ok = pct_move_from_prev_close >= cfg.CPR_WIDE_MIN_PCT_MOVE
+        else:
+            pct_move_from_prev_close = float('nan')
+            move_from_prev_close_ok = False
 
-        if cfg.DEBUG_MODE and cfg.ATR_ADAPTIVE_ENABLED:
-            ratio_str = (
-                f"{atr_short_val/atr_long_val:.3f}"
-                if (not np.isnan(atr_long_val) and atr_long_val > 1e-9) else "n/a"
-            )
+        if cfg.ENABLE_CPR:
+            if cpr_ok:
+                effective_cpr_ok = momentum_count >= 3
+            else:  # Wide CPR: 3 of 5 AND >= CPR_WIDE_MIN_PCT_MOVE from prior day's close
+                effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
+        else:
+            effective_cpr_ok = True
+
+        if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
             logger_pair.debug(
-                f"[{pair_name}] RVOL adaptive | "
-                f"atr_s/l={atr_short_val:.4f}/{atr_long_val:.4f} | "
-                f"ratio={ratio_str} | "
-                f"threshold={effective_threshold:.3f} | "
-                f"met={rvol_raw_check} | "
-                f"fallback={used_fallback}"
+                f"[{pair_name}] CPR {'narrow' if cpr_ok else 'WIDE'} | "
+                f"effective={effective_cpr_ok} | momentum={momentum_count}/5 "
+                f"(adx={adx_val:.1f}[{adx_bypass_ok},{adx_rising}], "
+                f"rvol_static={rvol_bypass_ok}, rvol_adaptive={adaptive_rvol_check}"
+                f"[thr={adaptive_threshold if adaptive_threshold is not None else float('nan'):.3f}], "
+                f"vol_ema={volume_above_ema_ok}) | "
+                f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
+                f"NR_CPR={nr_cpr:.4f}"
             )
-
         volume_curr = data_15m["volume"][i15]
         volume_ema_curr = volume_ema_arr[i15]
         if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
@@ -5338,7 +5350,7 @@ async def run_once() -> bool:
                     await sdb.set_metadata(day_tracker_key, current_date_str)
                     logger_run.info(f"✅ Daily reset complete ({current_date_str})")
                 except Exception as e:
-                    logger_run.error(f"⚠️ Failed to save reset date: {e}")
+                    logger_run.error(f"⚠�� Failed to save reset date: {e}")
             else:
                 logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
 
