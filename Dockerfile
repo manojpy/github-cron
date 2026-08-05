@@ -5,7 +5,7 @@
 # ---------- STAGE 1: UV INSTALLER ----------
 FROM python:3.11-slim-bookworm AS uv-installer
 
-RUN pip install --no-cache-dir uv==0.5.15
+RUN pip install --no-cache-dir uv==0.6.12
 
 
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
@@ -107,6 +107,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONOPTIMIZE=2 \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
+    NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
     OMP_NUM_THREADS=2 \
     MEMORY_LIMIT_BYTES=850000000 \
