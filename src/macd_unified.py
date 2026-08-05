@@ -2451,22 +2451,7 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
         return False
 
-
-except Exception as e:
-        logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
-        return False
-
-def independent_candle_reverify(
-    data_15m: Dict[str, np.ndarray],
-    candle_index: int,
-    cached_o: float, cached_h: float, cached_l: float, cached_c: float,
-    cached_is_green: bool, cached_is_red: bool,
-    cached_valid_buy: bool, cached_valid_sell: bool,
-    min_wick_ratio: float,
-    pair_name: str,
-    logger_pair: logging.Logger,
-) -> bool:
-   
+def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached_o: float, cached_h: float, cached_l: float, cached_c: float, cached_is_green: bool, cached_is_red: bool, cached_valid_buy: bool, cached_valid_sell: bool, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger) -> bool:
     try:
         raw_o = float(data_15m["open"][candle_index])
         raw_h = float(data_15m["high"][candle_index])
