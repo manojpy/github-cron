@@ -4002,7 +4002,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         atr_short_val = atr_short_arr[i15]
         atr_long_val = atr_long_arr[i15]
 
-        # ── Adaptive RVOL ──
+        # ── Adaptive RVOL (scoped to the buy_common/sell_common gate only) ──
         adaptive_threshold = None
         if cfg.ATR_ADAPTIVE_ENABLED:
             adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg)
@@ -4010,13 +4010,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         effective_threshold = adaptive_threshold if adaptive_threshold is not None else cfg.RVOL_THRESHOLD
         used_fallback = adaptive_threshold is None
 
-        if not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9:
-            rvol_raw_check = (atr_short_val / atr_long_val) >= effective_threshold
-        else:
-            rvol_raw_check = False
+        atr_ratio_valid = (
+            not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9
+        )
+        atr_ratio = (atr_short_val / atr_long_val) if atr_ratio_valid else float('nan')
 
+        rvol_raw_check = atr_ratio_valid and (atr_ratio >= effective_threshold)
         rvol_ok = rvol_raw_check if cfg.ENABLE_RVOL_ALERT else True
-        rvol_bypass_ok = rvol_raw_check
+
+        rvol_static_check = atr_ratio_valid and (atr_ratio >= cfg.RVOL_THRESHOLD)
+        rvol_bypass_ok = rvol_static_check    
 
         if cfg.DEBUG_MODE and cfg.ATR_ADAPTIVE_ENABLED:
             ratio_str = (
