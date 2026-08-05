@@ -4036,14 +4036,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             and adaptive_threshold is not None
             and atr_ratio >= adaptive_threshold
         )
-
-        # ── Market volatility filter: ADX OR static RVOL OR adaptive RVOL ──
         adx_pass = adx_raw_check if cfg.ENABLE_ADX_FILTER else False
         rvol_static_pass = rvol_bypass_ok if cfg.ENABLE_RVOL_ALERT else False
         rvol_adaptive_pass = adaptive_rvol_check  # False if ATR_ADAPTIVE_ENABLED=False
 
         any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
         volatility_filter_ok = (not any_vol_feature_enabled) or adx_pass or rvol_static_pass or rvol_adaptive_pass
+        rvol_ok=volatility_filter_ok
 
         # ── ADX rising check ──
         adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
@@ -4091,15 +4090,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         if cfg.DEBUG_MODE:
             ratio_str = f"{atr_ratio:.3f}" if atr_ratio_valid else "n/a"
+            adaptive_str = f"{adaptive_threshold:.3f}" if adaptive_threshold is not None else "n/a"
             logger_pair.debug(
                 f"[{pair_name}] Volatility filter | "
                 f"ratio={ratio_str} | "
                 f"static={cfg.RVOL_THRESHOLD:.3f}[{rvol_bypass_ok}] | "
-                f"adaptive={adaptive_threshold:.3f if adaptive_threshold else None}[{adaptive_rvol_check}] | "
+                f"adaptive={adaptive_str}[{adaptive_rvol_check}] | "
                 f"adx={adx_val:.1f}[{adx_pass}] | "
                 f"market_filter={volatility_filter_ok}"
             )
-
         ppo_gate_curr = ppo_gate_arr[i15]
         ppo_gate_prev = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_arr[i15]
         ppo_gate_sig_curr = ppo_gate_signal_arr[i15]
@@ -4197,8 +4196,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
         trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
-
-        volatility_filter_ok = adx_ok or rvol_bypass_ok or adaptive_rvol_check
 
         buy_common = (
             base_buy_trend and is_valid_for_buy
