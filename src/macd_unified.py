@@ -180,8 +180,8 @@ class BotConfig(BaseModel):
     SRSI_RSI_LEN: int = 14
     SRSI_KALMAN_LEN: int = 9
     SRSI_EMA_LEN: int = 5
-    ATR_SHORT: int = 5
-    ATR_LONG: int = 14
+    ATR_SHORT: int = Field(default=5, ge=1, le=50)
+    ATR_LONG: int = Field(default=14, ge=2, le=200)
     MAX_PARALLEL_FETCH: int = Field(15, ge=1, le=20)
     HTTP_TIMEOUT: int = 15
     CANDLE_FETCH_RETRIES: int = 3
@@ -287,6 +287,11 @@ class BotConfig(BaseModel):
 
     @model_validator(mode='after')
     def validate_adaptive_rvol(self) -> 'BotConfig':
+        if self.ATR_SHORT >= self.ATR_LONG:
+            raise ValueError(
+                f'ATR_SHORT ({self.ATR_SHORT}) must be < ATR_LONG ({self.ATR_LONG}) '
+                f'— the RVOL ratio assumes short-period ATR is compared against a longer baseline'
+            )
         if self.ATR_ADAPTIVE_ENABLED:
             if self.ATR_PCTL_MIN_HISTORY >= self.ATR_PCTL_LOOKBACK:
                 raise ValueError(
@@ -299,7 +304,7 @@ class BotConfig(BaseModel):
                     f'ADAPTIVE_MULT_VOLATILE ({self.ADAPTIVE_MULT_VOLATILE})'
                 )
         return self
-    
+
     @model_validator(mode='after')
     def validate_ppo_ordering(self) -> 'BotConfig':
         if self.PPO_FAST >= self.PPO_SLOW:
@@ -307,6 +312,7 @@ class BotConfig(BaseModel):
                 f'PPO_FAST ({self.PPO_FAST}) must be strictly less than '
                 f'PPO_SLOW ({self.PPO_SLOW})'
             )
+
         if self.PPO_GATE_FAST >= self.PPO_GATE_SLOW:
             raise ValueError(
                 f'PPO_GATE_FAST ({self.PPO_GATE_FAST}) must be strictly less than '
