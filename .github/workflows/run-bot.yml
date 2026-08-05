@@ -17,6 +17,11 @@ on:
         default: false
         type: boolean
 
+# Prevent overlapping runs from cron + manual dispatch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
@@ -45,6 +50,11 @@ jobs:
             echo "❌ Missing secrets: ${MISSING[*]}"
             exit 1
           fi
+          
+          if [ -z "${{ secrets.MACD_CONFIG_JSON }}" ]; then
+            echo "⚠️ MACD_CONFIG_JSON not set — will fallback to GitHub API download"
+          fi
+          
           echo "✅ All required secrets configured"
 
       - name: 🔨 Create Config
@@ -83,7 +93,7 @@ jobs:
           fi
 
       - name: 🐳 Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -129,11 +139,23 @@ jobs:
 
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
+          
+          # Write secrets to a temporary env-file to avoid exposing them in 'ps'
+          ENV_FILE="$(pwd)/.bot_env"
+          cat > "$ENV_FILE" <<EOF
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          DELTA_API_BASE=${{ secrets.DELTA_API_BASE }}
+          DRY_RUN_MODE=$DRY_RUN
+          TRIGGER_TIMESTAMP=$START_TIME
+          CLEAR_ALL_STATES=$CLEAR_ALL_STATES
+          EOF
+          
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \
-            --name macd_bot_runner \
+            --name "macd_bot_${{ github.run_id }}" \
             --platform linux/amd64 \
-            --network host \
             --memory="900m" \
             --memory-swap="1800m" \
             --cpus="2.0" \
@@ -141,15 +163,9 @@ jobs:
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
             --tmpfs /home/appuser/.cache:rw,noexec,nosuid,size=32m \
+            --env-file "$ENV_FILE" \
             -e TZ=Asia/Kolkata \
-            -e PYTHONPATH=/app/src:$PYTHONPATH \
-            -e TRIGGER_TIMESTAMP="$START_TIME" \
-            -e CLEAR_ALL_STATES="$CLEAR_ALL_STATES" \
-            -e TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
-            -e TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -e REDIS_URL="${{ secrets.REDIS_URL }}" \
-            -e DELTA_API_BASE="${{ secrets.DELTA_API_BASE }}" \
-            -e DRY_RUN_MODE="$DRY_RUN" \
+            -e PYTHONPATH=/app/src \
             -e PYTHONUNBUFFERED=1 \
             -e NUMBA_NUM_THREADS=2 \
             -e OMP_NUM_THREADS=2 \
@@ -160,6 +176,8 @@ jobs:
           DURATION=$(( $(date +%s) - START_TIME ))
           echo "execution_time=${DURATION}" >> $GITHUB_OUTPUT
           echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+          
+          rm -f "$ENV_FILE"
 
           if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]; then
             echo "⚠️ Bot execution timed out after ${DURATION}s" | tee -a logs/bot_output.log
@@ -238,7 +256,7 @@ jobs:
         with:
           name: bot-execution-logs-${{ github.run_number }}
           path: logs/
-          retention-days: 2
+          retention-days: 7
           compression-level: 9
           if-no-files-found: ignore
 
