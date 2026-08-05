@@ -43,7 +43,6 @@ jobs:
         with:
           driver-opts: |
             image=moby/buildkit:latest
-            network=host
           buildkitd-flags: --allow-insecure-entitlement network.host
 
       - name: 🔐 Log in to GitHub Container Registry
@@ -93,7 +92,7 @@ jobs:
         run: |
           echo "🧪 Running AOT verification..."
           docker run --rm -i --platform linux/amd64 \
-            -e PYTHONPATH=/app/src:$PYTHONPATH \
+            -e PYTHONPATH=/app/src \
             -e TZ=Asia/Kolkata \
             -e REQUIRE_AOT=${{ env.REQUIRE_AOT }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
