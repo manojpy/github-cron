@@ -2481,15 +2481,36 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
         return False
 
-def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached_o: float, cached_h: float, cached_l: float, cached_c: float, cached_is_green: bool, cached_is_red: bool, cached_valid_buy: bool, cached_valid_sell: bool, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger) -> bool:
+def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached_o: float, cached_h: float, cached_l: float, cached_c: float, cached_is_green: bool, cached_is_red: bool, cached_valid_buy: bool, cached_valid_sell: bool, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger, cached_ts: Optional[int] = None, cached_vol: Optional[float] = None) -> bool:
     try:
         raw_o = float(data_15m["open"][candle_index])
         raw_h = float(data_15m["high"][candle_index])
         raw_l = float(data_15m["low"][candle_index])
         raw_c = float(data_15m["close"][candle_index])
+        raw_ts = int(data_15m["timestamp"][candle_index])
+        raw_vol = float(data_15m["volume"][candle_index])
     except (IndexError, KeyError, TypeError, ValueError) as e:
         logger_pair.error(
-            f"[{pair_name}] Independent re-verify: cannot read raw OHLC at index {candle_index}: {e} — suppressing alert"
+            f"[{pair_name}] Independent re-verify: cannot read raw OHLCV at index {candle_index}: {e} — suppressing alert"
+        )
+        return False
+
+    if any(np.isnan([raw_o, raw_h, raw_l, raw_c])) or any(np.isinf([raw_o, raw_h, raw_l, raw_c])):
+        logger_pair.error(
+            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} — suppressing alert"
+        )
+        return False
+
+    if cached_ts is not None and raw_ts != cached_ts:
+        logger_pair.error(
+            f"[{pair_name}] Independent re-verify TIMESTAMP MISMATCH: raw={raw_ts} cached={cached_ts} "
+            f"— suppressing alert"
+        )
+        return False
+
+    if cached_vol is not None and raw_vol <= 0:
+        logger_pair.error(
+            f"[{pair_name}] Independent re-verify: zero/negative volume ({raw_vol}) at dispatch — suppressing alert"
         )
         return False
 
@@ -2548,7 +2569,6 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
             f"— suppressing alert"
         )
         return False
-
     return True
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
@@ -4071,10 +4091,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if cfg.ENABLE_CPR:
             if cpr_ok:  # Narrow CPR: any 3 of 5
                 effective_cpr_ok = momentum_count >= 3
-            else:       # Wide CPR: any 3 of 5 + price move threshold
-                effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
+            else:       # Wide CPR: any 3 of 5 + (price move threshold OR ADX-rising+RVOL bypass)
+                adx_rvol_bypass_ok = (
+                    cfg.ENABLE_CPR_ADX_RVOL_BYPASS
+                    and adx_rising
+                    and (rvol_bypass_ok or adaptive_rvol_check)
+                )
+                effective_cpr_ok = momentum_count >= 3 and (move_from_prev_close_ok or adx_rvol_bypass_ok)
         else:
-            effective_cpr_ok = True
+            effective_cpr_ok = True  
 
         if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
             logger_pair.debug(
@@ -4085,6 +4110,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"[thr={adaptive_threshold if adaptive_threshold is not None else float('nan'):.3f}], "
                 f"vol_ema={volume_above_ema_ok}) | "
                 f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
+                f"adx_rvol_bypass={cfg.ENABLE_CPR_ADX_RVOL_BYPASS and not cpr_ok and adx_rising and (rvol_bypass_ok or adaptive_rvol_check)} | "
                 f"NR_CPR={nr_cpr:.4f}"
             )
 
@@ -4662,6 +4688,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 cached_valid_buy=is_valid_for_buy, cached_valid_sell=is_valid_for_sell,
                 min_wick_ratio=Constants.MIN_WICK_RATIO,
                 pair_name=pair_name, logger_pair=logger_pair,
+                cached_ts=ts_curr, cached_vol=candle_info["volume"],
             )
             if not reverified:
                 logger_pair.warning(
@@ -4693,14 +4720,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"skipping {len(alerts_to_send)} alerts for {pair_name}"
                     )
 
-                if all_state_changes:
-                    persist_ok = await sdb.atomic_batch_update(all_state_changes)
-                    if not persist_ok:
-                        logger_pair.error(
-                            f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
-                        )
-                    for _, _, alert_key in alerts_to_send:
-                        await sdb.release_recent_alert(pair_name, alert_key)
+                    if all_state_changes:
+                        persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                        if not persist_ok:
+                            logger_pair.error(
+                                f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                            )
+                        for _, _, alert_key in alerts_to_send:
+                            await sdb.release_recent_alert(pair_name, alert_key)
                     return pair_name, {
                         "state": "LIMIT_REACHED",
                         "ts": int(time.time()),
@@ -4712,7 +4739,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         }
                     }
                 alerts_sent_ref[0] += len(alerts_to_send)
-
         if alerts_to_send:          
             try:
                 if len(alerts_to_send) == 1:
