@@ -2098,13 +2098,13 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if candle_index + 1 < len(data_15m["timestamp"]):
         next_candle_ts = int(data_15m["timestamp"][candle_index + 1])
         expected_next_ts = ts + interval_seconds
+        next_candle_is_still_forming = (next_candle_ts + interval_seconds) > reference_time
 
-        if abs(next_candle_ts - expected_next_ts) > 60:
+        if not next_candle_is_still_forming and abs(next_candle_ts - expected_next_ts) > 60:
             return False, False, None, ( 
                 f"Gap detected: Expected next candle at {format_ist_time(expected_next_ts)} " 
                 f"but found at {format_ist_time(next_candle_ts)} " f"(diff={abs(next_candle_ts - expected_next_ts)}s). Data may be incomplete." 
-            )
-
+            ) 
     candle_range = h - l
     
     if candle_range < 1e-9:
@@ -2304,9 +2304,11 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             max_diff = np.max(ts_diffs)
         
             if min_diff <= 0:
-                logger.error(
-                    f"parse_candles_to_numpy: Rejecting — non-monotonic/duplicate timestamps | "
-                    f"Min diff: {min_diff}s, Max diff: {max_diff}s"
+                bad_idx = np.where(ts_diffs <= 0)[0]
+                logger.warning(
+                    f"parse_candles_to_numpy: {len(bad_idx)} non-monotonic/duplicate timestamp(s) found "
+                    f"(indices {bad_idx[:5].tolist()}) | Min diff: {min_diff}s, Max diff: {max_diff}s | "
+                    f"Continuing — get_last_closed_index_from_array will reject if this is near the target candle."
                 )
                 return None
         
@@ -2358,18 +2360,9 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     
     current_period_start = (reference_time // interval_seconds) * interval_seconds
     expected_ts_open_time = current_period_start - interval_seconds
-   
+
     candle_close_time = expected_ts_open_time + interval_seconds
     time_since_candle_closed = reference_time - candle_close_time
- 
-    if not candle_is_stable(expected_ts_open_time, reference_time, interval_minutes):
-        logger.warning(
-            "[%s] Candle %dm open %s not stable (buffer/age check failed). Skipping.",
-            pair_name or "?",
-            int(interval_minutes),
-            format_ist_time(expected_ts_open_time),
-        )
-        return None
 
     try:
         ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
@@ -2408,7 +2401,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     # Move stability check AFTER finding the actual candle
     if not candle_is_stable(actual_candle_open, reference_time, interval_minutes):
-        logger.debug(
+        logger.warning(
             "[%s] Candle %dm actual open %s not stable. Skipping.",
             pair_name or "?",
             int(interval_minutes),
@@ -4798,257 +4791,257 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if all_state_changes:
             await sdb.atomic_batch_update(all_state_changes)
 
-        reasons = []
-        if not buy_common and not sell_common:
-            reasons.append("Trend filter blocked")
-        
-        if context.get("pivot_suppressions"):
-            reasons.extend(context["pivot_suppressions"])
-
-        if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
-            if not base_buy_trend:
-                reasons.append("PPO>0 blocked: base_buy_trend=False")
-            elif not confirmation_buy:
-                reasons.append("PPO>0 blocked: confirmation_buy=False (future cloud)")
-            elif not is_valid_for_buy:
-                reasons.append("PPO>0 blocked: Knox rejected candle (wick/color/timing)")
-            else:
-                reasons.append(
-                    f"PPO>0 blocked: market filter "
-                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                    f"rvol_ok={rvol_ok})"
-                )
-        
-        if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
-            if not base_sell_trend:
-                reasons.append("PPO<0 blocked: base_sell_trend=False")
-            elif not confirmation_sell:
-                reasons.append("PPO<0 blocked: confirmation_sell=False (future cloud)")
-            elif not is_valid_for_sell:
-                reasons.append("PPO<0 blocked: Knox rejected candle (wick/color/timing)")
-            else:
-                reasons.append(
-                    f"PPO<0 blocked: market filter "
-                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                    f"rvol_ok={rvol_ok})"
-                )
-       
-        if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
-            if not base_buy_trend:
-                reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
-            elif not confirmation_buy:
-                reasons.append("PPO>+0.11 blocked: confirmation_buy=False (future cloud)")
-            elif not is_valid_for_buy:
-                reasons.append("PPO>+0.11 blocked: Knox rejected candle")
-            else:
-                reasons.append(
-                    f"PPO>+0.11 blocked: market filter "
-                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                    f"rvol_ok={rvol_ok})"
-                )
-        
-        if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
-            if not base_sell_trend:
-                reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
-            elif not confirmation_sell:
-                reasons.append("PPO<-0.11 blocked: confirmation_sell=False (future cloud)")
-            elif not is_valid_for_sell:
-                reasons.append("PPO<-0.11 blocked: Knox rejected candle")
-            else:
-                reasons.append(
-                    f"PPO<-0.11 blocked: market filter "
-                    f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                    f"rvol_ok={rvol_ok})"
-                )
-        
-        if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
-            if rsi_curr >= Constants.RSI_SRSI_BUY_MAX:
-                reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {Constants.RSI_SRSI_BUY_MAX}")
-            elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
-                reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
-            elif not buy_common:
-                if not base_buy_trend:
-                    reasons.append("RSI>EMA5 blocked: base_buy_trend=False")
-                elif not confirmation_buy:
-                    reasons.append("RSI>EMA5 blocked: confirmation_buy=False (future cloud)")
-                elif not is_valid_for_buy:
-                    reasons.append("RSI>EMA5 blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"RSI>EMA5 blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-
-        if rsi_prev >= rsi_ema_prev and rsi_curr < rsi_ema_curr:
-            if rsi_curr <= Constants.RSI_SRSI_SELL_MIN:
-                reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {Constants.RSI_SRSI_SELL_MIN}")
-            elif ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
-                reasons.append(f"RSI<EMA5 blocked: PPO={ppo_gate_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
-            elif not sell_common:
-                if not base_sell_trend:
-                    reasons.append("RSI<EMA5 blocked: base_sell_trend=False")
-                elif not confirmation_sell:
-                    reasons.append("RSI<EMA5 blocked: confirmation_sell=False (future cloud)")
-                elif not is_valid_for_sell:
-                    reasons.append("RSI<EMA5 blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"RSI<EMA5 blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-       
-        if cfg.ENABLE_VWAP and vwap_available:
-            if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
-                if not base_buy_trend:
-                    reasons.append("VWAP up-cross blocked: base_buy_trend=False")
-                elif not confirmation_buy:
-                    reasons.append("VWAP up-cross blocked: confirmation_buy=False")
-                elif not is_valid_for_buy:
-                    reasons.append("VWAP up-cross blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"VWAP up-cross blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-            
-            if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
-                if not base_sell_trend:
-                    reasons.append("VWAP down-cross blocked: base_sell_trend=False")
-                elif not confirmation_sell:
-                    reasons.append("VWAP down-cross blocked: confirmation_sell=False")
-                elif not is_valid_for_sell:
-                    reasons.append("VWAP down-cross blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"VWAP down-cross blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-
-        if cfg.ENABLE_PPO_GATE:
-            if not ppo_gate_ok_buy:
-                reasons.append(f"PPO Gate buy: Gate({ppo_gate_curr:.2f}) <= Signal({ppo_gate_sig_curr:.2f})")
-            if not ppo_gate_ok_sell:
-                reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
-
-        if cfg.ENABLE_TK_CONVERSION_CROSS:
-            if close_prev <= tk_conversion_prev and close_curr > tk_conversion_curr and not buy_common:
-                if not base_buy_trend:
-                    reasons.append("Conversion up-cross blocked: base_buy_trend=False")
-                elif not confirmation_buy:
-                    reasons.append("Conversion up-cross blocked: confirmation_buy=False")
-                elif not is_valid_for_buy:
-                    reasons.append("Conversion up-cross blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"Conversion up-cross blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-
-            if close_prev >= tk_conversion_prev and close_curr < tk_conversion_curr and not sell_common:
-                if not base_sell_trend:
-                    reasons.append("Conversion down-cross blocked: base_sell_trend=False")
-                elif not confirmation_sell:
-                    reasons.append("Conversion down-cross blocked: confirmation_sell=False")
-                elif not is_valid_for_sell:
-                    reasons.append("Conversion down-cross blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"Conversion down-cross blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-
-        if cfg.ENABLE_KIJUN_CROSS:
-            if close_prev <= tk_base_prev and close_curr > tk_base_curr and not buy_common:
-                if not base_buy_trend:
-                    reasons.append("Kijun up-cross blocked: base_buy_trend=False")
-                elif not confirmation_buy:
-                    reasons.append("Kijun up-cross blocked: confirmation_buy=False")
-                elif not is_valid_for_buy:
-                    reasons.append("Kijun up-cross blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"Kijun up-cross blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-
-            if close_prev >= tk_base_prev and close_curr < tk_base_curr and not sell_common:
-                if not base_sell_trend:
-                    reasons.append("Kijun down-cross blocked: base_sell_trend=False")
-                elif not confirmation_sell:
-                    reasons.append("Kijun down-cross blocked: confirmation_sell=False")
-                elif not is_valid_for_sell:
-                    reasons.append("Kijun down-cross blocked: Knox rejected candle")
-                else:
-                    reasons.append(
-                        f"Kijun down-cross blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
-                    )
-
-        if cfg.ENABLE_HIST_RMA:
-            if buy_common and not hist_reversal_buy:
-                if np.isnan(hist_curr):
-                    reasons.append("Hist RMA buy: NaN")
-                elif hist_curr <= 0:
-                    reasons.append(f"Hist RMA buy: hist_curr={hist_curr:.2f} <= 0")
-                elif not (hist_m3 > hist_m2 > hist_m1):
-                    reasons.append(f"Hist RMA buy: sequence not rising ({hist_m3:.2f} > {hist_m2:.2f} > {hist_m1:.2f})")
-                elif not (hist_curr > hist_m1):
-                    reasons.append(f"Hist RMA buy: no acceleration ({hist_curr:.2f} <= {hist_m1:.2f})")
-            if sell_common and not hist_reversal_sell:
-                if np.isnan(hist_curr):
-                    reasons.append("Hist RMA sell: NaN")
-                elif hist_curr >= 0:
-                    reasons.append(f"Hist RMA sell: hist_curr={hist_curr:.2f} >= 0")
-                elif not (hist_m3 < hist_m2 < hist_m1):
-                    reasons.append(f"Hist RMA sell: sequence not falling ({hist_m3:.2f} < {hist_m2:.2f} < {hist_m1:.2f})")
-                elif not (hist_curr < hist_m1):
-                    reasons.append(f"Hist RMA sell: no acceleration ({hist_curr:.2f} >= {hist_m1:.2f})")
-
-        if cfg.RSI_GUARD_ENABLED:
-            if not rsi_guard_ok_buy:
-                reasons.append(f"RSI Guard buy: RSI({rsi_guard_smooth_curr:.2f}) <= EMA({rsi_guard_ema_curr:.2f})")
-            if not rsi_guard_ok_sell:
-                reasons.append(f"RSI Guard sell: RSI({rsi_guard_smooth_curr:.2f}) >= EMA({rsi_guard_ema_curr:.2f})")
-
-        if cfg.RMA_CLOUD_ENABLED:
-            if not rma_cloud_ok_buy:
-                reasons.append(f"RMA Cloud buy: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) <= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
-            if not rma_cloud_ok_sell:
-                reasons.append(f"RMA Cloud sell: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) >= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
-
-        if cfg.ICHIMOKU_CLOUD_ENABLED:
-            if not ichimoku_gate_ok_buy:
-                reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
-            if not ichimoku_gate_ok_sell:
-                reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
-
-        if not cloud_group_ok_buy:
-            reasons.append("Cloud group buy: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
-        if not cloud_group_ok_sell:
-            reasons.append("Cloud group sell: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
-        if not oscillator_group_ok_buy:
-            reasons.append("Oscillator group buy: need 2-of-3 (PPO/RSI/TK) — not met")
-        if not oscillator_group_ok_sell:
-            reasons.append("Oscillator group sell: need 2-of-3 (PPO/RSI/TK) — not met")
-
         failed_conditions = [
             name for name, val in [
                 ("buy_common", buy_common),
                 ("sell_common", sell_common),
             ] if not val
         ]
-        
+
+        reasons = []
         if not alerts_to_send:
-            future_cloud_state = "green" if cloud_up else "red" if cloud_down else "neutral"
+            if not buy_common and not sell_common:
+                reasons.append("Trend filter blocked")
+            
+            if context.get("pivot_suppressions"):
+                reasons.extend(context["pivot_suppressions"])
+
+            if ppo_prev <= 0 and ppo_curr > 0 and not buy_common:
+                if not base_buy_trend:
+                    reasons.append("PPO>0 blocked: base_buy_trend=False")
+                elif not confirmation_buy:
+                    reasons.append("PPO>0 blocked: confirmation_buy=False (future cloud)")
+                elif not is_valid_for_buy:
+                    reasons.append("PPO>0 blocked: Knox rejected candle (wick/color/timing)")
+                else:
+                    reasons.append(
+                        f"PPO>0 blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+        
+            if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
+                if not base_sell_trend:
+                    reasons.append("PPO<0 blocked: base_sell_trend=False")
+                elif not confirmation_sell:
+                    reasons.append("PPO<0 blocked: confirmation_sell=False (future cloud)")
+                elif not is_valid_for_sell:
+                    reasons.append("PPO<0 blocked: Knox rejected candle (wick/color/timing)")
+                else:
+                    reasons.append(
+                        f"PPO<0 blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+       
+            if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
+                if not base_buy_trend:
+                    reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
+                elif not confirmation_buy:
+                    reasons.append("PPO>+0.11 blocked: confirmation_buy=False (future cloud)")
+                elif not is_valid_for_buy:
+                    reasons.append("PPO>+0.11 blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"PPO>+0.11 blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+        
+            if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
+                if not base_sell_trend:
+                    reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
+                elif not confirmation_sell:
+                    reasons.append("PPO<-0.11 blocked: confirmation_sell=False (future cloud)")
+                elif not is_valid_for_sell:
+                    reasons.append("PPO<-0.11 blocked: Knox rejected candle")
+                else:
+                    reasons.append(
+                        f"PPO<-0.11 blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"rvol_ok={rvol_ok})"
+                    )
+        
+            if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
+                if rsi_curr >= Constants.RSI_SRSI_BUY_MAX:
+                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {Constants.RSI_SRSI_BUY_MAX}")
+                elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
+                    reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
+                elif not buy_common:
+                    if not base_buy_trend:
+                        reasons.append("RSI>EMA5 blocked: base_buy_trend=False")
+                    elif not confirmation_buy:
+                        reasons.append("RSI>EMA5 blocked: confirmation_buy=False (future cloud)")
+                    elif not is_valid_for_buy:
+                        reasons.append("RSI>EMA5 blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"RSI>EMA5 blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+            if rsi_prev >= rsi_ema_prev and rsi_curr < rsi_ema_curr:
+                if rsi_curr <= Constants.RSI_SRSI_SELL_MIN:
+                    reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {Constants.RSI_SRSI_SELL_MIN}")
+                elif ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
+                    reasons.append(f"RSI<EMA5 blocked: PPO={ppo_gate_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
+                elif not sell_common:
+                    if not base_sell_trend:
+                        reasons.append("RSI<EMA5 blocked: base_sell_trend=False")
+                    elif not confirmation_sell:
+                        reasons.append("RSI<EMA5 blocked: confirmation_sell=False (future cloud)")
+                    elif not is_valid_for_sell:
+                        reasons.append("RSI<EMA5 blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"RSI<EMA5 blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+       
+            if cfg.ENABLE_VWAP and vwap_available:
+                if close_prev <= vwap_prev and close_curr > vwap_curr and not buy_common:
+                    if not base_buy_trend:
+                        reasons.append("VWAP up-cross blocked: base_buy_trend=False")
+                    elif not confirmation_buy:
+                        reasons.append("VWAP up-cross blocked: confirmation_buy=False")
+                    elif not is_valid_for_buy:
+                        reasons.append("VWAP up-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"VWAP up-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+            
+                if close_prev >= vwap_prev and close_curr < vwap_curr and not sell_common:
+                    if not base_sell_trend:
+                        reasons.append("VWAP down-cross blocked: base_sell_trend=False")
+                    elif not confirmation_sell:
+                        reasons.append("VWAP down-cross blocked: confirmation_sell=False")
+                    elif not is_valid_for_sell:
+                        reasons.append("VWAP down-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"VWAP down-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+            if cfg.ENABLE_PPO_GATE:
+                if not ppo_gate_ok_buy:
+                    reasons.append(f"PPO Gate buy: Gate({ppo_gate_curr:.2f}) <= Signal({ppo_gate_sig_curr:.2f})")
+                if not ppo_gate_ok_sell:
+                    reasons.append(f"PPO Gate sell: Gate({ppo_gate_curr:.2f}) >= Signal({ppo_gate_sig_curr:.2f})")
+
+            if cfg.ENABLE_TK_CONVERSION_CROSS:
+                if close_prev <= tk_conversion_prev and close_curr > tk_conversion_curr and not buy_common:
+                    if not base_buy_trend:
+                        reasons.append("Conversion up-cross blocked: base_buy_trend=False")
+                    elif not confirmation_buy:
+                        reasons.append("Conversion up-cross blocked: confirmation_buy=False")
+                    elif not is_valid_for_buy:
+                        reasons.append("Conversion up-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"Conversion up-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+                if close_prev >= tk_conversion_prev and close_curr < tk_conversion_curr and not sell_common:
+                    if not base_sell_trend:
+                        reasons.append("Conversion down-cross blocked: base_sell_trend=False")
+                    elif not confirmation_sell:
+                        reasons.append("Conversion down-cross blocked: confirmation_sell=False")
+                    elif not is_valid_for_sell:
+                        reasons.append("Conversion down-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"Conversion down-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+            if cfg.ENABLE_KIJUN_CROSS:
+                if close_prev <= tk_base_prev and close_curr > tk_base_curr and not buy_common:
+                    if not base_buy_trend:
+                        reasons.append("Kijun up-cross blocked: base_buy_trend=False")
+                    elif not confirmation_buy:
+                        reasons.append("Kijun up-cross blocked: confirmation_buy=False")
+                    elif not is_valid_for_buy:
+                        reasons.append("Kijun up-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"Kijun up-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+                if close_prev >= tk_base_prev and close_curr < tk_base_curr and not sell_common:
+                    if not base_sell_trend:
+                        reasons.append("Kijun down-cross blocked: base_sell_trend=False")
+                    elif not confirmation_sell:
+                        reasons.append("Kijun down-cross blocked: confirmation_sell=False")
+                    elif not is_valid_for_sell:
+                        reasons.append("Kijun down-cross blocked: Knox rejected candle")
+                    else:
+                        reasons.append(
+                            f"Kijun down-cross blocked: market filter "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"rvol_ok={rvol_ok})"
+                        )
+
+            if cfg.ENABLE_HIST_RMA:
+                if buy_common and not hist_reversal_buy:
+                    if np.isnan(hist_curr):
+                        reasons.append("Hist RMA buy: NaN")
+                    elif hist_curr <= 0:
+                        reasons.append(f"Hist RMA buy: hist_curr={hist_curr:.2f} <= 0")
+                    elif not (hist_m3 > hist_m2 > hist_m1):
+                        reasons.append(f"Hist RMA buy: sequence not rising ({hist_m3:.2f} > {hist_m2:.2f} > {hist_m1:.2f})")
+                    elif not (hist_curr > hist_m1):
+                        reasons.append(f"Hist RMA buy: no acceleration ({hist_curr:.2f} <= {hist_m1:.2f})")
+                if sell_common and not hist_reversal_sell:
+                    if np.isnan(hist_curr):
+                        reasons.append("Hist RMA sell: NaN")
+                    elif hist_curr >= 0:
+                        reasons.append(f"Hist RMA sell: hist_curr={hist_curr:.2f} >= 0")
+                    elif not (hist_m3 < hist_m2 < hist_m1):
+                        reasons.append(f"Hist RMA sell: sequence not falling ({hist_m3:.2f} < {hist_m2:.2f} < {hist_m1:.2f})")
+                    elif not (hist_curr < hist_m1):
+                        reasons.append(f"Hist RMA sell: no acceleration ({hist_curr:.2f} >= {hist_m1:.2f})")
+
+            if cfg.RSI_GUARD_ENABLED:
+                if not rsi_guard_ok_buy:
+                    reasons.append(f"RSI Guard buy: RSI({rsi_guard_smooth_curr:.2f}) <= EMA({rsi_guard_ema_curr:.2f})")
+                if not rsi_guard_ok_sell:
+                    reasons.append(f"RSI Guard sell: RSI({rsi_guard_smooth_curr:.2f}) >= EMA({rsi_guard_ema_curr:.2f})")
+
+            if cfg.RMA_CLOUD_ENABLED:
+                if not rma_cloud_ok_buy:
+                    reasons.append(f"RMA Cloud buy: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) <= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
+                if not rma_cloud_ok_sell:
+                    reasons.append(f"RMA Cloud sell: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) >= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
+
+            if cfg.ICHIMOKU_CLOUD_ENABLED:
+                if not ichimoku_gate_ok_buy:
+                    reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
+                if not ichimoku_gate_ok_sell:
+                    reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
+
+            if not cloud_group_ok_buy:
+                reasons.append("Cloud group buy: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
+            if not cloud_group_ok_sell:
+                reasons.append("Cloud group sell: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
+            if not oscillator_group_ok_buy:
+                reasons.append("Oscillator group buy: need 2-of-3 (PPO/RSI/TK) — not met")
+            if not oscillator_group_ok_sell:
+                reasons.append("Oscillator group sell: need 2-of-3 (PPO/RSI/TK) — not met")
+
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
+
         return pair_name, {
             "state": "ALERT_SENT" if alerts_to_send else "NO_SIGNAL",
             "ts": int(time.time()),
@@ -5085,16 +5078,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
     finally:
         PAIR_ID.set("")
-        if data_15m is not None:
-            data_15m = None
-        if data_5m is not None:
-            data_5m = None
-        if data_daily is not None:
-            data_daily = None
-        if indicators is not None:
-            indicators = None
-        if context is not None:
-            context = None
 
         global _pair_eval_counter
         _pair_eval_counter += 1
@@ -5149,9 +5132,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         return None
     
     finally:
-        data_15m = None
-        data_5m = None
-        data_daily = None
+        pass
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
@@ -5200,9 +5181,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         prepared_tasks.append((pair_name, symbol, candles))
 
     logger_main.debug(f"Ready to evaluate {len(prepared_tasks)} pairs")
-
-    del all_candles
-    await asyncio.to_thread(gc.collect) 
 
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
