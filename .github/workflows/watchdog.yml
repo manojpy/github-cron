@@ -1,0 +1,105 @@
+name: 🚨 MACD Bot Watchdog
+
+# Runs independently of run-bot.yml so it can detect the case where run-bot.yml
+# never even started (runner not acquired, GitHub internal error, or — if
+# nothing is currently cron-triggering run-bot.yml — simply never dispatched).
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # check every 30 min (2 expected bot cycles)
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  # Alert if no SUCCESSFUL run-bot.yml run in this many minutes.
+  # Bot cycle is ~15 min, so 40 min ≈ 2 missed cycles before paging you.
+  MAX_SILENCE_MIN: 40
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 🔍 Check run-bot.yml health
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          # Most recent run of any status/conclusion
+          LATEST_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?per_page=1")
+          LATEST_STATUS=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].status // "none"')
+          LATEST_CONCLUSION=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].conclusion // "none"')
+          LATEST_CREATED=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].created_at // "none"')
+          LATEST_URL=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].html_url // "none"')
+
+          echo "Latest run → status=$LATEST_STATUS conclusion=$LATEST_CONCLUSION created=$LATEST_CREATED"
+
+          # Most recent SUCCESSFUL run
+          SUCCESS_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?status=success&per_page=1")
+          LAST_SUCCESS=$(echo "$SUCCESS_JSON" | jq -r '.workflow_runs[0].created_at // empty')
+
+          NOW_EPOCH=$(date -u +%s)
+          if [ -n "$LAST_SUCCESS" ]; then
+            SUCCESS_EPOCH=$(date -u -d "$LAST_SUCCESS" +%s)
+            AGE_MIN=$(( (NOW_EPOCH - SUCCESS_EPOCH) / 60 ))
+          else
+            AGE_MIN=999999
+          fi
+          echo "Minutes since last successful run: $AGE_MIN"
+
+          ALERT=""
+
+          # Case 1: most recent run finished but failed/was cancelled/timed out
+          if [ "$LATEST_STATUS" = "completed" ] && [ "$LATEST_CONCLUSION" != "success" ]; then
+            ALERT="⚠️ Latest run-bot.yml run finished with conclusion: ${LATEST_CONCLUSION}"$'\n'"Run: ${LATEST_URL}"
+          fi
+
+          # Case 2: too long since any successful run — catches runner-acquisition
+          # failures, GitHub internal errors, and silently-stopped cron alike.
+          if [ "$AGE_MIN" -ge "${MAX_SILENCE_MIN}" ]; then
+            SILENCE="🚨 No successful MACD Bot run in ${AGE_MIN} min (expected every ~15 min)"$'\n'"Last success: ${LAST_SUCCESS:-never recorded}"$'\n'"Latest run seen: ${LATEST_URL} (status=${LATEST_STATUS}, conclusion=${LATEST_CONCLUSION})"
+            if [ -n "$ALERT" ]; then
+              ALERT="${ALERT}"$'\n\n'"${SILENCE}"
+            else
+              ALERT="$SILENCE"
+            fi
+          fi
+
+          if [ -n "$ALERT" ]; then
+            {
+              echo "send_alert=true"
+              echo "alert_msg<<EOF"
+              echo "$ALERT"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Bot healthy — last success ${AGE_MIN} min ago"
+            echo "send_alert=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 📨 Send Telegram Alert
+        if: steps.check.outputs.send_alert == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALERT_MSG: ${{ steps.check.outputs.alert_msg }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${ALERT_MSG}" \
+            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
+
+      - name: 📋 Summary
+        if: always()
+        run: |
+          echo "## 🚨 Watchdog Check" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check.outputs.send_alert }}" = "true" ]; then
+            echo "**Alert sent** — see Telegram" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ No issues detected" >> $GITHUB_STEP_SUMMARY
+          fi

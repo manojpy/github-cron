@@ -276,3 +276,27 @@ jobs:
           else
             echo "⚠️ No logs captured" >> $GITHUB_STEP_SUMMARY
           fi
+
+      # PHASE 5: FAILURE NOTIFICATION
+      # Only fires if the job actually started (a runner was acquired) and a step
+      # failed — e.g. bot exited non-zero, timed out, or config/secrets were bad.
+      # This CANNOT catch "runner not acquired" / GitHub-internal-error failures,
+      # since in those cases no step in this job ever runs. See watchdog.yml for that.
+      - name: 📨 Notify Telegram on Failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          STATUS="${{ steps.results.outputs.status || 'Unknown' }}"
+          ERROR_MSG="${{ steps.results.outputs.error_msg || 'See workflow logs' }}"
+          EXIT_CODE="${{ steps.bot_run.outputs.exit_code || 'N/A' }}"
+          DURATION="${{ steps.bot_run.outputs.execution_time || 'N/A' }}"
+
+          MSG="🔴 MACD Bot workflow FAILED"$'\n'"Status: ${STATUS}"$'\n'"Exit code: ${EXIT_CODE} | Duration: ${DURATION}s"$'\n'"Error: ${ERROR_MSG}"$'\n'"Run: ${RUN_URL}"
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
