@@ -1183,7 +1183,12 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
 
         ok, msg = _validate_ohlc_arrays(data_15m, n_15m)
         if not ok:
-            logger.error(f"Gate indicators: OHLC validation failed — {msg}")
+            logger.error(f"Gate indicators: 15m OHLC validation failed — {msg}")
+            return None
+
+        ok, msg = _validate_ohlc_arrays(data_5m, n_5m)
+        if not ok:
+            logger.error(f"Gate indicators: 5m OHLC validation failed — {msg}")
             return None
 
         results: Dict[str, Any] = {}
