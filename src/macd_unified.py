@@ -3563,6 +3563,10 @@ def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states:
     cl_curr, cl_prev = context.get("cloud_lower_curr"), context.get("cloud_lower_prev")
 
     if any(v is None or np.isnan(v) for v in (cu_curr, cu_prev, cl_curr, cl_prev)):
+        # Prerequisite data missing — can't evaluate the cross, so drop any stale ACTIVE state
+        for k in (ALERT_KEYS['cloud_cross_up'], ALERT_KEYS['cloud_cross_down']):
+            if conditional_states.get(k, False):
+                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
         return resets
 
     if close_prev > cu_prev and close_curr <= cu_curr:
@@ -3581,6 +3585,9 @@ def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_state
     conv_curr, conv_prev = context.get("tk_conversion_curr"), context.get("tk_conversion_prev")
 
     if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
+        for k in (ALERT_KEYS['tk_conversion_up'], ALERT_KEYS['tk_conversion_down']):
+            if conditional_states.get(k, False):
+                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
         return resets
 
     if close_prev > conv_prev and close_curr <= conv_curr:
@@ -3599,6 +3606,9 @@ def _reset_kijun_cross_alerts(pair_name: str, context: dict, conditional_states:
     base_curr, base_prev = context.get("tk_base_curr"), context.get("tk_base_prev")
 
     if base_curr is None or base_prev is None or np.isnan(base_curr) or np.isnan(base_prev):
+        for k in (ALERT_KEYS['kijun_cross_up'], ALERT_KEYS['kijun_cross_down']):
+            if conditional_states.get(k, False):
+                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
         return resets
 
     if close_prev > base_prev and close_curr <= base_curr:
@@ -3643,6 +3653,15 @@ def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict)
     resets = []
     piv = context.get("pivots", {})
     if not piv:
+        # Pivot data missing entirely — drop any stale ACTIVE pivot alerts for known levels
+        for level in set(PIVOT_LEVELS_BUY):
+            k = ALERT_KEYS.get(f"pivot_up_{level}")
+            if k and conditional_states.get(k, False):
+                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
+        for level in set(PIVOT_LEVELS_SELL):
+            k = ALERT_KEYS.get(f"pivot_down_{level}")
+            if k and conditional_states.get(k, False):
+                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
         return resets
 
     close_curr, close_prev = context["close_curr"], context["close_prev"]
@@ -4664,26 +4683,25 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         all_state_changes.extend(resets_to_apply)  
 
-        alerts_to_send = raw_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-
-        pivot_count = sum(1 for _, _, k in alerts_to_send if k.startswith("pivot_"))
-        if pivot_count > 3:
-            logger_pair.warning(
-                f"Limiting pivot alerts for {pair_name}: {pivot_count} triggered, keeping 3"
-            )
-            pivot_alerts = [(t, e, k) for t, e, k in alerts_to_send if k.startswith("pivot_")][:3]
-            other_alerts = [(t, e, k) for t, e, k in alerts_to_send if not k.startswith("pivot_")]
-            alerts_to_send = other_alerts + pivot_alerts
-
         filtered_alerts = []
-        for alert_title, alert_extra, alert_key in alerts_to_send:
+        for alert_title, alert_extra, alert_key in raw_alerts:
             should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
             if not should_send:
                 logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
                 continue
 
             filtered_alerts.append((alert_title, alert_extra, alert_key))
-        alerts_to_send = filtered_alerts
+
+        pivot_count = sum(1 for _, _, k in filtered_alerts if k.startswith("pivot_"))
+        if pivot_count > 3:
+            logger_pair.warning(
+                f"Limiting pivot alerts for {pair_name}: {pivot_count} triggered, keeping 3"
+            )
+            pivot_alerts = [(t, e, k) for t, e, k in filtered_alerts if k.startswith("pivot_")][:3]
+            other_alerts = [(t, e, k) for t, e, k in filtered_alerts if not k.startswith("pivot_")]
+            filtered_alerts = other_alerts + pivot_alerts
+
+        alerts_to_send = filtered_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
         if alerts_to_send:
             reverified = independent_candle_reverify(
