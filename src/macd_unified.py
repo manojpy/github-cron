@@ -4890,7 +4890,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
 
-    limit_reached = False
+        limit_reached = False
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
                 current_total = alerts_sent_ref[0]
