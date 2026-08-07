@@ -4884,20 +4884,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"[{pair_name}] Candle unconfirmed — alert suppressed, dedup key KEPT to prevent duplicates"
                 )
                 alerts_to_send = []
+        new_alert_activations = []
+        for _, _, alert_key in alerts_to_send:
+            new_alert_activations.append(
+                (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
+            )
 
-        if not alerts_to_send:
-            return pair_name, {
-                "state": "CHECKS_FAILED",
-                "ts": int(time.time()),
-                "summary": {
-                    "alerts": 0,
-                    "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                    "hist_rma": round(hist_curr, 4),
-                    "suppression": "Re-verify or candle-confirm failed"
-                }
-            }
         limit_reached = False
-        if alerts_sent_ref is not None and alerts_sent_lock is not None:
+        if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
                 current_total = alerts_sent_ref[0]
                 if current_total >= max_alerts_per_run:
@@ -4905,57 +4899,51 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 else:
                     alerts_sent_ref[0] += len(alerts_to_send)
 
-        if limit_reached:
-            logger_pair.warning(
-                f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
-                f"skipping {len(alerts_to_send)} alerts for {pair_name}"
-            )
-            if all_state_changes:
-                persist_ok = await sdb.atomic_batch_update(all_state_changes)
-                if not persist_ok:
-                    logger_pair.error(
-                        f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
-                    )
-                for _, _, alert_key in alerts_to_send:
-                    await sdb.release_recent_alert(pair_name, alert_key)
-            return pair_name, {
-                "state": "LIMIT_REACHED",
-                "ts": int(time.time()),
-                "summary": {
-                    "alerts": 0,
-                    "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                    "hist_rma": round(hist_curr, 4),
-                    "suppression": f"Global limit {max_alerts_per_run} reached"
+            if limit_reached:
+                logger_pair.warning(
+                    f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
+                    f"skipping {len(alerts_to_send)} alerts for {pair_name}"
+                )
+                if all_state_changes:
+                    persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                    if not persist_ok:
+                        logger_pair.error(
+                            f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                        )
+                    for _, _, alert_key in alerts_to_send:
+                        await sdb.release_recent_alert(pair_name, alert_key)
+                return pair_name, {
+                    "state": "LIMIT_REACHED",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                        "hist_rma": round(hist_curr, 4), 
+                        "suppression": f"Global limit {max_alerts_per_run} reached"
+                    }
                 }
-            }
-
-        new_alert_activations = []
-        for _, _, alert_key in alerts_to_send:
-            new_alert_activations.append(
-                (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
-            )
-
-        try:
-            if len(alerts_to_send) == 1:
-                title, extra, _ = alerts_to_send[0]
-                msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
-            else:
-                items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
-
-            if not cfg.DRY_RUN_MODE:
-                send_success = await telegram_queue.send(msg)
-                if send_success:
-                    all_state_changes.extend(new_alert_activations)
-                    logger_pair.info(
-                        f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
-                        f"Keys: {[ak for _, _, ak in alerts_to_send]}"
-                    )
+        if alerts_to_send:
+            try:
+                if len(alerts_to_send) == 1:
+                    title, extra, _ = alerts_to_send[0]
+                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
                 else:
-                    logger_pair.error(
-                        f"Alert dispatch failed | {pair_name} | "
-                        f"State NOT marked ACTIVE, dedup claim retained for retry next run"
-                    )
+                    items = [(t, e) for t, e, _ in alerts_to_send[:25]]
+                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
+
+                if not cfg.DRY_RUN_MODE:
+                    send_success = await telegram_queue.send(msg)
+                    if send_success:
+                        all_state_changes.extend(new_alert_activations)
+                        logger_pair.info(
+                            f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
+                            f"Keys: {[ak for _, _, ak in alerts_to_send]}"
+                        )
+                    else:
+                        logger_pair.error(
+                            f"Alert dispatch failed | {pair_name} | "
+                            f"State NOT marked ACTIVE, dedup claim retained for retry next run"
+                        )
                 else:
                     # DRY RUN: mark ACTIVE anyway so this run mirrors production dedup/reset behavior
                     all_state_changes.extend(new_alert_activations)
