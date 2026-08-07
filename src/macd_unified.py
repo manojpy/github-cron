@@ -5443,7 +5443,7 @@ async def run_once() -> bool:
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
     if cfg.ENABLE_CPR:
-        bypass_status = "ON" if cfg.ENABLE_CPR_ADX_RVOL_BYPASS else "OFF"
+        bypass_status = "ON" if cfg.ENABLE_CPR_ADX_RVOL_CONFIRM else "OFF"
         logger_run.info(
             f"CPR gate active | threshold={cfg.CPR_THRESHOLD_PCT} | "
             f"ADX+RVOL bypass={bypass_status}"
