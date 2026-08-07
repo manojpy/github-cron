@@ -200,7 +200,7 @@ class BotConfig(BaseModel):
     ENABLE_VWAP: bool = Field(default=True)
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
-    ENABLE_CPR_ADX_RVOL_BYPASS: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
+    ENABLE_CPR_ADX_RVOL_CONFIRM: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
@@ -4210,15 +4210,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             move_from_prev_close_ok = False
 
         if cfg.ENABLE_CPR:
-            if cpr_ok:  # Narrow CPR: any 3 of 5
+            if cpr_ok:
                 effective_cpr_ok = momentum_count >= 3
-            else:       # Wide CPR: any 3 of 5 + (price move threshold OR ADX-rising+RVOL bypass)
-                adx_rvol_bypass_ok = (
-                    cfg.ENABLE_CPR_ADX_RVOL_BYPASS
-                    and adx_rising
-                    and (rvol_bypass_ok or adaptive_rvol_check)
-                )
-                effective_cpr_ok = momentum_count >= 3 and (move_from_prev_close_ok or adx_rvol_bypass_ok)
+        else:
+            if cfg.ENABLE_CPR_ADX_RVOL_CONFIRM:
+                adx_rvol_confirm_ok = adx_rising and (rvol_bypass_ok or adaptive_rvol_check)
+            else:
+                adx_rvol_confirm_ok = True
+
+            effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok and adx_rvol_confirm_ok)
         else:
             effective_cpr_ok = True  
 
