@@ -4210,17 +4210,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             move_from_prev_close_ok = False
 
         if cfg.ENABLE_CPR:
-            if cpr_ok:
+            if cpr_ok:  # Narrow CPR: any 3 of 5
                 effective_cpr_ok = momentum_count >= 3
+            else:       # Wide CPR: 3/5 AND mandatory 2% move AND optional ADX/RVOL confirm
+                if cfg.ENABLE_CPR_ADX_RVOL_CONFIRM:
+                    adx_rvol_confirm_ok = adx_rising and (rvol_bypass_ok or adaptive_rvol_check)
+                else:
+                    adx_rvol_confirm_ok = True
+                effective_cpr_ok = (
+                    momentum_count >= 3
+                    and move_from_prev_close_ok
+                    and adx_rvol_confirm_ok
+                )
         else:
-            if cfg.ENABLE_CPR_ADX_RVOL_CONFIRM:
-                adx_rvol_confirm_ok = adx_rising and (rvol_bypass_ok or adaptive_rvol_check)
-            else:
-                adx_rvol_confirm_ok = True
-
-            effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok and adx_rvol_confirm_ok)
-        else:
-            effective_cpr_ok = True  
+            effective_cpr_ok = True
 
         if cfg.DEBUG_MODE and cfg.ENABLE_CPR:
             logger_pair.debug(
@@ -4231,10 +4234,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"[thr={adaptive_threshold if adaptive_threshold is not None else float('nan'):.3f}], "
                 f"vol_ema={volume_above_ema_ok}) | "
                 f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
-                f"adx_rvol_bypass={cfg.ENABLE_CPR_ADX_RVOL_BYPASS and not cpr_ok and adx_rising and (rvol_bypass_ok or adaptive_rvol_check)} | "
+                f"adx_rvol_confirm={cfg.ENABLE_CPR_ADX_RVOL_CONFIRM and not cpr_ok and adx_rising and (rvol_bypass_ok or adaptive_rvol_check)} | "
                 f"NR_CPR={nr_cpr:.4f}"
             )
-
         if cfg.DEBUG_MODE:
             ratio_str = f"{atr_ratio:.3f}" if atr_ratio_valid else "n/a"
             adaptive_str = f"{adaptive_threshold:.3f}" if adaptive_threshold is not None else "n/a"
