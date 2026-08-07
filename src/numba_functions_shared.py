@@ -391,12 +391,10 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
-@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
-def calculate_atr_rma(high, low, close, period):
+@njit("f8[:](f8[:], f8[:], f8[:])", nogil=True, cache=True)
+def true_range_numba(high, low, close):
+    """Shared True Range calc — previously duplicated in calculate_atr_rma and calculate_adx_core."""
     n = len(close)
-    if n < period:
-        return np.full(n, np.nan, dtype=np.float64)
-
     tr = np.empty(n, dtype=np.float64)
     tr[0] = high[0] - low[0]
 
@@ -408,6 +406,16 @@ def calculate_atr_rma(high, low, close, period):
         tr2 = abs(h - c)
         tr3 = abs(l - c)
         tr[i] = max(tr1, tr2, tr3)
+
+    return tr
+
+@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
+def calculate_atr_rma(high, low, close, period):
+    n = len(close)
+    if n < period:
+        return np.full(n, np.nan, dtype=np.float64)
+
+    tr = true_range_numba(high, low, close)
 
     alpha = 1.0 / float(period)
     atr = ema_loop_alpha(tr, alpha)
@@ -421,23 +429,15 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     if n < di_length + adx_length:
         return adx
 
+    tr = true_range_numba(high, low, close)
     plus_dm = np.zeros(n, dtype=np.float64)
     minus_dm = np.zeros(n, dtype=np.float64)
-    tr = np.zeros(n, dtype=np.float64)
-
-    tr[0] = high[0] - low[0]
 
     for i in range(1, n):
         h = high[i]
         l = low[i]
         prev_h = high[i - 1]
         prev_l = low[i - 1]
-        prev_c = close[i - 1]
-
-        tr1 = h - l
-        tr2 = abs(h - prev_c)
-        tr3 = abs(l - prev_c)
-        tr[i] = max(tr1, tr2, tr3)
 
         up = h - prev_h
         down = prev_l - l
@@ -483,6 +483,7 @@ EXPORT_CONFIG = {
     'vwap_daily_loop_safe':          'f8[:](f8[:], f8[:], i8[:])',
     'calculate_ppo_core':            'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
     'calculate_rsi_core':            'f8[:](f8[:], i4)',
+    'true_range_numba':          'f8[:](f8[:], f8[:], f8[:])', 
     'calculate_atr_rma':             'f8[:](f8[:], f8[:], f8[:], i4)',
     'calculate_adx_core':            'f8[:](f8[:], f8[:], f8[:], i4, i4)',
 }
@@ -490,7 +491,7 @@ EXPORT_CONFIG = {
 __all__ = list(EXPORT_CONFIG.keys())
 
 # Guard: raise immediately at import if count drops unexpectedly
-expected_min_functions = 12
+expected_min_functions = 13
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

@@ -40,6 +40,7 @@ from aot_bridge import (
     rolling_min_max_numba,
     calculate_ppo_core,
     calculate_rsi_core,
+    true_range_numba, 
     calculate_atr_rma, 
     calculate_adx_core
 )

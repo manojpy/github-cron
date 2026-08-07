@@ -55,6 +55,7 @@ REQUIRED_AOT_FUNCTIONS = [
     'rolling_min_max_numba',
     'calculate_ppo_core',
     'calculate_rsi_core',
+    'true_range_numba', 
     'calculate_atr_rma',
     'calculate_adx_core',
 ]
@@ -154,7 +155,7 @@ def initialize_jit_fallback() -> None:
     global _jit_functions, _fallback_reason
 
     try:
-        # Import all 12 functions (already cached by Python)
+        # Import all 13 functions (already cached by Python)
         from numba_functions_shared import (
             sanitize_array_numba,
             ema_loop,
@@ -166,6 +167,7 @@ def initialize_jit_fallback() -> None:
             rolling_min_max_numba,
             calculate_ppo_core,
             calculate_rsi_core,
+            true_range_numba,  
             calculate_atr_rma,
             calculate_adx_core,
         )
@@ -182,6 +184,7 @@ def initialize_jit_fallback() -> None:
             'rolling_min_max_numba': rolling_min_max_numba,
             'calculate_ppo_core': calculate_ppo_core,
             'calculate_rsi_core': calculate_rsi_core,
+            'true_range_numba': true_range_numba,
             'calculate_atr_rma': calculate_atr_rma,
             'calculate_adx_core': calculate_adx_core,
         }
@@ -207,6 +210,7 @@ def _build_aot_dispatch() -> Dict[str, Callable]:
         'rolling_min_max_numba': _aot_module.rolling_min_max_numba,
         'calculate_ppo_core': _aot_module.calculate_ppo_core,
         'calculate_rsi_core': _aot_module.calculate_rsi_core,
+        'true_range_numba': _aot_module.true_range_numba,
         'calculate_atr_rma': _aot_module.calculate_atr_rma,
         'calculate_adx_core': _aot_module.calculate_adx_core,
     }
@@ -298,6 +302,9 @@ def calculate_ppo_core(close: np.ndarray, fast: int, slow: int, signal: int) -> 
 def calculate_rsi_core(close: np.ndarray, period: int) -> np.ndarray:
     return _dispatch['calculate_rsi_core'](close, period)
 
+def true_range_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    return _dispatch['true_range_numba'](high, low, close)
+
 def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
     return _dispatch['calculate_atr_rma'](high, low, close, period)
 
@@ -339,6 +346,7 @@ __all__ = [
     'calculate_rsi_core',
 
     # Pattern Recognition
+    'true_range_numba', 
     'calculate_atr_rma',
     'calculate_adx_core',
 ]
