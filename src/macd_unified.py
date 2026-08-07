@@ -3464,9 +3464,6 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"fast_tenkan_cross_down","title":"⚡🌐🔴 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("close_curr",float('inf'))<ctx.get("fast_cloud_lower_curr",float('-inf')) and ctx.get("fast_future_red",False) and ctx.get("fast_tenkan_le_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastConv {ctx.get('fast_tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ] 
 
-
-]
-
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots:
