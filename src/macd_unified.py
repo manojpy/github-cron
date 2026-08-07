@@ -4684,6 +4684,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    elif cfg.DEBUG_MODE:
+                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
 
                 except Exception as e:
                     logger_pair.debug(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
@@ -4705,6 +4707,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    elif cfg.DEBUG_MODE:
+                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
                     logger_pair.debug(f"Cloud cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
@@ -4724,6 +4728,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    elif cfg.DEBUG_MODE:
+                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
                     logger_pair.debug(f"TK conversion cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
@@ -4743,6 +4749,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    elif cfg.DEBUG_MODE:
+                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
                     logger_pair.debug(f"Kijun cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
@@ -4763,6 +4771,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    elif cfg.DEBUG_MODE:
+                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
                     logger_pair.debug(f"Fast cloud cross check failed for {alert_key}: {e}", exc_info=True)
                     trigger = False
@@ -4782,9 +4792,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     )
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                    elif cfg.DEBUG_MODE:
+                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
                     logger_pair.debug(f"Fast Tenkan cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
+                    trigger = False                 
             else:
                 try:
                     trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
@@ -4878,35 +4890,39 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
 
+    limit_reached = False
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
                 current_total = alerts_sent_ref[0]
                 if current_total >= max_alerts_per_run:
-                    logger_pair.warning(
-                        f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
-                        f"skipping {len(alerts_to_send)} alerts for {pair_name}"
-                    )
+                    limit_reached = True
+                else:
+                    alerts_sent_ref[0] += len(alerts_to_send)
 
-                    if all_state_changes:
-                        persist_ok = await sdb.atomic_batch_update(all_state_changes)
-                        if not persist_ok:
-                            logger_pair.error(
-                                f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
-                            )
-                        for _, _, alert_key in alerts_to_send:
-                            await sdb.release_recent_alert(pair_name, alert_key)
-                    return pair_name, {
-                        "state": "LIMIT_REACHED",
-                        "ts": int(time.time()),
-                        "summary": {
-                            "alerts": 0,
-                            "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                            "hist_rma": round(hist_curr, 4), 
-                            "suppression": f"Global limit {max_alerts_per_run} reached"
-                        }
+            if limit_reached:
+                logger_pair.warning(
+                    f"Global alert limit reached ({current_total}/{max_alerts_per_run}), "
+                    f"skipping {len(alerts_to_send)} alerts for {pair_name}"
+                )
+                if all_state_changes:
+                    persist_ok = await sdb.atomic_batch_update(all_state_changes)
+                    if not persist_ok:
+                        logger_pair.error(
+                            f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
+                        )
+                    for _, _, alert_key in alerts_to_send:
+                        await sdb.release_recent_alert(pair_name, alert_key)
+                return pair_name, {
+                    "state": "LIMIT_REACHED",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                        "hist_rma": round(hist_curr, 4), 
+                        "suppression": f"Global limit {max_alerts_per_run} reached"
                     }
-                alerts_sent_ref[0] += len(alerts_to_send)
-        if alerts_to_send:          
+                }
+        if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
