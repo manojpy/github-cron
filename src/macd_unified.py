@@ -4951,11 +4951,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                         f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                     )
-                    else:
-                        logger_pair.error(
-                            f"Alert dispatch failed | {pair_name} | "
-                            f"State NOT marked ACTIVE, dedup claim retained for retry next run"
-                        )
+                else:
+                    logger_pair.error(
+                        f"Alert dispatch failed | {pair_name} | "
+                        f"State NOT marked ACTIVE, dedup claim retained for retry next run"
+                    )
                 else:
                     # DRY RUN: mark ACTIVE anyway so this run mirrors production dedup/reset behavior
                     all_state_changes.extend(new_alert_activations)
