@@ -1607,69 +1607,69 @@ class SessionManager:
         return cls._ssl_context
 
 @classmethod
-async def get_session(cls) -> aiohttp.ClientSession:
-    old_session_to_close: Optional[aiohttp.ClientSession] = None
+    async def get_session(cls) -> aiohttp.ClientSession:
+        old_session_to_close: Optional[aiohttp.ClientSession] = None
 
-    async with cls._lock:
-        should_recreate = False
-        reason = None
+        async with cls._lock:
+            should_recreate = False
+            reason = None
 
-        if cls._session is None or cls._session.closed:
-            should_recreate = True
-            reason = "no session"
-        elif cls._request_count >= cls._session_reuse_limit:
-            should_recreate = True
-            reason = f"request limit reached ({cls._request_count})"
-            logger.info(f"Session recreation triggered: {reason}")
+            if cls._session is None or cls._session.closed:
+                should_recreate = True
+                reason = "no session"
+            elif cls._request_count >= cls._session_reuse_limit:
+                should_recreate = True
+                reason = f"request limit reached ({cls._request_count})"
+                logger.info(f"Session recreation triggered: {reason}")
 
-        if should_recreate:
-            if cls._session and not cls._session.closed:
-                old_session_to_close = cls._session
+            if should_recreate:
+                if cls._session and not cls._session.closed:
+                    old_session_to_close = cls._session
 
-            connector = TCPConnector(
-                limit=max(cfg.TCP_CONN_LIMIT, cfg.MAX_PARALLEL_FETCH),
-                limit_per_host=max(cfg.TCP_CONN_LIMIT_PER_HOST, cfg.MAX_PARALLEL_FETCH),
-                ssl=cls._get_ssl_context(),
-                force_close=False,
-                enable_cleanup_closed=True,
-                ttl_dns_cache=3600,
-                keepalive_timeout=90,
-                family=0,
-            )
+                connector = TCPConnector(
+                    limit=max(cfg.TCP_CONN_LIMIT, cfg.MAX_PARALLEL_FETCH),
+                    limit_per_host=max(cfg.TCP_CONN_LIMIT_PER_HOST, cfg.MAX_PARALLEL_FETCH),
+                    ssl=cls._get_ssl_context(),
+                    force_close=False,
+                    enable_cleanup_closed=True,
+                    ttl_dns_cache=3600,
+                    keepalive_timeout=90,
+                    family=0,
+                )
 
-            timeout = aiohttp.ClientTimeout(
-                total=cfg.HTTP_TIMEOUT,
-                connect=8,
-                sock_read=cfg.HTTP_TIMEOUT,
-            )
+                timeout = aiohttp.ClientTimeout(
+                    total=cfg.HTTP_TIMEOUT,
+                    connect=8,
+                    sock_read=cfg.HTTP_TIMEOUT,
+                )
 
-            cls._session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers={
-                    "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Connection": "keep-alive",
-                },
-                raise_for_status=False,
-            )
-            cls._creation_time = time.time()
-            cls._request_count = 0
+                cls._session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    headers={
+                        "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip, deflate",
+                        "Connection": "keep-alive",
+                    },
+                    raise_for_status=False,
+                )
+                cls._creation_time = time.time()
+                cls._request_count = 0
 
-            if cfg.DEBUG_MODE:
-                logger.debug("HTTP session created")
+                if cfg.DEBUG_MODE:
+                    logger.debug("HTTP session created")
 
-        new_session = cls._session
+            new_session = cls._session
 
-    if old_session_to_close is not None:
-        try:
-            await old_session_to_close.close()
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logger.warning(f"Error closing old session: {e}")
+        if old_session_to_close is not None:
+            try:
+                await old_session_to_close.close()
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.warning(f"Error closing old session: {e}")
 
-    return new_session
+        return new_session
 
     @classmethod
     def track_request(cls) -> None:
@@ -1683,37 +1683,37 @@ async def get_session(cls) -> aiohttp.ClientSession:
             )
 
 @classmethod
-async def close_session(cls) -> None:
-    session_to_close: Optional[aiohttp.ClientSession] = None
-    session_age = 0.0
-    request_count = 0
+    async def close_session(cls) -> None:
+        session_to_close: Optional[aiohttp.ClientSession] = None
+        session_age = 0.0
+        request_count = 0
 
-    async with cls._lock:
-        if cls._session and not cls._session.closed:
-            session_to_close = cls._session
-            session_age = time.time() - cls._creation_time
-            request_count = cls._request_count
-            # Reset state now, under the lock, so any concurrent
-            # get_session() call sees "no session" immediately instead
-            # of waiting on the close()+sleep() below.
-            cls._session = None
-            cls._request_count = 0
-            cls._creation_time = 0.0
-        else:
-            logger.debug("Session already closed or not created")
+        async with cls._lock:
+            if cls._session and not cls._session.closed:
+                session_to_close = cls._session
+                session_age = time.time() - cls._creation_time
+                request_count = cls._request_count
+                # Reset state now, under the lock, so any concurrent
+                # get_session() call sees "no session" immediately instead
+                # of waiting on the close()+sleep() below.
+                cls._session = None
+                cls._request_count = 0
+                cls._creation_time = 0.0
+            else:
+                logger.debug("Session already closed or not created")
 
-    if session_to_close is not None:
-        try:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"Closing HTTP session | "
-                    f"Age: {session_age:.1f}s | Requests served: {request_count}"
-                )
-            await session_to_close.close()
-            await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
-            logger.info("HTTP session closed successfully")
-        except Exception as e:
-            logger.warning(f"Error closing session: {e}")
+        if session_to_close is not None:
+            try:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"Closing HTTP session | "
+                        f"Age: {session_age:.1f}s | Requests served: {request_count}"
+                    )
+                await session_to_close.close()
+                await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
+                logger.info("HTTP session closed successfully")
+            except Exception as e:
+                logger.warning(f"Error closing session: {e}")
 
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
