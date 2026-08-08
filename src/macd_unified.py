@@ -3611,7 +3611,7 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict, previous_thresholds: dict) -> list:
     resets = []
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
     ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
@@ -3648,7 +3648,7 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -
 
     return resets
 
-def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict, previous_thresholds: dict) -> list:
     resets = []
     rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
     rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
