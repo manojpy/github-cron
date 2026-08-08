@@ -5639,7 +5639,7 @@ async def run_once() -> bool:
                 if telegram_queue is None:
                     telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
-                    f"🧹 {cfg.BOT_NAME} ��� All stored alert states cleared\n"
+                    f"🧹 {cfg.BOT_NAME} All stored alert states cleared\n"
                     f"State keys: {st} | Dedup keys: {dd}\n"
                     f"Time: {format_ist_time()}"
                 ))
