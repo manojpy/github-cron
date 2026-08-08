@@ -228,6 +228,7 @@ class BotConfig(BaseModel):
     ENABLE_FAST_ICHIMOKU_CLOUD_CROSS: bool = Field(default=True, description="15m alert: close crosses fast Ichimoku cloud (9,26,52,26), gated by future fast-cloud color and Fast Tenkan/Kijun alignment, plus all other buy/sell common conditions")
     ENABLE_FAST_ICHIMOKU_TENKAN_CROSS: bool = Field(default=True, description="15m alert: close crosses fast Ichimoku Tenkan line (9,26,52,26), gated by close beyond current fast cloud, future fast-cloud color, and Fast Tenkan/Kijun alignment, plus all other buy/sell common conditions")
     
+    EVAL_CONCURRENCY_LIMIT: int = Field(default=5, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
     MAX_ALERTS_PER_RUN: int = Field(default=50, ge=10, le=200)  
@@ -1592,8 +1593,6 @@ class SessionManager:
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _creation_time: ClassVar[float] = 0.0
-    _request_count: ClassVar[int] = 0
-    _session_reuse_limit: ClassVar[int] = 1000
 
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
@@ -1609,19 +1608,8 @@ class SessionManager:
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         old_session_to_close: Optional[aiohttp.ClientSession] = None
-
         async with cls._lock:
-            should_recreate = False
-            reason = None
-
-            if cls._session is None or cls._session.closed:
-                should_recreate = True
-                reason = "no session"
-            elif cls._request_count >= cls._session_reuse_limit:
-                should_recreate = True
-                reason = f"request limit reached ({cls._request_count})"
-                logger.info(f"Session recreation triggered: {reason}")
-
+            should_recreate = cls._session is None or cls._session.closed
             if should_recreate:
                 if cls._session and not cls._session.closed:
                     old_session_to_close = cls._session
@@ -1655,7 +1643,6 @@ class SessionManager:
                     raise_for_status=False,
                 )
                 cls._creation_time = time.time()
-                cls._request_count = 0
 
                 if cfg.DEBUG_MODE:
                     logger.debug("HTTP session created")
@@ -1672,32 +1659,16 @@ class SessionManager:
         return new_session
 
     @classmethod
-    def track_request(cls) -> None:
-        cls._request_count += 1
-
-        threshold_warning = cls._session_reuse_limit * 0.8
-        if cls._request_count == int(threshold_warning):
-            logger.debug(
-                f"Session approaching recreation threshold: "
-                f"{cls._request_count}/{cls._session_reuse_limit} requests"
-            )
-
-    @classmethod
     async def close_session(cls) -> None:
+
         session_to_close: Optional[aiohttp.ClientSession] = None
         session_age = 0.0
-        request_count = 0
 
         async with cls._lock:
             if cls._session and not cls._session.closed:
                 session_to_close = cls._session
                 session_age = time.time() - cls._creation_time
-                request_count = cls._request_count
-                # Reset state now, under the lock, so any concurrent
-                # get_session() call sees "no session" immediately instead
-                # of waiting on the close()+sleep() below.
                 cls._session = None
-                cls._request_count = 0
                 cls._creation_time = 0.0
             else:
                 logger.debug("Session already closed or not created")
@@ -1823,8 +1794,7 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                     if attempt < retries:
                         total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
-                    continue
-                SessionManager.track_request()         
+                    continue         
                 if any(retry_stats.values()):
                     logger.info(
                         f"Fetch succeeded after retries | URL: {url[:80]} | "
@@ -1931,43 +1901,47 @@ class APICircuitBreaker:
         self.last_failure_time = 0.0
         self.state = "CLOSED"
         self.success_count = 0
-        
-    def record_success(self) -> None:
-        if self.state == "HALF_OPEN":
-            self.success_count += 1
-            if self.success_count >= 2:
-                logger.info("💫 Circuit breaker: Recovered, transitioning to CLOSED")
-                self.state = "CLOSED"
-                self.failures = 0
-                self.success_count = 0
-        elif self.state == "CLOSED":
-            if self.failures > 0:
-                self.failures = max(0, self.failures - 1)
-   
-    def record_failure(self) -> None:
-        self.failures += 1
-        self.last_failure_time = time.time()
-        
-        if self.failures >= self.failure_threshold and self.state == "CLOSED":
-            logger.warning(
-                f"⚠️ Circuit breaker: OPENED after {self.failures} failures. "
-                f"Blocking requests for {self.recovery_timeout}s"
-            )
-            self.state = "OPEN"
-    
-    def can_attempt(self) -> Tuple[bool, Optional[str]]:
-        if self.state == "CLOSED":
+        self._lock = asyncio.Lock()          # NEW
+
+    async def record_success(self) -> None:  # NEW: async
+        async with self._lock:
+            if self.state == "HALF_OPEN":
+                self.success_count += 1
+                if self.success_count >= 2:
+                    logger.info("💫 Circuit breaker: Recovered, transitioning to CLOSED")
+                    self.state = "CLOSED"
+                    self.failures = 0
+                    self.success_count = 0
+            elif self.state == "CLOSED":
+                if self.failures > 0:
+                    self.failures = max(0, self.failures - 1)
+
+    async def record_failure(self) -> None:   # NEW: async
+        async with self._lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+
+            if self.failures >= self.failure_threshold and self.state == "CLOSED":
+                logger.warning(
+                    f"⚠️ Circuit breaker: OPENED after {self.failures} failures. "
+                    f"Blocking requests for {self.recovery_timeout}s"
+                )
+                self.state = "OPEN"
+
+    async def can_attempt(self) -> Tuple[bool, Optional[str]]:  # NEW: async
+        async with self._lock:
+            if self.state == "CLOSED":
+                return True, None
+
+            if self.state == "OPEN":
+                elapsed = time.time() - self.last_failure_time
+                if elapsed >= self.recovery_timeout:
+                    logger.info("🟡 Circuit breaker: Transitioning to HALF_OPEN (testing recovery)")
+                    self.state = "HALF_OPEN"
+                    self.success_count = 0
+                    return True, None
+                return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
             return True, None
-        
-        if self.state == "OPEN":
-            elapsed = time.time() - self.last_failure_time
-            if elapsed >= self.recovery_timeout:
-                logger.info("🟡 Circuit breaker: Transitioning to HALF_OPEN (testing recovery)")
-                self.state = "HALF_OPEN"
-                self.success_count = 0
-                return True, None            
-            return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"        
-        return True, None
 
 class DataFetcher:
     def __init__(self, api_base: str, *, session: Optional[aiohttp.ClientSession] = None, max_parallel: Optional[int] = None):
@@ -2001,7 +1975,7 @@ class DataFetcher:
         return await SessionManager.get_session()
   
     async def fetch_candles(self, symbol: str, resolution: str, limit: int, reference_time: int, expected_open_15: Optional[int] = None, for_confirmation: bool = False) -> Optional[Dict[str, Any]]:
-        can_proceed, reason = self.circuit_breaker.can_attempt()
+        can_proceed, reason = await self.circuit_breaker.can_attempt()
         if not can_proceed:
             logger.warning(f"Circuit breaker blocked candles {symbol}: {reason}")
             self.fetch_stats["circuit_breaker_blocks"] += 1
@@ -2041,7 +2015,7 @@ class DataFetcher:
         if data:
             result = data.get("result", {})
             if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
-                self.circuit_breaker.record_success()
+                await self.circuit_breaker.record_success()
                 self.fetch_stats["candles"]["success"] += 1
 
                 num_candles = len(result.get("t", []))
@@ -2068,11 +2042,11 @@ class DataFetcher:
             else:
                 logger.warning(f"Candles response missing fields | Symbol: {symbol}")
                 self.fetch_stats["candles"]["failed"] += 1
-                self.circuit_breaker.record_failure()
+                await self.circuit_breaker.record_failure()
         else:
             logger.warning(f"Candles fetch failed | Symbol: {symbol}")
             self.fetch_stats["candles"]["failed"] += 1
-            self.circuit_breaker.record_failure()
+            await self.circuit_breaker.record_failure()
 
         return None
 
@@ -5516,15 +5490,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
     logger_main.debug(f"🧠 Phase 3: Evaluating {len(prepared_tasks)} pairs...")
     eval_start = time.time()
-    results = await asyncio.gather(
-        *[
-            guarded_eval(
+    eval_semaphore = asyncio.Semaphore(cfg.EVAL_CONCURRENCY_LIMIT)  # NEW, e.g. 5
+
+    async def _bounded_eval(t):
+        async with eval_semaphore:
+            return await guarded_eval(
                 t, state_db, telegram_queue, correlation_id,
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
-            ) for t in prepared_tasks],
+            )
+
+    results = await asyncio.gather(
+        *[_bounded_eval(t) for t in prepared_tasks],
         return_exceptions=True,
     )
-
     eval_elapsed = time.time() - eval_start
     logger_main.debug(f"Evaluation complete: {eval_elapsed:.1f}s")
 
@@ -5540,7 +5518,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         f"Results: {len(valid_results)} successful, {len(results) - len(valid_results)} failed"
     )
     del results, prepared_tasks, pair_requests, valid_tasks
-    await asyncio.to_thread(gc.collect)
     
     process = psutil.Process()
 
@@ -5710,7 +5687,7 @@ async def run_once() -> bool:
                     await sdb.set_metadata(day_tracker_key, current_date_str)
                     logger_run.info(f"✅ Daily reset complete ({current_date_str})")
                 except Exception as e:
-                    logger_run.error(f"⚠��� Failed to save reset date: {e}")
+                    logger_run.error(f"❌Failed to save reset date: {e}")
             else:
                 logger_run.debug(f"No daily reset needed (last reset: {last_reset_date_str})")
 
@@ -5820,7 +5797,6 @@ async def run_once() -> bool:
                 f"Waits: {rate_stats['total_waits']} | "
                 f"Total wait: {rate_stats['total_wait_time_seconds']:.1f}s"
             )
-
         final_memory_mb = process.memory_info().rss / 1024 / 1024
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
@@ -5942,7 +5918,6 @@ try:
     logger.info(f"🌎 uvloop enabled | {JSON_BACKEND} enabled")
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
-
 
 if __name__ == "__main__":  
     aot_bridge.ensure_initialized()
