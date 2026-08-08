@@ -1455,29 +1455,28 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
         logger.warning("Redis degraded — skipping mass state purge")
         return 0, 0
 
-    state_keys: List[str] = []
-    dedup_keys: List[str] = []
+state_hash_keys: List[str] = [f"{sdb.state_prefix}{pair}" for pair in pairs]
+dedup_keys: List[str] = [
+    f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+    for pair in pairs
+    for alert_key in ALERT_KEYS.values()
+]
 
-    for pair in pairs:
-        for alert_key in ALERT_KEYS.values():
-            state_keys.append(f"{sdb.state_prefix}{pair}:{alert_key}")
-            dedup_keys.append(f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}")
+deleted_states = 0
+deleted_dedups = 0
 
-    deleted_states = 0
-    deleted_dedups = 0
+try:
+    if state_hash_keys:
+        deleted_states = await sdb._redis.delete(*state_hash_keys)
+    if dedup_keys:
+        deleted_dedups = await sdb._redis.delete(*dedup_keys)
 
-    try:
-        if state_keys:
-            deleted_states = await sdb._redis.delete(*state_keys)
-        if dedup_keys:
-            deleted_dedups = await sdb._redis.delete(*dedup_keys)
-
-        logger.info(
-            f"🧹 MASS RESET complete | "
-            f"State keys deleted: {deleted_states}/{len(state_keys)} | "
-            f"Dedup keys deleted: {deleted_dedups}/{len(dedup_keys)}"
-        )
-        return deleted_states, deleted_dedups
+    logger.info(
+        f"🧹 MASS RESET complete | "
+        f"State hash keys deleted: {deleted_states}/{len(state_hash_keys)} | "
+        f"Dedup keys deleted: {deleted_dedups}/{len(dedup_keys)}"
+    )
+    return deleted_states, deleted_dedups
     except Exception as e:
         logger.error(f"Mass reset failed: {e}")
         return 0, 0
@@ -1610,64 +1609,70 @@ class SessionManager:
             logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
 
-    @classmethod
-    async def get_session(cls) -> aiohttp.ClientSession:
-        async with cls._lock:
-            # Check if we need to recreate
-            should_recreate = False
-            reason = None
+@classmethod
+async def get_session(cls) -> aiohttp.ClientSession:
+    old_session_to_close: Optional[aiohttp.ClientSession] = None
 
-            if cls._session is None or cls._session.closed:
-                should_recreate = True
-                reason = "no session"
-            elif cls._request_count >= cls._session_reuse_limit:
-                should_recreate = True
-                reason = f"request limit reached ({cls._request_count})"
-                logger.info(f"Session recreation triggered: {reason}")
+    async with cls._lock:
+        should_recreate = False
+        reason = None
 
-            if should_recreate:
-                if cls._session and not cls._session.closed:
-                    try:
-                        await cls._session.close()
-                        await asyncio.sleep(0.1)
-                    except Exception as e:
-                        logger.warning(f"Error closing old session: {e}")
+        if cls._session is None or cls._session.closed:
+            should_recreate = True
+            reason = "no session"
+        elif cls._request_count >= cls._session_reuse_limit:
+            should_recreate = True
+            reason = f"request limit reached ({cls._request_count})"
+            logger.info(f"Session recreation triggered: {reason}")
 
-                connector = TCPConnector(
-                    limit=cfg.TCP_CONN_LIMIT,
-                    limit_per_host=cfg.TCP_CONN_LIMIT_PER_HOST,
-                    ssl=cls._get_ssl_context(),
-                    force_close=False,
-                    enable_cleanup_closed=True,
-                    ttl_dns_cache=3600,
-                    keepalive_timeout=90,
-                    family=0,
-                )
+        if should_recreate:
+            if cls._session and not cls._session.closed:
+                old_session_to_close = cls._session
 
-                timeout = aiohttp.ClientTimeout(
-                    total=cfg.HTTP_TIMEOUT,
-                    connect=8,
-                    sock_read=cfg.HTTP_TIMEOUT,
-                )
+            connector = TCPConnector(
+                limit=max(cfg.TCP_CONN_LIMIT, cfg.MAX_PARALLEL_FETCH),
+                limit_per_host=max(cfg.TCP_CONN_LIMIT_PER_HOST, cfg.MAX_PARALLEL_FETCH),
+                ssl=cls._get_ssl_context(),
+                force_close=False,
+                enable_cleanup_closed=True,
+                ttl_dns_cache=3600,
+                keepalive_timeout=90,
+                family=0,
+            )
 
-                cls._session = aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout,
-                    headers={
-                        "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
-                        "Accept": "application/json",
-                        "Accept-Encoding": "gzip, deflate",
-                        "Connection": "keep-alive",
-                    },
-                    raise_for_status=False,
-                )
-                cls._creation_time = time.time()
-                cls._request_count = 0
+            timeout = aiohttp.ClientTimeout(
+                total=cfg.HTTP_TIMEOUT,
+                connect=8,
+                sock_read=cfg.HTTP_TIMEOUT,
+            )
 
-                if cfg.DEBUG_MODE:
-                    logger.debug("HTTP session created")
+            cls._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={
+                    "User-Agent": f"{cfg.BOT_NAME}/{__version__}",
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive",
+                },
+                raise_for_status=False,
+            )
+            cls._creation_time = time.time()
+            cls._request_count = 0
 
-            return cls._session
+            if cfg.DEBUG_MODE:
+                logger.debug("HTTP session created")
+
+        new_session = cls._session
+
+    if old_session_to_close is not None:
+        try:
+            await old_session_to_close.close()
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Error closing old session: {e}")
+
+    return new_session
 
     @classmethod
     def track_request(cls) -> None:
@@ -1680,29 +1685,38 @@ class SessionManager:
                 f"{cls._request_count}/{cls._session_reuse_limit} requests"
             )
 
-    @classmethod
-    async def close_session(cls) -> None:
-        async with cls._lock:
-            if cls._session and not cls._session.closed:
-                try:
-                    session_age = time.time() - cls._creation_time
+@classmethod
+async def close_session(cls) -> None:
+    session_to_close: Optional[aiohttp.ClientSession] = None
+    session_age = 0.0
+    request_count = 0
 
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"Closing HTTP session | "
-                            f"Age: {session_age:.1f}s | Requests served: {cls._request_count}"
-                        )
-                    await cls._session.close()
-                    await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
-                    logger.info("HTTP session closed successfully")
-                except Exception as e:
-                    logger.warning(f"Error closing session: {e}")
-                finally:
-                    cls._session = None
-                    cls._request_count = 0
-                    cls._creation_time = 0.0
-            else:
-                logger.debug("Session already closed or not created")
+    async with cls._lock:
+        if cls._session and not cls._session.closed:
+            session_to_close = cls._session
+            session_age = time.time() - cls._creation_time
+            request_count = cls._request_count
+            # Reset state now, under the lock, so any concurrent
+            # get_session() call sees "no session" immediately instead
+            # of waiting on the close()+sleep() below.
+            cls._session = None
+            cls._request_count = 0
+            cls._creation_time = 0.0
+        else:
+            logger.debug("Session already closed or not created")
+
+    if session_to_close is not None:
+        try:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Closing HTTP session | "
+                    f"Age: {session_age:.1f}s | Requests served: {request_count}"
+                )
+            await session_to_close.close()
+            await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
+            logger.info("HTTP session closed successfully")
+        except Exception as e:
+            logger.warning(f"Error closing session: {e}")
 
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
@@ -2987,136 +3001,141 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
-    async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
-        
-        if not self._redis or self.degraded or not alert_keys:
-            return {k: False for k in alert_keys}
+async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
+    if not self._redis or self.degraded or not alert_keys:
+        return {k: False for k in alert_keys}
 
-        try:
-            state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-            mget_results = await asyncio.wait_for(
-                self._redis.mget(state_keys),
-                timeout=timeout
-            )
+    try:
+        hash_key = f"{self.state_prefix}{pair}"
+        hash_data = await asyncio.wait_for(
+            self._redis.hgetall(hash_key),
+            timeout=timeout
+        )
 
-            states: Dict[str, bool] = {}
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-                
-                if val is None:
-                    states[key] = False
+        states: Dict[str, bool] = {}
+        for key in alert_keys:
+            val = hash_data.get(key)
+
+            if val is None:
+                states[key] = False
+                continue
+
+            try:
+                parsed_state = json_loads(val)
+                states[key] = parsed_state.get("state") == "ACTIVE"
+
+            except (JSONDecodeError, TypeError) as e:
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"Failed to parse state for {pair}:{key}: {e}")
+                states[key] = False
+            except Exception as e:
+                logger.error(f"Unexpected error parsing state for {pair}:{key}: {e}")
+                states[key] = False
+
+        return states
+    except asyncio.TimeoutError as e:
+        await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
+        return {k: False for k in alert_keys}
+    except Exception as e:
+        await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
+        return {k: False for k in alert_keys}
+
+async def batch_get_alert_thresholds(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Optional[float]]:
+    if not self._redis or self.degraded or not alert_keys:
+        return {k: None for k in alert_keys}
+
+    try:
+        hash_key = f"{self.state_prefix}{pair}"
+        hash_data = await asyncio.wait_for(
+            self._redis.hgetall(hash_key),
+            timeout=timeout
+        )
+
+        thresholds: Dict[str, Optional[float]] = {}
+        for key in alert_keys:
+            val = hash_data.get(key)
+            if val is None:
+                thresholds[key] = None
+                continue
+            try:
+                parsed_state = json_loads(val)
+                raw = parsed_state.get("state")
+                thresholds[key] = float(raw) if raw is not None else None
+            except (JSONDecodeError, TypeError, ValueError) as e:
+                if cfg.DEBUG_MODE:
+                    logger.debug(f"Failed to parse threshold for {pair}:{key}: {e}")
+                thresholds[key] = None
+            except Exception as e:
+                logger.error(f"Unexpected error parsing threshold for {pair}:{key}: {e}")
+                thresholds[key] = None
+
+        return thresholds
+    except asyncio.TimeoutError as e:
+        await self._record_redis_failure("batch_get_alert_thresholds", e)
+        return {k: None for k in alert_keys}
+    except Exception as e:
+        await self._record_redis_failure("batch_get_alert_thresholds", e)
+        return {k: None for k in alert_keys}
+
+async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+    if self.degraded or not self._redis:
+        return False
+
+    if not updates and not deletes:
+        return True
+    try:
+        async with self._redis.pipeline() as pipe:
+            now = int(time.time())
+            touched_hashes: Set[str] = set()
+
+            hash_writes: Dict[str, Dict[str, str]] = {}
+            for key, state, custom_ts in (updates or []):
+                pair, sep, field = key.partition(":")
+                if not sep:
+                    logger.error(f"Skipping malformed state key (expected 'pair:field'): {key}")
                     continue
-                
+                ts = custom_ts if custom_ts is not None else now
                 try:
-                    if isinstance(val, bytes):
-                        val_str = val.decode("utf-8")
-                    elif isinstance(val, str):
-                        val_str = val
-                    else:
-                        states[key] = False
-                        continue
-
-                    parsed_state = json_loads(val_str)
-                    states[key] = parsed_state.get("state") == "ACTIVE"
-                    
-                except (JSONDecodeError, TypeError) as e:
-                    if cfg.DEBUG_MODE:
-                        logger.debug(f"Failed to parse state for {key}: {e}")
-                    states[key] = False
+                    data = json_dumps({"state": state, "ts": ts})
                 except Exception as e:
-                    logger.error(f"Unexpected error parsing state for {key}: {e}")
-                    states[key] = False
-
-            return states
-        except asyncio.TimeoutError as e:
-            await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
-            return {k: False for k in alert_keys}
-        except Exception as e:
-            await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
-            return {k: False for k in alert_keys}
-
-    async def batch_get_alert_thresholds(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Optional[float]]:
-        """Reads the numeric threshold stored at alert fire-time, so resets can compare
-        against the value that was active when the alert fired, not today's recomputed one."""
-        if not self._redis or self.degraded or not alert_keys:
-            return {k: None for k in alert_keys}
-
-        try:
-            state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
-            mget_results = await asyncio.wait_for(
-                self._redis.mget(state_keys),
-                timeout=timeout
-            )
-
-            thresholds: Dict[str, Optional[float]] = {}
-            for idx, key in enumerate(alert_keys):
-                val = mget_results[idx] if idx < len(mget_results) else None
-                if val is None:
-                    thresholds[key] = None
+                    logger.error(f"Failed to serialize state for {key}: {e}")
                     continue
-                try:
-                    val_str = val.decode("utf-8") if isinstance(val, bytes) else val
-                    parsed_state = json_loads(val_str)
-                    raw = parsed_state.get("state")
-                    thresholds[key] = float(raw) if raw is not None else None
-                except (JSONDecodeError, TypeError, ValueError) as e:
-                    if cfg.DEBUG_MODE:
-                        logger.debug(f"Failed to parse threshold for {key}: {e}")
-                    thresholds[key] = None
-                except Exception as e:
-                    logger.error(f"Unexpected error parsing threshold for {key}: {e}")
-                    thresholds[key] = None
+                hash_key = f"{self.state_prefix}{pair}"
+                hash_writes.setdefault(hash_key, {})[field] = data
 
-            return thresholds
-        except asyncio.TimeoutError as e:
-            await self._record_redis_failure("batch_get_alert_thresholds", e)
-            return {k: None for k in alert_keys}
-        except Exception as e:
-            await self._record_redis_failure("batch_get_alert_thresholds", e)
-            return {k: None for k in alert_keys}
+            for hash_key, mapping in hash_writes.items():
+                pipe.hset(hash_key, mapping=mapping)
+                touched_hashes.add(hash_key)
 
-    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-        """
-        OPTIMIZED: Use single delete(*keys) instead of looping through deletes.
-        """
-        if self.degraded or not self._redis:
-            return False
+            hash_deletes: Dict[str, List[str]] = {}
+            for key in (deletes or []):
+                if not key:
+                    continue
+                raw_key = key[len(self.state_prefix):] if key.startswith(self.state_prefix) else key
+                pair, sep, field = raw_key.partition(":")
+                if not sep:
+                    logger.error(f"Skipping malformed delete key (expected 'pair:field'): {key}")
+                    continue
+                hash_key = f"{self.state_prefix}{pair}"
+                hash_deletes.setdefault(hash_key, []).append(field)
 
-        if not updates and not deletes:
-            return True
+            for hash_key, fields in hash_deletes.items():
+                pipe.hdel(hash_key, *fields)
+                touched_hashes.add(hash_key)
 
-        try:
-            async with self._redis.pipeline() as pipe:
-                now = int(time.time())
+            if self.expiry_seconds > 0:
+                for hash_key in touched_hashes:
+                    pipe.expire(hash_key, self.expiry_seconds)
 
-                for key, state, custom_ts in (updates or []):
-                    ts = custom_ts if custom_ts is not None else now
-                    try:
-                        data = json_dumps({"state": state, "ts": ts})
-                    except Exception as e:
-                        logger.error(f"Failed to serialize state for {key}: {e}")
-                        continue
-                
-                    full_key = f"{self.state_prefix}{key}"
-                    if self.expiry_seconds > 0:
-                        pipe.set(full_key, data, ex=self.expiry_seconds)
-                    else:
-                        pipe.set(full_key, data)
+            await asyncio.wait_for(pipe.execute(), timeout=timeout)
+        return True
 
-                if deletes:
-                    delete_keys = [f"{self.state_prefix}{key}" if not key.startswith(self.state_prefix) else key for key in deletes if key]
-                    if delete_keys:
-                        pipe.delete(*delete_keys)
-
-                await asyncio.wait_for(pipe.execute(), timeout=timeout)
-            return True
-
-        except asyncio.TimeoutError as e:
-            await self._record_redis_failure("atomic_batch_update", e)
-            return False
-        except Exception as e:
-            await self._record_redis_failure("atomic_batch_update", e)
-            return False
+    except asyncio.TimeoutError as e:
+        await self._record_redis_failure("atomic_batch_update", e)
+        return False
+    except Exception as e:
+        await self._record_redis_failure("atomic_batch_update", e)
+        return False
 
 class RedisLock:    
     RELEASE_LUA = """
@@ -5623,7 +5642,7 @@ async def run_once() -> bool:
                 if telegram_queue is None:
                     telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
-                    f"🧹 {cfg.BOT_NAME} — All stored alert states cleared\n"
+                    f"🧹 {cfg.BOT_NAME} ��� All stored alert states cleared\n"
                     f"State keys: {st} | Dedup keys: {dd}\n"
                     f"Time: {format_ist_time()}"
                 ))
