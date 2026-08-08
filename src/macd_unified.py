@@ -5032,7 +5032,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
                 alerts_to_send = []
 
-       THRESHOLD_AT_FIRE = {
+        THRESHOLD_AT_FIRE = {
             "ppo_adaptive_up": context["ppo_adaptive_threshold"],
             "ppo_adaptive_down": context["ppo_adaptive_threshold"],
             "rsi_cross_adaptive_up": context["rsi_adaptive_buy"],
