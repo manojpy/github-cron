@@ -1677,8 +1677,7 @@ class SessionManager:
             try:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
-                        f"Closing HTTP session | "
-                        f"Age: {session_age:.1f}s | Requests served: {request_count}"
+                        f"Closing HTTP session | Age: {session_age:.1f}s"
                     )
                 await session_to_close.close()
                 await asyncio.sleep(0.1)  # OPTIMIZED: Reduced from 0.25s
@@ -1691,15 +1690,12 @@ class SessionManager:
         if cls._session is None:
             return {
                 "active": False,
-                "request_count": 0,
                 "age_seconds": 0.0,
             }
         age = time.time() - cls._creation_time if cls._creation_time > 0 else 0.0
         return {
             "active": not cls._session.closed,
-            "request_count": cls._request_count,
             "age_seconds": round(age, 1),
-            "requests_until_recreation": cls._session_reuse_limit - cls._request_count,
         }
 
 class RetryCategory:
