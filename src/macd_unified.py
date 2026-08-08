@@ -3034,6 +3034,46 @@ class RedisStateStore:
             await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
             return {k: False for k in alert_keys}
 
+    async def batch_get_alert_thresholds(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Optional[float]]:
+        """Reads the numeric threshold stored at alert fire-time, so resets can compare
+        against the value that was active when the alert fired, not today's recomputed one."""
+        if not self._redis or self.degraded or not alert_keys:
+            return {k: None for k in alert_keys}
+
+        try:
+            state_keys = [f"{self.state_prefix}{pair}:{k}" for k in alert_keys]
+            mget_results = await asyncio.wait_for(
+                self._redis.mget(state_keys),
+                timeout=timeout
+            )
+
+            thresholds: Dict[str, Optional[float]] = {}
+            for idx, key in enumerate(alert_keys):
+                val = mget_results[idx] if idx < len(mget_results) else None
+                if val is None:
+                    thresholds[key] = None
+                    continue
+                try:
+                    val_str = val.decode("utf-8") if isinstance(val, bytes) else val
+                    parsed_state = json_loads(val_str)
+                    raw = parsed_state.get("state")
+                    thresholds[key] = float(raw) if raw is not None else None
+                except (JSONDecodeError, TypeError, ValueError) as e:
+                    if cfg.DEBUG_MODE:
+                        logger.debug(f"Failed to parse threshold for {key}: {e}")
+                    thresholds[key] = None
+                except Exception as e:
+                    logger.error(f"Unexpected error parsing threshold for {key}: {e}")
+                    thresholds[key] = None
+
+            return thresholds
+        except asyncio.TimeoutError as e:
+            await self._record_redis_failure("batch_get_alert_thresholds", e)
+            return {k: None for k in alert_keys}
+        except Exception as e:
+            await self._record_redis_failure("batch_get_alert_thresholds", e)
+            return {k: None for k in alert_keys}
+
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
         """
         OPTIMIZED: Use single delete(*keys) instead of looping through deletes.
@@ -3571,6 +3611,22 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
+def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict, previous_thresholds: dict) -> list:
+    ...
+    ppo_adaptive_up_thr = previous_thresholds.get("ppo_adaptive_up")
+    if ppo_adaptive_up_thr is None:
+        ppo_adaptive_up_thr = context["ppo_adaptive_threshold"]  # fallback: no stored value yet
+    if ppo_prev > ppo_adaptive_up_thr and ppo_curr <= ppo_adaptive_up_thr:
+        if conditional_states.get(ALERT_KEYS['ppo_adaptive_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_up']}", "INACTIVE", None))
+
+    ppo_adaptive_down_thr = previous_thresholds.get("ppo_adaptive_down")
+    if ppo_adaptive_down_thr is None:
+        ppo_adaptive_down_thr = context["ppo_adaptive_threshold"]
+    if ppo_prev < -ppo_adaptive_down_thr and ppo_curr >= -ppo_adaptive_down_thr:
+        if conditional_states.get(ALERT_KEYS['ppo_adaptive_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_down']}", "INACTIVE", None))
+
 def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
@@ -3592,12 +3648,17 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -
         if conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
 
-    ppo_adaptive = context["ppo_adaptive_threshold"]
-    if ppo_prev > ppo_adaptive and ppo_curr <= ppo_adaptive:
+    ppo_adaptive_up_thr = previous_thresholds.get("ppo_adaptive_up")
+    if ppo_adaptive_up_thr is None:
+        ppo_adaptive_up_thr = context["ppo_adaptive_threshold"]  # fallback: no stored value yet
+    if ppo_prev > ppo_adaptive_up_thr and ppo_curr <= ppo_adaptive_up_thr:
         if conditional_states.get(ALERT_KEYS['ppo_adaptive_up'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_up']}", "INACTIVE", None))
 
-    if ppo_prev < -ppo_adaptive and ppo_curr >= -ppo_adaptive:
+    ppo_adaptive_down_thr = previous_thresholds.get("ppo_adaptive_down")
+    if ppo_adaptive_down_thr is None:
+        ppo_adaptive_down_thr = context["ppo_adaptive_threshold"]
+    if ppo_prev < -ppo_adaptive_down_thr and ppo_curr >= -ppo_adaptive_down_thr:
         if conditional_states.get(ALERT_KEYS['ppo_adaptive_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_down']}", "INACTIVE", None))
 
@@ -3616,8 +3677,12 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
         if conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
 
-    rsi_buy = context["rsi_adaptive_buy"]
-    rsi_sell = context["rsi_adaptive_sell"]
+    rsi_buy = previous_thresholds.get("rsi_cross_adaptive_up")
+    if rsi_buy is None:
+        rsi_buy = context["rsi_adaptive_buy"]
+    rsi_sell = previous_thresholds.get("rsi_cross_adaptive_down")
+    if rsi_sell is None:
+        rsi_sell = context["rsi_adaptive_sell"]
 
     if rsi_prev > rsi_buy and rsi_curr <= rsi_buy:
         if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_up'], False):
@@ -3626,7 +3691,7 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
     if rsi_prev < rsi_sell and rsi_curr >= rsi_sell:
         if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_down']}", "INACTIVE", None))
-    
+
     return resets
 
 def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
@@ -4219,13 +4284,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         atr_short_val = atr_short_arr[i15]
         atr_long_val = atr_long_arr[i15]
 
-        # ── ATR ratio helpers ──
         atr_ratio_valid = (
             not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9
         )
         atr_ratio = (atr_short_val / atr_long_val) if atr_ratio_valid else float('nan')
 
-        # ── Adaptive threshold lookup ──
         adaptive_threshold = None
         if cfg.ATR_ADAPTIVE_ENABLED:
             adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg)
@@ -4234,7 +4297,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg)
         cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg)
 
-        # ── Volume EMA check (needed for momentum) ──
         volume_curr = data_15m["volume"][i15]
         volume_ema_curr = volume_ema_arr[i15]
         if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
@@ -4242,10 +4304,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             volume_above_ema_ok = False
 
-        # ── Static RVOL ──
         rvol_bypass_ok = atr_ratio_valid and (atr_ratio >= cfg.RVOL_THRESHOLD)
 
-        # ── Adaptive RVOL ──
         adaptive_rvol_check = (
             atr_ratio_valid
             and adaptive_threshold is not None
@@ -4259,14 +4319,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         volatility_filter_ok = (not any_vol_feature_enabled) or adx_pass or rvol_static_pass or rvol_adaptive_pass
         rvol_ok=volatility_filter_ok
 
-        # ── ADX rising check ──
         adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
         adx_rising = (
             not np.isnan(adx_val) and not np.isnan(adx_prev)
             and adx_prev > 0 and adx_val > adx_prev
         )
-
-        # ── CPR momentum conditions (5 total) ──
         momentum_conditions = [
             adx_bypass_ok,         # 1. ADX >= threshold
             adx_rising,            # 2. ADX rising vs prior bar
@@ -4683,11 +4740,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             if not skip:
                 alert_keys_to_check.append(key)
 
-        # Fetch ALL alert states so resets work even for alerts whose requirements disappeared
         all_redis_alert_keys = list(ALERT_KEYS.values())
         previous_states = await sdb.batch_get_all_alert_states(
             pair_name, all_redis_alert_keys
         )
+
+        ADAPTIVE_THRESHOLD_KEYS = {
+            "ppo_adaptive_up": f"{ALERT_KEYS['ppo_adaptive_up']}_THR",
+            "ppo_adaptive_down": f"{ALERT_KEYS['ppo_adaptive_down']}_THR",
+            "rsi_cross_adaptive_up": f"{ALERT_KEYS['rsi_cross_adaptive_up']}_THR",
+            "rsi_cross_adaptive_down": f"{ALERT_KEYS['rsi_cross_adaptive_down']}_THR",
+        }
+        previous_thresholds = await sdb.batch_get_alert_thresholds(
+            pair_name, list(ADAPTIVE_THRESHOLD_KEYS.values())
+        )
+
         all_state_changes = []
 
         for alert_key in alert_keys_to_check:
@@ -4905,8 +4972,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         conditional_states = previous_states
 
         resets_to_apply = []
-        resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states, previous_thresholds))
+        resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states, previous_thresholds))
         resets_to_apply.extend(_reset_vwap_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
@@ -4916,7 +4983,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         resets_to_apply.extend(_reset_kijun_cross_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_fast_cloud_cross_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_fast_tenkan_cross_alerts(pair_name, context, conditional_states))
-
+        
         all_state_changes.extend(resets_to_apply)
 
         filtered_alerts = []
@@ -4964,12 +5031,24 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     f"[{pair_name}] Candle unconfirmed — alert suppressed, dedup key KEPT to prevent duplicates"
                 )
                 alerts_to_send = []
+
+       THRESHOLD_AT_FIRE = {
+            "ppo_adaptive_up": context["ppo_adaptive_threshold"],
+            "ppo_adaptive_down": context["ppo_adaptive_threshold"],
+            "rsi_cross_adaptive_up": context["rsi_adaptive_buy"],
+            "rsi_cross_adaptive_down": context["rsi_adaptive_sell"],
+        }
+
         new_alert_activations = []
         for _, _, alert_key in alerts_to_send:
             new_alert_activations.append(
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
-
+            if alert_key in THRESHOLD_AT_FIRE:
+                thr_key = ADAPTIVE_THRESHOLD_KEYS[alert_key]
+                new_alert_activations.append(
+                    (f"{pair_name}:{thr_key}", THRESHOLD_AT_FIRE[alert_key], None)
+                )
         limit_reached = False
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
