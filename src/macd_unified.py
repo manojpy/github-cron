@@ -109,18 +109,10 @@ __version__ = "1.8.0-stable"
 
 class Constants:
     MIN_WICK_RATIO = 0.2
-    RSI_SRSI_BUY_MAX = 60.0
-    RSI_SRSI_SELL_MIN = 40.0
     PPO_RSI_GUARD_BUY = 0.50
     PPO_RSI_GUARD_SELL = -0.50
     PPO_SIGNAL_CROSS_MAX_BUY = 0.30
     PPO_SIGNAL_CROSS_MIN_SELL = -0.30
-    PPO_011_THRESHOLD = 0.11
-    PPO_011_THRESHOLD_SELL = -0.11
-    RSI_CROSS55_BUY = 55.0
-    RSI_CROSS65_BUY = 65.0
-    RSI_CROSS45_SELL = 45.0
-    RSI_CROSS35_SELL = 35.0
     CIRCUIT_BREAKER_MAX_WAIT = 300
     INFINITY_CLAMP = 1e8
     TELEGRAM_MAX_MESSAGE_LENGTH = 4096
@@ -166,7 +158,8 @@ class BotConfig(BaseModel):
     RMA_50_PERIOD: int = Field(default=50, ge=10, le=200, description="RMA 50 period")
     RMA_200_PERIOD: int = Field(default=200, ge=50, le=500, description="RMA 200 period")
     VOLUME_EMA_LENGTH: int = Field(default=20, ge=2, le=100, description="EMA period for 15m volume, used as wide-CPR confirmation (candle volume > EMA)")
-    CPR_WIDE_MIN_PCT_MOVE: float = Field(default=2.0, ge=0.1, le=20.0, description="Minimum % move from previous day's close required for wide-CPR bypass")
+    CPR_ADAPTIVE_CALM: float = Field(default=1.0, ge=0.1, le=20.0, description="Min % move from prev close for wide-CPR bypass, calm regime")
+    CPR_ADAPTIVE_VOLATILE: float = Field(default=3.5, ge=0.1, le=20.0, description="Min % move from prev close for wide-CPR bypass, volatile regime") 
     ENABLE_HIST_RMA: bool = Field(default=True, description="Enable RMA 10/30 histogram reversal alerts")
     HIST_RMA_FAST: int = Field(default=10, ge=2, le=100, description="Histogram RMA fast period")
     HIST_RMA_SLOW: int = Field(default=30, ge=5, le=200, description="Histogram RMA slow period")
@@ -244,9 +237,16 @@ class BotConfig(BaseModel):
     ATR_PCTL_MIN_HISTORY: int = Field(default=50, ge=10, le=400)
     ADAPTIVE_MULT_CALM: float = Field(default=0.85, ge=0.1, le=2.0)
     ADAPTIVE_MULT_VOLATILE: float = Field(default=1.4, ge=0.5, le=3.0)
-    ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX directional movement calculation period
-    ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)  # ADX smoothing RMA period
-    ADX_THRESHOLD: float = Field(default=18.0, ge=5.0, le=50.0)  # ADX trend strength threshold (18=moderate, higher=stronger)   
+    ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)
+    ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)
+    ADX_ADAPTIVE_TARGET_PCTL: float = Field(default=60.0, ge=1.0, le=99.0, description="ADX threshold = this percentile of the pair's own trailing ADX history")
+    ADX_ADAPTIVE_FALLBACK: float = Field(default=18.0, ge=5.0, le=50.0, description="ADX threshold used during warm-up or when ATR_ADAPTIVE_ENABLED=False")
+    PPO_ADAPTIVE_CALM: float = Field(default=0.08, ge=0.01, le=1.0, description="PPO cross threshold in calm regime")
+    PPO_ADAPTIVE_VOLATILE: float = Field(default=0.20, ge=0.01, le=1.0, description="PPO cross threshold in volatile regime")
+    RSI_ADAPTIVE_BUY_CALM: float = Field(default=55.0, ge=50.0, le=90.0, description="RSI buy level in calm regime")
+    RSI_ADAPTIVE_BUY_VOLATILE: float = Field(default=70.0, ge=50.0, le=90.0, description="RSI buy level in volatile regime")
+    RSI_ADAPTIVE_SELL_CALM: float = Field(default=45.0, ge=10.0, le=50.0, description="RSI sell level in calm regime")
+    RSI_ADAPTIVE_SELL_VOLATILE: float = Field(default=30.0, ge=10.0, le=50.0, description="RSI sell level in volatile regime")
     MAX_CANDLE_STALENESS_SEC: int = Field(default=1200, ge=600, le=3600)  # Max candle age in seconds (10-60 min)
     RATE_LIMIT_PER_MINUTE: int = Field(default=400, ge=90, le=600)
     CONFIRM_RATE_LIMIT_PER_MINUTE: int = Field(default=20, ge=5, le=60)
@@ -306,10 +306,33 @@ class BotConfig(BaseModel):
                     f'ATR_PCTL_MIN_HISTORY ({self.ATR_PCTL_MIN_HISTORY}) must be < '
                     f'ATR_PCTL_LOOKBACK ({self.ATR_PCTL_LOOKBACK})'
                 )
+
             if self.ADAPTIVE_MULT_CALM >= self.ADAPTIVE_MULT_VOLATILE:
                 raise ValueError(
                     f'ADAPTIVE_MULT_CALM ({self.ADAPTIVE_MULT_CALM}) must be < '
                     f'ADAPTIVE_MULT_VOLATILE ({self.ADAPTIVE_MULT_VOLATILE})'
+                )
+            if self.PPO_ADAPTIVE_CALM >= self.PPO_ADAPTIVE_VOLATILE:
+                raise ValueError(
+                    f'PPO_ADAPTIVE_CALM ({self.PPO_ADAPTIVE_CALM}) must be < '
+                    f'PPO_ADAPTIVE_VOLATILE ({self.PPO_ADAPTIVE_VOLATILE})'
+                )
+            if self.RSI_ADAPTIVE_BUY_CALM >= self.RSI_ADAPTIVE_BUY_VOLATILE:
+                raise ValueError(
+                    f'RSI_ADAPTIVE_BUY_CALM ({self.RSI_ADAPTIVE_BUY_CALM}) must be < '
+                    f'RSI_ADAPTIVE_BUY_VOLATILE ({self.RSI_ADAPTIVE_BUY_VOLATILE})'
+                )
+            if self.RSI_ADAPTIVE_SELL_CALM <= self.RSI_ADAPTIVE_SELL_VOLATILE:
+                raise ValueError(
+                    f'RSI_ADAPTIVE_SELL_CALM ({self.RSI_ADAPTIVE_SELL_CALM}) must be > '
+                    f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
+                    f'— sell threshold drops as volatility rises'
+                )
+
+            if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
+                raise ValueError(
+                    f'CPR_ADAPTIVE_CALM ({self.CPR_ADAPTIVE_CALM}) must be < '
+                    f'CPR_ADAPTIVE_VOLATILE ({self.CPR_ADAPTIVE_VOLATILE})'
                 )
         return self
 
@@ -1474,10 +1497,9 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
     
     return True, None
 
-def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
-    if not cfg.ATR_ADAPTIVE_ENABLED:
-        return None
-
+def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+    """Percentile rank (0.0=calmest .. 1.0=most volatile) of current long-ATR
+    against its trailing ATR_PCTL_LOOKBACK window. None if insufficient history."""
     lookback = cfg.ATR_PCTL_LOOKBACK
     start = i15 - lookback
     if start < 0:
@@ -1493,13 +1515,64 @@ def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConf
         return None
 
     sorted_valid = np.sort(valid)
-    rank = np.searchsorted(sorted_valid, current, side='right')
-    pctl = rank / len(sorted_valid)  # 0.0 = calmest, 1.0 = most volatile
+    rank_lt = np.searchsorted(sorted_valid, current, side='left')   # count strictly < current
+    rank_le = np.searchsorted(sorted_valid, current, side='right')  # count <= current
+    return (rank_lt + rank_le) / (2 * len(sorted_valid))
 
-    mult = cfg.ADAPTIVE_MULT_CALM + pctl * (cfg.ADAPTIVE_MULT_VOLATILE - cfg.ADAPTIVE_MULT_CALM)
-    mult = max(cfg.ADAPTIVE_MULT_CALM, min(cfg.ADAPTIVE_MULT_VOLATILE, mult))
+def _scale_by_pctl(pctl: Optional[float], calm: float, volatile: float, fallback_pctl: float = 0.5) -> float:
+    """Linearly scales a [calm, volatile] range by pctl. Falls back to fallback_pctl
+    (midpoint by default) when pctl is unavailable, so callers always get a usable value."""
+    p = pctl if pctl is not None else fallback_pctl
+    val = calm + p * (volatile - calm)
+    lo, hi = min(calm, volatile), max(calm, volatile)
+    return max(lo, min(hi, val))
 
-    return mult
+def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+    if not cfg.ATR_ADAPTIVE_ENABLED:
+        return None
+    pctl = get_atr_percentile(atr_long_arr, i15, cfg)
+    if pctl is None:
+        return None
+    return _scale_by_pctl(pctl, cfg.ADAPTIVE_MULT_CALM, cfg.ADAPTIVE_MULT_VOLATILE)
+
+def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
+    """Self-referential: ADX threshold = the value at cfg.ADX_ADAPTIVE_TARGET_PCTL of
+    this pair's own trailing ADX history — so each pair gets its own baseline instead
+    of one fixed number for all ~30 pairs. Falls back to ADX_ADAPTIVE_FALLBACK when
+    ATR_ADAPTIVE_ENABLED=False or there isn't enough history yet."""
+    if not cfg.ATR_ADAPTIVE_ENABLED:
+        return cfg.ADX_ADAPTIVE_FALLBACK
+
+    lookback = cfg.ATR_PCTL_LOOKBACK
+    start = i15 - lookback
+    if start < 0:
+        return cfg.ADX_ADAPTIVE_FALLBACK
+
+    window = adx_arr[start:i15]
+    valid = window[~np.isnan(window)]
+    if len(valid) < cfg.ATR_PCTL_MIN_HISTORY:
+        return cfg.ADX_ADAPTIVE_FALLBACK
+
+    sorted_valid = np.sort(valid)
+    idx = int(cfg.ADX_ADAPTIVE_TARGET_PCTL / 100.0 * (len(sorted_valid) - 1))
+    idx = max(0, min(len(sorted_valid) - 1, idx))
+    return float(sorted_valid[idx])
+
+def get_adaptive_ppo_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
+    pctl = get_atr_percentile(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    return _scale_by_pctl(pctl, cfg.PPO_ADAPTIVE_CALM, cfg.PPO_ADAPTIVE_VOLATILE)
+
+def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Tuple[float, float]:
+    """Returns (buy_threshold, sell_threshold), computed from one shared percentile
+    so both sides move together with the same volatility regime."""
+    pctl = get_atr_percentile(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    buy = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_BUY_CALM, cfg.RSI_ADAPTIVE_BUY_VOLATILE)
+    sell = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_SELL_CALM, cfg.RSI_ADAPTIVE_SELL_VOLATILE)
+    return buy, sell
+
+def get_adaptive_cpr_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
+    pctl = get_atr_percentile(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    return _scale_by_pctl(pctl, cfg.CPR_ADAPTIVE_CALM, cfg.CPR_ADAPTIVE_VOLATILE)
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
@@ -3439,14 +3512,12 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
     {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_up","title":"🟢 PPO cross▲0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=Constants.PPO_011_THRESHOLD) and (ppo.get("curr",np.nan)>Constants.PPO_011_THRESHOLD) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"ppo_011_down","title":"🔴 PPO cross▼ -0.11","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=Constants.PPO_011_THRESHOLD_SELL) and (ppo.get("curr",np.nan)<Constants.PPO_011_THRESHOLD_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
-    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<Constants.RSI_SRSI_BUY_MAX) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>Constants.RSI_SRSI_SELL_MIN) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_55_up","title":"🟢 RSI▲55","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS55_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS55_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲55 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_65_up","title":"🟢 RSI▲65","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=Constants.RSI_CROSS65_BUY) and (rsi.get("curr",50)>Constants.RSI_CROSS65_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲65 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_45_down","title":"🔴 RSI▼45","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS45_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS45_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼45 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
-    {"key":"rsi_cross_35_down","title":"🔴 RSI▼35","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=Constants.RSI_CROSS35_SELL) and (rsi.get("curr",50)<Constants.RSI_CROSS35_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼35 | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"ppo_adaptive_up","title":"🟢 PPO cross▲adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)>ctx.get("ppo_adaptive_threshold",0.11)) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs adapt {ctx.get('ppo_adaptive_threshold',0):.3f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"ppo_adaptive_down","title":"🔴 PPO cross▼adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=-ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)<-ctx.get("ppo_adaptive_threshold",0.11)) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs adapt {-ctx.get('ppo_adaptive_threshold',0):.3f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
+    {"key":"rsi_ema5_up","title":"🟢 RSI▲EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("prev",50)<=rsi.get("ema_prev",50)) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("curr",50)<ctx.get("rsi_adaptive_buy",60)) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲EMA5 {rsi.get('ema_curr',50):.2f} | cap {ctx.get('rsi_adaptive_buy',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_ema5_down","title":"🔴 RSI▼EMA5","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("prev",50)>=rsi.get("ema_prev",50)) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("curr",50)>ctx.get("rsi_adaptive_sell",40)) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼EMA5 {rsi.get('ema_curr',50):.2f} | cap {ctx.get('rsi_adaptive_sell',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_cross_adaptive_up","title":"🟢 RSI▲adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (rsi.get("curr",50)>rsi.get("ema_curr",50)) and (rsi.get("prev",50)<=ctx.get("rsi_adaptive_buy",60)) and (rsi.get("curr",50)>ctx.get("rsi_adaptive_buy",60)) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▲{ctx.get('rsi_adaptive_buy',0):.1f} | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
+    {"key":"rsi_cross_adaptive_down","title":"🔴 RSI▼adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (rsi.get("curr",50)<rsi.get("ema_curr",50)) and (rsi.get("prev",50)>=ctx.get("rsi_adaptive_sell",40)) and (rsi.get("curr",50)<ctx.get("rsi_adaptive_sell",40)) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"RSI {rsi.get('curr',50):.2f} ▼{ctx.get('rsi_adaptive_sell',0):.1f} | EMA5 {rsi.get('ema_curr',50):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["rsi"]},
     {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -3521,13 +3592,14 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -
         if conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
 
-    if ppo_prev > Constants.PPO_011_THRESHOLD and ppo_curr <= Constants.PPO_011_THRESHOLD:
-        if conditional_states.get(ALERT_KEYS['ppo_011_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_up']}", "INACTIVE", None))
+    ppo_adaptive = context["ppo_adaptive_threshold"]
+    if ppo_prev > ppo_adaptive and ppo_curr <= ppo_adaptive:
+        if conditional_states.get(ALERT_KEYS['ppo_adaptive_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_up']}", "INACTIVE", None))
 
-    if ppo_prev < Constants.PPO_011_THRESHOLD_SELL and ppo_curr >= Constants.PPO_011_THRESHOLD_SELL:
-        if conditional_states.get(ALERT_KEYS['ppo_011_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_011_down']}", "INACTIVE", None))
+    if ppo_prev < -ppo_adaptive and ppo_curr >= -ppo_adaptive:
+        if conditional_states.get(ALERT_KEYS['ppo_adaptive_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_down']}", "INACTIVE", None))
 
     return resets
 
@@ -3544,22 +3616,17 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
         if conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
 
-    if rsi_prev > Constants.RSI_CROSS55_BUY and rsi_curr <= Constants.RSI_CROSS55_BUY:
-        if conditional_states.get(ALERT_KEYS['rsi_cross_55_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_55_up']}", "INACTIVE", None))
+    rsi_buy = context["rsi_adaptive_buy"]
+    rsi_sell = context["rsi_adaptive_sell"]
 
-    if rsi_prev > Constants.RSI_CROSS65_BUY and rsi_curr <= Constants.RSI_CROSS65_BUY:
-        if conditional_states.get(ALERT_KEYS['rsi_cross_65_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_65_up']}", "INACTIVE", None))
+    if rsi_prev > rsi_buy and rsi_curr <= rsi_buy:
+        if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_up'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_up']}", "INACTIVE", None))
 
-    if rsi_prev < Constants.RSI_CROSS45_SELL and rsi_curr >= Constants.RSI_CROSS45_SELL:
-        if conditional_states.get(ALERT_KEYS['rsi_cross_45_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_45_down']}", "INACTIVE", None))
-
-    if rsi_prev < Constants.RSI_CROSS35_SELL and rsi_curr >= Constants.RSI_CROSS35_SELL:
-        if conditional_states.get(ALERT_KEYS['rsi_cross_35_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_35_down']}", "INACTIVE", None))
-
+    if rsi_prev < rsi_sell and rsi_curr >= rsi_sell:
+        if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_down'], False):
+            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_down']}", "INACTIVE", None))
+    
     return resets
 
 def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
@@ -3817,16 +3884,16 @@ def validate_alert_definitions() -> None:
 validate_alert_definitions()
 
 BUY_ALERT_KEYS: Set[str] = {
-    "ppo_signal_up", "ppo_zero_up", "ppo_011_up",
-    "rsi_ema5_up", "rsi_cross_55_up", "rsi_cross_65_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
+    "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
+    "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
     "cloud_cross_up", "tk_conversion_up", "kijun_cross_up",
     "fast_cloud_cross_up", "fast_tenkan_cross_up",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
-    "ppo_signal_down", "ppo_zero_down", "ppo_011_down",
-    "rsi_ema5_down", "rsi_cross_45_down", "rsi_cross_35_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
+    "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
+    "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
     "cloud_cross_down", "tk_conversion_down", "kijun_cross_down",
     "fast_cloud_cross_down", "fast_tenkan_cross_down",
 }
@@ -4142,8 +4209,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
 
+
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
-        adx_raw_check = adx_val >= cfg.ADX_THRESHOLD
+        adx_adaptive_threshold = get_adaptive_adx_threshold(adx_arr, i15, cfg)
+        adx_raw_check = adx_val >= adx_adaptive_threshold
         adx_ok = adx_raw_check if cfg.ENABLE_ADX_FILTER else True
         adx_bypass_ok = adx_raw_check
 
@@ -4160,6 +4229,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         adaptive_threshold = None
         if cfg.ATR_ADAPTIVE_ENABLED:
             adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg)
+
+        ppo_adaptive_threshold = get_adaptive_ppo_threshold(atr_long_arr, i15, cfg)
+        rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg)
+        cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg)
 
         # ── Volume EMA check (needed for momentum) ──
         volume_curr = data_15m["volume"][i15]
@@ -4205,7 +4278,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         if not np.isnan(prev_day_close) and prev_day_close > 0:
             pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
-            move_from_prev_close_ok = pct_move_from_prev_close >= cfg.CPR_WIDE_MIN_PCT_MOVE
+            move_from_prev_close_ok = pct_move_from_prev_close >= cpr_adaptive_min_pct_move
         else:
             pct_move_from_prev_close = float('nan')
             move_from_prev_close_ok = False
@@ -4570,7 +4643,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "ppohist_curr": ppohist_curr, "ppohist_m1": ppohist_m1,
             "ppohist_m2": ppohist_m2, "ppohist_m3": ppohist_m3,
             "ppohist_reversal_buy": ppohist_reversal_buy, "ppohist_reversal_sell": ppohist_reversal_sell,
-
+            "adx_adaptive_threshold": adx_adaptive_threshold,
+            "ppo_adaptive_threshold": ppo_adaptive_threshold,
+            "rsi_adaptive_buy": rsi_adaptive_buy,
+            "rsi_adaptive_sell": rsi_adaptive_sell,
             "buy_wick_ratio": buy_wick_ratio,
             "sell_wick_ratio": sell_wick_ratio,
             "is_green": is_green, "is_red": is_red,
@@ -4580,6 +4656,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "cpr_ok": effective_cpr_ok,
             "momentum_count": momentum_count,
             "move_from_prev_close_ok": move_from_prev_close_ok, 
+            "cpr_adaptive_min_pct_move": cpr_adaptive_min_pct_move,
         }
 
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
@@ -4986,9 +5063,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 else:
                     reasons.append(
                         f"PPO>0 blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                         f"rvol_ok={rvol_ok})"
-                    )
+                    )           
         
             if ppo_prev >= 0 and ppo_curr < 0 and not sell_common:
                 if not base_sell_trend:
@@ -5000,41 +5077,41 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 else:
                     reasons.append(
                         f"PPO<0 blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                         f"rvol_ok={rvol_ok})"
                     )
        
-            if ppo_prev <= Constants.PPO_011_THRESHOLD and ppo_curr > Constants.PPO_011_THRESHOLD and not buy_common:
+            if ppo_prev <= ppo_adaptive_threshold and ppo_curr > ppo_adaptive_threshold and not buy_common:
                 if not base_buy_trend:
-                    reasons.append("PPO>+0.11 blocked: base_buy_trend=False")
+                    reasons.append("PPO>+adapt blocked: base_buy_trend=False")
                 elif not confirmation_buy:
-                    reasons.append("PPO>+0.11 blocked: confirmation_buy=False (future cloud)")
+                    reasons.append("PPO>+adapt blocked: confirmation_buy=False (future cloud)")
                 elif not is_valid_for_buy:
-                    reasons.append("PPO>+0.11 blocked: Knox rejected candle")
+                    reasons.append("PPO>+adapt blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"PPO>+0.11 blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                        f"rvol_ok={rvol_ok})"
+                        f"PPO>+{ppo_adaptive_threshold:.3f} blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
+                        f"rvol_ok={rvol_ok})"             
                     )
         
-            if ppo_prev >= Constants.PPO_011_THRESHOLD_SELL and ppo_curr < Constants.PPO_011_THRESHOLD_SELL and not sell_common:
+            if ppo_prev >= -ppo_adaptive_threshold and ppo_curr < -ppo_adaptive_threshold and not sell_common:
                 if not base_sell_trend:
-                    reasons.append("PPO<-0.11 blocked: base_sell_trend=False")
+                    reasons.append("PPO<-adapt blocked: base_sell_trend=False")
                 elif not confirmation_sell:
-                    reasons.append("PPO<-0.11 blocked: confirmation_sell=False (future cloud)")
+                    reasons.append("PPO<-adapt blocked: confirmation_sell=False (future cloud)")
                 elif not is_valid_for_sell:
-                    reasons.append("PPO<-0.11 blocked: Knox rejected candle")
+                    reasons.append("PPO<-adapt blocked: Knox rejected candle")
                 else:
                     reasons.append(
-                        f"PPO<-0.11 blocked: market filter "
-                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                        f"PPO<-{ppo_adaptive_threshold:.3f} blocked: market filter "
+                        f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                         f"rvol_ok={rvol_ok})"
-                    )
-        
+                    )      
+
             if rsi_prev <= rsi_ema_prev and rsi_curr > rsi_ema_curr:
-                if rsi_curr >= Constants.RSI_SRSI_BUY_MAX:
-                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {Constants.RSI_SRSI_BUY_MAX}")
+                if rsi_curr >= rsi_adaptive_buy:
+                    reasons.append(f"RSI>EMA5 blocked: RSI={rsi_curr:.2f} ≥ cap {rsi_adaptive_buy:.1f}")
                 elif ppo_gate_curr >= Constants.PPO_RSI_GUARD_BUY:
                     reasons.append(f"RSI>EMA5 blocked: PPO={ppo_gate_curr:.2f} ≥ guard {Constants.PPO_RSI_GUARD_BUY}")
                 elif not buy_common:
@@ -5047,13 +5124,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"RSI>EMA5 blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
 
             if rsi_prev >= rsi_ema_prev and rsi_curr < rsi_ema_curr:
-                if rsi_curr <= Constants.RSI_SRSI_SELL_MIN:
-                    reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {Constants.RSI_SRSI_SELL_MIN}")
+                if rsi_curr <= rsi_adaptive_sell:
+                    reasons.append(f"RSI<EMA5 blocked: RSI={rsi_curr:.2f} ≤ cap {rsi_adaptive_sell:.1f}")
                 elif ppo_gate_curr <= Constants.PPO_RSI_GUARD_SELL:
                     reasons.append(f"RSI<EMA5 blocked: PPO={ppo_gate_curr:.2f} ≤ guard {Constants.PPO_RSI_GUARD_SELL}")
                 elif not sell_common:
@@ -5066,7 +5143,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"RSI<EMA5 blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
        
@@ -5081,7 +5158,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"VWAP up-cross blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
             
@@ -5095,8 +5172,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"VWAP down-cross blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
-                            f"rvol_ok={rvol_ok})"
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
+                            f"rvol_ok={rvol_ok})")"
                         )
 
             if cfg.ENABLE_PPO_GATE:
@@ -5116,7 +5193,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"Conversion up-cross blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
 
@@ -5130,7 +5207,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"Conversion down-cross blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
 
@@ -5145,7 +5222,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"Kijun up-cross blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
 
@@ -5159,7 +5236,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     else:
                         reasons.append(
                             f"Kijun down-cross blocked: market filter "
-                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {cfg.ADX_THRESHOLD}], "
+                            f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
                             f"rvol_ok={rvol_ok})"
                         )
 
