@@ -2998,141 +2998,148 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
-async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
-    if not self._redis or self.degraded or not alert_keys:
-        return {k: False for k in alert_keys}
+    async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
+        if not self._redis or self.degraded or not alert_keys:
+            return {k: False for k in alert_keys}
 
-    try:
-        hash_key = f"{self.state_prefix}{pair}"
-        hash_data = await asyncio.wait_for(
-            self._redis.hgetall(hash_key),
-            timeout=timeout
-        )
+        try:
+            hash_key = f"{self.state_prefix}{pair}"
+            hash_data = await asyncio.wait_for(
+                self._redis.hgetall(hash_key),
+                timeout=timeout,
+            )
 
-        states: Dict[str, bool] = {}
-        for key in alert_keys:
-            val = hash_data.get(key)
+            states: Dict[str, bool] = {}
+            for key in alert_keys:
+                val = hash_data.get(key)
 
-            if val is None:
-                states[key] = False
-                continue
-
-            try:
-                parsed_state = json_loads(val)
-                states[key] = parsed_state.get("state") == "ACTIVE"
-
-            except (JSONDecodeError, TypeError) as e:
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"Failed to parse state for {pair}:{key}: {e}")
-                states[key] = False
-            except Exception as e:
-                logger.error(f"Unexpected error parsing state for {pair}:{key}: {e}")
-                states[key] = False
-
-        return states
-    except asyncio.TimeoutError as e:
-        await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
-        return {k: False for k in alert_keys}
-    except Exception as e:
-        await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
-        return {k: False for k in alert_keys}
-
-async def batch_get_alert_thresholds(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Optional[float]]:
-    if not self._redis or self.degraded or not alert_keys:
-        return {k: None for k in alert_keys}
-
-    try:
-        hash_key = f"{self.state_prefix}{pair}"
-        hash_data = await asyncio.wait_for(
-            self._redis.hgetall(hash_key),
-            timeout=timeout
-        )
-
-        thresholds: Dict[str, Optional[float]] = {}
-        for key in alert_keys:
-            val = hash_data.get(key)
-            if val is None:
-                thresholds[key] = None
-                continue
-            try:
-                parsed_state = json_loads(val)
-                raw = parsed_state.get("state")
-                thresholds[key] = float(raw) if raw is not None else None
-            except (JSONDecodeError, TypeError, ValueError) as e:
-                if cfg.DEBUG_MODE:
-                    logger.debug(f"Failed to parse threshold for {pair}:{key}: {e}")
-                thresholds[key] = None
-            except Exception as e:
-                logger.error(f"Unexpected error parsing threshold for {pair}:{key}: {e}")
-                thresholds[key] = None
-
-        return thresholds
-    except asyncio.TimeoutError as e:
-        await self._record_redis_failure("batch_get_alert_thresholds", e)
-        return {k: None for k in alert_keys}
-    except Exception as e:
-        await self._record_redis_failure("batch_get_alert_thresholds", e)
-        return {k: None for k in alert_keys}
-
-async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
-    if self.degraded or not self._redis:
-        return False
-
-    if not updates and not deletes:
-        return True
-    try:
-        async with self._redis.pipeline() as pipe:
-            now = int(time.time())
-            touched_hashes: Set[str] = set()
-
-            hash_writes: Dict[str, Dict[str, str]] = {}
-            for key, state, custom_ts in (updates or []):
-                pair, sep, field = key.partition(":")
-                if not sep:
-                    logger.error(f"Skipping malformed state key (expected 'pair:field'): {key}")
+                if val is None:
+                    states[key] = False
                     continue
-                ts = custom_ts if custom_ts is not None else now
+
                 try:
-                    data = json_dumps({"state": state, "ts": ts})
+                    parsed_state = json_loads(val)
+                    states[key] = parsed_state.get("state") == "ACTIVE"
+                except (JSONDecodeError, TypeError) as e:
+                    if cfg.DEBUG_MODE:
+                        logger.debug(f"Failed to parse state for {pair}:{key}: {e}")
+                    states[key] = False
                 except Exception as e:
-                    logger.error(f"Failed to serialize state for {key}: {e}")
+                    logger.error(f"Unexpected error parsing state for {pair}:{key}: {e}")
+                    states[key] = False
+
+            return states
+        except asyncio.TimeoutError as e:
+            await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
+            return {k: False for k in alert_keys}
+        except Exception as e:
+            await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
+            return {k: False for k in alert_keys}
+
+    async def batch_get_alert_thresholds(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Optional[float]]:
+        if not self._redis or self.degraded or not alert_keys:
+            return {k: None for k in alert_keys}
+
+        try:
+            hash_key = f"{self.state_prefix}{pair}"
+            hash_data = await asyncio.wait_for(
+                self._redis.hgetall(hash_key),
+                timeout=timeout,
+            )
+
+            thresholds: Dict[str, Optional[float]] = {}
+            for key in alert_keys:
+                val = hash_data.get(key)
+                if val is None:
+                    thresholds[key] = None
                     continue
-                hash_key = f"{self.state_prefix}{pair}"
-                hash_writes.setdefault(hash_key, {})[field] = data
+                try:
+                    parsed_state = json_loads(val)
+                    raw = parsed_state.get("state")
+                    thresholds[key] = float(raw) if raw is not None else None
+                except (JSONDecodeError, TypeError, ValueError) as e:
+                    if cfg.DEBUG_MODE:
+                        logger.debug(f"Failed to parse threshold for {pair}:{key}: {e}")
+                    thresholds[key] = None
+                except Exception as e:
+                    logger.error(f"Unexpected error parsing threshold for {pair}:{key}: {e}")
+                    thresholds[key] = None
 
-            for hash_key, mapping in hash_writes.items():
-                pipe.hset(hash_key, mapping=mapping)
-                touched_hashes.add(hash_key)
+            return thresholds
+        except asyncio.TimeoutError as e:
+            await self._record_redis_failure("batch_get_alert_thresholds", e)
+            return {k: None for k in alert_keys}
+        except Exception as e:
+            await self._record_redis_failure("batch_get_alert_thresholds", e)
+            return {k: None for k in alert_keys}
 
-            hash_deletes: Dict[str, List[str]] = {}
-            for key in (deletes or []):
-                if not key:
-                    continue
-                raw_key = key[len(self.state_prefix):] if key.startswith(self.state_prefix) else key
-                pair, sep, field = raw_key.partition(":")
-                if not sep:
-                    logger.error(f"Skipping malformed delete key (expected 'pair:field'): {key}")
-                    continue
-                hash_key = f"{self.state_prefix}{pair}"
-                hash_deletes.setdefault(hash_key, []).append(field)
+    async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
+        if self.degraded or not self._redis:
+            return False
 
-            for hash_key, fields in hash_deletes.items():
-                pipe.hdel(hash_key, *fields)
-                touched_hashes.add(hash_key)
+        if not updates and not deletes:
+            return True
 
-            if self.expiry_seconds > 0:
-                for hash_key in touched_hashes:
-                    pipe.expire(hash_key, self.expiry_seconds)
+        try:
+            async with self._redis.pipeline() as pipe:
+                now = int(time.time())
+                touched_hashes: Set[str] = set()
 
-            await asyncio.wait_for(pipe.execute(), timeout=timeout)
-        return True
+                hash_writes: Dict[str, Dict[str, str]] = {}
+                for key, state, custom_ts in (updates or []):
+                    pair, sep, field = key.partition(":")
+                    if not sep:
+                        logger.error(
+                            f"Skipping malformed state key (expected 'pair:field'): {key}"
+                        )
+                        continue
+                    ts = custom_ts if custom_ts is not None else now
+                    try:
+                        data = json_dumps({"state": state, "ts": ts})
+                    except Exception as e:
+                        logger.error(f"Failed to serialize state for {key}: {e}")
+                        continue
+                    hash_key = f"{self.state_prefix}{pair}"
+                    hash_writes.setdefault(hash_key, {})[field] = data
 
-    except asyncio.TimeoutError as e:
-        await self._record_redis_failure("atomic_batch_update", e)
-        return False
-    except Exception as e:
-        await self._record_redis_failure("atomic_batch_update", e)
-        return False
+                for hash_key, mapping in hash_writes.items():
+                    pipe.hset(hash_key, mapping=mapping)
+                    touched_hashes.add(hash_key)
+
+                hash_deletes: Dict[str, List[str]] = {}
+                for key in (deletes or []):
+                    if not key:
+                        continue
+                    raw_key = (
+                        key[len(self.state_prefix) :]
+                        if key.startswith(self.state_prefix)
+                        else key
+                    )
+                    pair, sep, field = raw_key.partition(":")
+                    if not sep:
+                        logger.error(
+                            f"Skipping malformed delete key (expected 'pair:field'): {key}"
+                        )
+                        continue
+                    hash_key = f"{self.state_prefix}{pair}"
+                    hash_deletes.setdefault(hash_key, []).append(field)
+
+                for hash_key, fields in hash_deletes.items():
+                    pipe.hdel(hash_key, *fields)
+                    touched_hashes.add(hash_key)
+
+                if self.expiry_seconds > 0:
+                    for hash_key in touched_hashes:
+                        pipe.expire(hash_key, self.expiry_seconds)
+
+                await asyncio.wait_for(pipe.execute(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError as e:
+            await self._record_redis_failure("atomic_batch_update", e)
+            return False
+        except Exception as e:
+            await self._record_redis_failure("atomic_batch_update", e)
+            return False
 
 class RedisLock:    
     RELEASE_LUA = """
