@@ -1606,7 +1606,7 @@ class SessionManager:
             logger.debug("SSL context created with TLSv1.2+ minimum")
         return cls._ssl_context
 
-@classmethod
+    @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         old_session_to_close: Optional[aiohttp.ClientSession] = None
 
@@ -1682,7 +1682,7 @@ class SessionManager:
                 f"{cls._request_count}/{cls._session_reuse_limit} requests"
             )
 
-@classmethod
+    @classmethod
     async def close_session(cls) -> None:
         session_to_close: Optional[aiohttp.ClientSession] = None
         session_age = 0.0
