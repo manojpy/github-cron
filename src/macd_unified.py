@@ -4308,7 +4308,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(adx_val) and not np.isnan(adx_prev)
             and adx_prev > 0 and adx_val > adx_prev
         )
-        rvol_vote_ok = adaptive_rvol_check if cfg.ATR_ADAPTIVE_ENABLED else rvol_bypass_ok
+
+        rvol_vote_ok = rvol_static_pass or rvol_adaptive_pass
 
         body_conviction_ok = (
             candle_range > 1e-9
@@ -4344,7 +4345,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"[{pair_name}] CPR {'narrow' if cpr_ok else 'WIDE'} | "
                 f"effective={effective_cpr_ok} | momentum={momentum_count}/5 "
                 f"(adx={adx_val:.1f}[{adx_bypass_ok},{adx_rising}], "
-                f"rvol={rvol_vote_ok}[{'adaptive' if cfg.ATR_ADAPTIVE_ENABLED else 'static'}]"
+                f"rvol={rvol_vote_ok}[static={rvol_static_pass},adaptive={rvol_adaptive_pass}]"
                 f"[thr={adaptive_threshold if adaptive_threshold is not None else float('nan'):.3f}], "
                 f"vol_ema={volume_above_ema_ok}, body={body_conviction_ok}) | "
                 f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
