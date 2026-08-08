@@ -5173,7 +5173,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         reasons.append(
                             f"VWAP down-cross blocked: market filter "
                             f"(adx_ok={adx_ok} [{adx_val:.1f} vs {adx_adaptive_threshold:.1f}], "
-                            f"rvol_ok={rvol_ok})")"
+                            f"rvol_ok={rvol_ok})"
                         )
 
             if cfg.ENABLE_PPO_GATE:
