@@ -1448,35 +1448,32 @@ async def _blanket_reset_pair(
     return len(resets)
 
 async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger) -> Tuple[int, int]:
-    """Delete every alert state and dedup key for all pairs.
-    Returns (state_keys_deleted, dedup_keys_deleted).
-    """
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
         return 0, 0
 
-state_hash_keys: List[str] = [f"{sdb.state_prefix}{pair}" for pair in pairs]
-dedup_keys: List[str] = [
-    f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
-    for pair in pairs
-    for alert_key in ALERT_KEYS.values()
-]
+    state_hash_keys: List[str] = [f"{sdb.state_prefix}{pair}" for pair in pairs]
+    dedup_keys: List[str] = [
+        f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+        for pair in pairs
+        for alert_key in ALERT_KEYS.values()
+    ]
 
-deleted_states = 0
-deleted_dedups = 0
+    deleted_states = 0
+    deleted_dedups = 0
 
-try:
-    if state_hash_keys:
-        deleted_states = await sdb._redis.delete(*state_hash_keys)
-    if dedup_keys:
-        deleted_dedups = await sdb._redis.delete(*dedup_keys)
+    try:
+        if state_hash_keys:
+            deleted_states = await sdb._redis.delete(*state_hash_keys)
+        if dedup_keys:
+            deleted_dedups = await sdb._redis.delete(*dedup_keys)
 
-    logger.info(
-        f"🧹 MASS RESET complete | "
-        f"State hash keys deleted: {deleted_states}/{len(state_hash_keys)} | "
-        f"Dedup keys deleted: {deleted_dedups}/{len(dedup_keys)}"
-    )
-    return deleted_states, deleted_dedups
+        logger.info(
+            f"🧹 MASS RESET complete | "
+            f"State hash keys deleted: {deleted_states}/{len(state_hash_keys)} | "
+            f"Dedup keys deleted: {deleted_dedups}/{len(dedup_keys)}"
+        )
+        return deleted_states, deleted_dedups
     except Exception as e:
         logger.error(f"Mass reset failed: {e}")
         return 0, 0
@@ -3524,7 +3521,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
             alert_lines.append(f"{prefix} *{e_desc}*")
     
     body = "\n".join(alert_lines)
-    datetime_line = f"📅 {e_date}{spacing}⏰ {e_time}"
+    datetime_line = f"�� {e_date}{spacing}⏰ {e_time}"
     
     return f"{line1}\n{body}\n{datetime_line}"
 
