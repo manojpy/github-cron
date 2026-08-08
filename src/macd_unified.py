@@ -3611,22 +3611,6 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict, previous_thresholds: dict) -> list:
-    ...
-    ppo_adaptive_up_thr = previous_thresholds.get("ppo_adaptive_up")
-    if ppo_adaptive_up_thr is None:
-        ppo_adaptive_up_thr = context["ppo_adaptive_threshold"]  # fallback: no stored value yet
-    if ppo_prev > ppo_adaptive_up_thr and ppo_curr <= ppo_adaptive_up_thr:
-        if conditional_states.get(ALERT_KEYS['ppo_adaptive_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_up']}", "INACTIVE", None))
-
-    ppo_adaptive_down_thr = previous_thresholds.get("ppo_adaptive_down")
-    if ppo_adaptive_down_thr is None:
-        ppo_adaptive_down_thr = context["ppo_adaptive_threshold"]
-    if ppo_prev < -ppo_adaptive_down_thr and ppo_curr >= -ppo_adaptive_down_thr:
-        if conditional_states.get(ALERT_KEYS['ppo_adaptive_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_down']}", "INACTIVE", None))
-
 def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
@@ -3680,14 +3664,13 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -
     rsi_buy = previous_thresholds.get("rsi_cross_adaptive_up")
     if rsi_buy is None:
         rsi_buy = context["rsi_adaptive_buy"]
-    rsi_sell = previous_thresholds.get("rsi_cross_adaptive_down")
-    if rsi_sell is None:
-        rsi_sell = context["rsi_adaptive_sell"]
-
     if rsi_prev > rsi_buy and rsi_curr <= rsi_buy:
         if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_up'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_up']}", "INACTIVE", None))
 
+    rsi_sell = previous_thresholds.get("rsi_cross_adaptive_down")
+    if rsi_sell is None:
+        rsi_sell = context["rsi_adaptive_sell"]
     if rsi_prev < rsi_sell and rsi_curr >= rsi_sell:
         if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_down']}", "INACTIVE", None))
