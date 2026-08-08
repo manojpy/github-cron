@@ -194,8 +194,9 @@ class BotConfig(BaseModel):
     ENABLE_VWAP: bool = Field(default=True)
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
-    ENABLE_CPR_ADX_RVOL_CONFIRM: bool = Field(default=False, description="Allow ADX-rising+RVOL to substitute for narrow CPR")
+    ENABLE_CPR_ADX_RVOL_CONFIRM: bool = Field(default=False, description="DEPRECATED: no longer used in CPR momentum gate (see CPR_MOMENTUM_BODY_RATIO_MIN)")
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
+    CPR_MOMENTUM_BODY_RATIO_MIN: float = Field(default=0.50, ge=0.0, le=1.0, description="Min |close-open|/range for candle-body-conviction momentum vote")
     PIVOT_LOOKBACK_PERIOD: int = 15
     FAIL_ON_REDIS_DOWN: bool = False
     FAIL_ON_TELEGRAM_DOWN: bool = False
@@ -4307,12 +4308,19 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             not np.isnan(adx_val) and not np.isnan(adx_prev)
             and adx_prev > 0 and adx_val > adx_prev
         )
+        rvol_vote_ok = adaptive_rvol_check if cfg.ATR_ADAPTIVE_ENABLED else rvol_bypass_ok
+
+        body_conviction_ok = (
+            candle_range > 1e-9
+            and (abs(close_curr - open_curr) / candle_range) >= cfg.CPR_MOMENTUM_BODY_RATIO_MIN
+        )
+
         momentum_conditions = [
-            adx_bypass_ok,         # 1. ADX >= threshold
+            adx_bypass_ok,         # 1. ADX level >= threshold
             adx_rising,            # 2. ADX rising vs prior bar
-            rvol_bypass_ok,        # 3. Static RVOL >= RVOL_THRESHOLD
-            adaptive_rvol_check,   # 4. Adaptive RVOL >= percentile-based threshold
-            volume_above_ema_ok,   # 5. Volume > EMA(volume)
+            rvol_vote_ok,          # 3. RVOL (static or adaptive, single vote — not both)
+            volume_above_ema_ok,   # 4. Volume > EMA(volume)
+            body_conviction_ok,    # 5. Candle body conviction (|close-open|/range)
         ]
         momentum_count = sum(momentum_conditions)
 
@@ -4324,18 +4332,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             move_from_prev_close_ok = False
 
         if cfg.ENABLE_CPR:
-            if cpr_ok:  # Narrow CPR: any 3 of 5
+            if cpr_ok:  # Narrow CPR: 3 of 5 independent momentum votes
                 effective_cpr_ok = momentum_count >= 3
-            else:       # Wide CPR: 3/5 AND mandatory 2% move AND optional ADX/RVOL confirm
-                if cfg.ENABLE_CPR_ADX_RVOL_CONFIRM:
-                    adx_rvol_confirm_ok = adx_rising and (rvol_bypass_ok or adaptive_rvol_check)
-                else:
-                    adx_rvol_confirm_ok = True
-                effective_cpr_ok = (
-                    momentum_count >= 3
-                    and move_from_prev_close_ok
-                    and adx_rvol_confirm_ok
-                )
+            else:       # Wide CPR: same 3 of 5, plus mandatory min % move
+                effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
         else:
             effective_cpr_ok = True
 
@@ -4344,11 +4344,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 f"[{pair_name}] CPR {'narrow' if cpr_ok else 'WIDE'} | "
                 f"effective={effective_cpr_ok} | momentum={momentum_count}/5 "
                 f"(adx={adx_val:.1f}[{adx_bypass_ok},{adx_rising}], "
-                f"rvol_static={rvol_bypass_ok}, rvol_adaptive={adaptive_rvol_check}"
+                f"rvol={rvol_vote_ok}[{'adaptive' if cfg.ATR_ADAPTIVE_ENABLED else 'static'}]"
                 f"[thr={adaptive_threshold if adaptive_threshold is not None else float('nan'):.3f}], "
-                f"vol_ema={volume_above_ema_ok}) | "
+                f"vol_ema={volume_above_ema_ok}, body={body_conviction_ok}) | "
                 f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
-                f"adx_rvol_confirm={cfg.ENABLE_CPR_ADX_RVOL_CONFIRM and not cpr_ok and adx_rising and (rvol_bypass_ok or adaptive_rvol_check)} | "
                 f"NR_CPR={nr_cpr:.4f}"
             )
         if cfg.DEBUG_MODE:
@@ -5583,10 +5582,9 @@ async def run_once() -> bool:
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
     if cfg.ENABLE_CPR:
-        bypass_status = "ON" if cfg.ENABLE_CPR_ADX_RVOL_CONFIRM else "OFF"
         logger_run.info(
             f"CPR gate active | threshold={cfg.CPR_THRESHOLD_PCT} | "
-            f"ADX+RVOL bypass={bypass_status}"
+            f"momentum=3-of-5 (narrow & wide) | body_ratio_min={cfg.CPR_MOMENTUM_BODY_RATIO_MIN}"
         )
     else:
         logger_run.info("CPR gate disabled")
