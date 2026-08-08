@@ -3528,7 +3528,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
             alert_lines.append(f"{prefix} *{e_desc}*")
     
     body = "\n".join(alert_lines)
-    datetime_line = f"�� {e_date}{spacing}⏰ {e_time}"
+    datetime_line = f"📆  {e_date}{spacing}⏰ {e_time}"
     
     return f"{line1}\n{body}\n{datetime_line}"
 
