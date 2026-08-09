@@ -1,4 +1,5 @@
 from __future__ import annotations   
+from types import MappingProxyType
 import logging
 import aot_bridge
 import os
@@ -2250,27 +2251,15 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
     if candle_range < 1e-9:
         return False, False, None, f"Zero-range candle (H={h:.4f} L={l:.4f})"
     
-    if c > o:
-        is_green = True
-        is_red = False
-        candle_color = "GREEN"
-        upper_wick = h - c
-        lower_wick = o - l
-        body = c - o
-    elif c < o:
-        is_green = False
-        is_red = True
-        candle_color = "RED"
-        upper_wick = h - o
-        lower_wick = c - l
-        body = o - c
-    else:
-        is_green = False
-        is_red = False
-        candle_color = "DOJI"
-        upper_wick = h - o
-        lower_wick = c - l
-        body = 0.0
+    is_green = c > o
+    is_red = c < o
+    candle_color = "GREEN" if is_green else "RED" if is_red else "DOJI"
+
+    hi_body = max(o, c)
+    lo_body = min(o, c)
+    body = hi_body - lo_body
+    upper_wick = h - hi_body
+    lower_wick = lo_body - l
     
     calculated_range = upper_wick + body + lower_wick
 
@@ -2324,7 +2313,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
             reason = f"DOJI candle rejected: body {body_ratio*100:.1f}% < {Constants.MIN_BODY_RATIO*100:.0f}%"
         return False, False, candle_info, reason
 
-    return is_valid_for_buy, is_valid_for_sell, candle_info, None
+    return is_valid_for_buy, is_valid_for_sell, MappingProxyType(candle_info), None
 
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
     try:   
@@ -2618,96 +2607,6 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     except Exception as e:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
         return False
-
-def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached_o: float, cached_h: float, cached_l: float, cached_c: float, cached_is_green: bool, cached_is_red: bool, cached_valid_buy: bool, cached_valid_sell: bool, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger, cached_ts: Optional[int] = None, cached_vol: Optional[float] = None) -> bool:
-    try:
-        raw_o = float(data_15m["open"][candle_index])
-        raw_h = float(data_15m["high"][candle_index])
-        raw_l = float(data_15m["low"][candle_index])
-        raw_c = float(data_15m["close"][candle_index])
-        raw_ts = int(data_15m["timestamp"][candle_index])
-        raw_vol = float(data_15m["volume"][candle_index])
-    except (IndexError, KeyError, TypeError, ValueError) as e:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify: cannot read raw OHLCV at index {candle_index}: {e} — suppressing alert"
-        )
-        return False
-
-    if any(np.isnan([raw_o, raw_h, raw_l, raw_c])) or any(np.isinf([raw_o, raw_h, raw_l, raw_c])):
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} — suppressing alert"
-        )
-        return False
-
-    if cached_ts is not None and raw_ts != cached_ts:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify TIMESTAMP MISMATCH: raw={raw_ts} cached={cached_ts} "
-            f"— suppressing alert"
-        )
-        return False
-
-    if cached_vol is not None and raw_vol <= 0:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify: zero/negative volume ({raw_vol}) at dispatch — suppressing alert"
-        )
-        return False
-
-    def _close_enough(a: float, b: float) -> bool:
-        return abs(a - b) <= 1e-6 * max(abs(a), abs(b), 1.0)
-
-    mismatches = [
-        tag for tag, a, b in (
-            ("open", raw_o, cached_o), ("high", raw_h, cached_h),
-            ("low", raw_l, cached_l), ("close", raw_c, cached_c),
-        ) if not _close_enough(a, b)
-    ]
-    if mismatches:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify OHLC MISMATCH on {mismatches} at index {candle_index} "
-            f"| raw O={raw_o:.6f} H={raw_h:.6f} L={raw_l:.6f} C={raw_c:.6f} "
-            f"| cached O={cached_o:.6f} H={cached_h:.6f} L={cached_l:.6f} C={cached_c:.6f} "
-            f"— suppressing alert"
-        )
-        return False
-
-    raw_range = raw_h - raw_l
-    if raw_range < 1e-9:
-        logger_pair.error(f"[{pair_name}] Independent re-verify: zero-range candle at dispatch — suppressing alert")
-        return False
-
-    raw_is_green = raw_c > raw_o
-    raw_is_red = raw_c < raw_o
-
-    if raw_is_green != cached_is_green or raw_is_red != cached_is_red:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify COLOR MISMATCH: "
-            f"raw(green={raw_is_green}, red={raw_is_red}) vs cached(green={cached_is_green}, red={cached_is_red}) "
-            f"| O={raw_o:.4f} C={raw_c:.4f} — suppressing alert"
-        )
-        return False
-
-    hi_body = max(raw_o, raw_c)
-    lo_body = min(raw_o, raw_c)
-    raw_upper_wick = raw_h - hi_body
-    raw_lower_wick = lo_body - raw_l
-    raw_body = hi_body - lo_body
-
-    raw_body_ratio = raw_body / raw_range
-    raw_upper_ratio = raw_upper_wick / raw_range
-    raw_lower_ratio = raw_lower_wick / raw_range
-
-    raw_valid_buy = raw_is_green and raw_upper_ratio < min_wick_ratio and raw_body_ratio >= Constants.MIN_BODY_RATIO
-    raw_valid_sell = raw_is_red and raw_lower_ratio < min_wick_ratio and raw_body_ratio >= Constants.MIN_BODY_RATIO
-
-    if raw_valid_buy != cached_valid_buy or raw_valid_sell != cached_valid_sell:
-        logger_pair.error(
-            f"[{pair_name}] Independent re-verify VALIDITY MISMATCH: "
-            f"raw(buy={raw_valid_buy}, sell={raw_valid_sell}) vs cached(buy={cached_valid_buy}, sell={cached_valid_sell}) "
-            f"| upper_ratio={raw_upper_ratio:.4f} lower_ratio={raw_lower_ratio:.4f} body_ratio={raw_body_ratio:.4f} "
-            f"— suppressing alert"
-        )
-        return False
-    return True
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
@@ -4977,22 +4876,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             filtered_alerts = other_alerts + pivot_alerts
 
         alerts_to_send = filtered_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-
-        if alerts_to_send:
-            reverified = independent_candle_reverify(
-                data_15m=data_15m, candle_index=i15,
-                cached_o=o, cached_h=h, cached_l=l, cached_c=c,
-                cached_is_green=is_green, cached_is_red=is_red,
-                cached_valid_buy=is_valid_for_buy, cached_valid_sell=is_valid_for_sell,
-                min_wick_ratio=Constants.MIN_WICK_RATIO,
-                pair_name=pair_name, logger_pair=logger_pair,
-                cached_ts=ts_curr, cached_vol=candle_info["volume"],
-            )
-            if not reverified:
-                logger_pair.warning(
-                    f"[{pair_name}] Independent re-verify failed — alert suppressed, dedup key KEPT to prevent duplicates"
-                )
-                alerts_to_send = []
 
         new_alert_activations = []
         for _, _, alert_key in alerts_to_send:
