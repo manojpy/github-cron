@@ -242,6 +242,7 @@ class BotConfig(BaseModel):
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_ADAPTIVE_TARGET_PCTL: float = Field(default=60.0, ge=1.0, le=99.0, description="ADX threshold = this percentile of the pair's own trailing ADX history")
+    ADX_ADAPTIVE_BAND_WIDTH: float = Field(default=0.0, ge=0.0, le=40.0)
     ADX_ADAPTIVE_FALLBACK: float = Field(default=18.0, ge=5.0, le=50.0, description="ADX threshold used during warm-up or when ATR_ADAPTIVE_ENABLED=False")
     PPO_ADAPTIVE_CALM: float = Field(default=0.08, ge=0.01, le=1.0, description="PPO cross threshold in calm regime")
     PPO_ADAPTIVE_VOLATILE: float = Field(default=0.20, ge=0.01, le=1.0, description="PPO cross threshold in volatile regime")
@@ -330,12 +331,21 @@ class BotConfig(BaseModel):
                     f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
                     f'— sell threshold drops as volatility rises'
                 )
-
             if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
                 raise ValueError(
                     f'CPR_ADAPTIVE_CALM ({self.CPR_ADAPTIVE_CALM}) must be < '
                     f'CPR_ADAPTIVE_VOLATILE ({self.CPR_ADAPTIVE_VOLATILE})'
                 )
+
+            if self.ADX_ADAPTIVE_BAND_WIDTH > 0:
+                lo = self.ADX_ADAPTIVE_TARGET_PCTL - self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
+                hi = self.ADX_ADAPTIVE_TARGET_PCTL + self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
+                if lo < 1.0 or hi > 99.0:
+                    raise ValueError(
+                        f'ADX_ADAPTIVE_TARGET_PCTL ({self.ADX_ADAPTIVE_TARGET_PCTL}) ± '
+                        f'band/2 ({self.ADX_ADAPTIVE_BAND_WIDTH / 2.0}) produces range '
+                        f'[{lo:.1f}, {hi:.1f}] which exceeds [1, 99]'
+                    )
         return self
 
     @model_validator(mode='after')
@@ -1517,6 +1527,26 @@ def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Op
     rank_le = np.searchsorted(sorted_valid, current, side='right')  # count <= current
     return (rank_lt + rank_le) / (2 * len(sorted_valid))
 
+def get_atr_percentile_smoothed(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, ema_period: int = 5) -> Optional[float]:
+    required_depth = cfg.ATR_PCTL_LOOKBACK + ema_period
+    if i15 < required_depth:
+        return get_atr_percentile(atr_long_arr, i15, cfg)  # unsmoothed during warmup
+
+    pctl_values = []
+    for j in range(i15 - ema_period + 1, i15 + 1):
+        p = get_atr_percentile(atr_long_arr, j, cfg)
+        if p is not None:
+            pctl_values.append(p)
+
+    if not pctl_values:
+        return None
+
+    alpha = 2.0 / (ema_period + 1)
+    ema = pctl_values[0]
+    for val in pctl_values[1:]:
+        ema = alpha * val + (1.0 - alpha) * ema
+    return ema
+
 def _scale_by_pctl(pctl: Optional[float], calm: float, volatile: float, fallback_pctl: float = 0.5) -> float:
     """Linearly scales a [calm, volatile] range by pctl. Falls back to fallback_pctl
     (midpoint by default) when pctl is unavailable, so callers always get a usable value."""
@@ -1552,24 +1582,47 @@ def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) ->
         return cfg.ADX_ADAPTIVE_FALLBACK
 
     sorted_valid = np.sort(valid)
-    idx = int(cfg.ADX_ADAPTIVE_TARGET_PCTL / 100.0 * (len(sorted_valid) - 1))
-    idx = max(0, min(len(sorted_valid) - 1, idx))
-    return float(sorted_valid[idx])
+    n = len(sorted_valid)
+
+    band_half = cfg.ADX_ADAPTIVE_BAND_WIDTH / 2.0
+    if band_half <= 0.0:
+        idx = int(cfg.ADX_ADAPTIVE_TARGET_PCTL / 100.0 * (n - 1))
+        idx = max(0, min(n - 1, idx))
+        return float(sorted_valid[idx])
+
+    lo_pctl = max(0.0, cfg.ADX_ADAPTIVE_TARGET_PCTL - band_half)
+    hi_pctl = min(100.0, cfg.ADX_ADAPTIVE_TARGET_PCTL + band_half)
+    lo_idx = max(0, int(lo_pctl / 100.0 * (n - 1)))
+    hi_idx = min(n - 1, int(hi_pctl / 100.0 * (n - 1)))
+    band = sorted_valid[lo_idx:hi_idx + 1]
+    return float(np.median(band))
+
+def get_adaptive_adx_threshold_smoothed(adx_arr: np.ndarray, i15: int, cfg: BotConfig, ema_period: int = 5) -> float:
+    required_depth = cfg.ATR_PCTL_LOOKBACK + ema_period
+    if i15 < required_depth:
+        return get_adaptive_adx_threshold(adx_arr, i15, cfg)  # unsmoothed fallback
+
+    thresholds = [get_adaptive_adx_threshold(adx_arr, j, cfg) for j in range(i15 - ema_period + 1, i15 + 1)]
+    alpha = 2.0 / (ema_period + 1)
+    ema = thresholds[0]
+    for val in thresholds[1:]:
+        ema = alpha * val + (1.0 - alpha) * ema
+    return ema
 
 def get_adaptive_ppo_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
-    pctl = get_atr_percentile(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    pctl = get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
     return _scale_by_pctl(pctl, cfg.PPO_ADAPTIVE_CALM, cfg.PPO_ADAPTIVE_VOLATILE)
 
 def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Tuple[float, float]:
     """Returns (buy_threshold, sell_threshold), computed from one shared percentile
     so both sides move together with the same volatility regime."""
-    pctl = get_atr_percentile(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    pctl = get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
     buy = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_BUY_CALM, cfg.RSI_ADAPTIVE_BUY_VOLATILE)
     sell = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_SELL_CALM, cfg.RSI_ADAPTIVE_SELL_VOLATILE)
     return buy, sell
 
 def get_adaptive_cpr_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
-    pctl = get_atr_percentile(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    pctl = get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
     return _scale_by_pctl(pctl, cfg.CPR_ADAPTIVE_CALM, cfg.CPR_ADAPTIVE_VOLATILE)
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
@@ -4245,7 +4298,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
 
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
-        adx_adaptive_threshold = get_adaptive_adx_threshold(adx_arr, i15, cfg)
+        adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
         adx_raw_check = adx_val >= adx_adaptive_threshold
         adx_ok = adx_raw_check if cfg.ENABLE_ADX_FILTER else True
         adx_bypass_ok = adx_raw_check
