@@ -4997,16 +4997,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
                 alerts_to_send = []
 
-        if alerts_to_send:
-            confirmed = await confirm_candle_unchanged(
-                fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
-            )
-            if not confirmed:
-                logger_pair.warning(
-                    f"[{pair_name}] Candle unconfirmed — alert suppressed, dedup key KEPT to prevent duplicates"
-                )
-                alerts_to_send = []
-
         THRESHOLD_AT_FIRE = {
             "ppo_adaptive_up": context["ppo_adaptive_threshold"],
             "ppo_adaptive_down": context["ppo_adaptive_threshold"],
@@ -5056,6 +5046,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                         "suppression": f"Global limit {max_alerts_per_run} reached"
                     }
                 }
+
         if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
@@ -5066,7 +5057,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
 
                 if not cfg.DRY_RUN_MODE:
-                    send_success = await telegram_queue.send(msg)
+                    reconfirmed = await confirm_candle_unchanged(
+                        fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
+                    )
+                    if not reconfirmed:
+                        logger_pair.warning(
+                            f"[{pair_name}] 🔁 Candle changed in send-queue window (dedup/token-bucket delay) — "
+                            f"alert suppressed, dedup key KEPT to prevent duplicates"
+                        )
+                        if alerts_sent_ref is not None and alerts_sent_lock is not None:
+                            async with alerts_sent_lock:
+                                alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - len(alerts_to_send))
+                        send_success = False
+                    else:
+                        send_success = await telegram_queue.send(msg)
                     if send_success:
                         all_state_changes.extend(new_alert_activations)
                         logger_pair.info(
