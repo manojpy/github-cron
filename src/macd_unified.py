@@ -3605,7 +3605,7 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict, previous_thresholds: dict) -> list:
+def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
     ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
@@ -3626,23 +3626,19 @@ def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict, p
         if conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
 
-    ppo_adaptive_up_thr = previous_thresholds.get("ppo_adaptive_up")
-    if ppo_adaptive_up_thr is None:
-        ppo_adaptive_up_thr = context["ppo_adaptive_threshold"]  # fallback: no stored value yet
+    ppo_adaptive_up_thr = context["ppo_adaptive_threshold"]
     if ppo_prev > ppo_adaptive_up_thr and ppo_curr <= ppo_adaptive_up_thr:
         if conditional_states.get(ALERT_KEYS['ppo_adaptive_up'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_up']}", "INACTIVE", None))
 
-    ppo_adaptive_down_thr = previous_thresholds.get("ppo_adaptive_down")
-    if ppo_adaptive_down_thr is None:
-        ppo_adaptive_down_thr = context["ppo_adaptive_threshold"]
+    ppo_adaptive_down_thr = context["ppo_adaptive_threshold"]
     if ppo_prev < -ppo_adaptive_down_thr and ppo_curr >= -ppo_adaptive_down_thr:
         if conditional_states.get(ALERT_KEYS['ppo_adaptive_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_down']}", "INACTIVE", None))
 
     return resets
 
-def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict, previous_thresholds: dict) -> list:
+def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     resets = []
     rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
     rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
@@ -3655,16 +3651,12 @@ def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict, p
         if conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
 
-    rsi_buy = previous_thresholds.get("rsi_cross_adaptive_up")
-    if rsi_buy is None:
-        rsi_buy = context["rsi_adaptive_buy"]
+    rsi_buy = context["rsi_adaptive_buy"]
     if rsi_prev > rsi_buy and rsi_curr <= rsi_buy:
         if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_up'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_up']}", "INACTIVE", None))
 
-    rsi_sell = previous_thresholds.get("rsi_cross_adaptive_down")
-    if rsi_sell is None:
-        rsi_sell = context["rsi_adaptive_sell"]
+    rsi_sell = context["rsi_adaptive_sell"]
     if rsi_prev < rsi_sell and rsi_curr >= rsi_sell:
         if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_down'], False):
             resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_down']}", "INACTIVE", None))
@@ -4719,17 +4711,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         previous_states = await sdb.batch_get_all_alert_states(
             pair_name, all_redis_alert_keys
         )
-
-        ADAPTIVE_THRESHOLD_KEYS = {
-            "ppo_adaptive_up": f"{ALERT_KEYS['ppo_adaptive_up']}_THR",
-            "ppo_adaptive_down": f"{ALERT_KEYS['ppo_adaptive_down']}_THR",
-            "rsi_cross_adaptive_up": f"{ALERT_KEYS['rsi_cross_adaptive_up']}_THR",
-            "rsi_cross_adaptive_down": f"{ALERT_KEYS['rsi_cross_adaptive_down']}_THR",
-        }
-        previous_thresholds = await sdb.batch_get_alert_thresholds(
-            pair_name, list(ADAPTIVE_THRESHOLD_KEYS.values())
-        )
-
         all_state_changes = []
 
         for alert_key in alert_keys_to_check:
@@ -4947,8 +4928,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         conditional_states = previous_states
 
         resets_to_apply = []
-        resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states, previous_thresholds))
-        resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states, previous_thresholds))
+        resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
+        resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_vwap_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
         resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
@@ -4997,23 +4978,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 )
                 alerts_to_send = []
 
-        THRESHOLD_AT_FIRE = {
-            "ppo_adaptive_up": context["ppo_adaptive_threshold"],
-            "ppo_adaptive_down": context["ppo_adaptive_threshold"],
-            "rsi_cross_adaptive_up": context["rsi_adaptive_buy"],
-            "rsi_cross_adaptive_down": context["rsi_adaptive_sell"],
-        }
-
         new_alert_activations = []
         for _, _, alert_key in alerts_to_send:
             new_alert_activations.append(
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
-            if alert_key in THRESHOLD_AT_FIRE:
-                thr_key = ADAPTIVE_THRESHOLD_KEYS[alert_key]
-                new_alert_activations.append(
-                    (f"{pair_name}:{thr_key}", THRESHOLD_AT_FIRE[alert_key], None)
-                )
         limit_reached = False
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
