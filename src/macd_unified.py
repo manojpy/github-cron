@@ -4291,11 +4291,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         adx_pass = adx_raw_check if cfg.ENABLE_ADX_FILTER else False
         rvol_static_pass = rvol_bypass_ok if cfg.ENABLE_RVOL_ALERT else False
         rvol_adaptive_pass = adaptive_rvol_check  # False if ATR_ADAPTIVE_ENABLED=False
-
-        any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
-        volatility_filter_ok = (not any_vol_feature_enabled) or adx_pass or rvol_static_pass or rvol_adaptive_pass
-        rvol_ok=volatility_filter_ok
-
+        
         adx_prev = adx_arr[i15 - 1] if i15 >= 1 else adx_val
         adx_rising = (
             not np.isnan(adx_val) and not np.isnan(adx_prev)
@@ -4308,7 +4304,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             candle_range > 1e-9
             and (abs(close_curr - open_curr) / candle_range) >= cfg.CPR_MOMENTUM_BODY_RATIO_MIN
         )
-
         momentum_conditions = [
             adx_bypass_ok,         # 1. ADX level >= threshold
             adx_rising,            # 2. ADX rising vs prior bar
@@ -4318,6 +4313,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ]
         momentum_count = sum(momentum_conditions)
 
+        any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
+        volatility_filter_ok = (not any_vol_feature_enabled) or (momentum_count >= 3)
+        rvol_ok = volatility_filter_ok
+
         if not np.isnan(prev_day_close) and prev_day_close > 0:
             pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
             move_from_prev_close_ok = pct_move_from_prev_close >= cpr_adaptive_min_pct_move
@@ -4326,10 +4325,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             move_from_prev_close_ok = False
 
         if cfg.ENABLE_CPR:
-            if cpr_ok:  # Narrow CPR: 3 of 5 independent momentum votes
-                effective_cpr_ok = momentum_count >= 3
-            else:       # Wide CPR: same 3 of 5, plus mandatory min % move
-                effective_cpr_ok = momentum_count >= 3 and move_from_prev_close_ok
+            if cpr_ok:  # Narrow CPR: momentum now enforced globally via volatility_filter_ok
+                effective_cpr_ok = True
+            else:       # Wide CPR: same, plus mandatory min % move from prior close
+                effective_cpr_ok = move_from_prev_close_ok
         else:
             effective_cpr_ok = True
 
@@ -5578,13 +5577,17 @@ async def run_once() -> bool:
         f"🎯 Run started | Correlation ID: {correlation_id} | "
         f"Reference time: {reference_time} ({format_ist_time(reference_time)})"
     )
+    logger_run.debug(
+        f"Momentum gate active (all alerts) | 3-of-5 vote | "
+        f"body_ratio_min={cfg.CPR_MOMENTUM_BODY_RATIO_MIN}"
+    )
     if cfg.ENABLE_CPR:
         logger_run.info(
             f"CPR gate active | threshold={cfg.CPR_THRESHOLD_PCT} | "
-            f"momentum=3-of-5 (narrow & wide) | body_ratio_min={cfg.CPR_MOMENTUM_BODY_RATIO_MIN}"
+            f"wide CPR requires move_from_prev_close (see CPR_THRESHOLD_PCT/adaptive)"
         )
     else:
-        logger_run.info("CPR gate disabled")
+        logger_run.debug("CPR gate disabled")
     try:
         process = psutil.Process()
         container_memory_mb = process.memory_info().rss / 1024 / 1024
