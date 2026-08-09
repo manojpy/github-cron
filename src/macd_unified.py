@@ -3059,43 +3059,6 @@ class RedisStateStore:
             await self._record_redis_failure(f"batch_get_all_alert_states({pair})", e)
             return {k: False for k in alert_keys}
 
-    async def batch_get_alert_thresholds(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Optional[float]]:
-        if not self._redis or self.degraded or not alert_keys:
-            return {k: None for k in alert_keys}
-
-        try:
-            hash_key = f"{self.state_prefix}{pair}"
-            hash_data = await asyncio.wait_for(
-                self._redis.hgetall(hash_key),
-                timeout=timeout,
-            )
-
-            thresholds: Dict[str, Optional[float]] = {}
-            for key in alert_keys:
-                val = hash_data.get(key)
-                if val is None:
-                    thresholds[key] = None
-                    continue
-                try:
-                    parsed_state = json_loads(val)
-                    raw = parsed_state.get("state")
-                    thresholds[key] = float(raw) if raw is not None else None
-                except (JSONDecodeError, TypeError, ValueError) as e:
-                    if cfg.DEBUG_MODE:
-                        logger.debug(f"Failed to parse threshold for {pair}:{key}: {e}")
-                    thresholds[key] = None
-                except Exception as e:
-                    logger.error(f"Unexpected error parsing threshold for {pair}:{key}: {e}")
-                    thresholds[key] = None
-
-            return thresholds
-        except asyncio.TimeoutError as e:
-            await self._record_redis_failure("batch_get_alert_thresholds", e)
-            return {k: None for k in alert_keys}
-        except Exception as e:
-            await self._record_redis_failure("batch_get_alert_thresholds", e)
-            return {k: None for k in alert_keys}
-
     async def atomic_batch_update(self, updates: List[Tuple[str, Any, Optional[int]]], deletes: Optional[List[str]] = None, timeout: float = 4.0) -> bool:
         if self.degraded or not self._redis:
             return False
