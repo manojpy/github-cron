@@ -17,6 +17,7 @@ import gc
 import json
 from collections import deque
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -2619,7 +2620,20 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
         return False
 
-def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached_o: float, cached_h: float, cached_l: float, cached_c: float, cached_is_green: bool, cached_is_red: bool, cached_valid_buy: bool, cached_valid_sell: bool, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger, cached_ts: Optional[int] = None, cached_vol: Optional[float] = None) -> bool:
+@dataclass(frozen=True)
+class CandleSnapshot:
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    is_green: bool
+    is_red: bool
+    is_valid_for_buy: bool
+    is_valid_for_sell: bool
+
+def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached: CandleSnapshot, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger) -> bool:
     try:
         raw_o = float(data_15m["open"][candle_index])
         raw_h = float(data_15m["high"][candle_index])
@@ -2639,14 +2653,14 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
         )
         return False
 
-    if cached_ts is not None and raw_ts != cached_ts:
+    if raw_ts != cached.timestamp:
         logger_pair.error(
-            f"[{pair_name}] Independent re-verify TIMESTAMP MISMATCH: raw={raw_ts} cached={cached_ts} "
+            f"[{pair_name}] Independent re-verify TIMESTAMP MISMATCH: raw={raw_ts} cached={cached.timestamp} "
             f"— suppressing alert"
         )
         return False
 
-    if cached_vol is not None and raw_vol <= 0:
+    if raw_vol <= 0:
         logger_pair.error(
             f"[{pair_name}] Independent re-verify: zero/negative volume ({raw_vol}) at dispatch — suppressing alert"
         )
@@ -2657,15 +2671,15 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
 
     mismatches = [
         tag for tag, a, b in (
-            ("open", raw_o, cached_o), ("high", raw_h, cached_h),
-            ("low", raw_l, cached_l), ("close", raw_c, cached_c),
+            ("open", raw_o, cached.open), ("high", raw_h, cached.high),
+            ("low", raw_l, cached.low), ("close", raw_c, cached.close),
         ) if not _close_enough(a, b)
     ]
     if mismatches:
         logger_pair.error(
             f"[{pair_name}] Independent re-verify OHLC MISMATCH on {mismatches} at index {candle_index} "
             f"| raw O={raw_o:.6f} H={raw_h:.6f} L={raw_l:.6f} C={raw_c:.6f} "
-            f"| cached O={cached_o:.6f} H={cached_h:.6f} L={cached_l:.6f} C={cached_c:.6f} "
+            f"| cached O={cached.open:.6f} H={cached.high:.6f} L={cached.low:.6f} C={cached.close:.6f} "
             f"— suppressing alert"
         )
         return False
@@ -2678,10 +2692,10 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
     raw_is_green = raw_c > raw_o
     raw_is_red = raw_c < raw_o
 
-    if raw_is_green != cached_is_green or raw_is_red != cached_is_red:
+    if raw_is_green != cached.is_green or raw_is_red != cached.is_red:
         logger_pair.error(
             f"[{pair_name}] Independent re-verify COLOR MISMATCH: "
-            f"raw(green={raw_is_green}, red={raw_is_red}) vs cached(green={cached_is_green}, red={cached_is_red}) "
+            f"raw(green={raw_is_green}, red={raw_is_red}) vs cached(green={cached.is_green}, red={cached.is_red}) "
             f"| O={raw_o:.4f} C={raw_c:.4f} — suppressing alert"
         )
         return False
@@ -2699,10 +2713,10 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
     raw_valid_buy = raw_is_green and raw_upper_ratio < min_wick_ratio and raw_body_ratio >= Constants.MIN_BODY_RATIO
     raw_valid_sell = raw_is_red and raw_lower_ratio < min_wick_ratio and raw_body_ratio >= Constants.MIN_BODY_RATIO
 
-    if raw_valid_buy != cached_valid_buy or raw_valid_sell != cached_valid_sell:
+    if raw_valid_buy != cached.is_valid_for_buy or raw_valid_sell != cached.is_valid_for_sell:
         logger_pair.error(
             f"[{pair_name}] Independent re-verify VALIDITY MISMATCH: "
-            f"raw(buy={raw_valid_buy}, sell={raw_valid_sell}) vs cached(buy={cached_valid_buy}, sell={cached_valid_sell}) "
+            f"raw(buy={raw_valid_buy}, sell={raw_valid_sell}) vs cached(buy={cached.is_valid_for_buy}, sell={cached.is_valid_for_sell}) "
             f"| upper_ratio={raw_upper_ratio:.4f} lower_ratio={raw_lower_ratio:.4f} body_ratio={raw_body_ratio:.4f} "
             f"— suppressing alert"
         )
@@ -4190,8 +4204,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         if cfg.ICHIMOKU_TK_GUARD_ENABLED:
             if tk_guard_valid:
-                tk_guard_ok_buy = tk_conversion_curr >= tk_base_curr
-                tk_guard_ok_sell = tk_conversion_curr <= tk_base_curr
+                tk_guard_ok_buy = (tk_conversion_curr >= tk_base_curr) and (close_curr > tk_base_curr)
+                tk_guard_ok_sell = (tk_conversion_curr <= tk_base_curr) and (close_curr < tk_base_curr)
             else:
                 logger_pair.debug(
                     f"[{pair_name}] TK lines not ready at i15={i15}. "
@@ -4432,10 +4446,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         confirmation_sell = cloud_group_ok_sell
 
         active_osc_buy = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
-        if len(active_osc_buy) >= 2:
-            oscillator_group_ok_buy = sum(active_osc_buy) >= 2
-        elif active_osc_buy:
-            oscillator_group_ok_buy = all(active_osc_buy)
+        if active_osc_buy:
+            oscillator_group_ok_buy = sum(active_osc_buy) >= 1
         elif oscillator_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Oscillator group: all gates abstained (warmup/gap) — buy denied."
@@ -4445,10 +4457,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             oscillator_group_ok_buy = True
 
         active_osc_sell = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
-        if len(active_osc_sell) >= 2:
-            oscillator_group_ok_sell = sum(active_osc_sell) >= 2
-        elif active_osc_sell:
-            oscillator_group_ok_sell = all(active_osc_sell)
+        if active_osc_sell:
+            oscillator_group_ok_sell = sum(active_osc_sell) >= 1
         elif oscillator_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Oscillator group: all gates abstained (warmup/gap) — sell denied."
@@ -4979,14 +4989,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         alerts_to_send = filtered_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
         if alerts_to_send:
+            cached_snapshot = CandleSnapshot(
+                timestamp=ts_curr, open=o, high=h, low=l, close=c,
+                volume=candle_info["volume"],
+                is_green=is_green, is_red=is_red,
+                is_valid_for_buy=is_valid_for_buy, is_valid_for_sell=is_valid_for_sell,
+            )
             reverified = independent_candle_reverify(
                 data_15m=data_15m, candle_index=i15,
-                cached_o=o, cached_h=h, cached_l=l, cached_c=c,
-                cached_is_green=is_green, cached_is_red=is_red,
-                cached_valid_buy=is_valid_for_buy, cached_valid_sell=is_valid_for_sell,
+                cached=cached_snapshot,
                 min_wick_ratio=Constants.MIN_WICK_RATIO,
                 pair_name=pair_name, logger_pair=logger_pair,
-                cached_ts=ts_curr, cached_vol=candle_info["volume"],
             )
             if not reverified:
                 logger_pair.warning(
