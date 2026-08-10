@@ -1696,7 +1696,7 @@ class SessionManager:
                     },
                     raise_for_status=False,
                 )
-                cls._creation_time = time.time()
+                cls._creation_time = time.monotonic()
 
                 if cfg.DEBUG_MODE:
                     logger.debug("HTTP session created")
@@ -1721,7 +1721,7 @@ class SessionManager:
         async with cls._lock:
             if cls._session and not cls._session.closed:
                 session_to_close = cls._session
-                session_age = time.time() - cls._creation_time
+                session_age = time.monotonic() - cls._creation_time
                 cls._session = None
                 cls._creation_time = 0.0
             else:
@@ -1746,7 +1746,7 @@ class SessionManager:
                 "active": False,
                 "age_seconds": 0.0,
             }
-        age = time.time() - cls._creation_time if cls._creation_time > 0 else 0.0
+        age = time.monotonic() - cls._creation_time if cls._creation_time > 0 else 0.0
         return {
             "active": not cls._session.closed,
             "age_seconds": round(age, 1),
@@ -1905,7 +1905,7 @@ class RateLimitedFetcher:
         while True:
             sleep_needed = 0.0
             async with self.lock:
-                now = time.time()
+                now = time.monotonic()
                 while self.requests and now - self.requests[0] > 60.0:
                     self.requests.popleft()
                 if len(self.requests) < self.max_per_minute:
@@ -1922,13 +1922,13 @@ class RateLimitedFetcher:
                         f"sleeping {sleep_needed:.2f}s | Total waits: {self.total_waits}"
                     )
             
-            t0 = time.time()
+            t0 = time.monotonic()
             try:
                 await asyncio.sleep(sleep_needed)
             except asyncio.CancelledError:
-                self.total_wait_time += max(0.0, time.time() - t0)
+                self.total_wait_time += max(0.0, time.monotonic() - t0)
                 raise
-            self.total_wait_time += time.time() - t0
+            self.total_wait_time += time.monotonic() - t0
 
         async with self.semaphore:
             return await func(*args, **kwargs)
@@ -3606,7 +3606,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppohist_buy","title":"🟢🔥 PPO Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"cloud_cross_down","title":"☁️���� Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
+    {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -5029,7 +5029,15 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             new_alert_activations.append(
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
+
+        async def _refund_alert_budget(n: int) -> None:
+            """Undo the optimistic budget reservation when a send does not go out."""
+            if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
+                async with alerts_sent_lock:
+                    alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - n)
+
         limit_reached = False
+
         if alerts_to_send and alerts_sent_ref is not None and alerts_sent_lock is not None:
             async with alerts_sent_lock:
                 current_total = alerts_sent_ref[0]
@@ -5080,12 +5088,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             f"[{pair_name}] 🔁 Candle changed in send-queue window (dedup/token-bucket delay) — "
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
                         )
-                        if alerts_sent_ref is not None and alerts_sent_lock is not None:
-                            async with alerts_sent_lock:
-                                alerts_sent_ref[0] = max(0, alerts_sent_ref[0] - len(alerts_to_send))
+
+                        await _refund_alert_budget(len(alerts_to_send))
                         send_success = False
                     else:
                         send_success = await telegram_queue.send(msg)
+
                     if send_success:
                         all_state_changes.extend(new_alert_activations)
                         logger_pair.info(
@@ -5093,19 +5101,23 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                     else:
+                        await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
                             f"Alert dispatch failed | {pair_name} | "
-                            f"State NOT marked ACTIVE, dedup claim retained for retry next run"
-                        )
+                            f"State NOT marked ACTIVE, dedup claim retained for retry next run | "
+                            f"Budget refunded"
+                        )               
                 else:
                     # DRY RUN: mark ACTIVE anyway so this run mirrors production dedup/reset behavior
                     all_state_changes.extend(new_alert_activations)
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
             except Exception as e:
+                await _refund_alert_budget(len(alerts_to_send))
                 logger_pair.error(
                     f"Alert dispatch exception for {pair_name}: {e} | "
-                    f"State NOT marked ACTIVE, dedup key retained — will not retry until window expires"
+                    f"State NOT marked ACTIVE, dedup key retained, budget refunded — "
+                    f"will not retry until window expires"
                 )
 
         if all_state_changes:
