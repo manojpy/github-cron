@@ -1523,10 +1523,13 @@ def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Op
     if np.isnan(current) or current <= 0:
         return None
 
-    sorted_valid = np.sort(valid)
-    rank_lt = np.searchsorted(sorted_valid, current, side='left')   # count strictly < current
-    rank_le = np.searchsorted(sorted_valid, current, side='right')  # count <= current
-    return (rank_lt + rank_le) / (2 * len(sorted_valid))
+    # Sort-free percentile rank: O(n) instead of O(n log n) from np.sort().
+    # count_lt/count_eq reproduce the same mid-rank tie handling as the old
+    # (rank_lt + rank_le) / (2n) formula, without materializing a sort.
+    n = len(valid)
+    count_lt = np.sum(valid < current)
+    count_eq = np.sum(valid == current)
+    return (count_lt + 0.5 * count_eq) / n
 
 def get_atr_percentile_smoothed(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, ema_period: int = 5) -> Optional[float]:
     required_depth = cfg.ATR_PCTL_LOOKBACK + ema_period
@@ -1645,8 +1648,14 @@ def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray,
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
-    _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _lock: ClassVar[Optional[asyncio.Lock]] = None
     _creation_time: ClassVar[float] = 0.0
+
+    @classmethod
+    def _get_lock(cls) -> asyncio.Lock:
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+        return cls._lock
 
     @classmethod
     def _get_ssl_context(cls) -> ssl.SSLContext:
@@ -1662,7 +1671,7 @@ class SessionManager:
     @classmethod
     async def get_session(cls) -> aiohttp.ClientSession:
         old_session_to_close: Optional[aiohttp.ClientSession] = None
-        async with cls._lock:
+        async with cls._get_lock():  
             should_recreate = cls._session is None or cls._session.closed
             if should_recreate:
                 if cls._session and not cls._session.closed:
@@ -1714,11 +1723,9 @@ class SessionManager:
 
     @classmethod
     async def close_session(cls) -> None:
-
         session_to_close: Optional[aiohttp.ClientSession] = None
         session_age = 0.0
-
-        async with cls._lock:
+        async with cls._get_lock():
             if cls._session and not cls._session.closed:
                 session_to_close = cls._session
                 session_age = time.monotonic() - cls._creation_time
@@ -2075,19 +2082,21 @@ class DataFetcher:
 
                     if diff > Constants.API_TIMESTAMP_TOLERANCE_SEC:
                         if last_open < expected_open_ts:
-                            logger.debug(
-                                f"⚠️ API DELAY | {symbol} {resolution} | "
-                                f"Expected: {format_ist_time(expected_open_ts)} | "
-                                f"Got: {format_ist_time(last_open)} "
-                                f"(Diff: {diff}s > tolerance {Constants.API_TIMESTAMP_TOLERANCE_SEC}s)"
-                            )
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    f"⚠️ API DELAY | {symbol} {resolution} | "
+                                    f"Expected: {format_ist_time(expected_open_ts)} | "
+                                    f"Got: {format_ist_time(last_open)} "
+                                    f"(Diff: {diff}s > tolerance {Constants.API_TIMESTAMP_TOLERANCE_SEC}s)"
+                                )
                         else:
                             logger.debug(f"API Ahead | {symbol} {resolution} | Diff: {diff}s")
                     else:
-                        logger.debug(
-                            f"✅ Scanned {symbol} {resolution} | "
-                            f"Latest: {format_ist_time(last_open)} | Candles: {num_candles}"
-                        )
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"✅ Scanned {symbol} {resolution} | "
+                                f"Latest: {format_ist_time(last_open)} | Candles: {num_candles}"
+                            )
                 return data
             else:
                 logger.warning(f"Candles response missing fields | Symbol: {symbol}")
@@ -2521,20 +2530,17 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     matches = np.flatnonzero(np.abs(ts_normalized - expected_ts_open_time) <= 1)
     if matches.size == 0:
-        last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
-        count = int(ts_normalized.size)
-        last5_list = [format_ist_time(t) for t in ts_normalized[-5:]]
-        last5_str = str(last5_list)
-        
-        logger.debug(
-            "[%s] Target %dm open %s not found. last_ts=%s count=%s last5=%s",
-            pair_name or "?", 
-            int(interval_minutes), 
-            format_ist_time(expected_ts_open_time),
-            last_ts,
-            count,
-            last5_str
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            last_ts = format_ist_time(ts_normalized[-1]) if ts_normalized.size else 'N/A'
+            count = int(ts_normalized.size)
+            last5_list = [format_ist_time(t) for t in ts_normalized[-5:]]
+            last5_str = str(last5_list)
+
+            logger.debug(
+                "[%s] Target %dm open %s not found. last_ts=%s count=%s last5=%s",
+                pair_name or "?", int(interval_minutes), format_ist_time(expected_ts_open_time),
+                last_ts, count, last5_str
+            )
         return None
 
     last_closed_idx = int(matches[-1])
@@ -2560,16 +2566,13 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         )
         return None
 
-    logger.debug(
-        "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
-        pair_name or "?",
-        int(interval_minutes),
-        last_closed_idx,
-        format_ist_time(actual_candle_open),
-        format_ist_time(actual_close),
-        int(time_since_candle_closed)
-    )
-
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
+            pair_name or "?", int(interval_minutes), last_closed_idx,
+            format_ist_time(actual_candle_open), format_ist_time(actual_close),
+            int(time_since_candle_closed)
+        )
     return last_closed_idx
 
 @dataclass(frozen=True)
@@ -2770,8 +2773,20 @@ class RedisStateStore:
     _pool_healthy: ClassVar[Dict[str, bool]] = {}
     _pool_created_at: ClassVar[Dict[str, float]] = {}
     _pool_reuse_count: ClassVar[Dict[str, int]] = {}
-    _pool_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _script_reload_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+    _pool_lock: ClassVar[Optional[asyncio.Lock]] = None
+    _script_reload_lock: ClassVar[Optional[asyncio.Lock]] = None
+
+    @classmethod
+    def _get_pool_lock(cls) -> asyncio.Lock:
+        if cls._pool_lock is None:
+            cls._pool_lock = asyncio.Lock()
+        return cls._pool_lock
+
+    @classmethod
+    def _get_script_reload_lock(cls) -> asyncio.Lock:
+        if cls._script_reload_lock is None:
+            cls._script_reload_lock = asyncio.Lock()
+        return cls._script_reload_lock
 
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
@@ -2833,7 +2848,7 @@ class RedisStateStore:
             self.degraded_alerted = False
             self._connection_attempts = 0
 
-            async with RedisStateStore._pool_lock:
+            async with RedisStateStore._get_pool_lock():
                 existing_pool = RedisStateStore._global_pools.get(self.redis_url)
                 pool_is_healthy = False
                 if existing_pool:
@@ -2875,7 +2890,7 @@ class RedisStateStore:
     async def connect(self, timeout: float = 5.0) -> None:
         pool_reused = False
 
-        async with RedisStateStore._pool_lock:
+        async with RedisStateStore._get_pool_lock():
             pool = RedisStateStore._global_pools.get(self.redis_url)
             healthy = RedisStateStore._pool_healthy.get(self.redis_url, False)
 
@@ -2945,7 +2960,7 @@ class RedisStateStore:
 
     @classmethod
     async def shutdown_global_pool(cls, redis_url: Optional[str] = None) -> None:
-        async with cls._pool_lock:
+        async with cls._get_pool_lock():
             urls = [redis_url] if redis_url else list(cls._global_pools.keys())
             for url in urls:
                 pool = cls._global_pools.get(url)
@@ -4009,10 +4024,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 
-        if not candle_is_stable(data_15m["timestamp"][i15], reference_time, interval_minutes=15):
-            logger_pair.debug(f"[{pair_name}] Selected candle not stable, skipping alerts.")
-            return None
- 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m,
             candle_index=i15,
@@ -4077,7 +4088,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
             f"ValidBuy={is_valid_for_buy} ValidSell={is_valid_for_sell}"
         )
-
         open_curr = o
         high_curr = h
         low_curr = l
@@ -4104,10 +4114,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 fallback_idx = int(np.flatnonzero(window_mask)[-1])
                 i5 = fallback_idx
                 actual_5m_ts = int(ts_5m_arr[fallback_idx])
-                logger_pair.debug(
-                    f"[{pair_name}] 5m fallback: using {format_ist_time(actual_5m_ts)} "
-                    f"(expected {format_ist_time(expected_5m_open)} not available)"
-                )
+                if logger_pair.isEnabledFor(logging.DEBUG):
+                    logger_pair.debug(
+                        f"[{pair_name}] 5m fallback: using {format_ist_time(actual_5m_ts)} "
+                        f"(expected {format_ist_time(expected_5m_open)} not available)"
+                    )    
             else:
                 logger_pair.warning(
                     f"[{pair_name}] 5m candle not found at {format_ist_time(expected_5m_open)} "
@@ -4134,19 +4145,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         expected_last_5m = ts_15m_val + 600
         if actual_5m_ts != expected_last_5m:
-            logger_pair.debug(
-                f"[{pair_name}] Using non-last 5m candle: got {format_ist_time(actual_5m_ts)}, "
-                f"expected {format_ist_time(expected_last_5m)}"
-            )
+            if logger_pair.isEnabledFor(logging.DEBUG):
+                logger_pair.debug(
+                    f"[{pair_name}] Using non-last 5m candle: got {format_ist_time(actual_5m_ts)}, "
+                    f"expected {format_ist_time(expected_last_5m)}"
+                )
 
         if i5 < Constants.MIN_ALIGNED_5M_CANDLES:
             return None
 
-        logger_pair.debug(
-            f"[{pair_name}] 5m candle selected | "
-            f"Open={format_ist_time(actual_5m_ts)} | i5={i5} | "
-            f"Close={data_5m['close'][i5]:.2f}"
-        )
+        if logger_pair.isEnabledFor(logging.DEBUG):
+            logger_pair.debug(
+                f"[{pair_name}] 5m candle selected | "
+                f"Open={format_ist_time(actual_5m_ts)} | i5={i5} | "
+                f"Close={data_5m['close'][i5]:.2f}"
+            )
 
         # ═══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
@@ -4610,7 +4623,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         ppohist_m1 = (ppo_gate_arr[i15-1] - ppo_gate_signal_arr[i15-1]) if i15 >= 1 else 0.0
         ppohist_m2 = (ppo_gate_arr[i15-2] - ppo_gate_signal_arr[i15-2]) if i15 >= 2 else 0.0
         ppohist_m3 = (ppo_gate_arr[i15-3] - ppo_gate_signal_arr[i15-3]) if i15 >= 3 else 0.0
-
 
         MIN_HIST_RMA_BARS_VALID = cfg.HIST_RMA_SLOW * 3
         has_valid_hist_rma = (
