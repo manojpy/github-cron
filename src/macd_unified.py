@@ -2571,12 +2571,22 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     )
 
     return last_closed_idx
-    
+
+@dataclass(frozen=True)
+class CandleSnapshot:
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    is_green: bool
+    is_red: bool
+    is_valid_for_buy: bool
+    is_valid_for_sell: bool
+
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
-    ts_curr: int, o: float, h: float, l: float, c: float, reference_time: int, logger_pair: logging.Logger) -> bool:
-    """Re-fetch the just-evaluated 15m candle right before dispatch and confirm
-    OHLC hasn't shifted since the original fetch. Guards against exchange kline
-    data still settling in the seconds right after candle close."""
+    ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> bool:
     try:
         raw = await fetcher.fetch_candles(
             symbol, "15", limit=3, reference_time=reference_time, expected_open_15=ts_curr,
@@ -2594,8 +2604,29 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
             return False
 
         idx = int(matches[-1])
-        fo, fh, fl, fc = (float(fresh["open"][idx]), float(fresh["high"][idx]),
-                          float(fresh["low"][idx]), float(fresh["close"][idx]))
+        fo = float(fresh["open"][idx])
+        fh = float(fresh["high"][idx])
+        fl = float(fresh["low"][idx])
+        fc = float(fresh["close"][idx])
+        fvol = float(fresh["volume"][idx])
+
+        # Volume check (matches validate_candle_for_alerts)
+        if fvol <= 0:
+            logger_pair.warning(f"[{pair_name}] Confirmation candle has zero volume — suppressing")
+            return False
+
+        # Color consistency check
+        was_green = cached.is_green
+        was_red = cached.is_red
+        is_now_green = fc > fo
+        is_now_red = fc < fo
+        if (was_green and not is_now_green) or (was_red and not is_now_red):
+            logger_pair.warning(
+                f"[{pair_name}] Confirmation candle COLOR changed: "
+                f"was {'green' if was_green else 'red'}, now "
+                f"{'green' if is_now_green else 'red' if is_now_red else 'doji'}"
+            )
+            return False
 
         def _price_match(a: float, b: float) -> bool:
             abs_diff = abs(a - b)
@@ -2604,34 +2635,20 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
             rel_diff = abs_diff / max(abs(a), abs(b), 1e-12)
             return rel_diff <= 1e-6
 
-        if (not _price_match(fo, o) or not _price_match(fh, h) or
-            not _price_match(fl, l) or not _price_match(fc, c)):
+        if (not _price_match(fo, cached.open) or not _price_match(fh, cached.high) or
+            not _price_match(fl, cached.low) or not _price_match(fc, cached.close)):
 
             logger_pair.warning(
                 f"[{pair_name}] 🔁 Candle CHANGED since first fetch — repaint detected, suppressing alert | "
-                f"First: O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f} | "
+                f"First: O={cached.open:.4f} H={cached.high:.4f} L={cached.low:.4f} C={cached.close:.4f} | "
                 f"Now:   O={fo:.4f} H={fh:.4f} L={fl:.4f} C={fc:.4f}"
             )
             return False
 
         return True
-
     except Exception as e:
         logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
         return False
-
-@dataclass(frozen=True)
-class CandleSnapshot:
-    timestamp: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    is_green: bool
-    is_red: bool
-    is_valid_for_buy: bool
-    is_valid_for_sell: bool
 
 def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached: CandleSnapshot, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger) -> bool:
     try:
@@ -3589,7 +3606,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"ppohist_buy","title":"🟢🔥 PPO Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"cloud_cross_down","title":"☁️🔴 Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
+    {"key":"cloud_cross_down","title":"☁️���� Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Lower {ctx.get('cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"tk_conversion_up","title":"🌐🟢 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -5056,7 +5073,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
-                        fetcher, symbol, pair_name, ts_curr, o, h, l, c, reference_time, logger_pair
+                        fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
                     )
                     if not reconfirmed:
                         logger_pair.warning(
