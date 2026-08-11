@@ -17,7 +17,7 @@ import gc
 import json
 from collections import deque
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -2342,7 +2342,7 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
 
-def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, np.ndarray]]:
+def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceData]:
     try:   
         if not result or not isinstance(result, dict):
             logger.warning("parse_candles_to_numpy: result is None or not dict")
@@ -2486,8 +2486,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
                 f"Range: {format_ist_time(data['timestamp'][0])} to {format_ist_time(data['timestamp'][-1])}"
             )
     
-        return data
-
+        return PriceData.from_dict(data)
     except Exception as e:
         logger.error(
             f"parse_candles_to_numpy: Unexpected exception: {e}",
@@ -2597,6 +2596,81 @@ class CandleSnapshot:
     is_valid_for_buy: bool
     is_valid_for_sell: bool
 
+@dataclass(slots=True)
+class PriceData:
+    """Typed replacement for the loose {"timestamp": arr, "open": arr, ...} dict
+    returned by parse_candles_to_numpy()."""
+    ts: np.ndarray
+    open: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    close: np.ndarray
+    volume: np.ndarray
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, np.ndarray]) -> "PriceData":
+        return cls(
+            ts=d["timestamp"], open=d["open"], high=d["high"],
+            low=d["low"], close=d["close"], volume=d["volume"],
+        )
+
+    def as_dict(self) -> Dict[str, np.ndarray]:
+        """Back-compat shim for call sites not yet migrated off dict-style access."""
+        return {"timestamp": self.ts, "open": self.open, "high": self.high,
+                "low": self.low, "close": self.close, "volume": self.volume}
+
+    def __len__(self) -> int:
+        return len(self.ts)
+
+@dataclass(slots=True)
+class IndicatorCache:
+    """Typed replacement for the merged gate_indicators/alert_indicators dict."""
+    # -- gate indicators (Phase 1, cheap) --
+    rma50_15: np.ndarray
+    rma200_5: np.ndarray
+    ichimoku_cloud_upper: np.ndarray
+    ichimoku_cloud_lower: np.ndarray
+    ichimoku_future_green: np.ndarray
+    ichimoku_future_red: np.ndarray
+    ichimoku_conversion_line: np.ndarray
+    ichimoku_base_line: np.ndarray
+    fast_ichimoku_cloud_upper: np.ndarray
+    fast_ichimoku_cloud_lower: np.ndarray
+    fast_ichimoku_future_green: np.ndarray
+    fast_ichimoku_future_red: np.ndarray
+    fast_ichimoku_conversion_line: np.ndarray
+    fast_ichimoku_base_line: np.ndarray
+    adx: np.ndarray
+    atr_short: np.ndarray
+    atr_long: np.ndarray
+    volume_ema: np.ndarray
+    ppo_gate: np.ndarray
+    ppo_gate_signal: np.ndarray
+    rsi_guard_smooth: np.ndarray
+    rsi_guard_ema: np.ndarray
+    rma_cloud_fast_15: np.ndarray
+    cpr_ok: bool = True
+    nr_cpr: float = float("nan")
+    prev_day_close: float = float("nan")
+    # -- alert indicators (Phase 2, expensive) --
+    ppo: Optional[np.ndarray] = None
+    ppo_signal: Optional[np.ndarray] = None
+    smooth_rsi: Optional[np.ndarray] = None
+    smooth_rsi_ema: Optional[np.ndarray] = None
+    vwap: Optional[np.ndarray] = None
+    hist_rma: Optional[np.ndarray] = None
+    pivots: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dicts(cls, gate: Dict[str, Any], alert: Optional[Dict[str, Any]] = None) -> "IndicatorCache":
+        merged = {**gate, **(alert or {})}
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in merged.items() if k in known})
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Back-compat shim — mirrors the old `{**gate_indicators, **alert_indicators}` merge."""
+        return {f: getattr(self, f) for f in self.__dataclass_fields__}
+
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""
@@ -2607,18 +2681,18 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
             logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — inconclusive, releasing dedup claim")
             return None
 
-        ts_arr = fresh["timestamp"]
-        matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 5)
+        fresh = PriceData.from_dict(fresh_raw)
+        matches = np.flatnonzero(np.abs(fresh.ts - ts_curr) <= 5)
         if matches.size == 0:
             logger_pair.warning(f"[{pair_name}] Confirmation candle {format_ist_time(ts_curr)} not found — inconclusive, releasing dedup claim")
             return None
 
         idx = int(matches[-1])
-        fo = float(fresh["open"][idx])
-        fh = float(fresh["high"][idx])
-        fl = float(fresh["low"][idx])
-        fc = float(fresh["close"][idx])
-        fvol = float(fresh["volume"][idx])
+        fo = float(fresh.open[idx])
+        fh = float(fresh.high[idx])
+        fl = float(fresh.low[idx])
+        fc = float(fresh.close[idx])
+        fvol = float(fresh.volume[idx])
 
         # Volume check (matches validate_candle_for_alerts)
         if fvol <= 0:
@@ -4312,7 +4386,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
 
-
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
         adx_raw_check = adx_val >= adx_adaptive_threshold
@@ -5464,24 +5537,27 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     data_daily = None
     
     try:
-        data_15m = parse_candles_to_numpy(candles.get("15"))
-        data_5m = parse_candles_to_numpy(candles.get("5"))      
-        data_daily = parse_candles_to_numpy(candles.get("D")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
+        pd_15m = parse_candles_to_numpy(candles.get("15"))
+        pd_5m = parse_candles_to_numpy(candles.get("5"))
+        pd_daily = parse_candles_to_numpy(candles.get("D")) if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else None
 
-        if data_15m is None:
+        if pd_15m is None:
             logger_main.warning(f"Skipping {p_name}: 15m parse failed")
             return None
         
-        if data_5m is None:
+        if pd_5m is None:
             logger_main.warning(f"Skipping {p_name}: 5m parse failed")
             return None
-   
+
+        data_15m = pd_15m.as_dict()
+        data_5m = pd_5m.as_dict()
+        data_daily = pd_daily.as_dict() if pd_daily is not None else None
+
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
             alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
         )
-
         return result
     
     except asyncio.CancelledError:
