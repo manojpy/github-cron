@@ -4326,7 +4326,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
 
-
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
         adx_raw_check = adx_val >= adx_adaptive_threshold
@@ -4645,7 +4644,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     is_green, is_red = gr.is_green, gr.is_red
     is_valid_for_buy, is_valid_for_sell = gr.is_valid_for_buy, gr.is_valid_for_sell
     buy_wick_ratio, sell_wick_ratio = gr.buy_wick_ratio, gr.sell_wick_ratio
-    rma50_15_val, rma200_5_val = gr.rma50_15_val, gr.rma200_5_val
+    rma50_15_val = gr.rma50_15_val
     cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
     cloud_upper_val, cloud_lower_val = gr.cloud_upper_val, gr.cloud_lower_val
     cloud_upper_prev, cloud_lower_prev = gr.cloud_upper_prev, gr.cloud_lower_prev
@@ -4662,15 +4661,15 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     fast_tenkan_ge_kijun, fast_tenkan_le_kijun = gr.fast_tenkan_ge_kijun, gr.fast_tenkan_le_kijun
     oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
     ppo_gate_arr, ppo_gate_signal_arr = gr.ppo_gate_arr, gr.ppo_gate_signal_arr
-    ppo_gate_curr, ppo_gate_prev = gr.ppo_gate_curr, gr.ppo_gate_prev
-    ppo_gate_sig_curr, ppo_gate_sig_prev = gr.ppo_gate_sig_curr, gr.ppo_gate_sig_prev
+    ppo_gate_curr = gr.ppo_gate_curr
+    ppo_gate_sig_curr = gr.ppo_gate_sig_curr
     rsi_guard_smooth_curr, rsi_guard_ema_curr = gr.rsi_guard_smooth_curr, gr.rsi_guard_ema_curr
     rma_cloud_fast_curr = gr.rma_cloud_fast_curr
     rma_cloud_ok_buy, rma_cloud_ok_sell = gr.rma_cloud_ok_buy, gr.rma_cloud_ok_sell
     trend_gate_ok_buy, trend_gate_ok_sell = gr.trend_gate_ok_buy, gr.trend_gate_ok_sell
     adx_adaptive_threshold = gr.adx_adaptive_threshold
     momentum_count = gr.momentum_count
-    cpr_ok, nr_cpr, effective_cpr_ok = gr.cpr_ok, gr.nr_cpr, gr.effective_cpr_ok
+    effective_cpr_ok = gr.effective_cpr_ok
     cpr_adaptive_min_pct_move = gr.cpr_adaptive_min_pct_move
     move_from_prev_close_ok = gr.move_from_prev_close_ok
     ppo_adaptive_threshold = gr.ppo_adaptive_threshold
@@ -5085,7 +5084,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     close_curr, close_prev = gr.close_curr, gr.close_prev
     is_green, is_red = gr.is_green, gr.is_red
     is_valid_for_buy, is_valid_for_sell = gr.is_valid_for_buy, gr.is_valid_for_sell
-    min_wick_ratio = gr.min_wick_ratio
     base_buy_trend, base_sell_trend = gr.base_buy_trend, gr.base_sell_trend
     rma50_15_val = gr.rma50_15_val
     cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
