@@ -91,6 +91,15 @@ def normalize_timestamp(ts: Union[int, float]) -> int:
     
     return ts_int
 
+def normalize_timestamp_array(ts: np.ndarray) -> np.ndarray:
+    """Vectorized version of normalize_timestamp() — no Python-level loop."""
+    ts_int = np.asarray(ts, dtype=np.int64)
+    ts_int = np.where(ts_int > 1_000_000_000_000, ts_int // 1000, ts_int)
+    bad = (ts_int < 0) | (ts_int > 4102444800)
+    if np.any(bad):
+        raise ValueError(f"Normalized timestamp(s) out of range: {ts_int[bad][:5].tolist()}")
+    return ts_int
+
 class CprNotReadyError(Exception):
     """
     Raised by _find_closed_daily_candle() when yesterday's daily candle
@@ -210,6 +219,7 @@ class BotConfig(BaseModel):
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
+    SANITIZE_BAD_CANDLES: bool = Field(default=False, description="If True, drop individual invalid candles instead of rejecting the whole fetch")
     ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
     ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Ichimoku conversion line length")
     ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
@@ -782,7 +792,6 @@ def _find_today_daily_open(data_daily: Dict[str, np.ndarray], reference_time: in
 
 def validate_conversion_cross(close_prev: float, close_curr: float,
     conv_prev: float, conv_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
-
     vals = [close_prev, close_curr, conv_prev, conv_curr]
     if any(np.isnan(v) for v in vals):
         return False, "NaN in inputs"
@@ -981,7 +990,6 @@ def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, v
     try:
         hlc3 = (high + low + close) / 3.0
         
-        # In macd_unified.py before calling:
         if len(timestamps) > 1 and np.any(np.diff(timestamps) < 0):
             logger.warning(
                 "[%s] Timestamps not sorted — VWAP may be incorrect",
@@ -1147,8 +1155,9 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
         is_complete, reason = is_previous_day_complete(
             timestamps_15m,  # Use 15m for validation
             reference_time,
-            min_candles=cfg.MIN_CANDLES_PER_DAY if hasattr(cfg, 'MIN_CANDLES_PER_DAY') else 90,
-            buffer_seconds=cfg.DAILY_RESET_BUFFER_SEC if hasattr(cfg, 'DAILY_RESET_BUFFER_SEC') else 300
+            
+            min_candles=cfg.MIN_CANDLES_PER_DAY,
+            buffer_seconds=cfg.DAILY_RESET_BUFFER_SEC
         )
         
         if not is_complete:
@@ -1523,9 +1532,6 @@ def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Op
     if np.isnan(current) or current <= 0:
         return None
 
-    # Sort-free percentile rank: O(n) instead of O(n log n) from np.sort().
-    # count_lt/count_eq reproduce the same mid-rank tie handling as the old
-    # (rank_lt + rank_le) / (2n) formula, without materializing a sort.
     n = len(valid)
     count_lt = np.sum(valid < current)
     count_eq = np.sum(valid == current)
@@ -2389,26 +2395,29 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[Dict[st
             ~((l <= o) & (o <= h) & (l <= c) & (c <= h)) |            # Relationship check
              (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)                 # Non-positive check
         )
-    
         error_count = np.sum(error_mask)
     
         if error_count > 0:
-            logger.error(
-                f"parse_candles_to_numpy: Found {error_count} invalid candle(s) out of {n} "
-                f"({error_count / n * 100:.1f}%)"
-            )
-        
+            logger.error(...)
             error_indices = np.where(error_mask)[0]
             first_errors = error_indices[:min(5, len(error_indices))]
-        
             for idx in first_errors:
-                logger.error(
-                    f"  Index {idx}: O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f}"
+                logger.error(f"  Index {idx}: O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f}")
+
+            if cfg.SANITIZE_BAD_CANDLES and error_count < n:
+                keep_mask = ~error_mask
+                logger.warning(
+                    f"parse_candles_to_numpy: SANITIZE_BAD_CANDLES=True — dropping {error_count} "
+                    f"bad candle(s), keeping {n - error_count}/{n}"
                 )
-        
-            logger.error("parse_candles_to_numpy: Rejecting data due to invalid candles")
-            return None
-    
+                for k in data:
+                    data[k] = data[k][keep_mask]
+                o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+                n = len(data["timestamp"])
+            else:
+                logger.error("parse_candles_to_numpy: Rejecting data due to invalid candles")
+                return None
+
         v = data["volume"]
         volume_error_mask = ~np.isfinite(v) | (v < 0)
         volume_error_count = np.sum(volume_error_mask)
@@ -2515,7 +2524,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     time_since_candle_closed = reference_time - candle_close_time
 
     try:
-        ts_normalized = np.array([normalize_timestamp(t) for t in timestamps], dtype=np.int64)
+        ts_normalized = normalize_timestamp_array(timestamps)
     except Exception as e:
         logger.error("[%s] Timestamp normalization failed: %s", pair_name or "?", e)
         return None
@@ -2589,22 +2598,20 @@ class CandleSnapshot:
     is_valid_for_sell: bool
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
-    ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> bool:
+    ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
+    """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""
     try:
-        raw = await fetcher.fetch_candles(
-            symbol, "15", limit=3, reference_time=reference_time, expected_open_15=ts_curr,
-            for_confirmation=True
-        )
+        raw = await fetcher.fetch_candles(...)
         fresh = parse_candles_to_numpy(raw)
         if fresh is None:
-            logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — holding alert back this run")
-            return False
+            logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — inconclusive, releasing dedup claim")
+            return None
 
         ts_arr = fresh["timestamp"]
         matches = np.flatnonzero(np.abs(ts_arr - ts_curr) <= 5)
         if matches.size == 0:
-            logger_pair.warning(f"[{pair_name}] Confirmation candle {format_ist_time(ts_curr)} not found in re-fetch")
-            return False
+            logger_pair.warning(f"[{pair_name}] Confirmation candle {format_ist_time(ts_curr)} not found — inconclusive, releasing dedup claim")
+            return None
 
         idx = int(matches[-1])
         fo = float(fresh["open"][idx])
@@ -2650,8 +2657,8 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
 
         return True
     except Exception as e:
-        logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — holding alert back this run")
-        return False
+        logger_pair.warning(f"[{pair_name}] Confirmation check errored: {e} — inconclusive, releasing dedup claim")
+        return None
 
 def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: int, cached: CandleSnapshot, min_wick_ratio: float, pair_name: str, logger_pair: logging.Logger) -> bool:
     try:
@@ -2687,7 +2694,10 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
         return False
 
     def _close_enough(a: float, b: float) -> bool:
-        return abs(a - b) <= 1e-6 * max(abs(a), abs(b), 1.0)
+        abs_diff = abs(a - b)
+        rel_tolerance = 1e-6 * max(abs(a), abs(b), 1.0)
+        abs_floor = 1e-8  # noise floor for sub-cent priced coins, e.g. $0.00001
+        return abs_diff <= max(rel_tolerance, abs_floor)
 
     mismatches = [
         tag for tag, a, b in (
@@ -4099,8 +4109,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         interval_5m_sec = 5 * 60
         expected_5m_open = (reference_time // interval_5m_sec) * interval_5m_sec - interval_5m_sec
-
-        ts_5m_arr = np.array([normalize_timestamp(int(t)) for t in data_5m["timestamp"]], dtype=np.int64)
+        ts_5m_arr = normalize_timestamp_array(data_5m["timestamp"])
 
         matches_5m = np.flatnonzero(np.abs(ts_5m_arr - expected_5m_open) <= 30)
 
@@ -5095,12 +5104,20 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     reconfirmed = await confirm_candle_unchanged(
                         fetcher, symbol, pair_name, ts_curr, cached_snapshot, reference_time, logger_pair
                     )
-                    if not reconfirmed:
+                    if reconfirmed is None:
                         logger_pair.warning(
-                            f"[{pair_name}] 🔁 Candle changed in send-queue window (dedup/token-bucket delay) — "
+                            f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
+                            f"dedup key RELEASED so it can retry next run"
+                        )
+                        for _, _, alert_key in alerts_to_send:
+                            await sdb.release_recent_alert(pair_name, alert_key)
+                        await _refund_alert_budget(len(alerts_to_send))
+                        send_success = False
+                    elif reconfirmed is False:
+                        logger_pair.warning(
+                            f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
                         )
-
                         await _refund_alert_budget(len(alerts_to_send))
                         send_success = False
                     else:
