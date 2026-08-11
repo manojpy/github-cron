@@ -2398,12 +2398,12 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
         error_count = np.sum(error_mask)
     
         if error_count > 0:
-            logger.error(...)
             error_indices = np.where(error_mask)[0]
             first_errors = error_indices[:min(5, len(error_indices))]
+            logger.error(f"parse_candles_to_numpy: {error_count} invalid candle(s) detected")
             for idx in first_errors:
                 logger.error(f"  Index {idx}: O={o[idx]:.2f} H={h[idx]:.2f} L={l[idx]:.2f} C={c[idx]:.2f}")
-
+  
             if cfg.SANITIZE_BAD_CANDLES and error_count < n:
                 keep_mask = ~error_mask
                 logger.warning(
@@ -2670,6 +2670,94 @@ class IndicatorCache:
     def as_dict(self) -> Dict[str, Any]:
         """Back-compat shim — mirrors the old `{**gate_indicators, **alert_indicators}` merge."""
         return {f: getattr(self, f) for f in self.__dataclass_fields__}
+
+@dataclass(slots=True)
+class GateResult:
+    # -- identity / indices --
+    pair_name: str
+    i15: int
+    i5: int
+    ts_curr: int
+    reference_time: int
+
+    # -- candle info --
+    candle_info: Dict[str, Any]
+    o: float; h: float; l: float; c: float
+    open_curr: float; high_curr: float; low_curr: float; close_curr: float
+    close_prev: float
+    close_5m_val: float
+    is_green: bool; is_red: bool
+    is_valid_for_buy: bool; is_valid_for_sell: bool
+    candle_index: int
+    min_wick_ratio: float
+    buy_wick_ratio: float; sell_wick_ratio: float
+
+    # -- gate/alert indicator dicts (still raw dicts — untouched by this pass) --
+    gate_indicators: Dict[str, Any]
+    
+    # -- trend --
+    base_buy_trend: bool; base_sell_trend: bool
+    rma50_15_val: float; rma200_5_val: float
+
+    # -- ichimoku cloud --
+    cloud_up: Optional[bool]; cloud_down: Optional[bool]
+    cloud_upper_val: float; cloud_lower_val: float
+    cloud_upper_prev: float; cloud_lower_prev: float
+    ichimoku_gate_ok_buy: Optional[bool]; ichimoku_gate_ok_sell: Optional[bool]
+    confirmation_buy: bool; confirmation_sell: bool
+    cloud_group_ok_buy: bool; cloud_group_ok_sell: bool
+
+    # -- TK guard --
+    tk_conversion_curr: float; tk_conversion_prev: float
+    tk_base_curr: float; tk_base_prev: float
+    tk_guard_ok_buy: Optional[bool]; tk_guard_ok_sell: Optional[bool]
+
+    # -- fast ichimoku (alert-only) --
+    fast_future_green: bool; fast_future_red: bool
+    fast_cloud_upper_curr: float; fast_cloud_lower_curr: float
+    fast_cloud_upper_prev: float; fast_cloud_lower_prev: float
+    fast_tk_conversion_curr: float; fast_tk_conversion_prev: float
+    fast_tk_base_curr: float; fast_tk_base_prev: float
+    fast_tenkan_ge_kijun: bool; fast_tenkan_le_kijun: bool
+
+    # -- oscillator group votes --
+    oscillator_group_ok_buy: bool; oscillator_group_ok_sell: bool
+    ppo_gate_arr: np.ndarray; ppo_gate_signal_arr: np.ndarray
+    ppo_gate_curr: float; ppo_gate_prev: float
+    ppo_gate_sig_curr: float; ppo_gate_sig_prev: float
+    ppo_gate_ok_buy: bool; ppo_gate_ok_sell: bool
+    rsi_guard_smooth_curr: float; rsi_guard_ema_curr: float
+    rsi_guard_ok_buy: bool; rsi_guard_ok_sell: bool
+    rma_cloud_fast_curr: float
+    rma_cloud_ok_buy: bool; rma_cloud_ok_sell: bool
+
+    # -- trend gate combination --
+    trend_gate_ok_buy: bool; trend_gate_ok_sell: bool
+
+    # -- volatility / ADX / RVOL --
+    adx_val: float; adx_adaptive_threshold: float; adx_ok: bool
+    rvol_bypass_ok: bool; rvol_ok: bool
+    adaptive_rvol_check: bool
+    momentum_count: int
+    volatility_filter_ok: bool
+
+    # -- CPR --
+    cpr_ok: bool; nr_cpr: float
+    effective_cpr_ok: bool
+    cpr_adaptive_min_pct_move: float
+    move_from_prev_close_ok: bool
+
+    # -- adaptive thresholds carried into Phase 2 --
+    ppo_adaptive_threshold: float
+    rsi_adaptive_buy: float; rsi_adaptive_sell: float
+
+    # -- final gate decision --
+    buy_common: bool
+    sell_common: bool
+
+    # -- misc data passed through --
+    data_15m: PriceData
+    close_prev_invalid: bool = False
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
@@ -3749,159 +3837,118 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-def _reset_if_active(pair_name: str, key: str, conditional_states: dict, should_reset: bool) -> list:
-    """Atomic primitive: if the alert is currently ACTIVE and should_reset is True, emit an INACTIVE reset."""
-    if should_reset and conditional_states.get(ALERT_KEYS[key], False):
-        return [(f"{pair_name}:{ALERT_KEYS[key]}", "INACTIVE", None)]
-    return []
+def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> List[Tuple[str, str, None]]:
+    """Generic cross-reset engine. Emits INACTIVE updates when a cross that was
+    previously ACTIVE has now reversed."""
+    resets: List[Tuple[str, str, None]] = []
 
-def _reset_keys_unconditional(pair_name: str, keys: tuple, conditional_states: dict) -> list:
-    """Reset every key in `keys` that's currently ACTIVE — used when prerequisite data is missing/NaN."""
-    resets = []
-    for k in keys:
-        resets.extend(_reset_if_active(pair_name, k, conditional_states, True))
-    return resets
+    def _add(up_key: str, down_key: str,
+             curr: float, prev: float,
+             up_thr_curr: float, up_thr_prev: float,
+             down_thr_curr: float, down_thr_prev: float) -> None:
+        if prev > up_thr_prev and curr <= up_thr_curr:
+            rk = ALERT_KEYS.get(up_key)
+            if rk and conditional_states.get(rk, False):
+                resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+        if prev < down_thr_prev and curr >= down_thr_curr:
+            rk = ALERT_KEYS.get(down_key)
+            if rk and conditional_states.get(rk, False):
+                resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-def _reset_cross(pair_name: str, up_key: str, down_key: str, curr: float, prev: float,
-                  up_thr_curr: float, up_thr_prev: float, down_thr_curr: float, down_thr_prev: float,
-                  conditional_states: dict) -> list:
-    """Generic two-way cross-reset: fires up_key's reset on a downcross through the
-    up-threshold, down_key's reset on an upcross through the down-threshold."""
-    resets = []
-    resets.extend(_reset_if_active(pair_name, up_key, conditional_states,
-                                    prev > up_thr_prev and curr <= up_thr_curr))
-    resets.extend(_reset_if_active(pair_name, down_key, conditional_states,
-                                    prev < down_thr_prev and curr >= down_thr_curr))
-    return resets
-
-def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
-    ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
+    # ── PPO ──
+    ppo_c, ppo_p = context["ppo_curr"], context["ppo_prev"]
+    ps_c,  ps_p  = context["ppo_sig_curr"], context["ppo_sig_prev"]
     thr = context["ppo_adaptive_threshold"]
-    resets = []
-    resets.extend(_reset_cross(pair_name, 'ppo_signal_up', 'ppo_signal_down',
-                                ppo_curr, ppo_prev, ppo_sig_curr, ppo_sig_prev, ppo_sig_curr, ppo_sig_prev,
-                                conditional_states))
-    resets.extend(_reset_cross(pair_name, 'ppo_zero_up', 'ppo_zero_down',
-                                ppo_curr, ppo_prev, 0, 0, 0, 0, conditional_states))
-    resets.extend(_reset_cross(pair_name, 'ppo_adaptive_up', 'ppo_adaptive_down',
-                                ppo_curr, ppo_prev, thr, thr, -thr, -thr, conditional_states))
-    return resets
+    _add("ppo_signal_up", "ppo_signal_down", ppo_c, ppo_p, ps_c, ps_p, ps_c, ps_p)
+    _add("ppo_zero_up",   "ppo_zero_down",   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
+    _add("ppo_adaptive_up", "ppo_adaptive_down", ppo_c, ppo_p, thr, thr, -thr, -thr)
 
-def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
-    rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
-    resets = []
-    resets.extend(_reset_cross(pair_name, 'rsi_ema5_up', 'rsi_ema5_down',
-                                rsi_curr, rsi_prev, rsi_ema_curr, rsi_ema_prev, rsi_ema_curr, rsi_ema_prev,
-                                conditional_states))
-    buy, sell = context["rsi_adaptive_buy"], context["rsi_adaptive_sell"]
-    resets.extend(_reset_cross(pair_name, 'rsi_cross_adaptive_up', 'rsi_cross_adaptive_down',
-                                rsi_curr, rsi_prev, buy, buy, sell, sell, conditional_states))
-    return resets
+    # ── RSI ──
+    rsi_c, rsi_p = context["rsi_curr"], context["rsi_prev"]
+    ema_c, ema_p = context["rsi_ema_curr"], context["rsi_ema_prev"]
+    _add("rsi_ema5_up", "rsi_ema5_down", rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
+    buy_thr, sell_thr = context["rsi_adaptive_buy"], context["rsi_adaptive_sell"]
+    _add("rsi_cross_adaptive_up", "rsi_cross_adaptive_down",
+         rsi_c, rsi_p, buy_thr, buy_thr, sell_thr, sell_thr)
 
-def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    if not context.get("vwap_available", False):
-        return _reset_keys_unconditional(pair_name, ('vwap_up', 'vwap_down'), conditional_states)
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    vwap_curr, vwap_prev = context["vwap_curr"], context["vwap_prev"]
-    return _reset_cross(pair_name, 'vwap_up', 'vwap_down', close_curr, close_prev,
-                         vwap_curr, vwap_prev, vwap_curr, vwap_prev, conditional_states)
+    # ── VWAP ──
+    if context.get("vwap_available"):
+        _add("vwap_up", "vwap_down", context["close_curr"], context["close_prev"],
+             context["vwap_curr"], context["vwap_prev"], context["vwap_curr"], context["vwap_prev"])
+    else:
+        for k in ("vwap_up", "vwap_down"):
+            rk = ALERT_KEYS.get(k)
+            if rk and conditional_states.get(rk, False):
+                resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    cu_curr, cu_prev = context.get("cloud_upper_curr"), context.get("cloud_upper_prev")
-    cl_curr, cl_prev = context.get("cloud_lower_curr"), context.get("cloud_lower_prev")
-    if any(v is None or np.isnan(v) for v in (cu_curr, cu_prev, cl_curr, cl_prev)):
-        return _reset_keys_unconditional(pair_name, ('cloud_cross_up', 'cloud_cross_down'), conditional_states)
-    return _reset_cross(pair_name, 'cloud_cross_up', 'cloud_cross_down', close_curr, close_prev,
-                         cu_curr, cu_prev, cl_curr, cl_prev, conditional_states)
+    # ── Cloud crosses (slow + fast) ──
+    for up_k, down_k, cu, cu_p, cl, cl_p in (
+        ("cloud_cross_up", "cloud_cross_down",
+         "cloud_upper_curr", "cloud_upper_prev", "cloud_lower_curr", "cloud_lower_prev"),
+        ("fast_cloud_cross_up", "fast_cloud_cross_down",
+         "fast_cloud_upper_curr", "fast_cloud_upper_prev", "fast_cloud_lower_curr", "fast_cloud_lower_prev"),
+    ):
+        cu_c, cu_pr = context.get(cu), context.get(cu_p)
+        cl_c, cl_pr = context.get(cl), context.get(cl_p)
+        if all(v is not None and not np.isnan(v) for v in (cu_c, cu_pr, cl_c, cl_pr)):
+            _add(up_k, down_k, context["close_curr"], context["close_prev"], cu_c, cu_pr, cl_c, cl_pr)
+        else:
+            for k in (up_k, down_k):
+                rk = ALERT_KEYS.get(k)
+                if rk and conditional_states.get(rk, False):
+                    resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    conv_curr, conv_prev = context.get("tk_conversion_curr"), context.get("tk_conversion_prev")
-    if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
-        return _reset_keys_unconditional(pair_name, ('tk_conversion_up', 'tk_conversion_down'), conditional_states)
-    return _reset_cross(pair_name, 'tk_conversion_up', 'tk_conversion_down', close_curr, close_prev,
-                         conv_curr, conv_prev, conv_curr, conv_prev, conditional_states)
+    # ── Conversion / Kijun / Fast Tenkan ──
+    for up_k, down_k, conv, conv_p in (
+        ("tk_conversion_up", "tk_conversion_down", "tk_conversion_curr", "tk_conversion_prev"),
+        ("kijun_cross_up",   "kijun_cross_down",   "tk_base_curr",       "tk_base_prev"),
+        ("fast_tenkan_cross_up", "fast_tenkan_cross_down", "fast_tk_conversion_curr", "fast_tk_conversion_prev"),
+    ):
+        c_c, c_p = context.get(conv), context.get(conv_p)
+        if c_c is not None and c_p is not None and not np.isnan(c_c) and not np.isnan(c_p):
+            _add(up_k, down_k, context["close_curr"], context["close_prev"], c_c, c_p, c_c, c_p)
+        else:
+            for k in (up_k, down_k):
+                rk = ALERT_KEYS.get(k)
+                if rk and conditional_states.get(rk, False):
+                    resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-def _reset_kijun_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    base_curr, base_prev = context.get("tk_base_curr"), context.get("tk_base_prev")
-    if base_curr is None or base_prev is None or np.isnan(base_curr) or np.isnan(base_prev):
-        return _reset_keys_unconditional(pair_name, ('kijun_cross_up', 'kijun_cross_down'), conditional_states)
-    return _reset_cross(pair_name, 'kijun_cross_up', 'kijun_cross_down', close_curr, close_prev,
-                         base_curr, base_prev, base_curr, base_prev, conditional_states)
+    # ── Hist RMA ──
+    hist_c, hist_m1 = context["hist_curr"], context["hist_m1"]
+    for k, cond in (("hist_rma_buy",  np.isnan(hist_c) or hist_c <= 1e-8 or hist_c <= hist_m1),
+                    ("hist_rma_sell", np.isnan(hist_c) or hist_c >= -1e-8 or hist_c >= hist_m1)):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and cond:
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-def _reset_fast_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    cu_curr, cu_prev = context.get("fast_cloud_upper_curr"), context.get("fast_cloud_upper_prev")
-    cl_curr, cl_prev = context.get("fast_cloud_lower_curr"), context.get("fast_cloud_lower_prev")
-    if any(v is None or np.isnan(v) for v in (cu_curr, cu_prev, cl_curr, cl_prev)):
-        return _reset_keys_unconditional(pair_name, ('fast_cloud_cross_up', 'fast_cloud_cross_down'), conditional_states)
-    return _reset_cross(pair_name, 'fast_cloud_cross_up', 'fast_cloud_cross_down', close_curr, close_prev,
-                         cu_curr, cu_prev, cl_curr, cl_prev, conditional_states)
+    # ── PPO Hist ──
+    ph_c, ph_m1 = context["ppohist_curr"], context["ppohist_m1"]
+    for k, cond in (("ppohist_buy",  np.isnan(ph_c) or ph_c <= 1e-8 or ph_c <= ph_m1),
+                    ("ppohist_sell", np.isnan(ph_c) or ph_c >= -1e-8 or ph_c >= ph_m1)):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and cond:
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-def _reset_fast_tenkan_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    conv_curr, conv_prev = context.get("fast_tk_conversion_curr"), context.get("fast_tk_conversion_prev")
-    if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
-        return _reset_keys_unconditional(pair_name, ('fast_tenkan_cross_up', 'fast_tenkan_cross_down'), conditional_states)
-    return _reset_cross(pair_name, 'fast_tenkan_cross_up', 'fast_tenkan_cross_down', close_curr, close_prev,
-                         conv_curr, conv_prev, conv_curr, conv_prev, conditional_states)
-
-def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    hist_curr, hist_m1 = context["hist_curr"], context["hist_m1"]
-    resets = []
-    resets.extend(_reset_if_active(pair_name, "hist_rma_buy", conditional_states,
-                                    np.isnan(hist_curr) or hist_curr <= 1e-8 or hist_curr <= hist_m1))
-    resets.extend(_reset_if_active(pair_name, "hist_rma_sell", conditional_states,
-                                    np.isnan(hist_curr) or hist_curr >= -1e-8 or hist_curr >= hist_m1))
-    return resets
-
-def _reset_ppohist_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    ppohist_curr, ppohist_m1 = context["ppohist_curr"], context["ppohist_m1"]
-    resets = []
-    resets.extend(_reset_if_active(pair_name, "ppohist_buy", conditional_states,
-                                    np.isnan(ppohist_curr) or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1))
-    resets.extend(_reset_if_active(pair_name, "ppohist_sell", conditional_states,
-                                    np.isnan(ppohist_curr) or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1))
-    return resets
-
-def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+    # ── Pivots ──
     piv = context.get("pivots", {})
+    close_c, close_p = context["close_curr"], context["close_prev"]
     if not piv:
-        missing_up = tuple(f"pivot_up_{lvl}" for lvl in set(PIVOT_LEVELS_BUY) if f"pivot_up_{lvl}" in ALERT_KEYS)
-        missing_down = tuple(f"pivot_down_{lvl}" for lvl in set(PIVOT_LEVELS_SELL) if f"pivot_down_{lvl}" in ALERT_KEYS)
-        return _reset_keys_unconditional(pair_name, missing_up + missing_down, conditional_states)
-
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-    resets = []
-    for level_name, level_value in piv.items():
-        up_key, down_key = f"pivot_up_{level_name}", f"pivot_down_{level_name}"
-        if up_key in ALERT_KEYS:
-            resets.extend(_reset_if_active(pair_name, up_key, conditional_states,
-                                            close_prev > level_value and close_curr <= level_value))
-        if down_key in ALERT_KEYS:
-            resets.extend(_reset_if_active(pair_name, down_key, conditional_states,
-                                            close_prev < level_value and close_curr >= level_value))
-    return resets
-
-    close_curr, close_prev = context["close_curr"], context["close_prev"]
-
-    for level_name, level_value in piv.items():
-        up_key = f"pivot_up_{level_name}"
-        down_key = f"pivot_down_{level_name}"
-
-        if up_key in ALERT_KEYS:
-            if close_prev > level_value and close_curr <= level_value:
-                if conditional_states.get(ALERT_KEYS[up_key], False):
-                    resets.append((f"{pair_name}:{ALERT_KEYS[up_key]}", "INACTIVE", None))
-
-        if down_key in ALERT_KEYS:
-            if close_prev < level_value and close_curr >= level_value:
-                if conditional_states.get(ALERT_KEYS[down_key], False):
-                    resets.append((f"{pair_name}:{ALERT_KEYS[down_key]}", "INACTIVE", None))
+        for lvl in set(PIVOT_LEVELS_BUY + PIVOT_LEVELS_SELL):
+            for prefix in ("pivot_up_", "pivot_down_"):
+                k = f"{prefix}{lvl}"
+                rk = ALERT_KEYS.get(k)
+                if rk and conditional_states.get(rk, False):
+                    resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+    else:
+        for lvl, val in piv.items():
+            up_k = f"pivot_up_{lvl}"
+            rk = ALERT_KEYS.get(up_k)
+            if rk and conditional_states.get(rk, False) and close_p > val and close_c <= val:
+                resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+            down_k = f"pivot_down_{lvl}"
+            rk = ALERT_KEYS.get(down_k)
+            if rk and conditional_states.get(rk, False) and close_p < val and close_c >= val:
+                resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
     return resets
 
@@ -3983,43 +4030,31 @@ SELL_ALERT_KEYS: Set[str] = {
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
-async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray],
-    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-    reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
-    max_alerts_per_run: int =cfg.MAX_ALERTS_PER_RUN) -> Optional[Tuple[str, Dict[str, Any]]]:
-
+async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
+    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
+    reference_time: int) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     if reference_time is None:
-        reference_time = get_trigger_timestamp()   
-     
+        reference_time = get_trigger_timestamp()
+
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
-    raw_alerts: List[Tuple[str, str, str]] = []
     close_15m = None
     timestamps_15m = None
-    indicators = None
-    ppo = None
-    ppo_signal = None
-    smooth_rsi = None
-    vwap = None
-    hist_rma = None
     rma50_15 = None
     rma200_5 = None
-    piv = None
-    context = None
 
     try:
-        i15 = get_last_closed_index_from_array(data_15m["timestamp"], 15, reference_time, pair_name)
+        i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
-            data_15m=data_15m,
+            data_15m=data_15m.as_dict(),
             candle_index=i15,
             reference_time=reference_time,
             pair_name=pair_name,
             min_wick_ratio=Constants.MIN_WICK_RATIO
         )
-   
         if not is_valid_for_buy and not is_valid_for_sell:
             if candle_info is None:
                 logger_pair.debug(
@@ -4082,12 +4117,13 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         close_curr = c
         candle_range = h - l
 
-        close_15m = data_15m["close"]
-        timestamps_15m = data_15m["timestamp"]
+        close_15m = data_15m.close
+        timestamps_15m = data_15m.ts
 
         interval_5m_sec = 5 * 60
         expected_5m_open = (reference_time // interval_5m_sec) * interval_5m_sec - interval_5m_sec
-        ts_5m_arr = normalize_timestamp_array(data_5m["timestamp"])
+
+        ts_5m_arr = normalize_timestamp_array(data_5m.ts)
 
         matches_5m = np.flatnonzero(np.abs(ts_5m_arr - expected_5m_open) <= 30)
 
@@ -4095,7 +4131,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             i5 = int(matches_5m[-1])
             actual_5m_ts = int(ts_5m_arr[i5])
         else:
-            ts_15m_val = int(normalize_timestamp(int(data_15m["timestamp"][i15])))
+            ts_15m_val = int(normalize_timestamp(int(data_15m.ts[i15])))
             window_mask = (ts_5m_arr >= ts_15m_val) & (ts_5m_arr < ts_15m_val + 900)
             if np.any(window_mask):
                 fallback_idx = int(np.flatnonzero(window_mask)[-1])
@@ -4122,7 +4158,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             )
             return None
 
-        ts_15m_val = int(normalize_timestamp(int(data_15m["timestamp"][i15])))
+        ts_15m_val = int(normalize_timestamp(int(data_15m.ts[i15])))
         if actual_5m_ts < ts_15m_val or actual_5m_ts >= ts_15m_val + 900:
             logger_pair.error(
                 f"[{pair_name}] 5m/15m misalignment: 5m={format_ist_time(actual_5m_ts)} "
@@ -4145,14 +4181,14 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             logger_pair.debug(
                 f"[{pair_name}] 5m candle selected | "
                 f"Open={format_ist_time(actual_5m_ts)} | i5={i5} | "
-                f"Close={data_5m['close'][i5]:.2f}"
+                f"Close={data_5m.close[i5]:.2f}"
             )
 
         # ═══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
         # ═══════════════════════════════════════════════════════
         gate_indicators = await asyncio.to_thread(
-            calculate_gate_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+            calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
         if gate_indicators is None:
             logger_pair.error(f"Skipping {pair_name}: gate indicators failed")
@@ -4276,7 +4312,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                     "suppression": "close_prev was NaN/Inf/≤0"
                 }
             }  
-        close_5m_val = data_5m["close"][i5]
+        close_5m_val = data_5m.close[i5]
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
@@ -4289,6 +4325,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         else:
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
+
 
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
@@ -4312,7 +4349,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg)
         cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg)
 
-        volume_curr = data_15m["volume"][i15]
+        volume_curr = data_15m.volume[i15]
         volume_ema_curr = volume_ema_arr[i15]
         if not np.isnan(volume_curr) and not np.isnan(volume_ema_curr) and volume_ema_curr > 1e-9:
             volume_above_ema_ok = volume_curr > volume_ema_curr
@@ -4524,38 +4561,148 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "ts": int(time.time()),
                 "summary": {
                     "alerts": 0,
-                    "cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
+                    "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
                     "hist_rma": 0.0,
                     "suppression": f"Gate blocked: {', '.join(reasons)}"
                 }
             }
+        return GateResult(
+            pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
+            candle_info=candle_info, o=o, h=h, l=l, c=c,
+            open_curr=open_curr, high_curr=high_curr, low_curr=low_curr, close_curr=close_curr,
+            close_prev=close_prev, close_5m_val=close_5m_val,
+            is_green=is_green, is_red=is_red,
+            is_valid_for_buy=is_valid_for_buy, is_valid_for_sell=is_valid_for_sell,
+            candle_index=i15, min_wick_ratio=Constants.MIN_WICK_RATIO,
+            buy_wick_ratio=buy_wick_ratio, sell_wick_ratio=sell_wick_ratio,
+            gate_indicators=gate_indicators,
+            base_buy_trend=base_buy_trend, base_sell_trend=base_sell_trend,
+            rma50_15_val=rma50_15_val, rma200_5_val=rma200_5_val,
+            cloud_up=cloud_up, cloud_down=cloud_down,
+            cloud_upper_val=cloud_upper_val, cloud_lower_val=cloud_lower_val,
+            cloud_upper_prev=cloud_upper_prev, cloud_lower_prev=cloud_lower_prev,
+            ichimoku_gate_ok_buy=ichimoku_gate_ok_buy, ichimoku_gate_ok_sell=ichimoku_gate_ok_sell,
+            confirmation_buy=confirmation_buy, confirmation_sell=confirmation_sell,
+            cloud_group_ok_buy=cloud_group_ok_buy, cloud_group_ok_sell=cloud_group_ok_sell,
+            tk_conversion_curr=tk_conversion_curr, tk_conversion_prev=tk_conversion_prev,
+            tk_base_curr=tk_base_curr, tk_base_prev=tk_base_prev,
+            tk_guard_ok_buy=tk_guard_ok_buy, tk_guard_ok_sell=tk_guard_ok_sell,
+            fast_future_green=fast_future_green, fast_future_red=fast_future_red,
+            fast_cloud_upper_curr=fast_cloud_upper_curr, fast_cloud_lower_curr=fast_cloud_lower_curr,
+            fast_cloud_upper_prev=fast_cloud_upper_prev, fast_cloud_lower_prev=fast_cloud_lower_prev,
+            fast_tk_conversion_curr=fast_tk_conversion_curr, fast_tk_conversion_prev=fast_tk_conversion_prev,
+            fast_tk_base_curr=fast_tk_base_curr, fast_tk_base_prev=fast_tk_base_prev,
+            fast_tenkan_ge_kijun=fast_tenkan_ge_kijun, fast_tenkan_le_kijun=fast_tenkan_le_kijun,
+            oscillator_group_ok_buy=oscillator_group_ok_buy, oscillator_group_ok_sell=oscillator_group_ok_sell,
+            ppo_gate_arr=ppo_gate_arr, ppo_gate_signal_arr=ppo_gate_signal_arr,
+            ppo_gate_curr=ppo_gate_curr, ppo_gate_prev=ppo_gate_prev,
+            ppo_gate_sig_curr=ppo_gate_sig_curr, ppo_gate_sig_prev=ppo_gate_sig_prev,
+            ppo_gate_ok_buy=ppo_gate_ok_buy, ppo_gate_ok_sell=ppo_gate_ok_sell,
+            rsi_guard_smooth_curr=rsi_guard_smooth_curr, rsi_guard_ema_curr=rsi_guard_ema_curr,
+            rsi_guard_ok_buy=rsi_guard_ok_buy, rsi_guard_ok_sell=rsi_guard_ok_sell,
+            rma_cloud_fast_curr=rma_cloud_fast_curr,
+            rma_cloud_ok_buy=rma_cloud_ok_buy, rma_cloud_ok_sell=rma_cloud_ok_sell,
+            trend_gate_ok_buy=trend_gate_ok_buy, trend_gate_ok_sell=trend_gate_ok_sell,
+            adx_val=adx_val, adx_adaptive_threshold=adx_adaptive_threshold, adx_ok=adx_ok,
+            rvol_bypass_ok=rvol_bypass_ok, rvol_ok=rvol_ok, adaptive_rvol_check=adaptive_rvol_check,
+            momentum_count=momentum_count, volatility_filter_ok=volatility_filter_ok,
+            cpr_ok=cpr_ok, nr_cpr=nr_cpr, effective_cpr_ok=effective_cpr_ok,
+            cpr_adaptive_min_pct_move=cpr_adaptive_min_pct_move, move_from_prev_close_ok=move_from_prev_close_ok,
+            ppo_adaptive_threshold=ppo_adaptive_threshold,
+            rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
+            buy_common=buy_common, sell_common=sell_common,
+            data_15m=data_15m, close_prev_invalid=close_prev_invalid,
+        )
+    except asyncio.CancelledError:
+        logger_pair.warning(f"Evaluation cancelled for {pair_name}")
+        raise
+    except RuntimeError as e:
+        logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
+        return pair_name, {
+            "state": "INVARIANT_VIOLATION",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": 0,
+                "future_cloud": "neutral",
+                "hist_rma": 0.0,
+                "error": str(e)
+            }
+        }
+    except Exception as e:
+        logger_pair.exception(
+            f"❌ Error in _eval_gate for {pair_name}: {e} | Correlation: {correlation_id}"
+        )
+        return None
 
-        # ═══════════════════════════════════════════════════════
-        # PHASE 2 — Expensive indicators only for gate-passed pairs
-        # ═══════════════════════════════════════════════════════
+async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
+    reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger
+) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], None]:
+    pair_name = gr.pair_name
+    i15 = gr.i15
+    ts_curr = gr.ts_curr
+    data_15m = gr.data_15m
+    gate_indicators = gr.gate_indicators
+    open_curr, high_curr, low_curr, close_curr = gr.open_curr, gr.high_curr, gr.low_curr, gr.close_curr
+    close_prev, close_5m_val = gr.close_prev, gr.close_5m_val
+    is_green, is_red = gr.is_green, gr.is_red
+    is_valid_for_buy, is_valid_for_sell = gr.is_valid_for_buy, gr.is_valid_for_sell
+    buy_wick_ratio, sell_wick_ratio = gr.buy_wick_ratio, gr.sell_wick_ratio
+    rma50_15_val, rma200_5_val = gr.rma50_15_val, gr.rma200_5_val
+    cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
+    cloud_upper_val, cloud_lower_val = gr.cloud_upper_val, gr.cloud_lower_val
+    cloud_upper_prev, cloud_lower_prev = gr.cloud_upper_prev, gr.cloud_lower_prev
+    ichimoku_gate_ok_buy, ichimoku_gate_ok_sell = gr.ichimoku_gate_ok_buy, gr.ichimoku_gate_ok_sell
+    cloud_group_ok_buy, cloud_group_ok_sell = gr.cloud_group_ok_buy, gr.cloud_group_ok_sell
+    tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
+    tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
+    tk_guard_ok_buy, tk_guard_ok_sell = gr.tk_guard_ok_buy, gr.tk_guard_ok_sell
+    fast_future_green, fast_future_red = gr.fast_future_green, gr.fast_future_red
+    fast_cloud_upper_curr, fast_cloud_lower_curr = gr.fast_cloud_upper_curr, gr.fast_cloud_lower_curr
+    fast_cloud_upper_prev, fast_cloud_lower_prev = gr.fast_cloud_upper_prev, gr.fast_cloud_lower_prev
+    fast_tk_conversion_curr, fast_tk_conversion_prev = gr.fast_tk_conversion_curr, gr.fast_tk_conversion_prev
+    fast_tk_base_curr, fast_tk_base_prev = gr.fast_tk_base_curr, gr.fast_tk_base_prev
+    fast_tenkan_ge_kijun, fast_tenkan_le_kijun = gr.fast_tenkan_ge_kijun, gr.fast_tenkan_le_kijun
+    oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
+    ppo_gate_arr, ppo_gate_signal_arr = gr.ppo_gate_arr, gr.ppo_gate_signal_arr
+    ppo_gate_curr, ppo_gate_prev = gr.ppo_gate_curr, gr.ppo_gate_prev
+    ppo_gate_sig_curr, ppo_gate_sig_prev = gr.ppo_gate_sig_curr, gr.ppo_gate_sig_prev
+    rsi_guard_smooth_curr, rsi_guard_ema_curr = gr.rsi_guard_smooth_curr, gr.rsi_guard_ema_curr
+    rma_cloud_fast_curr = gr.rma_cloud_fast_curr
+    rma_cloud_ok_buy, rma_cloud_ok_sell = gr.rma_cloud_ok_buy, gr.rma_cloud_ok_sell
+    trend_gate_ok_buy, trend_gate_ok_sell = gr.trend_gate_ok_buy, gr.trend_gate_ok_sell
+    adx_adaptive_threshold = gr.adx_adaptive_threshold
+    momentum_count = gr.momentum_count
+    cpr_ok, nr_cpr, effective_cpr_ok = gr.cpr_ok, gr.nr_cpr, gr.effective_cpr_ok
+    cpr_adaptive_min_pct_move = gr.cpr_adaptive_min_pct_move
+    move_from_prev_close_ok = gr.move_from_prev_close_ok
+    ppo_adaptive_threshold = gr.ppo_adaptive_threshold
+    rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
+    buy_common, sell_common = gr.buy_common, gr.sell_common
+    close_prev_invalid = gr.close_prev_invalid
+
+    try:
         alert_indicators = await asyncio.to_thread(
-            calculate_alert_indicators_numpy, data_15m, data_5m, data_daily, reference_time
+            calculate_alert_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
         if alert_indicators is None:
             logger_pair.error(f"Skipping {pair_name}: alert indicators failed")
             return None
 
-        # Merge into a single dict so downstream code stays unchanged
-        indicators = {**gate_indicators, **alert_indicators}
+        indicators = IndicatorCache.from_dicts(gate_indicators, alert_indicators)
 
         critical_indicators = ["ppo", "ppo_signal", "smooth_rsi", "smooth_rsi_ema"]
-        is_valid, msg = validate_indicators_dict(indicators, critical_indicators)
+        is_valid, msg = validate_indicators_dict(indicators.as_dict(), critical_indicators)
         if not is_valid:
             logger_pair.warning(f"Skipping {pair_name}: {msg}")
             return None
 
-        ppo = indicators["ppo"]
-        ppo_signal = indicators["ppo_signal"]
-        smooth_rsi = indicators["smooth_rsi"]
-        smooth_rsi_ema = indicators["smooth_rsi_ema"]
-        vwap = indicators["vwap"]
-        hist_rma = indicators["hist_rma"]
-        piv = indicators.get("pivots", {})
+        ppo = indicators.ppo
+        ppo_signal = indicators.ppo_signal
+        smooth_rsi = indicators.smooth_rsi
+        smooth_rsi_ema = indicators.smooth_rsi_ema
+        vwap = indicators.vwap
+        hist_rma = indicators.hist_rma
+        piv = indicators.pivots or {}
 
         ppo_sig_curr = ppo_signal[i15]
         ppo_sig_prev = ppo_signal[i15 - 1] if i15 >= 1 else ppo_signal[i15]
@@ -4717,7 +4864,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
             "is_green": is_green, "is_red": is_red,
             "pivots": piv if piv else {},
             "pivot_suppressions": [],
-            "nr_cpr": indicators.get('nr_cpr', float('nan')),
+            "nr_cpr": indicators.nr_cpr,
             "cpr_ok": effective_cpr_ok,
             "momentum_count": momentum_count,
             "move_from_prev_close_ok": move_from_prev_close_ok, 
@@ -4752,8 +4899,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
         previous_states = await sdb.batch_get_all_alert_states(
             pair_name, all_redis_alert_keys
         )
-        all_state_changes = []
 
+        raw_alerts: List[Tuple[str, str, str]] = []
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
@@ -4968,19 +5115,77 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
 
         conditional_states = previous_states
 
-        resets_to_apply = []
-        resets_to_apply.extend(_reset_ppo_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_rsi_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_vwap_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_pivot_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_hist_rma_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_ppohist_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_cloud_cross_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_tk_conversion_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_kijun_cross_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_fast_cloud_cross_alerts(pair_name, context, conditional_states))
-        resets_to_apply.extend(_reset_fast_tenkan_cross_alerts(pair_name, context, conditional_states))
-        
+        return context, conditional_states, raw_alerts
+
+    except asyncio.CancelledError:
+        logger_pair.warning(f"Evaluation cancelled for {pair_name}")
+        raise
+    except RuntimeError as e:
+        logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
+        return pair_name, {
+            "state": "INVARIANT_VIOLATION",
+            "ts": int(time.time()),
+            "summary": {
+                "alerts": 0,
+                "future_cloud": "neutral",
+                "hist_rma": 0.0,
+                "error": str(e)
+            }
+        }
+    except Exception as e:
+        logger_pair.exception(
+            f"❌ Error in _eval_alerts for {pair_name}: {e} | Correlation: {correlation_id}"
+        )
+        return None
+
+async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
+    raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
+    fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
+    alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int
+) -> Tuple[str, Dict[str, Any]]:
+   
+    pair_name = gr.pair_name
+    i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
+    data_15m = gr.data_15m
+    candle_info = gr.candle_info
+    o, h, l, c = gr.o, gr.h, gr.l, gr.c
+    close_curr, close_prev = gr.close_curr, gr.close_prev
+    is_green, is_red = gr.is_green, gr.is_red
+    is_valid_for_buy, is_valid_for_sell = gr.is_valid_for_buy, gr.is_valid_for_sell
+    candle_index, min_wick_ratio = gr.candle_index, gr.min_wick_ratio
+    base_buy_trend, base_sell_trend = gr.base_buy_trend, gr.base_sell_trend
+    rma50_15_val = gr.rma50_15_val
+    cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
+    ichimoku_gate_ok_buy, ichimoku_gate_ok_sell = gr.ichimoku_gate_ok_buy, gr.ichimoku_gate_ok_sell
+    confirmation_buy, confirmation_sell = gr.confirmation_buy, gr.confirmation_sell
+    cloud_group_ok_buy, cloud_group_ok_sell = gr.cloud_group_ok_buy, gr.cloud_group_ok_sell
+    tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
+    tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
+    oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
+    ppo_gate_curr, ppo_gate_sig_curr = gr.ppo_gate_curr, gr.ppo_gate_sig_curr
+    ppo_gate_ok_buy, ppo_gate_ok_sell = gr.ppo_gate_ok_buy, gr.ppo_gate_ok_sell
+    rsi_guard_smooth_curr, rsi_guard_ema_curr = gr.rsi_guard_smooth_curr, gr.rsi_guard_ema_curr
+    rsi_guard_ok_buy, rsi_guard_ok_sell = gr.rsi_guard_ok_buy, gr.rsi_guard_ok_sell
+    rma_cloud_fast_curr = gr.rma_cloud_fast_curr
+    rma_cloud_ok_buy, rma_cloud_ok_sell = gr.rma_cloud_ok_buy, gr.rma_cloud_ok_sell
+    adx_val, adx_adaptive_threshold, adx_ok = gr.adx_val, gr.adx_adaptive_threshold, gr.adx_ok
+    rvol_ok = gr.rvol_ok
+    ppo_adaptive_threshold = gr.ppo_adaptive_threshold
+    rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
+    buy_common, sell_common = gr.buy_common, gr.sell_common
+
+    hist_curr, hist_m1, hist_m2, hist_m3 = context["hist_curr"], context["hist_m1"], context["hist_m2"], context["hist_m3"]
+    hist_reversal_buy, hist_reversal_sell = context["hist_reversal_buy"], context["hist_reversal_sell"]
+    vwap_curr, vwap_prev, vwap_available = context["vwap_curr"], context["vwap_prev"], context["vwap_available"]
+    ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
+    rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
+    rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
+
+    all_state_changes = []
+
+    try:
+        resets_to_apply = _build_resets(pair_name, context, conditional_states)
+
         all_state_changes.extend(resets_to_apply)
 
         filtered_alerts = []
@@ -5011,7 +5216,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 is_valid_for_buy=is_valid_for_buy, is_valid_for_sell=is_valid_for_sell,
             )
             reverified = independent_candle_reverify(
-                data_15m=data_15m, candle_index=i15,
+                data_15m=data_15m.as_dict(), candle_index=i15,
                 cached=cached_snapshot,
                 min_wick_ratio=Constants.MIN_WICK_RATIO,
                 pair_name=pair_name, logger_pair=logger_pair,
@@ -5390,10 +5595,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
+
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
-
     except RuntimeError as e:
         logger_pair.critical(f"🚨 INVARIANT VIOLATION in {pair_name}: {e}")
         return pair_name, {
@@ -5406,17 +5611,39 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 "error": str(e)
             }
         }
-
     except Exception as e:
         logger_pair.exception(
-            f"❌ Error in evaluate_pair_and_alert for {pair_name}: {e} | "
-            f"Correlation: {correlation_id}"
+            f"❌ Error in _apply_and_dispatch_alerts for {pair_name}: {e} | Correlation: {correlation_id}"
         )
         return None
 
+async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
+    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
+    reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> Optional[Tuple[str, Dict[str, Any]]]:
+
+    logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
+
+    try:
+        gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time)
+        if gr is None:
+            return None
+        if isinstance(gr, tuple):
+            return gr  # hard reject / wick reject / gate blocked -- already final
+
+        alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
+        if alert_result is None:
+            return None
+        if isinstance(alert_result, tuple) and len(alert_result) == 2:
+            return alert_result  # reserved: RuntimeError path inside _eval_alerts
+        context, conditional_states, raw_alerts = alert_result
+
+        return await _apply_and_dispatch_alerts(
+            gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
+            correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
+        )
     finally:
         PAIR_ID.set("")
-
         global _pair_eval_counter
         _pair_eval_counter += 1
         if _pair_eval_counter % MEMORY_CHECK_INTERVAL_PAIRS == 0:
@@ -5424,11 +5651,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: Dict[str, np.ndarray
                 process = psutil.Process()
                 current_memory_mb = process.memory_info().rss / 1024 / 1024
                 memory_limit_mb = cfg.MEMORY_LIMIT_BYTES / 1024 / 1024
-             
                 if current_memory_mb > (memory_limit_mb * 0.8):
-                    logger_pair.warning(
-                        f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB"
-                    )
+                    logger_pair.warning(f"Memory spike: {current_memory_mb:.0f}MB / {memory_limit_mb:.0f}MB")
             except Exception:
                 pass
 
@@ -5436,10 +5660,7 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN ):
 
     p_name, symbol, candles = task_data
-    data_15m = None
-    data_5m = None
-    data_daily = None
-    
+
     try:
         pd_15m = parse_candles_to_numpy(candles.get("15"))
         pd_5m = parse_candles_to_numpy(candles.get("5"))
@@ -5453,8 +5674,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             logger_main.warning(f"Skipping {p_name}: 5m parse failed")
             return None
 
-        data_15m = pd_15m.as_dict()
-        data_5m = pd_5m.as_dict()
+        data_15m = pd_15m
+        data_5m = pd_5m
         data_daily = pd_daily.as_dict() if pd_daily is not None else None
 
         result = await evaluate_pair_and_alert(
