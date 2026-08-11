@@ -3749,237 +3749,143 @@ def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tupl
 
     return True, None
 
-def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
+def _reset_if_active(pair_name: str, key: str, conditional_states: dict, should_reset: bool) -> list:
+    """Atomic primitive: if the alert is currently ACTIVE and should_reset is True, emit an INACTIVE reset."""
+    if should_reset and conditional_states.get(ALERT_KEYS[key], False):
+        return [(f"{pair_name}:{ALERT_KEYS[key]}", "INACTIVE", None)]
+    return []
+
+def _reset_keys_unconditional(pair_name: str, keys: tuple, conditional_states: dict) -> list:
+    """Reset every key in `keys` that's currently ACTIVE — used when prerequisite data is missing/NaN."""
     resets = []
+    for k in keys:
+        resets.extend(_reset_if_active(pair_name, k, conditional_states, True))
+    return resets
+
+def _reset_cross(pair_name: str, up_key: str, down_key: str, curr: float, prev: float,
+                  up_thr_curr: float, up_thr_prev: float, down_thr_curr: float, down_thr_prev: float,
+                  conditional_states: dict) -> list:
+    """Generic two-way cross-reset: fires up_key's reset on a downcross through the
+    up-threshold, down_key's reset on an upcross through the down-threshold."""
+    resets = []
+    resets.extend(_reset_if_active(pair_name, up_key, conditional_states,
+                                    prev > up_thr_prev and curr <= up_thr_curr))
+    resets.extend(_reset_if_active(pair_name, down_key, conditional_states,
+                                    prev < down_thr_prev and curr >= down_thr_curr))
+    return resets
+
+def _reset_ppo_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
     ppo_curr, ppo_prev = context["ppo_curr"], context["ppo_prev"]
     ppo_sig_curr, ppo_sig_prev = context["ppo_sig_curr"], context["ppo_sig_prev"]
-
-    if ppo_prev > ppo_sig_prev and ppo_curr <= ppo_sig_curr:
-        if conditional_states.get(ALERT_KEYS['ppo_signal_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_up']}", "INACTIVE", None))
-
-    if ppo_prev < ppo_sig_prev and ppo_curr >= ppo_sig_curr:
-        if conditional_states.get(ALERT_KEYS['ppo_signal_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_signal_down']}", "INACTIVE", None))
-
-    if ppo_prev > 0 and ppo_curr <= 0:
-        if conditional_states.get(ALERT_KEYS['ppo_zero_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_up']}", "INACTIVE", None))
-
-    if ppo_prev < 0 and ppo_curr >= 0:
-        if conditional_states.get(ALERT_KEYS['ppo_zero_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_zero_down']}", "INACTIVE", None))
-
-    ppo_adaptive_up_thr = context["ppo_adaptive_threshold"]
-    if ppo_prev > ppo_adaptive_up_thr and ppo_curr <= ppo_adaptive_up_thr:
-        if conditional_states.get(ALERT_KEYS['ppo_adaptive_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_up']}", "INACTIVE", None))
-
-    ppo_adaptive_down_thr = context["ppo_adaptive_threshold"]
-    if ppo_prev < -ppo_adaptive_down_thr and ppo_curr >= -ppo_adaptive_down_thr:
-        if conditional_states.get(ALERT_KEYS['ppo_adaptive_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppo_adaptive_down']}", "INACTIVE", None))
-
+    thr = context["ppo_adaptive_threshold"]
+    resets = []
+    resets.extend(_reset_cross(pair_name, 'ppo_signal_up', 'ppo_signal_down',
+                                ppo_curr, ppo_prev, ppo_sig_curr, ppo_sig_prev, ppo_sig_curr, ppo_sig_prev,
+                                conditional_states))
+    resets.extend(_reset_cross(pair_name, 'ppo_zero_up', 'ppo_zero_down',
+                                ppo_curr, ppo_prev, 0, 0, 0, 0, conditional_states))
+    resets.extend(_reset_cross(pair_name, 'ppo_adaptive_up', 'ppo_adaptive_down',
+                                ppo_curr, ppo_prev, thr, thr, -thr, -thr, conditional_states))
     return resets
 
 def _reset_rsi_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     rsi_curr, rsi_prev = context["rsi_curr"], context["rsi_prev"]
     rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
-
-    if rsi_prev > rsi_ema_prev and rsi_curr <= rsi_ema_curr:
-        if conditional_states.get(ALERT_KEYS['rsi_ema5_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_up']}", "INACTIVE", None))
-
-    if rsi_prev < rsi_ema_prev and rsi_curr >= rsi_ema_curr:
-        if conditional_states.get(ALERT_KEYS['rsi_ema5_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_ema5_down']}", "INACTIVE", None))
-
-    rsi_buy = context["rsi_adaptive_buy"]
-    if rsi_prev > rsi_buy and rsi_curr <= rsi_buy:
-        if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_up']}", "INACTIVE", None))
-
-    rsi_sell = context["rsi_adaptive_sell"]
-    if rsi_prev < rsi_sell and rsi_curr >= rsi_sell:
-        if conditional_states.get(ALERT_KEYS['rsi_cross_adaptive_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['rsi_cross_adaptive_down']}", "INACTIVE", None))
-
+    resets = []
+    resets.extend(_reset_cross(pair_name, 'rsi_ema5_up', 'rsi_ema5_down',
+                                rsi_curr, rsi_prev, rsi_ema_curr, rsi_ema_prev, rsi_ema_curr, rsi_ema_prev,
+                                conditional_states))
+    buy, sell = context["rsi_adaptive_buy"], context["rsi_adaptive_sell"]
+    resets.extend(_reset_cross(pair_name, 'rsi_cross_adaptive_up', 'rsi_cross_adaptive_down',
+                                rsi_curr, rsi_prev, buy, buy, sell, sell, conditional_states))
     return resets
 
 def _reset_vwap_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
-
     if not context.get("vwap_available", False):
-        if conditional_states.get(ALERT_KEYS['vwap_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-        if conditional_states.get(ALERT_KEYS['vwap_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-        return resets
-
+        return _reset_keys_unconditional(pair_name, ('vwap_up', 'vwap_down'), conditional_states)
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     vwap_curr, vwap_prev = context["vwap_curr"], context["vwap_prev"]
-
-    if close_prev > vwap_prev and close_curr <= vwap_curr:
-        if conditional_states.get(ALERT_KEYS['vwap_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_up']}", "INACTIVE", None))
-
-    if close_prev < vwap_prev and close_curr >= vwap_curr:
-        if conditional_states.get(ALERT_KEYS['vwap_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['vwap_down']}", "INACTIVE", None))
-
-    return resets
+    return _reset_cross(pair_name, 'vwap_up', 'vwap_down', close_curr, close_prev,
+                         vwap_curr, vwap_prev, vwap_curr, vwap_prev, conditional_states)
 
 def _reset_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     cu_curr, cu_prev = context.get("cloud_upper_curr"), context.get("cloud_upper_prev")
     cl_curr, cl_prev = context.get("cloud_lower_curr"), context.get("cloud_lower_prev")
-
     if any(v is None or np.isnan(v) for v in (cu_curr, cu_prev, cl_curr, cl_prev)):
-        # Prerequisite data missing — can't evaluate the cross, so drop any stale ACTIVE state
-        for k in (ALERT_KEYS['cloud_cross_up'], ALERT_KEYS['cloud_cross_down']):
-            if conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        return resets
-
-    if close_prev > cu_prev and close_curr <= cu_curr:
-        if conditional_states.get(ALERT_KEYS['cloud_cross_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_up']}", "INACTIVE", None))
-
-    if close_prev < cl_prev and close_curr >= cl_curr:
-        if conditional_states.get(ALERT_KEYS['cloud_cross_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['cloud_cross_down']}", "INACTIVE", None))
-
-    return resets
+        return _reset_keys_unconditional(pair_name, ('cloud_cross_up', 'cloud_cross_down'), conditional_states)
+    return _reset_cross(pair_name, 'cloud_cross_up', 'cloud_cross_down', close_curr, close_prev,
+                         cu_curr, cu_prev, cl_curr, cl_prev, conditional_states)
 
 def _reset_tk_conversion_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     conv_curr, conv_prev = context.get("tk_conversion_curr"), context.get("tk_conversion_prev")
-
     if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
-        for k in (ALERT_KEYS['tk_conversion_up'], ALERT_KEYS['tk_conversion_down']):
-            if conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        return resets
-
-    if close_prev > conv_prev and close_curr <= conv_curr:
-        if conditional_states.get(ALERT_KEYS['tk_conversion_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_up']}", "INACTIVE", None))
-
-    if close_prev < conv_prev and close_curr >= conv_curr:
-        if conditional_states.get(ALERT_KEYS['tk_conversion_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['tk_conversion_down']}", "INACTIVE", None))
-
-    return resets
+        return _reset_keys_unconditional(pair_name, ('tk_conversion_up', 'tk_conversion_down'), conditional_states)
+    return _reset_cross(pair_name, 'tk_conversion_up', 'tk_conversion_down', close_curr, close_prev,
+                         conv_curr, conv_prev, conv_curr, conv_prev, conditional_states)
 
 def _reset_kijun_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     base_curr, base_prev = context.get("tk_base_curr"), context.get("tk_base_prev")
-
     if base_curr is None or base_prev is None or np.isnan(base_curr) or np.isnan(base_prev):
-        for k in (ALERT_KEYS['kijun_cross_up'], ALERT_KEYS['kijun_cross_down']):
-            if conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        return resets
-
-    if close_prev > base_prev and close_curr <= base_curr:
-        if conditional_states.get(ALERT_KEYS['kijun_cross_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['kijun_cross_up']}", "INACTIVE", None))
-
-    if close_prev < base_prev and close_curr >= base_curr:
-        if conditional_states.get(ALERT_KEYS['kijun_cross_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['kijun_cross_down']}", "INACTIVE", None))
-
-    return resets
+        return _reset_keys_unconditional(pair_name, ('kijun_cross_up', 'kijun_cross_down'), conditional_states)
+    return _reset_cross(pair_name, 'kijun_cross_up', 'kijun_cross_down', close_curr, close_prev,
+                         base_curr, base_prev, base_curr, base_prev, conditional_states)
 
 def _reset_fast_cloud_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     cu_curr, cu_prev = context.get("fast_cloud_upper_curr"), context.get("fast_cloud_upper_prev")
     cl_curr, cl_prev = context.get("fast_cloud_lower_curr"), context.get("fast_cloud_lower_prev")
-
     if any(v is None or np.isnan(v) for v in (cu_curr, cu_prev, cl_curr, cl_prev)):
-        for k in (ALERT_KEYS['fast_cloud_cross_up'], ALERT_KEYS['fast_cloud_cross_down']):
-            if conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        return resets
-
-    if close_prev > cu_prev and close_curr <= cu_curr:
-        if conditional_states.get(ALERT_KEYS['fast_cloud_cross_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_up']}", "INACTIVE", None))
-
-    if close_prev < cl_prev and close_curr >= cl_curr:
-        if conditional_states.get(ALERT_KEYS['fast_cloud_cross_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['fast_cloud_cross_down']}", "INACTIVE", None))
-
-    return resets
+        return _reset_keys_unconditional(pair_name, ('fast_cloud_cross_up', 'fast_cloud_cross_down'), conditional_states)
+    return _reset_cross(pair_name, 'fast_cloud_cross_up', 'fast_cloud_cross_down', close_curr, close_prev,
+                         cu_curr, cu_prev, cl_curr, cl_prev, conditional_states)
 
 def _reset_fast_tenkan_cross_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     close_curr, close_prev = context["close_curr"], context["close_prev"]
     conv_curr, conv_prev = context.get("fast_tk_conversion_curr"), context.get("fast_tk_conversion_prev")
-
     if conv_curr is None or conv_prev is None or np.isnan(conv_curr) or np.isnan(conv_prev):
-        for k in (ALERT_KEYS['fast_tenkan_cross_up'], ALERT_KEYS['fast_tenkan_cross_down']):
-            if conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        return resets
-
-    if close_prev > conv_prev and close_curr <= conv_curr:
-        if conditional_states.get(ALERT_KEYS['fast_tenkan_cross_up'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['fast_tenkan_cross_up']}", "INACTIVE", None))
-
-    if close_prev < conv_prev and close_curr >= conv_curr:
-        if conditional_states.get(ALERT_KEYS['fast_tenkan_cross_down'], False):
-            resets.append((f"{pair_name}:{ALERT_KEYS['fast_tenkan_cross_down']}", "INACTIVE", None))
-
-    return resets
+        return _reset_keys_unconditional(pair_name, ('fast_tenkan_cross_up', 'fast_tenkan_cross_down'), conditional_states)
+    return _reset_cross(pair_name, 'fast_tenkan_cross_up', 'fast_tenkan_cross_down', close_curr, close_prev,
+                         conv_curr, conv_prev, conv_curr, conv_prev, conditional_states)
 
 def _reset_hist_rma_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     hist_curr, hist_m1 = context["hist_curr"], context["hist_m1"]
-
-    if conditional_states.get(ALERT_KEYS["hist_rma_buy"], False):
-        if np.isnan(hist_curr) or hist_curr <= 1e-8 or hist_curr <= hist_m1:
-            resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_buy']}", "INACTIVE", None))
-
-    if conditional_states.get(ALERT_KEYS["hist_rma_sell"], False):
-        if np.isnan(hist_curr) or hist_curr >= -1e-8 or hist_curr >= hist_m1:
-            resets.append((f"{pair_name}:{ALERT_KEYS['hist_rma_sell']}", "INACTIVE", None))
-
+    resets = []
+    resets.extend(_reset_if_active(pair_name, "hist_rma_buy", conditional_states,
+                                    np.isnan(hist_curr) or hist_curr <= 1e-8 or hist_curr <= hist_m1))
+    resets.extend(_reset_if_active(pair_name, "hist_rma_sell", conditional_states,
+                                    np.isnan(hist_curr) or hist_curr >= -1e-8 or hist_curr >= hist_m1))
     return resets
 
 def _reset_ppohist_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     ppohist_curr, ppohist_m1 = context["ppohist_curr"], context["ppohist_m1"]
-
-    if conditional_states.get(ALERT_KEYS["ppohist_buy"], False):
-        if np.isnan(ppohist_curr) or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1:
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_buy']}", "INACTIVE", None))
-
-    if conditional_states.get(ALERT_KEYS["ppohist_sell"], False):
-        if np.isnan(ppohist_curr) or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1:
-            resets.append((f"{pair_name}:{ALERT_KEYS['ppohist_sell']}", "INACTIVE", None))
-
+    resets = []
+    resets.extend(_reset_if_active(pair_name, "ppohist_buy", conditional_states,
+                                    np.isnan(ppohist_curr) or ppohist_curr <= 1e-8 or ppohist_curr <= ppohist_m1))
+    resets.extend(_reset_if_active(pair_name, "ppohist_sell", conditional_states,
+                                    np.isnan(ppohist_curr) or ppohist_curr >= -1e-8 or ppohist_curr >= ppohist_m1))
     return resets
 
 def _reset_pivot_alerts(pair_name: str, context: dict, conditional_states: dict) -> list:
-    resets = []
     piv = context.get("pivots", {})
     if not piv:
-        # Pivot data missing entirely — drop any stale ACTIVE pivot alerts for known levels
-        for level in set(PIVOT_LEVELS_BUY):
-            k = ALERT_KEYS.get(f"pivot_up_{level}")
-            if k and conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        for level in set(PIVOT_LEVELS_SELL):
-            k = ALERT_KEYS.get(f"pivot_down_{level}")
-            if k and conditional_states.get(k, False):
-                resets.append((f"{pair_name}:{k}", "INACTIVE", None))
-        return resets
+        missing_up = tuple(f"pivot_up_{lvl}" for lvl in set(PIVOT_LEVELS_BUY) if f"pivot_up_{lvl}" in ALERT_KEYS)
+        missing_down = tuple(f"pivot_down_{lvl}" for lvl in set(PIVOT_LEVELS_SELL) if f"pivot_down_{lvl}" in ALERT_KEYS)
+        return _reset_keys_unconditional(pair_name, missing_up + missing_down, conditional_states)
+
+    close_curr, close_prev = context["close_curr"], context["close_prev"]
+    resets = []
+    for level_name, level_value in piv.items():
+        up_key, down_key = f"pivot_up_{level_name}", f"pivot_down_{level_name}"
+        if up_key in ALERT_KEYS:
+            resets.extend(_reset_if_active(pair_name, up_key, conditional_states,
+                                            close_prev > level_value and close_curr <= level_value))
+        if down_key in ALERT_KEYS:
+            resets.extend(_reset_if_active(pair_name, down_key, conditional_states,
+                                            close_prev < level_value and close_curr >= level_value))
+    return resets
 
     close_curr, close_prev = context["close_curr"], context["close_prev"]
 
