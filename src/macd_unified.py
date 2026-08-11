@@ -2675,13 +2675,11 @@ async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name:
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
     """Returns True=unchanged, False=confirmed repaint/mismatch, None=inconclusive (fetch/network failure)."""
     try:
-        raw = await fetcher.fetch_candles(...)
+        raw = await fetcher.fetch_candles(symbol, "15", 5, reference_time, for_confirmation=True) 
         fresh = parse_candles_to_numpy(raw)
         if fresh is None:
             logger_pair.warning(f"[{pair_name}] Confirmation fetch failed — inconclusive, releasing dedup claim")
             return None
-
-        fresh = PriceData.from_dict(fresh_raw)
         matches = np.flatnonzero(np.abs(fresh.ts - ts_curr) <= 5)
         if matches.size == 0:
             logger_pair.warning(f"[{pair_name}] Confirmation candle {format_ist_time(ts_curr)} not found — inconclusive, releasing dedup claim")
