@@ -4639,11 +4639,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 ) -> Union[Tuple[Dict[str, Any], Dict[str, bool], List[Tuple[str, str, str]]], Tuple[str, Dict[str, Any]], None]:
     pair_name = gr.pair_name
     i15 = gr.i15
-    ts_curr = gr.ts_curr
     data_15m = gr.data_15m
-    gate_indicators = gr.gate_indicators
-    open_curr, high_curr, low_curr, close_curr = gr.open_curr, gr.high_curr, gr.low_curr, gr.close_curr
-    close_prev, close_5m_val = gr.close_prev, gr.close_5m_val
+    close_curr = gr.close_curr
+    close_prev = gr.close_prev
     is_green, is_red = gr.is_green, gr.is_red
     is_valid_for_buy, is_valid_for_sell = gr.is_valid_for_buy, gr.is_valid_for_sell
     buy_wick_ratio, sell_wick_ratio = gr.buy_wick_ratio, gr.sell_wick_ratio
@@ -4688,7 +4686,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             logger_pair.error(f"Skipping {pair_name}: alert indicators failed")
             return None
 
-        indicators = IndicatorCache.from_dicts(gate_indicators, alert_indicators)
+        indicators = IndicatorCache.from_dicts(gr.gate_indicators, alert_indicators)
 
         critical_indicators = ["ppo", "ppo_signal", "smooth_rsi", "smooth_rsi_ema"]
         is_valid, msg = validate_indicators_dict(indicators.as_dict(), critical_indicators)
@@ -4800,7 +4798,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             ppohist_reversal_buy = (
                 buy_common and ppohist_curr > 0
                 and ppohist_m3 > ppohist_m2 > ppohist_m1 and ppohist_curr > ppohist_m1
-        )
+            )
             ppohist_reversal_sell = (
                 sell_common and ppohist_curr < 0
                 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1
@@ -4819,8 +4817,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
         context = {
             "close_curr": close_curr, "close_prev": close_prev,
-            "open_curr": open_curr, "high_curr": high_curr, "low_curr": low_curr,
-            "ts_curr": ts_curr, "close_5m_val": close_5m_val,
             "ppo_curr": ppo_curr, "ppo_prev": ppo_prev,
             "ppo_sig_curr": ppo_sig_curr, "ppo_sig_prev": ppo_sig_prev,
             "rsi_curr": rsi_curr, "rsi_prev": rsi_prev,
@@ -4901,6 +4897,49 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         )
 
         raw_alerts: List[Tuple[str, str, str]] = []
+
+        # ── Registry for cross-based alerts (same pattern as _build_resets) ──
+        _CROSS_HANDLERS = {
+            "vwap": {
+                "keys": {"vwap_up", "vwap_down"},
+                "enabled": vwap_available,
+                "validator": validate_vwap_cross,
+                "ctx_args": ("close_prev", "close_curr", "vwap_prev", "vwap_curr"),
+            },
+            "cloud_cross": {
+                "keys": {"cloud_cross_up", "cloud_cross_down"},
+                "enabled": cfg.ENABLE_CLOUD_CROSS_ALERT,
+                "validator": validate_cloud_cross,
+                "ctx_args": ("close_prev", "close_curr", "cloud_upper_prev", "cloud_upper_curr",
+                             "cloud_lower_prev", "cloud_lower_curr"),
+            },
+            "tk_conversion": {
+                "keys": {"tk_conversion_up", "tk_conversion_down"},
+                "enabled": cfg.ENABLE_TK_CONVERSION_CROSS,
+                "validator": validate_conversion_cross,
+                "ctx_args": ("close_prev", "close_curr", "tk_conversion_prev", "tk_conversion_curr"),
+            },
+            "kijun_cross": {
+                "keys": {"kijun_cross_up", "kijun_cross_down"},
+                "enabled": cfg.ENABLE_KIJUN_CROSS,
+                "validator": validate_conversion_cross,
+                "ctx_args": ("close_prev", "close_curr", "tk_base_prev", "tk_base_curr"),
+            },
+            "fast_cloud_cross": {
+                "keys": {"fast_cloud_cross_up", "fast_cloud_cross_down"},
+                "enabled": cfg.ENABLE_FAST_ICHIMOKU_CLOUD_CROSS,
+                "validator": validate_cloud_cross,
+                "ctx_args": ("close_prev", "close_curr", "fast_cloud_upper_prev", "fast_cloud_upper_curr",
+                             "fast_cloud_lower_prev", "fast_cloud_lower_curr"),
+            },
+            "fast_tenkan_cross": {
+                "keys": {"fast_tenkan_cross_up", "fast_tenkan_cross_down"},
+                "enabled": cfg.ENABLE_FAST_ICHIMOKU_TENKAN_CROSS,
+                "validator": validate_conversion_cross,
+                "ctx_args": ("close_prev", "close_curr", "fast_tk_conversion_prev", "fast_tk_conversion_curr"),
+            },
+        }
+
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
@@ -4910,7 +4949,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 if not is_green:
                     logger_pair.debug(
                         f"[{pair_name}] 🚫 BLOCKED BUY: {alert_key} on RED candle! "
-                        f"O={open_curr:.2f} C={close_curr:.2f}"
+                        f"O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
                     continue
                 if not is_valid_for_buy:
@@ -4922,7 +4961,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 if not is_red:
                     logger_pair.debug(
                         f"[{pair_name}] 🚫 BLOCKED SELL: {alert_key} on GREEN candle! "
-                        f"O={open_curr:.2f} C={close_curr:.2f}"
+                        f"O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
                     continue
                 if not is_valid_for_sell:
@@ -4947,153 +4986,47 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             key = ALERT_KEYS[alert_key]
             trigger = False
 
-            if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
-                level = alert_key.split("_")[-1]
-                is_buy = alert_key.startswith("pivot_up_")
-                try:
-
-                    valid_cross, reason = get_pivot_alert_info(context, level, is_buy)
-                    if not valid_cross and reason and piv:
-                         context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except Exception as e:
-                    logger_pair.debug(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
-            
-            elif alert_key in ("vwap_up", "vwap_down"):
-                if not vwap_available:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: VWAP unavailable")
+            # ── Cross-alert dispatch ──
+            handled = False
+            for handler in _CROSS_HANDLERS.values():
+                if alert_key not in handler["keys"]:
                     continue
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "vwap_up")
-                    valid_cross, cross_reason = validate_vwap_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["vwap_prev"], context["vwap_curr"],
-                        is_buy_side
-                    )
-                    if valid_cross:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    elif cfg.DEBUG_MODE:
-                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
-
-                except Exception as e:
-                    logger_pair.debug(f"VWAP check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
-
-            elif alert_key in ("cloud_cross_up", "cloud_cross_down"):
-                if not cfg.ENABLE_CLOUD_CROSS_ALERT:
+                if not handler["enabled"]:
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: Cloud cross alert disabled")
-                    continue
-                trigger = False
+                        logger_pair.debug(f"Skipping {alert_key}: cross prerequisite disabled")
+                    handled = True
+                    break
                 try:
-                    is_buy_side = (alert_key == "cloud_cross_up")
-                    valid_cross, cross_reason = validate_cloud_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["cloud_upper_prev"], context["cloud_upper_curr"],
-                        context["cloud_lower_prev"], context["cloud_lower_curr"],
-                        is_buy_side
-                    )
+                    is_buy_side = alert_key.endswith("_up")
+                    args = [context[k] for k in handler["ctx_args"]] + [is_buy_side]
+                    valid_cross, cross_reason = handler["validator"](*args)
                     if valid_cross:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     elif cfg.DEBUG_MODE:
                         logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
-                    logger_pair.debug(f"Cloud cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
+                    logger_pair.debug(f"{alert_key} cross check failed: {e}", exc_info=True)
+                handled = True
+                break
 
-            elif alert_key in ("tk_conversion_up", "tk_conversion_down"):
-                if not cfg.ENABLE_TK_CONVERSION_CROSS:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: TK conversion cross disabled")
-                    continue
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "tk_conversion_up")
-                    valid_cross, cross_reason = validate_conversion_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["tk_conversion_prev"], context["tk_conversion_curr"],
-                        is_buy_side
-                    )
-                    if valid_cross:
+            if not handled:
+                if alert_key.startswith("pivot_up_") or alert_key.startswith("pivot_down_"):
+                    level = alert_key.split("_")[-1]
+                    is_buy = alert_key.startswith("pivot_up_")
+                    try:
+                        valid_cross, reason = get_pivot_alert_info(context, level, is_buy)
+                        if not valid_cross and reason and piv:
+                             context["pivot_suppressions"].append(f"{alert_key}: {reason}")
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    elif cfg.DEBUG_MODE:
-                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
-                except Exception as e:
-                    logger_pair.debug(f"TK conversion cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
-
-            elif alert_key in ("kijun_cross_up", "kijun_cross_down"):
-                if not cfg.ENABLE_KIJUN_CROSS:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: Kijun cross disabled")
-                    continue
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "kijun_cross_up")
-                    valid_cross, cross_reason = validate_conversion_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["tk_base_prev"], context["tk_base_curr"],
-                        is_buy_side
-                    )
-                    if valid_cross:
+                    except Exception as e:
+                        logger_pair.debug(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
+                        trigger = False
+                else:
+                    try:
                         trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    elif cfg.DEBUG_MODE:
-                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
-                except Exception as e:
-                    logger_pair.debug(f"Kijun cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
-
-            elif alert_key in ("fast_cloud_cross_up", "fast_cloud_cross_down"):
-                if not cfg.ENABLE_FAST_ICHIMOKU_CLOUD_CROSS:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: Fast Ichimoku cloud cross disabled")
-                    continue
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "fast_cloud_cross_up")
-                    valid_cross, cross_reason = validate_cloud_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["fast_cloud_upper_prev"], context["fast_cloud_upper_curr"],
-                        context["fast_cloud_lower_prev"], context["fast_cloud_lower_curr"],
-                        is_buy_side
-                    )
-                    if valid_cross:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    elif cfg.DEBUG_MODE:
-                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
-                except Exception as e:
-                    logger_pair.debug(f"Fast cloud cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
-
-            elif alert_key in ("fast_tenkan_cross_up", "fast_tenkan_cross_down"):
-                if not cfg.ENABLE_FAST_ICHIMOKU_TENKAN_CROSS:
-                    if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: Fast Ichimoku Tenkan cross disabled")
-                    continue
-                trigger = False
-                try:
-                    is_buy_side = (alert_key == "fast_tenkan_cross_up")
-                    valid_cross, cross_reason = validate_conversion_cross(
-                        context["close_prev"], context["close_curr"],
-                        context["fast_tk_conversion_prev"], context["fast_tk_conversion_curr"],
-                        is_buy_side
-                    )
-                    if valid_cross:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                    elif cfg.DEBUG_MODE:
-                        logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
-                except Exception as e:
-                    logger_pair.debug(f"Fast Tenkan cross check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False                 
-            else:
-                try:
-                    trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
-                except Exception as e:
-                    logger_pair.debug(f"Alert check failed for {alert_key}: {e}", exc_info=True)
-                    trigger = False
+                    except Exception as e:
+                        logger_pair.debug(f"Alert check failed for {alert_key}: {e}", exc_info=True)
+                        trigger = False
 
             if trigger and not previous_states.get(key, False):
                 extra = ""
@@ -5110,7 +5043,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     logger_pair.debug(
                         f"✅ Alert FIRED: {alert_key} | "
                         f"buy_common={buy_common} sell_common={sell_common} | "
-                        f"Candle: O={open_curr:.2f} C={close_curr:.2f}"
+                        f"Candle: O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
 
         conditional_states = previous_states
@@ -5152,7 +5085,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     close_curr, close_prev = gr.close_curr, gr.close_prev
     is_green, is_red = gr.is_green, gr.is_red
     is_valid_for_buy, is_valid_for_sell = gr.is_valid_for_buy, gr.is_valid_for_sell
-    candle_index, min_wick_ratio = gr.candle_index, gr.min_wick_ratio
+    min_wick_ratio = gr.min_wick_ratio
     base_buy_trend, base_sell_trend = gr.base_buy_trend, gr.base_sell_trend
     rma50_15_val = gr.rma50_15_val
     cloud_up, cloud_down = gr.cloud_up, gr.cloud_down
