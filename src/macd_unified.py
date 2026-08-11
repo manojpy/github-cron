@@ -1619,21 +1619,25 @@ def get_adaptive_adx_threshold_smoothed(adx_arr: np.ndarray, i15: int, cfg: BotC
         ema = alpha * val + (1.0 - alpha) * ema
     return ema
 
-def get_adaptive_ppo_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
-    pctl = get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
-    return _scale_by_pctl(pctl, cfg.PPO_ADAPTIVE_CALM, cfg.PPO_ADAPTIVE_VOLATILE)
+
+def _get_smoothed_pctl(atr_long_arr, i15, cfg) -> Optional[float]:
+    return get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+
+def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr: str) -> float:
+    pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
+    return _scale_by_pctl(pctl, getattr(cfg, calm_attr), getattr(cfg, volatile_attr))
+
+def get_adaptive_ppo_threshold(atr_long_arr, i15, cfg) -> float:
+    return get_adaptive_threshold(atr_long_arr, i15, cfg, "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE")
 
 def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Tuple[float, float]:
-    """Returns (buy_threshold, sell_threshold), computed from one shared percentile
-    so both sides move together with the same volatility regime."""
-    pctl = get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
+    pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     buy = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_BUY_CALM, cfg.RSI_ADAPTIVE_BUY_VOLATILE)
     sell = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_SELL_CALM, cfg.RSI_ADAPTIVE_SELL_VOLATILE)
     return buy, sell
 
-def get_adaptive_cpr_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
-    pctl = get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
-    return _scale_by_pctl(pctl, cfg.CPR_ADAPTIVE_CALM, cfg.CPR_ADAPTIVE_VOLATILE)
+def get_adaptive_cpr_threshold(atr_long_arr, i15, cfg) -> float:
+    return get_adaptive_threshold(atr_long_arr, i15, cfg, "CPR_ADAPTIVE_CALM", "CPR_ADAPTIVE_VOLATILE")
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
