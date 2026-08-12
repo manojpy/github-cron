@@ -216,6 +216,10 @@ class BotConfig(BaseModel):
     REDIS_RETRY_DELAY: float = 2.0
     REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
     ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
+    ENABLE_ALERT_COALESCING: bool = Field(default=True) 
+    COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
+    ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
+    CONFLUENCE_MIN_VOTES: int = Field(default=3, ge=2, le=10) 
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
@@ -1619,7 +1623,6 @@ def get_adaptive_adx_threshold_smoothed(adx_arr: np.ndarray, i15: int, cfg: BotC
         ema = alpha * val + (1.0 - alpha) * ema
     return ema
 
-
 def _get_smoothed_pctl(atr_long_arr, i15, cfg) -> Optional[float]:
     return get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
 
@@ -2558,7 +2561,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     last_closed_idx = int(matches[-1])
     actual_candle_open = int(ts_normalized[last_closed_idx])
 
-    # Move stability check AFTER finding the actual candle
     if not candle_is_stable(actual_candle_open, reference_time, interval_minutes):
         logger.warning(
             "[%s] Candle %dm actual open %s not stable. Skipping.",
@@ -2762,6 +2764,52 @@ class GateResult:
     # -- misc data passed through --
     data_15m: PriceData
     close_prev_invalid: bool = False
+
+def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
+    """Count independent gate votes that agree for the given direction.
+    Read-only over already-computed GateResult fields — does not alter any
+    existing trigger/gate logic. Returns (score, total_available_votes)."""
+    votes: List[bool] = []
+
+    if is_buy:
+        votes.append(gr.base_buy_trend)
+        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None:
+            votes.append(gr.ichimoku_gate_ok_buy)
+        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_buy is not None:
+            votes.append(gr.rma_cloud_ok_buy)
+        if cfg.ENABLE_PPO_GATE:
+            votes.append(gr.ppo_gate_ok_buy)
+        if cfg.RSI_GUARD_ENABLED:
+            votes.append(gr.rsi_guard_ok_buy)
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None:
+            votes.append(gr.tk_guard_ok_buy)
+        if cfg.ENABLE_ADX_FILTER:
+            votes.append(gr.adx_ok)
+        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
+            votes.append(gr.rvol_ok)
+        if cfg.ENABLE_CPR:
+            votes.append(gr.effective_cpr_ok)
+    else:
+        votes.append(gr.base_sell_trend)
+        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None:
+            votes.append(gr.ichimoku_gate_ok_sell)
+        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_sell is not None:
+            votes.append(gr.rma_cloud_ok_sell)
+        if cfg.ENABLE_PPO_GATE:
+            votes.append(gr.ppo_gate_ok_sell)
+        if cfg.RSI_GUARD_ENABLED:
+            votes.append(gr.rsi_guard_ok_sell)
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_sell is not None:
+            votes.append(gr.tk_guard_ok_sell)
+        if cfg.ENABLE_ADX_FILTER:
+            votes.append(gr.adx_ok)
+        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
+            votes.append(gr.rvol_ok)
+        if cfg.ENABLE_CPR:
+            votes.append(gr.effective_cpr_ok)
+
+    score = sum(1 for v in votes if v)
+    return score, len(votes)
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
@@ -3214,13 +3262,14 @@ class RedisStateStore:
             f"set_metadata {key}",
         )
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int) -> bool:
+    async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
             return True
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+        effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         try:
             result = await asyncio.wait_for(
-                self._redis.set(recent_key, str(ts), nx=True, ex=cfg.ALERT_DEDUP_WINDOW_SEC),
+                self._redis.set(recent_key, str(ts), nx=True, ex=effective_window),
                 timeout=3.0
             )
             should_send = bool(result)
@@ -5124,26 +5173,20 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         all_state_changes.extend(resets_to_apply)
 
-        filtered_alerts = []
-        for alert_title, alert_extra, alert_key in raw_alerts:
-            should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
-            if not should_send:
-                logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
-                continue
-
-            filtered_alerts.append((alert_title, alert_extra, alert_key))
-
-        pivot_count = sum(1 for _, _, k in filtered_alerts if k.startswith("pivot_"))
+        pivot_count = sum(1 for _, _, k in raw_alerts if k.startswith("pivot_"))
         if pivot_count > 3:
             logger_pair.warning(
                 f"Limiting pivot alerts for {pair_name}: {pivot_count} triggered, keeping 3"
             )
-            pivot_alerts = [(t, e, k) for t, e, k in filtered_alerts if k.startswith("pivot_")][:3]
-            other_alerts = [(t, e, k) for t, e, k in filtered_alerts if not k.startswith("pivot_")]
-            filtered_alerts = other_alerts + pivot_alerts
+            pivot_alerts = [(t, e, k) for t, e, k in raw_alerts if k.startswith("pivot_")][:3]
+            other_alerts = [(t, e, k) for t, e, k in raw_alerts if not k.startswith("pivot_")]
+            capped_alerts = other_alerts + pivot_alerts
+        else:
+            capped_alerts = raw_alerts
 
-        alerts_to_send = filtered_alerts[:cfg.MAX_ALERTS_PER_PAIR]
+        alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
+        cached_snapshot: Optional[CandleSnapshot] = None
         if alerts_to_send:
             cached_snapshot = CandleSnapshot(
                 timestamp=ts_curr, open=o, high=h, low=l, close=c,
@@ -5159,16 +5202,57 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             )
             if not reverified:
                 logger_pair.warning(
-                    f"[{pair_name}] Independent re-verify failed — alert suppressed, dedup key KEPT to prevent duplicates"
+                    f"[{pair_name}] Independent re-verify failed — alert suppressed. No dedup/coalesce "
+                    f"claim was taken yet, so this will be re-attempted next run if the trigger persists."
                 )
                 alerts_to_send = []
+
+        if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE:
+            is_buy_dir = bool(gr.is_green and gr.is_valid_for_buy)
+            score, total = compute_confluence_score(gr, is_buy=is_buy_dir)
+            required = min(cfg.CONFLUENCE_MIN_VOTES, total)
+            if score < required:
+                logger_pair.info(
+                    f"[{pair_name}] Confluence gate blocked dispatch: {score}/{total} votes (need {required})"
+                )
+                alerts_to_send = []
+
+        coalesced_dedup_key: Optional[str] = None
+        if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
+            direction = "BUY" if (gr.is_green and gr.is_valid_for_buy) else "SELL"
+            coalesced_dedup_key = f"coalesced_{direction}"
+            should_send = await sdb.check_recent_alert(
+                pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
+            )
+            if not should_send:
+                logger_pair.debug(
+                    f"[{pair_name}] Coalesced {direction} alert deduped (within "
+                    f"{cfg.COALESCE_DEDUP_WINDOW_SEC}s) — skipping dispatch"
+                )
+                alerts_to_send = []
+        elif alerts_to_send:
+            deduped_alerts = []
+            for alert_title, alert_extra, alert_key in alerts_to_send:
+                should_send = await sdb.check_recent_alert(pair_name, alert_key, ts_curr)
+                if not should_send:
+                    logger_pair.debug(f"Alert {alert_key} skipped (dedup window)")
+                    continue
+                deduped_alerts.append((alert_title, alert_extra, alert_key))
+            alerts_to_send = deduped_alerts
+
+        async def _release_dedup_claims() -> None:
+            """Releases whichever kind of claim was taken in step 4 above."""
+            if coalesced_dedup_key:
+                await sdb.release_recent_alert(pair_name, coalesced_dedup_key)
+            else:
+                for _, _, alert_key in alerts_to_send:
+                    await sdb.release_recent_alert(pair_name, alert_key)
 
         new_alert_activations = []
         for _, _, alert_key in alerts_to_send:
             new_alert_activations.append(
                 (f"{pair_name}:{ALERT_KEYS[alert_key]}", "ACTIVE", None)
             )
-
         async def _refund_alert_budget(n: int) -> None:
             """Undo the optimistic budget reservation when a send does not go out."""
             if n > 0 and alerts_sent_ref is not None and alerts_sent_lock is not None:
@@ -5196,8 +5280,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         logger_pair.error(
                             f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
                         )
-                    for _, _, alert_key in alerts_to_send:
-                        await sdb.release_recent_alert(pair_name, alert_key)
+            await _release_dedup_claims()
                 return pair_name, {
                     "state": "LIMIT_REACHED",
                     "ts": int(time.time()),
@@ -5227,11 +5310,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
                             f"dedup key RELEASED so it can retry next run"
                         )
-                        for _, _, alert_key in alerts_to_send:
-                            await sdb.release_recent_alert(pair_name, alert_key)
+                    await _release_dedup_claims()
                         await _refund_alert_budget(len(alerts_to_send))
                         send_success = False
-                    elif reconfirmed is False:
+                    elif reconfirmed is False:           
                         logger_pair.warning(
                             f"[{pair_name}] 🔁 Confirmed repaint in send-queue window — "
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
@@ -5560,12 +5642,31 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
-    try:
         gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time)
         if gr is None:
             return None
         if isinstance(gr, tuple):
             return gr  # hard reject / wick reject / gate blocked -- already final
+
+        if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
+            score, total = compute_confluence_score(gr, is_buy=gr.buy_common)
+            required = min(cfg.CONFLUENCE_MIN_VOTES, total)
+            if score < required:
+                logger_pair.info(
+                    f"[{pair_name}] Confluence gate blocked: {score}/{total} votes "
+                    f"(need {required}) — skipping Phase-2 indicators"
+                )
+                await _blanket_reset_pair(sdb, pair_name, logger_pair)
+                return pair_name, {
+                    "state": "NO_SIGNAL",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                        "hist_rma": 0.0,
+                        "suppression": f"Confluence gate: {score}/{total} votes, need {required}"
+                    }
+                }
 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
