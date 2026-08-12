@@ -1243,7 +1243,7 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
     return piv
 
-def evaluate_oi_funding_gate(pair_name: str, is_buy: bool, ticker: Optional[Dict[str, Any]], cached_oi_usd: Optional[float], cfg: BotConfig) -> Tuple[bool, bool, bool, str]:
+def evaluate_oi_funding_gate(pair_name: str, is_buy: bool, ticker: Optional[Dict[str, Any]], cached_oi_usd: Optional[float], oi_history: List[float], cfg: BotConfig) -> Tuple[bool, bool, bool, str]:
     if not cfg.ENABLE_OI_FUNDING_GATE:
         return True, True, True, "disabled"
 
