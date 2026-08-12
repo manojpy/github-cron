@@ -220,6 +220,11 @@ class BotConfig(BaseModel):
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_VOTES: int = Field(default=3, ge=2, le=10) 
+    ENABLE_WIN_RATE_FILTER: bool = Field(default=False) 
+    OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
+    OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
+    MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
+    MIN_WIN_RATE: float = Field(default=0.45, ge=0.0, le=1.0)    
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
@@ -2986,6 +2991,8 @@ class RedisKeyPrefix:
     ALERT = "alert:"
     RECENT_ALERT = "recent_alert:"
     LOCK = "lock:"
+    OUTCOME_PENDING = "outcome_pending:"
+    ALERT_STATS = "alert_stats:"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -3289,6 +3296,88 @@ class RedisStateStore:
             await asyncio.wait_for(self._redis.delete(recent_key), timeout=1.0)
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
+
+    async def record_pending_outcome(self, pair: str, alert_key: str, direction: str,
+                                       entry_ts: int, entry_price: float) -> None:
+        """Call right after an alert is actually sent. Stashes what's needed to
+        grade it later, once OUTCOME_LOOKAHEAD_CANDLES have closed."""
+        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
+            return
+        key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
+        try:
+            payload = json_dumps({"direction": direction, "entry_ts": entry_ts, "entry_price": entry_price})
+        except Exception as e:
+            logger.warning(f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}")
+            return
+        ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
+        try:
+            await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
+        except Exception as e:
+            logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
+
+    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
+                                         logger_pair: logging.Logger) -> None:
+        """Call once per pair per run, before evaluating new signals. Grades any of
+        this pair's pending outcomes whose lookahead window has closed, using candles
+        already fetched this run for the gate/alert evaluation — no extra API calls."""
+        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
+            return
+        try:
+            pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:*"
+            keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
+        except Exception as e:
+            logger_pair.warning(f"Failed to scan pending outcomes for {pair}: {e}")
+            return
+
+        for key in keys:
+            try:
+                raw = await asyncio.wait_for(self._redis.get(key), timeout=2.0)
+                if raw is None:
+                    continue
+                data = json_loads(raw)
+                entry_ts = int(data["entry_ts"])
+                direction = data["direction"]
+                entry_price = float(data["entry_price"])
+
+                entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
+                if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
+                    continue  # entry candle has scrolled out of our current window; leave pending, retry later
+                target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
+                if target_idx > i15:
+                    continue  # not enough candles have closed yet — grade it on a later run
+
+                future_price = float(data_15m.close[target_idx])
+                pct_move = (future_price - entry_price) / entry_price * 100.0
+                win = pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT if direction == "buy" \
+                    else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
+
+                alert_key = key.split(":")[-2]
+                stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
+                async with self._redis.pipeline() as pipe:
+                    pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                    pipe.expire(stats_key, cfg.STATE_EXPIRY_DAYS * 86400)
+                    pipe.delete(key)
+                    await asyncio.wait_for(pipe.execute(), timeout=2.0)
+            except Exception as e:
+                logger_pair.warning(f"Failed to resolve pending outcome {key}: {e}")
+                continue
+
+    async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
+        """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""
+        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
+            return None, 0
+        stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
+        try:
+            data = await asyncio.wait_for(self._redis.hgetall(stats_key), timeout=2.0)
+            wins = int(data.get("wins", 0))
+            losses = int(data.get("losses", 0))
+            total = wins + losses
+            if total < cfg.MIN_WIN_RATE_SAMPLE:
+                return None, total
+            return wins / total, total
+        except Exception as e:
+            logger.warning(f"Failed to read win rate for {pair}:{alert_key}: {e}")
+            return None, 0
 
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
@@ -4100,6 +4189,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
+
+        if cfg.ENABLE_WIN_RATE_FILTER:
+            await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m.as_dict(),
@@ -5217,6 +5309,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
                 alerts_to_send = []
 
+        if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
+            surviving_alerts = []
+            for alert_title, alert_extra, alert_key in alerts_to_send:
+                win_rate, sample = await sdb.get_alert_win_rate(pair_name, alert_key)
+                if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
+                    logger_pair.info(
+                        f"[{pair_name}] Win-rate filter dropped {alert_key}: "
+                        f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
+                    )
+                    continue
+                surviving_alerts.append((alert_title, alert_extra, alert_key))
+            alerts_to_send = surviving_alerts
+
         coalesced_dedup_key: Optional[str] = None
         if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
             direction = "BUY" if (gr.is_green and gr.is_valid_for_buy) else "SELL"
@@ -5321,12 +5426,19 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         send_success = False
                     else:
                         send_success = await telegram_queue.send(msg)
+
                     if send_success:
                         all_state_changes.extend(new_alert_activations)
                         logger_pair.info(
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
+                        if cfg.ENABLE_WIN_RATE_FILTER:
+                            direction = "buy" if (gr.is_green and gr.is_valid_for_buy) else "sell"
+                            for _, _, alert_key in alerts_to_send:
+                                await sdb.record_pending_outcome(
+                                    pair_name, alert_key, direction, ts_curr, close_curr
+                                )
                     else:
                         await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
