@@ -5310,7 +5310,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"dedup key RELEASED so it can retry next run"
                         )
                     await _release_dedup_claims()
-                        await _refund_alert_budget(len(alerts_to_send))
+                    await _refund_alert_budget(len(alerts_to_send))
                         send_success = False
                     elif reconfirmed is False:           
                         logger_pair.warning(
