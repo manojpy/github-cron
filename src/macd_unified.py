@@ -2868,9 +2868,11 @@ class GateResult:
     # -- final gate decision --
     buy_common: bool
     sell_common: bool
-
-    # -- misc data passed through --
     data_15m: PriceData
+    microstructure_ok_buy: bool
+    microstructure_ok_sell: bool
+    ms_reason_buy: str
+    ms_reason_sell: str
     close_prev_invalid: bool = False
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
