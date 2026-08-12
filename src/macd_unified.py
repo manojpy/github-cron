@@ -5309,8 +5309,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"[{pair_name}] Confirmation inconclusive — alert suppressed this run, "
                             f"dedup key RELEASED so it can retry next run"
                         )
-                    await _release_dedup_claims()
-                    await _refund_alert_budget(len(alerts_to_send))
+                        await _release_dedup_claims()
+                        await _refund_alert_budget(len(alerts_to_send))
                         send_success = False
                     elif reconfirmed is False:           
                         logger_pair.warning(
@@ -5321,7 +5321,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         send_success = False
                     else:
                         send_success = await telegram_queue.send(msg)
-
                     if send_success:
                         all_state_changes.extend(new_alert_activations)
                         logger_pair.info(
