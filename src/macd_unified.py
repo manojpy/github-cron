@@ -6066,7 +6066,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         async with eval_semaphore:
             return await guarded_eval(
                 t, state_db, telegram_queue, correlation_id,
-                reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
+                reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
+                oi_gate_data=oi_gate_data
             )
 
     results = await asyncio.gather(
