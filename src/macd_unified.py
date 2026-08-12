@@ -221,14 +221,12 @@ class BotConfig(BaseModel):
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_VOTES: int = Field(default=3, ge=2, le=10) 
     ENABLE_WIN_RATE_FILTER: bool = Field(default=False) 
-    ENABLE_OI_FUNDING_GATE: bool = Field(default=False, description="Enable OI/funding external confirmation gate")
-    OI_MIN_CHANGE_PCT: float = Field(default=3.0, ge=0.0, le=50.0, description="Min OI % increase vs last snapshot to pass")
-    FUNDING_EXTREME_PCT: float = Field(default=20.0, ge=1.0, le=100.0, description="Block any direction if |funding| exceeds this %")
-    FUNDING_CROWDED_PCT: float = Field(default=5.0, ge=0.5, le=50.0, description="Block buy if funding > this %, block sell if funding < -this %")
-    OI_ADAPTIVE_ENABLED: bool = Field(default=False, description="Use percentile-based OI gate instead of flat threshold")
-    OI_PCTL_LOOKBACK: int = Field(default=30, ge=10, le=200, description="Number of OI observations to retain per pair")
-    OI_PCTL_MIN_HISTORY: int = Field(default=10, ge=5, le=100, description="Min history before adaptive gate activates")
-    OI_PCTL_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0, description="OI change must exceed this percentile of pair's own history")
+    ENABLE_OI_FUNDING_FILTER: bool = Field(default=False, description="Block BUY/SELL when OI isn't rising (vs pair's own history) AND funding is crowded (vs pair's own history) in the alert direction")
+    OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
+    MIN_OI_FUNDING_SAMPLES: int = Field(default=8, ge=3, description="Min warm-up samples before the adaptive gate activates for a pair; fail-open until then")
+    OI_RISING_PERCENTILE: float = Field(default=0.50, ge=0.0, le=1.0, description="OI delta must exceed this percentile of the pair's own recent |delta| history to count as 'rising with conviction'")
+    FUNDING_CROWDED_PERCENTILE: float = Field(default=0.80, ge=0.5, le=1.0, description="Current funding must be at/above this percentile (BUY) or at/below its complement (SELL) of the pair's own recent funding history to count as 'crowded'")
+    FUNDING_ABS_FLOOR: float = Field(default=0.0005, ge=0.0, description="Min |funding| required before percentile-crowding applies at all, so a flat near-zero history can't self-trigger 'crowded'")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
@@ -1243,76 +1241,6 @@ def calculate_pivot_levels_numpy(high: np.ndarray, low: np.ndarray, close: np.nd
 
     return piv
 
-def evaluate_oi_funding_gate(pair_name: str, is_buy: bool, ticker: Optional[Dict[str, Any]], cached_oi_usd: Optional[float], oi_history: List[float], cfg: BotConfig) -> Tuple[bool, bool, bool, str]:
-    if not cfg.ENABLE_OI_FUNDING_GATE:
-        return True, True, True, "disabled"
-
-    if ticker is None:
-        return True, True, True, "No ticker data (fail-open)"
-
-    try:
-        current_oi = float(ticker.get("oi_value_usd", 0))
-        current_funding = float(ticker.get("funding_rate", 0))
-    except (TypeError, ValueError):
-        return True, True, True, "Ticker parse error (fail-open)"
-
-    oi_ok = True
-    oi_reason = ""
-    oi_change_pct = None
-    if cached_oi_usd and cached_oi_usd > 0 and current_oi > 0:
-        oi_change_pct = (current_oi - cached_oi_usd) / cached_oi_usd * 100.0
-
-        if cfg.OI_ADAPTIVE_ENABLED:
-            if len(oi_history) < cfg.OI_PCTL_MIN_HISTORY:
-                oi_ok = True
-                oi_reason = f"OI adaptive warmup ({len(oi_history)}/{cfg.OI_PCTL_MIN_HISTORY})"
-            else:
-                # Require OI to be rising (new capital entering)
-                if oi_change_pct <= 0:
-                    oi_ok = False
-                    oi_reason = f"OI falling ({oi_change_pct:+.2f}%)"
-                else:
-                    # Percentile of |current change| vs |historical changes|
-                    abs_hist = [abs(x) for x in oi_history]
-                    current_abs = abs(oi_change_pct)
-                    n = len(abs_hist)
-                    count_lt = sum(1 for x in abs_hist if x < current_abs)
-                    count_eq = sum(1 for x in abs_hist if x == current_abs)
-                    pctl = (count_lt + 0.5 * count_eq) / n
-
-                    if pctl < cfg.OI_PCTL_THRESHOLD:
-                        oi_ok = False
-                        oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} < {cfg.OI_PCTL_THRESHOLD:.0%}"
-                    else:
-                        oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} ≥ {cfg.OI_PCTL_THRESHOLD:.0%}"
-        else:
-            # Fallback to flat threshold if adaptive disabled
-            if oi_change_pct < cfg.OI_MIN_CHANGE_PCT:
-                oi_ok = False
-                oi_reason = f"OI {oi_change_pct:+.2f}% < {cfg.OI_MIN_CHANGE_PCT}%"
-    else:
-        oi_reason = "No prior OI (fail-open)"
-
-    # ── Funding gate: avoid extreme crowding (unchanged) ──
-    funding_ok = True
-    funding_reason = ""
-    abs_fr_pct = abs(current_funding) * 100.0
-
-    if abs_fr_pct > cfg.FUNDING_EXTREME_PCT:
-        funding_ok = False
-        funding_reason = f"Funding extreme ({current_funding:+.4f})"
-    elif abs_fr_pct > cfg.FUNDING_CROWDED_PCT:
-        if is_buy and current_funding > 0:
-            funding_ok = False
-            funding_reason = f"Longs crowded ({current_funding:+.4f})"
-        elif not is_buy and current_funding < 0:
-            funding_ok = False
-            funding_reason = f"Shorts crowded ({current_funding:+.4f})"
-
-    microstructure_ok = oi_ok and funding_ok
-    reason = "; ".join(filter(None, [oi_reason, funding_reason]))
-    return oi_ok, funding_ok, microstructure_ok, reason
-
 def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Dict[str, np.ndarray], data_daily: Optional[Dict[str, np.ndarray]], reference_time: int) -> Optional[Dict[str, np.ndarray]]:
     """Cheap indicators needed ONLY for the main buy/sell gate."""
     try:
@@ -1536,6 +1464,50 @@ def calculate_alert_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: D
     except Exception as e:
         logger.error(f"calculate_alert_indicators_numpy failed: {e}", exc_info=True)
         return None
+
+def _percentile_rank(value: float, history: List[float]) -> float:
+    if not history:
+        return 0.5
+    less = sum(1 for h in history if h < value)
+    return less / len(history)
+
+
+def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[float], funding: Optional[float], funding_history: List[float], is_buy: bool) -> Optional[str]:
+    if oi_now is None or len(oi_history) < cfg.MIN_OI_FUNDING_SAMPLES:
+        return None
+
+    prev_oi = oi_history[-1]
+    oi_delta = oi_now - prev_oi
+
+    delta_history = [abs(b - a) for a, b in zip(oi_history[:-1], oi_history[1:])]
+    adaptive_min_rise = 0.0
+    if delta_history:
+        sorted_deltas = sorted(delta_history)
+        idx = min(int(cfg.OI_RISING_PERCENTILE * len(sorted_deltas)), len(sorted_deltas) - 1)
+        adaptive_min_rise = sorted_deltas[idx]
+    oi_rising = oi_delta > adaptive_min_rise
+
+    not_crowded = True
+    funding_pctile = None
+    if funding is not None and len(funding_history) >= cfg.MIN_OI_FUNDING_SAMPLES:
+        funding_pctile = _percentile_rank(funding, funding_history)
+        above_floor = abs(funding) >= cfg.FUNDING_ABS_FLOOR
+        if is_buy:
+            crowded = above_floor and funding > 0 and funding_pctile >= cfg.FUNDING_CROWDED_PERCENTILE
+        else:
+            crowded = above_floor and funding < 0 and funding_pctile <= (1.0 - cfg.FUNDING_CROWDED_PERCENTILE)
+        not_crowded = not crowded
+
+    if oi_rising or not_crowded:
+        return None
+
+    side = "BUY" if is_buy else "SELL"
+    fp_str = f"{funding_pctile:.2f}" if funding_pctile is not None else "n/a"
+    return (
+        f"OI/funding gate: {side} blocked | OI {prev_oi:.0f}→{oi_now:.0f} "
+        f"(delta {oi_delta:+.0f} vs pair's own adaptive min {adaptive_min_rise:.0f}) "
+        f"| funding {funding:.4f} self-pctile={fp_str} (crowded vs own history)"
+    )
 
 async def _blanket_reset_pair(
     sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger
@@ -2100,7 +2072,6 @@ class DataFetcher:
     def __init__(self, api_base: str, *, session: Optional[aiohttp.ClientSession] = None, max_parallel: Optional[int] = None):
         self.api_base = api_base.rstrip("/")
         self._external_session = session
-        self._tickers_map: Dict[str, Dict[str, Any]] = {}
         max_parallel = max_parallel or cfg.MAX_PARALLEL_FETCH
         self.timeout = cfg.HTTP_TIMEOUT
         self.rate_limiter = RateLimitedFetcher(
@@ -2122,26 +2093,6 @@ class DataFetcher:
             "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
         }
-    async def prefetch_tickers(self) -> Dict[str, Dict[str, Any]]:
-        url = f"{self.api_base}/v2/tickers"
-        data = await self.rate_limiter.call(
-            async_fetch_json,
-            url,
-            params={"contract_types": "perpetual_futures"},
-            retries=2,
-            backoff=1.0,
-            timeout=self.timeout,
-        )
-        if data and data.get("success"):
-            self._tickers_map = {r["symbol"]: r for r in data.get("result", [])}
-            logger.info(f"📊 Tickers prefetched: {len(self._tickers_map)} instruments")
-        else:
-            self._tickers_map = {}
-            logger.warning("Ticker prefetch returned no data")
-        return self._tickers_map
-
-    def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
-        return self._tickers_map.get(symbol)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._external_session is not None:
@@ -2225,6 +2176,56 @@ class DataFetcher:
             await self.circuit_breaker.record_failure()
 
         return None
+
+    async def fetch_tickers_batch(self) -> Dict[str, Dict[str, Optional[float]]]:
+        self.fetch_stats.setdefault("tickers", {"success": 0, "failed": 0})
+
+        can_proceed, reason = await self.circuit_breaker.can_attempt()
+        if not can_proceed:
+            logger.warning(f"Circuit breaker blocked tickers fetch: {reason}")
+            self.fetch_stats["tickers"]["failed"] += 1
+            return {}
+
+        url = f"{self.api_base}/v2/tickers"
+        data = await self.rate_limiter.call(
+            async_fetch_json,
+            url,
+            retries=cfg.CANDLE_FETCH_RETRIES,
+            backoff=cfg.CANDLE_FETCH_BACKOFF,
+            timeout=self.timeout,
+        )
+
+        out: Dict[str, Dict[str, Optional[float]]] = {}
+        if not data:
+            logger.warning("Tickers fetch failed -- OI/funding filter running fail-open this run")
+            self.fetch_stats["tickers"]["failed"] += 1
+            await self.circuit_breaker.record_failure()
+            return out
+
+        for row in data.get("result", []):
+            symbol = row.get("symbol")
+            if not symbol:
+                continue
+            oi_raw = row.get("open_interest")
+            funding_raw = row.get("funding_rate")
+            if oi_raw is None and funding_raw is None:
+                continue
+            try:
+                out[symbol] = {
+                    "oi": float(oi_raw) if oi_raw is not None else None,
+                    "funding": float(funding_raw) if funding_raw is not None else None,
+                }
+            except (TypeError, ValueError):
+                continue
+
+        if out:
+            await self.circuit_breaker.record_success()
+            self.fetch_stats["tickers"]["success"] += 1
+        else:
+            logger.warning("Tickers response parsed but no OI/funding fields found -- check Delta API field names")
+            self.fetch_stats["tickers"]["failed"] += 1
+
+        return out
 
     def get_stats(self) -> Dict[str, Any]:
         stats = {
@@ -2716,10 +2717,6 @@ class PriceData:
     low: np.ndarray
     close: np.ndarray
     volume: np.ndarray
-    microstructure_ok_buy: bool = True
-    microstructure_ok_sell: bool = True
-    ms_reason_buy: str = ""
-    ms_reason_sell: str = ""
 
     @classmethod
     def from_dict(cls, d: Dict[str, np.ndarray]) -> "PriceData":
@@ -2868,11 +2865,9 @@ class GateResult:
     # -- final gate decision --
     buy_common: bool
     sell_common: bool
+
+    # -- misc data passed through --
     data_15m: PriceData
-    microstructure_ok_buy: bool
-    microstructure_ok_sell: bool
-    ms_reason_buy: str
-    ms_reason_sell: str
     close_prev_invalid: bool = False
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
@@ -3088,6 +3083,7 @@ def build_products_map_from_cfg() -> Dict[str, dict]:
     return products_map
 
 class RedisKeyPrefix:
+    """Centralized Redis key prefixes"""
     PAIR_STATE = "pair_state:"
     METADATA = "metadata:"
     ALERT = "alert:"
@@ -3095,7 +3091,6 @@ class RedisKeyPrefix:
     LOCK = "lock:"
     OUTCOME_PENDING = "outcome_pending:"
     ALERT_STATS = "alert_stats:"
-    OI_HISTORY = "oi_history:"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -3159,33 +3154,6 @@ class RedisStateStore:
                 logger.critical(f"Redis reconnect failed after '{operation}' — staying degraded for remainder of run")
         except Exception as reconnect_exc:
             logger.critical(f"Redis reconnect attempt itself failed: {reconnect_exc} — staying degraded")
-
-    async def record_oi_change(self, pair: str, change_pct: float, cfg: BotConfig, timeout: float = 2.0) -> None:
-        if self.degraded or not self._redis:
-            return
-        key = f"{RedisKeyPrefix.OI_HISTORY}{pair}"
-        try:
-            async with self._redis.pipeline() as pipe:
-                pipe.lpush(key, str(change_pct))
-                pipe.ltrim(key, 0, cfg.OI_PCTL_LOOKBACK - 1)
-                pipe.expire(key, self.expiry_seconds if self.expiry_seconds > 0 else 7 * 86400)
-                await asyncio.wait_for(pipe.execute(), timeout=timeout)
-        except Exception as e:
-            logger.debug(f"Failed to record OI history for {pair}: {e}")
-
-    async def get_oi_history(self, pair: str, timeout: float = 2.0) -> List[float]:
-        if self.degraded or not self._redis:
-            return []
-        key = f"{RedisKeyPrefix.OI_HISTORY}{pair}"
-        try:
-            raw = await asyncio.wait_for(
-                self._redis.lrange(key, 0, -1),
-                timeout=timeout,
-            )
-            return [float(x) for x in raw if x is not None]
-        except Exception as e:
-            logger.debug(f"Failed to get OI history for {pair}: {e}")
-            return []
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
@@ -3398,36 +3366,6 @@ class RedisStateStore:
             timeout,
             f"set_metadata {key}",
         )
-    async def cache_oi_snapshot(self, pair: str, oi_usd: float, funding_rate: float, ts: int, timeout: float = 2.0) -> None:
-        if self.degraded or not self._redis:
-            return
-        key = f"{self.state_prefix}{pair}"
-        try:
-            await asyncio.wait_for(
-                self._redis.hset(key, mapping={
-                    "last_oi_usd": str(oi_usd),
-                    "last_funding_rate": str(funding_rate),
-                    "last_oi_ts": str(ts),
-                }),
-                timeout=timeout,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to cache OI for {pair}: {e}")
-
-    async def get_last_oi(self, pair: str, timeout: float = 2.0) -> Tuple[Optional[float], Optional[float], Optional[int]]:
-        if self.degraded or not self._redis:
-            return None, None, None
-        key = f"{self.state_prefix}{pair}"
-        try:
-            data = await asyncio.wait_for(
-                self._redis.hmget(key, "last_oi_usd", "last_funding_rate", "last_oi_ts"),
-                timeout=timeout,
-            )
-            if data and data[0]:
-                return float(data[0]), float(data[1]) if data[1] else None, int(data[2]) if data[2] else None
-        except Exception as e:
-            logger.debug(f"Failed to get last OI for {pair}: {e}")
-        return None, None, None
 
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
@@ -4334,7 +4272,7 @@ SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
-    reference_time: int, fetcher: Optional[DataFetcher] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
+    reference_time: int) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     if reference_time is None:
         reference_time = get_trigger_timestamp()
 
@@ -4631,6 +4569,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
 
+
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
         adx_raw_check = adx_val >= adx_adaptive_threshold
@@ -4695,31 +4634,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
         volatility_filter_ok = (not any_vol_feature_enabled) or (momentum_count >= 3)
         rvol_ok = volatility_filter_ok
-
-        ticker = fetcher.get_ticker(pair_name) if fetcher else None
-        last_oi, _, _ = await sdb.get_last_oi(pair_name) if (sdb and not sdb.degraded) else (None, None, None)
-
-        oi_history = []
-        if cfg.OI_ADAPTIVE_ENABLED and ticker and sdb and not sdb.degraded:
-            current_oi_raw = float(ticker.get("oi_value_usd", 0))
-            if last_oi and last_oi > 0 and current_oi_raw > 0:
-                current_change = (current_oi_raw - last_oi) / last_oi * 100.0
-                await sdb.record_oi_change(pair_name, current_change, cfg)
-            oi_history = await sdb.get_oi_history(pair_name)
-
-        oi_ok_buy, funding_ok_buy, ms_ok_buy, ms_reason_buy = evaluate_oi_funding_gate(
-            pair_name, True, ticker, last_oi, oi_history, cfg
-        )
-        oi_ok_sell, funding_ok_sell, ms_ok_sell, ms_reason_sell = evaluate_oi_funding_gate(
-            pair_name, False, ticker, last_oi, oi_history, cfg
-        )
-        if ticker and sdb and not sdb.degraded:
-            await sdb.cache_oi_snapshot(
-                pair_name,
-                float(ticker.get("oi_value_usd", 0)),
-                float(ticker.get("funding_rate", 0)),
-                reference_time,
-            )
 
         if not np.isnan(prev_day_close) and prev_day_close > 0:
             pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
@@ -4856,13 +4770,11 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             base_buy_trend and is_valid_for_buy
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_buy
-            and ms_ok_buy
         )
         sell_common = (
             base_sell_trend and is_valid_for_sell
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_sell
-            and ms_ok_sell
         )
         # ═══════════════════════════════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
@@ -4879,12 +4791,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                     f"market_filter=False (adx={adx_val:.1f}, "
                     f"rvol_static={rvol_bypass_ok}, rvol_adaptive={adaptive_rvol_check})"
                 )
-            if not ms_ok_buy and not ms_ok_sell:
-                reasons.append(f"Microstructure: {ms_reason_buy or ms_reason_sell}")
-            elif not ms_ok_buy:
-                reasons.append(f"Microstructure buy: {ms_reason_buy}")
-            elif not ms_ok_sell:
-                reasons.append(f"Microstructure sell: {ms_reason_sell}")
             if not effective_cpr_ok:
                 reasons.append("cpr=False")
             if not trend_gate_ok_buy and not trend_gate_ok_sell:
@@ -4949,8 +4855,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
             buy_common=buy_common, sell_common=sell_common,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
-            microstructure_ok_buy=ms_ok_buy, microstructure_ok_sell=ms_ok_sell,
-            ms_reason_buy=ms_reason_buy, ms_reason_sell=ms_reason_sell,
         )
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
@@ -5666,7 +5570,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         reasons = []
         if not alerts_to_send:
             if not buy_common and not sell_common:
-                reasons.append("Trend filter blocked")       
+                reasons.append("Trend filter blocked")
+            
             if context.get("pivot_suppressions"):
                 reasons.extend(context["pivot_suppressions"])
 
@@ -5903,10 +5808,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 reasons.append("Oscillator group buy: need 2-of-3 (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:
                 reasons.append("Oscillator group sell: need 2-of-3 (PPO/RSI/TK) — not met")
-            if not gr.microstructure_ok_buy:
-                reasons.append(gr.ms_reason_buy or "Microstructure buy gate blocked")
-            if not gr.microstructure_ok_sell:
-                reasons.append(gr.ms_reason_sell or "Microstructure sell gate blocked")
 
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
 
@@ -5945,11 +5846,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
-    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> Optional[Tuple[str, Dict[str, Any]]]:
+    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
+    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
-    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, fetcher)
+    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time)
     if gr is None:
         return None
     if isinstance(gr, tuple):
@@ -5975,6 +5877,29 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 }
             }
 
+    if cfg.ENABLE_OI_FUNDING_FILTER and (gr.buy_common or gr.sell_common):
+        pair_oi = (oi_gate_data or {}).get(pair_name)
+        if pair_oi is not None:
+            oi_reason = _oi_funding_gate_reason(
+                pair_oi.get("oi_now"),
+                pair_oi.get("oi_history", []),
+                pair_oi.get("funding"),
+                pair_oi.get("funding_history", []),
+                is_buy=gr.buy_common,
+            )
+            if oi_reason is not None:
+                logger_pair.info(f"[{pair_name}] {oi_reason}")
+                await _blanket_reset_pair(sdb, pair_name, logger_pair)
+                return pair_name, {
+                    "state": "NO_SIGNAL",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                        "hist_rma": 0.0,
+                        "suppression": oi_reason
+                    }
+                }
     try: 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
@@ -6002,7 +5927,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 pass
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
-                       alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN ):
+                       alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN,
+                       oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None):
 
     p_name, symbol, candles = task_data
 
@@ -6026,7 +5952,8 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
         result = await evaluate_pair_and_alert(
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
-            alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
+            alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
+            oi_gate_data=oi_gate_data
         )
         return result
     
@@ -6080,6 +6007,48 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     fetch_elapsed = time.time() - fetch_start
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
 
+    oi_gate_data: Dict[str, Dict[str, Any]] = {}
+    if cfg.ENABLE_OI_FUNDING_FILTER:
+        oi_funding_map = await fetcher.fetch_tickers_batch()
+        logger_main.info(
+            f"📈 OI/funding: {len(oi_funding_map)}/{len(pairs_to_process)} pairs have live data this run"
+        )
+        for pair_name in pairs_to_process:
+            product_info = products_map.get(pair_name)
+            if not product_info:
+                continue
+            symbol = product_info["symbol"]
+            current = oi_funding_map.get(symbol)
+            if not current or current.get("oi") is None:
+                continue
+
+            meta_key = f"oi_hist:{pair_name}"
+            oi_hist: List[float] = []
+            funding_hist: List[float] = []
+            prev_raw = await state_db.get_metadata(meta_key)
+            if prev_raw:
+                try:
+                    payload = json_loads(prev_raw)
+                    oi_hist = payload.get("oi_samples", []) or []
+                    funding_hist = payload.get("funding_samples", []) or []
+                except Exception:
+                    oi_hist, funding_hist = [], []
+
+            oi_gate_data[pair_name] = {
+                "oi_now": current["oi"],
+                "oi_history": oi_hist,
+                "funding": current.get("funding"),
+                "funding_history": funding_hist,
+            }
+            new_oi_hist = (oi_hist + [current["oi"]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+            new_funding_hist = funding_hist
+            if current.get("funding") is not None:
+                new_funding_hist = (funding_hist + [current["funding"]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+
+            await state_db.set_metadata(
+                meta_key,
+                json_dumps({"oi_samples": new_oi_hist, "funding_samples": new_funding_hist, "ts": int(time.time())})
+            )
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
     prepared_tasks = []
@@ -6208,12 +6177,6 @@ async def run_once() -> bool:
 
         logger_run.debug("📦 Initializing HTTP fetcher...")
         fetcher = DataFetcher(cfg.DELTA_API_BASE)
-        if cfg.ENABLE_OI_FUNDING_GATE:
-            try:
-                await fetcher.prefetch_tickers()
-            except Exception as e:
-                logger_run.warning(f"Ticker prefetch failed: {e} — proceeding without OI/funding gate")
-
         pairs_to_process = list(cfg.PAIRS)
         products_map = build_products_map_from_cfg()
 
