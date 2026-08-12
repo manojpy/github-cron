@@ -6010,8 +6010,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     oi_gate_data: Dict[str, Dict[str, Any]] = {}
     if cfg.ENABLE_OI_FUNDING_FILTER:
         oi_funding_map = await fetcher.fetch_tickers_batch()
+        matched_oi = sum(
+            1 for p in pairs_to_process
+            if p in oi_funding_map or products_map.get(p, {}).get("symbol") in oi_funding_map
+        )
         logger_main.info(
-            f"📈 OI/funding: {len(oi_funding_map)}/{len(pairs_to_process)} pairs have live data this run"
+            f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have live data this run"
         )
         for pair_name in pairs_to_process:
             product_info = products_map.get(pair_name)
