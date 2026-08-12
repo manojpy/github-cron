@@ -2788,8 +2788,6 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
             votes.append(gr.rsi_guard_ok_buy)
         if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None:
             votes.append(gr.tk_guard_ok_buy)
-        if cfg.ENABLE_ADX_FILTER:
-            votes.append(gr.adx_ok)
         if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
             votes.append(gr.rvol_ok)
         if cfg.ENABLE_CPR:
