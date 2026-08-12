@@ -5640,32 +5640,33 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
-        gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time)
-        if gr is None:
-            return None
-        if isinstance(gr, tuple):
-            return gr  # hard reject / wick reject / gate blocked -- already final
+    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time)
+    if gr is None:
+        return None
+    if isinstance(gr, tuple):
+        return gr  # hard reject / wick reject / gate blocked -- already final
 
-        if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
-            score, total = compute_confluence_score(gr, is_buy=gr.buy_common)
-            required = min(cfg.CONFLUENCE_MIN_VOTES, total)
-            if score < required:
-                logger_pair.info(
-                    f"[{pair_name}] Confluence gate blocked: {score}/{total} votes "
-                    f"(need {required}) — skipping Phase-2 indicators"
-                )
-                await _blanket_reset_pair(sdb, pair_name, logger_pair)
-                return pair_name, {
-                    "state": "NO_SIGNAL",
-                    "ts": int(time.time()),
-                    "summary": {
-                        "alerts": 0,
-                        "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
-                        "hist_rma": 0.0,
-                        "suppression": f"Confluence gate: {score}/{total} votes, need {required}"
-                    }
+    if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
+        score, total = compute_confluence_score(gr, is_buy=gr.buy_common)
+        required = min(cfg.CONFLUENCE_MIN_VOTES, total)
+        if score < required:
+            logger_pair.info(
+                f"[{pair_name}] Confluence gate blocked: {score}/{total} votes "
+                f"(need {required}) — skipping Phase-2 indicators"
+            )
+            await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            return pair_name, {
+                "state": "NO_SIGNAL",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                    "hist_rma": 0.0,
+                    "suppression": f"Confluence gate: {score}/{total} votes, need {required}"
                 }
+            }
 
+    try: 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
             return None
