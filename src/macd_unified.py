@@ -5280,18 +5280,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         logger_pair.error(
                             f"[{pair_name}] State persistence failed — alert state may be inconsistent this run"
                         )
-            await _release_dedup_claims()
+                await _release_dedup_claims()
                 return pair_name, {
                     "state": "LIMIT_REACHED",
                     "ts": int(time.time()),
                     "summary": {
                         "alerts": 0,
                         "future_cloud": "green" if cloud_up else "red" if cloud_down else "neutral",
-                        "hist_rma": round(hist_curr, 4), 
+                        "hist_rma": round(hist_curr, 4),
                         "suppression": f"Global limit {max_alerts_per_run} reached"
                     }
                 }
-
         if alerts_to_send:
             try:
                 if len(alerts_to_send) == 1:
