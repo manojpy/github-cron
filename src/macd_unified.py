@@ -1256,53 +1256,44 @@ def evaluate_oi_funding_gate(pair_name: str, is_buy: bool, ticker: Optional[Dict
     except (TypeError, ValueError):
         return True, True, True, "Ticker parse error (fail-open)"
 
-        oi_ok = True
-        oi_reason = ""
-        oi_change_pct = None
-        if cached_oi_usd and cached_oi_usd > 0 and current_oi > 0:
-            oi_change_pct = (current_oi - cached_oi_usd) / cached_oi_usd * 100.0
+    oi_ok = True
+    oi_reason = ""
+    oi_change_pct = None
+    if cached_oi_usd and cached_oi_usd > 0 and current_oi > 0:
+        oi_change_pct = (current_oi - cached_oi_usd) / cached_oi_usd * 100.0
 
-            if cfg.OI_ADAPTIVE_ENABLED:
-                # Record this observation for future runs (builds the distribution)
-                if sdb and not sdb.degraded:
-                    await sdb.record_oi_change(pair_name, oi_change_pct, cfg)
-
-                # Fetch history and evaluate
-                oi_history = []
-                if sdb and not sdb.degraded:
-                    oi_history = await sdb.get_oi_history(pair_name)
-
-                if len(oi_history) < cfg.OI_PCTL_MIN_HISTORY:
-                    oi_ok = True
-                    oi_reason = f"OI adaptive warmup ({len(oi_history)}/{cfg.OI_PCTL_MIN_HISTORY})"
-                else:
-                    # Require OI to be rising (new capital entering)
-                    if oi_change_pct <= 0:
-                        oi_ok = False
-                        oi_reason = f"OI falling ({oi_change_pct:+.2f}%)"
-                    else:
-                        # Percentile of |current change| vs |historical changes|
-                        abs_hist = [abs(x) for x in oi_history]
-                        current_abs = abs(oi_change_pct)
-                        n = len(abs_hist)
-                        count_lt = sum(1 for x in abs_hist if x < current_abs)
-                        count_eq = sum(1 for x in abs_hist if x == current_abs)
-                        pctl = (count_lt + 0.5 * count_eq) / n
-
-                        if pctl < cfg.OI_PCTL_THRESHOLD:
-                            oi_ok = False
-                            oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} < {cfg.OI_PCTL_THRESHOLD:.0%}"
-                        else:
-                            oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} ≥ {cfg.OI_PCTL_THRESHOLD:.0%}"
+        if cfg.OI_ADAPTIVE_ENABLED:
+            if len(oi_history) < cfg.OI_PCTL_MIN_HISTORY:
+                oi_ok = True
+                oi_reason = f"OI adaptive warmup ({len(oi_history)}/{cfg.OI_PCTL_MIN_HISTORY})"
             else:
-                # Fallback to flat threshold if adaptive disabled
-                if oi_change_pct < cfg.OI_MIN_CHANGE_PCT:
+                # Require OI to be rising (new capital entering)
+                if oi_change_pct <= 0:
                     oi_ok = False
-                    oi_reason = f"OI {oi_change_pct:+.2f}% < {cfg.OI_MIN_CHANGE_PCT}%"
-        else:
-            oi_reason = "No prior OI (fail-open)"
+                    oi_reason = f"OI falling ({oi_change_pct:+.2f}%)"
+                else:
+                    # Percentile of |current change| vs |historical changes|
+                    abs_hist = [abs(x) for x in oi_history]
+                    current_abs = abs(oi_change_pct)
+                    n = len(abs_hist)
+                    count_lt = sum(1 for x in abs_hist if x < current_abs)
+                    count_eq = sum(1 for x in abs_hist if x == current_abs)
+                    pctl = (count_lt + 0.5 * count_eq) / n
 
-    # ── Funding gate: avoid extreme crowding ──
+                    if pctl < cfg.OI_PCTL_THRESHOLD:
+                        oi_ok = False
+                        oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} < {cfg.OI_PCTL_THRESHOLD:.0%}"
+                    else:
+                        oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} ≥ {cfg.OI_PCTL_THRESHOLD:.0%}"
+        else:
+            # Fallback to flat threshold if adaptive disabled
+            if oi_change_pct < cfg.OI_MIN_CHANGE_PCT:
+                oi_ok = False
+                oi_reason = f"OI {oi_change_pct:+.2f}% < {cfg.OI_MIN_CHANGE_PCT}%"
+    else:
+        oi_reason = "No prior OI (fail-open)"
+
+    # ── Funding gate: avoid extreme crowding (unchanged) ──
     funding_ok = True
     funding_reason = ""
     abs_fr_pct = abs(current_funding) * 100.0
@@ -4706,11 +4697,19 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         ticker = fetcher.get_ticker(pair_name) if fetcher else None
         last_oi, _, _ = await sdb.get_last_oi(pair_name) if (sdb and not sdb.degraded) else (None, None, None)
 
+        oi_history = []
+        if cfg.OI_ADAPTIVE_ENABLED and ticker and sdb and not sdb.degraded:
+            current_oi_raw = float(ticker.get("oi_value_usd", 0))
+            if last_oi and last_oi > 0 and current_oi_raw > 0:
+                current_change = (current_oi_raw - last_oi) / last_oi * 100.0
+                await sdb.record_oi_change(pair_name, current_change, cfg)
+            oi_history = await sdb.get_oi_history(pair_name)
+
         oi_ok_buy, funding_ok_buy, ms_ok_buy, ms_reason_buy = evaluate_oi_funding_gate(
-            pair_name, True, ticker, last_oi, cfg
+            pair_name, True, ticker, last_oi, oi_history, cfg
         )
         oi_ok_sell, funding_ok_sell, ms_ok_sell, ms_reason_sell = evaluate_oi_funding_gate(
-            pair_name, False, ticker, last_oi, cfg
+            pair_name, False, ticker, last_oi, oi_history, cfg
         )
         if ticker and sdb and not sdb.degraded:
             await sdb.cache_oi_snapshot(
