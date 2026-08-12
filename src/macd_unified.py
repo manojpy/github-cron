@@ -225,6 +225,10 @@ class BotConfig(BaseModel):
     OI_MIN_CHANGE_PCT: float = Field(default=3.0, ge=0.0, le=50.0, description="Min OI % increase vs last snapshot to pass")
     FUNDING_EXTREME_PCT: float = Field(default=20.0, ge=1.0, le=100.0, description="Block any direction if |funding| exceeds this %")
     FUNDING_CROWDED_PCT: float = Field(default=5.0, ge=0.5, le=50.0, description="Block buy if funding > this %, block sell if funding < -this %")
+    OI_ADAPTIVE_ENABLED: bool = Field(default=False, description="Use percentile-based OI gate instead of flat threshold")
+    OI_PCTL_LOOKBACK: int = Field(default=30, ge=10, le=200, description="Number of OI observations to retain per pair")
+    OI_PCTL_MIN_HISTORY: int = Field(default=10, ge=5, le=100, description="Min history before adaptive gate activates")
+    OI_PCTL_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0, description="OI change must exceed this percentile of pair's own history")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
@@ -1252,16 +1256,51 @@ def evaluate_oi_funding_gate(pair_name: str, is_buy: bool, ticker: Optional[Dict
     except (TypeError, ValueError):
         return True, True, True, "Ticker parse error (fail-open)"
 
-    # ── OI gate: require OI to be rising vs last snapshot ──
-    oi_ok = True
-    oi_reason = ""
-    if cached_oi_usd and cached_oi_usd > 0 and current_oi > 0:
-        oi_change_pct = (current_oi - cached_oi_usd) / cached_oi_usd * 100.0
-        if oi_change_pct < cfg.OI_MIN_CHANGE_PCT:
-            oi_ok = False
-            oi_reason = f"OI {oi_change_pct:+.2f}% < {cfg.OI_MIN_CHANGE_PCT}%"
-    else:
-        oi_reason = "No prior OI (fail-open)"
+        oi_ok = True
+        oi_reason = ""
+        oi_change_pct = None
+        if cached_oi_usd and cached_oi_usd > 0 and current_oi > 0:
+            oi_change_pct = (current_oi - cached_oi_usd) / cached_oi_usd * 100.0
+
+            if cfg.OI_ADAPTIVE_ENABLED:
+                # Record this observation for future runs (builds the distribution)
+                if sdb and not sdb.degraded:
+                    await sdb.record_oi_change(pair_name, oi_change_pct, cfg)
+
+                # Fetch history and evaluate
+                oi_history = []
+                if sdb and not sdb.degraded:
+                    oi_history = await sdb.get_oi_history(pair_name)
+
+                if len(oi_history) < cfg.OI_PCTL_MIN_HISTORY:
+                    oi_ok = True
+                    oi_reason = f"OI adaptive warmup ({len(oi_history)}/{cfg.OI_PCTL_MIN_HISTORY})"
+                else:
+                    # Require OI to be rising (new capital entering)
+                    if oi_change_pct <= 0:
+                        oi_ok = False
+                        oi_reason = f"OI falling ({oi_change_pct:+.2f}%)"
+                    else:
+                        # Percentile of |current change| vs |historical changes|
+                        abs_hist = [abs(x) for x in oi_history]
+                        current_abs = abs(oi_change_pct)
+                        n = len(abs_hist)
+                        count_lt = sum(1 for x in abs_hist if x < current_abs)
+                        count_eq = sum(1 for x in abs_hist if x == current_abs)
+                        pctl = (count_lt + 0.5 * count_eq) / n
+
+                        if pctl < cfg.OI_PCTL_THRESHOLD:
+                            oi_ok = False
+                            oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} < {cfg.OI_PCTL_THRESHOLD:.0%}"
+                        else:
+                            oi_reason = f"OI {oi_change_pct:+.2f}% at pctl {pctl:.0%} ≥ {cfg.OI_PCTL_THRESHOLD:.0%}"
+            else:
+                # Fallback to flat threshold if adaptive disabled
+                if oi_change_pct < cfg.OI_MIN_CHANGE_PCT:
+                    oi_ok = False
+                    oi_reason = f"OI {oi_change_pct:+.2f}% < {cfg.OI_MIN_CHANGE_PCT}%"
+        else:
+            oi_reason = "No prior OI (fail-open)"
 
     # ── Funding gate: avoid extreme crowding ──
     funding_ok = True
@@ -3056,7 +3095,6 @@ def build_products_map_from_cfg() -> Dict[str, dict]:
     return products_map
 
 class RedisKeyPrefix:
-    """Centralized Redis key prefixes"""
     PAIR_STATE = "pair_state:"
     METADATA = "metadata:"
     ALERT = "alert:"
@@ -3064,6 +3102,7 @@ class RedisKeyPrefix:
     LOCK = "lock:"
     OUTCOME_PENDING = "outcome_pending:"
     ALERT_STATS = "alert_stats:"
+    OI_HISTORY = "oi_history:"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -3127,6 +3166,33 @@ class RedisStateStore:
                 logger.critical(f"Redis reconnect failed after '{operation}' — staying degraded for remainder of run")
         except Exception as reconnect_exc:
             logger.critical(f"Redis reconnect attempt itself failed: {reconnect_exc} — staying degraded")
+
+    async def record_oi_change(self, pair: str, change_pct: float, cfg: BotConfig, timeout: float = 2.0) -> None:
+        if self.degraded or not self._redis:
+            return
+        key = f"{RedisKeyPrefix.OI_HISTORY}{pair}"
+        try:
+            async with self._redis.pipeline() as pipe:
+                pipe.lpush(key, str(change_pct))
+                pipe.ltrim(key, 0, cfg.OI_PCTL_LOOKBACK - 1)
+                pipe.expire(key, self.expiry_seconds if self.expiry_seconds > 0 else 7 * 86400)
+                await asyncio.wait_for(pipe.execute(), timeout=timeout)
+        except Exception as e:
+            logger.debug(f"Failed to record OI history for {pair}: {e}")
+
+    async def get_oi_history(self, pair: str, timeout: float = 2.0) -> List[float]:
+        if self.degraded or not self._redis:
+            return []
+        key = f"{RedisKeyPrefix.OI_HISTORY}{pair}"
+        try:
+            raw = await asyncio.wait_for(
+                self._redis.lrange(key, 0, -1),
+                timeout=timeout,
+            )
+            return [float(x) for x in raw if x is not None]
+        except Exception as e:
+            logger.debug(f"Failed to get OI history for {pair}: {e}")
+            return []
 
     async def _attempt_connect(self, timeout: float = 5.0) -> bool:
         try:
