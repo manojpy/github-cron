@@ -2867,14 +2867,14 @@ class GateResult:
     buy_common: bool
     sell_common: bool
 
+    # -- misc data passed through --
+    data_15m: PriceData
+    close_prev_invalid: bool = False
+
     # -- OI / funding gate --
     oi_funding_ok_buy: Optional[bool] = None
     oi_funding_ok_sell: Optional[bool] = None
     oi_funding_reason: Optional[str] = None
-
-    # -- misc data passed through --
-    data_15m: PriceData
-    close_prev_invalid: bool = False
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
     """Count independent gate votes that agree for the given direction.
@@ -4905,8 +4905,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
             buy_common=buy_common, sell_common=sell_common,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
-            oi_funding_ok_buy=oi_funding_ok_buy, oi_funding_ok_sell=oi_funding_ok_sell, oi_funding_reason=oi_funding_reason,
-
+            oi_funding_ok_buy=oi_funding_ok_buy, 
+            oi_funding_ok_sell=oi_funding_ok_sell, 
+            oi_funding_reason=oi_funding_reason,
         )
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
