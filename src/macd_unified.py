@@ -1488,8 +1488,8 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[float], fu
         sorted_deltas = sorted(delta_history)
         idx = min(int(cfg.OI_RISING_PERCENTILE * len(sorted_deltas)), len(sorted_deltas) - 1)
         adaptive_min_rise = sorted_deltas[idx]
-    oi_rising = oi_delta > adaptive_min_rise
-
+    oi_delta_pctile = _percentile_rank(oi_delta, delta_history) if delta_history else 0.5
+    oi_rising = oi_delta > 0 and oi_delta_pctile >= cfg.OI_RISING_PERCENTILE
     not_crowded = True
     funding_pctile = None
     if funding is not None and len(funding_history) >= cfg.MIN_OI_FUNDING_SAMPLES:
@@ -6078,7 +6078,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             oi_samples = [[ts, v] for ts, v in oi_samples if now_ts - ts <= max_age_sec]
             funding_samples = [[ts, v] for ts, v in funding_samples if now_ts - ts <= max_age_sec]
 
-            # Extract clean value lists for the gate
             oi_hist = [v for ts, v in oi_samples]
             funding_hist = [v for ts, v in funding_samples if v is not None]
 
@@ -6088,11 +6087,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 "funding": current.get("funding"),
                 "funding_history": funding_hist,
             }
+            last_known_funding = funding_samples[-1][1] if funding_samples else None
+            funding_to_store = current.get("funding")
+            if funding_to_store is None:
+                funding_to_store = last_known_funding
 
             # Append current sample and cap by length
             new_oi_samples = (oi_samples + [[now_ts, current["oi"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
-            new_funding_samples = (funding_samples + [[now_ts, current.get("funding")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
-
+            new_funding_samples = (funding_samples + [[now_ts, funding_to_store]])[-cfg.OI_FUNDING_HISTORY_LEN:]
             await state_db.set_metadata(
                 meta_key,
                 json_dumps({
