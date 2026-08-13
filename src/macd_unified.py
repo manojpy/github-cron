@@ -229,6 +229,10 @@ class BotConfig(BaseModel):
     FUNDING_ABS_FLOOR: float = Field(default=0.0005, ge=0.0, description="Min |funding| required before percentile-crowding applies at all, so a flat near-zero history can't self-trigger 'crowded'")
     MIN_OI_USD: float = Field(default=0.0, ge=0.0, description="Ignore the OI/funding gate entirely for pairs whose current OI is below this floor (quote currency). 0 disables the floor")
     OI_FUNDING_MAX_SAMPLE_AGE_SEC: int = Field(default=5400, ge=300, description="Prune OI/funding samples older than this (default 90min ≈ 6 cycles @15m). Prevents comparing a stale pre-outage sample as if only one cycle passed")
+    ENABLE_OB_GATE: bool = Field(default=False, description="Add institutional order-block (supply/demand) reversal on 15m as a confluence vote. Abstains (None) unless a fresh, first-touch reversal off an unmitigated zone confirms this cycle")
+    OB_LOOKBACK_CANDLES: int = Field(default=96, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
+    OB_IMPULSE_LOOKAHEAD: int = Field(default=3, ge=1, le=10, description="Candles after a candidate base candle checked for the impulsive displacement that confirms it as an order block")
+    OB_IMPULSE_ATR_MULT: float = Field(default=1.5, ge=0.1, le=10.0, description="Min displacement away from the base candle, in ATR multiples (measured at formation), required to qualify as an institutional impulse") 
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
@@ -1492,6 +1496,89 @@ def _percentile_rank(value: float, history: List[float]) -> float:
     equal = sum(1 for h in history if h == value)
     return (less + 0.5 * equal) / len(history)
 
+@dataclass(slots=True)
+class OrderBlock:
+    """A candidate institutional order block: the base candle immediately
+    preceding an ATR-normalized impulsive displacement away from it."""
+    index: int
+    top: float
+    bottom: float
+    is_demand: bool  # True = bullish/demand zone, False = bearish/supply zone
+
+def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
+    atr_short_arr: np.ndarray, start_idx: int, end_idx: int, lookahead: int, atr_mult: float) -> List[OrderBlock]:
+    """Pure scan over closed-candle arrays [start_idx, end_idx) for base candles
+    followed by a strong-enough displacement to qualify as an order block.
+    end_idx is exclusive and must be <= the current candle index so this never
+    looks at the in-evaluation candle when forming a zone."""
+    zones: List[OrderBlock] = []
+    for j in range(start_idx, end_idx):
+        atr_j = atr_short_arr[j]
+        if np.isnan(atr_j) or atr_j <= 0:
+            continue
+        lookahead_end = min(j + lookahead, end_idx - 1)
+        if lookahead_end <= j:
+            continue
+        if c[j] < o[j]:  # red base candle -> check for bullish impulse after it
+            max_close_after = np.max(c[j + 1:lookahead_end + 1])
+            if (max_close_after - h[j]) >= atr_mult * atr_j:
+                zones.append(OrderBlock(index=j, top=h[j], bottom=l[j], is_demand=True))
+        if c[j] > o[j]:  # green base candle -> check for bearish impulse after it
+            min_close_after = np.min(c[j + 1:lookahead_end + 1])
+            if (l[j] - min_close_after) >= atr_mult * atr_j:
+                zones.append(OrderBlock(index=j, top=h[j], bottom=l[j], is_demand=False))
+    return zones
+
+def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
+    atr_short_arr: np.ndarray, i15: int, cfg_obj: "Settings") -> Tuple[Optional[bool], Optional[bool], Optional[str]]:
+    """Returns (ob_ok_buy, ob_ok_sell, reason).
+    True  = a fresh, first-touch reversal off an unmitigated zone confirms this
+            direction on the current (i15) candle.
+    None  = no qualifying zone reaction this candle (abstain — this is the
+            default outcome on most candles since order blocks are sparse).
+    A zone is treated as mitigated (and ignored) the moment it has been
+    touched or broken by any candle prior to the current one, so each zone
+    can only ever contribute a signal on its first live retest."""
+    start_idx = max(0, i15 - cfg_obj.OB_LOOKBACK_CANDLES)
+    zones = _find_order_blocks(
+        o, h, l, c, atr_short_arr, start_idx, i15,
+        cfg_obj.OB_IMPULSE_LOOKAHEAD, cfg_obj.OB_IMPULSE_ATR_MULT,
+    )
+
+    ob_ok_buy: Optional[bool] = None
+    ob_ok_sell: Optional[bool] = None
+    reason: Optional[str] = None
+
+    for z in zones:
+        confirm_end = min(z.index + cfg_obj.OB_IMPULSE_LOOKAHEAD, i15 - 1)
+        test_start = confirm_end + 1
+        if test_start >= i15:
+            continue  # zone too fresh — no prior bar to confirm it's still unmitigated
+
+        prior_low = l[test_start:i15]
+        prior_high = h[test_start:i15]
+        prior_close = c[test_start:i15]
+        touched_before = bool(np.any((prior_low <= z.top) & (prior_high >= z.bottom)))
+        if z.is_demand:
+            broken_before = bool(np.any(prior_close < z.bottom))
+        else:
+            broken_before = bool(np.any(prior_close > z.top))
+        if touched_before or broken_before:
+            continue  # already mitigated on an earlier candle — skip silently
+
+        touches_now = (l[i15] <= z.top) and (h[i15] >= z.bottom)
+        if not touches_now:
+            continue
+
+        if z.is_demand and c[i15] > z.top:
+            ob_ok_buy = True
+            reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+        elif not z.is_demand and c[i15] < z.bottom:
+            ob_ok_sell = True
+            reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+
+    return ob_ok_buy, ob_ok_sell, reason
+
 def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool) -> Optional[str]:
     if oi_now is None:
         return None
@@ -1557,7 +1644,6 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
         return 0, 0
-
     state_hash_keys: List[str] = [f"{sdb.state_prefix}{pair}" for pair in pairs]
     dedup_keys: List[str] = [
         f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
@@ -2902,6 +2988,11 @@ class GateResult:
     oi_funding_ok_sell: Optional[bool] = None
     oi_funding_reason: Optional[str] = None
 
+    # -- order block / supply-demand (optional confluence vote) --
+    ob_gate_ok_buy: Optional[bool] = None
+    ob_gate_ok_sell: Optional[bool] = None
+    ob_gate_reason: Optional[str] = None
+
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
     """Count independent gate votes that agree for the given direction.
     Read-only over already-computed GateResult fields — does not alter any
@@ -2926,6 +3017,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
             votes.append(gr.effective_cpr_ok)
         if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None:
             votes.append(gr.oi_funding_ok_buy)
+        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_buy is not None:
+            votes.append(gr.ob_gate_ok_buy)
     else:
         votes.append(gr.base_sell_trend)
         if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None:
@@ -2946,6 +3039,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
             votes.append(gr.effective_cpr_ok)
         if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None:
             votes.append(gr.oi_funding_ok_sell)
+        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_sell is not None:
+            votes.append(gr.ob_gate_ok_sell)
 
     score = sum(1 for v in votes if v)
     return score, len(votes)
@@ -4857,10 +4952,17 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
                 pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=False,
             )
-            oi_funding_ok_buy = buy_reason is None
+        oi_funding_ok_buy = buy_reason is None
             oi_funding_ok_sell = sell_reason is None
             oi_funding_reason = buy_reason or sell_reason
 
+        ob_gate_ok_buy = ob_gate_ok_sell = None
+        ob_gate_reason = None
+        if cfg.ENABLE_OB_GATE:
+            ob_gate_ok_buy, ob_gate_ok_sell, ob_gate_reason = _order_block_gate_reason(
+                data_15m.open, data_15m.high, data_15m.low, data_15m.close,
+                atr_short_arr, i15, cfg,
+            )
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
             candle_info=candle_info, o=o, h=h, l=l, c=c,
@@ -4909,6 +5011,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
             oi_funding_ok_buy=oi_funding_ok_buy, oi_funding_ok_sell=oi_funding_ok_sell,
             oi_funding_reason=oi_funding_reason,
+            ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
+            ob_gate_reason=ob_gate_reason,
         )
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
