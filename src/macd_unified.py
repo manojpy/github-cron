@@ -1530,15 +1530,7 @@ def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarra
     return zones
 
 def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-    atr_short_arr: np.ndarray, i15: int, cfg_obj: "Settings") -> Tuple[Optional[bool], Optional[bool], Optional[str]]:
-    """Returns (ob_ok_buy, ob_ok_sell, reason).
-    True  = a fresh, first-touch reversal off an unmitigated zone confirms this
-            direction on the current (i15) candle.
-    None  = no qualifying zone reaction this candle (abstain — this is the
-            default outcome on most candles since order blocks are sparse).
-    A zone is treated as mitigated (and ignored) the moment it has been
-    touched or broken by any candle prior to the current one, so each zone
-    can only ever contribute a signal on its first live retest."""
+    atr_short_arr: np.ndarray, i15: int, cfg_obj: "BotConfig") -> Tuple[Optional[bool], Optional[bool], Optional[str]]:
     start_idx = max(0, i15 - cfg_obj.OB_LOOKBACK_CANDLES)
     zones = _find_order_blocks(
         o, h, l, c, atr_short_arr, start_idx, i15,
@@ -1552,18 +1544,24 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
     for z in zones:
         confirm_end = min(z.index + cfg_obj.OB_IMPULSE_LOOKAHEAD, i15 - 1)
         test_start = confirm_end + 1
-        if test_start > i15:
-            continue 
-
-        prior_low = l[test_start:i15]
-        prior_high = h[test_start:i15]
-        prior_close = c[test_start:i15]
-        if z.is_demand:
-            broken_before = bool(np.any(prior_close < z.bottom))
+        if test_start >= i15:
+            # No candles yet between formation/confirmation and now — the
+            # zone is fresh by definition, so it can't be broken or mitigated.
+            broken_before = False
+            mitigated_before = False
         else:
-            broken_before = bool(np.any(prior_close > z.top))
-        if broken_before:
-            continue 
+            prior_low = l[test_start:i15]
+            prior_high = h[test_start:i15]
+            prior_close = c[test_start:i15]
+            touched_prior = (prior_low <= z.top) & (prior_high >= z.bottom)
+            if z.is_demand:
+                broken_before = bool(np.any(prior_close < z.bottom))
+                mitigated_before = bool(np.any(touched_prior & (prior_close > z.top)))
+            else:
+                broken_before = bool(np.any(prior_close > z.top))
+                mitigated_before = bool(np.any(touched_prior & (prior_close < z.bottom)))
+        if broken_before or mitigated_before:
+            continue  # already broken (closed through) or already reversed once — skip silently
 
         touches_now = (l[i15] <= z.top) and (h[i15] >= z.bottom)
         if not touches_now:
@@ -2997,7 +2995,6 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
     Read-only over already-computed GateResult fields — does not alter any
     existing trigger/gate logic. Returns (score, total_available_votes)."""
     votes: List[bool] = []
-
     if is_buy:
         votes.append(gr.base_buy_trend)
         if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None:
@@ -4172,10 +4169,9 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"fast_cloud_cross_down","title":"⚡☁️🔴 Fast Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("fast_future_red",False) and ctx.get("fast_tenkan_le_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloud {ctx.get('fast_cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"fast_tenkan_cross_up","title":"⚡🌐🟢 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("close_curr",float('-inf'))>ctx.get("fast_cloud_upper_curr",float('inf')) and ctx.get("fast_future_green",False) and ctx.get("fast_tenkan_ge_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastConv {ctx.get('fast_tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"fast_tenkan_cross_down","title":"⚡🌐🔴 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("close_curr",float('inf'))<ctx.get("fast_cloud_lower_curr",float('-inf')) and ctx.get("fast_future_red",False) and ctx.get("fast_tenkan_le_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastConv {ctx.get('fast_tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"ob_reversal_buy","title":"🟢🏛️ OB Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:ctx.get("ob_gate_reason") or "Demand zone reversal","requires":[]},
-    {"key":"ob_reversal_sell","title":"🔴🏛️ OB Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:ctx.get("ob_gate_reason") or "Supply zone reversal","requires":[]}
-] 
-
+    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand order block reversed'} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ob_reversal_sell","title":"🔴🏛️ Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply order block reversed'} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
+]
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots:
@@ -4295,7 +4291,6 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ── PPO Hist ──
     ph_c, ph_m1 = context["ppohist_curr"], context["ppohist_m1"]
     for k, cond in (("ppohist_buy",  np.isnan(ph_c) or ph_c <= 1e-8 or ph_c <= ph_m1),
                     ("ppohist_sell", np.isnan(ph_c) or ph_c >= -1e-8 or ph_c >= ph_m1)):
@@ -4303,13 +4298,10 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ── Order Block ──
-    ob_buy = context.get("ob_gate_ok_buy")
-    ob_sell = context.get("ob_gate_ok_sell")
-    for k, cond in (("ob_reversal_buy",  not ob_buy),
-                    ("ob_reversal_sell", not ob_sell)):
+    # ── Order Block reversal ──
+    for k, ok_key in (("ob_reversal_buy", "ob_gate_ok_buy"), ("ob_reversal_sell", "ob_gate_ok_sell")):
         rk = ALERT_KEYS.get(k)
-        if rk and conditional_states.get(rk, False) and cond:
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
     # ── Pivots ──
@@ -4401,20 +4393,17 @@ BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
     "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
     "cloud_cross_up", "tk_conversion_up", "kijun_cross_up",
-    "fast_cloud_cross_up", "fast_tenkan_cross_up",
+    "fast_cloud_cross_up", "fast_tenkan_cross_up", "ob_reversal_buy",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
-BUY_ALERT_KEYS.update({"ob_reversal_buy"})
-
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
     "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
     "cloud_cross_down", "tk_conversion_down", "kijun_cross_down",
-    "fast_cloud_cross_down", "fast_tenkan_cross_down",
+    "fast_cloud_cross_down", "fast_tenkan_cross_down", "ob_reversal_sell",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
-SELL_ALERT_KEYS.update({"ob_reversal_sell"})
 
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
@@ -4978,6 +4967,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close,
                 atr_short_arr, i15, cfg,
             )
+            if ob_gate_reason:
+                logger_pair.debug(f"[{pair_name}] OB gate: {ob_gate_reason}")
+
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
             candle_info=candle_info, o=o, h=h, l=l, c=c,
@@ -5093,6 +5085,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
     buy_common, sell_common = gr.buy_common, gr.sell_common
     close_prev_invalid = gr.close_prev_invalid
+    ob_gate_ok_buy, ob_gate_ok_sell = gr.ob_gate_ok_buy, gr.ob_gate_ok_sell
+    ob_gate_reason = gr.ob_gate_reason
 
     try:
         alert_indicators = await asyncio.to_thread(
@@ -5281,11 +5275,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "momentum_count": momentum_count,
             "move_from_prev_close_ok": move_from_prev_close_ok, 
             "cpr_adaptive_min_pct_move": cpr_adaptive_min_pct_move,
-            "ob_gate_ok_buy": gr.ob_gate_ok_buy,
-            "ob_gate_ok_sell": gr.ob_gate_ok_sell,
-            "ob_gate_reason": gr.ob_gate_reason,
+            "ob_gate_ok_buy": ob_gate_ok_buy, "ob_gate_ok_sell": ob_gate_ok_sell,
+            "ob_gate_reason": ob_gate_reason,
         }
-
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
         rsi_ctx = {"curr": rsi_curr, "prev": rsi_prev, "ema_curr": rsi_ema_curr, "ema_prev": rsi_ema_prev}
