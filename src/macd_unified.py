@@ -1651,12 +1651,19 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
         return 0, 0
+
     state_hash_keys: List[str] = [f"{sdb.state_prefix}{pair}" for pair in pairs]
+
     dedup_keys: List[str] = [
-        f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
+        f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{raw_key}"
         for pair in pairs
-        for alert_key in ALERT_KEYS.values()
+        for raw_key in ALERT_KEYS.keys() 
     ]
+
+    if cfg.ENABLE_ALERT_COALESCING:
+        for pair in pairs:
+            dedup_keys.append(f"{RedisKeyPrefix.RECENT_ALERT}{pair}:coalesced_BUY")
+            dedup_keys.append(f"{RedisKeyPrefix.RECENT_ALERT}{pair}:coalesced_SELL")
 
     deleted_states = 0
     deleted_dedups = 0
