@@ -4303,6 +4303,15 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
+    # ── Order Block ──
+    ob_buy = context.get("ob_gate_ok_buy")
+    ob_sell = context.get("ob_gate_ok_sell")
+    for k, cond in (("ob_reversal_buy",  not ob_buy),
+                    ("ob_reversal_sell", not ob_sell)):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and cond:
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+
     # ── Pivots ──
     piv = context.get("pivots", {})
     close_c, close_p = context["close_curr"], context["close_prev"]
