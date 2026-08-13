@@ -1561,18 +1561,28 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
                 broken_before = bool(np.any(prior_close > z.top))
                 mitigated_before = bool(np.any(touched_prior & (prior_close < z.bottom)))
         if broken_before or mitigated_before:
-            continue  # already broken (closed through) or already reversed once — skip silently
+            continue
 
         touches_now = (l[i15] <= z.top) and (h[i15] >= z.bottom)
         if not touches_now:
             continue
 
-        if z.is_demand and c[i15] > z.top:
-            ob_ok_buy = True
-            reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
-        elif not z.is_demand and c[i15] < z.bottom:
-            ob_ok_sell = True
-            reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+        if z.is_demand:
+            if c[i15] > z.top:
+                ob_ok_buy = True
+                reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+            elif ob_ok_buy is not True:
+                # Zone touched this cycle but close didn't confirm reversal —
+                # explicit failure (False), distinct from "no zone in play" (None).
+                ob_ok_buy = False
+                reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
+        else:
+            if c[i15] < z.bottom:
+                ob_ok_sell = True
+                reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+            elif ob_ok_sell is not True:
+                ob_ok_sell = False
+                reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
 
     return ob_ok_buy, ob_ok_sell, reason
 
@@ -5961,7 +5971,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reasons.append(f"RMA Cloud buy: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) <= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
                 if not rma_cloud_ok_sell:
                     reasons.append(f"RMA Cloud sell: RMA{cfg.RMA_CLOUD_FAST_PERIOD}({rma_cloud_fast_curr:.2f}) >= RMA{cfg.RMA_50_PERIOD}({rma50_15_val:.2f})")
-
+            if cfg.ENABLE_OB_GATE:
+                if gr.ob_gate_ok_buy is False:
+                    reasons.append(f"OB buy: {gr.ob_gate_reason or 'zone touched, no reversal confirmed'}")
+                if gr.ob_gate_ok_sell is False:
+                    reasons.append(f"OB sell: {gr.ob_gate_reason or 'zone touched, no reversal confirmed'}")
             if cfg.ICHIMOKU_CLOUD_ENABLED:
                 if not ichimoku_gate_ok_buy:
                     reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
@@ -5989,7 +6003,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 "suppression": ", ".join(failed_conditions + reasons) if (failed_conditions or reasons) else "No conditions met"
             }
         }
-
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
         raise
@@ -6069,6 +6082,22 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                         "suppression": oi_reason
                     }
                 }
+    if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
+        ob_ok = gr.ob_gate_ok_buy if gr.buy_common else gr.ob_gate_ok_sell
+        if ob_ok is False:
+            ob_reason = gr.ob_gate_reason or "OB gate: zone touched, no reversal confirmed"
+            logger_pair.info(f"[{pair_name}] {ob_reason}")
+            await _blanket_reset_pair(sdb, pair_name, logger_pair)
+            return pair_name, {
+                "state": "NO_SIGNAL",
+                "ts": int(time.time()),
+                "summary": {
+                    "alerts": 0,
+                    "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                    "hist_rma": 0.0,
+                    "suppression": ob_reason
+                }
+            }
     try: 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
