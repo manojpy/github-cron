@@ -623,7 +623,6 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
 shutdown_event = asyncio.Event()
 
 _pair_eval_counter = 0
-_oi_funding_block_counter = 0
 
 MEMORY_CHECK_INTERVAL_PAIRS = 5  # only sample RSS every N pair evaluations
 
@@ -2119,6 +2118,7 @@ class DataFetcher:
             "circuit_breaker_blocks": 0,
             "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
+            "oi_funding_blocks": 0,
         }
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -2259,9 +2259,9 @@ class DataFetcher:
             "products": self.fetch_stats["products"].copy(),
             "candles": self.fetch_stats["candles"].copy(),
             "circuit_breaker_blocks": self.fetch_stats["circuit_breaker_blocks"],
+            "oi_funding_blocks": self.fetch_stats["oi_funding_blocks"],
             "rate_limiter": self.rate_limiter.get_stats(),
-        }
-        
+        }     
         total_products = stats["products"]["success"] + stats["products"]["failed"]
         total_candles = stats["candles"]["success"] + stats["candles"]["failed"]
         
@@ -5943,8 +5943,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
             if oi_reason is not None:
                 logger_pair.info(f"[{pair_name}] {oi_reason}")
-                global _oi_funding_block_counter
-                _oi_funding_block_counter += 1
+                fetcher.fetch_stats["oi_funding_blocks"] += 1
                 await _blanket_reset_pair(sdb, pair_name, logger_pair)
                 return pair_name, {
                     "state": "NO_SIGNAL",
@@ -6448,7 +6447,7 @@ async def run_once() -> bool:
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent_ref[0]} | "
-            f"OI/Funding blocks: {_oi_funding_block_counter} | "
+            f"OI/Funding blocks: {fetcher_stats.get('oi_funding_blocks', 0)} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
