@@ -224,10 +224,11 @@ class BotConfig(BaseModel):
     ENABLE_OI_FUNDING_FILTER: bool = Field(default=False, description="Block BUY/SELL when OI isn't rising (vs pair's own history) AND funding is crowded (vs pair's own history) in the alert direction")
     OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
     MIN_OI_FUNDING_SAMPLES: int = Field(default=8, ge=3, description="Min warm-up samples before the adaptive gate activates for a pair; fail-open until then")
-    MIN_OI_USD: float = Field(default=0.0, ge=0.0, description="Minimum OI in USD for OI/funding gate to activate. 0 = disabled.")
     OI_RISING_PERCENTILE: float = Field(default=0.50, ge=0.0, le=1.0, description="OI delta must exceed this percentile of the pair's own recent |delta| history to count as 'rising with conviction'")
     FUNDING_CROWDED_PERCENTILE: float = Field(default=0.80, ge=0.5, le=1.0, description="Current funding must be at/above this percentile (BUY) or at/below its complement (SELL) of the pair's own recent funding history to count as 'crowded'")
     FUNDING_ABS_FLOOR: float = Field(default=0.0005, ge=0.0, description="Min |funding| required before percentile-crowding applies at all, so a flat near-zero history can't self-trigger 'crowded'")
+    MIN_OI_USD: float = Field(default=0.0, ge=0.0, description="Ignore the OI/funding gate entirely for pairs whose current OI is below this floor (quote currency). 0 disables the floor")
+    OI_FUNDING_MAX_SAMPLE_AGE_SEC: int = Field(default=5400, ge=300, description="Prune OI/funding samples older than this (default 90min ≈ 6 cycles @15m). Prevents comparing a stale pre-outage sample as if only one cycle passed")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
@@ -622,6 +623,8 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
 shutdown_event = asyncio.Event()
 
 _pair_eval_counter = 0
+_oi_funding_block_counter = 0
+
 MEMORY_CHECK_INTERVAL_PAIRS = 5  # only sample RSS every N pair evaluations
 
 _VALIDATION_DONE = False
@@ -1466,6 +1469,23 @@ def calculate_alert_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: D
         logger.error(f"calculate_alert_indicators_numpy failed: {e}", exc_info=True)
         return None
 
+def _normalize_samples(raw: List[Any]) -> List[List[float]]:
+    """Accepts either the new [ts, value] format or the old bare-float format
+    (pre-migration Redis payloads). Old entries get ts=0 so the staleness
+    prune below drops them on the next run instead of crashing on them."""
+    out: List[List[float]] = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append([item[0], item[1]])
+        elif isinstance(item, (int, float)):
+            out.append([0, item])
+    return out
+
+def _prune_stale_samples(samples: List[List[float]], max_age_sec: int, now_ts: int) -> List[List[float]]:
+    if max_age_sec <= 0:
+        return samples
+    return [s for s in samples if (now_ts - s[0]) <= max_age_sec]
+
 def _percentile_rank(value: float, history: List[float]) -> float:
     if not history:
         return 0.5
@@ -1473,27 +1493,31 @@ def _percentile_rank(value: float, history: List[float]) -> float:
     equal = sum(1 for h in history if h == value)
     return (less + 0.5 * equal) / len(history)
 
-def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[float], funding: Optional[float], funding_history: List[float], is_buy: bool) -> Optional[str]:
-    if oi_now is None or len(oi_history) < cfg.MIN_OI_FUNDING_SAMPLES:
+def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool) -> Optional[str]:
+    if oi_now is None:
+        return None
+    if cfg.MIN_OI_USD > 0 and oi_now < cfg.MIN_OI_USD:
+        return None  # micro-cap pair — filter doesn't apply, avoid false "rising" reads
+    if len(oi_history) < cfg.MIN_OI_FUNDING_SAMPLES:
         return None
 
-    if cfg.MIN_OI_USD > 0 and oi_now < cfg.MIN_OI_USD:
-        return None  # Abstain for micro-cap pairs
-    prev_oi = oi_history[-1]
+    oi_values = [v for _, v in oi_history]
+    prev_oi = oi_values[-1]
     oi_delta = oi_now - prev_oi
 
-    delta_history = [abs(b - a) for a, b in zip(oi_history[:-1], oi_history[1:])]
+    delta_history = [abs(b - a) for a, b in zip(oi_values[:-1], oi_values[1:])]
     adaptive_min_rise = 0.0
     if delta_history:
         sorted_deltas = sorted(delta_history)
         idx = min(int(cfg.OI_RISING_PERCENTILE * len(sorted_deltas)), len(sorted_deltas) - 1)
         adaptive_min_rise = sorted_deltas[idx]
-    oi_delta_pctile = _percentile_rank(oi_delta, delta_history) if delta_history else 0.5
-    oi_rising = oi_delta > 0 and oi_delta_pctile >= cfg.OI_RISING_PERCENTILE
+    oi_rising = oi_delta > adaptive_min_rise
+
     not_crowded = True
     funding_pctile = None
-    if funding is not None and len(funding_history) >= cfg.MIN_OI_FUNDING_SAMPLES:
-        funding_pctile = _percentile_rank(funding, funding_history)
+    funding_values = [v for _, v in funding_history]
+    if funding is not None and len(funding_values) >= cfg.MIN_OI_FUNDING_SAMPLES:
+        funding_pctile = _percentile_rank(funding, funding_values)
         above_floor = abs(funding) >= cfg.FUNDING_ABS_FLOOR
         if is_buy:
             crowded = above_floor and funding > 0 and funding_pctile >= cfg.FUNDING_CROWDED_PERCENTILE
@@ -2095,8 +2119,8 @@ class DataFetcher:
             "circuit_breaker_blocks": 0,
             "rate_limiter_waits": 0,
             "total_wait_time": 0.0,
-            "oi_funding_blocks": 0,
         }
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._external_session is not None:
             return self._external_session
@@ -2864,6 +2888,8 @@ class GateResult:
     # -- adaptive thresholds carried into Phase 2 --
     ppo_adaptive_threshold: float
     rsi_adaptive_buy: float; rsi_adaptive_sell: float
+
+    # -- final gate decision --
     buy_common: bool
     sell_common: bool
 
@@ -2871,7 +2897,7 @@ class GateResult:
     data_15m: PriceData
     close_prev_invalid: bool = False
 
-    # -- OI / funding gate --
+    # -- OI/funding (optional confluence vote) --
     oi_funding_ok_buy: Optional[bool] = None
     oi_funding_ok_sell: Optional[bool] = None
     oi_funding_reason: Optional[str] = None
@@ -2898,11 +2924,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
             votes.append(gr.rvol_ok)
         if cfg.ENABLE_CPR:
             votes.append(gr.effective_cpr_ok)
-        if cfg.ENABLE_OI_FUNDING_FILTER:
-            if is_buy and gr.oi_funding_ok_buy is not None:
-                votes.append(gr.oi_funding_ok_buy)
-            if not is_buy and gr.oi_funding_ok_sell is not None:
-                votes.append(gr.oi_funding_ok_sell)
+        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None:
+            votes.append(gr.oi_funding_ok_buy)
     else:
         votes.append(gr.base_sell_trend)
         if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None:
@@ -2921,6 +2944,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
             votes.append(gr.rvol_ok)
         if cfg.ENABLE_CPR:
             votes.append(gr.effective_cpr_ok)
+        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None:
+            votes.append(gr.oi_funding_ok_sell)
 
     score = sum(1 for v in votes if v)
     return score, len(votes)
@@ -4283,8 +4308,7 @@ SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
-    reference_time: int, oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None, fetcher: Optional[DataFetcher] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
-
+    reference_time: int, pair_oi: Optional[Dict[str, Any]] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     if reference_time is None:
         reference_time = get_trigger_timestamp()
 
@@ -4581,6 +4605,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
 
+
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
         adx_raw_check = adx_val >= adx_adaptive_threshold
@@ -4777,52 +4802,15 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
         trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
 
-        oi_funding_ok_buy = None
-        oi_funding_ok_sell = None
-        oi_funding_reason = None
-
-        if cfg.ENABLE_OI_FUNDING_FILTER and oi_gate_data:
-            pair_oi = oi_gate_data.get(pair_name)
-            if pair_oi is not None:
-                oi_now = pair_oi.get("oi_now")
-                oi_history = pair_oi.get("oi_history", [])
-                funding = pair_oi.get("funding")
-                funding_history = pair_oi.get("funding_history", [])
-
-                buy_reason = _oi_funding_gate_reason(
-                    oi_now, oi_history, funding, funding_history, is_buy=True
-                )
-                sell_reason = _oi_funding_gate_reason(
-                    oi_now, oi_history, funding, funding_history, is_buy=False
-                )
-
-                oi_funding_ok_buy = buy_reason is None
-                oi_funding_ok_sell = sell_reason is None
-                if buy_reason and sell_reason:
-                    oi_funding_reason = f"Buy: {buy_reason} | Sell: {sell_reason}"
-                elif buy_reason:
-                    oi_funding_reason = buy_reason
-                elif sell_reason:
-                    oi_funding_reason = sell_reason
-
-                if fetcher is not None and (buy_reason or sell_reason):
-                    fetcher.fetch_stats["oi_funding_blocks"] = (
-                        fetcher.fetch_stats.get("oi_funding_blocks", 0) + 1
-                    )
-        oi_funding_hard_block_buy = oi_funding_ok_buy is False
-        oi_funding_hard_block_sell = oi_funding_ok_sell is False
-
         buy_common = (
             base_buy_trend and is_valid_for_buy
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_buy
-            and not oi_funding_hard_block_buy
         )
         sell_common = (
             base_sell_trend and is_valid_for_sell
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_sell
-            and not oi_funding_hard_block_sell
         )
         # ═══════════════════════════════════════════════════════
         # EARLY EXIT — Skip expensive indicators if gate is closed
@@ -4832,8 +4820,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             reasons = []
             if not base_buy_trend and not base_sell_trend:
                 reasons.append("base_trend=False")
-            if oi_funding_reason:
-                reasons.append(f"oi_funding={oi_funding_reason}")
             if not confirmation_buy and not confirmation_sell:
                 reasons.append("cloud_align=False")
             if not volatility_filter_ok:
@@ -4859,6 +4845,22 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                     "suppression": f"Gate blocked: {', '.join(reasons)}"
                 }
             }
+
+        oi_funding_ok_buy = oi_funding_ok_sell = None
+        oi_funding_reason = None
+        if cfg.ENABLE_OI_FUNDING_FILTER and cfg.ENABLE_CONFLUENCE_GATE and pair_oi is not None:
+            buy_reason = _oi_funding_gate_reason(
+                pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
+                pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=True,
+            )
+            sell_reason = _oi_funding_gate_reason(
+                pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
+                pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=False,
+            )
+            oi_funding_ok_buy = buy_reason is None
+            oi_funding_ok_sell = sell_reason is None
+            oi_funding_reason = buy_reason or sell_reason
+
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
             candle_info=candle_info, o=o, h=h, l=l, c=c,
@@ -4905,8 +4907,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
             buy_common=buy_common, sell_common=sell_common,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
-            oi_funding_ok_buy=oi_funding_ok_buy, 
-            oi_funding_ok_sell=oi_funding_ok_sell, 
+            oi_funding_ok_buy=oi_funding_ok_buy, oi_funding_ok_sell=oi_funding_ok_sell,
             oi_funding_reason=oi_funding_reason,
         )
     except asyncio.CancelledError:
@@ -5904,7 +5905,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
-    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time)
+    pair_oi = (oi_gate_data or {}).get(pair_name)
+    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
     if gr is None:
         return None
     if isinstance(gr, tuple):
@@ -5929,11 +5931,31 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                     "suppression": f"Confluence gate: {score}/{total} votes, need {required}"
                 }
             }
-    gr = await _eval_gate(
-        pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time,
-        oi_gate_data=oi_gate_data,
-        fetcher=fetcher,
-    )
+    if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
+        if pair_oi is not None:
+            oi_reason = _oi_funding_gate_reason(
+                pair_oi.get("oi_now"),
+                pair_oi.get("oi_history", []),
+                pair_oi.get("funding"),
+                pair_oi.get("funding_history", []),
+                is_buy=gr.buy_common,
+            )
+
+            if oi_reason is not None:
+                logger_pair.info(f"[{pair_name}] {oi_reason}")
+                global _oi_funding_block_counter
+                _oi_funding_block_counter += 1
+                await _blanket_reset_pair(sdb, pair_name, logger_pair)
+                return pair_name, {
+                    "state": "NO_SIGNAL",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
+                        "hist_rma": 0.0,
+                        "suppression": oi_reason
+                    }
+                }
     try: 
         alert_result = await _eval_alerts(gr, data_5m, data_daily, reference_time, sdb, correlation_id, logger_pair)
         if alert_result is None:
@@ -6051,6 +6073,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         logger_main.info(
             f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have live data this run"
         )
+        now_ts = int(time.time())
         for pair_name in pairs_to_process:
             product_info = products_map.get(pair_name)
             if not product_info:
@@ -6061,25 +6084,21 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 continue
 
             meta_key = f"oi_hist:{pair_name}"
-            oi_samples: List[List[float]] = []      # [[ts, value], ...]
-            funding_samples: List[List[float]] = []  # [[ts, value], ...]
+            oi_hist: List[List[float]] = []
+            funding_hist: List[List[float]] = []
             prev_raw = await state_db.get_metadata(meta_key)
             if prev_raw:
                 try:
                     payload = json_loads(prev_raw)
-                    oi_samples = payload.get("oi_samples", []) or []
-                    funding_samples = payload.get("funding_samples", []) or []
+                    oi_hist = _normalize_samples(payload.get("oi_samples", []) or [])
+                    funding_hist = _normalize_samples(payload.get("funding_samples", []) or [])
                 except Exception:
-                    oi_samples, funding_samples = [], []
+                    oi_hist, funding_hist = [], []
 
-            # Prune stale samples (older than the expected lookback window)
-            max_age_sec = cfg.OI_FUNDING_HISTORY_LEN * 15 * 60
-            now_ts = int(time.time())
-            oi_samples = [[ts, v] for ts, v in oi_samples if now_ts - ts <= max_age_sec]
-            funding_samples = [[ts, v] for ts, v in funding_samples if now_ts - ts <= max_age_sec]
-
-            oi_hist = [v for ts, v in oi_samples]
-            funding_hist = [v for ts, v in funding_samples if v is not None]
+            # Drop anything older than OI_FUNDING_MAX_SAMPLE_AGE_SEC so an outage
+            # doesn't get compared as if only one normal cycle had passed.
+            oi_hist = _prune_stale_samples(oi_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
+            funding_hist = _prune_stale_samples(funding_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
 
             oi_gate_data[pair_name] = {
                 "oi_now": current["oi"],
@@ -6087,21 +6106,14 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 "funding": current.get("funding"),
                 "funding_history": funding_hist,
             }
-            last_known_funding = funding_samples[-1][1] if funding_samples else None
-            funding_to_store = current.get("funding")
-            if funding_to_store is None:
-                funding_to_store = last_known_funding
+            new_oi_hist = (oi_hist + [[now_ts, current["oi"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+            new_funding_hist = funding_hist
+            if current.get("funding") is not None:
+                new_funding_hist = (funding_hist + [[now_ts, current["funding"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
 
-            # Append current sample and cap by length
-            new_oi_samples = (oi_samples + [[now_ts, current["oi"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
-            new_funding_samples = (funding_samples + [[now_ts, funding_to_store]])[-cfg.OI_FUNDING_HISTORY_LEN:]
             await state_db.set_metadata(
                 meta_key,
-                json_dumps({
-                    "oi_samples": new_oi_samples,
-                    "funding_samples": new_funding_samples,
-                    "ts": now_ts,
-                })
+                json_dumps({"oi_samples": new_oi_hist, "funding_samples": new_funding_hist, "ts": now_ts})
             )
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
@@ -6430,13 +6442,13 @@ async def run_once() -> bool:
         memory_delta = final_memory_mb - container_memory_mb
         run_duration = time.time() - start_time
         redis_status = "OK" if (sdb and not sdb.degraded) else "DEGRADED"
-        oi_blocks = fetcher.fetch_stats.get("oi_funding_blocks", 0) if fetcher else 0
+
         summary = (
             f"🎯🌏 RUN COMPLETE | "
             f"Duration: {run_duration:.1f}s | "
             f"Pairs: {len(all_results)}/{len(pairs_to_process)} | "
             f"Alerts: {alerts_sent_ref[0]} | "
-            f"OI/Funding blocks: {oi_blocks} | "
+            f"OI/Funding blocks: {_oi_funding_block_counter} | "
             f"Memory: {int(final_memory_mb)}MB (Δ{memory_delta:+.0f}MB) | "
             f"Redis: {redis_status}"
         )
