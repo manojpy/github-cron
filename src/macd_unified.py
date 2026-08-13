@@ -4952,7 +4952,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
                 pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=False,
             )
-        oi_funding_ok_buy = buy_reason is None
+            oi_funding_ok_buy = buy_reason is None
             oi_funding_ok_sell = sell_reason is None
             oi_funding_reason = buy_reason or sell_reason
 
