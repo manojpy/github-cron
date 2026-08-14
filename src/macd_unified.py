@@ -1605,7 +1605,6 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
             if cfg_obj.OB_MIN_PENETRATION_ATR_MULT > 0 and not np.isnan(atr_i15) and atr_i15 > 0
             else 0.0
         )
-
         if z.is_demand:
             if c[i15] > z.top + min_penetration:
                 ob_ok_buy = True
