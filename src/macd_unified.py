@@ -1605,6 +1605,7 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
             if cfg_obj.OB_MIN_PENETRATION_ATR_MULT > 0 and not np.isnan(atr_i15) and atr_i15 > 0
             else 0.0
         )
+
         if z.is_demand:
             if c[i15] > z.top + min_penetration:
                 ob_ok_buy = True
@@ -1619,8 +1620,10 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
             elif ob_ok_sell is not True:
                 ob_ok_sell = False
                 reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
-    logger_pair.debug(
-        f"[{pair_name}] OB diag | zones found: {len(zones)} | "
+
+    # Diagnostic: outside the loop, using module-level logger + context var
+    logger.debug(
+        f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium else 'N/A'} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
         f"reason={reason or 'no zone touched/confirmed'}"
