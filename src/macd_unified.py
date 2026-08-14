@@ -6419,15 +6419,19 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     finally:
         pass
 
+
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
     correlation_id: str, lock: RedisLock, reference_time: int,
     alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> List[Tuple[str, Dict[str, Any]]]:
 
+    ticker_task = None
+    if cfg.ENABLE_OI_FUNDING_FILTER:
+        ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())
+
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
-
     limit_15m = 300
     limit_5m = max(
         Constants.MIN_CANDLES_FOR_INDICATORS + Constants.CANDLE_SAFETY_BUFFER,
