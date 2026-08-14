@@ -1528,24 +1528,31 @@ class OrderBlock:
 def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
     atr_short_arr: np.ndarray, start_idx: int, end_idx: int, lookahead: int, atr_mult: float) -> List[OrderBlock]:
     """Pure scan over closed-candle arrays [start_idx, end_idx) for base candles
-    followed by a strong-enough displacement to qualify as an order block.
-    end_idx is exclusive and must be <= the current candle index so this never
-    looks at the in-evaluation candle when forming a zone."""
+    followed by a strong-enough displacement to qualify as an order block."""
     zones: List[OrderBlock] = []
     for j in range(start_idx, end_idx):
         atr_j = atr_short_arr[j]
         if np.isnan(atr_j) or atr_j <= 0:
             continue
-        lookahead_end = min(j + lookahead, end_idx - 1)
-        if lookahead_end <= j:
+        la_end = min(j + lookahead + 1, end_idx)
+        if la_end <= j + 1:
             continue
+        thr = atr_mult * atr_j
+
         if c[j] < o[j]:  # red base candle -> check for bullish impulse after it
-            max_close_after = np.max(c[j + 1:lookahead_end + 1])
-            if (max_close_after - h[j]) >= atr_mult * atr_j:
+            mc = float(c[j + 1])
+            for k in range(j + 2, la_end):
+                if c[k] > mc:
+                    mc = c[k]
+            if (mc - h[j]) >= thr:
                 zones.append(OrderBlock(index=j, top=h[j], bottom=l[j], is_demand=True))
+
         if c[j] > o[j]:  # green base candle -> check for bearish impulse after it
-            min_close_after = np.min(c[j + 1:lookahead_end + 1])
-            if (l[j] - min_close_after) >= atr_mult * atr_j:
+            mc = float(c[j + 1])
+            for k in range(j + 2, la_end):
+                if c[k] < mc:
+                    mc = c[k]
+            if (l[j] - mc) >= thr:
                 zones.append(OrderBlock(index=j, top=h[j], bottom=l[j], is_demand=False))
     return zones
 
@@ -3146,66 +3153,69 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "order_block": 2.5,
 }
 
-def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float]:
-    """Sum weighted independent gate votes that agree for the given direction.
-    Read-only over already-computed GateResult fields — does not alter any
-    existing trigger/gate logic. Returns (score, total_available_weight)."""
+def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
+    exclude = exclude or set()
     votes: List[Tuple[float, bool]] = []
     if is_buy:
-        votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_buy_trend))
-        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None:
+        if "base_trend" not in exclude:
+            votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_buy_trend))
+        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None and "ichimoku_cloud" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["ichimoku_cloud"], gr.ichimoku_gate_ok_buy))
-        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_buy is not None:
+        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_buy is not None and "rma_cloud" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["rma_cloud"], gr.rma_cloud_ok_buy))
-        if cfg.ENABLE_PPO_GATE:
+        if cfg.ENABLE_PPO_GATE and "ppo_cross" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["ppo_cross"], gr.ppo_gate_ok_buy))
-        if cfg.RSI_GUARD_ENABLED:
+        if cfg.RSI_GUARD_ENABLED and "rsi_guard" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["rsi_guard"], gr.rsi_guard_ok_buy))
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None:
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None and "tk_guard" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["tk_guard"], gr.tk_guard_ok_buy))
-        if cfg.ENABLE_ADX_FILTER:
+        if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["adx"], gr.adx_ok))
-        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
+        if (cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED) and "rvol" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["rvol"], gr.rvol_ok))
-        if cfg.ENABLE_CPR:
+        if cfg.ENABLE_CPR and "cpr" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["cpr"], gr.effective_cpr_ok))
-        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None:
+        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None and "oi_funding" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["oi_funding"], gr.oi_funding_ok_buy))
-        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_buy is not None:
+        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_buy is not None and "order_block" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["order_block"], gr.ob_gate_ok_buy))
     else:
-        votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_sell_trend))
-        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None:
+        if "base_trend" not in exclude:
+            votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_sell_trend))
+        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None and "ichimoku_cloud" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["ichimoku_cloud"], gr.ichimoku_gate_ok_sell))
-        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_sell is not None:
+        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_sell is not None and "rma_cloud" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["rma_cloud"], gr.rma_cloud_ok_sell))
-        if cfg.ENABLE_PPO_GATE:
+        if cfg.ENABLE_PPO_GATE and "ppo_cross" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["ppo_cross"], gr.ppo_gate_ok_sell))
-        if cfg.RSI_GUARD_ENABLED:
+        if cfg.RSI_GUARD_ENABLED and "rsi_guard" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["rsi_guard"], gr.rsi_guard_ok_sell))
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_sell is not None:
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_sell is not None and "tk_guard" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["tk_guard"], gr.tk_guard_ok_sell))
-        if cfg.ENABLE_ADX_FILTER:
+        if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["adx"], gr.adx_ok))
-        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
+        if (cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED) and "rvol" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["rvol"], gr.rvol_ok))
-        if cfg.ENABLE_CPR:
+        if cfg.ENABLE_CPR and "cpr" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["cpr"], gr.effective_cpr_ok))
-        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None:
+        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None and "oi_funding" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["oi_funding"], gr.oi_funding_ok_sell))
-        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_sell is not None:
+        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_sell is not None and "order_block" not in exclude:
             votes.append((CONFLUENCE_WEIGHTS["order_block"], gr.ob_gate_ok_sell))
 
     score = sum(w for w, v in votes if v)
     total = sum(w for w, _ in votes)
-    ob_voted_true = bool(gr.ob_gate_ok_buy) if is_buy else bool(gr.ob_gate_ok_sell)
-    if cfg.ENABLE_OB_GATE and ob_voted_true:
-        ob_weight = CONFLUENCE_WEIGHTS["order_block"]
-        base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
-        base_trend_voted_true = bool(gr.base_buy_trend) if is_buy else bool(gr.base_sell_trend)
-        other_score = score - ob_weight - (base_trend_weight if base_trend_voted_true else 0.0)
-        if other_score < cfg.OB_MIN_OTHER_SCORE:
-            score -= ob_weight
+
+    # OB safety check only when OB is included in this score
+    if cfg.ENABLE_OB_GATE and "order_block" not in exclude:
+        ob_voted_true = bool(gr.ob_gate_ok_buy) if is_buy else bool(gr.ob_gate_ok_sell)
+        if ob_voted_true:
+            ob_weight = CONFLUENCE_WEIGHTS["order_block"]
+            base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
+            base_trend_voted_true = bool(gr.base_buy_trend) if is_buy else bool(gr.base_sell_trend)
+            other_score = score - ob_weight - (base_trend_weight if base_trend_voted_true else 0.0)
+            if other_score < cfg.OB_MIN_OTHER_SCORE:
+                score -= ob_weight
 
     return score, total
 
@@ -3662,6 +3672,34 @@ class RedisStateStore:
             f"set_metadata {key}",
         )
 
+    async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
+        """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
+        if not self._redis or self.degraded or not keys:
+            return {k: None for k in keys}
+        try:
+            async with self._redis.pipeline() as pipe:
+                for k in keys:
+                    pipe.get(f"{self.meta_prefix}{k}")
+                values = await asyncio.wait_for(pipe.execute(), timeout=timeout)
+            return {k: v for k, v in zip(keys, values)}
+        except Exception as e:
+            logger.error(f"batch_get_metadata failed for {len(keys)} keys: {e}")
+            return {k: None for k in keys}
+
+    async def batch_set_metadata(self, items: Dict[str, str], timeout: float = 5.0) -> bool:
+        """Write many metadata keys in ONE Redis round-trip (pipeline)."""
+        if not self._redis or self.degraded or not items:
+            return True
+        try:
+            async with self._redis.pipeline() as pipe:
+                for k, v in items.items():
+                    pipe.set(f"{self.meta_prefix}{k}", v, ex=self.metadata_expiry_seconds)
+                await asyncio.wait_for(pipe.execute(), timeout=timeout)
+            return True
+        except Exception as e:
+            logger.error(f"batch_set_metadata failed: {e}")
+            return False
+
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
             return True
@@ -3692,8 +3730,6 @@ class RedisStateStore:
 
     async def record_pending_outcome(self, pair: str, alert_key: str, direction: str,
                                        entry_ts: int, entry_price: float) -> None:
-        """Call right after an alert is actually sent. Stashes what's needed to
-        grade it later, once OUTCOME_LOOKAHEAD_CANDLES have closed."""
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
@@ -3715,13 +3751,20 @@ class RedisStateStore:
         already fetched this run for the gate/alert evaluation — no extra API calls."""
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
-        try:
-            pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:*"
-            keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
-        except Exception as e:
-            logger_pair.warning(f"Failed to scan pending outcomes for {pair}: {e}")
-            return
 
+        # Use the run-level pre-scan when available (falls back to per-pair scan otherwise)
+        precomputed = getattr(self, "_pending_outcome_keys_by_pair", None)
+        if precomputed is not None:
+            keys = precomputed.get(pair, [])
+            if not keys:
+                return
+        else:
+            try:
+                pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:*"
+                keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
+            except Exception as e:
+                logger_pair.warning(f"Failed to scan pending outcomes for {pair}: {e}")
+                return
         for key in keys:
             try:
                 raw = await asyncio.wait_for(self._redis.get(key), timeout=2.0)
@@ -5147,8 +5190,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         ob_gate_ok_buy = ob_gate_ok_sell = None
         ob_gate_reason = None
-        if cfg.ENABLE_OB_GATE:
-            ob_gate_ok_buy, ob_gate_ok_sell, ob_gate_reason = _order_block_gate_reason(
+        if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE:
+            ob_gate_ok_buy, ob_gate_ok_sell, ob_gate_reason = await asyncio.to_thread(
+                _order_block_gate_reason,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close,
                 atr_short_arr, i15, cfg,
             )
@@ -6217,8 +6261,37 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     confluence_total: Optional[float] = None
 
     if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
-        score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
-        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+        if cfg.ENABLE_OB_GATE:
+            score_no_ob, total_no_ob = compute_confluence_score(gr, is_buy=gr.direction_is_buy, exclude={"order_block"})
+            max_possible = total_no_ob + CONFLUENCE_WEIGHTS["order_block"]
+            required = min(cfg.CONFLUENCE_MIN_SCORE, max_possible)
+
+            if score_no_ob >= cfg.CONFLUENCE_MIN_SCORE:
+                # Already passes; OB cannot change anything
+                gr.ob_gate_ok_buy = None
+                gr.ob_gate_ok_sell = None
+                score, total = score_no_ob, total_no_ob
+            elif score_no_ob + CONFLUENCE_WEIGHTS["order_block"] < cfg.CONFLUENCE_MIN_SCORE:
+                # Even with OB true, we cannot reach the threshold
+                gr.ob_gate_ok_buy = None
+                gr.ob_gate_ok_sell = None
+                score, total = score_no_ob, total_no_ob
+            else:
+                # OB might tip the scale — pay the cost and compute it once
+                ob_ok_buy, ob_ok_sell, ob_reason = await asyncio.to_thread(
+                    _order_block_gate_reason,
+                    gr.data_15m.open, gr.data_15m.high, gr.data_15m.low, gr.data_15m.close,
+                    gr.gate_indicators["atr_short"], gr.i15, cfg,
+                )
+                gr.ob_gate_ok_buy = ob_ok_buy
+                gr.ob_gate_ok_sell = ob_ok_sell
+                gr.ob_gate_reason = ob_reason
+                score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
+                required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+        else:
+            score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
+            required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+
         if score < required:
             logger_pair.info(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
@@ -6387,7 +6460,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     oi_gate_data: Dict[str, Dict[str, Any]] = {}
 
     if cfg.ENABLE_OI_FUNDING_FILTER:
-        oi_funding_map = await fetcher.fetch_tickers_batch()
+        oi_funding_map = await ticker_task if ticker_task else {}
         matched_oi = sum(
             1 for p in pairs_to_process
             if (oi_funding_map.get(products_map.get(p, {}).get("symbol", p)) or {}).get("oi") is not None
@@ -6395,8 +6468,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         logger_main.info(
             f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have OI data this run"
         )
+
         now_ts = int(time.time())
-        metadata_tasks: List[asyncio.Coroutine] = []
+
+        # Pass 1 — which pairs actually have OI data?
+        oi_entries = []                 # (pair_name, current, meta_key)
+        meta_keys_to_read = []
         for pair_name in pairs_to_process:
             product_info = products_map.get(pair_name)
             if not product_info:
@@ -6405,24 +6482,29 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             current = oi_funding_map.get(symbol)
             if not current or current.get("oi") is None:
                 continue
-
             meta_key = f"oi_hist:{pair_name}"
-            oi_hist: List[List[float]] = []
-            funding_hist: List[List[float]] = []
-            price_hist: List[List[float]] = []
-            prev_raw = await state_db.get_metadata(meta_key)
+            oi_entries.append((pair_name, current, meta_key))
+            meta_keys_to_read.append(meta_key)
+
+        # Pass 2 — ONE round-trip for ALL history reads
+        prev_raw_map = await state_db.batch_get_metadata(meta_keys_to_read)
+
+        new_histories: Dict[str, str] = {}
+        for (pair_name, current, meta_key) in oi_entries:
+            oi_hist = funding_hist = price_hist = []
+            prev_raw = prev_raw_map.get(meta_key)
             if prev_raw:
                 try:
                     payload = json_loads(prev_raw)
-                    oi_hist = _normalize_samples(payload.get("oi_samples", []) or [])
+                    oi_hist      = _normalize_samples(payload.get("oi_samples", []) or [])
                     funding_hist = _normalize_samples(payload.get("funding_samples", []) or [])
-                    price_hist = _normalize_samples(payload.get("price_samples", []) or [])
+                    price_hist   = _normalize_samples(payload.get("price_samples", []) or [])
                 except Exception:
-                    oi_hist, funding_hist, price_hist = [], [], []
+                    oi_hist = funding_hist = price_hist = []
 
-            oi_hist = _prune_stale_samples(oi_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
+            oi_hist      = _prune_stale_samples(oi_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
             funding_hist = _prune_stale_samples(funding_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
-            price_hist = _prune_stale_samples(price_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
+            price_hist   = _prune_stale_samples(price_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
 
             oi_gate_data[pair_name] = {
                 "oi_now": current["oi"],
@@ -6433,6 +6515,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 "price_now": current.get("price"),
                 "price_history": price_hist,
             }
+
             new_oi_hist = (oi_hist + [[now_ts, current["oi"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
             new_funding_hist = funding_hist
             if current.get("funding") is not None:
@@ -6441,18 +6524,34 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             if current.get("price") is not None:
                 new_price_hist = (price_hist + [[now_ts, current["price"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
 
-            metadata_tasks.append(
-                state_db.set_metadata(
-                    meta_key,
-                    json_dumps({
-                        "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
-                        "price_samples": new_price_hist, "ts": now_ts,
-                    })
-                )
-            )
+            new_histories[meta_key] = json_dumps({
+                "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
+                "price_samples": new_price_hist, "ts": now_ts,
+            })
 
-        if metadata_tasks:
-            await asyncio.gather(*metadata_tasks, return_exceptions=True)
+        # ONE round-trip for ALL writes
+        if new_histories:
+            await state_db.batch_set_metadata(new_histories)
+
+    if cfg.ENABLE_WIN_RATE_FILTER and not state_db.degraded and state_db._redis:
+        try:
+            pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}*"
+            keys = [k async for k in state_db._redis.scan_iter(match=pattern, count=500)]
+            prefix_len = len(RedisKeyPrefix.OUTCOME_PENDING)
+            pending_by_pair: Dict[str, List[str]] = {}
+            for k in keys:
+                pair = k[prefix_len:].split(":", 1)[0]
+                pending_by_pair.setdefault(pair, []).append(k)
+            state_db._pending_outcome_keys_by_pair = pending_by_pair
+            total = sum(len(v) for v in pending_by_pair.values())
+            if total:
+                logger_main.info(f"⏳ Pre-scanned {total} pending outcome(s) across {len(pending_by_pair)} pair(s)")
+        except Exception as e:
+            logger_main.warning(f"Pending outcome pre-scan failed: {e}")
+            state_db._pending_outcome_keys_by_pair = None
+    else:
+        state_db._pending_outcome_keys_by_pair = None
+
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
     prepared_tasks = []
