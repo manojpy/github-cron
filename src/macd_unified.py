@@ -1525,10 +1525,9 @@ class OrderBlock:
     bottom: float
     is_demand: bool  # True = bullish/demand zone, False = bearish/supply zone
 
+
 def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
     atr_short_arr: np.ndarray, start_idx: int, end_idx: int, lookahead: int, atr_mult: float) -> List[OrderBlock]:
-    """Pure scan over closed-candle arrays [start_idx, end_idx) for base candles
-    followed by a strong-enough displacement to qualify as an order block."""
     zones: List[OrderBlock] = []
     for j in range(start_idx, end_idx):
         atr_j = atr_short_arr[j]
@@ -1540,6 +1539,7 @@ def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarra
         thr = atr_mult * atr_j
 
         if c[j] < o[j]:  # red base candle -> check for bullish impulse after it
+            # Fast manual max: avoids numpy slice allocation for small lookahead
             mc = float(c[j + 1])
             for k in range(j + 2, la_end):
                 if c[k] > mc:
@@ -1556,23 +1556,27 @@ def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarra
                 zones.append(OrderBlock(index=j, top=h[j], bottom=l[j], is_demand=False))
     return zones
 
-def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-    atr_short_arr: np.ndarray, i15: int, cfg_obj: "BotConfig") -> Tuple[Optional[bool], Optional[bool], Optional[str]]:
+def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     start_idx = max(0, i15 - cfg_obj.OB_LOOKBACK_CANDLES)
     zones = _find_order_blocks(
         o, h, l, c, atr_short_arr, start_idx, i15,
         cfg_obj.OB_IMPULSE_LOOKAHEAD, cfg_obj.OB_IMPULSE_ATR_MULT,
     )
 
-    equilibrium: Optional[float] = None
+    equilibrium = None
     if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > start_idx:
-        range_high = float(np.max(h[start_idx:i15]))
-        range_low = float(np.min(l[start_idx:i15]))
+        # Scalar min/max — no slice allocations
+        range_high = h[start_idx]
+        range_low  = l[start_idx]
+        for idx in range(start_idx + 1, i15):
+            if h[idx] > range_high:
+                range_high = h[idx]
+            if l[idx] < range_low:
+                range_low = l[idx]
         equilibrium = (range_high + range_low) / 2.0
 
-    ob_ok_buy: Optional[bool] = None
-    ob_ok_sell: Optional[bool] = None
-    reason: Optional[str] = None
+    ob_ok_buy = ob_ok_sell = None
+    reason = None
 
     for z in zones:
         if equilibrium is not None:
@@ -1580,23 +1584,40 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
                 continue
             if not z.is_demand and z.bottom <= equilibrium:
                 continue
+
         confirm_end = min(z.index + cfg_obj.OB_IMPULSE_LOOKAHEAD, i15 - 1)
         test_start = confirm_end + 1
+
         if test_start >= i15:
             broken_before = False
             mitigated_before = False
         else:
-            prior_low = l[test_start:i15]
-            prior_high = h[test_start:i15]
-            prior_close = c[test_start:i15]
-            touched_prior = (prior_low <= z.top) & (prior_high >= z.bottom)
-            inside_prior = (prior_close >= z.bottom) & (prior_close <= z.top)
+            # Scalar scan — no numpy slices, no boolean temp arrays
+            broken_before = False
+            mitigated_before = False
+
             if z.is_demand:
-                broken_before = bool(np.any(prior_close < z.bottom))
-                mitigated_before = bool(np.any(touched_prior & inside_prior))
+                # Demand: broken = any close below zone bottom
+                #         mitigated = any candle that touches AND closes inside zone
+                for idx in range(test_start, i15):
+                    if c[idx] < z.bottom:
+                        broken_before = True
+                        break
+                    if l[idx] <= z.top and h[idx] >= z.bottom:
+                        if z.bottom <= c[idx] <= z.top:
+                            mitigated_before = True
+                            break
             else:
-                broken_before = bool(np.any(prior_close > z.top))
-                mitigated_before = bool(np.any(touched_prior & inside_prior))
+                # Supply: broken = any close above zone top
+                #         mitigated = any candle that touches AND closes inside zone
+                for idx in range(test_start, i15):
+                    if c[idx] > z.top:
+                        broken_before = True
+                        break
+                    if l[idx] <= z.top and h[idx] >= z.bottom:
+                        if z.bottom <= c[idx] <= z.top:
+                            mitigated_before = True
+                            break
 
         if broken_before or mitigated_before:
             continue
@@ -1627,7 +1648,6 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
                 ob_ok_sell = False
                 reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
 
-    # Diagnostic: outside the loop, using module-level logger + context var
     logger.debug(
         f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium else 'N/A'} | "
