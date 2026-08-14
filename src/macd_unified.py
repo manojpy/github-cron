@@ -5646,9 +5646,10 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
-    alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int
+    alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
+    confluence_score: Optional[float] = None,
+    confluence_total: Optional[float] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-   
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     data_15m = gr.data_15m
@@ -5686,7 +5687,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     rsi_ema_curr, rsi_ema_prev = context["rsi_ema_curr"], context["rsi_ema_prev"]
 
     all_state_changes = []
-
     try:
         resets_to_apply = _build_resets(pair_name, context, conditional_states)
 
@@ -5726,15 +5726,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
                 alerts_to_send = []
 
-        if alerts_to_send:
-            dispatch_score, dispatch_total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
-            if cfg.ENABLE_CONFLUENCE_GATE:
-                required = min(cfg.CONFLUENCE_MIN_SCORE, dispatch_total)
-                if dispatch_score < required:
-                    logger_pair.info(
-                        f"[{pair_name}] Confluence gate blocked dispatch: {dispatch_score:.1f}/{dispatch_total:.1f} weighted score (need {required:.1f})"
-                    )
-                    alerts_to_send = []
+        if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
+            required = min(cfg.CONFLUENCE_MIN_SCORE, confluence_total)
+            if confluence_score < required:
+                logger_pair.info(
+                    f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"
+                )
+                alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             surviving_alerts = []
@@ -5827,10 +5825,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
-                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=dispatch_score)
+                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score)
                 else:
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=dispatch_score)
+                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score)
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
@@ -6190,6 +6188,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     if isinstance(gr, tuple):
         return gr  # hard reject / wick reject / gate blocked -- already final
 
+    confluence_score: Optional[float] = None
+    confluence_total: Optional[float] = None
+
     if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
         score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
         required = min(cfg.CONFLUENCE_MIN_SCORE, total)
@@ -6209,6 +6210,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                     "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
                 }
             }
+        confluence_score = score
+        confluence_total = total
+
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
         if pair_oi is not None:
             oi_reason = _oi_funding_gate_reason(
@@ -6260,7 +6264,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
         return await _apply_and_dispatch_alerts(
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
-            correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run
+            correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
+            confluence_score=confluence_score,
+            confluence_total=confluence_total,
         )
     finally:
         PAIR_ID.set("")
@@ -6335,7 +6341,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
 
     pair_requests = []
-    valid_tasks = []
+    valid_tasks = []     
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
         if not product_info:
@@ -6368,6 +6374,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have live data this run"
         )
         now_ts = int(time.time())
+        metadata_tasks: List[asyncio.Coroutine] = []
         for pair_name in pairs_to_process:
             product_info = products_map.get(pair_name)
             if not product_info:
@@ -6411,13 +6418,19 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             if current.get("price") is not None:
                 new_price_hist = (price_hist + [[now_ts, current["price"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
 
-            await state_db.set_metadata(
-                meta_key,
-                json_dumps({
-                    "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
-                    "price_samples": new_price_hist, "ts": now_ts,
-                })
+            metadata_tasks.append(
+                state_db.set_metadata(
+                    meta_key,
+                    json_dumps({
+                        "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
+                        "price_samples": new_price_hist, "ts": now_ts,
+                    })
+                )
             )
+
+        if metadata_tasks:
+            await asyncio.gather(*metadata_tasks, return_exceptions=True)
+
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
     prepared_tasks = []
