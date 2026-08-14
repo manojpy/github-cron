@@ -1622,7 +1622,7 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
                 reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
 
     # Diagnostic: outside the loop, using module-level logger + context var
-    logger.debug(
+    logger.info(
         f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium else 'N/A'} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
