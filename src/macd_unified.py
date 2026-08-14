@@ -5118,11 +5118,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                     "suppression": f"Gate blocked: {', '.join(reasons)}"
                 }
             }
-        logger_pair.debug(
-            f"[{pair_name}] OI diag | pair_oi is {'NOT None' if pair_oi is not None else 'NONE'} | "
-            f"ENABLE_OI_FUNDING_FILTER={cfg.ENABLE_OI_FUNDING_FILTER} | "
-            f"ENABLE_CONFLUENCE_GATE={cfg.ENABLE_CONFLUENCE_GATE}"
-        )
         oi_funding_ok_buy = oi_funding_ok_sell = None
         oi_funding_reason = None
         if cfg.ENABLE_OI_FUNDING_FILTER and cfg.ENABLE_CONFLUENCE_GATE and pair_oi is not None:
@@ -6384,6 +6379,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
 
     oi_gate_data: Dict[str, Dict[str, Any]] = {}
+
     if cfg.ENABLE_OI_FUNDING_FILTER:
         oi_funding_map = await fetcher.fetch_tickers_batch()
         matched_oi = sum(
@@ -6391,7 +6387,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             if (oi_funding_map.get(products_map.get(p, {}).get("symbol", p)) or {}).get("oi") is not None
         )
         logger_main.info(
-            f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have live data this run"
+            f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have OI data this run"
         )
         now_ts = int(time.time())
         metadata_tasks: List[asyncio.Coroutine] = []
@@ -6450,12 +6446,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         if metadata_tasks:
             await asyncio.gather(*metadata_tasks, return_exceptions=True)
-        logger_main.info(
-            f"🔍 OI diag | oi_gate_data keys: {list(oi_gate_data.keys())[:5]} "
-            f"(count={len(oi_gate_data)}) | "
-            f"fetch_tickers symbols sample: {list(oi_funding_map.keys())[:5]}"
-        )
-
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
     prepared_tasks = []
