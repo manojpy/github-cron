@@ -2430,33 +2430,26 @@ class DataFetcher:
             if not symbol:
                 continue
 
-            # TEMPORARY DIAGNOSTIC — remove after fixing
-            if symbol in ("ETHUSD", "BTCUSD", "ZECUSD"):
-                logger_main.info(
-                    f"Ticker raw row [{symbol}]: keys={list(row.keys())} | "
-                    f"open_interest={row.get('open_interest')} | "
-                    f"oi={row.get('oi')} | "
-                    f"open_interest_usd={row.get('open_interest_usd')} | "
-                    f"funding_rate={row.get('funding_rate')} | "
-                    f"mark_price={row.get('mark_price')}"
-                )
+            oi_raw = row.get("open_interest")
+            if oi_raw is None:
+                oi_raw = row.get("oi")
+            if oi_raw is None:
+                oi_raw = row.get("open_interest_usd")
+            if oi_raw is None:
+                oi_raw = row.get("openInterest")
 
-            oi_raw = (
-                row.get("open_interest")
-                or row.get("oi")
-                or row.get("open_interest_usd")
-                or row.get("openInterest")
-            )
-            funding_raw = (
-                row.get("funding_rate")
-                or row.get("fundingRate")
-                or row.get("funding")
-            )
-            price_raw = (
-                row.get("mark_price")
-                or row.get("markPrice")
-                or row.get("close")
-            )
+            funding_raw = row.get("funding_rate")
+            if funding_raw is None:
+                funding_raw = row.get("fundingRate")
+            if funding_raw is None:
+                funding_raw = row.get("funding")
+
+            price_raw = row.get("mark_price")
+            if price_raw is None:
+                price_raw = row.get("markPrice")
+            if price_raw is None:
+                price_raw = row.get("close")
+
             if oi_raw is None and funding_raw is None:
                 continue
             try:
@@ -6387,7 +6380,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
-
     fetch_elapsed = time.time() - fetch_start
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
 
@@ -6396,7 +6388,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         oi_funding_map = await fetcher.fetch_tickers_batch()
         matched_oi = sum(
             1 for p in pairs_to_process
-            if p in oi_funding_map or products_map.get(p, {}).get("symbol") in oi_funding_map
+            if (oi_funding_map.get(products_map.get(p, {}).get("symbol", p)) or {}).get("oi") is not None
         )
         logger_main.info(
             f"📈 OI/funding: {matched_oi}/{len(pairs_to_process)} pairs have live data this run"
@@ -6463,8 +6455,6 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             f"(count={len(oi_gate_data)}) | "
             f"fetch_tickers symbols sample: {list(oi_funding_map.keys())[:5]}"
         )
-
-
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
