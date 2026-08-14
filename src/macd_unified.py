@@ -1620,7 +1620,12 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
             elif ob_ok_sell is not True:
                 ob_ok_sell = False
                 reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
-
+    logger_pair.debug(
+        f"[{pair_name}] OB diag | zones found: {len(zones)} | "
+        f"equilibrium={'%.4f' % equilibrium if equilibrium else 'N/A'} | "
+        f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
+        f"reason={reason or 'no zone touched/confirmed'}"
+    )
     return ob_ok_buy, ob_ok_sell, reason
 
 def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], price_now: Optional[float], price_history: List[List[float]], is_buy: bool) -> Optional[str]:
