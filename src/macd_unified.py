@@ -220,6 +220,8 @@ class BotConfig(BaseModel):
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_SCORE: float = Field(default=6.0, ge=0.5, le=50.0, description="Min weighted confluence score required to pass (see compute_confluence_score for per-vote weights: HTF trend/OB=3, OI/funding=2, ADX/RVOL/CPR=1, PPO/RSI/TK cross=0.5)")
+    OB_MIN_OTHER_SCORE: float = Field(default=3.0, ge=0.0, le=50.0, description="Min weighted score from votes OTHER than base_trend and order_block required before the OB vote is allowed to count toward the confluence total. base_trend is excluded because it's a precondition for evaluation, not independent confluence. Default 3.0 is set above oi_funding's 2.0 weight so oi_funding alone can't pair with OB to clear the gate")
+    OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
     ENABLE_WIN_RATE_FILTER: bool = Field(default=False) 
     ENABLE_OI_FUNDING_FILTER: bool = Field(default=False, description="Block BUY/SELL when OI isn't rising (vs pair's own history) AND funding is crowded (vs pair's own history) in the alert direction")
     OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
@@ -227,8 +229,8 @@ class BotConfig(BaseModel):
     OI_RISING_PERCENTILE: float = Field(default=0.50, ge=0.0, le=1.0, description="OI delta must exceed this percentile of the pair's own recent |delta| history to count as 'rising with conviction'")
     FUNDING_CROWDED_PERCENTILE: float = Field(default=0.80, ge=0.5, le=1.0, description="Current funding must be at/above this percentile (BUY) or at/below its complement (SELL) of the pair's own recent funding history to count as 'crowded'")
     FUNDING_ABS_FLOOR: float = Field(default=0.0005, ge=0.0, description="Min |funding| required before percentile-crowding applies at all, so a flat near-zero history can't self-trigger 'crowded'")
-    MIN_OI_USD: float = Field(default=0.0, ge=0.0, description="Ignore the OI/funding gate entirely for pairs whose current OI is below this floor (quote currency). 0 disables the floor")
-    OI_FUNDING_MAX_SAMPLE_AGE_SEC: int = Field(default=5400, ge=300, description="Prune OI/funding samples older than this (default 90min ≈ 6 cycles @15m). Prevents comparing a stale pre-outage sample as if only one cycle passed")
+    MIN_OI_USD: float = Field(default=75000, ge=0.0, description="Ignore the OI/funding gate entirely for pairs whose current OI is below this floor (quote currency). 0 disables the floor")
+    OI_FUNDING_MAX_SAMPLE_AGE_SEC: int = Field(default=10800, ge=300, description="Prune OI/funding samples older than this (default 180min ≈ 12 cycles @15m, matching OI_DIVERGENCE_LOOKBACK_SAMPLES). Prevents comparing a stale pre-outage sample as if only one cycle passed")
     ENABLE_OI_PRICE_DIVERGENCE: bool = Field(default=False, description="Block BUY when price is rising but OI is falling (short-covering, not new demand); block SELL when price is falling but OI is falling (long liquidation, not new supply). Requires ticker mark price to be available.")
     OI_DIVERGENCE_LOOKBACK_SAMPLES: int = Field(default=12, ge=2, le=200, description="How many OI/price history samples back to compare against for divergence (default 12 runs @15m ≈ 3h)")
     OI_DIVERGENCE_MIN_PRICE_ROC_PCT: float = Field(default=0.3, ge=0.0, le=50.0, description="Min absolute price move (%) over the lookback window before divergence logic applies at all")
@@ -383,6 +385,19 @@ class BotConfig(BaseModel):
                         f'band/2 ({self.ADX_ADAPTIVE_BAND_WIDTH / 2.0}) produces range '
                         f'[{lo:.1f}, {hi:.1f}] which exceeds [1, 99]'
                     )
+        return self
+
+    @model_validator(mode='after')
+    def validate_oi_divergence_window(self) -> 'BotConfig':
+        if self.ENABLE_OI_PRICE_DIVERGENCE:
+            required_age_sec = self.OI_DIVERGENCE_LOOKBACK_SAMPLES * 900  # 900s = 1 cycle @15m
+            if self.OI_FUNDING_MAX_SAMPLE_AGE_SEC < required_age_sec:
+                raise ValueError(
+                    f'OI_FUNDING_MAX_SAMPLE_AGE_SEC ({self.OI_FUNDING_MAX_SAMPLE_AGE_SEC}s) is less than '
+                    f'OI_DIVERGENCE_LOOKBACK_SAMPLES * 900 ({required_age_sec}s) — history will be pruned '
+                    f'before the divergence lookback can be satisfied, so ENABLE_OI_PRICE_DIVERGENCE will '
+                    f'silently never fire. Raise OI_FUNDING_MAX_SAMPLE_AGE_SEC or lower OI_DIVERGENCE_LOOKBACK_SAMPLES.'
+                )
         return self
 
     @model_validator(mode='after')
@@ -1564,16 +1579,19 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
             broken_before = False
             mitigated_before = False
         else:
+
             prior_low = l[test_start:i15]
             prior_high = h[test_start:i15]
             prior_close = c[test_start:i15]
             touched_prior = (prior_low <= z.top) & (prior_high >= z.bottom)
+            inside_prior = (prior_close >= z.bottom) & (prior_close <= z.top)
             if z.is_demand:
                 broken_before = bool(np.any(prior_close < z.bottom))
-                mitigated_before = bool(np.any(touched_prior & (prior_close > z.top)))
+                mitigated_before = bool(np.any(touched_prior & inside_prior))
             else:
                 broken_before = bool(np.any(prior_close > z.top))
-                mitigated_before = bool(np.any(touched_prior & (prior_close < z.bottom)))
+                mitigated_before = bool(np.any(touched_prior & inside_prior))
+
         if broken_before or mitigated_before:
             continue
 
@@ -1581,15 +1599,22 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
         if not touches_now:
             continue
 
+        atr_i15 = atr_short_arr[i15]
+        min_penetration = (
+            cfg_obj.OB_MIN_PENETRATION_ATR_MULT * atr_i15
+            if cfg_obj.OB_MIN_PENETRATION_ATR_MULT > 0 and not np.isnan(atr_i15) and atr_i15 > 0
+            else 0.0
+        )
+
         if z.is_demand:
-            if c[i15] > z.top:
+            if c[i15] > z.top + min_penetration:
                 ob_ok_buy = True
                 reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
             elif ob_ok_buy is not True:
                 ob_ok_buy = False
                 reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
         else:
-            if c[i15] < z.bottom:
+            if c[i15] < z.bottom - min_penetration:
                 ob_ok_sell = True
                 reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
             elif ob_ok_sell is not True:
@@ -3145,6 +3170,15 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
 
     score = sum(w for w, v in votes if v)
     total = sum(w for w, _ in votes)
+    ob_voted_true = bool(gr.ob_gate_ok_buy) if is_buy else bool(gr.ob_gate_ok_sell)
+    if cfg.ENABLE_OB_GATE and ob_voted_true:
+        ob_weight = CONFLUENCE_WEIGHTS["order_block"]
+        base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
+        base_trend_voted_true = bool(gr.base_buy_trend) if is_buy else bool(gr.base_sell_trend)
+        other_score = score - ob_weight - (base_trend_weight if base_trend_voted_true else 0.0)
+        if other_score < cfg.OB_MIN_OTHER_SCORE:
+            score -= ob_weight
+
     return score, total
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
