@@ -1662,11 +1662,12 @@ def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], pr
     return None
 
 def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool,
+    oi_usd_now: Optional[float] = None,
     price_now: Optional[float] = None, price_history: Optional[List[List[float]]] = None) -> Optional[str]:
     if oi_now is None:
         return None
-    if cfg.MIN_OI_USD > 0 and oi_now < cfg.MIN_OI_USD:
-        return None  # micro-cap pair — filter doesn't apply, avoid false "rising" reads
+    if cfg.MIN_OI_USD > 0 and (oi_usd_now is None or oi_usd_now < cfg.MIN_OI_USD):
+        return None 
     if len(oi_history) < cfg.MIN_OI_FUNDING_SAMPLES:
         return None
 
@@ -2436,31 +2437,32 @@ class DataFetcher:
             if not symbol:
                 continue
 
-            oi_raw = row.get("open_interest")
-            if oi_raw is None:
-                oi_raw = row.get("oi")
-            if oi_raw is None:
-                oi_raw = row.get("open_interest_usd")
-            if oi_raw is None:
-                oi_raw = row.get("openInterest")
-
-            funding_raw = row.get("funding_rate")
-            if funding_raw is None:
-                funding_raw = row.get("fundingRate")
-            if funding_raw is None:
-                funding_raw = row.get("funding")
-
-            price_raw = row.get("mark_price")
-            if price_raw is None:
-                price_raw = row.get("markPrice")
-            if price_raw is None:
-                price_raw = row.get("close")
-
+            oi_raw = (
+                row.get("open_interest")
+                or row.get("oi")
+                or row.get("open_interest_usd")
+                or row.get("openInterest")
+            )
+            oi_value_usd_raw = (
+                row.get("oi_value_usd")
+                or row.get("oi_value")
+            )
+            funding_raw = (
+                row.get("funding_rate")
+                or row.get("fundingRate")
+                or row.get("funding")
+            )
+            price_raw = (
+                row.get("mark_price")
+                or row.get("markPrice")
+                or row.get("close")
+            )
             if oi_raw is None and funding_raw is None:
                 continue
             try:
                 out[symbol] = {
                     "oi": float(oi_raw) if oi_raw is not None else None,
+                    "oi_value_usd": float(oi_value_usd_raw) if oi_value_usd_raw is not None else None,
                     "funding": float(funding_raw) if funding_raw is not None else None,
                     "price": float(price_raw) if price_raw is not None else None,
                 }
@@ -5127,15 +5129,16 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         oi_funding_ok_buy = oi_funding_ok_sell = None
         oi_funding_reason = None
         if cfg.ENABLE_OI_FUNDING_FILTER and cfg.ENABLE_CONFLUENCE_GATE and pair_oi is not None:
-
             buy_reason = _oi_funding_gate_reason(
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
                 pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=True,
+                oi_usd_now=pair_oi.get("oi_usd_now"),
                 price_now=pair_oi.get("price_now"), price_history=pair_oi.get("price_history", []),
             )
             sell_reason = _oi_funding_gate_reason(
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
                 pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=False,
+                oi_usd_now=pair_oi.get("oi_usd_now"),
                 price_now=pair_oi.get("price_now"), price_history=pair_oi.get("price_history", []),
             )
             oi_funding_ok_buy = buy_reason is None
@@ -6238,13 +6241,10 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
         if pair_oi is not None:
             oi_reason = _oi_funding_gate_reason(
-                pair_oi.get("oi_now"),
-                pair_oi.get("oi_history", []),
-                pair_oi.get("funding"),
-                pair_oi.get("funding_history", []),
-                is_buy=gr.buy_common,
-                price_now=pair_oi.get("price_now"),
-                price_history=pair_oi.get("price_history", []),
+                pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
+                pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=gr.buy_common,
+                oi_usd_now=pair_oi.get("oi_usd_now"),
+                price_now=pair_oi.get("price_now"), price_history=pair_oi.get("price_history", []),
             )
             if oi_reason is not None:
                 logger_pair.info(f"[{pair_name}] {oi_reason}")
@@ -6426,6 +6426,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
             oi_gate_data[pair_name] = {
                 "oi_now": current["oi"],
+                "oi_usd_now": current.get("oi_value_usd"),
                 "oi_history": oi_hist,
                 "funding": current.get("funding"),
                 "funding_history": funding_hist,
