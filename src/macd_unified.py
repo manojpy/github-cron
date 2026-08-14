@@ -227,6 +227,7 @@ class BotConfig(BaseModel):
     OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
     MIN_OI_FUNDING_SAMPLES: int = Field(default=8, ge=3, description="Min warm-up samples before the adaptive gate activates for a pair; fail-open until then")
     OI_RISING_PERCENTILE: float = Field(default=0.50, ge=0.0, le=1.0, description="OI delta must exceed this percentile of the pair's own recent |delta| history to count as 'rising with conviction'")
+    OI_DELTA_REF_SAMPLES: int = Field(default=3, ge=1, le=20, description="Number of most-recent OI history samples averaged to form the reference point for oi_delta, instead of comparing oi_now against only the single last sample. Smooths out a single anomalous tick (exchange glitch, brief liquidation cascade spike) from distorting the delta. 1 reproduces the old single-sample behavior")
     FUNDING_CROWDED_PERCENTILE: float = Field(default=0.80, ge=0.5, le=1.0, description="Current funding must be at/above this percentile (BUY) or at/below its complement (SELL) of the pair's own recent funding history to count as 'crowded'")
     FUNDING_ABS_FLOOR: float = Field(default=0.0005, ge=0.0, description="Min |funding| required before percentile-crowding applies at all, so a flat near-zero history can't self-trigger 'crowded'")
     MIN_OI_USD: float = Field(default=75000, ge=0.0, description="Ignore the OI/funding gate entirely for pairs whose current OI is below this floor (quote currency). 0 disables the floor")
@@ -1669,7 +1670,9 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float
         return divergence_reason
 
     oi_values = [v for _, v in oi_history]
-    prev_oi = oi_values[-1]
+    ref_n = min(cfg.OI_DELTA_REF_SAMPLES, len(oi_values))
+    recent_ref = oi_values[-ref_n:]
+    prev_oi = sum(recent_ref) / len(recent_ref)
     oi_delta = oi_now - prev_oi
 
     delta_history = [abs(b - a) for a, b in zip(oi_values[:-1], oi_values[1:])]
@@ -1698,7 +1701,7 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float
     side = "BUY" if is_buy else "SELL"
     fp_str = f"{funding_pctile:.2f}" if funding_pctile is not None else "n/a"
     return (
-        f"OI/funding gate: {side} blocked | OI {prev_oi:.0f}→{oi_now:.0f} "
+        f"OI/funding gate: {side} blocked | OI {ref_n}-smpl avg {prev_oi:.0f}→{oi_now:.0f} "
         f"(delta {oi_delta:+.0f} vs pair's own adaptive min {adaptive_min_rise:.0f}) "
         f"| funding {funding:.4f} self-pctile={fp_str} (crowded vs own history)"
     )
@@ -3103,6 +3106,7 @@ class GateResult:
     ob_gate_ok_buy: Optional[bool] = None
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None
+    direction_is_buy: bool = True
 
 CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
@@ -3115,7 +3119,7 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "rvol": 1.0,
     "cpr": 1.0,
     "oi_funding": 2.0,
-    "order_block": 3.0,
+    "order_block": 2.5,
 }
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float]:
@@ -5177,6 +5181,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             oi_funding_reason=oi_funding_reason,
             ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
             ob_gate_reason=ob_gate_reason,
+            direction_is_buy=bool(buy_common),
         )
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
@@ -5723,8 +5728,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 alerts_to_send = []
 
         if alerts_to_send:
-            is_buy_dir = bool(gr.is_green and gr.is_valid_for_buy)
-            dispatch_score, dispatch_total = compute_confluence_score(gr, is_buy=is_buy_dir)
+            dispatch_score, dispatch_total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
             if cfg.ENABLE_CONFLUENCE_GATE:
                 required = min(cfg.CONFLUENCE_MIN_SCORE, dispatch_total)
                 if dispatch_score < required:
@@ -5748,7 +5752,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         coalesced_dedup_key: Optional[str] = None
         if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
-            direction = "BUY" if (gr.is_green and gr.is_valid_for_buy) else "SELL"
+            direction = "BUY" if gr.direction_is_buy else "SELL"
             coalesced_dedup_key = f"coalesced_{direction}"
             should_send = await sdb.check_recent_alert(
                 pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
@@ -5858,7 +5862,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                         if cfg.ENABLE_WIN_RATE_FILTER:
-                            direction = "buy" if (gr.is_green and gr.is_valid_for_buy) else "sell"
+                            direction = "buy" if gr.direction_is_buy else "sell"
                             for _, _, alert_key in alerts_to_send:
                                 await sdb.record_pending_outcome(
                                     pair_name, alert_key, direction, ts_curr, close_curr
@@ -6188,7 +6192,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         return gr  # hard reject / wick reject / gate blocked -- already final
 
     if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
-        score, total = compute_confluence_score(gr, is_buy=gr.buy_common)
+        score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
         required = min(cfg.CONFLUENCE_MIN_SCORE, total)
         if score < required:
             logger_pair.info(
