@@ -5101,7 +5101,11 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                     "suppression": f"Gate blocked: {', '.join(reasons)}"
                 }
             }
-
+        logger_pair.debug(
+            f"[{pair_name}] OI diag | pair_oi is {'NOT None' if pair_oi is not None else 'NONE'} | "
+            f"ENABLE_OI_FUNDING_FILTER={cfg.ENABLE_OI_FUNDING_FILTER} | "
+            f"ENABLE_CONFLUENCE_GATE={cfg.ENABLE_CONFLUENCE_GATE}"
+        )
         oi_funding_ok_buy = oi_funding_ok_sell = None
         oi_funding_reason = None
         if cfg.ENABLE_OI_FUNDING_FILTER and cfg.ENABLE_CONFLUENCE_GATE and pair_oi is not None:
@@ -6430,6 +6434,13 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         if metadata_tasks:
             await asyncio.gather(*metadata_tasks, return_exceptions=True)
+        logger_main.info(
+            f"🔍 OI diag | oi_gate_data keys: {list(oi_gate_data.keys())[:5]} "
+            f"(count={len(oi_gate_data)}) | "
+            f"fetch_tickers symbols sample: {list(oi_funding_map.keys())[:5]}"
+        )
+
+
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
