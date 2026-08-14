@@ -2430,9 +2430,33 @@ class DataFetcher:
             if not symbol:
                 continue
 
-            oi_raw = row.get("open_interest")
-            funding_raw = row.get("funding_rate")
-            price_raw = row.get("mark_price", row.get("close"))
+            # TEMPORARY DIAGNOSTIC — remove after fixing
+            if symbol in ("ETHUSD", "BTCUSD", "ZECUSD"):
+                logger_main.info(
+                    f"Ticker raw row [{symbol}]: keys={list(row.keys())} | "
+                    f"open_interest={row.get('open_interest')} | "
+                    f"oi={row.get('oi')} | "
+                    f"open_interest_usd={row.get('open_interest_usd')} | "
+                    f"funding_rate={row.get('funding_rate')} | "
+                    f"mark_price={row.get('mark_price')}"
+                )
+
+            oi_raw = (
+                row.get("open_interest")
+                or row.get("oi")
+                or row.get("open_interest_usd")
+                or row.get("openInterest")
+            )
+            funding_raw = (
+                row.get("funding_rate")
+                or row.get("fundingRate")
+                or row.get("funding")
+            )
+            price_raw = (
+                row.get("mark_price")
+                or row.get("markPrice")
+                or row.get("close")
+            )
             if oi_raw is None and funding_raw is None:
                 continue
             try:
