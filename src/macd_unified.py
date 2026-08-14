@@ -204,7 +204,6 @@ class BotConfig(BaseModel):
     ENABLE_VWAP: bool = Field(default=True)
     ENABLE_PIVOT: bool = Field(default=True)
     ENABLE_CPR: bool = Field(default=False)
-    ENABLE_CPR_ADX_RVOL_CONFIRM: bool = Field(default=False, description="DEPRECATED: no longer used in CPR momentum gate (see CPR_MOMENTUM_BODY_RATIO_MIN)")
     CPR_THRESHOLD_PCT: float = Field(default=0.010, ge=0.001, le=0.10)
     CPR_MOMENTUM_BODY_RATIO_MIN: float = Field(default=0.50, ge=0.0, le=1.0, description="Min |close-open|/range for candle-body-conviction momentum vote")
     PIVOT_LOOKBACK_PERIOD: int = 15
