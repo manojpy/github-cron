@@ -219,7 +219,7 @@ class BotConfig(BaseModel):
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
-    CONFLUENCE_MIN_VOTES: int = Field(default=3, ge=2, le=10) 
+    CONFLUENCE_MIN_SCORE: float = Field(default=6.0, ge=0.5, le=50.0, description="Min weighted confluence score required to pass (see compute_confluence_score for per-vote weights: HTF trend/OB=3, OI/funding=2, ADX/RVOL/CPR=1, PPO/RSI/TK cross=0.5)")
     ENABLE_WIN_RATE_FILTER: bool = Field(default=False) 
     ENABLE_OI_FUNDING_FILTER: bool = Field(default=False, description="Block BUY/SELL when OI isn't rising (vs pair's own history) AND funding is crowded (vs pair's own history) in the alert direction")
     OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
@@ -229,10 +229,15 @@ class BotConfig(BaseModel):
     FUNDING_ABS_FLOOR: float = Field(default=0.0005, ge=0.0, description="Min |funding| required before percentile-crowding applies at all, so a flat near-zero history can't self-trigger 'crowded'")
     MIN_OI_USD: float = Field(default=0.0, ge=0.0, description="Ignore the OI/funding gate entirely for pairs whose current OI is below this floor (quote currency). 0 disables the floor")
     OI_FUNDING_MAX_SAMPLE_AGE_SEC: int = Field(default=5400, ge=300, description="Prune OI/funding samples older than this (default 90min ≈ 6 cycles @15m). Prevents comparing a stale pre-outage sample as if only one cycle passed")
+    ENABLE_OI_PRICE_DIVERGENCE: bool = Field(default=False, description="Block BUY when price is rising but OI is falling (short-covering, not new demand); block SELL when price is falling but OI is falling (long liquidation, not new supply). Requires ticker mark price to be available.")
+    OI_DIVERGENCE_LOOKBACK_SAMPLES: int = Field(default=12, ge=2, le=200, description="How many OI/price history samples back to compare against for divergence (default 12 runs @15m ≈ 3h)")
+    OI_DIVERGENCE_MIN_PRICE_ROC_PCT: float = Field(default=0.3, ge=0.0, le=50.0, description="Min absolute price move (%) over the lookback window before divergence logic applies at all")
+    OI_DIVERGENCE_MIN_OI_FALL_PCT: float = Field(default=2.0, ge=0.0, le=100.0, description="Min OI decline (%) over the lookback window to count as 'falling with conviction' (closing/covering, not new positioning)")
     ENABLE_OB_GATE: bool = Field(default=False, description="Add institutional order-block (supply/demand) reversal on 15m as a confluence vote. Abstains (None) unless a fresh, first-touch reversal off an unmitigated zone confirms this cycle")
     OB_LOOKBACK_CANDLES: int = Field(default=96, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
     OB_IMPULSE_LOOKAHEAD: int = Field(default=3, ge=1, le=10, description="Candles after a candidate base candle checked for the impulsive displacement that confirms it as an order block")
     OB_IMPULSE_ATR_MULT: float = Field(default=1.5, ge=0.1, le=10.0, description="Min displacement away from the base candle, in ATR multiples (measured at formation), required to qualify as an institutional impulse") 
+    ENABLE_OB_PREMIUM_DISCOUNT_FILTER: bool = Field(default=False, description="Only accept demand-zone OB reversals below the 50% equilibrium of the OB_LOOKBACK_CANDLES dealing range (discount), and supply-zone reversals above it (premium). Zones on the wrong side are skipped entirely.")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
     MIN_WIN_RATE_SAMPLE: int = Field(default=20, ge=1)    
@@ -1537,16 +1542,25 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
         cfg_obj.OB_IMPULSE_LOOKAHEAD, cfg_obj.OB_IMPULSE_ATR_MULT,
     )
 
+    equilibrium: Optional[float] = None
+    if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > start_idx:
+        range_high = float(np.max(h[start_idx:i15]))
+        range_low = float(np.min(l[start_idx:i15]))
+        equilibrium = (range_high + range_low) / 2.0
+
     ob_ok_buy: Optional[bool] = None
     ob_ok_sell: Optional[bool] = None
     reason: Optional[str] = None
 
     for z in zones:
+        if equilibrium is not None:
+            if z.is_demand and z.top >= equilibrium:
+                continue
+            if not z.is_demand and z.bottom <= equilibrium:
+                continue
         confirm_end = min(z.index + cfg_obj.OB_IMPULSE_LOOKAHEAD, i15 - 1)
         test_start = confirm_end + 1
         if test_start >= i15:
-            # No candles yet between formation/confirmation and now — the
-            # zone is fresh by definition, so it can't be broken or mitigated.
             broken_before = False
             mitigated_before = False
         else:
@@ -1572,8 +1586,6 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
                 ob_ok_buy = True
                 reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
             elif ob_ok_buy is not True:
-                # Zone touched this cycle but close didn't confirm reversal —
-                # explicit failure (False), distinct from "no zone in play" (None).
                 ob_ok_buy = False
                 reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
         else:
@@ -1586,13 +1598,50 @@ def _order_block_gate_reason(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.
 
     return ob_ok_buy, ob_ok_sell, reason
 
-def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool) -> Optional[str]:
+def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], price_now: Optional[float], price_history: List[List[float]], is_buy: bool) -> Optional[str]:
+    if not cfg.ENABLE_OI_PRICE_DIVERGENCE or price_now is None:
+        return None
+    lookback = cfg.OI_DIVERGENCE_LOOKBACK_SAMPLES
+    if len(oi_history) < lookback or len(price_history) < lookback:
+        return None
+
+    oi_ref = oi_history[-lookback][1]
+    price_ref = price_history[-lookback][1]
+    if oi_ref <= 0 or price_ref <= 0:
+        return None
+
+    oi_roc_pct = (oi_now - oi_ref) / oi_ref * 100.0
+    price_roc_pct = (price_now - price_ref) / price_ref * 100.0
+
+    if oi_roc_pct > -cfg.OI_DIVERGENCE_MIN_OI_FALL_PCT:
+        return None  # OI isn't falling with conviction — no divergence signal
+
+    if is_buy and price_roc_pct >= cfg.OI_DIVERGENCE_MIN_PRICE_ROC_PCT:
+        return (
+            f"OI/price divergence: BUY blocked | price {price_ref:.4g}→{price_now:.4g} "
+            f"({price_roc_pct:+.2f}%) rising on falling OI ({oi_roc_pct:+.2f}%) — "
+            f"looks like short-covering, not new demand"
+        )
+    if not is_buy and price_roc_pct <= -cfg.OI_DIVERGENCE_MIN_PRICE_ROC_PCT:
+        return (
+            f"OI/price divergence: SELL blocked | price {price_ref:.4g}→{price_now:.4g} "
+            f"({price_roc_pct:+.2f}%) falling on falling OI ({oi_roc_pct:+.2f}%) — "
+            f"looks like long-liquidation, not new supply"
+        )
+    return None
+
+def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float]], funding: Optional[float], funding_history: List[List[float]], is_buy: bool,
+    price_now: Optional[float] = None, price_history: Optional[List[List[float]]] = None) -> Optional[str]:
     if oi_now is None:
         return None
     if cfg.MIN_OI_USD > 0 and oi_now < cfg.MIN_OI_USD:
         return None  # micro-cap pair — filter doesn't apply, avoid false "rising" reads
     if len(oi_history) < cfg.MIN_OI_FUNDING_SAMPLES:
         return None
+
+    divergence_reason = _oi_price_divergence_reason(oi_now, oi_history, price_now, price_history or [], is_buy)
+    if divergence_reason is not None:
+        return divergence_reason
 
     oi_values = [v for _, v in oi_history]
     prev_oi = oi_values[-1]
@@ -2353,14 +2402,17 @@ class DataFetcher:
             symbol = row.get("symbol")
             if not symbol:
                 continue
+
             oi_raw = row.get("open_interest")
             funding_raw = row.get("funding_rate")
+            price_raw = row.get("mark_price", row.get("close"))
             if oi_raw is None and funding_raw is None:
                 continue
             try:
                 out[symbol] = {
                     "oi": float(oi_raw) if oi_raw is not None else None,
                     "funding": float(funding_raw) if funding_raw is not None else None,
+                    "price": float(price_raw) if price_raw is not None else None,
                 }
             except (TypeError, ValueError):
                 continue
@@ -3027,58 +3079,73 @@ class GateResult:
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None
 
-def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[int, int]:
-    """Count independent gate votes that agree for the given direction.
-    Read-only over already-computed GateResult fields — does not alter any
-    existing trigger/gate logic. Returns (score, total_available_votes)."""
-    votes: List[bool] = []
-    if is_buy:
-        votes.append(gr.base_buy_trend)
-        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None:
-            votes.append(gr.ichimoku_gate_ok_buy)
-        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_buy is not None:
-            votes.append(gr.rma_cloud_ok_buy)
-        if cfg.ENABLE_PPO_GATE:
-            votes.append(gr.ppo_gate_ok_buy)
-        if cfg.RSI_GUARD_ENABLED:
-            votes.append(gr.rsi_guard_ok_buy)
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None:
-            votes.append(gr.tk_guard_ok_buy)
-        if cfg.ENABLE_ADX_FILTER:
-            votes.append(gr.adx_ok)
-        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
-            votes.append(gr.rvol_ok)
-        if cfg.ENABLE_CPR:
-            votes.append(gr.effective_cpr_ok)
-        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None:
-            votes.append(gr.oi_funding_ok_buy)
-        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_buy is not None:
-            votes.append(gr.ob_gate_ok_buy)
-    else:
-        votes.append(gr.base_sell_trend)
-        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None:
-            votes.append(gr.ichimoku_gate_ok_sell)
-        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_sell is not None:
-            votes.append(gr.rma_cloud_ok_sell)
-        if cfg.ENABLE_PPO_GATE:
-            votes.append(gr.ppo_gate_ok_sell)
-        if cfg.RSI_GUARD_ENABLED:
-            votes.append(gr.rsi_guard_ok_sell)
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_sell is not None:
-            votes.append(gr.tk_guard_ok_sell)
-        if cfg.ENABLE_ADX_FILTER:
-            votes.append(gr.adx_ok)
-        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
-            votes.append(gr.rvol_ok)
-        if cfg.ENABLE_CPR:
-            votes.append(gr.effective_cpr_ok)
-        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None:
-            votes.append(gr.oi_funding_ok_sell)
-        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_sell is not None:
-            votes.append(gr.ob_gate_ok_sell)
+CONFLUENCE_WEIGHTS: Dict[str, float] = {
+    "base_trend": 3.0,
+    "ichimoku_cloud": 1.5,
+    "rma_cloud": 1.5,
+    "ppo_cross": 0.5,
+    "rsi_guard": 0.5,
+    "tk_guard": 0.5,
+    "adx": 1.0,
+    "rvol": 1.0,
+    "cpr": 1.0,
+    "oi_funding": 2.0,
+    "order_block": 3.0,
+}
 
-    score = sum(1 for v in votes if v)
-    return score, len(votes)
+def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float]:
+    """Sum weighted independent gate votes that agree for the given direction.
+    Read-only over already-computed GateResult fields — does not alter any
+    existing trigger/gate logic. Returns (score, total_available_weight)."""
+    votes: List[Tuple[float, bool]] = []
+    if is_buy:
+        votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_buy_trend))
+        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None:
+            votes.append((CONFLUENCE_WEIGHTS["ichimoku_cloud"], gr.ichimoku_gate_ok_buy))
+        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_buy is not None:
+            votes.append((CONFLUENCE_WEIGHTS["rma_cloud"], gr.rma_cloud_ok_buy))
+        if cfg.ENABLE_PPO_GATE:
+            votes.append((CONFLUENCE_WEIGHTS["ppo_cross"], gr.ppo_gate_ok_buy))
+        if cfg.RSI_GUARD_ENABLED:
+            votes.append((CONFLUENCE_WEIGHTS["rsi_guard"], gr.rsi_guard_ok_buy))
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None:
+            votes.append((CONFLUENCE_WEIGHTS["tk_guard"], gr.tk_guard_ok_buy))
+        if cfg.ENABLE_ADX_FILTER:
+            votes.append((CONFLUENCE_WEIGHTS["adx"], gr.adx_ok))
+        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
+            votes.append((CONFLUENCE_WEIGHTS["rvol"], gr.rvol_ok))
+        if cfg.ENABLE_CPR:
+            votes.append((CONFLUENCE_WEIGHTS["cpr"], gr.effective_cpr_ok))
+        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None:
+            votes.append((CONFLUENCE_WEIGHTS["oi_funding"], gr.oi_funding_ok_buy))
+        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_buy is not None:
+            votes.append((CONFLUENCE_WEIGHTS["order_block"], gr.ob_gate_ok_buy))
+    else:
+        votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_sell_trend))
+        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None:
+            votes.append((CONFLUENCE_WEIGHTS["ichimoku_cloud"], gr.ichimoku_gate_ok_sell))
+        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_sell is not None:
+            votes.append((CONFLUENCE_WEIGHTS["rma_cloud"], gr.rma_cloud_ok_sell))
+        if cfg.ENABLE_PPO_GATE:
+            votes.append((CONFLUENCE_WEIGHTS["ppo_cross"], gr.ppo_gate_ok_sell))
+        if cfg.RSI_GUARD_ENABLED:
+            votes.append((CONFLUENCE_WEIGHTS["rsi_guard"], gr.rsi_guard_ok_sell))
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_sell is not None:
+            votes.append((CONFLUENCE_WEIGHTS["tk_guard"], gr.tk_guard_ok_sell))
+        if cfg.ENABLE_ADX_FILTER:
+            votes.append((CONFLUENCE_WEIGHTS["adx"], gr.adx_ok))
+        if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
+            votes.append((CONFLUENCE_WEIGHTS["rvol"], gr.rvol_ok))
+        if cfg.ENABLE_CPR:
+            votes.append((CONFLUENCE_WEIGHTS["cpr"], gr.effective_cpr_ok))
+        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None:
+            votes.append((CONFLUENCE_WEIGHTS["oi_funding"], gr.oi_funding_ok_sell))
+        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_sell is not None:
+            votes.append((CONFLUENCE_WEIGHTS["order_block"], gr.ob_gate_ok_sell))
+
+    score = sum(w for w, v in votes if v)
+    total = sum(w for w, _ in votes)
+    return score, total
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
     ts_curr: int, cached: CandleSnapshot, reference_time: int, logger_pair: logging.Logger) -> Optional[bool]:
@@ -3157,7 +3224,7 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
 
     if any(np.isnan([raw_o, raw_h, raw_l, raw_c])) or any(np.isinf([raw_o, raw_h, raw_l, raw_c])):
         logger_pair.error(
-            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} — suppressing alert"
+            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} �� suppressing alert"
         )
         return False
 
@@ -4059,8 +4126,13 @@ def _format_price(price: Any) -> str:
     """Safely format price to 2 decimal places."""
     return f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
 
-def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None) -> str:
-    """Build a beautifully formatted Telegram single alert using MarkdownV2."""
+def _fmt_score(score: Optional[float]) -> str:
+    """Compact weighted-confluence-score suffix for message headers, e.g. '(7)' or '(6.5)'."""
+    if score is None:
+        return ""
+    return f"({score:.0f})" if float(score).is_integer() else f"({score:.1f})"
+
+def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None) -> str:
     if not title: 
         title = "ALERT"
     
@@ -4077,6 +4149,7 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     # 2. ESCAPE INDIVIDUAL DATA (Crucial for MarkdownV2 stability)
     e_symbols = escape_markdown_v2(symbols)
     e_pair = escape_markdown_v2(pair)
+    e_score = escape_markdown_v2(_fmt_score(score))
     e_price = escape_markdown_v2(price_str)
     e_desc = escape_markdown_v2(description)
     e_extra = escape_markdown_v2(extra_clean)
@@ -4085,8 +4158,8 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     
     # 3. APPLY TELEGRAM LAYOUT TAGS
     # Bold pair and bold price. Note: Literal hyphens '\-' must be escaped in MarkdownV2.
-    line1 = f"{e_symbols} *{e_pair}* \\- *{e_price}*"
-    
+    line1 = f"{e_symbols} *{e_pair}{e_score}* \\- *{e_price}*"
+
     # Bold the alert type, italicize the extra context details
     if e_extra:
         line2 = f"*{e_desc}* : _{e_extra}_"
@@ -4096,44 +4169,55 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     spacing = " " * 12
     line3 = f"📅 {e_date}{spacing}⏰ {e_time}"
     
-    # Return the raw composite string (do NOT wrap this in escape_markdown_v2)
     return f"{line1}\n{line2}\n{line3}"
         
-def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]]) -> str:
-    """Build a beautifully formatted Telegram batched alert using MarkdownV2."""
+def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]], score: Optional[float] = None) -> str:
     price_str = _format_price(price)
     date_str = format_ist_time(ts, '%d-%m-%Y')
     time_str = format_ist_time(ts, '%H:%M IST')
     
     e_pair = escape_markdown_v2(pair)
+    e_score = escape_markdown_v2(_fmt_score(score))
     e_price = escape_markdown_v2(price_str)
     e_date = escape_markdown_v2(date_str)
     e_time = escape_markdown_v2(time_str)
     spacing = " " * 12
     
     if not items:
-        return f"*{e_pair}* \\- *{e_price}*\n🗓️ {e_date}{spacing}🕙 {e_time}"
+        return f"*{e_pair}{e_score}* \\- *{e_price}*\n🗓️ {e_date}{spacing}🕙 {e_time}"
     
     headline_emoji = items[0][0].split(" ", 1)[0] if items[0][0] else "📊"
     e_headline_emoji = escape_markdown_v2(headline_emoji)
     
-    line1 = f"{e_headline_emoji} *{e_pair}* \\- *{e_price}*"
+    line1 = f"{e_headline_emoji} *{e_pair}{e_score}* \\- *{e_price}*"
     
+    condensed = len(items) > 2
+    shown_items = items[:2] if condensed else items
+    remaining = len(items) - 2 if condensed else 0
+
     alert_lines = []
-    for idx, (title, extra) in enumerate(items):
+    for idx, (title, extra) in enumerate(shown_items):
         parts = title.split(" ", 1)
         description = parts[1] if len(parts) == 2 else title
-        extra_clean = _clean_extra_text(extra)
-        
         e_desc = escape_markdown_v2(description)
-        e_extra = escape_markdown_v2(extra_clean)
-        
-        prefix = "└➤" if idx == len(items) - 1 else "├➤"
-        
-        if e_extra:
-            alert_lines.append(f"{prefix} *{e_desc}* : _{e_extra}_")
-        else:
+
+        is_last = (idx == len(shown_items) - 1) and not condensed
+        prefix = "└➤" if is_last else "├➤"
+
+        if condensed:
+            # Names only — no values — when there's a "+N more" line to follow
             alert_lines.append(f"{prefix} *{e_desc}*")
+        else:
+            extra_clean = _clean_extra_text(extra)
+            e_extra = escape_markdown_v2(extra_clean)
+            if e_extra:
+                alert_lines.append(f"{prefix} *{e_desc}* : _{e_extra}_")
+            else:
+                alert_lines.append(f"{prefix} *{e_desc}*")
+
+    if condensed:
+        e_more = escape_markdown_v2(f"+{remaining} more")
+        alert_lines.append(f"└➤ _{e_more}_")
     
     body = "\n".join(alert_lines)
     datetime_line = f"📆  {e_date}{spacing}⏰ {e_time}"
@@ -4741,7 +4825,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ichimoku_gate_ok_buy = None
             ichimoku_gate_ok_sell = None
 
-
         adx_val = adx_arr[i15] if not np.isnan(adx_arr[i15]) else 0.0
         adx_adaptive_threshold = get_adaptive_adx_threshold_smoothed(adx_arr, i15, cfg)
         adx_raw_check = adx_val >= adx_adaptive_threshold
@@ -4985,13 +5068,16 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         oi_funding_ok_buy = oi_funding_ok_sell = None
         oi_funding_reason = None
         if cfg.ENABLE_OI_FUNDING_FILTER and cfg.ENABLE_CONFLUENCE_GATE and pair_oi is not None:
+
             buy_reason = _oi_funding_gate_reason(
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
                 pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=True,
+                price_now=pair_oi.get("price_now"), price_history=pair_oi.get("price_history", []),
             )
             sell_reason = _oi_funding_gate_reason(
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
                 pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=False,
+                price_now=pair_oi.get("price_now"), price_history=pair_oi.get("price_history", []),
             )
             oi_funding_ok_buy = buy_reason is None
             oi_funding_ok_sell = sell_reason is None
@@ -5602,15 +5688,16 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
                 alerts_to_send = []
 
-        if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE:
+        if alerts_to_send:
             is_buy_dir = bool(gr.is_green and gr.is_valid_for_buy)
-            score, total = compute_confluence_score(gr, is_buy=is_buy_dir)
-            required = min(cfg.CONFLUENCE_MIN_VOTES, total)
-            if score < required:
-                logger_pair.info(
-                    f"[{pair_name}] Confluence gate blocked dispatch: {score}/{total} votes (need {required})"
-                )
-                alerts_to_send = []
+            dispatch_score, dispatch_total = compute_confluence_score(gr, is_buy=is_buy_dir)
+            if cfg.ENABLE_CONFLUENCE_GATE:
+                required = min(cfg.CONFLUENCE_MIN_SCORE, dispatch_total)
+                if dispatch_score < required:
+                    logger_pair.info(
+                        f"[{pair_name}] Confluence gate blocked dispatch: {dispatch_score:.1f}/{dispatch_total:.1f} weighted score (need {required:.1f})"
+                    )
+                    alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             surviving_alerts = []
@@ -5703,10 +5790,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
-                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra)
+                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=dispatch_score)
                 else:
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items)
+                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=dispatch_score)
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
@@ -6068,11 +6155,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
         score, total = compute_confluence_score(gr, is_buy=gr.buy_common)
-        required = min(cfg.CONFLUENCE_MIN_VOTES, total)
+        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
         if score < required:
             logger_pair.info(
-                f"[{pair_name}] Confluence gate blocked: {score}/{total} votes "
-                f"(need {required}) — skipping Phase-2 indicators"
+                f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
+                f"(need {required:.1f}) — skipping Phase-2 indicators"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
@@ -6082,7 +6169,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                     "alerts": 0,
                     "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
                     "hist_rma": 0.0,
-                    "suppression": f"Confluence gate: {score}/{total} votes, need {required}"
+                    "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
                 }
             }
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
@@ -6093,8 +6180,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                 pair_oi.get("funding"),
                 pair_oi.get("funding_history", []),
                 is_buy=gr.buy_common,
+                price_now=pair_oi.get("price_now"),
+                price_history=pair_oi.get("price_history", []),
             )
-
             if oi_reason is not None:
                 logger_pair.info(f"[{pair_name}] {oi_reason}")
                 fetcher.fetch_stats["oi_funding_blocks"] += 1
@@ -6255,34 +6343,43 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             meta_key = f"oi_hist:{pair_name}"
             oi_hist: List[List[float]] = []
             funding_hist: List[List[float]] = []
+            price_hist: List[List[float]] = []
             prev_raw = await state_db.get_metadata(meta_key)
             if prev_raw:
                 try:
                     payload = json_loads(prev_raw)
                     oi_hist = _normalize_samples(payload.get("oi_samples", []) or [])
                     funding_hist = _normalize_samples(payload.get("funding_samples", []) or [])
+                    price_hist = _normalize_samples(payload.get("price_samples", []) or [])
                 except Exception:
-                    oi_hist, funding_hist = [], []
+                    oi_hist, funding_hist, price_hist = [], [], []
 
-            # Drop anything older than OI_FUNDING_MAX_SAMPLE_AGE_SEC so an outage
-            # doesn't get compared as if only one normal cycle had passed.
             oi_hist = _prune_stale_samples(oi_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
             funding_hist = _prune_stale_samples(funding_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
+            price_hist = _prune_stale_samples(price_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
 
             oi_gate_data[pair_name] = {
                 "oi_now": current["oi"],
                 "oi_history": oi_hist,
                 "funding": current.get("funding"),
                 "funding_history": funding_hist,
+                "price_now": current.get("price"),
+                "price_history": price_hist,
             }
             new_oi_hist = (oi_hist + [[now_ts, current["oi"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
             new_funding_hist = funding_hist
             if current.get("funding") is not None:
                 new_funding_hist = (funding_hist + [[now_ts, current["funding"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+            new_price_hist = price_hist
+            if current.get("price") is not None:
+                new_price_hist = (price_hist + [[now_ts, current["price"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
 
             await state_db.set_metadata(
                 meta_key,
-                json_dumps({"oi_samples": new_oi_hist, "funding_samples": new_funding_hist, "ts": now_ts})
+                json_dumps({
+                    "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
+                    "price_samples": new_price_hist, "ts": now_ts,
+                })
             )
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
