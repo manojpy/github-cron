@@ -1709,10 +1709,7 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float
         f"| funding {funding:.4f} self-pctile={fp_str} (crowded vs own history)"
     )
 
-async def _blanket_reset_pair(
-    sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger
-) -> int:
-    """Reset every active alert state for a pair without computing per-indicator logic."""
+async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
     all_keys = list(ALERT_KEYS.values())
     previous_states = await sdb.batch_get_all_alert_states(pair_name, all_keys)
     resets = [
@@ -3127,67 +3124,79 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
     exclude = exclude or set()
-    votes: List[Tuple[float, bool]] = []
-    if is_buy:
-        if "base_trend" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_buy_trend))
-        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_buy is not None and "ichimoku_cloud" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["ichimoku_cloud"], gr.ichimoku_gate_ok_buy))
-        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_buy is not None and "rma_cloud" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["rma_cloud"], gr.rma_cloud_ok_buy))
-        if cfg.ENABLE_PPO_GATE and "ppo_cross" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["ppo_cross"], gr.ppo_gate_ok_buy))
-        if cfg.RSI_GUARD_ENABLED and "rsi_guard" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["rsi_guard"], gr.rsi_guard_ok_buy))
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_buy is not None and "tk_guard" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["tk_guard"], gr.tk_guard_ok_buy))
-        if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["adx"], gr.adx_ok))
-        if (cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED) and "rvol" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["rvol"], gr.rvol_ok))
-        if cfg.ENABLE_CPR and "cpr" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["cpr"], gr.effective_cpr_ok))
-        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_buy is not None and "oi_funding" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["oi_funding"], gr.oi_funding_ok_buy))
-        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_buy is not None and "order_block" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["order_block"], gr.ob_gate_ok_buy))
-    else:
-        if "base_trend" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["base_trend"], gr.base_sell_trend))
-        if cfg.ICHIMOKU_CLOUD_ENABLED and gr.ichimoku_gate_ok_sell is not None and "ichimoku_cloud" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["ichimoku_cloud"], gr.ichimoku_gate_ok_sell))
-        if cfg.RMA_CLOUD_ENABLED and gr.rma_cloud_ok_sell is not None and "rma_cloud" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["rma_cloud"], gr.rma_cloud_ok_sell))
-        if cfg.ENABLE_PPO_GATE and "ppo_cross" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["ppo_cross"], gr.ppo_gate_ok_sell))
-        if cfg.RSI_GUARD_ENABLED and "rsi_guard" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["rsi_guard"], gr.rsi_guard_ok_sell))
-        if cfg.ICHIMOKU_TK_GUARD_ENABLED and gr.tk_guard_ok_sell is not None and "tk_guard" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["tk_guard"], gr.tk_guard_ok_sell))
-        if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["adx"], gr.adx_ok))
-        if (cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED) and "rvol" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["rvol"], gr.rvol_ok))
-        if cfg.ENABLE_CPR and "cpr" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["cpr"], gr.effective_cpr_ok))
-        if cfg.ENABLE_OI_FUNDING_FILTER and gr.oi_funding_ok_sell is not None and "oi_funding" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["oi_funding"], gr.oi_funding_ok_sell))
-        if cfg.ENABLE_OB_GATE and gr.ob_gate_ok_sell is not None and "order_block" not in exclude:
-            votes.append((CONFLUENCE_WEIGHTS["order_block"], gr.ob_gate_ok_sell))
+    score = 0.0
+    total = 0.0
 
-    score = sum(w for w, v in votes if v)
-    total = sum(w for w, _ in votes)
+    base_trend    = gr.base_buy_trend if is_buy else gr.base_sell_trend
+    ichimoku_ok   = gr.ichimoku_gate_ok_buy if is_buy else gr.ichimoku_gate_ok_sell
+    rma_cloud_ok  = gr.rma_cloud_ok_buy if is_buy else gr.rma_cloud_ok_sell
+    ppo_cross_ok  = gr.ppo_gate_ok_buy if is_buy else gr.ppo_gate_ok_sell
+    rsi_guard_ok  = gr.rsi_guard_ok_buy if is_buy else gr.rsi_guard_ok_sell
+    tk_guard_ok   = gr.tk_guard_ok_buy if is_buy else gr.tk_guard_ok_sell
+    oi_funding_ok = gr.oi_funding_ok_buy if is_buy else gr.oi_funding_ok_sell
+    ob_gate_ok    = gr.ob_gate_ok_buy if is_buy else gr.ob_gate_ok_sell
 
-    # OB safety check only when OB is included in this score
-    if cfg.ENABLE_OB_GATE and "order_block" not in exclude:
-        ob_voted_true = bool(gr.ob_gate_ok_buy) if is_buy else bool(gr.ob_gate_ok_sell)
-        if ob_voted_true:
-            ob_weight = CONFLUENCE_WEIGHTS["order_block"]
-            base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
-            base_trend_voted_true = bool(gr.base_buy_trend) if is_buy else bool(gr.base_sell_trend)
-            other_score = score - ob_weight - (base_trend_weight if base_trend_voted_true else 0.0)
-            if other_score < cfg.OB_MIN_OTHER_SCORE:
-                score -= ob_weight
+    if "base_trend" not in exclude:
+        w = CONFLUENCE_WEIGHTS["base_trend"]
+        total += w
+        if base_trend: score += w
+
+    if cfg.ICHIMOKU_CLOUD_ENABLED and ichimoku_ok is not None and "ichimoku_cloud" not in exclude:
+        w = CONFLUENCE_WEIGHTS["ichimoku_cloud"]
+        total += w
+        if ichimoku_ok: score += w
+
+    if cfg.RMA_CLOUD_ENABLED and rma_cloud_ok is not None and "rma_cloud" not in exclude:
+        w = CONFLUENCE_WEIGHTS["rma_cloud"]
+        total += w
+        if rma_cloud_ok: score += w
+
+    if cfg.ENABLE_PPO_GATE and "ppo_cross" not in exclude:
+        w = CONFLUENCE_WEIGHTS["ppo_cross"]
+        total += w
+        if ppo_cross_ok: score += w
+
+    if cfg.RSI_GUARD_ENABLED and "rsi_guard" not in exclude:
+        w = CONFLUENCE_WEIGHTS["rsi_guard"]
+        total += w
+        if rsi_guard_ok: score += w
+
+    if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_ok is not None and "tk_guard" not in exclude:
+        w = CONFLUENCE_WEIGHTS["tk_guard"]
+        total += w
+        if tk_guard_ok: score += w
+
+    if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
+        w = CONFLUENCE_WEIGHTS["adx"]
+        total += w
+        if gr.adx_ok: score += w
+
+    if (cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED) and "rvol" not in exclude:
+        w = CONFLUENCE_WEIGHTS["rvol"]
+        total += w
+        if gr.rvol_ok: score += w
+
+    if cfg.ENABLE_CPR and "cpr" not in exclude:
+        w = CONFLUENCE_WEIGHTS["cpr"]
+        total += w
+        if gr.effective_cpr_ok: score += w
+
+    if cfg.ENABLE_OI_FUNDING_FILTER and oi_funding_ok is not None and "oi_funding" not in exclude:
+        w = CONFLUENCE_WEIGHTS["oi_funding"]
+        total += w
+        if oi_funding_ok: score += w
+
+    if cfg.ENABLE_OB_GATE and ob_gate_ok is not None and "order_block" not in exclude:
+        w = CONFLUENCE_WEIGHTS["order_block"]
+        total += w
+        if ob_gate_ok: score += w
+
+    if cfg.ENABLE_OB_GATE and "order_block" not in exclude and ob_gate_ok:
+        ob_weight = CONFLUENCE_WEIGHTS["order_block"]
+        base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
+        other_score = score - ob_weight - (base_trend_weight if base_trend else 0.0)
+        if other_score < cfg.OB_MIN_OTHER_SCORE:
+            score -= ob_weight
 
     return score, total
 
