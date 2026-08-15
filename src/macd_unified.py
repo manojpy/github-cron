@@ -249,10 +249,10 @@ class BotConfig(BaseModel):
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
     SANITIZE_BAD_CANDLES: bool = Field(default=False, description="If True, drop individual invalid candles instead of rejecting the whole fetch")
     ICHIMOKU_CLOUD_ENABLED: bool = Field(default=True, description="Enable Ichimoku Cloud as trend gate")
-    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Ichimoku conversion line length")
-    ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
-    ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
-    ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
+    ICHIMOKU_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Ichimoku conversion line length")
+    ICHIMOKU_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Ichimoku base line length")
+    ICHIMOKU_SPANB_PERIODS: int = Field(default=130, ge=1, le=500, description="Ichimoku leading span B length")
+    ICHIMOKU_DISPLACEMENT: int = Field(default=65, ge=1, le=400, description="Ichimoku cloud forward displacement")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
@@ -260,13 +260,6 @@ class BotConfig(BaseModel):
     ENABLE_CLOUD_CROSS_ALERT: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku cloud (23,65,130,65), subject to all other buy/sell common conditions") 
     ENABLE_KIJUN_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku base (Kijun) line (23,65,130,65), subject to all other buy/sell common conditions")
 
-    FAST_ICHIMOKU_CONVERSION_PERIODS: int = Field(default=9, ge=1, le=300, description="Fast Ichimoku (alert-only) conversion line length")
-    FAST_ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Fast Ichimoku (alert-only) base line length")
-    FAST_ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Fast Ichimoku (alert-only) leading span B length")
-    FAST_ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Fast Ichimoku (alert-only) cloud forward displacement")
-    ENABLE_FAST_ICHIMOKU_CLOUD_CROSS: bool = Field(default=True, description="15m alert: close crosses fast Ichimoku cloud (9,26,52,26), gated by future fast-cloud color and Fast Tenkan/Kijun alignment, plus all other buy/sell common conditions")
-    ENABLE_FAST_ICHIMOKU_TENKAN_CROSS: bool = Field(default=True, description="15m alert: close crosses fast Ichimoku Tenkan line (9,26,52,26), gated by close beyond current fast cloud, future fast-cloud color, and Fast Tenkan/Kijun alignment, plus all other buy/sell common conditions")
-    
     EVAL_CONCURRENCY_LIMIT: int = Field(default=5, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
@@ -1316,31 +1309,6 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_future_red'] = bool_arr.copy()
             results['ichimoku_conversion_line'] = nan_arr.copy()
             results['ichimoku_base_line'] = nan_arr.copy()
-
-        # ── Fast Ichimoku (9,26,52,26) — alert-only, independent of the slow Ichimoku gate above ──
-        if cfg.ENABLE_FAST_ICHIMOKU_CLOUD_CROSS or cfg.ENABLE_FAST_ICHIMOKU_TENKAN_CROSS:
-            fast_ichimoku = calculate_ichimoku_numpy(
-                data_15m["high"], data_15m["low"], close_15m,
-                cfg.FAST_ICHIMOKU_CONVERSION_PERIODS,
-                cfg.FAST_ICHIMOKU_BASE_PERIODS,
-                cfg.FAST_ICHIMOKU_SPANB_PERIODS,
-                cfg.FAST_ICHIMOKU_DISPLACEMENT,
-            )
-            results['fast_ichimoku_cloud_upper'] = fast_ichimoku['cloud_upper']
-            results['fast_ichimoku_cloud_lower'] = fast_ichimoku['cloud_lower']
-            results['fast_ichimoku_future_green'] = fast_ichimoku['future_green']
-            results['fast_ichimoku_future_red'] = fast_ichimoku['future_red']
-            results['fast_ichimoku_conversion_line'] = fast_ichimoku['conversion_line']
-            results['fast_ichimoku_base_line'] = fast_ichimoku['base_line']
-        else:
-            nan_arr_fast = np.full(n_15m, np.nan, dtype=np.float64)
-            bool_arr_fast = np.zeros(n_15m, dtype=bool)
-            results['fast_ichimoku_cloud_upper'] = nan_arr_fast.copy()
-            results['fast_ichimoku_cloud_lower'] = nan_arr_fast.copy()
-            results['fast_ichimoku_future_green'] = bool_arr_fast.copy()
-            results['fast_ichimoku_future_red'] = bool_arr_fast.copy()
-            results['fast_ichimoku_conversion_line'] = nan_arr_fast.copy()
-            results['fast_ichimoku_base_line'] = nan_arr_fast.copy()
 
         # ── Volatility: ATR + ADX ──
         results['atr_short'] = calculate_atr_rma(
@@ -3016,12 +2984,6 @@ class IndicatorCache:
     ichimoku_future_red: np.ndarray
     ichimoku_conversion_line: np.ndarray
     ichimoku_base_line: np.ndarray
-    fast_ichimoku_cloud_upper: np.ndarray
-    fast_ichimoku_cloud_lower: np.ndarray
-    fast_ichimoku_future_green: np.ndarray
-    fast_ichimoku_future_red: np.ndarray
-    fast_ichimoku_conversion_line: np.ndarray
-    fast_ichimoku_base_line: np.ndarray
     adx: np.ndarray
     atr_short: np.ndarray
     atr_long: np.ndarray
@@ -3093,14 +3055,6 @@ class GateResult:
     tk_conversion_curr: float; tk_conversion_prev: float
     tk_base_curr: float; tk_base_prev: float
     tk_guard_ok_buy: Optional[bool]; tk_guard_ok_sell: Optional[bool]
-
-    # -- fast ichimoku (alert-only) --
-    fast_future_green: bool; fast_future_red: bool
-    fast_cloud_upper_curr: float; fast_cloud_lower_curr: float
-    fast_cloud_upper_prev: float; fast_cloud_lower_prev: float
-    fast_tk_conversion_curr: float; fast_tk_conversion_prev: float
-    fast_tk_base_curr: float; fast_tk_base_prev: float
-    fast_tenkan_ge_kijun: bool; fast_tenkan_le_kijun: bool
 
     # -- oscillator group votes --
     oscillator_group_ok_buy: bool; oscillator_group_ok_sell: bool
@@ -4404,10 +4358,6 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"fast_cloud_cross_up","title":"⚡☁️🟢 Fast Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("fast_future_green",False) and ctx.get("fast_tenkan_ge_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloud {ctx.get('fast_cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"fast_cloud_cross_down","title":"⚡☁️🔴 Fast Cloud Down Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("fast_future_red",False) and ctx.get("fast_tenkan_le_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastCloud {ctx.get('fast_cloud_lower_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"fast_tenkan_cross_up","title":"⚡🌐🟢 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("close_curr",float('-inf'))>ctx.get("fast_cloud_upper_curr",float('inf')) and ctx.get("fast_future_green",False) and ctx.get("fast_tenkan_ge_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastConv {ctx.get('fast_tk_conversion_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"fast_tenkan_cross_down","title":"⚡🌐🔴 Fast Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("close_curr",float('inf'))<ctx.get("fast_cloud_lower_curr",float('-inf')) and ctx.get("fast_future_red",False) and ctx.get("fast_tenkan_le_kijun",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"FastConv {ctx.get('fast_tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand order block reversed'} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ob_reversal_sell","title":"🔴🏛️ Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply order block reversed'} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}
 ]
@@ -4494,8 +4444,6 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     for up_k, down_k, cu, cu_p, cl, cl_p in (
         ("cloud_cross_up", "cloud_cross_down",
          "cloud_upper_curr", "cloud_upper_prev", "cloud_lower_curr", "cloud_lower_prev"),
-        ("fast_cloud_cross_up", "fast_cloud_cross_down",
-         "fast_cloud_upper_curr", "fast_cloud_upper_prev", "fast_cloud_lower_curr", "fast_cloud_lower_prev"),
     ):
         cu_c, cu_pr = context.get(cu), context.get(cu_p)
         cl_c, cl_pr = context.get(cl), context.get(cl_p)
@@ -4511,7 +4459,6 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     for up_k, down_k, conv, conv_p in (
         ("tk_conversion_up", "tk_conversion_down", "tk_conversion_curr", "tk_conversion_prev"),
         ("kijun_cross_up",   "kijun_cross_down",   "tk_base_curr",       "tk_base_prev"),
-        ("fast_tenkan_cross_up", "fast_tenkan_cross_down", "fast_tk_conversion_curr", "fast_tk_conversion_prev"),
     ):
         c_c, c_p = context.get(conv), context.get(conv_p)
         if c_c is not None and c_p is not None and not np.isnan(c_c) and not np.isnan(c_p):
@@ -4631,16 +4578,14 @@ validate_alert_definitions()
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
     "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
-    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up",
-    "fast_cloud_cross_up", "fast_tenkan_cross_up", "ob_reversal_buy",
+    "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "ob_reversal_buy",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
 SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
     "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
-    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down",
-    "fast_cloud_cross_down", "fast_tenkan_cross_down", "ob_reversal_sell",
+    "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "ob_reversal_sell",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
@@ -4886,23 +4831,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         else:
             tk_guard_ok_buy = None
             tk_guard_ok_sell = None
-
-        fast_future_green = fast_ichimoku_future_green[i15]
-        fast_future_red = fast_ichimoku_future_red[i15]
-
-        fast_cloud_upper_curr = fast_ichimoku_cloud_upper[i15]
-        fast_cloud_lower_curr = fast_ichimoku_cloud_lower[i15]
-        fast_cloud_upper_prev = fast_ichimoku_cloud_upper[i15 - 1]
-        fast_cloud_lower_prev = fast_ichimoku_cloud_lower[i15 - 1]
-
-        fast_tk_conversion_curr = fast_ichimoku_conversion_line[i15]
-        fast_tk_conversion_prev = fast_ichimoku_conversion_line[i15 - 1]
-        fast_tk_base_curr = fast_ichimoku_base_line[i15]
-        fast_tk_base_prev = fast_ichimoku_base_line[i15 - 1]
-
-        fast_tk_valid = not (np.isnan(fast_tk_conversion_curr) or np.isnan(fast_tk_base_curr))
-        fast_tenkan_ge_kijun = fast_tk_valid and (fast_tk_conversion_curr >= fast_tk_base_curr)
-        fast_tenkan_le_kijun = fast_tk_valid and (fast_tk_conversion_curr <= fast_tk_base_curr)
 
         close_prev = close_15m[i15 - 1]
 
@@ -5233,12 +5161,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             tk_conversion_curr=tk_conversion_curr, tk_conversion_prev=tk_conversion_prev,
             tk_base_curr=tk_base_curr, tk_base_prev=tk_base_prev,
             tk_guard_ok_buy=tk_guard_ok_buy, tk_guard_ok_sell=tk_guard_ok_sell,
-            fast_future_green=fast_future_green, fast_future_red=fast_future_red,
-            fast_cloud_upper_curr=fast_cloud_upper_curr, fast_cloud_lower_curr=fast_cloud_lower_curr,
-            fast_cloud_upper_prev=fast_cloud_upper_prev, fast_cloud_lower_prev=fast_cloud_lower_prev,
-            fast_tk_conversion_curr=fast_tk_conversion_curr, fast_tk_conversion_prev=fast_tk_conversion_prev,
-            fast_tk_base_curr=fast_tk_base_curr, fast_tk_base_prev=fast_tk_base_prev,
-            fast_tenkan_ge_kijun=fast_tenkan_ge_kijun, fast_tenkan_le_kijun=fast_tenkan_le_kijun,
             oscillator_group_ok_buy=oscillator_group_ok_buy, oscillator_group_ok_sell=oscillator_group_ok_sell,
             ppo_gate_arr=ppo_gate_arr, ppo_gate_signal_arr=ppo_gate_signal_arr,
             ppo_gate_curr=ppo_gate_curr, ppo_gate_prev=ppo_gate_prev,
@@ -5305,12 +5227,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     tk_conversion_curr, tk_conversion_prev = gr.tk_conversion_curr, gr.tk_conversion_prev
     tk_base_curr, tk_base_prev = gr.tk_base_curr, gr.tk_base_prev
     tk_guard_ok_buy, tk_guard_ok_sell = gr.tk_guard_ok_buy, gr.tk_guard_ok_sell
-    fast_future_green, fast_future_red = gr.fast_future_green, gr.fast_future_red
-    fast_cloud_upper_curr, fast_cloud_lower_curr = gr.fast_cloud_upper_curr, gr.fast_cloud_lower_curr
-    fast_cloud_upper_prev, fast_cloud_lower_prev = gr.fast_cloud_upper_prev, gr.fast_cloud_lower_prev
-    fast_tk_conversion_curr, fast_tk_conversion_prev = gr.fast_tk_conversion_curr, gr.fast_tk_conversion_prev
-    fast_tk_base_curr, fast_tk_base_prev = gr.fast_tk_base_curr, gr.fast_tk_base_prev
-    fast_tenkan_ge_kijun, fast_tenkan_le_kijun = gr.fast_tenkan_ge_kijun, gr.fast_tenkan_le_kijun
     oscillator_group_ok_buy, oscillator_group_ok_sell = gr.oscillator_group_ok_buy, gr.oscillator_group_ok_sell
     ppo_gate_arr, ppo_gate_signal_arr = gr.ppo_gate_arr, gr.ppo_gate_signal_arr
     ppo_gate_curr, ppo_gate_prev = gr.ppo_gate_curr, gr.ppo_gate_prev
@@ -5487,12 +5403,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "cloud_lower_curr": cloud_lower_val, "cloud_lower_prev": cloud_lower_prev,
             "tk_guard_ok_buy": tk_guard_ok_buy, "tk_guard_ok_sell": tk_guard_ok_sell,
             "tk_conversion_curr": tk_conversion_curr, "tk_conversion_prev": tk_conversion_prev, "tk_base_curr": tk_base_curr, "tk_base_prev": tk_base_prev,
-            "fast_cloud_upper_curr": fast_cloud_upper_curr, "fast_cloud_upper_prev": fast_cloud_upper_prev,
-            "fast_cloud_lower_curr": fast_cloud_lower_curr, "fast_cloud_lower_prev": fast_cloud_lower_prev,
-            "fast_tk_conversion_curr": fast_tk_conversion_curr, "fast_tk_conversion_prev": fast_tk_conversion_prev,
-            "fast_tk_base_curr": fast_tk_base_curr, "fast_tk_base_prev": fast_tk_base_prev,
-            "fast_future_green": bool(fast_future_green), "fast_future_red": bool(fast_future_red),
-            "fast_tenkan_ge_kijun": fast_tenkan_ge_kijun, "fast_tenkan_le_kijun": fast_tenkan_le_kijun,
             "rma_cloud_ok_buy": rma_cloud_ok_buy, "rma_cloud_ok_sell": rma_cloud_ok_sell,
             "rma_cloud_fast_curr": rma_cloud_fast_curr, "rma_cloud_slow_curr": rma50_15_val,
             "ichimoku_gate_ok_buy": ichimoku_gate_ok_buy, "ichimoku_gate_ok_sell": ichimoku_gate_ok_sell, 
@@ -5578,19 +5488,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 "enabled": cfg.ENABLE_KIJUN_CROSS,
                 "validator": validate_conversion_cross,
                 "ctx_args": ("close_prev", "close_curr", "tk_base_prev", "tk_base_curr"),
-            },
-            "fast_cloud_cross": {
-                "keys": {"fast_cloud_cross_up", "fast_cloud_cross_down"},
-                "enabled": cfg.ENABLE_FAST_ICHIMOKU_CLOUD_CROSS,
-                "validator": validate_cloud_cross,
-                "ctx_args": ("close_prev", "close_curr", "fast_cloud_upper_prev", "fast_cloud_upper_curr",
-                             "fast_cloud_lower_prev", "fast_cloud_lower_curr"),
-            },
-            "fast_tenkan_cross": {
-                "keys": {"fast_tenkan_cross_up", "fast_tenkan_cross_down"},
-                "enabled": cfg.ENABLE_FAST_ICHIMOKU_TENKAN_CROSS,
-                "validator": validate_conversion_cross,
-                "ctx_args": ("close_prev", "close_curr", "fast_tk_conversion_prev", "fast_tk_conversion_curr"),
             },
         }
 
