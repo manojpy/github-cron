@@ -1576,7 +1576,7 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         equilibrium = (range_high + range_low) / 2.0
 
     ob_ok_buy = ob_ok_sell = None
-    reason = None
+    reason_buy = reason_sell = None
 
     for z in zones:
         if equilibrium is not None:
@@ -1636,21 +1636,23 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         if z.is_demand:
             if c[i15] > z.top + min_penetration:
                 ob_ok_buy = True
-                reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
             elif ob_ok_buy is not True:
                 ob_ok_buy = False
-                reason = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
+                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
         else:
             if c[i15] < z.bottom - min_penetration:
                 ob_ok_sell = True
-                reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
+                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
             elif ob_ok_sell is not True:
                 ob_ok_sell = False
-                reason = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
+                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
+
+    reason = reason_buy if ob_ok_buy else (reason_sell if ob_ok_sell else (reason_buy or reason_sell))
 
     logger.debug(
         f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
-        f"equilibrium={'%.4f' % equilibrium if equilibrium else 'N/A'} | "
+        f"equilibrium={'%.4f' % equilibrium if equilibrium is not None else 'N/A'} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
         f"reason={reason or 'no zone touched/confirmed'}"
     )
@@ -2464,25 +2466,21 @@ class DataFetcher:
             if not symbol:
                 continue
 
-            oi_raw = (
-                row.get("open_interest")
-                or row.get("oi")
-                or row.get("open_interest_usd")
-                or row.get("openInterest")
+            oi_raw = next(
+                (row[k] for k in ("open_interest", "oi", "open_interest_usd", "openInterest") if row.get(k) is not None),
+                None,
             )
-            oi_value_usd_raw = (
-                row.get("oi_value_usd")
-                or row.get("oi_value")
+            oi_value_usd_raw = next(
+                (row[k] for k in ("oi_value_usd", "oi_value") if row.get(k) is not None),
+                None,
             )
-            funding_raw = (
-                row.get("funding_rate")
-                or row.get("fundingRate")
-                or row.get("funding")
+            funding_raw = next(
+                (row[k] for k in ("funding_rate", "fundingRate", "funding") if row.get(k) is not None),
+                None,
             )
-            price_raw = (
-                row.get("mark_price")
-                or row.get("markPrice")
-                or row.get("close")
+            price_raw = next(
+                (row[k] for k in ("mark_price", "markPrice", "close") if row.get(k) is not None),
+                None,
             )
             if oi_raw is None and funding_raw is None:
                 continue
@@ -4402,7 +4400,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"vwap_up","title":"🔵▲ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"vwap_down","title":"🟣▼ VWAP Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"VWAP {ctx.get('vwap_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["vwap"]},
     {"key":"hist_rma_buy","title":"🔵⬆️ RMA Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("hist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"hist_rma_sell","title":"🟣⬇️ RMA Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"hist_rma_sell","title":"���⬇️ RMA Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("hist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Hist ({ctx.get('hist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_buy","title":"🟢🔥 PPO Rev BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ppohist_reversal_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"ppohist_sell","title":"🔴🔥 PPO Rev SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ppohist_reversal_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPOHist ({ctx.get('ppohist_curr',0):.4f}) | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"cloud_cross_up","title":"☁️🟢 Cloud Up Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Cloud Upper {ctx.get('cloud_upper_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
@@ -6515,7 +6513,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         new_histories: Dict[str, str] = {}
         for (pair_name, current, meta_key) in oi_entries:
-            oi_hist = funding_hist = price_hist = []
+            oi_hist, funding_hist, price_hist = [], [], []
             prev_raw = prev_raw_map.get(meta_key)
             if prev_raw:
                 try:
@@ -6524,7 +6522,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                     funding_hist = _normalize_samples(payload.get("funding_samples", []) or [])
                     price_hist   = _normalize_samples(payload.get("price_samples", []) or [])
                 except Exception:
-                    oi_hist = funding_hist = price_hist = []
+                    oi_hist, funding_hist, price_hist = [], [], []
 
             oi_hist      = _prune_stale_samples(oi_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
             funding_hist = _prune_stale_samples(funding_hist, cfg.OI_FUNDING_MAX_SAMPLE_AGE_SEC, now_ts)
