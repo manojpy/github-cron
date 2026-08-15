@@ -1645,7 +1645,7 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
 
     reason = reason_buy if ob_ok_buy else (reason_sell if ob_ok_sell else (reason_buy or reason_sell))
 
-    logger.info(
+    logger.debug(
         f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium is not None else 'N/A'} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
