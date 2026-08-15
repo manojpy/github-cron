@@ -221,7 +221,8 @@ class BotConfig(BaseModel):
     CONFLUENCE_MIN_SCORE: float = Field(default=6.0, ge=0.5, le=50.0, description="Min weighted confluence score required to pass (see compute_confluence_score for per-vote weights: HTF trend/OB=3, OI/funding=2, ADX/RVOL/CPR=1, PPO/RSI/TK cross=0.5)")
     OB_MIN_OTHER_SCORE: float = Field(default=3.0, ge=0.0, le=50.0, description="Min weighted score from votes OTHER than base_trend and order_block required before the OB vote is allowed to count toward the confluence total. base_trend is excluded because it's a precondition for evaluation, not independent confluence. Default 3.0 is set above oi_funding's 2.0 weight so oi_funding alone can't pair with OB to clear the gate")
     OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
-    ENABLE_WIN_RATE_FILTER: bool = Field(default=False) 
+    OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=2, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
+    ENABLE_WIN_RATE_FILTER: bool = Field(default=False)
     ENABLE_OI_FUNDING_FILTER: bool = Field(default=False, description="Block BUY/SELL when OI isn't rising (vs pair's own history) AND funding is crowded (vs pair's own history) in the alert direction")
     OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
     MIN_OI_FUNDING_SAMPLES: int = Field(default=8, ge=3, description="Min warm-up samples before the adaptive gate activates for a pair; fail-open until then")
@@ -1544,6 +1545,7 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
 
     ob_ok_buy = ob_ok_sell = None
     reason_buy = reason_sell = None
+    grace = cfg_obj.OB_CONFIRM_LOOKAHEAD_CANDLES
 
     for z in zones:
         if equilibrium is not None:
@@ -1554,62 +1556,65 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
 
         confirm_end = min(z.index + cfg_obj.OB_IMPULSE_LOOKAHEAD, i15 - 1)
         test_start = confirm_end + 1
+        if test_start > i15:
+            continue 
+        touch_idx = -1
+        zone_dead = False
+        confirmed_idx = -1
 
-        if test_start >= i15:
-            broken_before = False
-            mitigated_before = False
-        else:
-            # Scalar scan — no numpy slices, no boolean temp arrays
-            broken_before = False
-            mitigated_before = False
+        for idx in range(test_start, i15 + 1):
+            touched = (l[idx] <= z.top) and (h[idx] >= z.bottom)
+
+            if touch_idx == -1:
+                if not touched:
+                    continue
+                touch_idx = idx
+            elif idx - touch_idx > grace:
+                zone_dead = True
+                break
+
+            atr_idx = atr_short_arr[idx]
+            min_penetration = (
+                cfg_obj.OB_MIN_PENETRATION_ATR_MULT * atr_idx
+                if cfg_obj.OB_MIN_PENETRATION_ATR_MULT > 0 and not np.isnan(atr_idx) and atr_idx > 0
+                else 0.0
+            )
 
             if z.is_demand:
-                for idx in range(test_start, i15):
-                    if c[idx] < z.bottom:
-                        broken_before = True
-                        break
-                    if l[idx] <= z.top and h[idx] >= z.bottom:
-                        if z.bottom <= c[idx] <= z.top:
-                            mitigated_before = True
-                            break
+                if c[idx] > z.top + min_penetration:
+                    confirmed_idx = idx
+                    break
+                if c[idx] < z.bottom:
+                    zone_dead = True
+                    break
             else:
-                for idx in range(test_start, i15):
-                    if c[idx] > z.top:
-                        broken_before = True
-                        break
-                    if l[idx] <= z.top and h[idx] >= z.bottom:
-                        if z.bottom <= c[idx] <= z.top:
-                            mitigated_before = True
-                            break
+                if c[idx] < z.bottom - min_penetration:
+                    confirmed_idx = idx
+                    break
+                if c[idx] > z.top:
+                    zone_dead = True
+                    break
 
-        if broken_before or mitigated_before:
+        if touch_idx == -1 or zone_dead:
             continue
 
-        touches_now = (l[i15] <= z.top) and (h[i15] >= z.bottom)
-        if not touches_now:
-            continue
-
-        atr_i15 = atr_short_arr[i15]
-        min_penetration = (
-            cfg_obj.OB_MIN_PENETRATION_ATR_MULT * atr_i15
-            if cfg_obj.OB_MIN_PENETRATION_ATR_MULT > 0 and not np.isnan(atr_i15) and atr_i15 > 0
-            else 0.0
-        )
-
-        if z.is_demand:
-            if c[i15] > z.top + min_penetration:
+        if confirmed_idx == i15:
+            if z.is_demand:
                 ob_ok_buy = True
-                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
-            elif ob_ok_buy is not True:
-                ob_ok_buy = False
-                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
-        else:
-            if c[i15] < z.bottom - min_penetration:
+                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed, touched idx {touch_idx}"
+            else:
                 ob_ok_sell = True
-                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed"
-            elif ob_ok_sell is not True:
+                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed, touched idx {touch_idx}"
+        elif confirmed_idx != -1:
+            continue  # reversal already confirmed on an earlier candle — stale, not a new signal now
+        else:
+            # still inside the grace window, waiting on confirmation
+            if z.is_demand and ob_ok_buy is not True:
+                ob_ok_buy = False
+                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})"
+            elif not z.is_demand and ob_ok_sell is not True:
                 ob_ok_sell = False
-                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched, no reversal confirmed"
+                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})" 
 
     reason = reason_buy if ob_ok_buy else (reason_sell if ob_ok_sell else (reason_buy or reason_sell))
 
