@@ -1525,7 +1525,6 @@ class OrderBlock:
     bottom: float
     is_demand: bool  # True = bullish/demand zone, False = bearish/supply zone
 
-
 def _find_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
     atr_short_arr: np.ndarray, start_idx: int, end_idx: int, lookahead: int, atr_mult: float) -> List[OrderBlock]:
     zones: List[OrderBlock] = []
