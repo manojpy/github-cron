@@ -1597,8 +1597,6 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
             mitigated_before = False
 
             if z.is_demand:
-                # Demand: broken = any close below zone bottom
-                #         mitigated = any candle that touches AND closes inside zone
                 for idx in range(test_start, i15):
                     if c[idx] < z.bottom:
                         broken_before = True
@@ -1608,8 +1606,6 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
                             mitigated_before = True
                             break
             else:
-                # Supply: broken = any close above zone top
-                #         mitigated = any candle that touches AND closes inside zone
                 for idx in range(test_start, i15):
                     if c[idx] > z.top:
                         broken_before = True
@@ -1650,7 +1646,7 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
 
     reason = reason_buy if ob_ok_buy else (reason_sell if ob_ok_sell else (reason_buy or reason_sell))
 
-    logger.debug(
+    logger.info(
         f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium is not None else 'N/A'} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
