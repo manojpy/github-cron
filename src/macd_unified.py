@@ -3190,11 +3190,6 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
     if cfg.ENABLE_OB_GATE and ob_gate_ok is not None and "order_block" not in exclude:
         w = CONFLUENCE_WEIGHTS["order_block"]
         total += w
-        if ob_gate_ok: score += w
-
-    if cfg.ENABLE_OB_GATE and ob_gate_ok is not None and "order_block" not in exclude:
-        w = CONFLUENCE_WEIGHTS["order_block"]
-        total += w
         if ob_gate_ok:
             score += w
             base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
