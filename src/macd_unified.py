@@ -3136,7 +3136,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
     oi_funding_ok = gr.oi_funding_ok_buy if is_buy else gr.oi_funding_ok_sell
     ob_gate_ok    = gr.ob_gate_ok_buy if is_buy else gr.ob_gate_ok_sell
 
-    if "base_trend" not in exclude:
+    base_trend_included = "base_trend" not in exclude
+    if base_trend_included:
         w = CONFLUENCE_WEIGHTS["base_trend"]
         total += w
         if base_trend: score += w
@@ -3191,12 +3192,15 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
         total += w
         if ob_gate_ok: score += w
 
-    if cfg.ENABLE_OB_GATE and "order_block" not in exclude and ob_gate_ok:
-        ob_weight = CONFLUENCE_WEIGHTS["order_block"]
-        base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
-        other_score = score - ob_weight - (base_trend_weight if base_trend else 0.0)
-        if other_score < cfg.OB_MIN_OTHER_SCORE:
-            score -= ob_weight
+    if cfg.ENABLE_OB_GATE and ob_gate_ok is not None and "order_block" not in exclude:
+        w = CONFLUENCE_WEIGHTS["order_block"]
+        total += w
+        if ob_gate_ok:
+            score += w
+            base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
+            other_score = score - w - (base_trend_weight if (base_trend and base_trend_included) else 0.0)
+            if other_score < cfg.OB_MIN_OTHER_SCORE:
+                score -= w
 
     return score, total
 
