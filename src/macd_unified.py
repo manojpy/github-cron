@@ -5203,7 +5203,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         ob_gate_ok_buy = ob_gate_ok_sell = None
         ob_gate_reason = None
-        if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE:
+        if cfg.ENABLE_OB_GATE
             ob_gate_ok_buy, ob_gate_ok_sell, ob_gate_reason = await asyncio.to_thread(
                 _order_block_gate_reason,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close,
@@ -6274,36 +6274,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     confluence_total: Optional[float] = None
 
     if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
-        if cfg.ENABLE_OB_GATE:
-            score_no_ob, total_no_ob = compute_confluence_score(gr, is_buy=gr.direction_is_buy, exclude={"order_block"})
-            max_possible = total_no_ob + CONFLUENCE_WEIGHTS["order_block"]
-            required = min(cfg.CONFLUENCE_MIN_SCORE, max_possible)
-
-            if score_no_ob >= cfg.CONFLUENCE_MIN_SCORE:
-                # Already passes; OB cannot change anything
-                gr.ob_gate_ok_buy = None
-                gr.ob_gate_ok_sell = None
-                score, total = score_no_ob, total_no_ob
-            elif score_no_ob + CONFLUENCE_WEIGHTS["order_block"] < cfg.CONFLUENCE_MIN_SCORE:
-                # Even with OB true, we cannot reach the threshold
-                gr.ob_gate_ok_buy = None
-                gr.ob_gate_ok_sell = None
-                score, total = score_no_ob, total_no_ob
-            else:
-                # OB might tip the scale — pay the cost and compute it once
-                ob_ok_buy, ob_ok_sell, ob_reason = await asyncio.to_thread(
-                    _order_block_gate_reason,
-                    gr.data_15m.open, gr.data_15m.high, gr.data_15m.low, gr.data_15m.close,
-                    gr.gate_indicators["atr_short"], gr.i15, cfg,
-                )
-                gr.ob_gate_ok_buy = ob_ok_buy
-                gr.ob_gate_ok_sell = ob_ok_sell
-                gr.ob_gate_reason = ob_reason
-                score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
-                required = min(cfg.CONFLUENCE_MIN_SCORE, total)
-        else:
-            score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
-            required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+        score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
+        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
 
         if score < required:
             logger_pair.info(
@@ -6346,6 +6318,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                         "suppression": oi_reason
                     }
                 }
+
     if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
         ob_ok = gr.ob_gate_ok_buy if gr.buy_common else gr.ob_gate_ok_sell
         if ob_ok is False:
@@ -6431,7 +6404,6 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
     
     finally:
         pass
-
 
 async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[str, dict],
     pairs_to_process: List[str], state_db: RedisStateStore, telegram_queue: TelegramQueue,
