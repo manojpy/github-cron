@@ -5203,7 +5203,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         ob_gate_ok_buy = ob_gate_ok_sell = None
         ob_gate_reason = None
-        if cfg.ENABLE_OB_GATE
+        if cfg.ENABLE_OB_GATE:
             ob_gate_ok_buy, ob_gate_ok_sell, ob_gate_reason = await asyncio.to_thread(
                 _order_block_gate_reason,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close,
