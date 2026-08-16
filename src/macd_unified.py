@@ -149,7 +149,6 @@ class Constants:
     REVERSAL_PRIOR_LEG_LOOKBACK = 4 
     REVERSAL_PRIOR_LEG_MIN_RANGE_MULT = 0.5 
 
-
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
@@ -1560,6 +1559,10 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     reason_buy = reason_sell = None
     grace = cfg_obj.OB_CONFIRM_LOOKAHEAD_CANDLES
 
+    prior_leg = _prior_leg_direction(
+        c, h, l, i15 - 1, Constants.REVERSAL_PRIOR_LEG_LOOKBACK
+    )
+
     for z in zones:
         if equilibrium is not None:
             if z.is_demand and z.top >= equilibrium:
@@ -1612,12 +1615,18 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
             continue
 
         if confirmed_idx == i15:
-            if z.is_demand:
+            if z.is_demand and prior_leg == -1:
                 ob_ok_buy = True
-                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed, touched idx {touch_idx}"
-            else:
+                reason_buy = f"Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed after down-leg, touched idx {touch_idx}"
+            elif (not z.is_demand) and prior_leg == 1:
                 ob_ok_sell = True
-                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed, touched idx {touch_idx}"
+                reason_sell = f"Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed after up-leg, touched idx {touch_idx}"
+            else:
+                logger.debug(
+                    f"[{PAIR_ID.get() or '?'}] OB {'demand' if z.is_demand else 'supply'} idx {z.index} "
+                    f"closed beyond edge but prior leg is {prior_leg} "
+                    f"(need {-1 if z.is_demand else 1}) — vote withheld"
+                )
         elif confirmed_idx != -1:
             continue  # reversal already confirmed on an earlier candle — stale, not a new signal now
         else:
@@ -1634,6 +1643,7 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     logger.debug(
         f"[{PAIR_ID.get() or '?'}] OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium is not None else 'N/A'} | "
+        f"prior_leg={prior_leg} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
         f"reason={reason or 'no zone touched/confirmed'}"
     )
@@ -2726,35 +2736,25 @@ def _candle_metrics(data_15m: "PriceData", i: int) -> Optional[Dict[str, float]]
         "body_low": min(o, c), "body_high": max(o, c),
     }
 
-def _prior_leg_direction(data_15m: "PriceData", end_idx: int, lookback: int) -> int:
-    """Whether a real adverse move exists to reverse from, measured over the
-    `lookback` candles ending at `end_idx` (inclusive).
-
-    -1 → genuine drawdown: final close is at least MIN_RANGE_MULT x the window's
-         average candle range below the window's highest close, and that drawdown
-         dominates any run-up inside the window (close in the lower half).
-    +1 → mirror image (close in the upper half, above the window low).
-     0 → flat / ambiguous / not enough history / bad data.
-
-    The margin scales with the pair's own candle size, so it behaves the same
-    for BTC and for slow pairs like PAXG."""
+def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
+                         end_idx: int, lookback: int) -> int:
     first = end_idx - lookback
-    if end_idx < 0 or first < 0 or end_idx >= len(data_15m.close):
+    if end_idx < 0 or first < 0 or end_idx >= len(closes):
         return 0
-    closes = data_15m.close[first:end_idx + 1]
-    highs  = data_15m.high[first:end_idx + 1]
-    lows   = data_15m.low[first:end_idx + 1]
-    if np.any(np.isnan(closes)) or np.any(np.isnan(highs)) or np.any(np.isnan(lows)):
+    win_c = closes[first:end_idx + 1]
+    win_h = highs[first:end_idx + 1]
+    win_l = lows[first:end_idx + 1]
+    if np.any(np.isnan(win_c)) or np.any(np.isnan(win_h)) or np.any(np.isnan(win_l)):
         return 0
-    last_close = float(closes[-1])
+    last_close = float(win_c[-1])
     if last_close <= 0:
         return 0
-    avg_range = float(np.mean(highs - lows))
+    avg_range = float(np.mean(win_h - win_l))
     if avg_range <= 1e-12:
         return 0
     margin = Constants.REVERSAL_PRIOR_LEG_MIN_RANGE_MULT * avg_range
-    hi = float(np.max(closes))
-    lo = float(np.min(closes))
+    hi = float(np.max(win_c))
+    lo = float(np.min(win_c))
     drawdown = hi - last_close
     runup    = last_close - lo
     if drawdown >= margin and drawdown >= runup:
@@ -2763,25 +2763,7 @@ def _prior_leg_direction(data_15m: "PriceData", end_idx: int, lookback: int) -> 
         return 1
     return 0
 
-def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]:
-    """Detect a strong reversal pattern COMPLETING at candle i (the closed candle
-    the alert references — m0=i, m1=i-1, m2=i-2).
-
-    Every pattern must satisfy both:
-      1. The classic candlestick geometry.
-      2. A prior adverse move, so the alert fires as a REAL reversal and not as
-         trend continuation:
-         - patterns whose last pre-signal candle belongs to the adverse move
-           (engulfing, piercing, tweezer, harami, star, marubozu, pinbar)
-           measure the leg over the candles ending at i-1;
-         - Three Soldiers/Crows are themselves trend-colored, so their adverse
-           leg is measured over the candles ending at i-3 (before the pattern).
-
-    Pinbars additionally require the signal candle to close in the signal
-    direction (green hammer / red shooting star), matching the BUY/SELL dispatch
-    color check so a detected pattern is never silently dropped downstream.
-
-    Returns (bullish, bearish, pattern_name)."""
+def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]: 
     if i < 2 or i >= len(data_15m.close):
         return False, False, ""
     m0 = _candle_metrics(data_15m, i)        # signal candle (the one the alert points at)
@@ -2791,20 +2773,20 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
     m2 = _candle_metrics(data_15m, i - 2)
 
     lk = Constants.REVERSAL_PRIOR_LEG_LOOKBACK
-    p1 = _prior_leg_direction(data_15m, i - 1, lk)   # adverse leg up to just before m0
-    p3 = _prior_leg_direction(data_15m, i - 3, lk)   # adverse leg before Soldiers/Crows
+    p1 = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i - 1, lk)
+    p3 = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i - 3, lk)
     prior_down_1, prior_up_1 = (p1 == -1), (p1 == 1)
     prior_down_3, prior_up_3 = (p3 == -1), (p3 == 1)
 
-    # ── 3-candle patterns ──
     if m2 is not None:
-        # Morning Star: down leg, big red, small-body star, big green closing into candle-2's body
+        # Morning Star: now requires a prior down leg
         if (prior_down_1
                 and m2["is_red"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
                 and m0["is_green"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m0["c"] > (m2["body_low"] + m2["body_high"]) / 2):
             return True, False, "Morning Star"
+    
         # Evening Star: mirror
         if (prior_up_1
                 and m2["is_green"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
@@ -5392,7 +5374,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             oi_funding_reason=oi_funding_reason,
             ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
             ob_gate_reason=ob_gate_reason,
-            direction_is_buy=bool(buy_common),
+            direction_is_buy=bool(buy_common or buy_trend_common),
         )
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
