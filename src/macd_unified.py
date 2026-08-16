@@ -146,6 +146,9 @@ class Constants:
     REVERSAL_PIERCING_MIN_PENETRATION = 0.50 
     REVERSAL_HARAMI_MAX_BODY_RATIO = 0.50 
     REVERSAL_TWEEZER_TOLERANCE_PCT = 0.05
+    REVERSAL_PRIOR_LEG_LOOKBACK = 4 
+    REVERSAL_PRIOR_LEG_MIN_RANGE_MULT = 0.5 
+
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -2723,40 +2726,95 @@ def _candle_metrics(data_15m: "PriceData", i: int) -> Optional[Dict[str, float]]
         "body_low": min(o, c), "body_high": max(o, c),
     }
 
-def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]:
-    """Detect a strong reversal pattern ending at candle i. Checks 3-candle patterns
-    (Morning/Evening Star, Three Soldiers/Crows) first, then 2-candle (Engulfing,
-    Piercing/Dark Cloud, Tweezer, Harami), then 1-candle (Marubozu, Pinbar).
-    Returns (bullish, bearish, pattern_name)."""
-    if i < 1 or i >= len(data_15m.close):
-        return False, False, ""
+def _prior_leg_direction(data_15m: "PriceData", end_idx: int, lookback: int) -> int:
+    """Whether a real adverse move exists to reverse from, measured over the
+    `lookback` candles ending at `end_idx` (inclusive).
 
-    m0 = _candle_metrics(data_15m, i)       # current (most recent) candle
-    m1 = _candle_metrics(data_15m, i - 1)   # previous candle
+    -1 → genuine drawdown: final close is at least MIN_RANGE_MULT x the window's
+         average candle range below the window's highest close, and that drawdown
+         dominates any run-up inside the window (close in the lower half).
+    +1 → mirror image (close in the upper half, above the window low).
+     0 → flat / ambiguous / not enough history / bad data.
+
+    The margin scales with the pair's own candle size, so it behaves the same
+    for BTC and for slow pairs like PAXG."""
+    first = end_idx - lookback
+    if end_idx < 0 or first < 0 or end_idx >= len(data_15m.close):
+        return 0
+    closes = data_15m.close[first:end_idx + 1]
+    highs  = data_15m.high[first:end_idx + 1]
+    lows   = data_15m.low[first:end_idx + 1]
+    if np.any(np.isnan(closes)) or np.any(np.isnan(highs)) or np.any(np.isnan(lows)):
+        return 0
+    last_close = float(closes[-1])
+    if last_close <= 0:
+        return 0
+    avg_range = float(np.mean(highs - lows))
+    if avg_range <= 1e-12:
+        return 0
+    margin = Constants.REVERSAL_PRIOR_LEG_MIN_RANGE_MULT * avg_range
+    hi = float(np.max(closes))
+    lo = float(np.min(closes))
+    drawdown = hi - last_close
+    runup    = last_close - lo
+    if drawdown >= margin and drawdown >= runup:
+        return -1
+    if runup >= margin and runup >= drawdown:
+        return 1
+    return 0
+
+def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]:
+    """Detect a strong reversal pattern COMPLETING at candle i (the closed candle
+    the alert references — m0=i, m1=i-1, m2=i-2).
+
+    Every pattern must satisfy both:
+      1. The classic candlestick geometry.
+      2. A prior adverse move, so the alert fires as a REAL reversal and not as
+         trend continuation:
+         - patterns whose last pre-signal candle belongs to the adverse move
+           (engulfing, piercing, tweezer, harami, star, marubozu, pinbar)
+           measure the leg over the candles ending at i-1;
+         - Three Soldiers/Crows are themselves trend-colored, so their adverse
+           leg is measured over the candles ending at i-3 (before the pattern).
+
+    Pinbars additionally require the signal candle to close in the signal
+    direction (green hammer / red shooting star), matching the BUY/SELL dispatch
+    color check so a detected pattern is never silently dropped downstream.
+
+    Returns (bullish, bearish, pattern_name)."""
+    if i < 2 or i >= len(data_15m.close):
+        return False, False, ""
+    m0 = _candle_metrics(data_15m, i)        # signal candle (the one the alert points at)
+    m1 = _candle_metrics(data_15m, i - 1)
     if m0 is None or m1 is None:
         return False, False, ""
+    m2 = _candle_metrics(data_15m, i - 2)
 
-    has_m2 = i >= 2
-    m2 = _candle_metrics(data_15m, i - 2) if has_m2 else None  # two candles back
+    lk = Constants.REVERSAL_PRIOR_LEG_LOOKBACK
+    p1 = _prior_leg_direction(data_15m, i - 1, lk)   # adverse leg up to just before m0
+    p3 = _prior_leg_direction(data_15m, i - 3, lk)   # adverse leg before Soldiers/Crows
+    prior_down_1, prior_up_1 = (p1 == -1), (p1 == 1)
+    prior_down_3, prior_up_3 = (p3 == -1), (p3 == 1)
 
-    # ── 3-candle patterns (checked first: strongest confirmation) ──
+    # ── 3-candle patterns ──
     if m2 is not None:
-        # Morning Star: big red, small-body star, big green closing back into candle-1's body
-        if (m2["is_red"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
+        # Morning Star: down leg, big red, small-body star, big green closing into candle-2's body
+        if (prior_down_1
+                and m2["is_red"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
                 and m0["is_green"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m0["c"] > (m2["body_low"] + m2["body_high"]) / 2):
             return True, False, "Morning Star"
         # Evening Star: mirror
-        if (m2["is_green"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
+        if (prior_up_1
+                and m2["is_green"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
                 and m0["is_red"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m0["c"] < (m2["body_low"] + m2["body_high"]) / 2):
             return False, True, "Evening Star"
-
-        # Three White Soldiers: three consecutive strong green candles, each closing higher,
-        # each opening inside the prior candle's body
-        if (m2["is_green"] and m1["is_green"] and m0["is_green"]
+        # Three White Soldiers: only a reversal if preceded by an actual down leg
+        if (prior_down_3
+                and m2["is_green"] and m1["is_green"] and m0["is_green"]
                 and m2["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
                 and m1["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
                 and m0["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
@@ -2764,7 +2822,8 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
                 and m0["o"] >= m1["body_low"] and m0["o"] <= m1["body_high"] and m0["c"] > m1["c"]):
             return True, False, "Three White Soldiers"
         # Three Black Crows: mirror
-        if (m2["is_red"] and m1["is_red"] and m0["is_red"]
+        if (prior_up_3
+                and m2["is_red"] and m1["is_red"] and m0["is_red"]
                 and m2["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
                 and m1["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
                 and m0["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
@@ -2773,45 +2832,51 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
             return False, True, "Three Black Crows"
 
     # ── 2-candle patterns ──
-    if m0["is_green"] and m1["is_red"] and m0["o"] <= m1["body_low"] and m0["c"] >= m1["body_high"]:
+    if (prior_down_1 and m0["is_green"] and m1["is_red"]
+            and m0["o"] <= m1["body_low"] and m0["c"] >= m1["body_high"]):
         return True, False, "Bullish Engulfing"
-    if m0["is_red"] and m1["is_green"] and m0["o"] >= m1["body_high"] and m0["c"] <= m1["body_low"]:
+    if (prior_up_1 and m0["is_red"] and m1["is_green"]
+            and m0["o"] >= m1["body_high"] and m0["c"] <= m1["body_low"]):
         return False, True, "Bearish Engulfing"
 
     prev_mid = (m1["body_low"] + m1["body_high"]) / 2
-    if (m1["is_red"] and m0["is_green"] and m0["o"] <= m1["c"]
+    if (prior_down_1 and m1["is_red"] and m0["is_green"] and m0["o"] <= m1["c"]
             and m0["c"] > prev_mid and m0["c"] < m1["o"]):
         return True, False, "Piercing Line"
-    if (m1["is_green"] and m0["is_red"] and m0["o"] >= m1["c"]
+    if (prior_up_1 and m1["is_green"] and m0["is_red"] and m0["o"] >= m1["c"]
             and m0["c"] < prev_mid and m0["c"] > m1["o"]):
         return False, True, "Dark Cloud Cover"
 
     tol = m0["rng"] * Constants.REVERSAL_TWEEZER_TOLERANCE_PCT
-    if m1["is_red"] and m0["is_green"] and abs(m0["l"] - m1["l"]) <= tol:
+    if prior_down_1 and m1["is_red"] and m0["is_green"] and abs(m0["l"] - m1["l"]) <= tol:
         return True, False, "Tweezer Bottom"
-    if m1["is_green"] and m0["is_red"] and abs(m0["h"] - m1["h"]) <= tol:
+    if prior_up_1 and m1["is_green"] and m0["is_red"] and abs(m0["h"] - m1["h"]) <= tol:
         return False, True, "Tweezer Top"
 
-    if (m1["is_red"] and m0["is_green"]
+    if (prior_down_1 and m1["is_red"] and m0["is_green"]
             and m0["body_ratio"] <= Constants.REVERSAL_HARAMI_MAX_BODY_RATIO * m1["body_ratio"] + 1e-9
             and m0["body_low"] >= m1["body_low"] and m0["body_high"] <= m1["body_high"]):
         return True, False, "Bullish Harami"
-    if (m1["is_green"] and m0["is_red"]
+    if (prior_up_1 and m1["is_green"] and m0["is_red"]
             and m0["body_ratio"] <= Constants.REVERSAL_HARAMI_MAX_BODY_RATIO * m1["body_ratio"] + 1e-9
             and m0["body_low"] >= m1["body_low"] and m0["body_high"] <= m1["body_high"]):
         return False, True, "Bearish Harami"
 
-    # ── 1-candle patterns ──
+    # ── 1-candle patterns — only as a reversal AGAINST the prior leg ──
     if m0["body_ratio"] >= Constants.REVERSAL_MARUBOZU_BODY_RATIO:
-        if m0["is_green"]:
+        if prior_down_1 and m0["is_green"]:
             return True, False, "Bullish Marubozu"
-        if m0["is_red"]:
+        if prior_up_1 and m0["is_red"]:
             return False, True, "Bearish Marubozu"
 
     if m0["body_ratio"] <= Constants.REVERSAL_PINBAR_BODY_MAX_RATIO:
-        if m0["lower_wick_ratio"] >= Constants.REVERSAL_PINBAR_WICK_RATIO and m0["upper_wick_ratio"] < 0.15:
+        if (prior_down_1 and m0["is_green"]
+                and m0["lower_wick_ratio"] >= Constants.REVERSAL_PINBAR_WICK_RATIO
+                and m0["upper_wick_ratio"] < 0.15):
             return True, False, "Bullish Pinbar"
-        if m0["upper_wick_ratio"] >= Constants.REVERSAL_PINBAR_WICK_RATIO and m0["lower_wick_ratio"] < 0.15:
+        if (prior_up_1 and m0["is_red"]
+                and m0["upper_wick_ratio"] >= Constants.REVERSAL_PINBAR_WICK_RATIO
+                and m0["lower_wick_ratio"] < 0.15):
             return False, True, "Bearish Pinbar"
 
     return False, False, ""
@@ -3213,6 +3278,9 @@ class GateResult:
     # -- final gate decision --
     buy_common: bool
     sell_common: bool
+    buy_trend_common: bool
+    sell_trend_common: bool
+
 
     # -- misc data passed through --
     data_15m: PriceData
@@ -4768,20 +4836,25 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                         "suppression": f"Hard reject: {error_msg}"
                     }
                 }
-            logger_pair.debug(
-                f"[{pair_name}] Wick-rejected candle  blanket reset only. Reason: {error_msg}"
-            )
-            await _blanket_reset_pair(sdb, pair_name, logger_pair)
-            return pair_name, {
-                "state": "NO_SIGNAL",
-                "ts": int(time.time()),
-                "summary": {
-                    "alerts": 0,
-                    "future_cloud": "neutral",
-                    "hist_rma": 0.0,
-                    "suppression": f"Wick rejected: {error_msg}"
+
+            if not cfg.ENABLE_STRONG_REVERSAL_ALERT:
+                logger_pair.debug(
+                    f"[{pair_name}] Wick-rejected candle → blanket reset only. Reason: {error_msg}"
+                )
+                await _blanket_reset_pair(sdb, pair_name, logger_pair)
+                return pair_name, {
+                    "state": "NO_SIGNAL",
+                    "ts": int(time.time()),
+                    "summary": {
+                        "alerts": 0,
+                        "future_cloud": "neutral",
+                        "hist_rma": 0.0,
+                        "suppression": f"Wick rejected: {error_msg}"
+                    }
                 }
-            }
+            logger_pair.debug(
+                f"[{pair_name}] Shape-rejected candle kept for strong-reversal check: {error_msg}"
+            )
         o = candle_info["open"]
         h = candle_info["high"]
         l = candle_info["low"]
@@ -5196,20 +5269,25 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
         trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
 
-        buy_common = (
-            base_buy_trend and is_valid_for_buy
+
+        buy_trend_common = (
+            base_buy_trend
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_buy
         )
-        sell_common = (
-            base_sell_trend and is_valid_for_sell
+        sell_trend_common = (
+            base_sell_trend
             and volatility_filter_ok and effective_cpr_ok
             and trend_gate_ok_sell
         )
-        # ═══════════════════════════════════════════════════════
-        # EARLY EXIT — Skip expensive indicators if gate is closed
-        # ═══════════════════════════════════════════════════════
-        if not buy_common and not sell_common:
+        buy_common  = buy_trend_common and is_valid_for_buy
+        sell_common = sell_trend_common and is_valid_for_sell
+
+        reversal_candidate = (
+            cfg.ENABLE_STRONG_REVERSAL_ALERT
+            and (buy_trend_common or sell_trend_common)
+        )
+        if not buy_common and not sell_common and not reversal_candidate:
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             reasons = []
             if not base_buy_trend and not base_sell_trend:
@@ -5308,6 +5386,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ppo_adaptive_threshold=ppo_adaptive_threshold,
             rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
             buy_common=buy_common, sell_common=sell_common,
+            buy_trend_common=buy_trend_common, sell_trend_common=sell_trend_common,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
             oi_funding_ok_buy=oi_funding_ok_buy, oi_funding_ok_sell=oi_funding_ok_sell,
             oi_funding_reason=oi_funding_reason,
@@ -5372,6 +5451,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     ppo_adaptive_threshold = gr.ppo_adaptive_threshold
     rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
     buy_common, sell_common = gr.buy_common, gr.sell_common
+    buy_trend_common, sell_trend_common = gr.buy_trend_common, gr.sell_trend_common
     close_prev_invalid = gr.close_prev_invalid
     ob_gate_ok_buy, ob_gate_ok_sell = gr.ob_gate_ok_buy, gr.ob_gate_ok_sell
     ob_gate_reason = gr.ob_gate_reason
@@ -5501,10 +5581,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 sell_common and ppohist_curr < 0
                 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1
             )
+
         if cfg.ENABLE_STRONG_REVERSAL_ALERT:
             reversal_bullish, reversal_bearish, reversal_pattern_name = detect_reversal_candle_pattern(data_15m, i15)
-            strong_reversal_buy = buy_common and reversal_bullish
-            strong_reversal_sell = sell_common and reversal_bearish
+            strong_reversal_buy = buy_trend_common and reversal_bullish
+            strong_reversal_sell = sell_trend_common and reversal_bearish
         else:
             reversal_bullish, reversal_bearish, reversal_pattern_name = False, False, ""
             strong_reversal_buy, strong_reversal_sell = False, False
@@ -5643,11 +5724,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         f"O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
                     continue
-                if not is_valid_for_buy:
+
+                if not is_valid_for_buy and alert_key != "strong_reversal_buy":
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
                     continue
-        
             if alert_key in SELL_ALERT_KEYS:
                 if not is_red:
                     logger_pair.debug(
@@ -5655,7 +5736,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         f"O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
                     continue
-                if not is_valid_for_sell:
+                if not is_valid_for_sell and alert_key != "strong_reversal_sell":
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
                     continue
@@ -6312,10 +6393,16 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     confluence_score: Optional[float] = None
     confluence_total: Optional[float] = None
 
-    if cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
-        score, total = compute_confluence_score(gr, is_buy=gr.direction_is_buy)
-        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+    reversal_eligible = (
+        cfg.ENABLE_STRONG_REVERSAL_ALERT
+        and (gr.buy_trend_common or gr.sell_trend_common)
+    )
+    gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
+    buy_side = gr.buy_common or gr.buy_trend_common
 
+    if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
+        score, total = compute_confluence_score(gr, is_buy=buy_side)
+        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
         if score < required:
             logger_pair.info(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
@@ -6335,11 +6422,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         confluence_score = score
         confluence_total = total
 
-    if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
+    if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         if pair_oi is not None:
             oi_reason = _oi_funding_gate_reason(
                 pair_oi.get("oi_now"), pair_oi.get("oi_history", []),
-                pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=gr.buy_common,
+                pair_oi.get("funding"), pair_oi.get("funding_history", []), is_buy=buy_side,
                 oi_usd_now=pair_oi.get("oi_usd_now"),
                 price_now=pair_oi.get("price_now"), price_history=pair_oi.get("price_history", []),
             )
@@ -6357,9 +6444,8 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                         "suppression": oi_reason
                     }
                 }
-
-    if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE and (gr.buy_common or gr.sell_common):
-        ob_ok = gr.ob_gate_ok_buy if gr.buy_common else gr.ob_gate_ok_sell
+    if cfg.ENABLE_OB_GATE and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
+        ob_ok = gr.ob_gate_ok_buy if buy_side else gr.ob_gate_ok_sell
         if ob_ok is False:
             ob_reason = gr.ob_gate_reason or "OB gate: zone touched, no reversal confirmed"
             logger_pair.info(f"[{pair_name}] {ob_reason}")
