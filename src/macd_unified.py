@@ -2779,16 +2779,15 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
     prior_down_3, prior_up_3 = (p3 == -1), (p3 == 1)
 
     if m2 is not None:
-        # Morning Star: now requires a prior down leg
-        if (prior_down_1
+        # Morning Star: leg must be established BEFORE the pattern (matches Three-Soldiers convention)
+        if (prior_down_3
                 and m2["is_red"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
                 and m0["is_green"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m0["c"] > (m2["body_low"] + m2["body_high"]) / 2):
-            return True, False, "Morning Star"
-    
+            return True, False, "Morning Star" 
         # Evening Star: mirror
-        if (prior_up_1
+        if (prior_up_3
                 and m2["is_green"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
                 and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
                 and m0["is_red"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
