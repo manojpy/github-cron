@@ -3121,7 +3121,6 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "oi_funding": 2.0,
     "order_block": 2.5,
 }
-
 def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
     exclude = exclude or set()
     score = 0.0
@@ -5713,9 +5712,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
+            results = await asyncio.gather(
+                *(sdb.get_alert_win_rate(pair_name, ak) for _, _, ak in alerts_to_send)
+            )
             surviving_alerts = []
-            for alert_title, alert_extra, alert_key in alerts_to_send:
-                win_rate, sample = await sdb.get_alert_win_rate(pair_name, alert_key)
+            for (alert_title, alert_extra, alert_key), (win_rate, sample) in zip(alerts_to_send, results):
                 if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: "
@@ -5723,7 +5724,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     )
                     continue
                 surviving_alerts.append((alert_title, alert_extra, alert_key))
-            alerts_to_send = surviving_alerts
+            alerts_to_send = surviving_alerts         
 
         coalesced_dedup_key: Optional[str] = None
         if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
