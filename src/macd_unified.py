@@ -4277,20 +4277,16 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     line1 = f"{e_headline_emoji} *{e_pair}{e_score}* \\- *{e_price}*"
     
     condensed = len(items) > 2
-    shown_items = items[:2] if condensed else items
-    remaining = len(items) - 2 if condensed else 0
-
     alert_lines = []
-    for idx, (title, extra) in enumerate(shown_items):
+    for idx, (title, extra) in enumerate(items):
         parts = title.split(" ", 1)
         description = parts[1] if len(parts) == 2 else title
         e_desc = escape_markdown_v2(description)
 
-        is_last = (idx == len(shown_items) - 1) and not condensed
+        is_last = (idx == len(items) - 1)
         prefix = "└➤" if is_last else "├➤"
 
         if condensed:
-            # Names only — no values — when there's a "+N more" line to follow
             alert_lines.append(f"{prefix} *{e_desc}*")
         else:
             extra_clean = _clean_extra_text(extra)
@@ -4299,10 +4295,6 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
                 alert_lines.append(f"{prefix} *{e_desc}* : _{e_extra}_")
             else:
                 alert_lines.append(f"{prefix} *{e_desc}*")
-
-    if condensed:
-        e_more = escape_markdown_v2(f"+{remaining} more")
-        alert_lines.append(f"└➤ _{e_more}_")
     
     body = "\n".join(alert_lines)
     datetime_line = f"📆  {e_date}{spacing}⏰ {e_time}"
