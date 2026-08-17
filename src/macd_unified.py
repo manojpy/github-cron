@@ -3327,14 +3327,6 @@ class GateResult:
     momentum_count: int
     volatility_filter_ok: bool
 
-    # -- percentile-rank confluence votes (optional, all default-disabled) --
-    adx_pctl: Optional[float] = None
-    adx_strength_ok: Optional[bool] = None
-    atr_pctl: Optional[float] = None
-    atr_pctl_ok: Optional[bool] = None
-    volume_pctl: Optional[float] = None
-    volume_pctl_ok: Optional[bool] = None
-
     # -- CPR --
     cpr_ok: bool; nr_cpr: float
     effective_cpr_ok: bool
@@ -3366,6 +3358,14 @@ class GateResult:
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None
     direction_is_buy: bool = True
+
+    # -- percentile-rank confluence votes (optional, all default-disabled) --
+    adx_pctl: Optional[float] = None
+    adx_strength_ok: Optional[bool] = None
+    atr_pctl: Optional[float] = None
+    atr_pctl_ok: Optional[bool] = None
+    volume_pctl: Optional[float] = None
+    volume_pctl_ok: Optional[bool] = None
 
 CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
