@@ -311,7 +311,10 @@ class BotConfig(BaseModel):
     DAILY_RESET_BUFFER_SEC: int = Field(default=300, ge=0, le=3600)  # Buffer after midnight before allowing daily resets (VWAP/pivots)
     MIN_CANDLES_PER_DAY: int = Field(default=94, ge=50, le=100)  # Minimum candles for complete day (94=23h for 15m candles)
     CANDLE_MIN_AGE_BUFFER: int = Field(default=60, ge=0, le=600)  # Seconds to wait after candle interval before using (ensures finalized data)
-        
+    ENABLE_PPO_GATE_MOMENTUM_VOTE: bool = Field(default=False) 
+    ENABLE_RSI_GUARD_MOMENTUM_VOTE: bool = Field(default=False) 
+    ENABLE_RMA_CLOUD_MOMENTUM_VOTE: bool = Field(default=False) 
+
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
         if not re.match(r'^\d+:[A-Za-z0-9_-]+$', v):
@@ -3317,6 +3320,14 @@ class GateResult:
     rma_cloud_fast_curr: float
     rma_cloud_ok_buy: bool; rma_cloud_ok_sell: bool
 
+    # -- momentum-direction confluence votes (rising/falling vs prior bar) --
+    ppo_gate_momentum_ok_buy: Optional[bool] = None
+    ppo_gate_momentum_ok_sell: Optional[bool] = None
+    rsi_guard_momentum_ok_buy: Optional[bool] = None
+    rsi_guard_momentum_ok_sell: Optional[bool] = None
+    rma_cloud_momentum_ok_buy: Optional[bool] = None
+    rma_cloud_momentum_ok_sell: Optional[bool] = None
+
     # -- trend gate combination --
     trend_gate_ok_buy: bool; trend_gate_ok_sell: bool
 
@@ -3369,11 +3380,11 @@ class GateResult:
 
 CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
-    "ichimoku_cloud": 1.5,
-    "rma_cloud": 1.5,
-    "ppo_cross": 0.5,
-    "rsi_guard": 0.5,
-    "tk_guard": 0.5,
+    "ichimoku_cloud": 2.0,
+    "rma_cloud": 2.0,
+    "ppo_cross": 2.0,
+    "rsi_guard": 2.0,
+    "tk_guard": 2.0,
     "adx": 1.0,
     "rvol": 1.0,
     "cpr": 1.0,
@@ -3381,7 +3392,10 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "order_block": 2.5,
     "adx_strength": 1.0,
     "atr_percentile": 1.0,
-    "volume_percentile": 1.0,
+    "volume_percentile": 1.0, 
+    "ppo_gate_momentum":  1.5,
+    "rsi_guard_momentum": 1.5,
+    "rma_cloud_momentum": 1.5,
 }
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
@@ -3428,6 +3442,27 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
         w = CONFLUENCE_WEIGHTS["tk_guard"]
         total += w
         if tk_guard_ok: score += w
+    
+    ppo_gate_mom_ok = gr.ppo_gate_momentum_ok_buy if is_buy else gr.ppo_gate_momentum_ok_sell
+    if cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE and ppo_gate_mom_ok is not None and "ppo_gate_momentum" not in exclude:
+        w = CONFLUENCE_WEIGHTS["ppo_gate_momentum"]
+        total += w
+        if ppo_gate_mom_ok:
+            score += w
+
+    rsi_guard_mom_ok = gr.rsi_guard_momentum_ok_buy if is_buy else gr.rsi_guard_momentum_ok_sell
+    if cfg.ENABLE_RSI_GUARD_MOMENTUM_VOTE and rsi_guard_mom_ok is not None and "rsi_guard_momentum" not in exclude:
+        w = CONFLUENCE_WEIGHTS["rsi_guard_momentum"]
+        total += w
+        if rsi_guard_mom_ok:
+            score += w
+
+    rma_cloud_mom_ok = gr.rma_cloud_momentum_ok_buy if is_buy else gr.rma_cloud_momentum_ok_sell
+    if cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE and rma_cloud_mom_ok is not None and "rma_cloud_momentum" not in exclude:
+        w = CONFLUENCE_WEIGHTS["rma_cloud_momentum"]
+        total += w
+        if rma_cloud_mom_ok:
+            score += w
 
     if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
         w = CONFLUENCE_WEIGHTS["adx"]
@@ -5356,6 +5391,33 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rma_cloud_ok_buy = None
             rma_cloud_ok_sell = None
 
+        ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
+        if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
+                and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
+            ppo_gate_momentum_ok_buy = ppo_gate_curr > ppo_gate_prev_val
+            ppo_gate_momentum_ok_sell = ppo_gate_curr < ppo_gate_prev_val
+        else:
+            ppo_gate_momentum_ok_buy = None
+            ppo_gate_momentum_ok_sell = None
+
+        rsi_guard_smooth_prev_val = rsi_guard_smooth_arr[i15 - 1] if i15 >= 1 else rsi_guard_smooth_curr
+        if (cfg.ENABLE_RSI_GUARD_MOMENTUM_VOTE
+                and not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_smooth_prev_val)):
+            rsi_guard_momentum_ok_buy = rsi_guard_smooth_curr > rsi_guard_smooth_prev_val
+            rsi_guard_momentum_ok_sell = rsi_guard_smooth_curr < rsi_guard_smooth_prev_val
+        else:
+            rsi_guard_momentum_ok_buy = None
+            rsi_guard_momentum_ok_sell = None
+
+        rma_cloud_fast_prev_val = rma_cloud_fast_arr[i15 - 1] if i15 >= 1 else rma_cloud_fast_curr
+        if (cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE
+                and not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma_cloud_fast_prev_val)):
+            rma_cloud_momentum_ok_buy = rma_cloud_fast_curr > rma_cloud_fast_prev_val
+            rma_cloud_momentum_ok_sell = rma_cloud_fast_curr < rma_cloud_fast_prev_val
+        else:
+            rma_cloud_momentum_ok_buy = None
+            rma_cloud_momentum_ok_sell = None
+
         cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
 
@@ -5536,6 +5598,12 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
             ob_gate_reason=ob_gate_reason,
             direction_is_buy=bool(buy_common or buy_trend_common),
+            ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
+            ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
+            rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,
+            rsi_guard_momentum_ok_sell=rsi_guard_momentum_ok_sell,
+            rma_cloud_momentum_ok_buy=rma_cloud_momentum_ok_buy,
+            rma_cloud_momentum_ok_sell=rma_cloud_momentum_ok_sell,
         )
     except asyncio.CancelledError:
         logger_pair.warning(f"Evaluation cancelled for {pair_name}")
