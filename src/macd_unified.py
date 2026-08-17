@@ -452,14 +452,6 @@ class BotConfig(BaseModel):
                 f'RMA_CLOUD_FAST_PERIOD ({self.RMA_CLOUD_FAST_PERIOD}) must be strictly less than '
                 f'RMA_50_PERIOD ({self.RMA_50_PERIOD}), since the cloud slow leg reuses RMA_50_PERIOD'
             )
-        if cfg.ENABLE_VWAP:
-            results['vwap_gate'] = calculate_vwap_numpy(
-                data_15m["high"], data_15m["low"], close_15m,
-                data_15m["volume"], data_15m["timestamp"], reference_time
-            )
-        else:
-            results['vwap_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
-
         return self
 
     @model_validator(mode='after')
@@ -1399,6 +1391,14 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['rma_cloud_fast_15'] = calculate_rma_numpy(close_15m, cfg.RMA_CLOUD_FAST_PERIOD)
         else:
             results['rma_cloud_fast_15'] = np.full(n_15m, np.nan, dtype=np.float64)
+
+        if cfg.ENABLE_VWAP:
+            results['vwap_gate'] = calculate_vwap_numpy(
+                data_15m["high"], data_15m["low"], close_15m,
+                data_15m["volume"], data_15m["timestamp"], reference_time
+            )
+        else:
+            results['vwap_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
 
         # ── CPR (daily) ──
         if cfg.ENABLE_CPR and data_daily is not None:
