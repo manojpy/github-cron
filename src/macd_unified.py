@@ -2814,18 +2814,18 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
 
     # ── 2-candle patterns ──
     if (prior_down_1 and m0["is_green"] and m1["is_red"]
-            and m0["o"] <= m1["body_low"] and m0["c"] >= m1["body_high"]):
+            and m0["o"] < m1["body_low"] and m0["c"] > m1["body_high"]):
         return True, False, "Bullish Engulfing"
     if (prior_up_1 and m0["is_red"] and m1["is_green"]
-            and m0["o"] >= m1["body_high"] and m0["c"] <= m1["body_low"]):
+            and m0["o"] > m1["body_high"] and m0["c"] < m1["body_low"]):
         return False, True, "Bearish Engulfing"
 
-    prev_mid = (m1["body_low"] + m1["body_high"]) / 2
-    if (prior_down_1 and m1["is_red"] and m0["is_green"] and m0["o"] <= m1["c"]
-            and m0["c"] > prev_mid and m0["c"] < m1["o"]):
+    pen_depth = Constants.REVERSAL_PIERCING_MIN_PENETRATION * m1["body"]
+    if (prior_down_1 and m1["is_red"] and m0["is_green"] and m0["o"] < m1["c"]
+            and m0["c"] > m1["body_low"] + pen_depth and m0["c"] < m1["o"]):
         return True, False, "Piercing Line"
-    if (prior_up_1 and m1["is_green"] and m0["is_red"] and m0["o"] >= m1["c"]
-            and m0["c"] < prev_mid and m0["c"] > m1["o"]):
+    if (prior_up_1 and m1["is_green"] and m0["is_red"] and m0["o"] > m1["c"]
+            and m0["c"] < m1["body_high"] - pen_depth and m0["c"] > m1["o"]):
         return False, True, "Dark Cloud Cover"
 
     tol = m0["rng"] * Constants.REVERSAL_TWEEZER_TOLERANCE_PCT
