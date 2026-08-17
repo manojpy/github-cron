@@ -2326,7 +2326,7 @@ class DataFetcher:
         )
         self.confirm_rate_limiter = RateLimitedFetcher(
             max_per_minute=cfg.CONFIRM_RATE_LIMIT_PER_MINUTE,
-            concurrency=2,
+            concurrency=5,
         )
         self.circuit_breaker = APICircuitBreaker(
             failure_threshold=cfg.CB_FAILURE_THRESHOLD,
@@ -2423,6 +2423,33 @@ class DataFetcher:
             await self.circuit_breaker.record_failure()
 
         return None
+
+async def fetch_daily_cached(self, sdb: "RedisStateStore", symbol: str, limit: int,
+                                   reference_time: int) -> Optional[Dict[str, Any]]:
+        day_key = get_utc_date_key(reference_time)
+        cache_key = f"daily_cache:{symbol}:{day_key}"
+        if not sdb.degraded:
+            try:
+                cached_raw = await sdb.get_metadata(cache_key)
+                if cached_raw:
+                    logger.debug(f"📅 Daily cache HIT | {symbol}")
+                    return json_loads(cached_raw)
+            except Exception as e:
+                logger.debug(f"Daily cache read failed for {symbol}, falling through to live fetch: {e}")
+
+        logger.debug(f"📅 Daily cache MISS | {symbol} — fetching live")
+        data = await self.fetch_candles(symbol, "D", limit, reference_time)
+
+        if data and data.get("result") and not sdb.degraded:
+            try:
+                utc_now = datetime.fromtimestamp(reference_time, tz=timezone.utc)
+                seconds_into_day = (utc_now - utc_now.replace(hour=0, minute=0, second=0, microsecond=0)).seconds
+                ttl = 86400 - seconds_into_day + 300  # +5min buffer past midnight
+                await sdb.set_metadata(cache_key, json_dumps(data), ttl=ttl)
+            except Exception as e:
+                logger.debug(f"Daily cache write failed for {symbol} (non-fatal): {e}")
+
+        return data
 
     async def fetch_tickers_batch(self) -> Dict[str, Dict[str, Optional[float]]]:
         self.fetch_stats.setdefault("tickers", {"success": 0, "failed": 0})
@@ -3830,18 +3857,17 @@ class RedisStateStore:
             f"get_metadata {key}",
             parser=lambda r: r if r else None,
         )
-
-    async def set_metadata(self, key: str, value: str, timeout: float = 2.0) -> None:
+    async def set_metadata(self, key: str, value: str, timeout: float = 2.0,
+                             ttl: Optional[int] = None) -> None:
         await self._safe_redis_op(
             lambda: self._redis.set(
                 f"{self.meta_prefix}{key}",
                 value,
-                ex=self.metadata_expiry_seconds
+                ex=ttl if ttl is not None else self.metadata_expiry_seconds
             ),
             timeout,
             f"set_metadata {key}",
         )
-
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not keys:
@@ -3935,9 +3961,18 @@ class RedisStateStore:
             except Exception as e:
                 logger_pair.warning(f"Failed to scan pending outcomes for {pair}: {e}")
                 return
-        for key in keys:
+        try:
+            async with self._redis.pipeline() as read_pipe:
+                for key in keys:
+                    read_pipe.get(key)
+                raw_values = await asyncio.wait_for(read_pipe.execute(), timeout=2.0)
+        except Exception as e:
+            logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
+            return
+        write_pipe = self._redis.pipeline()
+        pending_writes = 0
+        for key, raw in zip(keys, raw_values):
             try:
-                raw = await asyncio.wait_for(self._redis.get(key), timeout=2.0)
                 if raw is None:
                     continue
                 data = json_loads(raw)
@@ -3959,14 +3994,18 @@ class RedisStateStore:
 
                 alert_key = key.split(":")[-2]
                 stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
-                async with self._redis.pipeline() as pipe:
-                    pipe.hincrby(stats_key, "wins" if win else "losses", 1)
-                    pipe.expire(stats_key, cfg.STATE_EXPIRY_DAYS * 86400)
-                    pipe.delete(key)
-                    await asyncio.wait_for(pipe.execute(), timeout=2.0)
+                write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                write_pipe.expire(stats_key, cfg.STATE_EXPIRY_DAYS * 86400)
+                write_pipe.delete(key)
+                pending_writes += 1
             except Exception as e:
                 logger_pair.warning(f"Failed to resolve pending outcome {key}: {e}")
                 continue
+        if pending_writes:
+            try:
+                await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
+            except Exception as e:
+                logger_pair.warning(f"Failed to persist resolved outcomes for {pair}: {e}")
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
         """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""
@@ -6071,10 +6110,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         if cfg.ENABLE_WIN_RATE_FILTER:
                             direction = "buy" if gr.direction_is_buy else "sell"
-                            for _, _, alert_key in alerts_to_send:
-                                await sdb.record_pending_outcome(
+                            await asyncio.gather(*(
+                                sdb.record_pending_outcome(
                                     pair_name, alert_key, direction, ts_curr, close_curr
                                 )
+                                for _, _, alert_key in alerts_to_send
+                            ))             
                     else:
                         await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
@@ -6558,9 +6599,10 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         cfg.RMA_200_PERIOD * 3 
     )
     daily_limit = cfg.PIVOT_LOOKBACK_PERIOD if (cfg.ENABLE_PIVOT or cfg.ENABLE_CPR) else 0
-
+    fetch_daily = cfg.ENABLE_PIVOT or cfg.ENABLE_CPR
     pair_requests = []
     valid_tasks = []     
+    daily_symbols = []
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
         if not product_info:
@@ -6568,16 +6610,26 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
 
         symbol = product_info["symbol"]
         resolutions = [("15", limit_15m), ("5", limit_5m)]
-
-        if cfg.ENABLE_PIVOT or cfg.ENABLE_CPR:
-            resolutions.append(("D", daily_limit))
-
         pair_requests.append((symbol, resolutions))
         valid_tasks.append((pair_name, symbol))
+        if fetch_daily:
+            daily_symbols.append(symbol)
+    daily_task = None
+    if fetch_daily:
+        daily_task = asyncio.gather(*(
+            fetcher.fetch_daily_cached(state_db, symbol, daily_limit, reference_time)
+            for symbol in daily_symbols
+        ))
 
     all_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
+
+    if daily_task is not None:
+        daily_results = await daily_task
+        for symbol, daily_data in zip(daily_symbols, daily_results):
+            all_candles.setdefault(symbol, {})["D"] = daily_data
+
     fetch_elapsed = time.time() - fetch_start
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
 
@@ -7117,7 +7169,12 @@ async def run_once() -> bool:
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info(f"🌎 uvloop enabled | {JSON_BACKEND} enabled")
+try:
+    import hiredis  # noqa: F401
+    _hiredis_status = f"hiredis {hiredis.__version__} enabled"
+except ImportError:
+    _hiredis_status = "hiredis NOT found (redis-py using pure-python parser)"
+logger.info(f"🌎 uvloop enabled | orjson enabled | {_hiredis_status}")
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
