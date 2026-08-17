@@ -3522,6 +3522,27 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
         return False
     return True
 
+def cross_check_15m_against_5m(data_5m: PriceData, ts_curr: int, cached: CandleSnapshot,
+                               pair_name: str, logger_pair) -> Optional[bool]:
+    mask = (data_5m.ts >= ts_curr) & (data_5m.ts < ts_curr + 900)
+    idx = np.flatnonzero(mask)
+    if len(idx) < 3:
+        return None
+    agg_o = float(data_5m.open[idx[0]])
+    agg_h = float(np.max(data_5m.high[idx]))
+    agg_l = float(np.min(data_5m.low[idx]))
+    agg_c = float(data_5m.close[idx[-1]])
+    def _eq(a, b): return abs(a - b) <= max(1e-6 * max(abs(a), abs(b), 1.0), 1e-8)
+    ok = _eq(agg_o, cached.open) and _eq(agg_h, cached.high) \
+         and _eq(agg_l, cached.low) and _eq(agg_c, cached.close)
+    if not ok:
+        logger_pair.warning(
+            f"[{pair_name}] 15m/5m ENDPOINT MISMATCH (data-integrity, not repaint) | "
+            f"15m: O={cached.open:.4f} H={cached.high:.4f} L={cached.low:.4f} C={cached.close:.4f} | "
+            f"5m-agg: O={agg_o:.4f} H={agg_h:.4f} L={agg_l:.4f} C={agg_c:.4f} — suppressing"
+        )
+    return ok
+
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
     for pair in cfg.PAIRS:
@@ -4509,9 +4530,8 @@ class AlertDefinition(TypedDict):
     requires: List[str]
  
 ALERT_DEFINITIONS: List[AlertDefinition] = [
-
-    {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
-    {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<60) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
+    {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>40) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
     {"key":"ppo_zero_down","title":"🔴 PPO cross▼0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=0.0) and (ppo.get("curr",np.nan)<0.0) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
     {"key":"ppo_adaptive_up","title":"🟢 PPO cross▲adapt","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ctx.get("ppo_adaptive_threshold",0.11)) and (ppo.get("curr",np.nan)>ctx.get("ppo_adaptive_threshold",0.11)) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs adapt {ctx.get('ppo_adaptive_threshold',0):.3f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
@@ -4532,10 +4552,10 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand order block reversed'} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"ob_reversal_sell","title":"🔴🏛️ Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply order block reversed'} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]},
-    {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]}
+    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan)<0.20 or rsi.get("curr",np.nan)<60)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand order block reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ob_reversal_sell","title":"🔴🏛️ Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>-0.20 or rsi.get("curr",np.nan)>40)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply order block reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("strong_reversal_buy",False) and (ppo.get("curr",np.nan)<0.20 or rsi.get("curr",np.nan)<60)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]},
+    {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("strong_reversal_sell",False) and (ppo.get("curr",np.nan)>-0.20 or rsi.get("curr",np.nan)>40)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]}
 ] 
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
@@ -5828,6 +5848,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
     alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
+    data_5m: PriceData,
     confluence_score: Optional[float] = None,
     confluence_total: Optional[float] = None,
 ) -> Tuple[str, Dict[str, Any]]:
@@ -5906,6 +5927,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"claim was taken yet, so this will be re-attempted next run if the trigger persists."
                 )
                 alerts_to_send = []
+
+            if alerts_to_send:
+                cross_check = cross_check_15m_against_5m(
+                    data_5m, ts_curr, cached_snapshot, pair_name, logger_pair
+                )
+                if cross_check is False:
+                    alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
             required = min(cfg.CONFLUENCE_MIN_SCORE, confluence_total)
@@ -6452,6 +6480,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         return await _apply_and_dispatch_alerts(
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
             correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
+            data_5m,
             confluence_score=confluence_score,
             confluence_total=confluence_total,
         )
@@ -6742,7 +6771,6 @@ async def run_once() -> bool:
     lock_extension_task: Optional[asyncio.Task] = None
     alerts_sent_lock = asyncio.Lock()
 
-    
     products_map: Optional[Dict[str, dict]] = None
     pairs_to_process: List[str] = []
     
