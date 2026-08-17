@@ -3320,14 +3320,6 @@ class GateResult:
     rma_cloud_fast_curr: float
     rma_cloud_ok_buy: bool; rma_cloud_ok_sell: bool
 
-    # -- momentum-direction confluence votes (rising/falling vs prior bar) --
-    ppo_gate_momentum_ok_buy: Optional[bool] = None
-    ppo_gate_momentum_ok_sell: Optional[bool] = None
-    rsi_guard_momentum_ok_buy: Optional[bool] = None
-    rsi_guard_momentum_ok_sell: Optional[bool] = None
-    rma_cloud_momentum_ok_buy: Optional[bool] = None
-    rma_cloud_momentum_ok_sell: Optional[bool] = None
-
     # -- trend gate combination --
     trend_gate_ok_buy: bool; trend_gate_ok_sell: bool
 
@@ -3377,6 +3369,14 @@ class GateResult:
     atr_pctl_ok: Optional[bool] = None
     volume_pctl: Optional[float] = None
     volume_pctl_ok: Optional[bool] = None
+
+    # -- momentum-direction confluence votes (rising/falling vs prior bar) --
+    ppo_gate_momentum_ok_buy: Optional[bool] = None
+    ppo_gate_momentum_ok_sell: Optional[bool] = None
+    rsi_guard_momentum_ok_buy: Optional[bool] = None
+    rsi_guard_momentum_ok_sell: Optional[bool] = None
+    rma_cloud_momentum_ok_buy: Optional[bool] = None
+    rma_cloud_momentum_ok_sell: Optional[bool] = None 
 
 CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
