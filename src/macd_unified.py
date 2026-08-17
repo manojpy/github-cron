@@ -2424,7 +2424,7 @@ class DataFetcher:
 
         return None
 
-async def fetch_daily_cached(self, sdb: "RedisStateStore", symbol: str, limit: int,
+    async def fetch_daily_cached(self, sdb: "RedisStateStore", symbol: str, limit: int,
                                    reference_time: int) -> Optional[Dict[str, Any]]:
         day_key = get_utc_date_key(reference_time)
         cache_key = f"daily_cache:{symbol}:{day_key}"
