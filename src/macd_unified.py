@@ -287,6 +287,14 @@ class BotConfig(BaseModel):
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_ADAPTIVE_TARGET_PCTL: float = Field(default=60.0, ge=1.0, le=99.0, description="ADX threshold = this percentile of the pair's own trailing ADX history")
+    ENABLE_ADX_STRENGTH_VOTE: bool = Field(default=False, description="Confluence vote: ADX in top ADX_STRENGTH_PCTL of its own history — a stricter secondary bar on top of the existing adx_ok gate, not a duplicate of it")
+    ADX_STRENGTH_PCTL: float = Field(default=80.0, ge=1.0, le=99.0, description="Percentile threshold for the adx_strength confluence vote. Should be set meaningfully above ADX_ADAPTIVE_TARGET_PCTL so this vote and the base 'adx' vote aren't answering the same question")
+    ENABLE_ATR_PCTL_VOTE: bool = Field(default=False, description="Confluence vote: current volatility (ATR) in top ATR_PCTL_VOTE_MIN of its own history — a volatility-regime check, distinct from the existing rvol vote which checks short/long ATR expansion trend")
+    ATR_PCTL_VOTE_MIN: float = Field(default=0.60, ge=0.0, le=1.0, description="Min ATR percentile rank (0-1) required for the atr_percentile confluence vote to pass")
+    ENABLE_VOLUME_PCTL_VOTE: bool = Field(default=False, description="Confluence vote: current volume in top VOLUME_PCTL_VOTE_MIN of its own trailing history — more robust than the existing EMA-based volume_above_ema_ok check, which a single spike can drag upward for several bars")
+    VOLUME_PCTL_VOTE_MIN: float = Field(default=0.70, ge=0.0, le=1.0, description="Min volume percentile rank (0-1) required for the volume_percentile confluence vote to pass")
+    VOLUME_PCTL_LOOKBACK: int = Field(default=96, ge=20, le=500, description="Rolling window (in 15m candles) for volume percentile ranking")
+    VOLUME_PCTL_MIN_HISTORY: int = Field(default=50, ge=10, le=400, description="Min warm-up samples before volume percentile activates; fails open (vote excluded) until then")
     ADX_ADAPTIVE_BAND_WIDTH: float = Field(default=0.0, ge=0.0, le=40.0)
     ADX_ADAPTIVE_FALLBACK: float = Field(default=18.0, ge=5.0, le=50.0, description="ADX threshold used during warm-up or when ATR_ADAPTIVE_ENABLED=False")
     PPO_ADAPTIVE_CALM: float = Field(default=0.08, ge=0.01, le=1.0, description="PPO cross threshold in calm regime")
@@ -354,7 +362,17 @@ class BotConfig(BaseModel):
                     f'ATR_PCTL_MIN_HISTORY ({self.ATR_PCTL_MIN_HISTORY}) must be < '
                     f'ATR_PCTL_LOOKBACK ({self.ATR_PCTL_LOOKBACK})'
                 )
-
+        if self.ENABLE_VOLUME_PCTL_VOTE and self.VOLUME_PCTL_MIN_HISTORY >= self.VOLUME_PCTL_LOOKBACK:
+            raise ValueError(
+                f'VOLUME_PCTL_MIN_HISTORY ({self.VOLUME_PCTL_MIN_HISTORY}) must be < '
+                f'VOLUME_PCTL_LOOKBACK ({self.VOLUME_PCTL_LOOKBACK})'
+            )
+        if self.ENABLE_ADX_STRENGTH_VOTE and self.ADX_STRENGTH_PCTL <= self.ADX_ADAPTIVE_TARGET_PCTL:
+            raise ValueError(
+                f'ADX_STRENGTH_PCTL ({self.ADX_STRENGTH_PCTL}) should be > '
+                f'ADX_ADAPTIVE_TARGET_PCTL ({self.ADX_ADAPTIVE_TARGET_PCTL}), otherwise the '
+                f'adx_strength vote duplicates the existing adx gate instead of adding a stricter bar'
+            )
             if self.ADAPTIVE_MULT_CALM >= self.ADAPTIVE_MULT_VOLATILE:
                 raise ValueError(
                     f'ADAPTIVE_MULT_CALM ({self.ADAPTIVE_MULT_CALM}) must be < '
@@ -1862,6 +1880,42 @@ def get_atr_percentile_smoothed(atr_long_arr: np.ndarray, i15: int, cfg: BotConf
         ema = alpha * val + (1.0 - alpha) * ema
     return ema
 
+def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: int,
+                             allow_zero: bool = False) -> Optional[float]:
+    start = i - lookback
+    if start < 0:
+        return None
+
+    window = arr[start:i]
+    valid = window[~np.isnan(window)]
+    if len(valid) < min_history:
+        return None
+
+    current = arr[i]
+    if np.isnan(current) or (not allow_zero and current <= 0):
+        return None
+
+    n = len(valid)
+    count_lt = np.sum(valid < current)
+    count_eq = np.sum(valid == current)
+    return (count_lt + 0.5 * count_eq) / n
+
+def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+    """Percentile rank (0.0=calmest .. 1.0=most volatile) of current long-ATR
+    against its trailing ATR_PCTL_LOOKBACK window. None if insufficient history."""
+    return _array_percentile_rank(atr_long_arr, i15, cfg.ATR_PCTL_LOOKBACK, cfg.ATR_PCTL_MIN_HISTORY)
+
+
+def get_adx_percentile(adx_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+    """Percentile rank (0.0=weakest .. 1.0=strongest) of current ADX against its
+    trailing ATR_PCTL_LOOKBACK window (reuses the same lookback as ATR for consistency)."""
+    return _array_percentile_rank(adx_arr, i15, cfg.ATR_PCTL_LOOKBACK, cfg.ATR_PCTL_MIN_HISTORY, allow_zero=True)
+
+def get_volume_percentile(volume_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+    """Percentile rank (0.0=quietest .. 1.0=busiest) of current volume against its
+    trailing VOLUME_PCTL_LOOKBACK window."""
+    return _array_percentile_rank(volume_arr, i15, cfg.VOLUME_PCTL_LOOKBACK, cfg.VOLUME_PCTL_MIN_HISTORY)
+
 def _scale_by_pctl(pctl: Optional[float], calm: float, volatile: float, fallback_pctl: float = 0.5) -> float:
     """Linearly scales a [calm, volatile] range by pctl. Falls back to fallback_pctl
     (midpoint by default) when pctl is unavailable, so callers always get a usable value."""
@@ -3273,6 +3327,14 @@ class GateResult:
     momentum_count: int
     volatility_filter_ok: bool
 
+    # -- percentile-rank confluence votes (optional, all default-disabled) --
+    adx_pctl: Optional[float] = None
+    adx_strength_ok: Optional[bool] = None
+    atr_pctl: Optional[float] = None
+    atr_pctl_ok: Optional[bool] = None
+    volume_pctl: Optional[float] = None
+    volume_pctl_ok: Optional[bool] = None
+
     # -- CPR --
     cpr_ok: bool; nr_cpr: float
     effective_cpr_ok: bool
@@ -3317,7 +3379,11 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "cpr": 1.0,
     "oi_funding": 2.0,
     "order_block": 2.5,
+    "adx_strength": 1.0,
+    "atr_percentile": 1.0,
+    "volume_percentile": 1.0,
 }
+
 def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
     exclude = exclude or set()
     score = 0.0
@@ -3377,6 +3443,21 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
         w = CONFLUENCE_WEIGHTS["cpr"]
         total += w
         if gr.effective_cpr_ok: score += w
+
+    if cfg.ENABLE_ADX_STRENGTH_VOTE and gr.adx_strength_ok is not None and "adx_strength" not in exclude:
+        w = CONFLUENCE_WEIGHTS["adx_strength"]
+        total += w
+        if gr.adx_strength_ok: score += w
+
+    if cfg.ENABLE_ATR_PCTL_VOTE and gr.atr_pctl_ok is not None and "atr_percentile" not in exclude:
+        w = CONFLUENCE_WEIGHTS["atr_percentile"]
+        total += w
+        if gr.atr_pctl_ok: score += w
+
+    if cfg.ENABLE_VOLUME_PCTL_VOTE and gr.volume_pctl_ok is not None and "volume_percentile" not in exclude:
+        w = CONFLUENCE_WEIGHTS["volume_percentile"]
+        total += w
+        if gr.volume_pctl_ok: score += w
 
     if cfg.ENABLE_OI_FUNDING_FILTER and oi_funding_ok is not None and "oi_funding" not in exclude:
         w = CONFLUENCE_WEIGHTS["oi_funding"]
@@ -5172,11 +5253,30 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             volume_above_ema_ok,   # 4. Volume > EMA(volume)
             body_conviction_ok,    # 5. Candle body conviction (|close-open|/range)
         ]
+
         momentum_count = sum(momentum_conditions)
 
         any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
         volatility_filter_ok = (not any_vol_feature_enabled) or (momentum_count >= 3)
         rvol_ok = volatility_filter_ok
+
+        adx_pctl = None
+        adx_strength_ok = None
+        if cfg.ENABLE_ADX_STRENGTH_VOTE:
+            adx_pctl = get_adx_percentile(adx_arr, i15, cfg)
+            adx_strength_ok = (adx_pctl is not None) and (adx_pctl * 100.0 >= cfg.ADX_STRENGTH_PCTL)
+
+        atr_pctl = None
+        atr_pctl_ok = None
+        if cfg.ENABLE_ATR_PCTL_VOTE:
+            atr_pctl = get_atr_percentile(atr_long_arr, i15, cfg)
+            atr_pctl_ok = (atr_pctl is not None) and (atr_pctl >= cfg.ATR_PCTL_VOTE_MIN)
+
+        volume_pctl = None
+        volume_pctl_ok = None
+        if cfg.ENABLE_VOLUME_PCTL_VOTE:
+            volume_pctl = get_volume_percentile(data_15m.volume, i15, cfg)
+            volume_pctl_ok = (volume_pctl is not None) and (volume_pctl >= cfg.VOLUME_PCTL_VOTE_MIN)
 
         if not np.isnan(prev_day_close) and prev_day_close > 0:
             pct_move_from_prev_close = abs(close_curr - prev_day_close) / prev_day_close * 100.0
@@ -5421,6 +5521,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             adx_val=adx_val, adx_adaptive_threshold=adx_adaptive_threshold, adx_ok=adx_ok,
             rvol_bypass_ok=rvol_bypass_ok, rvol_ok=rvol_ok, adaptive_rvol_check=adaptive_rvol_check,
             momentum_count=momentum_count, volatility_filter_ok=volatility_filter_ok,
+            adx_pctl=adx_pctl, adx_strength_ok=adx_strength_ok,
+            atr_pctl=atr_pctl, atr_pctl_ok=atr_pctl_ok,
+            volume_pctl=volume_pctl, volume_pctl_ok=volume_pctl_ok,
             cpr_ok=cpr_ok, nr_cpr=nr_cpr, effective_cpr_ok=effective_cpr_ok,
             cpr_adaptive_min_pct_move=cpr_adaptive_min_pct_move, move_from_prev_close_ok=move_from_prev_close_ok,
             ppo_adaptive_threshold=ppo_adaptive_threshold,
