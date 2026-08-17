@@ -7165,16 +7165,15 @@ async def run_once() -> bool:
             logger_run.debug(f"GC error: {e}")
 
         logger_run.debug("🧹 Resource cleanup finished")
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-try:
-    import hiredis  # noqa: F401
-    _hiredis_status = f"hiredis {hiredis.__version__} enabled"
-except ImportError:
-    _hiredis_status = "hiredis NOT found (redis-py using pure-python parser)"
-logger.info(f"🌎 uvloop enabled | orjson enabled | {_hiredis_status}")
+    try:
+        import hiredis
+        _hiredis_status = f"hiredis {hiredis.__version__} enabled"
+    except ImportError:
+        _hiredis_status = "hiredis NOT found (redis-py using pure-python parser)"
+    logger.info(f"🌎 uvloop enabled | orjson enabled | {_hiredis_status}")
 except ImportError:
     logger.info(f"❌ uvloop not available (using default) | {JSON_BACKEND} enabled")
 
