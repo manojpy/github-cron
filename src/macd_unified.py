@@ -2428,24 +2428,24 @@ class DataFetcher:
                                    reference_time: int) -> Optional[Dict[str, Any]]:
         day_key = get_utc_date_key(reference_time)
         cache_key = f"daily_cache:{symbol}:{day_key}"
-        if not sdb.degraded:
-            try:
-                cached_raw = await sdb.get_metadata(cache_key)
-                if cached_raw:
-                    logger.debug(f"📅 Daily cache HIT | {symbol}")
-                    return json_loads(cached_raw)
-            except Exception as e:
-                logger.debug(f"Daily cache read failed for {symbol}, falling through to live fetch: {e}")
 
         logger.debug(f"📅 Daily cache MISS | {symbol} — fetching live")
         data = await self.fetch_candles(symbol, "D", limit, reference_time)
 
         if data and data.get("result") and not sdb.degraded:
             try:
-                utc_now = datetime.fromtimestamp(reference_time, tz=timezone.utc)
-                seconds_into_day = (utc_now - utc_now.replace(hour=0, minute=0, second=0, microsecond=0)).seconds
-                ttl = 86400 - seconds_into_day + 300  # +5min buffer past midnight
-                await sdb.set_metadata(cache_key, json_dumps(data), ttl=ttl)
+                t = data["result"].get("t") or []
+                last_ts = int(t[-1]) if t else 0
+                if last_ts > 1_000_000_000_000:      # ms → s (same rule as parse_candles_to_numpy)
+                    last_ts //= 1000
+                yesterday_num = (reference_time // 86400) - 1
+                if last_ts and (last_ts // 86400) >= yesterday_num:
+                    utc_now = datetime.fromtimestamp(reference_time, tz=timezone.utc)
+                    seconds_into_day = (utc_now - utc_now.replace(hour=0, minute=0, second=0, microsecond=0)).seconds
+                    ttl = 86400 - seconds_into_day + 300  # +5min buffer past midnight
+                    await sdb.set_metadata(cache_key, json_dumps(data), ttl=ttl)
+                else:
+                    logger_main.info(f"📅 Daily cache WRITE SKIPPED for {symbol}: yesterday's bar not in response yet")
             except Exception as e:
                 logger.debug(f"Daily cache write failed for {symbol} (non-fatal): {e}")
 
@@ -6614,20 +6614,41 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         valid_tasks.append((pair_name, symbol))
         if fetch_daily:
             daily_symbols.append(symbol)
-    daily_task = None
-    if fetch_daily:
-        daily_task = asyncio.gather(*(
-            fetcher.fetch_daily_cached(state_db, symbol, daily_limit, reference_time)
-            for symbol in daily_symbols
-        ))
 
-    all_candles = await fetcher.fetch_all_candles_truly_parallel(
+    all_candles = {}
+    daily_task = None
+    miss_symbols = []
+
+    if fetch_daily and daily_symbols:
+        day_key = get_utc_date_key(reference_time)
+        cache_keys = [f"daily_cache:{sym}:{day_key}" for sym in daily_symbols]
+        cached_map = await state_db.batch_get_metadata(cache_keys)
+
+        for sym, ck in zip(daily_symbols, cache_keys):
+            raw = cached_map.get(ck)
+            if raw:
+                all_candles.setdefault(sym, {})["D"] = json_loads(raw)
+            else:
+                miss_symbols.append(sym)
+
+        if miss_symbols:
+            daily_task = asyncio.gather(*(
+                fetcher.fetch_daily_cached(state_db, sym, daily_limit, reference_time)
+                for sym in miss_symbols
+            ), return_exceptions=True)
+
+    live_candles = await fetcher.fetch_all_candles_truly_parallel(
         pair_requests, reference_time
     )
+    for sym, res in live_candles.items():
+        all_candles.setdefault(sym, {}).update(res)
 
     if daily_task is not None:
         daily_results = await daily_task
-        for symbol, daily_data in zip(daily_symbols, daily_results):
+        for symbol, daily_data in zip(miss_symbols, daily_results):
+            if isinstance(daily_data, Exception):
+                logger_main.warning(f"Daily fetch failed for {symbol}: {daily_data}")
+                daily_data = None
             all_candles.setdefault(symbol, {})["D"] = daily_data
 
     fetch_elapsed = time.time() - fetch_start
