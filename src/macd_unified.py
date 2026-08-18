@@ -1647,22 +1647,20 @@ def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: 
                 ob = find_pine_ob(h, l, c, atr200, i, ibtm_x, is_bullish_break=False)
                 if ob:
                     active_ob_list.append(ob)
-                
-        # Swing Bullish Break
+
+        # Swing Bullish Break (Pine applies no concordant filter at swing level — only internal)
         if not np.isnan(top_y) and top_cross and c_curr > top_y and c_prev <= top_y:
-            if _bull_concordant(i):
-                top_cross = False
-                ob = find_pine_ob(h, l, c, atr200, i, top_x, is_bullish_break=True)
-                if ob:
-                    active_ob_list.append(ob)
-                
-        # Swing Bearish Break
+            top_cross = False
+            ob = find_pine_ob(h, l, c, atr200, i, top_x, is_bullish_break=True)
+            if ob:
+                active_ob_list.append(ob)
+
+        # Swing Bearish Break (Pine applies no concordant filter at swing level — only internal)
         if not np.isnan(btm_y) and btm_cross and c_curr < btm_y and c_prev >= btm_y:
-            if _bear_concordant(i):
-                btm_cross = False
-                ob = find_pine_ob(h, l, c, atr200, i, btm_x, is_bullish_break=False)
-                if ob:
-                    active_ob_list.append(ob)
+            btm_cross = False
+            ob = find_pine_ob(h, l, c, atr200, i, btm_x, is_bullish_break=False)
+            if ob:
+                active_ob_list.append(ob)
             
         # Invalidate broken OBs (Pine logic: close breaks the opposite boundary)
         surviving = []
