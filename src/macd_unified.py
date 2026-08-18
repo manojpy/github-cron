@@ -248,9 +248,8 @@ class BotConfig(BaseModel):
     OI_DIVERGENCE_MIN_OI_FALL_PCT: float = Field(default=2.0, ge=0.0, le=100.0, description="Min OI decline (%) over the lookback window to count as 'falling with conviction' (closing/covering, not new positioning)")
     ENABLE_OB_GATE: bool = Field(default=False, description="Add institutional order-block (supply/demand) reversal on 15m as a confluence vote. Abstains (None) unless a fresh, first-touch reversal off an unmitigated zone confirms this cycle")
     OB_FILTER_CONFLUENCE: bool = Field(default=False) 
-    OB_LOOKBACK_CANDLES: int = Field(default=96, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
+    OB_LOOKBACK_CANDLES: int = Field(default=50, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
     OB_IMPULSE_LOOKAHEAD: int = Field(default=3, ge=1, le=10, description="Candles after a candidate base candle checked for the impulsive displacement that confirms it as an order block")
-    OB_IMPULSE_ATR_MULT: float = Field(default=1.5, ge=0.1, le=10.0, description="Min displacement away from the base candle, in ATR multiples (measured at formation), required to qualify as an institutional impulse") 
     ENABLE_OB_PREMIUM_DISCOUNT_FILTER: bool = Field(default=False, description="Only accept demand-zone OB reversals below the 50% equilibrium of the OB_LOOKBACK_CANDLES dealing range (discount), and supply-zone reversals above it (premium). Zones on the wrong side are skipped entirely.")
     OUTCOME_LOOKAHEAD_CANDLES: int = Field(default=8, ge=1, le=96) 
     OUTCOME_FAVORABLE_MOVE_PCT: float = Field(default=0.3, ge=0.01, le=10.0) 
@@ -1681,15 +1680,16 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     
     zones = calculate_pine_order_blocks(
         o, h, l, c, atr200,
-        swing_len=50,
+        swing_len=cfg_obj.OB_LOOKBACK_CANDLES,
         internal_len=5,
         filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE, 
     )
     
     equilibrium = None
-    if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > 50:
-        range_high = np.max(h[i15 - 50:i15])
-        range_low  = np.min(l[i15 - 50:i15])
+    lookback = cfg_obj.OB_LOOKBACK_CANDLES
+    if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > lookback:
+        range_high = np.max(h[i15 - lookback:i15])
+        range_low  = np.min(l[i15 - lookback:i15])
         equilibrium = (range_high + range_low) / 2.0
         
     ob_ok_buy = ob_ok_sell = None
@@ -4777,8 +4777,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan)<0.20 or rsi.get("curr",np.nan)<60)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand order block reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"ob_reversal_sell","title":"🔴🏛️ Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>-0.20 or rsi.get("curr",np.nan)>40)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply order block reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ob_reversal_buy","title":"🟢🏛️ Order Block Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan)<0.20 or rsi.get("curr",np.nan)<60)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand order block reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"ob_reversal_sell","title":"🔴🏛️ Order Block Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan)>-0.20 or rsi.get("curr",np.nan)>40)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply order block reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("strong_reversal_buy",False) and (ppo.get("curr",np.nan)<0.20 or rsi.get("curr",np.nan)<60)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("strong_reversal_sell",False) and (ppo.get("curr",np.nan)>-0.20 or rsi.get("curr",np.nan)>40)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]}
 ] 
@@ -5938,6 +5938,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "ob_gate_reason": ob_gate_reason,
             "strong_reversal_buy": strong_reversal_buy, "strong_reversal_sell": strong_reversal_sell,
             "reversal_pattern_name": reversal_pattern_name,
+            "reversal_bullish": reversal_bullish,
+            "reversal_bearish": reversal_bearish,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -6014,10 +6016,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not is_valid_for_buy and alert_key != "strong_reversal_buy":
+                if not is_valid_for_buy and alert_key not in ("strong_reversal_buy", "ob_reversal_buy"):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
                     continue
+       
             if alert_key in SELL_ALERT_KEYS:
                 if not is_red:
                     logger_pair.debug(
@@ -6025,7 +6028,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         f"O={gr.open_curr:.2f} C={close_curr:.2f}"
                     )
                     continue
-                if not is_valid_for_sell and alert_key != "strong_reversal_sell":
+
+
+                if not is_valid_for_sell and alert_key not in ("strong_reversal_sell", "ob_reversal_sell"):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
                     continue
