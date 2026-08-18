@@ -5164,11 +5164,10 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         adaptive_threshold = None
         if cfg.ATR_ADAPTIVE_ENABLED:
-     
-        shared_smoothed_pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
-        ppo_adaptive_threshold = get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
-        rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
-        cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+            shared_smoothed_pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
+            ppo_adaptive_threshold = get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+            rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+            cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
 
         volume_curr = data_15m.volume[i15]
         volume_ema_curr = volume_ema_arr[i15]
