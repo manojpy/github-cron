@@ -4236,37 +4236,30 @@ class RedisStateStore:
             logger.warning(f"Failed to read win rate for {pair}:{alert_key}: {e}")
             return None, 0
 
-async def batch_get_alert_win_rates(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], int]]:
-    if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not alert_keys:
-        return {k: (None, 0) for k in alert_keys}
-
-    try:
-        async with self._redis.pipeline() as pipe:
-            for ak in alert_keys:
-                pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
-            raw_results = await asyncio.wait_for(pipe.execute(), timeout=timeout)
-
-        out: Dict[str, Tuple[Optional[float], int]] = {}
-        for ak, data in zip(alert_keys, raw_results):
-            # hgetall returns {} for missing keys, but pipeline may return None
-            if not data:
-                out[ak] = (None, 0)
-                continue
-            wins = int(data.get("wins", 0))
-            losses = int(data.get("losses", 0))
-            total = wins + losses
-            if total < cfg.MIN_WIN_RATE_SAMPLE:
-                out[ak] = (None, total)
-            else:
-                out[ak] = (wins / total, total)
-        return out
-
-    except Exception as e:
-        logger.warning(
-            f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}"
-        )
-        return {k: (None, 0) for k in alert_keys}
-
+    async def batch_get_alert_win_rates(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], int]]:
+        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not alert_keys:
+            return {k: (None, 0) for k in alert_keys}
+        try:
+            async with self._redis.pipeline() as pipe:
+                for ak in alert_keys:
+                    pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
+                raw_results = await asyncio.wait_for(pipe.execute(), timeout=timeout)
+            out: Dict[str, Tuple[Optional[float], int]] = {}
+            for ak, data in zip(alert_keys, raw_results):
+                if not data:
+                    out[ak] = (None, 0)
+                    continue
+                wins = int(data.get("wins", 0))
+                losses = int(data.get("losses", 0))
+                total = wins + losses
+                if total < cfg.MIN_WIN_RATE_SAMPLE:
+                    out[ak] = (None, total)
+                else:
+                    out[ak] = (wins / total, total)
+            return out
+        except Exception as e:
+            logger.warning(f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}")
+            return {k: (None, 0) for k in alert_keys}
 
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
