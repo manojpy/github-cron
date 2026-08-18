@@ -2170,8 +2170,8 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
                     continue
-       
-                 if resp.status >= 400:
+
+                if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
