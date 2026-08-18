@@ -3388,8 +3388,6 @@ class GateResult:
     vwap_momentum_ok_buy: Optional[bool] = None
     vwap_momentum_ok_sell: Optional[bool] = None
 
-
-
 CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
     "ichimoku_cloud": 2.0,
