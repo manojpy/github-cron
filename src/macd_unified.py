@@ -247,7 +247,7 @@ class BotConfig(BaseModel):
     OI_DIVERGENCE_MIN_PRICE_ROC_PCT: float = Field(default=0.3, ge=0.0, le=50.0, description="Min absolute price move (%) over the lookback window before divergence logic applies at all")
     OI_DIVERGENCE_MIN_OI_FALL_PCT: float = Field(default=2.0, ge=0.0, le=100.0, description="Min OI decline (%) over the lookback window to count as 'falling with conviction' (closing/covering, not new positioning)")
     ENABLE_OB_GATE: bool = Field(default=False, description="Add institutional order-block (supply/demand) reversal on 15m as a confluence vote. Abstains (None) unless a fresh, first-touch reversal off an unmitigated zone confirms this cycle")
-    ENABLE_OB_CONFLUENCE_FILTER: bool = Field(default=False)
+    OB_FILTER_CONFLUENCE: bool = Field(default=False) 
     OB_LOOKBACK_CANDLES: int = Field(default=96, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
     OB_IMPULSE_LOOKAHEAD: int = Field(default=3, ge=1, le=10, description="Candles after a candidate base candle checked for the impulsive displacement that confirms it as an order block")
     OB_IMPULSE_ATR_MULT: float = Field(default=1.5, ge=0.1, le=10.0, description="Min displacement away from the base candle, in ATR multiples (measured at formation), required to qualify as an institutional impulse") 
@@ -1685,7 +1685,7 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         o, h, l, c, atr200,
         swing_len=50,
         internal_len=5,
-        filter_confluence=cfg_obj.ENABLE_OB_CONFLUENCE_FILTER,
+        filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE, 
     )
     
     equilibrium = None
