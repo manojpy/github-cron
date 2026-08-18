@@ -247,6 +247,7 @@ class BotConfig(BaseModel):
     OI_DIVERGENCE_MIN_PRICE_ROC_PCT: float = Field(default=0.3, ge=0.0, le=50.0, description="Min absolute price move (%) over the lookback window before divergence logic applies at all")
     OI_DIVERGENCE_MIN_OI_FALL_PCT: float = Field(default=2.0, ge=0.0, le=100.0, description="Min OI decline (%) over the lookback window to count as 'falling with conviction' (closing/covering, not new positioning)")
     ENABLE_OB_GATE: bool = Field(default=False, description="Add institutional order-block (supply/demand) reversal on 15m as a confluence vote. Abstains (None) unless a fresh, first-touch reversal off an unmitigated zone confirms this cycle")
+    ENABLE_OB_CONFLUENCE_FILTER: bool = Field(default=False)
     OB_LOOKBACK_CANDLES: int = Field(default=96, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
     OB_IMPULSE_LOOKAHEAD: int = Field(default=3, ge=1, le=10, description="Candles after a candidate base candle checked for the impulsive displacement that confirms it as an order block")
     OB_IMPULSE_ATR_MULT: float = Field(default=1.5, ge=0.1, le=10.0, description="Min displacement away from the base candle, in ATR multiples (measured at formation), required to qualify as an institutional impulse") 
@@ -1513,17 +1514,9 @@ class OrderBlock:
 
 def find_pine_ob(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr200: np.ndarray, 
                    break_idx: int, pivot_idx: int, is_bullish_break: bool) -> Optional[OrderBlock]:
-    """
-    Translates Pine Script's ob_coord logic.
-    Scans the bars between the pivot confirmation and the structure break
-    to find the origin candle (highest high for bearish, lowest low for bullish)
-    that meets the ATR volatility filter.
-    """
     best_val = -np.inf if not is_bullish_break else np.inf
     best_idx = -1
     
-    # Pine loop: i = 1 to (n - loc) - 1
-    # n is break_idx, loc is pivot_idx
     for i in range(1, break_idx - pivot_idx):
         bar_idx = break_idx - i
         candle_range = h[bar_idx] - l[bar_idx]
@@ -1548,8 +1541,10 @@ def find_pine_ob(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr200: np.ndarray
         )
     return None
 
-def calculate_pine_order_blocks(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr200: np.ndarray, 
-                                swing_len: int = 50, internal_len: int = 5) -> List[OrderBlock]:
+def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
+                                atr200: np.ndarray, 
+                                swing_len: int = 50, internal_len: int = 5,
+                                filter_confluence: bool = False) -> List[OrderBlock]:
     n = len(h)
     if n < max(swing_len, internal_len) + 2:
         return []
@@ -1557,15 +1552,15 @@ def calculate_pine_order_blocks(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr
     def get_swings(length):
         tops = []
         btms = []
-        os = -1  # -1 = unknown, 0 = top, 1 = btm
+        os = 0
         for i in range(length, n):
-            window_h = h[i-length:i]
-            window_l = l[i-length:i]
+            window_h = h[i - length + 1:i + 1]
+            window_l = l[i - length + 1:i + 1]
             upper = np.max(window_h)
             lower = np.min(window_l)
             
-            h_len = h[i-length]
-            l_len = l[i-length]
+            h_len = h[i - length]
+            l_len = l[i - length]
             
             prev_os = os
             if h_len > upper:
@@ -1573,10 +1568,10 @@ def calculate_pine_order_blocks(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr
             elif l_len < lower:
                 os = 1
                 
-            if os == 0 and prev_os != 0 and prev_os != -1:
-                tops.append((i, h_len, i-length))  # (confirm_idx, price, pivot_idx)
-            elif os == 1 and prev_os != 1 and prev_os != -1:
-                btms.append((i, l_len, i-length))
+            if os == 0 and prev_os != 0:
+                tops.append((i, h_len, i - length))  # (confirm_idx, price, pivot_idx)
+            elif os == 1 and prev_os != 1:
+                btms.append((i, l_len, i - length))
         return tops, btms
 
     swing_tops, swing_btms = get_swings(swing_len)
@@ -1621,31 +1616,53 @@ def calculate_pine_order_blocks(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr
             ibtm_cross = True
             
         c_curr = c[i]
-        c_prev = c[i-1]
+        c_prev = c[i - 1]
+        
+        def _bull_concordant(idx: int) -> bool:
+            if not filter_confluence:
+                return True
+            upper_wick = h[idx] - max(c[idx], o[idx])
+            lower_wick_alt = min(c[idx], o[idx] - l[idx])
+            return upper_wick > lower_wick_alt
+
+        def _bear_concordant(idx: int) -> bool:
+            if not filter_confluence:
+                return True
+            upper_wick = h[idx] - max(c[idx], o[idx])
+            lower_wick_alt = min(c[idx], o[idx] - l[idx])
+            return upper_wick < lower_wick_alt
         
         # Internal Bullish Break
         if not np.isnan(itop_y) and itop_cross and c_curr > itop_y and c_prev <= itop_y:
-            itop_cross = False
-            ob = find_pine_ob(h, l, c, atr200, i, itop_x, is_bullish_break=True)
-            if ob: active_ob_list.append(ob)
+            if _bull_concordant(i):
+                itop_cross = False
+                ob = find_pine_ob(h, l, c, atr200, i, itop_x, is_bullish_break=True)
+                if ob:
+                    active_ob_list.append(ob)
                 
         # Internal Bearish Break
         if not np.isnan(ibtm_y) and ibtm_cross and c_curr < ibtm_y and c_prev >= ibtm_y:
-            ibtm_cross = False
-            ob = find_pine_ob(h, l, c, atr200, i, ibtm_x, is_bullish_break=False)
-            if ob: active_ob_list.append(ob)
+            if _bear_concordant(i):
+                ibtm_cross = False
+                ob = find_pine_ob(h, l, c, atr200, i, ibtm_x, is_bullish_break=False)
+                if ob:
+                    active_ob_list.append(ob)
                 
         # Swing Bullish Break
         if not np.isnan(top_y) and top_cross and c_curr > top_y and c_prev <= top_y:
-            top_cross = False
-            ob = find_pine_ob(h, l, c, atr200, i, top_x, is_bullish_break=True)
-            if ob: active_ob_list.append(ob)
+            if _bull_concordant(i):
+                top_cross = False
+                ob = find_pine_ob(h, l, c, atr200, i, top_x, is_bullish_break=True)
+                if ob:
+                    active_ob_list.append(ob)
                 
         # Swing Bearish Break
         if not np.isnan(btm_y) and btm_cross and c_curr < btm_y and c_prev >= btm_y:
-            btm_cross = False
-            ob = find_pine_ob(h, l, c, atr200, i, btm_x, is_bullish_break=False)
-            if ob: active_ob_list.append(ob)
+            if _bear_concordant(i):
+                btm_cross = False
+                ob = find_pine_ob(h, l, c, atr200, i, btm_x, is_bullish_break=False)
+                if ob:
+                    active_ob_list.append(ob)
             
         # Invalidate broken OBs (Pine logic: close breaks the opposite boundary)
         surviving = []
@@ -1664,13 +1681,17 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     # 1. Calculate ATR 200 for the Pine OB volatility filter
     atr200 = calculate_atr_rma(h, l, c, 200)
     
-    # 2. Extract Pine-style Market Structure Order Blocks
-    zones = calculate_pine_order_blocks(h, l, c, atr200, swing_len=50, internal_len=5)
+    zones = calculate_pine_order_blocks(
+        o, h, l, c, atr200,
+        swing_len=50,
+        internal_len=5,
+        filter_confluence=cfg_obj.ENABLE_OB_CONFLUENCE_FILTER,
+    )
     
     equilibrium = None
     if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > 50:
-        range_high = np.max(h[i15-50:i15])
-        range_low  = np.min(l[i15-50:i15])
+        range_high = np.max(h[i15 - 50:i15])
+        range_low  = np.min(l[i15 - 50:i15])
         equilibrium = (range_high + range_low) / 2.0
         
     ob_ok_buy = ob_ok_sell = None
