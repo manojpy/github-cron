@@ -2123,8 +2123,6 @@ class RetryCategory:
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
 
-HTTP_CLIENT_ERROR = object()  # Sentinel: 4xx response, non-retryable, NOT a breaker fault
-
 def categorize_exception(exc: Exception) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return RetryCategory.TIMEOUT
@@ -2191,13 +2189,14 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
                     continue
-               
+                
                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
                     )
-                    return HTTP_CLIENT_ERROR   # was: return None          
+                    return None
+                
                 try:
                     data = await resp.json(loads=json_loads)
                 except (JSONDecodeError, TypeError, ValueError) as e:
@@ -2428,17 +2427,12 @@ class DataFetcher:
             timeout=self.timeout,
         )
 
-        if data is HTTP_CLIENT_ERROR:
-            # 4xx: bad symbol / bad request — NOT a circuit-breaker fault
-            logger.warning(f"Candles request rejected (4xx) | Symbol: {symbol}")
-            self.fetch_stats["candles"]["failed"] += 1
-            return None
-
         if data:
             result = data.get("result", {})
             if result and all(k in result for k in ("t", "o", "h", "l", "c", "v")):
                 await self.circuit_breaker.record_success()
                 self.fetch_stats["candles"]["success"] += 1
+
                 num_candles = len(result.get("t", []))
                 if num_candles > 0:
                     last_open = result["t"][-1]
@@ -2517,12 +2511,6 @@ class DataFetcher:
             backoff=cfg.CANDLE_FETCH_BACKOFF,
             timeout=self.timeout,
         )
-
-        if data is HTTP_CLIENT_ERROR:
-            # 4xx: bad request — NOT a circuit-breaker fault
-            logger.warning(f"Tickers request rejected (4xx)")
-            self.fetch_stats["tickers"]["failed"] += 1
-            return {}
 
         out: Dict[str, Dict[str, Optional[float]]] = {}
         if not data:
@@ -3073,6 +3061,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                     f"(indices {bad_idx[:5].tolist()}) | Min diff: {min_diff}s, Max diff: {max_diff}s | "
                     f"Continuing — get_last_closed_index_from_array will reject if this is near the target candle."
                 )
+                return None
         
             if cfg.DEBUG_MODE:
                 logger.debug(
@@ -4022,17 +4011,9 @@ class RedisStateStore:
             logger.error(f"batch_set_metadata failed: {e}")
             return False
 
-    async def check_recent_alert(self, pair: str, alert_key: str, ts: int,
-                                 window_sec: Optional[int] = None) -> bool:
+    async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
             return True
-        if not self._redis:
-            logger.error(
-                f"🚨 Dedup check: _redis is None but degraded=False — "
-                f"this should not happen. Failing OPEN for {pair}:{alert_key} "
-                f"(may produce a duplicate alert)"
-            )
-            return True  # fail-open: a duplicate alert is better than silence
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         try:
@@ -4046,7 +4027,7 @@ class RedisStateStore:
             return should_send
         except Exception as e:
             logger.error(f"Dedup check FAILED for {pair}:{alert_key}: {e}")
-            return True
+            return False   # fail-closed, not fail-open
 
     async def release_recent_alert(self, pair: str, alert_key: str) -> None:
         """Undo a dedup claim if the message didn't actually get delivered."""
@@ -6645,14 +6626,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         return None
 
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
-data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
-reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
-max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
-oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
+    reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
+    max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
+    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
+
     pair_oi = (oi_gate_data or {}).get(pair_name)
     gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
-    
     if gr is None:
         return None
     if isinstance(gr, tuple):
@@ -6668,19 +6650,13 @@ oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str,
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
     buy_side = gr.buy_common or gr.buy_trend_common
 
-    # ── Always compute the score when the gate passes (needed for outcome tracking) ──
-    if gate_passed:
-        score, total = compute_confluence_score(gr, is_buy=buy_side)
-        confluence_score = score
-        confluence_total = total
-
-    # ── Only *block* on it when the confluence gate is enabled ──
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
-        required = min(cfg.CONFLUENCE_MIN_SCORE, confluence_total)
-        if confluence_score < required:
+        score, total = compute_confluence_score(gr, is_buy=buy_side)
+        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+        if score < required:
             logger_pair.info(
-                f"[{pair_name}] Confluence gate blocked: {confluence_score:.1f}/{confluence_total:.1f} "
-                f"weighted score (need {required:.1f}) — skipping Phase-2 indicators"
+                f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
+                f"(need {required:.1f}) — skipping Phase-2 indicators"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
@@ -6690,9 +6666,12 @@ oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str,
                     "alerts": 0,
                     "future_cloud": "green" if gr.cloud_up else "red" if gr.cloud_down else "neutral",
                     "hist_rma": 0.0,
-                    "suppression": f"Confluence gate: {confluence_score:.1f}/{confluence_total:.1f}, need {required:.1f}"
+                    "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
                 }
             }
+        confluence_score = score
+        confluence_total = total
+
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         if pair_oi is not None:
             oi_reason = _oi_funding_gate_reason(
@@ -7209,10 +7188,10 @@ async def run_once() -> bool:
             lock = RedisLock(sdb._redis, "macd_bot_run")
             lock_acquired = await lock.acquire(timeout=5.0)
             if not lock_acquired:
-                logger_run.info(
-                    "ℹ️ Another instance holds the Redis lock — skipping this run (not an error)"
+                logger_run.warning(
+                    "⚠️ Another instance is running (Redis lock held) - exiting gracefully"
                 )
-                return True
+                return False
 
         async def extend_lock_periodically(lock_obj: RedisLock, telegram_queue: TelegramQueue):
             while not shutdown_event.is_set():
