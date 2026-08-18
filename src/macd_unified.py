@@ -4131,6 +4131,38 @@ class RedisStateStore:
             logger.warning(f"Failed to read win rate for {pair}:{alert_key}: {e}")
             return None, 0
 
+async def batch_get_alert_win_rates(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, Tuple[Optional[float], int]]:
+    if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not alert_keys:
+        return {k: (None, 0) for k in alert_keys}
+
+    try:
+        async with self._redis.pipeline() as pipe:
+            for ak in alert_keys:
+                pipe.hgetall(f"{RedisKeyPrefix.ALERT_STATS}{pair}:{ak}")
+            raw_results = await asyncio.wait_for(pipe.execute(), timeout=timeout)
+
+        out: Dict[str, Tuple[Optional[float], int]] = {}
+        for ak, data in zip(alert_keys, raw_results):
+            # hgetall returns {} for missing keys, but pipeline may return None
+            if not data:
+                out[ak] = (None, 0)
+                continue
+            wins = int(data.get("wins", 0))
+            losses = int(data.get("losses", 0))
+            total = wins + losses
+            if total < cfg.MIN_WIN_RATE_SAMPLE:
+                out[ak] = (None, total)
+            else:
+                out[ak] = (wins / total, total)
+        return out
+
+    except Exception as e:
+        logger.warning(
+            f"batch_get_alert_win_rates({pair}) failed for {len(alert_keys)} keys: {e}"
+        )
+        return {k: (None, 0) for k in alert_keys}
+
+
     async def batch_get_all_alert_states(self, pair: str, alert_keys: List[str], timeout: float = 3.0) -> Dict[str, bool]:
         if not self._redis or self.degraded or not alert_keys:
             return {k: False for k in alert_keys}
@@ -5355,7 +5387,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             cloud_group_ok_buy = sum(active_cloud_buy) >= 1
         elif cloud_group_enabled:
             logger_pair.debug(
-                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — buy denied."
+                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) ��� buy denied."
             )
             cloud_group_ok_buy = False
         else:
@@ -6083,11 +6115,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
-            results = await asyncio.gather(
-                *(sdb.get_alert_win_rate(pair_name, ak) for _, _, ak in alerts_to_send)
+            # Batch-fetch all win rates in a single Redis pipeline
+            alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
+            win_rate_map = await sdb.batch_get_alert_win_rates(
+                pair_name, alert_keys_to_check, timeout=3.0
             )
+
             surviving_alerts = []
-            for (alert_title, alert_extra, alert_key), (win_rate, sample) in zip(alerts_to_send, results):
+            for alert_title, alert_extra, alert_key in alerts_to_send:
+                win_rate, sample = win_rate_map.get(alert_key, (None, 0))
                 if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: "
@@ -6095,7 +6131,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     )
                     continue
                 surviving_alerts.append((alert_title, alert_extra, alert_key))
-            alerts_to_send = surviving_alerts         
+            alerts_to_send = surviving_alerts
 
         coalesced_dedup_key: Optional[str] = None
         if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
