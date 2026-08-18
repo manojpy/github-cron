@@ -40,7 +40,8 @@ jobs:
           echo "Latest run → status=$LATEST_STATUS conclusion=$LATEST_CONCLUSION created=$LATEST_CREATED"
 
           # Most recent SUCCESSFUL run
-          SUCCESS_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?status=success&per_page=1")
+
+          SUCCESS_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?conclusion=success&per_page=1")
           LAST_SUCCESS=$(echo "$SUCCESS_JSON" | jq -r '.workflow_runs[0].created_at // empty')
 
           NOW_EPOCH=$(date -u +%s)
