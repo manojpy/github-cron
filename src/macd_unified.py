@@ -377,42 +377,42 @@ class BotConfig(BaseModel):
                 f'ADX_ADAPTIVE_TARGET_PCTL ({self.ADX_ADAPTIVE_TARGET_PCTL}), otherwise the '
                 f'adx_strength vote duplicates the existing adx gate instead of adding a stricter bar'
             )
-            if self.ADAPTIVE_MULT_CALM >= self.ADAPTIVE_MULT_VOLATILE:
-                raise ValueError(
-                    f'ADAPTIVE_MULT_CALM ({self.ADAPTIVE_MULT_CALM}) must be < '
-                    f'ADAPTIVE_MULT_VOLATILE ({self.ADAPTIVE_MULT_VOLATILE})'
-                )
-            if self.PPO_ADAPTIVE_CALM >= self.PPO_ADAPTIVE_VOLATILE:
-                raise ValueError(
-                    f'PPO_ADAPTIVE_CALM ({self.PPO_ADAPTIVE_CALM}) must be < '
-                    f'PPO_ADAPTIVE_VOLATILE ({self.PPO_ADAPTIVE_VOLATILE})'
-                )
-            if self.RSI_ADAPTIVE_BUY_CALM >= self.RSI_ADAPTIVE_BUY_VOLATILE:
-                raise ValueError(
-                    f'RSI_ADAPTIVE_BUY_CALM ({self.RSI_ADAPTIVE_BUY_CALM}) must be < '
-                    f'RSI_ADAPTIVE_BUY_VOLATILE ({self.RSI_ADAPTIVE_BUY_VOLATILE})'
-                )
-            if self.RSI_ADAPTIVE_SELL_CALM <= self.RSI_ADAPTIVE_SELL_VOLATILE:
-                raise ValueError(
-                    f'RSI_ADAPTIVE_SELL_CALM ({self.RSI_ADAPTIVE_SELL_CALM}) must be > '
-                    f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
-                    f'— sell threshold drops as volatility rises'
-                )
-            if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
-                raise ValueError(
-                    f'CPR_ADAPTIVE_CALM ({self.CPR_ADAPTIVE_CALM}) must be < '
-                    f'CPR_ADAPTIVE_VOLATILE ({self.CPR_ADAPTIVE_VOLATILE})'
-                )
+        if self.ADAPTIVE_MULT_CALM >= self.ADAPTIVE_MULT_VOLATILE:
+            raise ValueError(
+                f'ADAPTIVE_MULT_CALM ({self.ADAPTIVE_MULT_CALM}) must be < '
+                f'ADAPTIVE_MULT_VOLATILE ({self.ADAPTIVE_MULT_VOLATILE})'
+            )
+        if self.PPO_ADAPTIVE_CALM >= self.PPO_ADAPTIVE_VOLATILE:
+            raise ValueError(
+                f'PPO_ADAPTIVE_CALM ({self.PPO_ADAPTIVE_CALM}) must be < '
+                f'PPO_ADAPTIVE_VOLATILE ({self.PPO_ADAPTIVE_VOLATILE})'
+            )
+        if self.RSI_ADAPTIVE_BUY_CALM >= self.RSI_ADAPTIVE_BUY_VOLATILE:
+            raise ValueError(
+                f'RSI_ADAPTIVE_BUY_CALM ({self.RSI_ADAPTIVE_BUY_CALM}) must be < '
+                f'RSI_ADAPTIVE_BUY_VOLATILE ({self.RSI_ADAPTIVE_BUY_VOLATILE})'
+            )
+        if self.RSI_ADAPTIVE_SELL_CALM <= self.RSI_ADAPTIVE_SELL_VOLATILE:
+            raise ValueError(
+                f'RSI_ADAPTIVE_SELL_CALM ({self.RSI_ADAPTIVE_SELL_CALM}) must be > '
+                f'RSI_ADAPTIVE_SELL_VOLATILE ({self.RSI_ADAPTIVE_SELL_VOLATILE}) '
+                f'— sell threshold drops as volatility rises'
+            )
+        if self.CPR_ADAPTIVE_CALM >= self.CPR_ADAPTIVE_VOLATILE:
+            raise ValueError(
+                f'CPR_ADAPTIVE_CALM ({self.CPR_ADAPTIVE_CALM}) must be < '
+                f'CPR_ADAPTIVE_VOLATILE ({self.CPR_ADAPTIVE_VOLATILE})'
+            )
 
-            if self.ADX_ADAPTIVE_BAND_WIDTH > 0:
-                lo = self.ADX_ADAPTIVE_TARGET_PCTL - self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
-                hi = self.ADX_ADAPTIVE_TARGET_PCTL + self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
-                if lo < 1.0 or hi > 99.0:
-                    raise ValueError(
-                        f'ADX_ADAPTIVE_TARGET_PCTL ({self.ADX_ADAPTIVE_TARGET_PCTL}) ± '
-                        f'band/2 ({self.ADX_ADAPTIVE_BAND_WIDTH / 2.0}) produces range '
-                        f'[{lo:.1f}, {hi:.1f}] which exceeds [1, 99]'
-                    )
+        if self.ADX_ADAPTIVE_BAND_WIDTH > 0:
+            lo = self.ADX_ADAPTIVE_TARGET_PCTL - self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
+            hi = self.ADX_ADAPTIVE_TARGET_PCTL + self.ADX_ADAPTIVE_BAND_WIDTH / 2.0
+            if lo < 1.0 or hi > 99.0:
+                raise ValueError(
+                    f'ADX_ADAPTIVE_TARGET_PCTL ({self.ADX_ADAPTIVE_TARGET_PCTL}) ± '
+                    f'band/2 ({self.ADX_ADAPTIVE_BAND_WIDTH / 2.0}) produces range '
+                    f'[{lo:.1f}, {hi:.1f}] which exceeds [1, 99]'
+                )
         return self
 
     @model_validator(mode='after')
@@ -1849,28 +1849,6 @@ def _validate_ohlc_arrays(data_15m: Dict[str, np.ndarray],
     
     return True, None
 
-def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
-    """Percentile rank (0.0=calmest .. 1.0=most volatile) of current long-ATR
-    against its trailing ATR_PCTL_LOOKBACK window. None if insufficient history."""
-    lookback = cfg.ATR_PCTL_LOOKBACK
-    start = i15 - lookback
-    if start < 0:
-        return None
-
-    window = atr_long_arr[start:i15]
-    valid = window[~np.isnan(window)]
-    if len(valid) < cfg.ATR_PCTL_MIN_HISTORY:
-        return None
-
-    current = atr_long_arr[i15]
-    if np.isnan(current) or current <= 0:
-        return None
-
-    n = len(valid)
-    count_lt = np.sum(valid < current)
-    count_eq = np.sum(valid == current)
-    return (count_lt + 0.5 * count_eq) / n
-
 def get_atr_percentile_smoothed(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig, ema_period: int = 5) -> Optional[float]:
     required_depth = cfg.ATR_PCTL_LOOKBACK + ema_period
     if i15 < required_depth:
@@ -2541,7 +2519,9 @@ class DataFetcher:
             await self.circuit_breaker.record_failure()
             return out
 
-        for row in data.get("result", []):
+        for row in (data.get("result") or []):
+            if not isinstance(row, dict):
+                continue
             symbol = row.get("symbol")
             if not symbol:
                 continue
@@ -3727,6 +3707,7 @@ class RedisKeyPrefix:
     LOCK = "lock:"
     OUTCOME_PENDING = "outcome_pending:"
     ALERT_STATS = "alert_stats:"
+    OUTCOME_LOG_STREAM = "outcome_log_stream"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -3869,9 +3850,9 @@ class RedisStateStore:
                     RedisStateStore._global_pools[self.redis_url] = None
                 else:
                     try:
+                        self._redis = pool
                         ok = await self._ping_with_retry(timeout)
                         if ok:
-                            self._redis = pool
                             RedisStateStore._pool_reuse_count[self.redis_url] = \
                                 RedisStateStore._pool_reuse_count.get(self.redis_url, 0) + 1
                             self.degraded = False
@@ -4059,12 +4040,17 @@ class RedisStateStore:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
     async def record_pending_outcome(self, pair: str, alert_key: str, direction: str,
-                                       entry_ts: int, entry_price: float) -> None:
+                                       entry_ts: int, entry_price: float,
+                                       confluence_score: Optional[float] = None,
+                                       confluence_total: Optional[float] = None) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
         try:
-            payload = json_dumps({"direction": direction, "entry_ts": entry_ts, "entry_price": entry_price})
+            payload = json_dumps({
+                "direction": direction, "entry_ts": entry_ts, "entry_price": entry_price,
+                "confluence_score": confluence_score, "confluence_total": confluence_total,
+            })
         except Exception as e:
             logger.warning(f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}")
             return
@@ -4076,9 +4062,6 @@ class RedisStateStore:
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
-        """Call once per pair per run, before evaluating new signals. Grades any of
-        this pair's pending outcomes whose lookahead window has closed, using candles
-        already fetched this run for the gate/alert evaluation — no extra API calls."""
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
 
@@ -4113,8 +4096,11 @@ class RedisStateStore:
                 entry_ts = int(data["entry_ts"])
                 direction = data["direction"]
                 entry_price = float(data["entry_price"])
+                conf_score = data.get("confluence_score")
+                conf_total = data.get("confluence_total")
 
                 entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
+
                 if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
                     continue  # entry candle has scrolled out of our current window; leave pending, retry later
                 target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
@@ -4130,6 +4116,18 @@ class RedisStateStore:
                 stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                 write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                 write_pipe.expire(stats_key, cfg.STATE_EXPIRY_DAYS * 86400)
+
+                if conf_score is not None and conf_total is not None:
+                    write_pipe.xadd(
+                        RedisKeyPrefix.OUTCOME_LOG_STREAM,
+                        {
+                            "pair": pair, "alert_key": alert_key, "direction": direction,
+                            "score": conf_score, "total": conf_total,
+                            "pct_move": round(pct_move, 4), "win": int(win), "entry_ts": entry_ts,
+                        },
+                        maxlen=50000, approximate=True,
+                    )
+
                 write_pipe.delete(key)
                 pending_writes += 1
             except Exception as e:
@@ -6313,10 +6311,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             direction = "buy" if gr.direction_is_buy else "sell"
                             await asyncio.gather(*(
                                 sdb.record_pending_outcome(
-                                    pair_name, alert_key, direction, ts_curr, close_curr
+                                    pair_name, alert_key, direction, ts_curr, close_curr,
+                                    confluence_score=confluence_score, confluence_total=confluence_total,
                                 )
                                 for _, _, alert_key in alerts_to_send
-                            ))             
+                            ))
                     else:
                         await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
