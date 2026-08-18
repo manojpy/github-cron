@@ -26,7 +26,7 @@ import aiohttp
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 import traceback
 
@@ -125,7 +125,6 @@ class Constants:
     PPO_SIGNAL_CROSS_MIN_SELL = -0.30
     CIRCUIT_BREAKER_MAX_WAIT = 300
     INFINITY_CLAMP = 1e8
-    TELEGRAM_MAX_MESSAGE_LENGTH = 4096
     VWAP_MAX_DISTANCE_PCT = 2.0
     INTER_BATCH_DELAY: float = 0.5
     MIN_CANDLES_FOR_INDICATORS = 250
@@ -152,8 +151,6 @@ class Constants:
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
 
-PIVOT_LEVELS = ["P", "S1", "S2", "S3", "R1", "R2", "R3"]
-
 class CompiledPatterns:
     VALID_SYMBOL = re.compile(r'^[A-Z0-9_]+$')
     ESCAPE_MARKDOWN = re.compile(r'[_*\[\]()~`>#+\-=|{}.!]') 
@@ -165,6 +162,7 @@ TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
 PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 
 class BotConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     REDIS_URL: str = Field(..., min_length=1)
@@ -188,6 +186,7 @@ class BotConfig(BaseModel):
     PPO_GATE_FAST: int = Field(default=32, ge=1, le=100, description="Gate PPO fast period")
     PPO_GATE_SLOW: int = Field(default=84, ge=2, le=200, description="Gate PPO slow period")
     PPO_GATE_SIGNAL: int = Field(default=20, ge=1, le=50, description="Gate PPO signal period")
+    PPOHIST_WARMUP_BUFFER_BARS: int = Field(default=56, ge=0, le=200)
     RSI_GUARD_ENABLED: bool = Field(default=False, description="Enable RSI(89) Kalman-smoothed vs EMA(50) as an alternate trend gate, OR'd with PPO gate")
     RSI_GUARD_RSI_LEN: int = Field(default=89, ge=2, le=200, description="RSI Guard RSI length")
     RSI_GUARD_KALMAN_LEN: int = Field(default=9, ge=1, le=50, description="RSI Guard Kalman smoothing length")
@@ -838,27 +837,6 @@ def _find_closed_daily_candle(data_daily: Dict[str, np.ndarray], reference_time:
 
     return d_high, d_low, d_close, candle_ts
 
-def _find_today_daily_open(data_daily: Dict[str, np.ndarray], reference_time: int) -> Optional[float]:
-    ts_arr = data_daily.get("timestamp")
-    op_arr = data_daily.get("open")
-    if ts_arr is None or op_arr is None or len(ts_arr) == 0:
-        return None
-
-    day_numbers = ts_arr // 86400
-    today_num = reference_time // 86400
-
-    mask = (day_numbers == today_num)
-    if not np.any(mask):
-        return None
-
-    idx = int(np.where(mask)[0][-1])
-    open_val = float(op_arr[idx])
-
-    if np.isnan(open_val) or np.isinf(open_val) or open_val <= 0:
-        return None
-
-    return open_val
-
 def validate_conversion_cross(close_prev: float, close_curr: float,
     conv_prev: float, conv_curr: float, is_buy: bool) -> Tuple[bool, Optional[str]]:
     vals = [close_prev, close_curr, conv_prev, conv_curr]
@@ -1054,8 +1032,7 @@ def calculate_ppo_numpy(close: np.ndarray, fast: int, slow: int, signal: int) ->
         default_len = len(close) if close is not None else 1
         return np.full(default_len, np.nan, dtype=np.float64), np.full(default_len, np.nan, dtype=np.float64)
     
-def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray,
-    reference_time: Optional[int] = None) -> np.ndarray:
+def calculate_vwap_numpy(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     try:
         hlc3 = (high + low + close) / 3.0
         
@@ -1395,7 +1372,7 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         if cfg.ENABLE_VWAP:
             results['vwap_gate'] = calculate_vwap_numpy(
                 data_15m["high"], data_15m["low"], close_15m,
-                data_15m["volume"], data_15m["timestamp"], reference_time
+                data_15m["volume"], data_15m["timestamp"]
             )
         else:
             results['vwap_gate'] = np.full(n_15m, np.nan, dtype=np.float64)
@@ -1970,21 +1947,25 @@ def get_adaptive_adx_threshold_smoothed(adx_arr: np.ndarray, i15: int, cfg: BotC
 def _get_smoothed_pctl(atr_long_arr, i15, cfg) -> Optional[float]:
     return get_atr_percentile_smoothed(atr_long_arr, i15, cfg) if cfg.ATR_ADAPTIVE_ENABLED else None
 
-def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr: str) -> float:
-    pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
+def get_adaptive_threshold(atr_long_arr, i15, cfg, calm_attr: str, volatile_attr: str,
+                            pctl: Optional[float] = None) -> float:
+    if pctl is None:
+        pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     return _scale_by_pctl(pctl, getattr(cfg, calm_attr), getattr(cfg, volatile_attr))
 
-def get_adaptive_ppo_threshold(atr_long_arr, i15, cfg) -> float:
-    return get_adaptive_threshold(atr_long_arr, i15, cfg, "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE")
+def get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl: Optional[float] = None) -> float:
+    return get_adaptive_threshold(atr_long_arr, i15, cfg, "PPO_ADAPTIVE_CALM", "PPO_ADAPTIVE_VOLATILE", pctl=pctl)
 
-def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Tuple[float, float]:
-    pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
+def get_adaptive_rsi_thresholds(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig,
+                                 pctl: Optional[float] = None) -> Tuple[float, float]:
+    if pctl is None:
+        pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     buy = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_BUY_CALM, cfg.RSI_ADAPTIVE_BUY_VOLATILE)
     sell = _scale_by_pctl(pctl, cfg.RSI_ADAPTIVE_SELL_CALM, cfg.RSI_ADAPTIVE_SELL_VOLATILE)
     return buy, sell
 
-def get_adaptive_cpr_threshold(atr_long_arr, i15, cfg) -> float:
-    return get_adaptive_threshold(atr_long_arr, i15, cfg, "CPR_ADAPTIVE_CALM", "CPR_ADAPTIVE_VOLATILE")
+def get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl: Optional[float] = None) -> float:
+    return get_adaptive_threshold(atr_long_arr, i15, cfg, "CPR_ADAPTIVE_CALM", "CPR_ADAPTIVE_VOLATILE", pctl=pctl)
 
 def _validate_atr_arrays(atr_short: np.ndarray, atr_long: np.ndarray, 
                         expected_len: int) -> Tuple[bool, Optional[str]]:   
@@ -2126,13 +2107,13 @@ class RetryCategory:
 def categorize_exception(exc: Exception) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return RetryCategory.TIMEOUT
-    elif isinstance(exc, (ClientConnectorError, aiohttp.ClientConnectorError)):
+    elif isinstance(exc, ClientConnectorError):
         return RetryCategory.NETWORK
     elif isinstance(exc, ClientResponseError):
         if hasattr(exc, "status") and exc.status == 429:
             return RetryCategory.RATE_LIMIT
         return RetryCategory.API_ERROR
-    elif isinstance(exc, (ClientError, aiohttp.ClientError)):
+    elif isinstance(exc, ClientError):
         return RetryCategory.NETWORK
     return RetryCategory.UNKNOWN
 
@@ -2189,14 +2170,13 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                         total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                         await asyncio.sleep(total_delay)
                     continue
-                
-                if resp.status >= 400:
+       
+                 if resp.status >= 400:
                     logger.error(
                         f"Client error {resp.status} for {url[:80]} | "
                         f"This usually indicates invalid request - not retrying"
                     )
-                    return None
-                
+                    return False
                 try:
                     data = await resp.json(loads=json_loads)
                 except (JSONDecodeError, TypeError, ValueError) as e:
@@ -2228,8 +2208,8 @@ async def async_fetch_json(url: str, params: Optional[Dict[str, Any]] = None, re
                 total_delay = compute_backoff(backoff, attempt, cap=Constants.CIRCUIT_BREAKER_MAX_WAIT / 10)
                 logger.debug(f"Retrying after {total_delay:.2f}s...")
                 await asyncio.sleep(total_delay)
-        
-        except (ClientConnectorError, ClientError, ClientResponseError) as e:
+
+        except ClientError as e:
             last_error = e
             category = categorize_exception(e)
             retry_stats[category] = retry_stats.get(category, 0) + 1
@@ -2266,6 +2246,7 @@ class RateLimitedFetcher:
         self.last_request_time = 0.0
 
     async def call(self, func: Callable, *args, **kwargs):
+        claimed_ts: Optional[float] = None
         while True:
             sleep_needed = 0.0
             async with self.lock:
@@ -2275,6 +2256,7 @@ class RateLimitedFetcher:
                 if len(self.requests) < self.max_per_minute:
                     self.requests.append(now)
                     self.last_request_time = now
+                    claimed_ts = now
                     break
                 else:
                     oldest_request_age = now - self.requests[0]
@@ -2294,8 +2276,18 @@ class RateLimitedFetcher:
                 raise
             self.total_wait_time += time.monotonic() - t0
 
-        async with self.semaphore:
-            return await func(*args, **kwargs)
+        try:
+            async with self.semaphore:
+                return await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            # Give the rate-window slot back — it was claimed before the call started,
+            # so a cancellation here shouldn't permanently burn it.
+            async with self.lock:
+                try:
+                    self.requests.remove(claimed_ts)
+                except ValueError:
+                    pass  # already pruned by the 60s window cleanup above
+            raise 
 
     def get_stats(self) -> Dict[str, Any]:
         return {
@@ -2461,9 +2453,12 @@ class DataFetcher:
                 self.fetch_stats["candles"]["failed"] += 1
                 await self.circuit_breaker.record_failure()
         else:
-            logger.warning(f"Candles fetch failed | Symbol: {symbol}")
             self.fetch_stats["candles"]["failed"] += 1
-            await self.circuit_breaker.record_failure()
+            if data is False:
+                logger.warning(f"Candles fetch got 4xx (not counted against circuit breaker) | Symbol: {symbol}")
+            else:
+                logger.warning(f"Candles fetch failed | Symbol: {symbol}")
+                await self.circuit_breaker.record_failure()
 
         return None
 
@@ -2585,27 +2580,7 @@ class DataFetcher:
             )        
         return stats
 
-    async def fetch_candles_batch(self, requests: List[Tuple[str, str, int]], reference_time: Optional[int] = None) -> Dict[str, Optional[Dict[str, Any]]]:
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
-        
-        tasks = []
-        request_keys = []
-        for symbol, resolution, limit in requests:
-            task = self.fetch_candles(symbol, resolution, limit, reference_time)
-            tasks.append(task)
-            request_keys.append(f"{symbol}_{resolution}")
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        output = {}
-        for key, result in zip(request_keys, results):
-            output[key] = None if isinstance(result, Exception) else result    
-        return output
-
-    async def fetch_all_candles_truly_parallel(self, pair_requests: List[Tuple[str, List[Tuple[str, int]]]], reference_time: Optional[int] = None) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
-        if reference_time is None:
-            reference_time = get_trigger_timestamp()
-
+    async def fetch_all_candles_truly_parallel(self, pair_requests: List[Tuple[str, List[Tuple[str, int]]]], reference_time: int) -> Dict[str, Dict[str, Optional[Dict[str, Any]]]]:
         expected_open_15 = calculate_expected_candle_timestamp(reference_time, 15)
         all_tasks = []
         task_metadata = []
@@ -3060,8 +3035,7 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                     f"parse_candles_to_numpy: {len(bad_idx)} non-monotonic/duplicate timestamp(s) found "
                     f"(indices {bad_idx[:5].tolist()}) | Min diff: {min_diff}s, Max diff: {max_diff}s | "
                     f"Continuing — get_last_closed_index_from_array will reject if this is near the target candle."
-                )
-                return None
+                )      
         
             if cfg.DEBUG_MODE:
                 logger.debug(
@@ -3097,15 +3071,11 @@ def candle_is_stable(ts_open: int, reference_time: int, interval_minutes: int = 
     )
 
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, 
-                                     reference_time: Optional[int] = None, 
+                                     reference_time: int, 
                                      pair_name: Optional[str] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 1:
         return None
-
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
     reference_time = normalize_timestamp(reference_time)
-
     interval_seconds = interval_minutes * 60
     
     current_period_start = (reference_time // interval_seconds) * interval_seconds
@@ -3586,7 +3556,7 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
 
     if any(np.isnan([raw_o, raw_h, raw_l, raw_c])) or any(np.isinf([raw_o, raw_h, raw_l, raw_c])):
         logger_pair.error(
-            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} �� suppressing alert"
+            f"[{pair_name}] Independent re-verify: raw OHLC contains NaN/Inf at index {candle_index} — suppressing alert"
         )
         return False
 
@@ -4014,6 +3984,12 @@ class RedisStateStore:
     async def check_recent_alert(self, pair: str, alert_key: str, ts: int, window_sec: Optional[int] = None) -> bool:
         if self.degraded:
             return True
+        if not self._redis:
+            logger.critical(
+                f"check_recent_alert: degraded=False but _redis is None (state desync) — "
+                f"failing closed for {pair}:{alert_key}, this alert will be blocked"
+            )
+            return False  # fail-closed, consistent with the except-branch policy below
         recent_key = f"{RedisKeyPrefix.RECENT_ALERT}{pair}:{alert_key}"
         effective_window = window_sec if window_sec is not None else cfg.ALERT_DEDUP_WINDOW_SEC
         try:
@@ -4489,76 +4465,6 @@ class TelegramQueue:
                     await asyncio.sleep(delay)
         return False
 
-    async def send_batch(self, messages: List[str]) -> bool:   
-        if not messages:
-            return True
-
-        def _safe_truncate_utf8(text: str, max_bytes: int) -> str:
-            encoded = text.encode('utf-8')
-            if len(encoded) <= max_bytes:
-                return text
-            truncated = encoded[:max_bytes]
-            # Strip continuation bytes (0x80-0xBF) from the tail
-            while truncated and truncated[-1] & 0xC0 == 0x80:
-                truncated = truncated[:-1]
-            return truncated.decode('utf-8', errors='ignore')
-   
-        MAX_LEN = Constants.TELEGRAM_MAX_MESSAGE_LENGTH
-        SAFETY_MARGIN = 100  # Account for URL encoding overhead
-        EFFECTIVE_MAX = MAX_LEN - SAFETY_MARGIN
-        SEPARATOR = "\n\n"
-        SEP_BYTES = len(SEPARATOR.encode('utf-8'))
-
-        batches: List[List[str]] = []
-        current: List[str] = []
-        current_bytes: int = 0
-
-        for msg in messages:
-            try:
-                msg_bytes = len(msg.encode('utf-8'))
-            except Exception as e:
-                logger.warning(f"Failed to encode message: {e}, skipping")
-                continue
-
-            estimated_encoded = int(msg_bytes * 1.15)
-    
-            needed = estimated_encoded
-            if current:
-                needed += SEP_BYTES
-
-            if estimated_encoded > EFFECTIVE_MAX:
-                if current:
-                    batches.append(current)
-                    current = []
-                    current_bytes = 0
-                truncated = _safe_truncate_utf8(msg, EFFECTIVE_MAX)
-                batches.append([truncated])
-                continue
-
-            if current_bytes + needed > EFFECTIVE_MAX:
-                batches.append(current)
-                current = []
-                current_bytes = 0
-
-            current.append(msg)
-            current_bytes += needed
-
-        if current:
-            batches.append(current)
-
-        if len(batches) > 1:
-            logger.info(f"Split alerts into {len(batches)} Telegram messages")
-
-        results = []
-        for idx, batch in enumerate(batches):
-            text = SEPARATOR.join(batch)
-            results.append(await self.send(text))
-
-            if idx < len(batches) - 1:
-                await asyncio.sleep(Constants.INTER_BATCH_DELAY)
-
-        return all(results)
-
 def _clean_extra_text(extra: Optional[str]) -> str:
     """Helper to strip emojis, OHLC data, and technical metadata."""
     if not extra:
@@ -4663,7 +4569,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     return f"{line1}\n{body}\n{datetime_line}"
 
 def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
-    """Factory function to create pivot alert definition without lambdas"""
+    """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level`/`is_buy`)"""
     if is_buy:
         return {
             "key": f"pivot_up_{level}",
@@ -4838,8 +4744,9 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
 
     # ── Hist RMA ──
     hist_c, hist_m1 = context["hist_curr"], context["hist_m1"]
-    for k, cond in (("hist_rma_buy",  np.isnan(hist_c) or hist_c <= 1e-8 or hist_c <= hist_m1),
-                    ("hist_rma_sell", np.isnan(hist_c) or hist_c >= -1e-8 or hist_c >= hist_m1)):
+    hist_eps = max(1e-10, abs(context["close_curr"]) * 1e-6)  # starting point — tune to your pairs
+    for k, cond in (("hist_rma_buy",  np.isnan(hist_c) or hist_c <= hist_eps or hist_c <= hist_m1),
+                    ("hist_rma_sell", np.isnan(hist_c) or hist_c >= -hist_eps or hist_c >= hist_m1)):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
@@ -4967,9 +4874,6 @@ SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
     reference_time: int, pair_oi: Optional[Dict[str, Any]] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
-    if reference_time is None:
-        reference_time = get_trigger_timestamp()
-
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     close_15m = None
@@ -5799,15 +5703,13 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 sell_common and hist_curr < 0
                 and hist_m3 < hist_m2 < hist_m1 and hist_curr < hist_m1
             )
-
-        MIN_PPOHIST_BARS_VALID = 160
+        min_ppohist_bars_valid = cfg.PPO_GATE_SLOW + cfg.PPO_GATE_SIGNAL + cfg.PPOHIST_WARMUP_BUFFER_BARS
         has_valid_ppohist = (
             cfg.ENABLE_PPO_GATE and
-            i15 >= MIN_PPOHIST_BARS_VALID and
+            i15 >= min_ppohist_bars_valid and
             not np.isnan(ppohist_curr) and not np.isnan(ppohist_m1) and
             not np.isnan(ppohist_m2) and not np.isnan(ppohist_m3)
         )
-
         if not has_valid_ppohist:
             ppohist_reversal_buy = False
             ppohist_reversal_sell = False
@@ -7029,7 +6931,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     )
     return valid_results
 
-async def run_once() -> bool:
+async def run_once() -> Optional[bool]:
     MAX_ALERTS_PER_RUN = cfg.MAX_ALERTS_PER_RUN
     all_results: List[Tuple[str, Dict[str, Any]]] = []
     correlation_id = uuid.uuid4().hex[:8]
@@ -7191,7 +7093,7 @@ async def run_once() -> bool:
                 logger_run.warning(
                     "⚠️ Another instance is running (Redis lock held) - exiting gracefully"
                 )
-                return False
+                return None
 
         async def extend_lock_periodically(lock_obj: RedisLock, telegram_queue: TelegramQueue):
             while not shutdown_event.is_set():
@@ -7454,7 +7356,10 @@ if __name__ == "__main__":
             return False
     try:
         success = asyncio.run(main_with_cleanup()) 
-        if success:
+        if success is None:
+            logger.info("ℹ️ Run skipped (another instance already running) — not a failure")
+            sys.exit(0)
+        elif success:
             sys.exit(0)
         else:
             logger.error("❌ Bot run failed")
