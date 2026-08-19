@@ -1,4 +1,7 @@
 services:
+  # =========================================================================
+  # SERVICE 1: Main bot — runs every 15 minutes, offset by 1 min
+  # =========================================================================
   - type: cron
     name: macd-unified-bot-cron
     runtime: docker
@@ -17,7 +20,6 @@ services:
     concurrencyPolicy: forbid
 
     # ✅ Smart build filtering - rebuild only on code/config changes
-    # ✅ Build filter: Only rebuild on code/config changes
     # Relies on .dockerignore and .gitignore for comprehensive ignore rules
     buildFilter:
       paths:
@@ -79,6 +81,18 @@ services:
       - key: DRY_RUN_MODE
         value: "false"
 
+      # 🧹 Redis state control — this REPLACES the GitHub Actions
+      # "clear_states" workflow_dispatch checkbox. Render cron has no
+      # per-run input, so this is a persistent toggle instead:
+      #   1. Set this value to "true" in the Render Dashboard
+      #      (Environment tab of this service)
+      #   2. Click "Trigger Run" to fire an out-of-schedule run that clears
+      #      all Redis state
+      #   3. Set it back to "false" so the next scheduled run doesn't
+      #      wipe state again
+      - key: CLEAR_ALL_STATES
+        value: "false"
+
       # API settings
       - key: MAX_PARALLEL_FETCH
         value: "12"
@@ -101,7 +115,8 @@ services:
       - key: DELTA_API_BASE
         sync: false
 
-    # ✅ Email notification on failure
+    # ✅ Email notification on failure (built-in Render feature, not a
+    # separate watchdog service/workflow)
     notifications:
       - event: failure
         channel: email
@@ -130,20 +145,77 @@ services:
     preDeployCommand: |
       echo "🚀 Pre-deploy validation..."
       echo "---"
-      
+
       # Check Python version
       python -c "import sys; print(f'✅ Python {sys.version}')"
-      
+
       # Validate config JSON
       python -c "import json; json.load(open('config_macd.json'))" && echo "✅ config_macd.json is valid JSON" || { echo "❌ Invalid JSON in config_macd.json"; exit 1; }
-      
+
       # Check required source files exist
       test -f src/macd_unified.py && echo "✅ src/macd_unified.py found" || { echo "❌ src/macd_unified.py missing"; exit 1; }
       test -f src/aot_bridge.py && echo "✅ src/aot_bridge.py found" || { echo "❌ src/aot_bridge.py missing"; exit 1; }
       test -f requirements.txt && echo "✅ requirements.txt found" || { echo "❌ requirements.txt missing"; exit 1; }
-      
+
       # Check dependencies
       python -m pip list | grep -E "aiohttp|numba|redis|pydantic" > /dev/null && echo "✅ Core dependencies available" || echo "⚠️  Will install dependencies during build"
-      
+
       echo "---"
       echo "✅ All pre-deploy checks passed!"
+
+  # =========================================================================
+  # SERVICE 2: Confluence win-rate analysis — on-demand only.
+  # Lightweight native Python cron (no Docker/AOT build needed), replaces
+  # the "run_optimization" checkbox from the GitHub Actions workflow.
+  # Schedule below is just a sane weekly safety-net default — the intended
+  # way to run this is: open this service in the Render Dashboard and
+  # click "Trigger Run" whenever you want a fresh win-rate readout.
+  # =========================================================================
+  - type: cron
+    name: macd-confluence-analysis
+    runtime: python
+
+    region: singapore
+    plan: starter
+
+    concurrencyPolicy: forbid
+
+    # Weekly Sunday 03:00 UTC — adjust or ignore; trigger manually anytime.
+    schedule: "0 3 * * 0"
+
+    buildFilter:
+      paths:
+        - scripts/**
+        - render.yml
+      ignoredPaths:
+        - src/**
+        - config_macd.json
+
+    buildCommand: pip install --quiet redis
+
+    startCommand: python scripts/analyze_confluence_thresholds.py
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: ANALYSIS_MIN_SAMPLE
+        value: "20"
+      - key: ANALYSIS_TARGET_WINRATE
+        value: "0.55"
+
+      # Secrets — reuse the same Redis instance and Telegram bot as the
+      # main service; set once in this service's own Environment tab
+      # (Render does not share sync:false secrets across services)
+      - key: REDIS_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+    notifications:
+      - event: failure
+        channel: email
+
+    autoDeploy: true
+    branch: main
