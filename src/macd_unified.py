@@ -1837,7 +1837,7 @@ def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], pr
 
     oi_ref = oi_history[-lookback][1]
     price_ref = price_history[-lookback][1]
-    if oi_ref <= 0 or price_ref <= 0:
+    if oi_ref is None or price_ref is None or oi_ref <= 0 or price_ref <= 0:
         return None
 
     oi_roc_pct = (oi_now - oi_ref) / oi_ref * 100.0
@@ -1874,7 +1874,10 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float
     if divergence_reason is not None:
         return divergence_reason
 
-    oi_values = [v for _, v in oi_history]
+    oi_values = [v for _, v in oi_history if v is not None]
+    if len(oi_values) < cfg.MIN_OI_FUNDING_SAMPLES:
+        return None
+
     ref_n = min(cfg.OI_DELTA_REF_SAMPLES, len(oi_values))
     recent_ref = oi_values[-ref_n:]
     prev_oi = sum(recent_ref) / len(recent_ref)
@@ -1890,7 +1893,7 @@ def _oi_funding_gate_reason(oi_now: Optional[float], oi_history: List[List[float
 
     not_crowded = True
     funding_pctile = None
-    funding_values = [v for _, v in funding_history]
+    funding_values = [v for _, v in funding_history if v is not None]
     if funding is not None and len(funding_values) >= cfg.MIN_OI_FUNDING_SAMPLES:
         funding_pctile = _percentile_rank(funding, funding_values)
         above_floor = abs(funding) >= cfg.FUNDING_ABS_FLOOR
@@ -3003,6 +3006,8 @@ def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray
     avg_range = float(np.mean(win_h - win_l))
     if avg_range <= 1e-12:
         return 0
+    if last_close > 0 and (avg_range / last_close) < 1e-5:  # Less than 0.001% average range
+        return 0
     margin = Constants.REVERSAL_PRIOR_LEG_MIN_RANGE_MULT * avg_range
     hi = float(np.max(win_c))
     lo = float(np.min(win_c))
@@ -3015,13 +3020,13 @@ def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray
     return 0
 
 def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]: 
-    if i < 2 or i >= len(data_15m.close):
+    if i < 1 or i >= len(data_15m.close):
         return False, False, ""
     m0 = _candle_metrics(data_15m, i)        # signal candle (the one the alert points at)
     m1 = _candle_metrics(data_15m, i - 1)
     if m0 is None or m1 is None:
         return False, False, ""
-    m2 = _candle_metrics(data_15m, i - 2)
+    m2 = _candle_metrics(data_15m, i - 2) if i >= 2 else None
 
     lk = Constants.REVERSAL_PRIOR_LEG_LOOKBACK
     p1 = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i - 1, lk)
@@ -3201,8 +3206,24 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
             vol_error_indices = np.where(volume_error_mask)[0]
             for idx in vol_error_indices[:min(5, len(vol_error_indices))]:
                 logger.error(f"  Index {idx}: Volume={v[idx]}")
-            logger.error("parse_candles_to_numpy: Rejecting data due to invalid volume")
-            return None
+
+            if cfg.SANITIZE_BAD_CANDLES and volume_error_count < n:
+                vol_keep_mask = ~volume_error_mask
+                logger.warning(
+                    f"parse_candles_to_numpy: SANITIZE_BAD_CANDLES=True — dropping {volume_error_count} "
+                    f"bad volume candle(s), keeping {n - volume_error_count}/{n}"
+                )
+                for k in data:
+                    data[k] = data[k][vol_keep_mask]
+                n = len(data["timestamp"])
+                if n == 0:
+                    logger.error("parse_candles_to_numpy: All candles dropped due to volume errors")
+                    return None
+                o, h, l, c = data["open"], data["high"], data["low"], data["close"]
+                v = data["volume"]
+            else:
+                logger.error("parse_candles_to_numpy: Rejecting data due to invalid volume")
+                return None
 
         hl_mid = (h + l) / 2.0
         candle_range = h - l
@@ -7050,14 +7071,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 "price_now": current.get("price"),
                 "price_history": price_hist,
             }
-
-            new_oi_hist = (oi_hist + [[now_ts, current["oi"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
-            new_funding_hist = funding_hist
-            if current.get("funding") is not None:
-                new_funding_hist = (funding_hist + [[now_ts, current["funding"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
-            new_price_hist = price_hist
-            if current.get("price") is not None:
-                new_price_hist = (price_hist + [[now_ts, current["price"]]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+            new_oi_hist = (oi_hist + [[now_ts, current.get("oi")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+            new_funding_hist = (funding_hist + [[now_ts, current.get("funding")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
+            new_price_hist = (price_hist + [[now_ts, current.get("price")]])[-cfg.OI_FUNDING_HISTORY_LEN:]
 
             new_histories[meta_key] = json_dumps({
                 "oi_samples": new_oi_hist, "funding_samples": new_funding_hist,
