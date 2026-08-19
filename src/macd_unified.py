@@ -1504,22 +1504,23 @@ def _percentile_rank(value: float, history: List[float]) -> float:
 
 @dataclass(slots=True)
 class OrderBlock:
-    """A candidate institutional order block: the base candle immediately
-    preceding an ATR-normalized impulsive displacement away from it."""
     index: int
     top: float
     bottom: float
-    is_demand: bool  # True = bullish/demand zone, False = bearish/supply zone
+    is_demand: bool
+    is_internal: bool = False 
 
-def find_pine_ob(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr200: np.ndarray, 
-                   break_idx: int, pivot_idx: int, is_bullish_break: bool) -> Optional[OrderBlock]:
+def find_pine_ob(h: np.ndarray, l: np.ndarray, c: np.ndarray, threshold_arr: np.ndarray, 
+                 break_idx: int, pivot_idx: int, is_bullish_break: bool) -> Optional[OrderBlock]:
     best_val = -np.inf if not is_bullish_break else np.inf
     best_idx = -1
     
     for i in range(1, break_idx - pivot_idx):
         bar_idx = break_idx - i
         candle_range = h[bar_idx] - l[bar_idx]
-        threshold = atr200[bar_idx] * 2.0
+        
+        # Multiply the selected threshold (ATR or CMR) by 2, mimicking Pine
+        threshold = threshold_arr[bar_idx] * 2.0
         
         if not np.isnan(threshold) and candle_range < threshold:
             if not is_bullish_break:  # Bearish OB -> find highest high
@@ -1536,17 +1537,27 @@ def find_pine_ob(h: np.ndarray, l: np.ndarray, c: np.ndarray, atr200: np.ndarray
             index=best_idx,
             top=h[best_idx],
             bottom=l[best_idx],
-            is_demand=is_bullish_break
+            is_demand=is_bullish_break,
+            is_internal=False # Will be overridden by the caller
         )
     return None
 
 def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
                                 atr200: np.ndarray, 
+                                ob_filter: str = 'Atr',
                                 swing_len: int = 50, internal_len: int = 5,
-                                filter_confluence: bool = False) -> List[OrderBlock]:
+                                filter_confluence: bool = False,
+                                show_iob: bool = True, iob_showlast: int = 5,
+                                show_ob: bool = True, ob_showlast: int = 5) -> Tuple[List[OrderBlock], List[OrderBlock]]:
     n = len(h)
     if n < max(swing_len, internal_len) + 2:
-        return []
+        return [], []
+
+    bar_indices = np.arange(1, n + 1)
+    cmr_arr = np.cumsum(h - l) / bar_indices
+    
+    # 2. Select the threshold array based on the indicator's input setting
+    threshold_arr = atr200 if ob_filter == 'Atr' else cmr_arr
 
     def get_swings(length):
         tops = []
@@ -1581,7 +1592,8 @@ def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: 
     int_top_map = {idx: (price, piv_idx) for idx, price, piv_idx in int_tops}
     int_btm_map = {idx: (price, piv_idx) for idx, price, piv_idx in int_btms}
     
-    active_ob_list = []
+    active_iobs = []
+    active_obs = []
     
     top_y = np.nan
     top_x = -1
@@ -1631,59 +1643,78 @@ def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: 
             lower_wick_alt = min(c[idx], o[idx] - l[idx])
             return upper_wick < lower_wick_alt
         
-        # Internal Bullish Break
-        if not np.isnan(itop_y) and itop_cross and c_curr > itop_y and c_prev <= itop_y:
+        # --- Detect Internal Bullish Structure Break ---
+        if show_iob and not np.isnan(itop_y) and itop_cross and c_curr > itop_y and c_prev <= itop_y:
             if top_y != itop_y and _bull_concordant(i):
                 itop_cross = False
-                ob = find_pine_ob(h, l, c, atr200, i, itop_x, is_bullish_break=True)
+                ob = find_pine_ob(h, l, c, threshold_arr, i, itop_x, is_bullish_break=True)
                 if ob:
-                    active_ob_list.append(ob)
+                    ob.is_internal = True
+                    active_iobs.append(ob)
 
-        # Internal Bearish Break
-        if not np.isnan(ibtm_y) and ibtm_cross and c_curr < ibtm_y and c_prev >= ibtm_y:
+        # --- Detect Internal Bearish Structure Break ---
+        if show_iob and not np.isnan(ibtm_y) and ibtm_cross and c_curr < ibtm_y and c_prev >= ibtm_y:
             if btm_y != ibtm_y and _bear_concordant(i):
                 ibtm_cross = False
-                ob = find_pine_ob(h, l, c, atr200, i, ibtm_x, is_bullish_break=False)
+                ob = find_pine_ob(h, l, c, threshold_arr, i, ibtm_x, is_bullish_break=False)
                 if ob:
-                    active_ob_list.append(ob)
+                    ob.is_internal = True
+                    active_iobs.append(ob)
 
-        # Swing Bullish Break (Pine applies no concordant filter at swing level — only internal)
-        if not np.isnan(top_y) and top_cross and c_curr > top_y and c_prev <= top_y:
+        # --- Detect Swing Bullish Structure Break ---
+        if show_ob and not np.isnan(top_y) and top_cross and c_curr > top_y and c_prev <= top_y:
             top_cross = False
-            ob = find_pine_ob(h, l, c, atr200, i, top_x, is_bullish_break=True)
+            ob = find_pine_ob(h, l, c, threshold_arr, i, top_x, is_bullish_break=True)
             if ob:
-                active_ob_list.append(ob)
+                ob.is_internal = False
+                active_obs.append(ob)
 
-        # Swing Bearish Break (Pine applies no concordant filter at swing level — only internal)
-        if not np.isnan(btm_y) and btm_cross and c_curr < btm_y and c_prev >= btm_y:
+        # --- Detect Swing Bearish Structure Break ---
+        if show_ob and not np.isnan(btm_y) and btm_cross and c_curr < btm_y and c_prev >= btm_y:
             btm_cross = False
-            ob = find_pine_ob(h, l, c, atr200, i, btm_x, is_bullish_break=False)
+            ob = find_pine_ob(h, l, c, threshold_arr, i, btm_x, is_bullish_break=False)
             if ob:
-                active_ob_list.append(ob)
+                ob.is_internal = False
+                active_obs.append(ob)
             
-        # Invalidate broken OBs (Pine logic: close breaks the opposite boundary)
-        surviving = []
-        for ob in active_ob_list:
+        # --- Invalidate Broken Internal Order Blocks (IOBs) ---
+        surviving_iobs = []
+        for ob in active_iobs:
+            if ob.is_demand and c_curr < ob.bottom:
+                continue  # Bullish IOB broken
+            if not ob.is_demand and c_curr > ob.top:
+                continue  # Bearish IOB broken
+            surviving_iobs.append(ob)
+        active_iobs = surviving_iobs
+
+        # --- Invalidate Broken Swing Order Blocks (OBs) ---
+        surviving_obs = []
+        for ob in active_obs:
             if ob.is_demand and c_curr < ob.bottom:
                 continue  # Bullish OB broken
             if not ob.is_demand and c_curr > ob.top:
                 continue  # Bearish OB broken
-            surviving.append(ob)
-        active_ob_list = surviving
+            surviving_obs.append(ob)
+        active_obs = surviving_obs
 
-    # Return the most recent active zones to keep downstream processing fast
-    return active_ob_list[-20:]
+    # Return exactly the required amount of active zones as defined by user settings
+    final_iobs = active_iobs[-iob_showlast:] if iob_showlast > 0 else []
+    final_obs = active_obs[-ob_showlast:] if ob_showlast > 0 else []
+    
+    return final_iobs, final_obs
 
 def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
-    # 1. Calculate ATR 200 for the Pine OB volatility filter
     atr200 = calculate_atr_rma(h, l, c, 200)
     
-    zones = calculate_pine_order_blocks(
+    active_iobs, active_obs = calculate_pine_order_blocks(
         o[:i15 + 1], h[:i15 + 1], l[:i15 + 1], c[:i15 + 1], atr200[:i15 + 1],
         swing_len=cfg_obj.OB_LOOKBACK_CANDLES,
         internal_len=5,
-        filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE, 
+        filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE,
+        iob_showlast=10, 
+        ob_showlast=10,
     )
+    zones = active_obs + active_iobs
     equilibrium = None
     lookback = cfg_obj.OB_LOOKBACK_CANDLES
     if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > lookback:
@@ -1751,32 +1782,43 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
 
             if z.is_demand and zone_prior_leg == -1:
                 ob_ok_buy = True
+                zone_type = "Internal" if z.is_internal else "Swing"
                 reason_buy = (
-                    f"Pine Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
+                    f"Pine {zone_type} Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
                     f"reversed after down-leg, touched idx {touch_idx}"
                 )
             elif (not z.is_demand) and zone_prior_leg == 1:
                 ob_ok_sell = True
+                zone_type = "Internal" if z.is_internal else "Swing"
                 reason_sell = (
-                    f"Pine Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
+                    f"Pine {zone_type} Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
                     f"reversed after up-leg, touched idx {touch_idx}"
                 )
             else:
+                zone_type = "Internal" if z.is_internal else "Swing"
                 logger.debug(
-                    f"[{PAIR_ID.get() or '?'}] Pine OB {'demand' if z.is_demand else 'supply'} "
+                    f"[{PAIR_ID.get() or '?'}] Pine {zone_type} OB "
+                    f"{'demand' if z.is_demand else 'supply'} "
                     f"idx {z.index} closed beyond edge but prior leg is {zone_prior_leg} "
                     f"(need {-1 if z.is_demand else 1}) — vote withheld"
                 )
+
         elif confirmed_idx != -1:
-            continue
+            continue     
         else:
+            zone_type = "Internal" if z.is_internal else "Swing"
             if z.is_demand and ob_ok_buy is not True:
                 ob_ok_buy = False
-                reason_buy = f"Pine Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})"
+                reason_buy = (
+                    f"Pine {zone_type} Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
+                    f"touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})"
+                )
             elif not z.is_demand and ob_ok_sell is not True:
                 ob_ok_sell = False
-                reason_sell = f"Pine Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})" 
-                
+                reason_sell = (
+                    f"Pine {zone_type} Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
+                    f"touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})"
+                )
     reason = reason_buy if ob_ok_buy else (reason_sell if ob_ok_sell else (reason_buy or reason_sell))
     logger.debug(
         f"[{PAIR_ID.get() or '?'}] Pine OB diag | zones found: {len(zones)} | "
