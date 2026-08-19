@@ -1,76 +1,98 @@
-# FILE 1: Dockerfile (CORRECTED)
-# ============================================================================
+# =============================================================================
+# MULTI-STAGE BUILD: Aggressive Caching + UV + AOT Compilation (HYBRID OPTIMIZED)
+# =============================================================================
 
+# ---------- STAGE 1: UV INSTALLER ----------
 FROM python:3.11-slim-bookworm AS uv-installer
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir uv==0.5.15
+RUN pip install --no-cache-dir uv==0.6.12
 
 
+# ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.11-slim-bookworm AS deps-builder
 
 COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
-COPY --from=uv-installer /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends build-essential git && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /build
 
+# Create virtual environment for clean multi-stage copying
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Enable BuildKit caching by removing --no-cache
+ENV UV_CACHE_DIR='/tmp/uv_cache'
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --no-cache -r requirements.txt && \
-    python -m compileall -q /usr/local/lib/python3.11/site-packages
+RUN --mount=type=cache,target=/tmp/uv_cache \
+    uv pip install -r requirements.txt && \
+    python -m compileall -q -o 2 $VIRTUAL_ENV
 
 
+# ---------- STAGE 3: AOT COMPILER ----------
 FROM deps-builder AS aot-builder
 
 WORKDIR /build
+
+# Only copy files the compiler actually imports.
+# Do NOT copy aot_bridge.py or macd_unified.py here — changing business logic
+# should not invalidate the AOT compilation cache.
 COPY src/aot_version.py ./
 COPY src/numba_functions_shared.py ./
-COPY src/aot_bridge.py ./
 COPY src/aot_build.py ./
-COPY src/macd_unified.py ./
-
-RUN ls -la *.py && \
-    test -f numba_functions_shared.py || (echo "❌ Missing numba_functions_shared.py" && exit 1) && \
-    test -f aot_build.py || (echo "❌ Missing aot_build.py" && exit 1)
 
 ARG AOT_STRICT=0
-RUN --mount=type=cache,target=/root/.cache/numba \
-    echo "🔨 Starting AOT compilation (unoptimized build)..." && \
-    python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify || \
-    (echo "❌ AOT build script failed" && exit 1) && \
-    echo "📂 Listing build outputs..." && ls -lh /build && \
-    echo "📄 Normalizing compiled filename..." && \
-    mv /build/macd_aot_compiled*.so /build/macd_aot_compiled.so && \
-    python -c "import importlib.util; \
-spec=importlib.util.spec_from_file_location('macd_aot_compiled','/build/macd_aot_compiled.so'); \
-mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); \
-print('✅ AOT binary verified')" || \
-    ( [ "$AOT_STRICT" != "1" ] && echo "⚠️ AOT failed, continuing..." || (echo "❌ AOT STRICT mode: Compilation failed" && exit 1) )
+
+# Clean structured shell block to correctly handle AOT_STRICT fallbacks
+RUN set -e; \
+    echo "🔨 Starting AOT compilation..."; \
+    if python aot_build.py --output-dir /build --module-name macd_aot_compiled --verify; then \
+        echo "✅ AOT build successful"; \
+        SO_FILE=$(ls -1 /build/macd_aot_compiled*.so 2>/dev/null | head -1); \
+        if [ -n "$SO_FILE" ]; then \
+            mv "$SO_FILE" /build/macd_aot_compiled.so; \
+        fi; \
+    else \
+        echo "⚠️ AOT compilation failed!"; \
+        if [ "$AOT_STRICT" = "1" ]; then \
+            echo "❌ AOT_STRICT=1: Aborting build."; \
+            exit 1; \
+        else \
+            echo "⚠️ AOT_STRICT=0: Creating empty stub files for JIT fallback..."; \
+            touch /build/macd_aot_compiled.so /build/macd_aot_compiled.version; \
+        fi; \
+    fi
 
 
+# ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.11-slim-bookworm AS final
 
 HEALTHCHECK NONE
 
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends libtbb12 ca-certificates && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    libtbb12 \
+    libgomp1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-COPY --from=uv-installer /usr/local/bin/uv /usr/local/bin/uv
-
+# Security - Non-root user
 RUN useradd --uid 1000 --no-log-init -m appuser && \
     mkdir -p /app/src && \
     chown -R appuser:appuser /app
 
 WORKDIR /app/src
 
-COPY --from=deps-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+# Copy Virtual Environment from deps-builder
+COPY --from=deps-builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
+# Copy AOT binary + version stamp from aot-builder
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
+COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version ./
 
 # Copy source files
 COPY --chown=appuser:appuser src/aot_version.py ./
@@ -78,24 +100,25 @@ COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
-# Copy minimal default config (secrets override via env vars)
-COPY --chown=appuser:appuser config_macd.json ./
-
 USER appuser
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONOPTIMIZE=2 \
-    PYTHONPATH=/app/src:$PYTHONPATH \
     NUMBA_CACHE_DIR=/tmp/numba_cache \
     NUMBA_WARNINGS=0 \
+    NUMBA_THREADING_LAYER=tbb \
     NUMBA_NUM_THREADS=2 \
     OMP_NUM_THREADS=2 \
-    MEMORY_LIMIT_BYTES=450000000 \
+    MEMORY_LIMIT_BYTES=850000000 \
     TZ=Asia/Kolkata \
     AOT_LIB_PATH=/app/src
 
-# Let PYTHONOPTIMIZE=2 (env, above) control optimization level; do not
-# additionally pass -O/-OO here — same convention as the GitHub Actions
-# build of this bot.
+LABEL org.opencontainers.image.title="MACD Unified Bot (AOT)" \
+      org.opencontainers.image.description="High-performance trading alert bot with AOT compilation" \
+      org.opencontainers.image.source="https://github.com/manojpy/github-cron" \
+      org.opencontainers.image.memory_limit="900MB" \
+      org.opencontainers.image.platform="linux/amd64"
+
+# Let PYTHONOPTIMIZE=2 control optimization level; do not override with -O/-OO
 CMD ["python", "macd_unified.py"]
