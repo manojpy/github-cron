@@ -1969,25 +1969,39 @@ def get_atr_percentile_smoothed(atr_long_arr: np.ndarray, i15: int, cfg: BotConf
         ema = alpha * val + (1.0 - alpha) * ema
     return ema
 
+_PCTL_RANK_CACHE_MAXSIZE = 256
+_pctl_rank_cache: "OrderedDict[tuple, Optional[float]]" = OrderedDict()
+_PCTL_CACHE_MISS = object()
+
 def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: int,
                              allow_zero: bool = False) -> Optional[float]:
     start = i - lookback
     if start < 0:
         return None
 
+    current = arr[i]
+    cache_key = (id(arr), i, lookback, min_history, allow_zero, current)
+    cached = _pctl_rank_cache.get(cache_key, _PCTL_CACHE_MISS)
+    if cached is not _PCTL_CACHE_MISS:
+        _pctl_rank_cache.move_to_end(cache_key)
+        return cached
+
     window = arr[start:i]
     valid = window[~np.isnan(window)]
     if len(valid) < min_history:
-        return None
+        result = None
+    elif np.isnan(current) or (not allow_zero and current <= 0):
+        result = None
+    else:
+        n = len(valid)
+        count_lt = np.sum(valid < current)
+        count_eq = np.sum(valid == current)
+        result = (count_lt + 0.5 * count_eq) / n
 
-    current = arr[i]
-    if np.isnan(current) or (not allow_zero and current <= 0):
-        return None
-
-    n = len(valid)
-    count_lt = np.sum(valid < current)
-    count_eq = np.sum(valid == current)
-    return (count_lt + 0.5 * count_eq) / n
+    _pctl_rank_cache[cache_key] = result
+    if len(_pctl_rank_cache) > _PCTL_RANK_CACHE_MAXSIZE:
+        _pctl_rank_cache.popitem(last=False)
+    return result
 
 def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
     """Percentile rank (0.0=calmest .. 1.0=most volatile) of current long-ATR
@@ -2021,6 +2035,10 @@ def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConf
         return None
     return _scale_by_pctl(pctl, cfg.ADAPTIVE_MULT_CALM, cfg.ADAPTIVE_MULT_VOLATILE)
 
+_ADX_THRESH_CACHE_MAXSIZE = 256
+_adx_thresh_cache: "OrderedDict[tuple, float]" = OrderedDict()
+_ADX_CACHE_MISS = object()
+
 def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) -> float:
     """Self-referential: ADX threshold = the value at cfg.ADX_ADAPTIVE_TARGET_PCTL of
     this pair's own trailing ADX history — so each pair gets its own baseline instead
@@ -2034,26 +2052,39 @@ def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) ->
     if start < 0:
         return cfg.ADX_ADAPTIVE_FALLBACK
 
+    current = adx_arr[i15] if i15 < len(adx_arr) else np.nan
+    cache_key = (id(adx_arr), i15, lookback, cfg.ADX_ADAPTIVE_TARGET_PCTL,
+                 cfg.ADX_ADAPTIVE_BAND_WIDTH, current)
+    cached = _adx_thresh_cache.get(cache_key, _ADX_CACHE_MISS)
+    if cached is not _ADX_CACHE_MISS:
+        _adx_thresh_cache.move_to_end(cache_key)
+        return cached
+
     window = adx_arr[start:i15]
     valid = window[~np.isnan(window)]
     if len(valid) < cfg.ATR_PCTL_MIN_HISTORY:
-        return cfg.ADX_ADAPTIVE_FALLBACK
+        result = cfg.ADX_ADAPTIVE_FALLBACK
+    else:
+        sorted_valid = np.sort(valid)
+        n = len(sorted_valid)
 
-    sorted_valid = np.sort(valid)
-    n = len(sorted_valid)
+        band_half = cfg.ADX_ADAPTIVE_BAND_WIDTH / 2.0
+        if band_half <= 0.0:
+            idx = int(cfg.ADX_ADAPTIVE_TARGET_PCTL / 100.0 * (n - 1))
+            idx = max(0, min(n - 1, idx))
+            result = float(sorted_valid[idx])
+        else:
+            lo_pctl = max(0.0, cfg.ADX_ADAPTIVE_TARGET_PCTL - band_half)
+            hi_pctl = min(100.0, cfg.ADX_ADAPTIVE_TARGET_PCTL + band_half)
+            lo_idx = max(0, int(lo_pctl / 100.0 * (n - 1)))
+            hi_idx = min(n - 1, int(hi_pctl / 100.0 * (n - 1)))
+            band = sorted_valid[lo_idx:hi_idx + 1]
+            result = float(np.median(band))
 
-    band_half = cfg.ADX_ADAPTIVE_BAND_WIDTH / 2.0
-    if band_half <= 0.0:
-        idx = int(cfg.ADX_ADAPTIVE_TARGET_PCTL / 100.0 * (n - 1))
-        idx = max(0, min(n - 1, idx))
-        return float(sorted_valid[idx])
-
-    lo_pctl = max(0.0, cfg.ADX_ADAPTIVE_TARGET_PCTL - band_half)
-    hi_pctl = min(100.0, cfg.ADX_ADAPTIVE_TARGET_PCTL + band_half)
-    lo_idx = max(0, int(lo_pctl / 100.0 * (n - 1)))
-    hi_idx = min(n - 1, int(hi_pctl / 100.0 * (n - 1)))
-    band = sorted_valid[lo_idx:hi_idx + 1]
-    return float(np.median(band))
+    _adx_thresh_cache[cache_key] = result
+    if len(_adx_thresh_cache) > _ADX_THRESH_CACHE_MAXSIZE:
+        _adx_thresh_cache.popitem(last=False)
+    return result
 
 def get_adaptive_adx_threshold_smoothed(adx_arr: np.ndarray, i15: int, cfg: BotConfig, ema_period: int = 5) -> float:
     required_depth = cfg.ATR_PCTL_LOOKBACK + ema_period
