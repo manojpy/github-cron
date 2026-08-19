@@ -1633,15 +1633,15 @@ def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: 
         
         # Internal Bullish Break
         if not np.isnan(itop_y) and itop_cross and c_curr > itop_y and c_prev <= itop_y:
-            if _bull_concordant(i):
+            if top_y != itop_y and _bull_concordant(i):
                 itop_cross = False
                 ob = find_pine_ob(h, l, c, atr200, i, itop_x, is_bullish_break=True)
                 if ob:
                     active_ob_list.append(ob)
-                
+
         # Internal Bearish Break
         if not np.isnan(ibtm_y) and ibtm_cross and c_curr < ibtm_y and c_prev >= ibtm_y:
-            if _bear_concordant(i):
+            if btm_y != ibtm_y and _bear_concordant(i):
                 ibtm_cross = False
                 ob = find_pine_ob(h, l, c, atr200, i, ibtm_x, is_bullish_break=False)
                 if ob:
@@ -1694,7 +1694,6 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     ob_ok_buy = ob_ok_sell = None
     reason_buy = reason_sell = None
     grace = cfg_obj.OB_CONFIRM_LOOKAHEAD_CANDLES
-    prior_leg = _prior_leg_direction(c, h, l, i15 - 1, Constants.REVERSAL_PRIOR_LEG_LOOKBACK)
     
     for z in zones:
         if equilibrium is not None:
@@ -1702,12 +1701,12 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
                 continue
             if not z.is_demand and z.bottom <= equilibrium:
                 continue
-                
+
         confirm_end = min(z.index + cfg_obj.OB_IMPULSE_LOOKAHEAD, i15 - 1)
         test_start = confirm_end + 1
         if test_start > i15:
-            continue 
-            
+            continue
+
         touch_idx = -1
         zone_dead = False
         confirmed_idx = -1
@@ -1740,25 +1739,36 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
                 if c[idx] > z.top:
                     zone_dead = True
                     break
-                    
+
         if touch_idx == -1 or zone_dead:
             continue
-            
+
         if confirmed_idx == i15:
-            if z.is_demand and prior_leg == -1:
+            leg_ref = touch_idx - 1
+            zone_prior_leg = _prior_leg_direction(
+                c, h, l, leg_ref, Constants.REVERSAL_PRIOR_LEG_LOOKBACK
+            )
+
+            if z.is_demand and zone_prior_leg == -1:
                 ob_ok_buy = True
-                reason_buy = f"Pine Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed after down-leg, touched idx {touch_idx}"
-            elif (not z.is_demand) and prior_leg == 1:
+                reason_buy = (
+                    f"Pine Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
+                    f"reversed after down-leg, touched idx {touch_idx}"
+                )
+            elif (not z.is_demand) and zone_prior_leg == 1:
                 ob_ok_sell = True
-                reason_sell = f"Pine Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) reversed after up-leg, touched idx {touch_idx}"
+                reason_sell = (
+                    f"Pine Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
+                    f"reversed after up-leg, touched idx {touch_idx}"
+                )
             else:
                 logger.debug(
-                    f"[{PAIR_ID.get() or '?'}] Pine OB {'demand' if z.is_demand else 'supply'} idx {z.index} "
-                    f"closed beyond edge but prior leg is {prior_leg} "
+                    f"[{PAIR_ID.get() or '?'}] Pine OB {'demand' if z.is_demand else 'supply'} "
+                    f"idx {z.index} closed beyond edge but prior leg is {zone_prior_leg} "
                     f"(need {-1 if z.is_demand else 1}) — vote withheld"
                 )
         elif confirmed_idx != -1:
-            continue  
+            continue
         else:
             if z.is_demand and ob_ok_buy is not True:
                 ob_ok_buy = False
@@ -1771,7 +1781,6 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     logger.debug(
         f"[{PAIR_ID.get() or '?'}] Pine OB diag | zones found: {len(zones)} | "
         f"equilibrium={'%.4f' % equilibrium if equilibrium is not None else 'N/A'} | "
-        f"prior_leg={prior_leg} | "
         f"ob_ok_buy={ob_ok_buy} ob_ok_sell={ob_ok_sell} | "
         f"reason={reason or 'no zone touched/confirmed'}"
     )
