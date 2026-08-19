@@ -6,7 +6,7 @@
   
   "BOT_NAME": "Unified Alert Bot",
   "DEBUG_MODE": false,
-  "SEND_TEST_MESSAGE": true,
+  "SEND_TEST_MESSAGE": false,
   "ENABLE_VWAP": true,
   "ENABLE_PIVOT": true,
   "ENABLE_RVOL_ALERT": true,
