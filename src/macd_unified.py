@@ -228,7 +228,7 @@ class BotConfig(BaseModel):
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
-    CONFLUENCE_MIN_SCORE: float = Field(default=6.0, ge=0.5, le=50.0, description="Min weighted confluence score required to pass (see compute_confluence_score for per-vote weights: HTF trend/OB=3, OI/funding=2, ADX/RVOL/CPR=1, PPO/RSI/TK cross=0.5)")
+    CONFLUENCE_MIN_PCT: float = Field(default=60.0, ge=1.0, le=100.0, description="Min percentage of the achievable confluence total required to pass. Denominator = sum of weights of enabled, non-abstaining votes this cycle, so the threshold auto-scales when votes are enabled/disabled — no manual retuning needed")
     OB_MIN_OTHER_SCORE: float = Field(default=3.0, ge=0.0, le=50.0, description="Min weighted score from votes OTHER than base_trend and order_block required before the OB vote is allowed to count toward the confluence total. base_trend is excluded because it's a precondition for evaluation, not independent confluence. Default 3.0 is set above oi_funding's 2.5 weight so oi_funding alone can't pair with OB to clear the gate")
     OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
     OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=2, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
@@ -4728,13 +4728,22 @@ def _format_price(price: Any) -> str:
     """Safely format price to 2 decimal places."""
     return f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
 
-def _fmt_score(score: Optional[float]) -> str:
-    """Compact weighted-confluence-score suffix for message headers, e.g. '(7)' or '(6.5)'."""
+def _fmt_num(n: float) -> str:
+    """Format a number with no trailing '.0' when it's a whole number."""
+    return f"{n:.0f}" if float(n).is_integer() else f"{n:.1f}"
+
+def _fmt_score(score: Optional[float], total: Optional[float] = None) -> str:
+    """Compact weighted-confluence-score suffix for message headers.
+    e.g. ' - 88%(26.5/30)' when total is known, else '(6.5)' as a fallback.
+    Returned as raw (unescaped) text; caller is responsible for MarkdownV2 escaping."""
     if score is None:
         return ""
-    return f"({score:.0f})" if float(score).is_integer() else f"({score:.1f})"
+    if total is not None and total > 0:
+        pct = round((score / total) * 100)
+        return f" - {pct}%({_fmt_num(score)}/{_fmt_num(total)})"
+    return f"({_fmt_num(score)})"
 
-def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None) -> str:
+def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional[str] = None, score: Optional[float] = None, total: Optional[float] = None) -> str:
     if not title: 
         title = "ALERT"
     
@@ -4751,15 +4760,13 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     # 2. ESCAPE INDIVIDUAL DATA (Crucial for MarkdownV2 stability)
     e_symbols = escape_markdown_v2(symbols)
     e_pair = escape_markdown_v2(pair)
-    e_score = escape_markdown_v2(_fmt_score(score))
+    e_score = escape_markdown_v2(_fmt_score(score, total)) 
     e_price = escape_markdown_v2(price_str)
     e_desc = escape_markdown_v2(description)
     e_extra = escape_markdown_v2(extra_clean)
     e_date = escape_markdown_v2(date_str)
     e_time = escape_markdown_v2(time_str)
     
-    # 3. APPLY TELEGRAM LAYOUT TAGS
-    # Bold pair and bold price. Note: Literal hyphens '\-' must be escaped in MarkdownV2.
     line1 = f"{e_symbols} *{e_pair}{e_score}* \\- *{e_price}*"
 
     # Bold the alert type, italicize the extra context details
@@ -4773,13 +4780,13 @@ def build_single_msg(title: str, pair: str, price: Any, ts: int, extra: Optional
     
     return f"{line1}\n{line2}\n{line3}"
         
-def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]], score: Optional[float] = None) -> str:
+def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str]], score: Optional[float] = None, total: Optional[float] = None) -> str:
     price_str = _format_price(price)
     date_str = format_ist_time(ts, '%d-%m-%Y')
     time_str = format_ist_time(ts, '%H:%M IST')
     
     e_pair = escape_markdown_v2(pair)
-    e_score = escape_markdown_v2(_fmt_score(score))
+    e_score = escape_markdown_v2(_fmt_score(score, total))
     e_price = escape_markdown_v2(price_str)
     e_date = escape_markdown_v2(date_str)
     e_time = escape_markdown_v2(time_str)
@@ -6329,7 +6336,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
-            required = min(cfg.CONFLUENCE_MIN_SCORE, confluence_total)
+            required = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
             if confluence_score < required:
                 logger_pair.info(
                     f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"
@@ -6433,10 +6440,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
-                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score)
+                    msg = build_single_msg(title, pair_name, close_curr, ts_curr, extra, score=confluence_score, total=confluence_total)
                 else:
                     items = [(t, e) for t, e, _ in alerts_to_send[:25]]
-                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score)
+                    msg = build_batched_msg(pair_name, close_curr, ts_curr, items, score=confluence_score, total=confluence_total)
 
                 if not cfg.DRY_RUN_MODE:
                     reconfirmed = await confirm_candle_unchanged(
@@ -6811,7 +6818,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         score, total = compute_confluence_score(gr, is_buy=buy_side)
-        required = min(cfg.CONFLUENCE_MIN_SCORE, total)
+        required = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
         if score < required:
             logger_pair.info(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
