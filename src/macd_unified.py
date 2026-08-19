@@ -13,6 +13,7 @@ import re
 import uuid
 import argparse
 import psutil
+import OrderedDict
 import gc
 import json
 from collections import deque
@@ -1679,12 +1680,11 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     atr200 = calculate_atr_rma(h, l, c, 200)
     
     zones = calculate_pine_order_blocks(
-        o, h, l, c, atr200,
+        o[:i15 + 1], h[:i15 + 1], l[:i15 + 1], c[:i15 + 1], atr200[:i15 + 1],
         swing_len=cfg_obj.OB_LOOKBACK_CANDLES,
         internal_len=5,
         filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE, 
     )
-    
     equilibrium = None
     lookback = cfg_obj.OB_LOOKBACK_CANDLES
     if cfg_obj.ENABLE_OB_PREMIUM_DISCOUNT_FILTER and i15 > lookback:
@@ -4943,7 +4943,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ── Strong reversal candle (engulfing/piercing/star/soldiers/tweezer/harami/marubozu/pinbar) ──
+    # ���─ Strong reversal candle (engulfing/piercing/star/soldiers/tweezer/harami/marubozu/pinbar) ──
     for k, ok_key in (("strong_reversal_buy", "strong_reversal_buy"), ("strong_reversal_sell", "strong_reversal_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
