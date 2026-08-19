@@ -13,10 +13,9 @@ import re
 import uuid
 import argparse
 import psutil
-import OrderedDict
 import gc
 import json
-from collections import deque
+from collections import deque, OrderedDict 
 from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -4808,8 +4807,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common",False) and ctx.get("ob_gate_ok_buy",False) and ctx.get("reversal_bullish",False) and (ppo.get("curr",np.nan) <0.20 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | Pattern: {ctx.get('reversal_pattern_name','N/A')} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
-    { "key": "ob_reversal_sell", "title": "🔴🏛️ Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common",False) and ctx.get("ob_gate_ok_sell",False) and ctx.get("reversal_bearish",False) and (ppo.get("curr",np.nan) >-0.20 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | Pattern: {ctx.get('reversal_pattern_name','N/A')} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
+    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.20 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
+    { "key": "ob_reversal_sell", "title": "🔴🏛️ Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.20 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("strong_reversal_buy",False) and (ppo.get("curr",np.nan)<0.20 or rsi.get("curr",np.nan)<60)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("strong_reversal_sell",False) and (ppo.get("curr",np.nan)>-0.20 or rsi.get("curr",np.nan)>40)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["strong_reversal"]}
 ] 
@@ -5969,8 +5968,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "ob_gate_reason": ob_gate_reason,
             "strong_reversal_buy": strong_reversal_buy, "strong_reversal_sell": strong_reversal_sell,
             "reversal_pattern_name": reversal_pattern_name,
-            "reversal_bullish": reversal_bullish,
-            "reversal_bearish": reversal_bearish,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -6047,7 +6044,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not is_valid_for_buy and alert_key not in ("strong_reversal_buy", "ob_reversal_buy"):
+
+                if not is_valid_for_buy and alert_key not in ("strong_reversal_buy",):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
                     continue
@@ -6060,8 +6058,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-
-                if not is_valid_for_sell and alert_key not in ("strong_reversal_sell", "ob_reversal_sell"):
+                if not is_valid_for_sell and alert_key not in ("strong_reversal_sell",):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
                     continue
