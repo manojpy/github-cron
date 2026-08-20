@@ -147,7 +147,7 @@ class Constants:
     REVERSAL_TWEEZER_TOLERANCE_PCT = 0.05
     REVERSAL_PRIOR_LEG_LOOKBACK = 4 
     REVERSAL_PRIOR_LEG_MIN_RANGE_MULT = 0.5 
-    OSCILLATOR_GROUP_MIN_VOTES = 2
+    OSCILLATOR_GROUP_MIN_VOTES = 1
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -266,6 +266,8 @@ class BotConfig(BaseModel):
     ICHIMOKU_BASE_PERIODS: int = Field(default=26, ge=1, le=400, description="Ichimoku base line length")
     ICHIMOKU_SPANB_PERIODS: int = Field(default=52, ge=1, le=500, description="Ichimoku leading span B length")
     ICHIMOKU_DISPLACEMENT: int = Field(default=26, ge=1, le=400, description="Ichimoku cloud forward displacement")
+    ICHIMOKU_TK_CONVERSION_PERIODS: int = Field(default=23, ge=1, le=300, description="Tenkan (conversion) length used for TK guard + cross alerts, independent of cloud conversion length")
+    ICHIMOKU_TK_BASE_PERIODS: int = Field(default=65, ge=1, le=400, description="Kijun (base) length used for TK guard + cross alerts, independent of cloud base length")
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
@@ -1308,8 +1310,8 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
         results['rma50_15'] = calculate_rma_numpy(close_15m, cfg.RMA_50_PERIOD)
         results['rma200_5'] = calculate_rma_numpy(close_5m, cfg.RMA_200_PERIOD)
 
-        # ── Ichimoku (cloud + TK guard) ──
-        if cfg.ICHIMOKU_CLOUD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED:
+        # ── Ichimoku cloud (9/26/52/26 — cloud + future cloud only) ──
+        if cfg.ICHIMOKU_CLOUD_ENABLED:
             ichimoku = calculate_ichimoku_numpy(
                 data_15m["high"], data_15m["low"], close_15m,
                 cfg.ICHIMOKU_CONVERSION_PERIODS,
@@ -1321,8 +1323,6 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_cloud_lower'] = ichimoku['cloud_lower']
             results['ichimoku_future_green'] = ichimoku['future_green']
             results['ichimoku_future_red'] = ichimoku['future_red']
-            results['ichimoku_conversion_line'] = ichimoku['conversion_line']
-            results['ichimoku_base_line'] = ichimoku['base_line']
         else:
             nan_arr = np.full(n_15m, np.nan, dtype=np.float64)
             bool_arr = np.zeros(n_15m, dtype=bool)
@@ -1330,8 +1330,21 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
             results['ichimoku_cloud_lower'] = nan_arr.copy()
             results['ichimoku_future_green'] = bool_arr.copy()
             results['ichimoku_future_red'] = bool_arr.copy()
-            results['ichimoku_conversion_line'] = nan_arr.copy()
-            results['ichimoku_base_line'] = nan_arr.copy()
+
+        # ── Tenkan/Kijun (23/65 — TK guard + Tenkan/Kijun cross alerts only) ──
+        # Independent of the cloud's own conversion/base periods above.
+        if cfg.ICHIMOKU_TK_GUARD_ENABLED or cfg.ENABLE_TK_CONVERSION_CROSS or cfg.ENABLE_KIJUN_CROSS:
+            _, hh_tk_conv = rolling_min_max_numba(data_15m["high"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)
+            ll_tk_conv, _ = rolling_min_max_numba(data_15m["low"], cfg.ICHIMOKU_TK_CONVERSION_PERIODS)
+            results['ichimoku_conversion_line'] = (hh_tk_conv + ll_tk_conv) / 2.0
+
+            _, hh_tk_base = rolling_min_max_numba(data_15m["high"], cfg.ICHIMOKU_TK_BASE_PERIODS)
+            ll_tk_base, _ = rolling_min_max_numba(data_15m["low"], cfg.ICHIMOKU_TK_BASE_PERIODS)
+            results['ichimoku_base_line'] = (hh_tk_base + ll_tk_base) / 2.0
+        else:
+            nan_arr_tk = np.full(n_15m, np.nan, dtype=np.float64)
+            results['ichimoku_conversion_line'] = nan_arr_tk.copy()
+            results['ichimoku_base_line'] = nan_arr_tk.copy()
 
         # ── Volatility: ATR + ADX ──
         results['atr_short'] = calculate_atr_rma(
