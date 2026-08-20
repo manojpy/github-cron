@@ -456,6 +456,16 @@ class BotConfig(BaseModel):
         return self
 
     @model_validator(mode='after')
+    def validate_confluence_floor(self) -> 'BotConfig':
+        max_achievable = 30.0  # sum of CONFLUENCE_WEIGHTS
+        if self.ENABLE_CONFLUENCE_GATE and self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
+            raise ValueError(
+                f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
+                f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
+            )
+        return self
+
+    @model_validator(mode='after')
     def validate_logic(self) -> 'BotConfig':
         
         errors = []
@@ -2063,7 +2073,6 @@ def get_atr_percentile(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Op
     against its trailing ATR_PCTL_LOOKBACK window. None if insufficient history."""
     return _array_percentile_rank(atr_long_arr, i15, cfg.ATR_PCTL_LOOKBACK, cfg.ATR_PCTL_MIN_HISTORY)
 
-
 def get_adx_percentile(adx_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
     """Percentile rank (0.0=weakest .. 1.0=strongest) of current ADX against its
     trailing ATR_PCTL_LOOKBACK window (reuses the same lookback as ATR for consistency)."""
@@ -2082,10 +2091,12 @@ def _scale_by_pctl(pctl: Optional[float], calm: float, volatile: float, fallback
     lo, hi = min(calm, volatile), max(calm, volatile)
     return max(lo, min(hi, val))
 
-def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig) -> Optional[float]:
+def get_adaptive_rvol_threshold(atr_long_arr: np.ndarray, i15: int, cfg: BotConfig,
+                                 pctl: Optional[float] = None) -> Optional[float]:
     if not cfg.ATR_ADAPTIVE_ENABLED:
         return None
-    pctl = get_atr_percentile(atr_long_arr, i15, cfg)
+    if pctl is None:
+        pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
     if pctl is None:
         return None
     return _scale_by_pctl(pctl, cfg.ADAPTIVE_MULT_CALM, cfg.ADAPTIVE_MULT_VOLATILE)
@@ -4954,7 +4965,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     _add("ppo_zero_up",   "ppo_zero_down",   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
     _add("ppo_adaptive_up", "ppo_adaptive_down", ppo_c, ppo_p, thr, thr, -thr, -thr)
 
-    # ─��� RSI ──
+    # ─����� RSI ──
     rsi_c, rsi_p = context["rsi_curr"], context["rsi_prev"]
     ema_c, ema_p = context["rsi_ema_curr"], context["rsi_ema_prev"]
     _add("rsi_ema5_up", "rsi_ema5_down", rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
@@ -5023,7 +5034,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
-    # ���─ Strong reversal candle (engulfing/piercing/star/soldiers/tweezer/harami/marubozu/pinbar) ──
+    # ── Strong reversal candle (engulfing/piercing/star/soldiers/tweezer/harami/marubozu/pinbar) ──
     for k, ok_key in (("strong_reversal_buy", "strong_reversal_buy"), ("strong_reversal_sell", "strong_reversal_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
@@ -5335,8 +5346,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         if ichimoku_cloud_ready:
             above_cloud = close_curr > cloud_upper_val
             below_cloud = close_curr < cloud_lower_val
-            cloud_up = future_green and above_cloud
-            cloud_down = future_red and below_cloud
+            cloud_up = bool(future_green and above_cloud)
+            cloud_down = bool(future_red and below_cloud)
         else:
             logger_pair.debug(
                 f"[{pair_name}] Ichimoku cloud NaN at i15={i15} (warmup/gap). "
@@ -5355,8 +5366,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         if cfg.ICHIMOKU_TK_GUARD_ENABLED:
             if tk_guard_valid:
-                tk_guard_ok_buy = (tk_conversion_curr >= tk_base_curr) and (close_curr > tk_base_curr)
-                tk_guard_ok_sell = (tk_conversion_curr <= tk_base_curr) and (close_curr < tk_base_curr)
+                tk_guard_ok_buy = bool((tk_conversion_curr >= tk_base_curr) and (close_curr > tk_base_curr))
+                tk_guard_ok_sell = bool((tk_conversion_curr <= tk_base_curr) and (close_curr < tk_base_curr))
+
             else:
                 logger_pair.debug(
                     f"[{pair_name}] TK lines not ready at i15={i15}. "
@@ -5397,8 +5409,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         rma50_15_val = rma50_15[i15]
         rma200_5_val = rma200_5[i5]
 
-        base_buy_trend = (rma50_15_val < close_curr) and (rma200_5_val < close_5m_val)
-        base_sell_trend = (rma50_15_val > close_curr) and (rma200_5_val > close_5m_val)
+        base_buy_trend = bool((rma50_15_val < close_curr) and (rma200_5_val < close_5m_val))
+        base_sell_trend = bool((rma50_15_val > close_curr) and (rma200_5_val > close_5m_val))
 
         if cfg.ICHIMOKU_CLOUD_ENABLED:
             ichimoku_gate_ok_buy = cloud_up
@@ -5420,14 +5432,11 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             not np.isnan(atr_short_val) and not np.isnan(atr_long_val) and atr_long_val > 1e-9
         )
         atr_ratio = (atr_short_val / atr_long_val) if atr_ratio_valid else float('nan')
-
-
-        adaptive_threshold = None
-        if cfg.ATR_ADAPTIVE_ENABLED:
-            shared_smoothed_pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
-            ppo_adaptive_threshold = get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
-            rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
-            cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+        shared_smoothed_pctl = _get_smoothed_pctl(atr_long_arr, i15, cfg)
+        adaptive_threshold = get_adaptive_rvol_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+        ppo_adaptive_threshold = get_adaptive_ppo_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+        rsi_adaptive_buy, rsi_adaptive_sell = get_adaptive_rsi_thresholds(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
+        cpr_adaptive_min_pct_move = get_adaptive_cpr_threshold(atr_long_arr, i15, cfg, pctl=shared_smoothed_pctl)
 
         volume_curr = data_15m.volume[i15]
         volume_ema_curr = volume_ema_arr[i15]
@@ -5466,7 +5475,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             volume_above_ema_ok,   # 4. Volume > EMA(volume)
             body_conviction_ok,    # 5. Candle body conviction (|close-open|/range)
         ]
-
         momentum_count = sum(momentum_conditions)
 
         any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
@@ -5538,8 +5546,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         if cfg.ENABLE_PPO_GATE:
             if not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_sig_curr):
-                ppo_gate_ok_buy = ppo_gate_curr > ppo_gate_sig_curr
-                ppo_gate_ok_sell = ppo_gate_curr < ppo_gate_sig_curr
+                ppo_gate_ok_buy = bool(ppo_gate_curr > ppo_gate_sig_curr)
+                ppo_gate_ok_sell = bool(ppo_gate_curr < ppo_gate_sig_curr)
             else:
                 ppo_gate_ok_buy = None
                 ppo_gate_ok_sell = None
@@ -5548,9 +5556,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             ppo_gate_ok_sell = None
 
         if cfg.RSI_GUARD_ENABLED:
-            if not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_ema_curr):
-                rsi_guard_ok_buy = rsi_guard_smooth_curr > rsi_guard_ema_curr
-                rsi_guard_ok_sell = rsi_guard_smooth_curr < rsi_guard_ema_curr
+            if not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_ema_curr):         
+                rsi_guard_ok_buy = bool(rsi_guard_smooth_curr > rsi_guard_ema_curr)
+                rsi_guard_ok_sell = bool(rsi_guard_smooth_curr < rsi_guard_ema_curr)
             else:
                 rsi_guard_ok_buy = None
                 rsi_guard_ok_sell = None
@@ -5560,8 +5568,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         if cfg.RMA_CLOUD_ENABLED:
             if not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma50_15_val):
-                rma_cloud_ok_buy = rma_cloud_fast_curr > rma50_15_val
-                rma_cloud_ok_sell = rma_cloud_fast_curr < rma50_15_val
+                rma_cloud_ok_buy = bool(rma_cloud_fast_curr > rma50_15_val)
+                rma_cloud_ok_sell = bool(rma_cloud_fast_curr < rma50_15_val)
             else:
                 rma_cloud_ok_buy = None
                 rma_cloud_ok_sell = None
@@ -5572,8 +5580,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
                 and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
-            ppo_gate_momentum_ok_buy = ppo_gate_curr > ppo_gate_prev_val
-            ppo_gate_momentum_ok_sell = ppo_gate_curr < ppo_gate_prev_val
+            ppo_gate_momentum_ok_buy = bool(ppo_gate_curr > ppo_gate_prev_val)
+            ppo_gate_momentum_ok_sell = bool(ppo_gate_curr < ppo_gate_prev_val)
         else:
             ppo_gate_momentum_ok_buy = None
             ppo_gate_momentum_ok_sell = None
@@ -5581,8 +5589,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         rsi_guard_smooth_prev_val = rsi_guard_smooth_arr[i15 - 1] if i15 >= 1 else rsi_guard_smooth_curr
         if (cfg.ENABLE_RSI_GUARD_MOMENTUM_VOTE
                 and not np.isnan(rsi_guard_smooth_curr) and not np.isnan(rsi_guard_smooth_prev_val)):
-            rsi_guard_momentum_ok_buy = rsi_guard_smooth_curr > rsi_guard_smooth_prev_val
-            rsi_guard_momentum_ok_sell = rsi_guard_smooth_curr < rsi_guard_smooth_prev_val
+            rsi_guard_momentum_ok_buy = bool(rsi_guard_smooth_curr > rsi_guard_smooth_prev_val)
+            rsi_guard_momentum_ok_sell = bool(rsi_guard_smooth_curr < rsi_guard_smooth_prev_val)
         else:
             rsi_guard_momentum_ok_buy = None
             rsi_guard_momentum_ok_sell = None
@@ -5590,8 +5598,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         rma_cloud_fast_prev_val = rma_cloud_fast_arr[i15 - 1] if i15 >= 1 else rma_cloud_fast_curr
         if (cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE
                 and not np.isnan(rma_cloud_fast_curr) and not np.isnan(rma_cloud_fast_prev_val)):
-            rma_cloud_momentum_ok_buy = rma_cloud_fast_curr > rma_cloud_fast_prev_val
-            rma_cloud_momentum_ok_sell = rma_cloud_fast_curr < rma_cloud_fast_prev_val
+            rma_cloud_momentum_ok_buy = bool(rma_cloud_fast_curr > rma_cloud_fast_prev_val)
+            rma_cloud_momentum_ok_sell = bool(rma_cloud_fast_curr < rma_cloud_fast_prev_val)
         else:
             rma_cloud_momentum_ok_buy = None
             rma_cloud_momentum_ok_sell = None
@@ -5599,10 +5607,15 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         vwap_gate_arr = gate_indicators["vwap_gate"]
         vwap_gate_curr = vwap_gate_arr[i15]
         vwap_gate_prev_val = vwap_gate_arr[i15 - 1] if i15 >= 1 else vwap_gate_curr
-        if (cfg.ENABLE_VWAP_MOMENTUM_VOTE
+        same_utc_day = (
+            i15 >= 1
+            and normalize_timestamp(int(data_15m.ts[i15])) // 86400
+                == normalize_timestamp(int(data_15m.ts[i15 - 1])) // 86400
+        )
+        if (cfg.ENABLE_VWAP_MOMENTUM_VOTE and same_utc_day
                 and not np.isnan(vwap_gate_curr) and not np.isnan(vwap_gate_prev_val)):
-            vwap_momentum_ok_buy = vwap_gate_curr > vwap_gate_prev_val
-            vwap_momentum_ok_sell = vwap_gate_curr < vwap_gate_prev_val
+            vwap_momentum_ok_buy = bool(vwap_gate_curr > vwap_gate_prev_val)
+            vwap_momentum_ok_sell = bool(vwap_gate_curr < vwap_gate_prev_val)
         else:
             vwap_momentum_ok_buy = None
             vwap_momentum_ok_sell = None
