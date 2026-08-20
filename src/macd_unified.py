@@ -1744,8 +1744,8 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         swing_len=cfg_obj.OB_LOOKBACK_CANDLES,
         internal_len=5,
         filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE,
-        iob_showlast=5, 
-        ob_showlast=5,
+        iob_showlast=10, 
+        ob_showlast=10,
     )
     zones = active_obs + active_iobs
     equilibrium = None
