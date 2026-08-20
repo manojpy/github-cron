@@ -4954,7 +4954,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     _add("ppo_zero_up",   "ppo_zero_down",   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
     _add("ppo_adaptive_up", "ppo_adaptive_down", ppo_c, ppo_p, thr, thr, -thr, -thr)
 
-    # ── RSI ──
+    # ─��� RSI ──
     rsi_c, rsi_p = context["rsi_curr"], context["rsi_prev"]
     ema_c, ema_p = context["rsi_ema_curr"], context["rsi_ema_prev"]
     _add("rsi_ema5_up", "rsi_ema5_down", rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
@@ -5609,25 +5609,38 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
-        
-        active_cloud_buy = [g for g in (ichimoku_gate_ok_buy, rma_cloud_ok_buy) if g is not None]
-        if active_cloud_buy:
-            cloud_group_ok_buy = all(active_cloud_buy)
+
+        cloud_votes_buy: List[Optional[bool]] = []
+        cloud_votes_sell: List[Optional[bool]] = []
+        if cfg.ICHIMOKU_CLOUD_ENABLED:
+            cloud_votes_buy.append(ichimoku_gate_ok_buy)
+            cloud_votes_sell.append(ichimoku_gate_ok_sell)
+        if cfg.RMA_CLOUD_ENABLED:
+            cloud_votes_buy.append(rma_cloud_ok_buy)
+            cloud_votes_sell.append(rma_cloud_ok_sell)
+
+        if cloud_votes_buy:
+            cloud_group_ok_buy = all(v is not None and bool(v) for v in cloud_votes_buy)
+            if not cloud_group_ok_buy:
+                logger_pair.debug(
+                    f"[{pair_name}] Cloud group BUY denied: need ALL enabled votes true, "
+                    f"no abstentions allowed — votes={cloud_votes_buy}"
+                )
         elif cloud_group_enabled:
-            logger_pair.debug(
-                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — buy denied."
-            )
+            logger_pair.debug(f"[{pair_name}] Cloud group: no votes configured — buy denied.")
             cloud_group_ok_buy = False
         else:
             cloud_group_ok_buy = True
 
-        active_cloud_sell = [g for g in (ichimoku_gate_ok_sell, rma_cloud_ok_sell) if g is not None]
-        if active_cloud_sell:
-            cloud_group_ok_sell = all(active_cloud_sell)
+        if cloud_votes_sell:
+            cloud_group_ok_sell = all(v is not None and bool(v) for v in cloud_votes_sell)
+            if not cloud_group_ok_sell:
+                logger_pair.debug(
+                    f"[{pair_name}] Cloud group SELL denied: need ALL enabled votes true, "
+                    f"no abstentions allowed — votes={cloud_votes_sell}"
+                )
         elif cloud_group_enabled:
-            logger_pair.debug(
-                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — sell denied."
-            )
+            logger_pair.debug(f"[{pair_name}] Cloud group: no votes configured — sell denied.")
             cloud_group_ok_sell = False
         else:
             cloud_group_ok_sell = True
@@ -6749,13 +6762,13 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 if not ichimoku_gate_ok_sell:
                     reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
             if not cloud_group_ok_buy:
-                reasons.append(f"Cloud group buy: need {len(active_cloud_buy)}-of-{len(active_cloud_buy)} (Ichimoku/RMA cloud) — not all agreed")
+                reasons.append("Cloud group buy: need ALL enabled votes true (Ichimoku/RMA cloud) — abstention or disagreement")
             if not cloud_group_ok_sell:
-                reasons.append(f"Cloud group sell: need {len(active_cloud_sell)}-of-{len(active_cloud_sell)} (Ichimoku/RMA cloud) — not all agreed")
+                reasons.append("Cloud group sell: need ALL enabled votes true (Ichimoku/RMA cloud) — abstention or disagreement")
             if not oscillator_group_ok_buy:
-                reasons.append(f"Oscillator group buy: need {min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_buy))}-of-{len(active_osc_buy)} (PPO/RSI/TK) — not met")
+                reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:
-                reasons.append(f"Oscillator group sell: need {min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_sell))}-of-{len(active_osc_sell)} (PPO/RSI/TK) — not met")
+                reasons.append(f"Oscillator group sell: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
 
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
 
