@@ -1535,55 +1535,59 @@ class OrderBlock:
     is_demand: bool
     is_internal: bool = False 
 
-def find_pine_ob(h: np.ndarray, l: np.ndarray, c: np.ndarray, threshold_arr: np.ndarray, 
-                 break_idx: int, pivot_idx: int, is_bullish_break: bool) -> Optional[OrderBlock]:
+def find_pine_ob(h, l, c, threshold_arr, break_idx, pivot_idx, is_bullish_break):
     best_val = -np.inf if not is_bullish_break else np.inf
     best_idx = -1
-    
+
+    # range(1, break_idx - pivot_idx)  →  1 .. (break_idx-pivot_idx-1) inclusive
     for i in range(1, break_idx - pivot_idx):
         bar_idx = break_idx - i
         candle_range = h[bar_idx] - l[bar_idx]
-        
-        # Multiply the selected threshold (ATR or CMR) by 2, mimicking Pine
+
         threshold = threshold_arr[bar_idx] * 2.0
-        
-        if not np.isnan(threshold) and candle_range < threshold:
-            if not is_bullish_break:  # Bearish OB -> find highest high
-                if h[bar_idx] > best_val:
-                    best_val = h[bar_idx]
-                    best_idx = bar_idx
-            else:  # Bullish OB -> find lowest low
-                if l[bar_idx] < best_val:
-                    best_val = l[bar_idx]
-                    best_idx = bar_idx
-                    
+        if np.isnan(threshold) or candle_range >= threshold:
+            continue
+
+        if not is_bullish_break:          # Bearish OB  →  find highest high
+            if h[bar_idx] > best_val:
+                best_val = h[bar_idx]
+                best_idx = bar_idx
+        else:                             # Bullish OB  →  find lowest low
+            if l[bar_idx] < best_val:
+                best_val = l[bar_idx]
+                best_idx = bar_idx
+
     if best_idx != -1:
         return OrderBlock(
             index=best_idx,
             top=h[best_idx],
             bottom=l[best_idx],
             is_demand=is_bullish_break,
-            is_internal=False # Will be overridden by the caller
+            is_internal=False,            # caller overrides
         )
     return None
 
-def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
-                                atr200: np.ndarray, 
-                                ob_filter: str = 'Atr',
-                                swing_len: int = 50, internal_len: int = 5,
-                                filter_confluence: bool = False,
-                                show_iob: bool = True, iob_showlast: int = 5,
-                                show_ob: bool = True, ob_showlast: int = 5) -> Tuple[List[OrderBlock], List[OrderBlock]]:
+def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swing_len: int = 50, internal_len: int = 5, filter_confluence: bool = False, show_iob: bool = True, iob_showlast: int = 5, show_ob: bool = True, ob_showlast: int = 5):
+    """
+    Faithful Python port of the Pine Order Block v5 logic.
+    """
     n = len(h)
     if n < max(swing_len, internal_len) + 2:
         return [], []
 
-    bar_indices = np.arange(1, n + 1)
-    cmr_arr = np.cumsum(h - l) / bar_indices
-    
-    # 2. Select the threshold array based on the indicator's input setting
+    # --- Cumulative Mean Range (Pine: ta.cum(high-low) / bar_index) ----------
+    # Pine bar_index starts at 0, so at index 0 we use high-low,
+    # at index i>0 we divide by i.
+    bar_idx = np.arange(n, dtype=np.float64)
+    ranges = h - l
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cmr_arr = np.cumsum(ranges) / np.maximum(1.0, bar_idx)
+    if n > 0:
+        cmr_arr[0] = ranges[0]
+
     threshold_arr = atr200 if ob_filter == 'Atr' else cmr_arr
 
+    # --- Swing detection (Pine: swings()) ------------------------------------
     def get_swings(length):
         tops = []
         btms = []
@@ -1593,49 +1597,56 @@ def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: 
             window_l = l[i - length + 1:i + 1]
             upper = np.max(window_h)
             lower = np.min(window_l)
-            
+
             h_len = h[i - length]
             l_len = l[i - length]
-            
+
             prev_os = os
             if h_len > upper:
                 os = 0
             elif l_len < lower:
                 os = 1
-                
+
             if os == 0 and prev_os != 0:
-                tops.append((i, h_len, i - length))  # (confirm_idx, price, pivot_idx)
+                tops.append((i, h_len, i - length))   # (confirm_idx, price, pivot_idx)
             elif os == 1 and prev_os != 1:
                 btms.append((i, l_len, i - length))
         return tops, btms
 
     swing_tops, swing_btms = get_swings(swing_len)
     int_tops, int_btms = get_swings(internal_len)
-    
+
     swing_top_map = {idx: (price, piv_idx) for idx, price, piv_idx in swing_tops}
     swing_btm_map = {idx: (price, piv_idx) for idx, price, piv_idx in swing_btms}
-    int_top_map = {idx: (price, piv_idx) for idx, price, piv_idx in int_tops}
-    int_btm_map = {idx: (price, piv_idx) for idx, price, piv_idx in int_btms}
-    
+    int_top_map     = {idx: (price, piv_idx) for idx, price, piv_idx in int_tops}
+    int_btm_map     = {idx: (price, piv_idx) for idx, price, piv_idx in int_btms}
+
     active_iobs = []
-    active_obs = []
-    
-    top_y = np.nan
-    top_x = -1
-    top_cross = True
-    
-    btm_y = np.nan
-    btm_x = -1
-    btm_cross = True
-    
-    itop_y = np.nan
-    itop_x = -1
-    itop_cross = True
-    
-    ibtm_y = np.nan
-    ibtm_x = -1
-    ibtm_cross = True
-    
+    active_obs  = []
+
+    top_y = np.nan;  top_x = -1;   top_cross = True
+    btm_y = np.nan;  btm_x = -1;   btm_cross = True
+    itop_y = np.nan; itop_x = -1;  itop_cross = True
+    ibtm_y = np.nan; ibtm_x = -1;  ibtm_cross = True
+
+    # --- Concordant filters (Pine: bull_concordant / bear_concordant) --------
+    def _bull_concordant(idx: int) -> bool:
+        if not filter_confluence:
+            return True
+        # Pine: high - math.max(close, open) > math.min(close, open) - low
+        upper_wick = h[idx] - max(c[idx], o[idx])
+        lower_wick = min(c[idx], o[idx]) - l[idx]
+        return upper_wick > lower_wick
+
+    def _bear_concordant(idx: int) -> bool:
+        if not filter_confluence:
+            return True
+        # Pine: high - math.max(close, open) < math.min(close, open) - low
+        upper_wick = h[idx] - max(c[idx], o[idx])
+        lower_wick = min(c[idx], o[idx]) - l[idx]
+        return upper_wick < lower_wick
+
+    # --- Main bar loop -------------------------------------------------------
     for i in range(1, n):
         # Update confirmed swings
         if i in swing_top_map:
@@ -1650,82 +1661,79 @@ def calculate_pine_order_blocks(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: 
         if i in int_btm_map:
             ibtm_y, ibtm_x = int_btm_map[i]
             ibtm_cross = True
-            
+
         c_curr = c[i]
         c_prev = c[i - 1]
-        
-        def _bull_concordant(idx: int) -> bool:
-            if not filter_confluence:
-                return True
-            upper_wick = h[idx] - max(c[idx], o[idx])
-            lower_wick_alt = min(c[idx], o[idx] - l[idx])
-            return upper_wick > lower_wick_alt
 
-        def _bear_concordant(idx: int) -> bool:
-            if not filter_confluence:
-                return True
-            upper_wick = h[idx] - max(c[idx], o[idx])
-            lower_wick_alt = min(c[idx], o[idx] - l[idx])
-            return upper_wick < lower_wick_alt
-        
-        # --- Detect Internal Bullish Structure Break ---
-        if show_iob and not np.isnan(itop_y) and itop_cross and c_curr > itop_y and c_prev <= itop_y:
-            if top_y != itop_y and _bull_concordant(i):
+        # ---- Internal Bullish Structure Break (crossover close, itop_y) ----
+        if (show_iob and not np.isnan(itop_y) and itop_cross
+                and c_curr > itop_y and c_prev <= itop_y):
+            if not np.isnan(top_y) and top_y == itop_y:
+                pass                                   # Pine: top_y != itop_y
+            elif _bull_concordant(i):
                 itop_cross = False
-                ob = find_pine_ob(h, l, c, threshold_arr, i, itop_x, is_bullish_break=True)
+                ob = find_pine_ob(h, l, c, threshold_arr, i, itop_x,
+                                  is_bullish_break=True)
                 if ob:
                     ob.is_internal = True
                     active_iobs.append(ob)
 
-        # --- Detect Internal Bearish Structure Break ---
-        if show_iob and not np.isnan(ibtm_y) and ibtm_cross and c_curr < ibtm_y and c_prev >= ibtm_y:
-            if btm_y != ibtm_y and _bear_concordant(i):
+        # ---- Internal Bearish Structure Break (crossunder close, ibtm_y) ---
+        if (show_iob and not np.isnan(ibtm_y) and ibtm_cross
+                and c_curr < ibtm_y and c_prev >= ibtm_y):
+            if not np.isnan(btm_y) and btm_y == ibtm_y:
+                pass
+            elif _bear_concordant(i):
                 ibtm_cross = False
-                ob = find_pine_ob(h, l, c, threshold_arr, i, ibtm_x, is_bullish_break=False)
+                ob = find_pine_ob(h, l, c, threshold_arr, i, ibtm_x,
+                                  is_bullish_break=False)
                 if ob:
                     ob.is_internal = True
                     active_iobs.append(ob)
 
-        # --- Detect Swing Bullish Structure Break ---
-        if show_ob and not np.isnan(top_y) and top_cross and c_curr > top_y and c_prev <= top_y:
+        # ---- Swing Bullish Structure Break ---------------------------------
+        if (show_ob and not np.isnan(top_y) and top_cross
+                and c_curr > top_y and c_prev <= top_y):
             top_cross = False
-            ob = find_pine_ob(h, l, c, threshold_arr, i, top_x, is_bullish_break=True)
+            ob = find_pine_ob(h, l, c, threshold_arr, i, top_x,
+                              is_bullish_break=True)
             if ob:
                 ob.is_internal = False
                 active_obs.append(ob)
 
-        # --- Detect Swing Bearish Structure Break ---
-        if show_ob and not np.isnan(btm_y) and btm_cross and c_curr < btm_y and c_prev >= btm_y:
+        # ---- Swing Bearish Structure Break ---------------------------------
+        if (show_ob and not np.isnan(btm_y) and btm_cross
+                and c_curr < btm_y and c_prev >= btm_y):
             btm_cross = False
-            ob = find_pine_ob(h, l, c, threshold_arr, i, btm_x, is_bullish_break=False)
+            ob = find_pine_ob(h, l, c, threshold_arr, i, btm_x,
+                              is_bullish_break=False)
             if ob:
                 ob.is_internal = False
                 active_obs.append(ob)
-            
-        # --- Invalidate Broken Internal Order Blocks (IOBs) ---
+
+        # ---- Invalidate broken Internal OBs --------------------------------
         surviving_iobs = []
         for ob in active_iobs:
             if ob.is_demand and c_curr < ob.bottom:
-                continue  # Bullish IOB broken
+                continue          # Bullish IOB broken
             if not ob.is_demand and c_curr > ob.top:
-                continue  # Bearish IOB broken
+                continue          # Bearish IOB broken
             surviving_iobs.append(ob)
         active_iobs = surviving_iobs
 
-        # --- Invalidate Broken Swing Order Blocks (OBs) ---
+        # ---- Invalidate broken Swing OBs -----------------------------------
         surviving_obs = []
         for ob in active_obs:
             if ob.is_demand and c_curr < ob.bottom:
-                continue  # Bullish OB broken
+                continue
             if not ob.is_demand and c_curr > ob.top:
-                continue  # Bearish OB broken
+                continue
             surviving_obs.append(ob)
         active_obs = surviving_obs
 
-    # Return exactly the required amount of active zones as defined by user settings
+    # Return the most recent N active zones (Pine: show_last)
     final_iobs = active_iobs[-iob_showlast:] if iob_showlast > 0 else []
-    final_obs = active_obs[-ob_showlast:] if ob_showlast > 0 else []
-    
+    final_obs  = active_obs[-ob_showlast:]   if ob_showlast  > 0 else []
     return final_iobs, final_obs
 
 def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
