@@ -356,34 +356,33 @@ class BotConfig(BaseModel):
 
     @model_validator(mode='after')
     def validate_confluence_floor(self) -> 'BotConfig':
-        max_achievable = 0.0
-        max_achievable += 3.0  # base_trend always counted
-        if self.ICHIMOKU_CLOUD_ENABLED: max_achievable += 2.0
-        if self.RMA_CLOUD_ENABLED:      max_achievable += 2.0
-        if self.ENABLE_PPO_GATE:        max_achievable += 2.0
-        if self.RSI_GUARD_ENABLED:      max_achievable += 2.0
-        if self.ICHIMOKU_TK_GUARD_ENABLED: max_achievable += 2.0
-        if self.ENABLE_ADX_FILTER:      max_achievable += 1.0
+        if not self.ENABLE_CONFLUENCE_GATE:
+            return self
+        max_achievable = 3.0  # base_trend always counts
+        if self.ICHIMOKU_CLOUD_ENABLED:                        max_achievable += 2.0
+        if self.RMA_CLOUD_ENABLED:                             max_achievable += 2.0
+        if self.ENABLE_PPO_GATE:                               max_achievable += 2.0
+        if self.RSI_GUARD_ENABLED:                             max_achievable += 2.0
+        if self.ICHIMOKU_TK_GUARD_ENABLED:                     max_achievable += 2.0
+        if self.ENABLE_ADX_FILTER:                             max_achievable += 1.0
         if self.ENABLE_RVOL_ALERT or self.ATR_ADAPTIVE_ENABLED: max_achievable += 1.0
-        if self.ENABLE_CPR:             max_achievable += 1.0
-        if self.ENABLE_ADX_STRENGTH_VOTE: max_achievable += 1.0
-        if self.ENABLE_ATR_PCTL_VOTE:   max_achievable += 1.0
-        if self.ENABLE_VOLUME_PCTL_VOTE: max_achievable += 1.0
-        if self.ENABLE_OI_FUNDING_FILTER: max_achievable += 2.5
-        if self.ENABLE_OB_GATE:         max_achievable += 2.5
-        if self.ENABLE_PPO_GATE_MOMENTUM_VOTE: max_achievable += 1.5
-        if self.ENABLE_RSI_GUARD_MOMENTUM_VOTE: max_achievable += 1.5
-        if self.ENABLE_RMA_CLOUD_MOMENTUM_VOTE: max_achievable += 1.5
-        if self.ENABLE_VWAP_MOMENTUM_VOTE: max_achievable += 1.5
-
-        if self.ENABLE_CONFLUENCE_GATE and self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
+        if self.ENABLE_CPR:                                    max_achievable += 1.0
+        if self.ENABLE_OI_FUNDING_FILTER:                      max_achievable += 2.5
+        if self.ENABLE_OB_GATE:                                max_achievable += 2.5
+        if self.ENABLE_ADX_STRENGTH_VOTE:                      max_achievable += 1.0
+        if self.ENABLE_ATR_PCTL_VOTE:                          max_achievable += 1.0
+        if self.ENABLE_VOLUME_PCTL_VOTE:                       max_achievable += 1.0
+        if self.ENABLE_PPO_GATE_MOMENTUM_VOTE:                 max_achievable += 1.5
+        if self.ENABLE_RSI_GUARD_MOMENTUM_VOTE:                max_achievable += 1.5
+        if self.ENABLE_RMA_CLOUD_MOMENTUM_VOTE:                max_achievable += 1.5
+        if self.ENABLE_VWAP_MOMENTUM_VOTE:                     max_achievable += 1.5
+        if self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
             raise ValueError(
                 f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
-                f'achievable weighted total ({max_achievable:.1f}) with current feature flags — '
+                f'achievable weighted total ({max_achievable:.1f}) with the current feature flags — '
                 f'every alert would be blocked forever'
             )
         return self
-
     @model_validator(mode='after')
     def validate_adaptive_rvol(self) -> 'BotConfig':
         if self.ATR_SHORT >= self.ATR_LONG:
@@ -3616,6 +3615,8 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "vwap_momentum": 1.5,
 }
 
+_confluence_floor_warned_pairs: Set[str] = set()
+
 def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
     exclude = exclude or set()
     score = 0.0
@@ -3734,6 +3735,17 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
             if other_score < cfg.OB_MIN_OTHER_SCORE:
                 score -= w
 
+    global _confluence_floor_warned_pairs
+    if (cfg.ENABLE_CONFLUENCE_GATE
+            and total < cfg.CONFLUENCE_MIN_ABS_SCORE
+            and gr.pair_name not in _confluence_floor_warned_pairs):
+        _confluence_floor_warned_pairs.add(gr.pair_name)
+        logger.warning(
+            f"[{gr.pair_name}] Confluence floor unreachable this cycle: achievable total "
+            f"({total:.1f}) < CONFLUENCE_MIN_ABS_SCORE ({cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) — "
+            f"all alerts blocked until more votes warm up / are enabled. "
+            f"If this persists across runs, lower the floor or enable more votes."
+        )
     return score, total
 
 async def confirm_candle_unchanged(fetcher: DataFetcher, symbol: str, pair_name: str,
