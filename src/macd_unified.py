@@ -147,6 +147,7 @@ class Constants:
     REVERSAL_TWEEZER_TOLERANCE_PCT = 0.05
     REVERSAL_PRIOR_LEG_LOOKBACK = 4 
     REVERSAL_PRIOR_LEG_MIN_RANGE_MULT = 0.5 
+    OSCILLATOR_GROUP_MIN_VOTES = 2
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
 PIVOT_LEVELS_SELL = ["P", "S1", "S2", "R1", "R2", "R3"]
@@ -229,6 +230,7 @@ class BotConfig(BaseModel):
     COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_PCT: float = Field(default=60.0, ge=1.0, le=100.0, description="Min percentage of the achievable confluence total required to pass. Denominator = sum of weights of enabled, non-abstaining votes this cycle, so the threshold auto-scales when votes are enabled/disabled — no manual retuning needed")
+    CONFLUENCE_MIN_ABS_SCORE: float = Field(default=18.0, ge=0.0, le=50.0, description="Absolute weighted-score floor required to pass the confluence gate, applied alongside CONFLUENCE_MIN_PCT. The stricter of the two (percentage-of-total vs this fixed floor) wins, so a low-vote-count cycle can't clear the gate on percentage alone")
     OB_MIN_OTHER_SCORE: float = Field(default=3.0, ge=0.0, le=50.0, description="Min weighted score from votes OTHER than base_trend and order_block required before the OB vote is allowed to count toward the confluence total. base_trend is excluded because it's a precondition for evaluation, not independent confluence. Default 3.0 is set above oi_funding's 2.5 weight so oi_funding alone can't pair with OB to clear the gate")
     OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
     OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=2, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
@@ -5607,13 +5609,13 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
-
+        
         active_cloud_buy = [g for g in (ichimoku_gate_ok_buy, rma_cloud_ok_buy) if g is not None]
         if active_cloud_buy:
-            cloud_group_ok_buy = sum(active_cloud_buy) >= 1
+            cloud_group_ok_buy = all(active_cloud_buy)
         elif cloud_group_enabled:
             logger_pair.debug(
-                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) ��� buy denied."
+                f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — buy denied."
             )
             cloud_group_ok_buy = False
         else:
@@ -5621,7 +5623,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         active_cloud_sell = [g for g in (ichimoku_gate_ok_sell, rma_cloud_ok_sell) if g is not None]
         if active_cloud_sell:
-            cloud_group_ok_sell = sum(active_cloud_sell) >= 1
+            cloud_group_ok_sell = all(active_cloud_sell)
         elif cloud_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — sell denied."
@@ -5635,7 +5637,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         active_osc_buy = [g for g in (ppo_gate_ok_buy, rsi_guard_ok_buy, tk_guard_ok_buy) if g is not None]
         if active_osc_buy:
-            oscillator_group_ok_buy = sum(active_osc_buy) >= 1
+            oscillator_group_ok_buy = sum(active_osc_buy) >= min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_buy))
         elif oscillator_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Oscillator group: all gates abstained (warmup/gap) — buy denied."
@@ -5646,7 +5648,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         active_osc_sell = [g for g in (ppo_gate_ok_sell, rsi_guard_ok_sell, tk_guard_ok_sell) if g is not None]
         if active_osc_sell:
-            oscillator_group_ok_sell = sum(active_osc_sell) >= 1
+            oscillator_group_ok_sell = sum(active_osc_sell) >= min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_sell))
         elif oscillator_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Oscillator group: all gates abstained (warmup/gap) — sell denied."
@@ -5657,7 +5659,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         trend_gate_ok_buy = cloud_group_ok_buy and oscillator_group_ok_buy
         trend_gate_ok_sell = cloud_group_ok_sell and oscillator_group_ok_sell
-
 
         buy_trend_common = (
             base_buy_trend
@@ -6336,7 +6337,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
-            required = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+            required = max(confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0), cfg.CONFLUENCE_MIN_ABS_SCORE)
             if confluence_score < required:
                 logger_pair.info(
                     f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"
@@ -6344,7 +6345,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
-            # Batch-fetch all win rates in a single Redis pipeline
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]
             win_rate_map = await sdb.batch_get_alert_win_rates(
                 pair_name, alert_keys_to_check, timeout=3.0
@@ -6748,15 +6748,14 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reasons.append(f"Ichimoku Cloud buy: price not above cloud / future not green (vote)")
                 if not ichimoku_gate_ok_sell:
                     reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
-
             if not cloud_group_ok_buy:
-                reasons.append("Cloud group buy: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
+                reasons.append(f"Cloud group buy: need {len(active_cloud_buy)}-of-{len(active_cloud_buy)} (Ichimoku/RMA cloud) — not all agreed")
             if not cloud_group_ok_sell:
-                reasons.append("Cloud group sell: need 1-of-2 (Ichimoku/RMA cloud) — 0 agreed")
+                reasons.append(f"Cloud group sell: need {len(active_cloud_sell)}-of-{len(active_cloud_sell)} (Ichimoku/RMA cloud) — not all agreed")
             if not oscillator_group_ok_buy:
-                reasons.append("Oscillator group buy: need 2-of-3 (PPO/RSI/TK) — not met")
+                reasons.append(f"Oscillator group buy: need {min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_buy))}-of-{len(active_osc_buy)} (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:
-                reasons.append("Oscillator group sell: need 2-of-3 (PPO/RSI/TK) — not met")
+                reasons.append(f"Oscillator group sell: need {min(Constants.OSCILLATOR_GROUP_MIN_VOTES, len(active_osc_sell))}-of-{len(active_osc_sell)} (PPO/RSI/TK) — not met")
 
             logger_pair.debug(f"😒 {pair_name} | Suppression: {', '.join(reasons)}") 
 
@@ -6818,11 +6817,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         score, total = compute_confluence_score(gr, is_buy=buy_side)
-        required = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+        required = max(total * (cfg.CONFLUENCE_MIN_PCT / 100.0), cfg.CONFLUENCE_MIN_ABS_SCORE)
         if score < required:
             logger_pair.info(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
-                f"(need {required:.1f}) — skipping Phase-2 indicators"
+                f"(need {required:.1f}, pct-floor={total * (cfg.CONFLUENCE_MIN_PCT / 100.0):.1f}, "
+                f"abs-floor={cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) — skipping Phase-2 indicators"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
