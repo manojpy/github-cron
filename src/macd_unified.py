@@ -3598,7 +3598,8 @@ class GateResult:
     sell_common: bool
     buy_trend_common: bool
     sell_trend_common: bool
-
+    buy_trend_common_relaxed: bool
+    sell_trend_common_relaxed: bool
 
     # -- misc data passed through --
     data_15m: PriceData
@@ -4956,8 +4957,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.20 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
-    { "key": "ob_reversal_sell", "title": "🔴🏛️ Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.20 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
+    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common_relaxed",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.20 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
+    { "key": "ob_reversal_sell", "title": "🔴🏛️ Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common_relaxed",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.20 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
 ] 
@@ -5022,7 +5023,7 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     _add("ppo_zero_up",   "ppo_zero_down",   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
     _add("ppo_adaptive_up", "ppo_adaptive_down", ppo_c, ppo_p, thr, thr, -thr, -thr)
 
-    # ─����� RSI ──
+    #  RSI ──
     rsi_c, rsi_p = context["rsi_curr"], context["rsi_prev"]
     ema_c, ema_p = context["rsi_ema_curr"], context["rsi_ema_prev"]
     _add("rsi_ema5_up", "rsi_ema5_down", rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
@@ -5356,7 +5357,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ═════════════════════════��═════════════════════════════
+        # ══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
         # ═══════════════════════════════════════════════════════
         gate_indicators = await asyncio.to_thread(
@@ -5742,10 +5743,19 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         )
         buy_common  = buy_trend_common and is_valid_for_buy
         sell_common = sell_trend_common and is_valid_for_sell
-
+        buy_trend_common_relaxed = (
+            base_buy_trend
+            and effective_cpr_ok
+            and trend_gate_ok_buy
+        )
+        sell_trend_common_relaxed = (
+            base_sell_trend
+            and effective_cpr_ok
+            and trend_gate_ok_sell
+        )
         reversal_candidate = (
-            cfg.ENABLE_STRONG_REVERSAL_ALERT
-            and (buy_trend_common or sell_trend_common)
+            (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
+            and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
@@ -5850,6 +5860,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rsi_adaptive_buy=rsi_adaptive_buy, rsi_adaptive_sell=rsi_adaptive_sell,
             buy_common=buy_common, sell_common=sell_common,
             buy_trend_common=buy_trend_common, sell_trend_common=sell_trend_common,
+            buy_trend_common_relaxed=buy_trend_common_relaxed, sell_trend_common_relaxed=sell_trend_common_relaxed,
             data_15m=data_15m, close_prev_invalid=close_prev_invalid,
             oi_funding_ok_buy=oi_funding_ok_buy, oi_funding_ok_sell=oi_funding_ok_sell,
             oi_funding_reason=oi_funding_reason,
@@ -5923,6 +5934,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     rsi_adaptive_buy, rsi_adaptive_sell = gr.rsi_adaptive_buy, gr.rsi_adaptive_sell
     buy_common, sell_common = gr.buy_common, gr.sell_common
     buy_trend_common, sell_trend_common = gr.buy_trend_common, gr.sell_trend_common
+    buy_trend_common_relaxed, sell_trend_common_relaxed = gr.buy_trend_common_relaxed, gr.sell_trend_common_relaxed
     close_prev_invalid = gr.close_prev_invalid
     ob_gate_ok_buy, ob_gate_ok_sell = gr.ob_gate_ok_buy, gr.ob_gate_ok_sell
     ob_gate_reason = gr.ob_gate_reason
@@ -6050,11 +6062,16 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 sell_common and ppohist_curr < 0
                 and ppohist_m3 < ppohist_m2 < ppohist_m1 and ppohist_curr < ppohist_m1
             )
-
         if cfg.ENABLE_STRONG_REVERSAL_ALERT:
             reversal_bullish, reversal_bearish, reversal_pattern_name = detect_reversal_candle_pattern(data_15m, i15)
-            strong_reversal_buy = buy_trend_common and reversal_bullish
-            strong_reversal_sell = sell_trend_common and reversal_bearish
+            strong_reversal_buy = (
+                buy_trend_common_relaxed and reversal_bullish
+                and (ppo_curr < 0.20 or rsi_curr < 60)
+            )
+            strong_reversal_sell = (
+                sell_trend_common_relaxed and reversal_bearish
+                and (ppo_curr > -0.20 or rsi_curr > 40)
+            )
         else:
             reversal_bullish, reversal_bearish, reversal_pattern_name = False, False, ""
             strong_reversal_buy, strong_reversal_sell = False, False
@@ -6096,6 +6113,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "oscillator_group_ok_buy": oscillator_group_ok_buy, "oscillator_group_ok_sell": oscillator_group_ok_sell,
             "buy_common": buy_common, "sell_common": sell_common,
             "buy_trend_common": buy_trend_common, "sell_trend_common": sell_trend_common,
+            "buy_trend_common_relaxed": buy_trend_common_relaxed, "sell_trend_common_relaxed": sell_trend_common_relaxed,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
             "ppohist_curr": ppohist_curr, "ppohist_m1": ppohist_m1,
@@ -6880,11 +6898,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     confluence_total: Optional[float] = None
 
     reversal_eligible = (
-        cfg.ENABLE_STRONG_REVERSAL_ALERT
-        and (gr.buy_trend_common or gr.sell_trend_common)
+        (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
+        and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
-    buy_side = gr.buy_common or gr.buy_trend_common
+    buy_side = gr.buy_common or gr.buy_trend_common or gr.buy_trend_common_relaxed
 
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         score, total = compute_confluence_score(gr, is_buy=buy_side)
