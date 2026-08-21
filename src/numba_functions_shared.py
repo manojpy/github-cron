@@ -2,6 +2,19 @@
 # Shared Numba Function Definitions - Single Source of Truth
 # ============================================================================
 
+import os
+import sys
+import hashlib
+from pathlib import Path
+from importlib.metadata import version as _pkg_version
+
+_numba_ver = _pkg_version("numba")
+_cache_version = hashlib.md5(f"{_numba_ver}-{sys.version}".encode()).hexdigest()[:8]
+os.environ.setdefault(
+    "NUMBA_CACHE_DIR",
+    str(Path(__file__).parent / ".numba_cache" / _cache_version),
+)
+
 import numpy as np
 from numba import njit, prange, types
 from typing import Dict, Optional, Tuple, Any
@@ -9,12 +22,33 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# SIGNATURES — single source of truth, shared by the @njit decorators below
+# and EXPORT_CONFIG at the bottom of this file. Never write a raw string
+# signature in more than one place; add/change a signature here only.
+# ============================================================================
+f8, i4, i8 = types.float64, types.int32, types.int64
+
+SIG_SANITIZE_ARRAY   = f8[:](f8[:], f8)
+SIG_ROLLING_MEAN     = f8[:](f8[:], i4)
+SIG_ROLLING_MIN_MAX  = types.Tuple((f8[:], f8[:]))(f8[:], i4)
+SIG_EMA_LOOP         = f8[:](f8[:], f8)
+SIG_EMA_LOOP_PINE    = f8[:](f8[:], f8)
+SIG_EMA_LOOP_ALPHA   = f8[:](f8[:], f8)
+SIG_KALMAN_LOOP      = f8[:](f8[:], i4, f8, f8)
+SIG_VWAP_DAILY       = f8[:](f8[:], f8[:], i8[:])
+SIG_PPO_CORE         = types.Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)
+SIG_RSI_CORE         = f8[:](f8[:], i4)
+SIG_TRUE_RANGE       = f8[:](f8[:], f8[:], f8[:])
+SIG_ATR_RMA          = f8[:](f8[:], f8[:], f8[:], i4)
+SIG_ADX_CORE         = f8[:](f8[:], f8[:], f8[:], i4, i4)
+
 
 # ============================================================================
 # 1. SANITIZATION
 # ============================================================================
 
-@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
+@njit(SIG_SANITIZE_ARRAY, nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
     """Replace NaN and Inf with default value - O(n)"""
     out = np.empty_like(arr)
@@ -23,7 +57,7 @@ def sanitize_array_numba(arr, default):
         out[i] = default if (np.isnan(val) or np.isinf(val)) else val
     return out
 
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
+@njit(SIG_ROLLING_MEAN, nogil=True, cache=True)
 def rolling_mean_numba(data, period):
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
@@ -80,7 +114,7 @@ def rolling_mean_numba(data, period):
 
     return out
 
-@njit("Tuple((f8[:], f8[:]))(f8[:], i4)", nogil=True, cache=True)
+@njit(SIG_ROLLING_MIN_MAX, nogil=True, cache=True)
 def rolling_min_max_numba(arr, period):
     """Match Pine's ta.lowest/ta.highest: output na unless full window of non-nan values."""
     n = len(arr)
@@ -135,7 +169,7 @@ def rolling_min_max_numba(arr, period):
 # 2. EMA FUNCTIONS
 # ============================================================================
 
-@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
+@njit(SIG_EMA_LOOP, nogil=True, cache=True)
 def ema_loop(data, length_float):
     n = len(data)
     length = int(length_float)
@@ -168,7 +202,7 @@ def ema_loop(data, length_float):
     return out
 
 
-@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
+@njit(SIG_EMA_LOOP_PINE, nogil=True, cache=True)
 def ema_loop_pine(data, length_float):
     n = len(data)
     length = int(length_float)
@@ -197,7 +231,7 @@ def ema_loop_pine(data, length_float):
     return out
 
 
-@njit("f8[:](f8[:], f8)", nogil=True, cache=True)
+@njit(SIG_EMA_LOOP_ALPHA, nogil=True, cache=True)
 def ema_loop_alpha(data, alpha):
     n = len(data)
     out = np.full(n, np.nan, dtype=np.float64)
@@ -246,7 +280,7 @@ def ema_loop_alpha(data, alpha):
 # 4. KALMAN / VWAP
 # ============================================================================
 
-@njit("f8[:](f8[:], i4, f8, f8)", nogil=True, cache=True)
+@njit(SIG_KALMAN_LOOP, nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
     """Kalman filter in O(n) - FIXED: applies formula on first valid bar"""
     n = len(src)
@@ -286,7 +320,7 @@ def kalman_loop(src, length, R, Q):
 
     return result
 
-@njit("f8[:](f8[:], f8[:], i8[:])", nogil=True, cache=True)
+@njit(SIG_VWAP_DAILY, nogil=True, cache=True)
 def vwap_daily_loop_safe(hlc3, volumes, timestamps):
     n = len(hlc3)
     vwap = np.empty(n, dtype=np.float64)
@@ -310,7 +344,7 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
 # 5. OSCILLATORS AND TECHNICAL INDICATORS
 # ============================================================================
 
-@njit("Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)", nogil=True, cache=True)
+@njit(SIG_PPO_CORE, nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
     n = len(close)
     fast_ma = ema_loop_pine(close, float(fast))
@@ -331,7 +365,7 @@ def calculate_ppo_core(close, fast, slow, signal):
     ppo_sig = ema_loop_pine(ppo, float(signal))
     return ppo, ppo_sig
 
-@njit("f8[:](f8[:], i4)", nogil=True, cache=True)
+@njit(SIG_RSI_CORE, nogil=True, cache=True)
 def calculate_rsi_core(close, period):
     n = len(close)
     rsi = np.full(n, np.nan, dtype=np.float64)
@@ -391,7 +425,7 @@ def calculate_rsi_core(close, period):
 
     return rsi
 
-@njit("f8[:](f8[:], f8[:], f8[:])", nogil=True, cache=True)
+@njit(SIG_TRUE_RANGE, nogil=True, cache=True)
 def true_range_numba(high, low, close):
     """Shared True Range calc — previously duplicated in calculate_atr_rma and calculate_adx_core."""
     n = len(close)
@@ -409,7 +443,7 @@ def true_range_numba(high, low, close):
 
     return tr
 
-@njit("f8[:](f8[:], f8[:], f8[:], i4)", nogil=True, cache=True)
+@njit(SIG_ATR_RMA, nogil=True, cache=True)
 def calculate_atr_rma(high, low, close, period):
     n = len(close)
     if n < period:
@@ -421,7 +455,7 @@ def calculate_atr_rma(high, low, close, period):
     atr = ema_loop_alpha(tr, alpha)
     return atr
 
-@njit("f8[:](f8[:], f8[:], f8[:], i4, i4)", nogil=True, cache=True)
+@njit(SIG_ADX_CORE, nogil=True, cache=True)
 def calculate_adx_core(high, low, close, di_length, adx_length):
     n = len(high)
     adx = np.full(n, np.nan, dtype=np.float64)
@@ -473,19 +507,19 @@ from aot_version import SOURCE_VERSION  # noqa: E402
 # ============================================================================
 
 EXPORT_CONFIG = {
-    'sanitize_array_numba':          'f8[:](f8[:], f8)',
-    'rolling_mean_numba':            'f8[:](f8[:], i4)',
-    'rolling_min_max_numba':         'Tuple((f8[:], f8[:]))(f8[:], i4)',
-    'ema_loop':                      'f8[:](f8[:], f8)',
-    'ema_loop_pine':                 'f8[:](f8[:], f8)',          # NEW
-    'ema_loop_alpha':                'f8[:](f8[:], f8)', 
-    'kalman_loop':                   'f8[:](f8[:], i4, f8, f8)',
-    'vwap_daily_loop_safe':          'f8[:](f8[:], f8[:], i8[:])',
-    'calculate_ppo_core':            'Tuple((f8[:], f8[:]))(f8[:], i4, i4, i4)',
-    'calculate_rsi_core':            'f8[:](f8[:], i4)',
-    'true_range_numba':          'f8[:](f8[:], f8[:], f8[:])', 
-    'calculate_atr_rma':             'f8[:](f8[:], f8[:], f8[:], i4)',
-    'calculate_adx_core':            'f8[:](f8[:], f8[:], f8[:], i4, i4)',
+    'sanitize_array_numba':  SIG_SANITIZE_ARRAY,
+    'rolling_mean_numba':    SIG_ROLLING_MEAN,
+    'rolling_min_max_numba': SIG_ROLLING_MIN_MAX,
+    'ema_loop':              SIG_EMA_LOOP,
+    'ema_loop_pine':         SIG_EMA_LOOP_PINE,          # NEW
+    'ema_loop_alpha':        SIG_EMA_LOOP_ALPHA,
+    'kalman_loop':           SIG_KALMAN_LOOP,
+    'vwap_daily_loop_safe':  SIG_VWAP_DAILY,
+    'calculate_ppo_core':    SIG_PPO_CORE,
+    'calculate_rsi_core':    SIG_RSI_CORE,
+    'true_range_numba':      SIG_TRUE_RANGE,
+    'calculate_atr_rma':     SIG_ATR_RMA,
+    'calculate_adx_core':    SIG_ADX_CORE,
 }
 
 __all__ = list(EXPORT_CONFIG.keys())
