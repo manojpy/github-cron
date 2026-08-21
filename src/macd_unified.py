@@ -29,6 +29,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
 import traceback
+from enum import StrEnum
 
 from aot_bridge import (
     sanitize_array_numba,
@@ -5019,31 +5020,31 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     ppo_c, ppo_p = context["ppo_curr"], context["ppo_prev"]
     ps_c,  ps_p  = context["ppo_sig_curr"], context["ppo_sig_prev"]
     thr = context["ppo_adaptive_threshold"]
-    _add("ppo_signal_up", "ppo_signal_down", ppo_c, ppo_p, ps_c, ps_p, ps_c, ps_p)
-    _add("ppo_zero_up",   "ppo_zero_down",   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
-    _add("ppo_adaptive_up", "ppo_adaptive_down", ppo_c, ppo_p, thr, thr, -thr, -thr)
+    _add(AlertKey.PPO_SIGNAL_UP, AlertKey.PPO_SIGNAL_DOWN, ppo_c, ppo_p, ps_c, ps_p, ps_c, ps_p)
+    _add(AlertKey.PPO_ZERO_UP,   AlertKey.PPO_ZERO_DOWN,   ppo_c, ppo_p, 0.0, 0.0, 0.0, 0.0)
+    _add(AlertKey.PPO_ADAPTIVE_UP, AlertKey.PPO_ADAPTIVE_DOWN, ppo_c, ppo_p, thr, thr, -thr, -thr)
 
     #  RSI ──
     rsi_c, rsi_p = context["rsi_curr"], context["rsi_prev"]
     ema_c, ema_p = context["rsi_ema_curr"], context["rsi_ema_prev"]
-    _add("rsi_ema5_up", "rsi_ema5_down", rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
+    _add(AlertKey.RSI_EMA5_UP, AlertKey.RSI_EMA5_DOWN, rsi_c, rsi_p, ema_c, ema_p, ema_c, ema_p)
     buy_thr, sell_thr = context["rsi_adaptive_buy"], context["rsi_adaptive_sell"]
-    _add("rsi_cross_adaptive_up", "rsi_cross_adaptive_down",
+    _add(AlertKey.RSI_CROSS_ADAPTIVE_UP, AlertKey.RSI_CROSS_ADAPTIVE_DOWN,
          rsi_c, rsi_p, buy_thr, buy_thr, sell_thr, sell_thr)
 
     # ── VWAP ──
     if context.get("vwap_available"):
-        _add("vwap_up", "vwap_down", context["close_curr"], context["close_prev"],
+        _add(AlertKey.VWAP_UP, AlertKey.VWAP_DOWN, context["close_curr"], context["close_prev"],
              context["vwap_curr"], context["vwap_prev"], context["vwap_curr"], context["vwap_prev"])
     else:
-        for k in ("vwap_up", "vwap_down"):
+        for k in (AlertKey.VWAP_UP, AlertKey.VWAP_DOWN):
             rk = ALERT_KEYS.get(k)
             if rk and conditional_states.get(rk, False):
                 resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
     # ── Cloud crosses (slow + fast) ──
     for up_k, down_k, cu, cu_p, cl, cl_p in (
-        ("cloud_cross_up", "cloud_cross_down",
+        (AlertKey.CLOUD_CROSS_UP, AlertKey.CLOUD_CROSS_DOWN,
          "cloud_upper_curr", "cloud_upper_prev", "cloud_lower_curr", "cloud_lower_prev"),
     ):
         cu_c, cu_pr = context.get(cu), context.get(cu_p)
@@ -5058,8 +5059,8 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
 
     # ── Conversion / Kijun / Fast Tenkan ──
     for up_k, down_k, conv, conv_p in (
-        ("tk_conversion_up", "tk_conversion_down", "tk_conversion_curr", "tk_conversion_prev"),
-        ("kijun_cross_up",   "kijun_cross_down",   "tk_base_curr",       "tk_base_prev"),
+        (AlertKey.TK_CONVERSION_UP, AlertKey.TK_CONVERSION_DOWN, "tk_conversion_curr", "tk_conversion_prev"),
+        (AlertKey.KIJUN_CROSS_UP,   AlertKey.KIJUN_CROSS_DOWN,   "tk_base_curr",       "tk_base_prev"),
     ):
         c_c, c_p = context.get(conv), context.get(conv_p)
         if c_c is not None and c_p is not None and not np.isnan(c_c) and not np.isnan(c_p):
@@ -5073,27 +5074,27 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
     # ── Hist RMA ──
     hist_c, hist_m1 = context["hist_curr"], context["hist_m1"]
     hist_eps = max(1e-10, abs(context["close_curr"]) * 1e-6)  # starting point — tune to your pairs
-    for k, cond in (("hist_rma_buy",  np.isnan(hist_c) or hist_c <= hist_eps or hist_c <= hist_m1),
-                    ("hist_rma_sell", np.isnan(hist_c) or hist_c >= -hist_eps or hist_c >= hist_m1)):
+    for k, cond in ((AlertKey.HIST_RMA_BUY,  np.isnan(hist_c) or hist_c <= hist_eps or hist_c <= hist_m1),
+                    (AlertKey.HIST_RMA_SELL, np.isnan(hist_c) or hist_c >= -hist_eps or hist_c >= hist_m1)):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
     ph_c, ph_m1 = context["ppohist_curr"], context["ppohist_m1"]
-    for k, cond in (("ppohist_buy",  np.isnan(ph_c) or ph_c <= 1e-8 or ph_c <= ph_m1),
-                    ("ppohist_sell", np.isnan(ph_c) or ph_c >= -1e-8 or ph_c >= ph_m1)):
+    for k, cond in ((AlertKey.PPOHIST_BUY,  np.isnan(ph_c) or ph_c <= 1e-8 or ph_c <= ph_m1),
+                    (AlertKey.PPOHIST_SELL, np.isnan(ph_c) or ph_c >= -1e-8 or ph_c >= ph_m1)):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and cond:
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
     # ── Order Block reversal ──
-    for k, ok_key in (("ob_reversal_buy", "ob_gate_ok_buy"), ("ob_reversal_sell", "ob_gate_ok_sell")):
+    for k, ok_key in ((AlertKey.OB_REVERSAL_BUY, "ob_gate_ok_buy"), (AlertKey.OB_REVERSAL_SELL, "ob_gate_ok_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
     # ── Strong reversal candle (engulfing/piercing/star/soldiers/tweezer/harami/marubozu/pinbar) ──
-    for k, ok_key in (("strong_reversal_buy", "strong_reversal_buy"), ("strong_reversal_sell", "strong_reversal_sell")):
+    for k, ok_key in ((AlertKey.STRONG_REVERSAL_BUY, "strong_reversal_buy"), (AlertKey.STRONG_REVERSAL_SELL, "strong_reversal_sell")):
         rk = ALERT_KEYS.get(k)
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
@@ -5143,6 +5144,8 @@ ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
 ALERT_KEYS: Dict[str, str] = {
     d["key"]: f"ALERT:{d['key'].upper()}" for d in ALERT_DEFINITIONS
 }
+
+AlertKey = StrEnum("AlertKey", {k.upper(): k for k in ALERT_KEYS})
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
