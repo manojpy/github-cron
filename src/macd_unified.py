@@ -6337,10 +6337,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
     alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
-    data_5m: PriceData,
-    confluence_score: Optional[float] = None,
-    confluence_total: Optional[float] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    data_5m: PriceData, confluence_score: Optional[float] = None, confluence_total: Optional[float] = None, reversal_only_cycle: bool = False) -> Tuple[str, Dict[str, Any]]:
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     data_15m = gr.data_15m
@@ -6425,7 +6422,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     alerts_to_send = []
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
-            required = max(confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0), cfg.CONFLUENCE_MIN_ABS_SCORE)
+            pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+            required = pct_floor if reversal_only_cycle else max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
             if confluence_score < required:
                 logger_pair.info(
                     f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"
@@ -6903,15 +6901,17 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
     buy_side = gr.buy_common or gr.buy_trend_common or gr.buy_trend_common_relaxed
+    reversal_only_cycle = reversal_eligible and not (gr.buy_common or gr.sell_common)
 
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         score, total = compute_confluence_score(gr, is_buy=buy_side)
-        required = max(total * (cfg.CONFLUENCE_MIN_PCT / 100.0), cfg.CONFLUENCE_MIN_ABS_SCORE)
+        pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
+        required = pct_floor if reversal_only_cycle else max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
         if score < required:
             logger_pair.info(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
-                f"(need {required:.1f}, pct-floor={total * (cfg.CONFLUENCE_MIN_PCT / 100.0):.1f}, "
-                f"abs-floor={cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) — skipping Phase-2 indicators"
+                f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
+                f"abs-floor={'n/a (reversal-only)' if reversal_only_cycle else f'{cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}'}) — skipping Phase-2 indicators"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
