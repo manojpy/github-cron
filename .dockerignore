@@ -4,6 +4,7 @@
 .gitignore
 
 # Python cache
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -13,6 +14,9 @@
 *.egg-info
 dist
 build
+
+# Numba cache
+.numba_cache/
 
 # IDE
 .vscode
