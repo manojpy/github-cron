@@ -5680,10 +5680,10 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
-        
+  
         active_cloud_buy = [g for g in (ichimoku_gate_ok_buy, rma_cloud_ok_buy) if g is not None]
         if active_cloud_buy:
-            cloud_group_ok_buy = all(active_cloud_buy)
+            cloud_group_ok_buy = any(active_cloud_buy)
         elif cloud_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — buy denied."
@@ -5694,7 +5694,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         active_cloud_sell = [g for g in (ichimoku_gate_ok_sell, rma_cloud_ok_sell) if g is not None]
         if active_cloud_sell:
-            cloud_group_ok_sell = all(active_cloud_sell)
+            cloud_group_ok_sell = any(active_cloud_sell)
         elif cloud_group_enabled:
             logger_pair.debug(
                 f"[{pair_name}] Cloud group: both gates abstained (warmup/gap) — sell denied."
