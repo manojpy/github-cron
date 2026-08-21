@@ -233,7 +233,8 @@ class BotConfig(BaseModel):
     CONFLUENCE_MIN_ABS_SCORE: float = Field(default=18.0, ge=0.0, le=50.0, description="Absolute weighted-score floor required to pass the confluence gate, applied alongside CONFLUENCE_MIN_PCT. The stricter of the two (percentage-of-total vs this fixed floor) wins, so a low-vote-count cycle can't clear the gate on percentage alone")
     OB_MIN_OTHER_SCORE: float = Field(default=3.0, ge=0.0, le=50.0, description="Min weighted score from votes OTHER than base_trend and order_block required before the OB vote is allowed to count toward the confluence total. base_trend is excluded because it's a precondition for evaluation, not independent confluence. Default 3.0 is set above oi_funding's 2.5 weight so oi_funding alone can't pair with OB to clear the gate")
     OB_MIN_PENETRATION_ATR_MULT: float = Field(default=0.05, ge=0.0, le=2.0, description="Minimum close penetration beyond the zone edge (top for demand, bottom for supply), scaled by ATR_SHORT, required to count as a confirmed reversal. 0 disables the check. Prevents a close a fraction of a tick beyond the zone from counting as 'reversed'")
-    OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=2, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
+    OB_CONFIRM_LOOKAHEAD_CANDLES: int = Field(default=5, ge=0, le=10, description="Candles of grace after a zone is first touched during which a close beyond the opposite edge (+ OB_MIN_PENETRATION_ATR_MULT) still counts as a confirmed reversal. 0 restores the old same-candle-only behavior. A close that fully breaks the zone in the invalidating direction during the grace window kills it immediately")
+    OB_PERSISTENCE_CANDLES: int = Field(default=2, ge=0, le=10, description="How many additional closed 15m candles after an OB confirmation to keep the gate valid. 0 = exact-candle-only (legacy).")
     ENABLE_WIN_RATE_FILTER: bool = Field(default=False)
     ENABLE_OI_FUNDING_FILTER: bool = Field(default=False, description="Block BUY/SELL when OI isn't rising (vs pair's own history) AND funding is crowded (vs pair's own history) in the alert direction")
     OI_FUNDING_HISTORY_LEN: int = Field(default=30, ge=5, le=200, description="Rolling window of past OI/funding samples kept per pair (in run cycles, e.g. 30 runs @ 15m cadence ≈ 7.5h)")
@@ -1758,6 +1759,13 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     ob_ok_buy = ob_ok_sell = None
     reason_buy = reason_sell = None
     grace = cfg_obj.OB_CONFIRM_LOOKAHEAD_CANDLES
+    persistence = getattr(cfg_obj, "OB_PERSISTENCE_CANDLES", 2)
+
+    # Track recent confirmations so the gate stays valid for a couple of candles
+    last_buy_confirm_idx = -1
+    last_sell_confirm_idx = -1
+    last_buy_zone = None
+    last_sell_zone = None
     
     for z in zones:
         if equilibrium is not None:
@@ -1807,12 +1815,13 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         if touch_idx == -1 or zone_dead:
             continue
 
-        if confirmed_idx == i15:
-            leg_ref = touch_idx - 1
-            zone_prior_leg = _prior_leg_direction(
-                c, h, l, leg_ref, Constants.REVERSAL_PRIOR_LEG_LOOKBACK
-            )
+        # Compute prior leg for any confirmation (current or recent)
+        leg_ref = touch_idx - 1
+        zone_prior_leg = _prior_leg_direction(
+            c, h, l, leg_ref, Constants.REVERSAL_PRIOR_LEG_LOOKBACK
+        )
 
+        if confirmed_idx == i15:
             if z.is_demand and zone_prior_leg == -1:
                 ob_ok_buy = True
                 zone_type = "Internal" if z.is_internal else "Swing"
@@ -1837,6 +1846,15 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
                 )
 
         elif confirmed_idx != -1:
+            # Remember recent confirmation for persistence across subsequent candles
+            if z.is_demand and zone_prior_leg == -1:
+                if confirmed_idx > last_buy_confirm_idx:
+                    last_buy_confirm_idx = confirmed_idx
+                    last_buy_zone = z
+            elif not z.is_demand and zone_prior_leg == 1:
+                if confirmed_idx > last_sell_confirm_idx:
+                    last_sell_confirm_idx = confirmed_idx
+                    last_sell_zone = z
             continue     
         else:
             zone_type = "Internal" if z.is_internal else "Swing"
@@ -1852,6 +1870,24 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
                     f"Pine {zone_type} Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
                     f"touched idx {touch_idx}, awaiting reversal ({i15 - touch_idx}/{grace})"
                 )
+
+    # Persistence: if no current confirmation, allow recent ones to stay valid
+    if ob_ok_buy is not True and last_buy_confirm_idx >= 0 and (i15 - last_buy_confirm_idx) <= persistence:
+        ob_ok_buy = True
+        zone_type = "Internal" if last_buy_zone.is_internal else "Swing"
+        reason_buy = (
+            f"Pine {zone_type} Demand OB {last_buy_zone.bottom:.4g}-{last_buy_zone.top:.4g} (idx {last_buy_zone.index}) "
+            f"confirmed idx {last_buy_confirm_idx}, still valid ({i15 - last_buy_confirm_idx}/{persistence})"
+        )
+
+    if ob_ok_sell is not True and last_sell_confirm_idx >= 0 and (i15 - last_sell_confirm_idx) <= persistence:
+        ob_ok_sell = True
+        zone_type = "Internal" if last_sell_zone.is_internal else "Swing"
+        reason_sell = (
+            f"Pine {zone_type} Supply OB {last_sell_zone.bottom:.4g}-{last_sell_zone.top:.4g} (idx {last_sell_zone.index}) "
+            f"confirmed idx {last_sell_confirm_idx}, still valid ({i15 - last_sell_confirm_idx}/{persistence})"
+        )
+
     reason = reason_buy if ob_ok_buy else (reason_sell if ob_ok_sell else (reason_buy or reason_sell))
     logger.debug(
         f"[{PAIR_ID.get() or '?'}] Pine OB diag | zones found: {len(zones)} | "
@@ -4920,8 +4956,8 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.20 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}% | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
-    { "key": "ob_reversal_sell", "title": "🔴🏛️ Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.20 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}% | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
+    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.20 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
+    { "key": "ob_reversal_sell", "title": "🔴🏛️ Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.20 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
 ] 
@@ -6059,6 +6095,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "cloud_group_ok_buy": cloud_group_ok_buy, "cloud_group_ok_sell": cloud_group_ok_sell,
             "oscillator_group_ok_buy": oscillator_group_ok_buy, "oscillator_group_ok_sell": oscillator_group_ok_sell,
             "buy_common": buy_common, "sell_common": sell_common,
+            "buy_trend_common": buy_trend_common, "sell_trend_common": sell_trend_common,
             "vwap_available": vwap_available,
             "vwap_enabled": cfg.ENABLE_VWAP and vwap_available,
             "ppohist_curr": ppohist_curr, "ppohist_m1": ppohist_m1,
@@ -6158,12 +6195,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-
-                if not is_valid_for_buy and alert_key not in ("strong_reversal_buy",):
+                if not is_valid_for_buy and alert_key not in ("strong_reversal_buy", "ob_reversal_buy"):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
                     continue
-       
+
             if alert_key in SELL_ALERT_KEYS:
                 if not is_red:
                     logger_pair.debug(
@@ -6172,7 +6208,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not is_valid_for_sell and alert_key not in ("strong_reversal_sell",):
+                if not is_valid_for_sell and alert_key not in ("strong_reversal_sell", "ob_reversal_sell"):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
                     continue
