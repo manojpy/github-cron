@@ -101,6 +101,7 @@ COPY --chown=appuser:appuser src/aot_function_registry.py ./
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
+COPY --chown=appuser:appuser src/numeric_selftest.py ./
 
 USER appuser
 
