@@ -38,6 +38,24 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 🔎 Type Check (mypy, informational)
+        id: mypy
+        continue-on-error: true
+        run: |
+          pip install --quiet mypy==1.14.1
+          pip install --quiet -r requirements.txt
+          echo "## 🔎 mypy Type Check" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          mypy src/macd_unified.py src/aot_bridge.py src/numeric_selftest.py \
+            --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
+
       - name: 🐳 Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
@@ -136,11 +154,11 @@ jobs:
                 "/app/src/macd_unified.py"
                 "/app/src/aot_bridge.py"
                 "/app/src/aot_version.py"
+                "/app/src/aot_function_registry.py"
                 "/app/src/numba_functions_shared.py"
+                "/app/src/numeric_selftest.py"
                 "/app/src/macd_aot_compiled.so"
                 "/app/src/macd_aot_compiled.version"
-                "/app/src/aot_function_registry.py"
-                "/app/src/numeric_selftest.py"
               )
               for file in "${FILES[@]}"; do
                 if [ ! -f "$file" ]; then
