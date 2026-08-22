@@ -16,7 +16,7 @@ import psutil
 import gc
 import json
 from collections import deque, OrderedDict 
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, TypedDict, Callable, Set, Deque, Union
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, Set, Deque, Union
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -4922,7 +4922,7 @@ def build_batched_msg(pair: str, price: Any, ts: int, items: List[Tuple[str, str
     
     return f"{line1}\n{body}\n{datetime_line}"
 
-def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
+def create_pivot_alert(level: str, is_buy: bool) -> Dict[str, Any]:
     """Factory function to create pivot alert definitions (check_fn/extra_fn are lambdas closing over `level`/`is_buy`)"""
     if is_buy:
         return {
@@ -4953,14 +4953,23 @@ def create_pivot_alert(level: str, is_buy: bool) -> AlertDefinition:
             "requires": ["pivots"]
         }
 
-class AlertDefinition(TypedDict):
+@dataclass(frozen=True, slots=True)
+class AlertRule:
     key: str
     title: str
     check_fn: Callable[[Any, Any, Any, Any], bool]
     extra_fn: Callable[[Any, Any, Any, Any, Dict[str, Any]], str]
     requires: List[str]
- 
-ALERT_DEFINITIONS: List[AlertDefinition] = [
+
+    def __post_init__(self) -> None:
+        if not callable(self.check_fn):
+            raise TypeError(f"Alert '{self.key}': check_fn must be callable")
+        if not callable(self.extra_fn):
+            raise TypeError(f"Alert '{self.key}': extra_fn must be callable")
+        if not isinstance(self.requires, list):
+            raise TypeError(f"Alert '{self.key}': requires must be a list")
+
+_ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"ppo_signal_up","title":"🟢 PPO cross▲signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)>ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)<Constants.PPO_SIGNAL_CROSS_MAX_BUY or rsi.get("curr",np.nan)<60) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
     {"key":"ppo_signal_down","title":"🔴 PPO cross▼signal","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_common",False) and (ppo.get("prev",np.nan)>=ppo_sig.get("prev",np.nan)) and (ppo.get("curr",np.nan)<ppo_sig.get("curr",np.nan)) and (ppo.get("curr",np.nan)>Constants.PPO_SIGNAL_CROSS_MIN_SELL or rsi.get("curr",np.nan)>40) and (ctx.get("ppo_gate_curr",np.nan)>Constants.PPO_RSI_GUARD_SELL)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} vs Sig {ppo_sig.get('curr',0):.2f} | RSI {rsi.get('curr',0):.1f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":["ppo","ppo_signal"]},
     {"key":"ppo_zero_up","title":"🟢 PPO cross▲0","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_common",False) and (ppo.get("prev",np.nan)<=0.0) and (ppo.get("curr",np.nan)>0.0) and (ctx.get("ppo_gate_curr",np.nan)<Constants.PPO_RSI_GUARD_BUY)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"PPO {ppo.get('curr',0):.2f} | PPOgate {ctx.get('ppo_gate_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":["ppo"]},
@@ -4987,7 +4996,7 @@ ALERT_DEFINITIONS: List[AlertDefinition] = [
     { "key": "ob_reversal_sell", "title": "🔴🏛 Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common_relaxed",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.30 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
-] 
+]
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots:
@@ -5155,19 +5164,20 @@ def get_pivot_alert_info(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple
     
     return ctx[cache_key]
 
-BUY_PIVOT_DEFS = [create_pivot_alert(level, is_buy=True) 
+BUY_PIVOT_DEFS = [AlertRule(**create_pivot_alert(level, is_buy=True))
                   for level in PIVOT_LEVELS_BUY]
 
-SELL_PIVOT_DEFS = [create_pivot_alert(level, is_buy=False) 
+SELL_PIVOT_DEFS = [AlertRule(**create_pivot_alert(level, is_buy=False))
                    for level in PIVOT_LEVELS_SELL]
 
+ALERT_DEFINITIONS: List[AlertRule] = [AlertRule(**d) for d in _ALERT_DEFINITIONS_RAW]
 ALERT_DEFINITIONS.extend(BUY_PIVOT_DEFS)
 ALERT_DEFINITIONS.extend(SELL_PIVOT_DEFS)
 
-ALERT_DEFINITIONS_MAP = {d["key"]: d for d in ALERT_DEFINITIONS}
+ALERT_DEFINITIONS_MAP = {d.key: d for d in ALERT_DEFINITIONS}
 
 ALERT_KEYS: Dict[str, str] = {
-    d["key"]: f"ALERT:{d['key'].upper()}" for d in ALERT_DEFINITIONS
+    d.key: f"ALERT:{d.key.upper()}" for d in ALERT_DEFINITIONS
 }
 
 AlertKey = StrEnum("AlertKey", {k.upper(): k for k in ALERT_KEYS})
@@ -5176,31 +5186,17 @@ logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
 def validate_alert_definitions() -> None:
     errors = []
-    
+
     keys_seen = set()
     for def_ in ALERT_DEFINITIONS:
-        key = def_["key"]
+        key = def_.key
         if key in keys_seen:
             errors.append(f"Duplicate alert key: {key}")
         keys_seen.add(key)
-    
-    required_fields = ["key", "title", "check_fn", "extra_fn", "requires"]
-    for idx, def_ in enumerate(ALERT_DEFINITIONS):
-        for field in required_fields:
-            if field not in def_:
-                errors.append(f"Alert definition {idx} missing field: {field}")
-        
-        if not callable(def_.get("check_fn")):
-            errors.append(f"Alert {def_.get('key', idx)}: check_fn is not callable")
-        if not callable(def_.get("extra_fn")):
-            errors.append(f"Alert {def_.get('key', idx)}: extra_fn is not callable")
-        
-        if not isinstance(def_.get("requires", []), list):
-            errors.append(f"Alert {def_.get('key', idx)}: requires must be a list")
-    
+
     for def_ in ALERT_DEFINITIONS:
-        if def_["key"] not in ALERT_KEYS:
-            errors.append(f"Alert key {def_['key']} missing from ALERT_KEYS mapping")
+        if def_.key not in ALERT_KEYS:
+            errors.append(f"Alert key {def_.key} missing from ALERT_KEYS mapping")
     
     if errors:
         error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -6172,8 +6168,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
         alert_keys_to_check = []
         for d in ALERT_DEFINITIONS:
-            key = d["key"]
-            requires = d.get("requires", [])
+            key = d.key
+            requires = d.requires
             
             skip = False
             if "pivots" in requires and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values())):
@@ -6291,7 +6287,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     args = [context[k] for k in handler["ctx_args"]] + [is_buy_side]
                     valid_cross, cross_reason = handler["validator"](*args)
                     if valid_cross:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                        trigger = def_.check_fn(context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     elif cfg.DEBUG_MODE:
                         logger_pair.debug(f"{alert_key} cross check: {cross_reason}")
                 except Exception as e:
@@ -6307,13 +6303,13 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                         valid_cross, reason = get_pivot_alert_info(context, level, is_buy)
                         if not valid_cross and reason and piv:
                              context["pivot_suppressions"].append(f"{alert_key}: {reason}")
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                        trigger = def_.check_fn(context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     except Exception as e:
                         logger_pair.debug(f"Pivot alert check failed for {alert_key}: {e}", exc_info=True)
                         trigger = False
                 else:
                     try:
-                        trigger = def_["check_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
+                        trigger = def_.check_fn(context, ppo_ctx, ppo_sig_ctx, rsi_ctx)
                     except Exception as e:
                         logger_pair.debug(f"Alert check failed for {alert_key}: {e}", exc_info=True)
                         trigger = False
@@ -6321,13 +6317,12 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             if trigger and not previous_states.get(key, False):
                 extra = ""
                 try:
-                    base_extra = def_["extra_fn"](context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
+                    base_extra = def_.extra_fn(context, ppo_ctx, ppo_sig_ctx, rsi_ctx, None) or ""
                     extra = base_extra
                 except Exception as e:
                     logger_pair.debug(f"Alert extra_fn failed for {alert_key}: {e}", exc_info=cfg.DEBUG_MODE)
                     extra = f"(Error: {str(e)[:100]})"
-
-                raw_alerts.append((def_["title"], extra, def_["key"]))
+                raw_alerts.append((def_.title, extra, def_.key))
             
                 if cfg.DEBUG_MODE:
                     logger_pair.debug(
