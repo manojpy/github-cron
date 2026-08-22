@@ -1820,8 +1820,6 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
 
         leg_ref = (confirm_touch_idx if confirmed_idx != -1 else touch_idx) - 1
 
-        # Compute prior leg for any confirmation (current or recent)
-        leg_ref = touch_idx - 1
         zone_prior_leg = _prior_leg_direction(
             c, h, l, leg_ref, Constants.REVERSAL_PRIOR_LEG_LOOKBACK
         )
