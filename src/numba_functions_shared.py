@@ -562,14 +562,22 @@ EXPORT_CONFIG = {
     'percentile_rank_numba': SIG_PERCENTILE_RANK,
 }
 
-__all__ = list(EXPORT_CONFIG.keys())
+from aot_function_registry import AOT_FUNCTION_NAMES  # noqa: E402
 
-# Guard: raise immediately at import if count drops unexpectedly
-expected_min_functions = 14
-if len(__all__) < expected_min_functions:
+_exported_names = set(EXPORT_CONFIG.keys())
+_registry_names = set(AOT_FUNCTION_NAMES)
+if _exported_names != _registry_names:
+    _missing_from_registry = sorted(_exported_names - _registry_names)
+    _missing_from_export   = sorted(_registry_names - _exported_names)
     raise AssertionError(
-        f"Expected at least {expected_min_functions} exported functions, "
-        f"but only {len(__all__)} found: {__all__}"
+        f"EXPORT_CONFIG (numba_functions_shared.py) and AOT_FUNCTION_NAMES "
+        f"(aot_function_registry.py) have drifted apart. "
+        f"In EXPORT_CONFIG but not the registry -- add to aot_function_registry.py: "
+        f"{_missing_from_registry}. "
+        f"In the registry but not EXPORT_CONFIG -- add to EXPORT_CONFIG: "
+        f"{_missing_from_export}."
     )
 
-logger.info(f"✅ Exported {len(__all__)} Numba-compiled functions for AOT")
+__all__ = list(EXPORT_CONFIG.keys())
+
+logger.info(f"✅ Exported {len(__all__)}/{len(AOT_FUNCTION_NAMES)} Numba-compiled functions for AOT")

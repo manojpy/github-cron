@@ -6,6 +6,16 @@ Provides transparent fallback between AOT-compiled (.so) and JIT-compiled
 functions with zero-overhead dispatch via lookup dictionary.
 
 Performance: ~5-6 seconds faster than wrapper-based approach.
+
+FUNCTION LIST: driven entirely by AOT_FUNCTION_NAMES in
+aot_function_registry.py -- the JIT-fallback dict and the AOT dispatch dict
+are both built from that single list, so adding a new function only means:
+(1) add its name to aot_function_registry.py, (2) add its @njit function to
+numba_functions_shared.py, (3) add its thin wrapper function below. The
+wrapper functions themselves stay hand-written on purpose (they're the
+typed public API other modules import from), but the completeness check at
+the bottom of this file raises immediately at import time if a wrapper is
+ever forgotten -- instead of failing later, silently or otherwise.
 """
 
 import os
@@ -17,6 +27,8 @@ from typing import Optional, Any, Callable, Dict, Tuple
 
 import importlib.util
 import numpy as np
+
+from aot_function_registry import AOT_FUNCTION_NAMES as REQUIRED_AOT_FUNCTIONS
 
 try:
     from aot_version import SOURCE_VERSION as _SHARED_SOURCE_VERSION
@@ -40,26 +52,6 @@ _dispatch: Dict[str, Callable] = {}
 # JIT function storage (for fallback)
 _jit_functions: Dict[str, Callable] = {}
 
-# ============================================================================
-# REQUIRED FUNCTIONS
-# ============================================================================
-
-REQUIRED_AOT_FUNCTIONS = [
-    'sanitize_array_numba',
-    'ema_loop',
-    'ema_loop_alpha',
-    'ema_loop_pine',
-    'kalman_loop',
-    'vwap_daily_loop_safe',
-    'rolling_mean_numba',
-    'rolling_min_max_numba',
-    'calculate_ppo_core',
-    'calculate_rsi_core',
-    'true_range_numba', 
-    'calculate_atr_rma',
-    'calculate_adx_core',
-    'percentile_rank_numba',
-]
 
 def get_library_extension() -> str:
     
@@ -152,45 +144,22 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
 
 
 def initialize_jit_fallback() -> None:
-    """Initialize JIT fallback functions from numba_functions_shared"""
+    """Initialize JIT fallback functions from numba_functions_shared.
+    Driven by REQUIRED_AOT_FUNCTIONS (from aot_function_registry.py) --
+    adding a function there is enough; nothing here needs to change."""
     global _jit_functions, _fallback_reason
 
     try:
-        # Import all 13 functions (already cached by Python)
-        from numba_functions_shared import (
-            sanitize_array_numba,
-            ema_loop,
-            ema_loop_alpha,
-            ema_loop_pine,
-            kalman_loop,
-            vwap_daily_loop_safe,
-            rolling_mean_numba,
-            rolling_min_max_numba,
-            calculate_ppo_core,
-            calculate_rsi_core,
-            true_range_numba,  
-            calculate_atr_rma,
-            calculate_adx_core,
-            percentile_rank_numba,
-        )
+        import numba_functions_shared as _shared
 
-        # Store in dictionary for dispatch
-        _jit_functions = {
-            'sanitize_array_numba': sanitize_array_numba,
-            'ema_loop': ema_loop,
-            'ema_loop_alpha': ema_loop_alpha,
-            'ema_loop_pine': ema_loop_pine,
-            'kalman_loop': kalman_loop,
-            'vwap_daily_loop_safe': vwap_daily_loop_safe,
-            'rolling_mean_numba': rolling_mean_numba,
-            'rolling_min_max_numba': rolling_min_max_numba,
-            'calculate_ppo_core': calculate_ppo_core,
-            'calculate_rsi_core': calculate_rsi_core,
-            'true_range_numba': true_range_numba,
-            'calculate_atr_rma': calculate_atr_rma,
-            'calculate_adx_core': calculate_adx_core,
-            'percentile_rank_numba': percentile_rank_numba,
-        }
+        missing = [name for name in REQUIRED_AOT_FUNCTIONS if not hasattr(_shared, name)]
+        if missing:
+            raise ImportError(
+                f"numba_functions_shared is missing {len(missing)} function(s) listed "
+                f"in aot_function_registry.py: {missing}"
+            )
+
+        _jit_functions = {name: getattr(_shared, name) for name in REQUIRED_AOT_FUNCTIONS}
 
     except ImportError as e:
         _fallback_reason = f"JIT fallback failed: {e}"
@@ -202,22 +171,7 @@ def _build_aot_dispatch() -> Dict[str, Callable]:
     ensure_initialized() can safely try/except around it as a defense-in-depth
     safety net (belt-and-suspenders on top of the REQUIRED_AOT_FUNCTIONS
     check in initialize_aot())."""
-    return {
-        'sanitize_array_numba': _aot_module.sanitize_array_numba,
-        'ema_loop': _aot_module.ema_loop,
-        'ema_loop_alpha': _aot_module.ema_loop_alpha,
-        'ema_loop_pine': _aot_module.ema_loop_pine,
-        'kalman_loop': _aot_module.kalman_loop,
-        'vwap_daily_loop_safe': _aot_module.vwap_daily_loop_safe,
-        'rolling_mean_numba': _aot_module.rolling_mean_numba,
-        'rolling_min_max_numba': _aot_module.rolling_min_max_numba,
-        'calculate_ppo_core': _aot_module.calculate_ppo_core,
-        'calculate_rsi_core': _aot_module.calculate_rsi_core,
-        'true_range_numba': _aot_module.true_range_numba,
-        'calculate_atr_rma': _aot_module.calculate_atr_rma,
-        'calculate_adx_core': _aot_module.calculate_adx_core,
-        'percentile_rank_numba': _aot_module.percentile_rank_numba,
-    }
+    return {name: getattr(_aot_module, name) for name in REQUIRED_AOT_FUNCTIONS}
 
 
 def ensure_initialized() -> None:
@@ -238,7 +192,7 @@ def ensure_initialized() -> None:
             warnings.warn(
                 f"AOT module unexpectedly missing an attribute ({e}) despite "
                 f"passing verification -- falling back to JIT. Check that "
-                f"REQUIRED_AOT_FUNCTIONS in aot_bridge.py matches EXPORT_CONFIG "
+                f"aot_function_registry.py matches EXPORT_CONFIG "
                 f"in numba_functions_shared.py."
             )
             _using_aot = False
@@ -273,6 +227,14 @@ def requires_warmup() -> bool:
 
 # ============================================================================
 # HIGH-PERFORMANCE DISPATCH INTERFACE
+# ----------------------------------------------------------------------------
+# Hand-written on purpose: this is the typed public API other modules import
+# from (`from aot_bridge import rolling_min_max_numba, ...`). Auto-generating
+# these via globals()/lambda would erase type hints, argument names, and
+# docstrings like ema_loop_pine's -- not worth it to save a few lines.
+# If you add a name to aot_function_registry.py, add its wrapper here; the
+# completeness check at the bottom of this file will raise at import time
+# if you forget.
 # ============================================================================
 
 def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
@@ -323,46 +285,31 @@ def percentile_rank_numba(arr: np.ndarray, i: int, lookback: int, min_history: i
 
 
 # ============================================================================
-# MODULE EXPORTS
+# COMPLETENESS CHECK -- catches a forgotten wrapper at import time instead of
+# an ImportError at some later call site.
+# ============================================================================
+
+_missing_wrappers = [name for name in REQUIRED_AOT_FUNCTIONS if name not in globals()]
+if _missing_wrappers:
+    raise RuntimeError(
+        f"aot_bridge.py: {_missing_wrappers} are listed in aot_function_registry.py "
+        f"but have no wrapper function defined above. Add:\n"
+        f"    def {_missing_wrappers[0]}(...):\n"
+        f"        return _dispatch['{_missing_wrappers[0]}'](...)"
+    )
+
+
+# ============================================================================
+# MODULE EXPORTS -- derived from REQUIRED_AOT_FUNCTIONS, so a name added to
+# the registry is automatically exported once its wrapper exists above.
 # ============================================================================
 
 __all__ = [
-    # Initialization
     'ensure_initialized',
     'is_using_aot',
     'get_fallback_reason',
     'requires_warmup',
-
-    # Sanitization
-    'sanitize_array_numba',
-
-    # Moving Averages
-    'ema_loop',
-    'ema_loop_alpha',
-    'ema_loop_pine',
-
-    # Filters
-    'kalman_loop',
-
-    # Market Indicators
-    'vwap_daily_loop_safe',
-
-    # Statistical
-    'rolling_mean_numba',
-    'rolling_min_max_numba',
-
-    # Oscillators
-    'calculate_ppo_core',
-    'calculate_rsi_core',
-
-    # Pattern Recognition
-    'true_range_numba', 
-    'calculate_atr_rma',
-    'calculate_adx_core',
-
-    # Statistical
-    'percentile_rank_numba',
-]
+] + REQUIRED_AOT_FUNCTIONS
 
 # Auto-initialize on import
 try:
