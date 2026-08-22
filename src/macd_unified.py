@@ -3043,6 +3043,24 @@ def validate_candle_for_alerts(data_15m: Dict[str, np.ndarray], candle_index: in
 
     return is_valid_for_buy, is_valid_for_sell, candle_info, None
 
+def _candle_metrics(data_15m: "PriceData", i: int) -> Optional[Dict[str, float]]:
+    """Per-candle OHLC ratios shared by all pattern checks. None if data is bad/degenerate."""
+    o, h, l, c = data_15m.open[i], data_15m.high[i], data_15m.low[i], data_15m.close[i]
+    if any(np.isnan(v) for v in (o, h, l, c)):
+        return None
+    rng = h - l
+    if rng <= 1e-12:
+        return None
+    body = abs(c - o)
+    return {
+        "o": o, "h": h, "l": l, "c": c, "rng": rng, "body": body,
+        "body_ratio": body / rng,
+        "upper_wick_ratio": (h - max(o, c)) / rng,
+        "lower_wick_ratio": (min(o, c) - l) / rng,
+        "is_green": c > o, "is_red": c < o,
+        "body_low": min(o, c), "body_high": max(o, c),
+    }
+
 def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
                          end_idx: int, lookback: int) -> int:
     first = end_idx - lookback
@@ -3072,126 +3090,101 @@ def _prior_leg_direction(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray
         return 1
     return 0
 
-def _unpack_bar_core(open_arr, high_arr, low_arr, close_arr, idx: int):
-    """Minimal 11-element tuple — no wick ratios (only needed for signal candle)."""
-    o = open_arr[idx]; h = high_arr[idx]; l = low_arr[idx]; c = close_arr[idx]
-    if np.isnan(o) or np.isnan(h) or np.isnan(l) or np.isnan(c):
-        return None
-    rng = h - l
-    if rng <= 1e-12:
-        return None
-    body = abs(c - o)
-    return (o, h, l, c, rng, body, body / rng, c > o, c < o, min(o, c), max(o, c))
-
-def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]:
+def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool, bool, str]: 
     if i < 1 or i >= len(data_15m.close):
         return False, False, ""
-
-    oa, ha, la, ca = data_15m.open, data_15m.high, data_15m.low, data_15m.close
-
-    # ── signal candle (i) ──
-    _m0 = _unpack_bar_core(oa, ha, la, ca, i)
-    if _m0 is None:
+    m0 = _candle_metrics(data_15m, i)        # signal candle (the one the alert points at)
+    m1 = _candle_metrics(data_15m, i - 1)
+    if m0 is None or m1 is None:
         return False, False, ""
-    (o0, h0, l0, c0, rng0, body0, br0, g0, r0, bl0, bh0) = _m0
-    uwr0 = (h0 - bh0) / rng0
-    lwr0 = (bl0 - l0) / rng0
+    m2 = _candle_metrics(data_15m, i - 2) if i >= 2 else None
 
-    # ── prior candle (i-1) ──
-    _m1 = _unpack_bar_core(oa, ha, la, ca, i - 1)
-    if _m1 is None:
-        return False, False, ""
-    (o1, h1, l1, c1, rng1, body1, br1, g1, r1, bl1, bh1) = _m1
-
-    # ── optional 3rd candle (i-2) ──
-    _m2 = _unpack_bar_core(oa, ha, la, ca, i - 2) if i >= 2 else None
-    if _m2 is not None:
-        (o2, h2, l2, c2, rng2, body2, br2, g2, r2, bl2, bh2) = _m2
-        mid2 = (bl2 + bh2) * 0.5
-
-    # ── prior leg directions ──
     lk = Constants.REVERSAL_PRIOR_LEG_LOOKBACK
-    p1 = _prior_leg_direction(ca, ha, la, i - 1, lk)
-    p3 = _prior_leg_direction(ca, ha, la, i - 3, lk)
+    p1 = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i - 1, lk)
+    p3 = _prior_leg_direction(data_15m.close, data_15m.high, data_15m.low, i - 3, lk)
     prior_down_1, prior_up_1 = (p1 == -1), (p1 == 1)
     prior_down_3, prior_up_3 = (p3 == -1), (p3 == 1)
 
-    # ── 3-candle patterns ──
-    if _m2 is not None:
+    if m2 is not None:
+        # Morning Star: leg must be established BEFORE the pattern (matches Three-Soldiers convention)
         if (prior_down_3
-                and r2 and br2 >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
-                and br1 <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
-                and g0 and br0 >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
-                and c0 > mid2):
-            return True, False, "Morning Star"
-
+                and m2["is_red"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
+                and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
+                and m0["is_green"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
+                and m0["c"] > (m2["body_low"] + m2["body_high"]) / 2):
+            return True, False, "Morning Star" 
+        # Evening Star: mirror
         if (prior_up_3
-                and g2 and br2 >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
-                and br1 <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
-                and r0 and br0 >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
-                and c0 < mid2):
+                and m2["is_green"] and m2["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
+                and m1["body_ratio"] <= Constants.REVERSAL_STAR_SMALL_BODY_MAX_RATIO
+                and m0["is_red"] and m0["body_ratio"] >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
+                and m0["c"] < (m2["body_low"] + m2["body_high"]) / 2):
             return False, True, "Evening Star"
-
+        # Three White Soldiers: only a reversal if preceded by an actual down leg
         if (prior_down_3
-                and g2 and g1 and g0
-                and br2 >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
-                and br1 >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
-                and br0 >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
-                and o1 >= bl2 and o1 <= bh2 and c1 > c2
-                and o0 >= bl1 and o0 <= bh1 and c0 > c1):
+                and m2["is_green"] and m1["is_green"] and m0["is_green"]
+                and m2["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
+                and m1["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
+                and m0["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
+                and m1["o"] >= m2["body_low"] and m1["o"] <= m2["body_high"] and m1["c"] > m2["c"]
+                and m0["o"] >= m1["body_low"] and m0["o"] <= m1["body_high"] and m0["c"] > m1["c"]):
             return True, False, "Three White Soldiers"
-
+        # Three Black Crows: mirror
         if (prior_up_3
-                and r2 and r1 and r0
-                and br2 >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
-                and br1 >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
-                and br0 >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
-                and o1 <= bh2 and o1 >= bl2 and c1 < c2
-                and o0 <= bh1 and o0 >= bl1 and c0 < c1):
+                and m2["is_red"] and m1["is_red"] and m0["is_red"]
+                and m2["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
+                and m1["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
+                and m0["body_ratio"] >= Constants.REVERSAL_SOLDIERS_MIN_BODY_RATIO
+                and m1["o"] <= m2["body_high"] and m1["o"] >= m2["body_low"] and m1["c"] < m2["c"]
+                and m0["o"] <= m1["body_high"] and m0["o"] >= m1["body_low"] and m0["c"] < m1["c"]):
             return False, True, "Three Black Crows"
 
     # ── 2-candle patterns ──
-    if prior_down_1 and g0 and r1 and o0 < bl1 and c0 > bh1:
+    if (prior_down_1 and m0["is_green"] and m1["is_red"]
+            and m0["o"] < m1["body_low"] and m0["c"] > m1["body_high"]):
         return True, False, "Bullish Engulfing"
-    if prior_up_1 and r0 and g1 and o0 > bh1 and c0 < bl1:
+    if (prior_up_1 and m0["is_red"] and m1["is_green"]
+            and m0["o"] > m1["body_high"] and m0["c"] < m1["body_low"]):
         return False, True, "Bearish Engulfing"
 
-    pen_depth = Constants.REVERSAL_PIERCING_MIN_PENETRATION * body1
-    if prior_down_1 and r1 and g0 and o0 < c1 and c0 > bl1 + pen_depth and c0 < o1:
+    pen_depth = Constants.REVERSAL_PIERCING_MIN_PENETRATION * m1["body"]
+    if (prior_down_1 and m1["is_red"] and m0["is_green"] and m0["o"] < m1["c"]
+            and m0["c"] > m1["body_low"] + pen_depth and m0["c"] < m1["o"]):
         return True, False, "Piercing Line"
-    if prior_up_1 and g1 and r0 and o0 > c1 and c0 < bh1 - pen_depth and c0 > o1:
+    if (prior_up_1 and m1["is_green"] and m0["is_red"] and m0["o"] > m1["c"]
+            and m0["c"] < m1["body_high"] - pen_depth and m0["c"] > m1["o"]):
         return False, True, "Dark Cloud Cover"
 
-    tol = rng0 * Constants.REVERSAL_TWEEZER_TOLERANCE_PCT
-    if prior_down_1 and r1 and g0 and abs(l0 - l1) <= tol:
+    tol = m0["rng"] * Constants.REVERSAL_TWEEZER_TOLERANCE_PCT
+    if prior_down_1 and m1["is_red"] and m0["is_green"] and abs(m0["l"] - m1["l"]) <= tol:
         return True, False, "Tweezer Bottom"
-    if prior_up_1 and g1 and r0 and abs(h0 - h1) <= tol:
+    if prior_up_1 and m1["is_green"] and m0["is_red"] and abs(m0["h"] - m1["h"]) <= tol:
         return False, True, "Tweezer Top"
 
-    if (prior_down_1 and r1 and g0
-            and br0 <= Constants.REVERSAL_HARAMI_MAX_BODY_RATIO * br1 + 1e-9
-            and bl0 >= bl1 and bh0 <= bh1):
+    if (prior_down_1 and m1["is_red"] and m0["is_green"]
+            and m0["body_ratio"] <= Constants.REVERSAL_HARAMI_MAX_BODY_RATIO * m1["body_ratio"] + 1e-9
+            and m0["body_low"] >= m1["body_low"] and m0["body_high"] <= m1["body_high"]):
         return True, False, "Bullish Harami"
-    if (prior_up_1 and g1 and r0
-            and br0 <= Constants.REVERSAL_HARAMI_MAX_BODY_RATIO * br1 + 1e-9
-            and bl0 >= bl1 and bh0 <= bh1):
+    if (prior_up_1 and m1["is_green"] and m0["is_red"]
+            and m0["body_ratio"] <= Constants.REVERSAL_HARAMI_MAX_BODY_RATIO * m1["body_ratio"] + 1e-9
+            and m0["body_low"] >= m1["body_low"] and m0["body_high"] <= m1["body_high"]):
         return False, True, "Bearish Harami"
 
     # ── 1-candle patterns — only as a reversal AGAINST the prior leg ──
-    if br0 >= Constants.REVERSAL_MARUBOZU_BODY_RATIO:
-        if prior_down_1 and g0:
+    if m0["body_ratio"] >= Constants.REVERSAL_MARUBOZU_BODY_RATIO:
+        if prior_down_1 and m0["is_green"]:
             return True, False, "Bullish Marubozu"
-        if prior_up_1 and r0:
+        if prior_up_1 and m0["is_red"]:
             return False, True, "Bearish Marubozu"
 
-    if br0 <= Constants.REVERSAL_PINBAR_BODY_MAX_RATIO:
-        if (prior_down_1 and g0
-                and lwr0 >= Constants.REVERSAL_PINBAR_WICK_RATIO
-                and uwr0 < 0.15):
+    if m0["body_ratio"] <= Constants.REVERSAL_PINBAR_BODY_MAX_RATIO:
+        if (prior_down_1 and m0["is_green"]
+                and m0["lower_wick_ratio"] >= Constants.REVERSAL_PINBAR_WICK_RATIO
+                and m0["upper_wick_ratio"] < 0.15):
             return True, False, "Bullish Pinbar"
-        if (prior_up_1 and r0
-                and uwr0 >= Constants.REVERSAL_PINBAR_WICK_RATIO
-                and lwr0 < 0.15):
+        if (prior_up_1 and m0["is_red"]
+                and m0["upper_wick_ratio"] >= Constants.REVERSAL_PINBAR_WICK_RATIO
+                and m0["lower_wick_ratio"] < 0.15):
             return False, True, "Bearish Pinbar"
 
     return False, False, ""
