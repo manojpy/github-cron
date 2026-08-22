@@ -228,7 +228,7 @@ class BotConfig(BaseModel):
     REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
     ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
-    COALESCE_DEDUP_WINDOW_SEC: int = Field(default=900, ge=0)
+    COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_PCT: float = Field(default=60.0, ge=1.0, le=100.0, description="Min percentage of the achievable confluence total required to pass. Denominator = sum of weights of enabled, non-abstaining votes this cycle, so the threshold auto-scales when votes are enabled/disabled — no manual retuning needed")
     CONFLUENCE_MIN_ABS_SCORE: float = Field(default=18.0, ge=0.0, le=50.0, description="Absolute weighted-score floor required to pass the confluence gate, applied alongside CONFLUENCE_MIN_PCT. The stricter of the two (percentage-of-total vs this fixed floor) wins, so a low-vote-count cycle can't clear the gate on percentage alone")
@@ -2612,6 +2612,38 @@ class APICircuitBreaker:
                     return True, None
                 return False, f"Circuit breaker OPEN (retry in {self.recovery_timeout - elapsed:.0f}s)"
             return True, None
+
+    async def snapshot(self) -> Dict[str, Any]:
+        """Serializable copy of current state, for persisting across the
+        ephemeral per-run process boundary (see restore())."""
+        async with self._lock:
+            return {
+                "failures": self.failures,
+                "last_failure_time": self.last_failure_time,
+                "state": self.state,
+                "success_count": self.success_count,
+            }
+
+    async def restore(self, data: Dict[str, Any]) -> None:
+        """Hydrate from a snapshot() dict. Never raises -- malformed or
+        missing fields just fall back to CLOSED/fresh, since a bad restore
+        should degrade to 'circuit breaker starts closed' (today's existing
+        behavior), not crash the run."""
+        try:
+            state = str(data.get("state", "CLOSED"))
+            if state not in ("CLOSED", "OPEN", "HALF_OPEN"):
+                state = "CLOSED"
+            async with self._lock:
+                self.failures = int(data.get("failures", 0))
+                self.last_failure_time = float(data.get("last_failure_time", 0.0))
+                self.state = state
+                self.success_count = int(data.get("success_count", 0))
+            logger.info(
+                f"🔄 Circuit breaker state restored: {self.state} "
+                f"(failures={self.failures})"
+            )
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Circuit breaker restore() got malformed data, staying CLOSED: {e}")
 
 class DataFetcher:
     def __init__(self, api_base: str, *, session: Optional[aiohttp.ClientSession] = None, max_parallel: Optional[int] = None):
@@ -7336,7 +7368,15 @@ async def run_once() -> Optional[bool]:
         sdb = RedisStateStore(cfg.REDIS_URL)
         await sdb.connect()
 
-        if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true":
+        if sdb and not sdb.degraded:
+            try:
+                cb_state_raw = await sdb.get_metadata("circuit_breaker_state")
+                if cb_state_raw:
+                    await fetcher.circuit_breaker.restore(json.loads(cb_state_raw))
+            except Exception as e:
+                logger_run.warning(f"Could not restore circuit breaker state from Redis: {e}")
+
+        if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true": 
             if sdb and not sdb.degraded:
                 logger_run.warning("🚨 CLEAR_ALL_STATES requested — purging all Redis alert states...")
                 st, dd, oo = await _clear_all_redis_states(sdb, pairs_to_process, logger_run)
@@ -7588,6 +7628,18 @@ async def run_once() -> Optional[bool]:
             except Exception as e:
                 logger_run.error(f"Error releasing lock: {e}", exc_info=False)
 
+        if sdb and not sdb.degraded and fetcher:
+            try:
+                cb_snapshot = await fetcher.circuit_breaker.snapshot()
+                await asyncio.wait_for(
+                    sdb.set_metadata("circuit_breaker_state", json.dumps(cb_snapshot), ttl=3600),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                logger_run.error("Timeout persisting circuit breaker state")
+            except Exception as e:
+                logger_run.error(f"Error persisting circuit breaker state: {e}", exc_info=False)
+
         if sdb:
             try:
                 await asyncio.wait_for(sdb.close(), timeout=3.0)
@@ -7596,7 +7648,6 @@ async def run_once() -> Optional[bool]:
                 logger_run.error("Timeout closing Redis")
             except Exception as e:
                 logger_run.error(f"Error closing Redis: {e}", exc_info=False)
-
         try:
             await asyncio.wait_for(
                 RedisStateStore.shutdown_global_pool(),

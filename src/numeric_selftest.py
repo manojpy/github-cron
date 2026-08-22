@@ -4,30 +4,6 @@ numeric_selftest.py
 Independent numerical verification of the AOT/JIT-dispatched indicator
 functions, run once at startup before any pair is evaluated.
 
-Two layers of protection:
-
-1. GOLDEN VALUE CHECKS -- synthetic OHLCV fixtures with expected outputs
-   computed by a plain-Python reference implementation defined in this file
-   (deliberately NOT imported from numba_functions_shared), so a bug shared
-   by both the JIT and AOT versions of a function is still caught, not just
-   divergence between them.
-
-2. AOT vs JIT CROSS-CHECK -- when AOT is active, the same fixtures are run
-   through the JIT versions in numba_functions_shared directly and diffed
-   against the AOT dispatch output. Catches signature/dtype-coercion bugs
-   that only affect the compiled .so -- the kind of thing that would still
-   pass the SOURCE_VERSION stamp check in aot_bridge.py because the stamp
-   only proves the .so was built from the right source, not that the
-   compiled artifact behaves identically to it.
-
-Called from macd_unified.py's startup block, after aot_bridge.ensure_initialized()
-and before warmup/run_once(). Failure behavior is controlled by the
-NUMERIC_SELFTEST_STRICT env var (see macd_unified.py).
-
-numba_functions_shared is imported lazily, only inside the AOT-vs-JIT branch,
-so that the AOT fast-startup path (no numba import needed) is unaffected when
-AOT is healthy -- mirrors the same reasoning documented in
-aot_function_registry.py for keeping that module numba-free.
 """
 
 from typing import List, Tuple
@@ -35,13 +11,6 @@ from typing import List, Tuple
 import numpy as np
 
 import aot_bridge
-
-# ---------------------------------------------------------------------------
-# Independent (pure-Python) reference implementations.
-# Deliberately re-derived from the indicator definitions rather than copied
-# from numba_functions_shared.py -- a bug shared by both places should still
-# fail this check.
-# ---------------------------------------------------------------------------
 
 
 def _ref_ema_alpha(data: List[float], alpha: float) -> List[float]:
