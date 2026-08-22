@@ -139,6 +139,8 @@ jobs:
                 "/app/src/numba_functions_shared.py"
                 "/app/src/macd_aot_compiled.so"
                 "/app/src/macd_aot_compiled.version"
+                "/app/src/aot_function_registry.py"
+                "/app/src/numeric_selftest.py"
               )
               for file in "${FILES[@]}"; do
                 if [ ! -f "$file" ]; then
