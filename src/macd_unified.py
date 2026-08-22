@@ -7612,7 +7612,7 @@ async def run_once() -> Optional[bool]:
                 SessionManager.close_session(),
                 timeout=5.0
             )
-            logger_run.debug("��� HTTP session closed")
+            logger_run.debug("HTTP session closed")
         except asyncio.TimeoutError:
             logger_run.error("Timeout closing HTTP session")
         except Exception as e:
@@ -7657,6 +7657,23 @@ if __name__ == "__main__":
             sys.exit(1)
     else:
         logger.info("✅ Verified: AOT artifacts loaded successfully")
+
+    if os.getenv("NUMERIC_SELFTEST_ENABLED", "true").lower() == "true":
+        import numeric_selftest
+        selftest_ok, selftest_failures = numeric_selftest.run_self_test()
+        if selftest_ok:
+            logger.info(
+                "✅ Numeric self-test passed (%s backend)",
+                "AOT" if aot_bridge.is_using_aot() else "JIT"
+            )
+        else:
+            for msg in selftest_failures:
+                logger.critical("❌ Numeric self-test failure: %s", msg)
+            if os.getenv("NUMERIC_SELFTEST_STRICT", "true").lower() == "true":
+                logger.critical("❌ NUMERIC_SELFTEST_STRICT=true and self-test failed - exiting")
+                sys.exit(1)
+            else:
+                logger.warning("⚠️ Continuing despite self-test failure (NUMERIC_SELFTEST_STRICT=false)")
 
     parser = argparse.ArgumentParser(
         prog="macd_unified",
