@@ -45,8 +45,8 @@ from aot_bridge import (
     true_range_numba, 
     calculate_atr_rma, 
     calculate_adx_core
+    percentile_rank_numba,
 )
-
 try:
     import orjson
 
@@ -1576,10 +1576,6 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
     n = len(h)
     if n < max(swing_len, internal_len) + 2:
         return [], []
-
-    # --- Cumulative Mean Range (Pine: ta.cum(high-low) / bar_index) ----------
-    # Pine bar_index starts at 0, so at index 0 we use high-low,
-    # at index i>0 we divide by i.
     bar_idx = np.arange(n, dtype=np.float64)
     ranges = h - l
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -1589,16 +1585,16 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
 
     threshold_arr = atr200 if ob_filter == 'Atr' else cmr_arr
 
-    # --- Swing detection (Pine: swings()) ------------------------------------
     def get_swings(length):
         tops = []
         btms = []
         os = 0
+        _, upper_arr = rolling_min_max_numba(h, length)
+        lower_arr, _ = rolling_min_max_numba(l, length)
+
         for i in range(length, n):
-            window_h = h[i - length + 1:i + 1]
-            window_l = l[i - length + 1:i + 1]
-            upper = np.max(window_h)
-            lower = np.min(window_l)
+            upper = upper_arr[i]
+            lower = lower_arr[i]
 
             h_len = h[i - length]
             l_len = l[i - length]
@@ -1610,7 +1606,7 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
                 os = 1
 
             if os == 0 and prev_os != 0:
-                tops.append((i, h_len, i - length))   # (confirm_idx, price, pivot_idx)
+                tops.append((i, h_len, i - length))
             elif os == 1 and prev_os != 1:
                 btms.append((i, l_len, i - length))
         return tops, btms
@@ -2108,18 +2104,8 @@ def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: 
     if cached is not _PCTL_CACHE_MISS:
         _pctl_rank_cache.move_to_end(cache_key)
         return cached
-
-    window = arr[start:i]
-    valid = window[~np.isnan(window)]
-    if len(valid) < min_history:
-        result = None
-    elif np.isnan(current) or (not allow_zero and current <= 0):
-        result = None
-    else:
-        n = len(valid)
-        count_lt = np.sum(valid < current)
-        count_eq = np.sum(valid == current)
-        result = (count_lt + 0.5 * count_eq) / n
+    raw = percentile_rank_numba(arr, int(i), int(lookback), int(min_history), bool(allow_zero))
+    result = None if np.isnan(raw) else float(raw)
 
     _pctl_rank_cache[cache_key] = result
     if len(_pctl_rank_cache) > _PCTL_RANK_CACHE_MAXSIZE:

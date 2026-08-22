@@ -42,6 +42,7 @@ SIG_RSI_CORE         = f8[:](f8[:], i4)
 SIG_TRUE_RANGE       = f8[:](f8[:], f8[:], f8[:])
 SIG_ATR_RMA          = f8[:](f8[:], f8[:], f8[:], i4)
 SIG_ADX_CORE         = f8[:](f8[:], f8[:], f8[:], i4, i4)
+SIG_PERCENTILE_RANK  = f8(f8[:], i4, i4, i4, types.boolean)
 
 
 # ============================================================================
@@ -500,6 +501,44 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     adx = ema_loop_alpha(tr_smooth, alpha_adx)
     return adx
 
+# ============================================================================
+# 6. PERCENTILE RANK
+# ============================================================================
+
+@njit(SIG_PERCENTILE_RANK, nogil=True, cache=True)
+def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
+    """Single-pass O(lookback) percentile rank of arr[i] against the trailing
+    `lookback` window arr[i-lookback:i] (window excludes arr[i] itself, matching
+    the original _array_percentile_rank slicing). Returns NaN wherever the
+    Python version returned None -- callers translate NaN -> None."""
+    start = i - lookback
+    if start < 0:
+        return np.nan
+
+    current = arr[i]
+    if np.isnan(current):
+        return np.nan
+    if not allow_zero and current <= 0.0:
+        return np.nan
+
+    count_valid = 0
+    count_lt = 0
+    count_eq = 0
+    for j in range(start, i):
+        v = arr[j]
+        if np.isnan(v):
+            continue
+        count_valid += 1
+        if v < current:
+            count_lt += 1
+        elif v == current:
+            count_eq += 1
+
+    if count_valid < min_history:
+        return np.nan
+
+    return (count_lt + 0.5 * count_eq) / count_valid
+
 from aot_version import SOURCE_VERSION  # noqa: E402
 
 # ============================================================================
@@ -520,12 +559,13 @@ EXPORT_CONFIG = {
     'true_range_numba':      SIG_TRUE_RANGE,
     'calculate_atr_rma':     SIG_ATR_RMA,
     'calculate_adx_core':    SIG_ADX_CORE,
+    'percentile_rank_numba': SIG_PERCENTILE_RANK,
 }
 
 __all__ = list(EXPORT_CONFIG.keys())
 
 # Guard: raise immediately at import if count drops unexpectedly
-expected_min_functions = 13
+expected_min_functions = 14
 if len(__all__) < expected_min_functions:
     raise AssertionError(
         f"Expected at least {expected_min_functions} exported functions, "

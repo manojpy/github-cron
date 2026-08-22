@@ -58,6 +58,7 @@ REQUIRED_AOT_FUNCTIONS = [
     'true_range_numba', 
     'calculate_atr_rma',
     'calculate_adx_core',
+    'percentile_rank_numba',
 ]
 
 def get_library_extension() -> str:
@@ -170,6 +171,7 @@ def initialize_jit_fallback() -> None:
             true_range_numba,  
             calculate_atr_rma,
             calculate_adx_core,
+            percentile_rank_numba,
         )
 
         # Store in dictionary for dispatch
@@ -187,6 +189,7 @@ def initialize_jit_fallback() -> None:
             'true_range_numba': true_range_numba,
             'calculate_atr_rma': calculate_atr_rma,
             'calculate_adx_core': calculate_adx_core,
+            'percentile_rank_numba': percentile_rank_numba,
         }
 
     except ImportError as e:
@@ -213,6 +216,7 @@ def _build_aot_dispatch() -> Dict[str, Callable]:
         'true_range_numba': _aot_module.true_range_numba,
         'calculate_atr_rma': _aot_module.calculate_atr_rma,
         'calculate_adx_core': _aot_module.calculate_adx_core,
+        'percentile_rank_numba': _aot_module.percentile_rank_numba,
     }
 
 
@@ -311,6 +315,12 @@ def calculate_atr_rma(high: np.ndarray, low: np.ndarray, close: np.ndarray, peri
 def calculate_adx_core(high: np.ndarray, low: np.ndarray, close: np.ndarray, di_length: int, adx_length: int) -> np.ndarray:
     return _dispatch['calculate_adx_core'](high, low, close, di_length, adx_length)
 
+def percentile_rank_numba(arr: np.ndarray, i: int, lookback: int, min_history: int, allow_zero: bool) -> float:
+    """Returns NaN (not None) where the caller's window is invalid -- the
+    Optional[float]/None translation happens in the caller, not here, since
+    Numba functions can't return None."""
+    return _dispatch['percentile_rank_numba'](arr, i, lookback, min_history, allow_zero)
+
 
 # ============================================================================
 # MODULE EXPORTS
@@ -349,6 +359,9 @@ __all__ = [
     'true_range_numba', 
     'calculate_atr_rma',
     'calculate_adx_core',
+
+    # Statistical
+    'percentile_rank_numba',
 ]
 
 # Auto-initialize on import
