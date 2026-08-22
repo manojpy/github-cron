@@ -228,7 +228,7 @@ class BotConfig(BaseModel):
     REDIS_LOCK_EXPIRY: int = Field(default=900, ge=900, description="Redis lock TTL in seconds")
     ALERT_DEDUP_WINDOW_SEC: int = Field(default=120, ge=0, description="Dedup window for repeat alerts")
     ENABLE_ALERT_COALESCING: bool = Field(default=True) 
-    COALESCE_DEDUP_WINDOW_SEC: int = Field(default=1800, ge=0)
+    COALESCE_DEDUP_WINDOW_SEC: int = Field(default=900, ge=0)
     ENABLE_CONFLUENCE_GATE: bool = Field(default=False) 
     CONFLUENCE_MIN_PCT: float = Field(default=60.0, ge=1.0, le=100.0, description="Min percentage of the achievable confluence total required to pass. Denominator = sum of weights of enabled, non-abstaining votes this cycle, so the threshold auto-scales when votes are enabled/disabled — no manual retuning needed")
     CONFLUENCE_MIN_ABS_SCORE: float = Field(default=18.0, ge=0.0, le=50.0, description="Absolute weighted-score floor required to pass the confluence gate, applied alongside CONFLUENCE_MIN_PCT. The stricter of the two (percentage-of-total vs this fixed floor) wins, so a low-vote-count cycle can't clear the gate on percentage alone")
@@ -1775,10 +1775,10 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         test_start = confirm_end + 1
         if test_start > i15:
             continue
-
         touch_idx = -1
         zone_dead = False
         confirmed_idx = -1
+        confirm_touch_idx = -1   # ← track the touch tied to the most recent confirmation
         for idx in range(test_start, i15 + 1):
             touched = (l[idx] <= z.top) and (h[idx] >= z.bottom)
             if touch_idx == -1:
@@ -1797,20 +1797,28 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
             if z.is_demand:
                 if c[idx] > z.top + min_penetration:
                     confirmed_idx = idx
-                    break
+                    confirm_touch_idx = touch_idx
+                    touch_idx = -1     # ← RESET so future approaches are detected
+                    continue           # ← KEEP SCANNING for more recent confirmations
                 if c[idx] < z.bottom:
                     zone_dead = True
                     break
             else:
                 if c[idx] < z.bottom - min_penetration:
                     confirmed_idx = idx
-                    break
+                    confirm_touch_idx = touch_idx
+                    touch_idx = -1
+                    continue
                 if c[idx] > z.top:
                     zone_dead = True
                     break
 
-        if touch_idx == -1 or zone_dead:
+        if zone_dead:
             continue
+        if confirmed_idx == -1 and touch_idx == -1:
+            continue
+
+        leg_ref = (confirm_touch_idx if confirmed_idx != -1 else touch_idx) - 1
 
         # Compute prior leg for any confirmation (current or recent)
         leg_ref = touch_idx - 1
@@ -1824,14 +1832,14 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
                 zone_type = "Internal" if z.is_internal else "Swing"
                 reason_buy = (
                     f"Pine {zone_type} Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
-                    f"reversed after down-leg, touched idx {touch_idx}"
+                    f"reversed after down-leg, touched idx {confirm_touch_idx}"
                 )
             elif (not z.is_demand) and zone_prior_leg == 1:
                 ob_ok_sell = True
                 zone_type = "Internal" if z.is_internal else "Swing"
                 reason_sell = (
                     f"Pine {zone_type} Supply OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
-                    f"reversed after up-leg, touched idx {touch_idx}"
+                    f"reversed after up-leg, touched idx {confirm_touch_idx}"
                 )
             else:
                 zone_type = "Internal" if z.is_internal else "Swing"
