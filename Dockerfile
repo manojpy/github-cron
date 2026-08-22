@@ -42,6 +42,7 @@ WORKDIR /build
 # Do NOT copy aot_bridge.py or macd_unified.py here — changing business logic
 # should not invalidate the AOT compilation cache.
 COPY src/aot_version.py ./
+COPY src/aot_function_registry.py ./
 COPY src/numba_functions_shared.py ./
 COPY src/aot_build.py ./
 
@@ -96,6 +97,7 @@ COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version
 
 # Copy source files
 COPY --chown=appuser:appuser src/aot_version.py ./
+COPY --chown=appuser:appuser src/aot_function_registry.py ./
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
