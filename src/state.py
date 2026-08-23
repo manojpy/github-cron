@@ -506,9 +506,14 @@ class RedisStateStore:
                 conf_total = data.get("confluence_total")
 
                 entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
-
+                # ── DEFENSIVE: fallback to exact match if searchsorted missed due to out-of-order timestamps ──
                 if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
-                    continue  # entry candle has scrolled out of our current window; leave pending, retry later
+                    exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
+                    if exact_matches.size == 0:
+                        continue  # entry candle has scrolled out of our current window; leave pending, retry later
+                    entry_idx = int(exact_matches[-1])
+                # ── END DEFENSIVE ──
+
                 target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
                 if target_idx > i15:
                     continue  # not enough candles have closed yet — grade it on a later run
