@@ -58,6 +58,7 @@ from bot_config import (
 # ── fetcher : only orchestrator-level I/O ──
 from fetcher import (
     SessionManager, DataFetcher, PriceData, parse_candles_to_numpy,
+    get_last_closed_index_from_array,
 )
 
 # ── indicators : only helpers macd_unified.py calls directly ──
@@ -127,6 +128,11 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
+    if cfg.ENABLE_WIN_RATE_FILTER and not sdb.degraded:
+        i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
+        if i15 is not None:
+            await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+    
     pair_oi = (oi_gate_data or {}).get(pair_name)
     gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
     if gr is None:
