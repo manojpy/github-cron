@@ -47,58 +47,38 @@ from aot_bridge import (
     percentile_rank_numba
 )
 
+# ── bot_config : only what macd_unified.py touches directly ──
 from bot_config import (
-    normalize_timestamp, normalize_timestamp_array, CprNotReadyError, Constants,
-    PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL, CompiledPatterns, TRACE_ID, PAIR_ID,
-    BotConfig, load_config, cfg, TraceContextFilter, SafeFormatter, setup_logging,
-    logger, logger_main, format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
-    json_dumps, json_loads, JSONDecodeError, JSON_BACKEND, shutdown_event, __version__,
+    Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
+    TRACE_ID, PAIR_ID, cfg, logger, logger_main,
+    format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
+    json_dumps, json_loads, shutdown_event, __version__,
 )
 
+# ── fetcher : only orchestrator-level I/O ──
+from fetcher import (
+    SessionManager, DataFetcher, PriceData, parse_candles_to_numpy,
+)
+
+# ── indicators : only helpers macd_unified.py calls directly ──
 from indicators import (
-    validate_indicator_array, validate_indicators_dict, is_previous_day_complete,
-    _find_closed_daily_candle, validate_conversion_cross, validate_cloud_cross,
-    validate_vwap_cross, get_utc_date_key, should_reset_daily_state,
-    calculate_smooth_rsi_numpy, calculate_volume_ema_numpy, calculate_ppo_numpy,
-    calculate_vwap_numpy, calculate_rma_numpy, calculate_ichimoku_numpy,
-    calculate_rsi_guard_numpy, warmup_if_needed, calculate_pivot_levels_numpy,
-    calculate_gate_indicators_numpy, calculate_alert_indicators_numpy,
-    _normalize_samples, _prune_stale_samples, _percentile_rank, OrderBlock,
-    find_pine_ob, calculate_pine_order_blocks, _order_block_gate_reason,
-    _oi_price_divergence_reason, _oi_funding_gate_reason, _validate_ohlc_arrays,
-    get_atr_percentile_smoothed, _array_percentile_rank, get_atr_percentile,
-    get_adx_percentile, get_volume_percentile, _scale_by_pctl,
-    get_adaptive_rvol_threshold, get_adaptive_adx_threshold,
-    get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl, get_adaptive_threshold,
-    get_adaptive_ppo_threshold, get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold,
-    _validate_atr_arrays, _prior_leg_direction, 
+    get_utc_date_key, should_reset_daily_state, warmup_if_needed,
+    _normalize_samples, _prune_stale_samples, _oi_funding_gate_reason,
 )
 
+# ── state / gates / alerts : trim to direct usage ──
 from state import (
     _blanket_reset_pair, _clear_all_redis_states, build_products_map_from_cfg,
-    RedisKeyPrefix, RedisStateStore, RedisLock, TokenBucket,
+    RedisKeyPrefix, RedisStateStore, RedisLock,
 )
 
-from fetcher import (
-    SessionManager, RetryCategory, categorize_exception, compute_backoff,
-    async_fetch_json, RateLimitedFetcher, APICircuitBreaker, DataFetcher,
-    validate_indicator_values, validate_candle_for_alerts,
-    _unpack_bar_core, detect_reversal_candle_pattern, parse_candles_to_numpy,
-    candle_is_stable, get_last_closed_index_from_array, CandleSnapshot, PriceData,
-    confirm_candle_unchanged, independent_candle_reverify, cross_check_15m_against_5m,
-    calculate_expected_candle_timestamp,
-)
-
-from gates import IndicatorCache, GateResult, CONFLUENCE_WEIGHTS, compute_confluence_score, _eval_gate
+from gates import GateResult, compute_confluence_score, _eval_gate
 
 from alerts import (
-    TelegramQueue, _clean_extra_text, _format_price, _fmt_num, _fmt_score,
-    build_single_msg, build_batched_msg, create_pivot_alert, AlertRule,
-    ALERT_DEFINITIONS, _validate_pivot_cross, _build_resets, get_pivot_alert_info,
-    BUY_PIVOT_DEFS, SELL_PIVOT_DEFS, ALERT_DEFINITIONS_MAP, ALERT_KEYS,
-    validate_alert_definitions, BUY_ALERT_KEYS, SELL_ALERT_KEYS,
-    _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
+    TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
 )
+
+_pair_eval_counter = 0
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
     logger.warning(f"Received signal {sig}, initiating async shutdown...")
@@ -640,7 +620,6 @@ async def run_once() -> Optional[bool]:
                 last_reset_date_str = await sdb.get_metadata(day_tracker_key)
             except Exception as e:
                 logger_run.warning(f"Failed to get last reset date: {e}")
-     
 
             if should_reset_daily_state(reference_time, last_reset_date_str):
                 logger_run.info(f"🔄 New day detected ({current_date_str}). Resetting daily states...")
