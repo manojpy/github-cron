@@ -466,7 +466,7 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
 
-async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
+    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
