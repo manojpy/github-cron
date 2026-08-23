@@ -988,6 +988,24 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
 
+        if alerts_to_send:
+            color_guarded = []
+            for title, extra, alert_key in alerts_to_send:
+                if alert_key in BUY_ALERT_KEYS and not gr.is_green:
+                    logger_pair.warning(
+                        f"[{pair_name}] 🚫 COLOR GUARD killed BUY '{alert_key}': "
+                        f"not a green candle (O={gr.open_curr:.4f} C={gr.close_curr:.4f})"
+                    )
+                    continue
+                if alert_key in SELL_ALERT_KEYS and not gr.is_red:
+                    logger_pair.warning(
+                        f"[{pair_name}] 🚫 COLOR GUARD killed SELL '{alert_key}': "
+                        f"not a red candle (O={gr.open_curr:.4f} C={gr.close_curr:.4f})"
+                    )
+                    continue
+                color_guarded.append((title, extra, alert_key))
+            alerts_to_send = color_guarded
+
         cached_snapshot: Optional[CandleSnapshot] = None
         if alerts_to_send:
             has_reversal_alert = any(
