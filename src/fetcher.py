@@ -1225,7 +1225,6 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         )
     return last_closed_idx
 
-
 @dataclass(frozen=True)
 class CandleSnapshot:
     timestamp: int
@@ -1238,6 +1237,10 @@ class CandleSnapshot:
     is_red: bool
     is_valid_for_buy: bool
     is_valid_for_sell: bool
+    reversal_pattern_name: str = ""
+    reversal_bullish: bool = False
+    reversal_bearish: bool = False
+
 
 @dataclass(slots=True)
 class PriceData:
@@ -1417,6 +1420,23 @@ def independent_candle_reverify(data_15m: Dict[str, np.ndarray], candle_index: i
             f"— suppressing alert"
         )
         return False
+
+    if cached.reversal_pattern_name:
+        fresh_price_data = PriceData.from_dict(data_15m)
+        fresh_bullish, fresh_bearish, fresh_pattern_name = detect_reversal_candle_pattern(
+            fresh_price_data, candle_index
+        )
+        if (fresh_bullish, fresh_bearish, fresh_pattern_name) != (
+            cached.reversal_bullish, cached.reversal_bearish, cached.reversal_pattern_name
+        ):
+            logger_pair.error(
+                f"[{pair_name}] Independent re-verify PATTERN MISMATCH: "
+                f"cached='{cached.reversal_pattern_name}' (bull={cached.reversal_bullish}, bear={cached.reversal_bearish}) "
+                f"vs fresh='{fresh_pattern_name}' (bull={fresh_bullish}, bear={fresh_bearish}) "
+                f"— suppressing alert"
+            )
+            return False
+
     return True
 
 def cross_check_15m_against_5m(data_5m: PriceData, ts_curr: int, cached: CandleSnapshot,

@@ -732,6 +732,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "ob_gate_reason": ob_gate_reason,
             "strong_reversal_buy": strong_reversal_buy, "strong_reversal_sell": strong_reversal_sell,
             "reversal_pattern_name": reversal_pattern_name,
+            "reversal_bullish": reversal_bullish, "reversal_bearish": reversal_bearish,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -989,11 +990,17 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         cached_snapshot: Optional[CandleSnapshot] = None
         if alerts_to_send:
+            has_reversal_alert = any(
+                k in ("strong_reversal_buy", "strong_reversal_sell") for _, _, k in alerts_to_send
+            )
             cached_snapshot = CandleSnapshot(
                 timestamp=ts_curr, open=o, high=h, low=l, close=c,
                 volume=candle_info["volume"],
                 is_green=is_green, is_red=is_red,
                 is_valid_for_buy=is_valid_for_buy, is_valid_for_sell=is_valid_for_sell,
+                reversal_pattern_name=context.get("reversal_pattern_name", "") if has_reversal_alert else "",
+                reversal_bullish=context.get("reversal_bullish", False) if has_reversal_alert else False,
+                reversal_bearish=context.get("reversal_bearish", False) if has_reversal_alert else False,
             )
             reverified = independent_candle_reverify(
                 data_15m=data_15m.as_dict(), candle_index=i15,
