@@ -808,9 +808,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not is_valid_for_buy and alert_key not in ("strong_reversal_buy", "ob_reversal_buy"):
+                if not (is_valid_for_buy or reversal_bullish):
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: not valid for buy")
+                        logger_pair.debug(f"Skipping {alert_key}: not valid for buy (wick/body fail, no reversal pattern)")
                     continue
 
             if alert_key in SELL_ALERT_KEYS:
@@ -821,9 +821,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not is_valid_for_sell and alert_key not in ("strong_reversal_sell", "ob_reversal_sell"):
+                if not (is_valid_for_sell or reversal_bearish):
                     if cfg.DEBUG_MODE:
-                        logger_pair.debug(f"Skipping {alert_key}: not valid for sell")
+                        logger_pair.debug(f"Skipping {alert_key}: not valid for sell (wick/body fail, no reversal pattern)")
                     continue
 
             if is_green and alert_key.startswith("pivot_down"):
