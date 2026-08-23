@@ -869,6 +869,14 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
         return False, False, ""
     (o1, h1, l1, c1, rng1, body1, br1, g1, r1, bl1, bh1) = _m1
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # DATA INTEGRITY: Require exactly contiguous 15m candles (900s)
+    # ═══════════════════════════════════════════════════════════════════════
+    if data_15m.ts[i] - data_15m.ts[i - 1] != 900:
+        return False, False, ""
+    if i >= 2 and data_15m.ts[i - 1] - data_15m.ts[i - 2] != 900:
+        return False, False, ""
+
     # ── optional 3rd candle (i-2) ──
     _m2 = _unpack_bar_core(oa, ha, la, ca, i - 2) if i >= 2 else None
     if _m2 is not None:
@@ -883,6 +891,8 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
     prior_down_3, prior_up_3 = (p3 == -1), (p3 == 1)
 
     # ── 3-candle patterns ──
+    #    NOTE: br1 is intentionally NOT checked here — Morning/Evening Star
+    #    require br1 to be SMALL (the star candle).
     if _m2 is not None:
         if (prior_down_3
                 and r2 and br2 >= Constants.REVERSAL_STAR_BIG_BODY_MIN_RATIO
@@ -916,17 +926,30 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
                 and o0 <= bh1 and o0 >= bl1 and c0 < c1):
             return False, True, "Three Black Crows"
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # TEXTBOOK REQUIREMENT: Candle 1 must be a "long" body for 2-candle & 1-candle
+    # reversal patterns (Engulfing, Piercing, Dark Cloud, Tweezers, Harami).
+    # ═══════════════════════════════════════════════════════════════════════
+    if br1 < Constants.REVERSAL_MIN_PRIOR_BODY_RATIO:
+        return False, False, ""
+
     # ── 2-candle patterns ──
     if prior_down_1 and g0 and r1 and o0 < bl1 and c0 > bh1:
         return True, False, "Bullish Engulfing"
     if prior_up_1 and r0 and g1 and o0 > bh1 and c0 < bl1:
         return False, True, "Bearish Engulfing"
 
-    pen_depth = Constants.REVERSAL_PIERCING_MIN_PENETRATION * body1
-    if prior_down_1 and r1 and g0 and o0 < c1 and c0 > bl1 + pen_depth and c0 < o1:
+    # ═══════════════════════════════════════════════════════════════════════
+    # TEXTBOOK Piercing Line & Dark Cloud Cover (15m-relaxed opens)
+    # ═══════════════════════════════════════════════════════════════════════
+    mid1 = (o1 + c1) * 0.5
+
+    if prior_down_1 and r1 and g0 and o0 <= l1 and c0 > mid1 and c0 < o1:
         return True, False, "Piercing Line"
-    if prior_up_1 and g1 and r0 and o0 > c1 and c0 < bh1 - pen_depth and c0 > o1:
+
+    if prior_up_1 and g1 and r0 and o0 >= h1 and c0 < mid1 and c0 > o1:
         return False, True, "Dark Cloud Cover"
+    # ═══════════════════════════════════════════════════════════════════════
 
     tol = rng0 * Constants.REVERSAL_TWEEZER_TOLERANCE_PCT
     if prior_down_1 and r1 and g0 and abs(l0 - l1) <= tol:
@@ -943,7 +966,7 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
             and bl0 >= bl1 and bh0 <= bh1):
         return False, True, "Bearish Harami"
 
-    # ── 1-candle patterns — only as a reversal AGAINST the prior leg ──
+    # ── 1-candle patterns ──
     if br0 >= Constants.REVERSAL_MARUBOZU_BODY_RATIO:
         if prior_down_1 and g0:
             return True, False, "Bullish Marubozu"
