@@ -48,13 +48,13 @@ from aot_bridge import (
 )
 
 # ── bot_config : only what macd_unified.py touches directly ──
+
 from bot_config import (
     Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
     json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__,
 )
-
 # ── fetcher : only orchestrator-level I/O ──
 from fetcher import (
     SessionManager, DataFetcher, PriceData, parse_candles_to_numpy,
@@ -587,7 +587,7 @@ async def run_once() -> Optional[bool]:
             try:
                 cb_state_raw = await sdb.get_metadata("circuit_breaker_state")
                 if cb_state_raw:
-                    await fetcher.circuit_breaker.restore(json.loads(cb_state_raw))
+                    await fetcher.circuit_breaker.restore(json_loads(cb_state_raw))
             except Exception as e:
                 logger_run.warning(f"Could not restore circuit breaker state from Redis: {e}")
 
