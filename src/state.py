@@ -47,6 +47,43 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
             logger.warning(f"⏱️ Redis scan for '{match}' timed out after {timeout}s. Aborting scan for this prefix to protect run deadline.")
             return []  # Fail-safe: return empty so we don't block the bot
 
+    async def _batch_unlink(keys: List[str], batch_size: int = 100) -> int:
+        """Unlink keys in batches to avoid blocking Redis with massive argument lists."""
+        if not keys:
+            return 0
+        total_deleted = 0
+        for i in range(0, len(keys), batch_size):
+            batch = keys[i:i + batch_size]
+            try:
+                # unlink() frees memory in a background thread on the Redis server
+                total_deleted += await sdb._redis.unlink(*batch)
+            except Exception as e:
+                logger.error(f"Batch unlink failed for {len(batch)} keys: {e}")
+        return total_deleted
+
+    try:
+        # ── 1. State hashes: scan for pair_state:* ──
+        state_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.PAIR_STATE}*", count=100)
+        deleted_states = await _batch_unlink(state_keys)
+
+        # ── 2. Dedup keys: scan for recent_alert:* ──
+        dedup_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.RECENT_ALERT}*", count=500)
+        deleted_dedups = await _batch_unlink(dedup_keys)
+
+        # ── 3. Pending Outcomes (Win-rate tracking queue) ──
+        outcome_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.OUTCOME_PENDING}*", count=100)
+        deleted_outcomes = await _batch_unlink(outcome_keys)
+
+        logger.info(
+            f"🧹 MASS RESET complete | "
+            f"States: {deleted_states} | Dedups: {deleted_dedups} | Outcomes: {deleted_outcomes}"
+        )
+        return deleted_states, deleted_dedups, deleted_outcomes
+
+    except Exception as e:
+        logger.error(f"Mass reset failed: {e}")
+        return 0, 0, 0
+
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
     for pair in cfg.PAIRS:
