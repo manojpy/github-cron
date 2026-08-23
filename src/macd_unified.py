@@ -52,7 +52,7 @@ from bot_config import (
     Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
     format_ist_time, MEMORY_CHECK_INTERVAL_PAIRS, validate_runtime_config,
-    json_dumps, json_loads, shutdown_event, __version__,
+    json_dumps, json_loads, JSON_BACKEND, shutdown_event, __version__,
 )
 
 # ── fetcher : only orchestrator-level I/O ──
