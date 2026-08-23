@@ -7,7 +7,6 @@ FROM python:3.11-slim-bookworm AS uv-installer
 
 RUN pip install --no-cache-dir uv==0.6.12
 
-
 # ---------- STAGE 2: DEPENDENCIES BUILDER ----------
 FROM python:3.11-slim-bookworm AS deps-builder
 
@@ -31,7 +30,6 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/tmp/uv_cache \
     uv pip install -r requirements.txt && \
     python -m compileall -q -o 2 $VIRTUAL_ENV
-
 
 # ---------- STAGE 3: AOT COMPILER ----------
 FROM deps-builder AS aot-builder
@@ -67,7 +65,6 @@ RUN set -e; \
             touch /build/macd_aot_compiled.so /build/macd_aot_compiled.version; \
         fi; \
     fi
-
 
 # ---------- STAGE 4: FINAL RUNTIME ----------
 FROM python:3.11-slim-bookworm AS final
@@ -110,9 +107,6 @@ COPY --chown=appuser:appuser src/indicators.py ./
 COPY --chown=appuser:appuser src/gates.py ./
 COPY --chown=appuser:appuser src/alerts.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
-
-
-
 
 USER appuser
 
