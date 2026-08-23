@@ -52,6 +52,8 @@ jobs:
           echo "## 🔎 mypy Type Check" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           mypy src/macd_unified.py src/aot_bridge.py src/numeric_selftest.py \
+            src/bot_config.py src/state.py src/fetcher.py src/indicators.py \
+            src/gates.py src/alerts.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
@@ -157,6 +159,12 @@ jobs:
                 "/app/src/aot_function_registry.py"
                 "/app/src/numba_functions_shared.py"
                 "/app/src/numeric_selftest.py"
+                "/app/src/bot_config.py"
+                "/app/src/state.py"
+                "/app/src/fetcher.py"
+                "/app/src/indicators.py"
+                "/app/src/gates.py"
+                "/app/src/alerts.py"
                 "/app/src/macd_aot_compiled.so"
                 "/app/src/macd_aot_compiled.version"
               )
