@@ -466,9 +466,9 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
 
-    async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
+async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
-        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
+        if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
 
         # Use the run-level pre-scan when available (falls back to per-pair scan otherwise)
@@ -484,6 +484,10 @@ class RedisStateStore:
             except Exception as e:
                 logger_pair.warning(f"Failed to scan pending outcomes for {pair}: {e}")
                 return
+
+        if not keys:
+            return
+
         try:
             async with self._redis.pipeline() as read_pipe:
                 for key in keys:
@@ -492,63 +496,138 @@ class RedisStateStore:
         except Exception as e:
             logger_pair.warning(f"Failed to batch-fetch pending outcomes for {pair}: {e}")
             return
-        write_pipe = self._redis.pipeline()
-        pending_writes = 0
-        for key, raw in zip(keys, raw_values):
-            try:
-                if raw is None:
-                    continue
-                data = json_loads(raw)
-                entry_ts = int(data["entry_ts"])
-                direction = data["direction"]
-                entry_price = float(data["entry_price"])
-                conf_score = data.get("confluence_score")
-                conf_total = data.get("confluence_total")
 
-                entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
-                # ── DEFENSIVE: fallback to exact match if searchsorted missed due to out-of-order timestamps ──
-                if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
-                    exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
-                    if exact_matches.size == 0:
-                        continue  # entry candle has scrolled out of our current window; leave pending, retry later
-                    entry_idx = int(exact_matches[-1])
-                # ── END DEFENSIVE ──
+        resolved_count = 0
+        not_ready_count = 0
+        ts_mismatch_count = 0
+        missing_score_count = 0
+        bad_payload_count = 0
 
-                target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
-                if target_idx > i15:
-                    continue  # not enough candles have closed yet — grade it on a later run
+        stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
 
-                future_price = float(data_15m.close[target_idx])
-                pct_move = (future_price - entry_price) / entry_price * 100.0
-                win = pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT if direction == "buy" \
-                    else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
+        try:
+            async with self._redis.pipeline() as write_pipe:
+                pending_writes = 0
 
-                alert_key = key.split(":")[-2]
-                stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
-                write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
-                write_pipe.expire(stats_key, cfg.STATE_EXPIRY_DAYS * 86400)
+                for key, raw in zip(keys, raw_values):
+                    try:
+                        if raw is None:
+                            # Race: expired between scan and fetch; harmless, skip silently
+                            continue
 
-                if conf_score is not None and conf_total is not None:
-                    write_pipe.xadd(
-                        RedisKeyPrefix.OUTCOME_LOG_STREAM,
-                        {
-                            "pair": pair, "alert_key": alert_key, "direction": direction,
-                            "score": conf_score, "total": conf_total,
-                            "pct_move": round(pct_move, 4), "win": int(win), "entry_ts": entry_ts,
-                        },
-                        maxlen=50000, approximate=True,
-                    )
+                        data = json_loads(raw)
+                        entry_ts = int(data["entry_ts"])
+                        direction = data["direction"]
+                        entry_price = float(data["entry_price"])
+                        conf_score = data.get("confluence_score")
+                        conf_total = data.get("confluence_total")
 
-                write_pipe.delete(key)
-                pending_writes += 1
-            except Exception as e:
-                logger_pair.warning(f"Failed to resolve pending outcome {key}: {e}")
-                continue
-        if pending_writes:
-            try:
-                await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
-            except Exception as e:
-                logger_pair.warning(f"Failed to persist resolved outcomes for {pair}: {e}")
+                        if entry_price <= 0:
+                            logger_pair.warning(
+                                f"Invalid entry_price {entry_price} for pending outcome {key}; skipping"
+                            )
+                            bad_payload_count += 1
+                            continue
+
+                        direction_norm = str(direction).lower()
+                        if direction_norm in ("buy", "long"):
+                            is_buy = True
+                        elif direction_norm in ("sell", "short"):
+                            is_buy = False
+                        else:
+                            logger_pair.warning(
+                                f"Unknown direction '{direction}' for pending outcome {key}; skipping"
+                            )
+                            bad_payload_count += 1
+                            continue
+
+                        entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
+                        # ── DEFENSIVE: fallback to exact match if searchsorted missed due to out-of-order timestamps ──
+                        if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
+                            exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
+                            if exact_matches.size == 0:
+                                ts_mismatch_count += 1
+                                if cfg.DEBUG_MODE:
+                                    logger_pair.debug(
+                                        f"[{pair}] Outcome entry_ts not found | "
+                                        f"entry_ts={entry_ts} | "
+                                        f"first_ts={data_15m.ts[0] if len(data_15m.ts) else None} | "
+                                        f"last_ts={data_15m.ts[-1] if len(data_15m.ts) else None}"
+                                    )
+                                continue  # scrolled out of window; leave pending for next run
+                            entry_idx = int(exact_matches[-1])
+                        # ── END DEFENSIVE ──
+
+                        target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
+                        if target_idx > i15:
+                            not_ready_count += 1
+                            continue  # not enough candles closed yet; grade on a later run
+
+                        future_price = float(data_15m.close[target_idx])
+                        pct_move = (future_price - entry_price) / entry_price * 100.0
+                        win = (
+                            pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
+                            if is_buy
+                            else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
+                        )
+
+                        alert_key = key.split(":")[-2]
+                        stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
+                        write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                        write_pipe.expire(stats_key, stats_ttl)
+
+                        stream_fields = None
+                        if conf_score is not None and conf_total is not None:
+                            stream_fields = {
+                                "pair": str(pair),
+                                "alert_key": str(alert_key),
+                                "direction": str(direction),
+                                "score": str(conf_score),
+                                "total": str(conf_total),
+                                "pct_move": f"{pct_move:.4f}",
+                                "win": "1" if win else "0",
+                                "entry_ts": str(entry_ts),
+                            }
+                        else:
+                            missing_score_count += 1
+                            logger_pair.debug(
+                                f"[{pair}] Outcome for {alert_key} has no confluence score/total; "
+                                f"stats updated but stream entry skipped"
+                            )
+
+                        if stream_fields is not None:
+                            write_pipe.xadd(
+                                RedisKeyPrefix.OUTCOME_LOG_STREAM,
+                                stream_fields,
+                                maxlen=50000,
+                                approximate=True,
+                            )
+
+                        write_pipe.delete(key)
+                        pending_writes += 1
+                        resolved_count += 1
+
+                    except Exception as e:
+                        logger_pair.warning(f"Failed to resolve pending outcome {key}: {e}")
+                        bad_payload_count += 1
+                        continue
+
+                if pending_writes:
+                    await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
+
+        except Exception as e:
+            logger_pair.warning(f"Failed to persist resolved outcomes for {pair}: {e}")
+            return
+
+        logger_pair.info(
+            f"[{pair}] Outcome resolution | "
+            f"pending={len(keys)} | "
+            f"resolved={resolved_count} | "
+            f"not_ready={not_ready_count} | "
+            f"ts_mismatch={ts_mismatch_count} | "
+            f"missing_score={missing_score_count} | "
+            f"bad_payload={bad_payload_count}"
+        )
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
         """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""
