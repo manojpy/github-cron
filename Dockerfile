@@ -95,13 +95,24 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.so ./
 COPY --from=aot-builder --chown=appuser:appuser /build/macd_aot_compiled.version ./
 
-# Copy source files
+# Copy AOT / bridge files (change rarely — keep early for layer cache)
 COPY --chown=appuser:appuser src/aot_version.py ./
 COPY --chown=appuser:appuser src/aot_function_registry.py ./
 COPY --chown=appuser:appuser src/numba_functions_shared.py ./
 COPY --chown=appuser:appuser src/aot_bridge.py ./
-COPY --chown=appuser:appuser src/macd_unified.py ./
 COPY --chown=appuser:appuser src/numeric_selftest.py ./
+
+# Copy business logic modules (change frequently)
+COPY --chown=appuser:appuser src/bot_config.py ./
+COPY --chown=appuser:appuser src/state.py ./
+COPY --chown=appuser:appuser src/fetcher.py ./
+COPY --chown=appuser:appuser src/indicators.py ./
+COPY --chown=appuser:appuser src/gates.py ./
+COPY --chown=appuser:appuser src/alerts.py ./
+COPY --chown=appuser:appuser src/macd_unified.py ./
+
+
+
 
 USER appuser
 
