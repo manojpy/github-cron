@@ -1208,12 +1208,20 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     actual_close = actual_candle_open + interval_seconds
     if reference_time < actual_close:
-        logger.error(...)
+        logger.error(
+            "[%s] 🚨 INVARIANT VIOLATION: reference_time (%s) is before actual_close (%s) "
+            "for %dm candle (open %s). candle_is_stable() should have prevented this. Skipping.",
+            pair_name or "?",
+            format_ist_time(reference_time),
+            format_ist_time(actual_close),
+            int(interval_minutes),
+            format_ist_time(actual_candle_open),
+        )
         return None
 
     next_idx = last_closed_idx + 1
     if next_idx >= ts_normalized.size or abs(int(ts_normalized[next_idx]) - actual_close) > 1:
-        logger.warning(
+        logger.debug(
             "[%s] Candle %dm at %s NOT exchange-confirmed closed: next candle open %s missing from feed. Skipping.",
             pair_name or "?", int(interval_minutes),
             format_ist_time(actual_candle_open), format_ist_time(actual_close),
