@@ -1213,7 +1213,7 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     next_idx = last_closed_idx + 1
     if next_idx >= ts_normalized.size or abs(int(ts_normalized[next_idx]) - actual_close) > 1:
-        logger.warning(
+        logger.debug(
             "[%s] Candle %dm at %s NOT exchange-confirmed closed: next candle open %s missing from feed. Skipping.",
             pair_name or "?", int(interval_minutes),
             format_ist_time(actual_candle_open), format_ist_time(actual_close),
