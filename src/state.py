@@ -482,7 +482,7 @@ class RedisStateStore:
                 pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:*"
                 keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
             except Exception as e:
-                logger_pair.warning(f"Failed to scan pending outcomes for {pair}: {e}")
+                logger_pair.debug(f"Failed to scan pending outcomes for {pair}: {e}")
                 return
 
         if not keys:
@@ -523,7 +523,7 @@ class RedisStateStore:
                         conf_total = data.get("confluence_total")
 
                         if entry_price <= 0:
-                            logger_pair.warning(
+                            logger_pair.debug(
                                 f"Invalid entry_price {entry_price} for pending outcome {key}; skipping"
                             )
                             bad_payload_count += 1
@@ -535,7 +535,7 @@ class RedisStateStore:
                         elif direction_norm in ("sell", "short"):
                             is_buy = False
                         else:
-                            logger_pair.warning(
+                            logger_pair.debug(
                                 f"Unknown direction '{direction}' for pending outcome {key}; skipping"
                             )
                             bad_payload_count += 1
@@ -608,7 +608,7 @@ class RedisStateStore:
                         resolved_count += 1
 
                     except Exception as e:
-                        logger_pair.warning(f"Failed to resolve pending outcome {key}: {e}")
+                        logger_pair.debug(f"Failed to resolve pending outcome {key}: {e}")
                         bad_payload_count += 1
                         continue
 
@@ -616,10 +616,10 @@ class RedisStateStore:
                     await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
 
         except Exception as e:
-            logger_pair.warning(f"Failed to persist resolved outcomes for {pair}: {e}")
+            logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
             return
 
-        logger_pair.info(
+        logger_pair.debug(
             f"[{pair}] Outcome resolution | "
             f"pending={len(keys)} | "
             f"resolved={resolved_count} | "
