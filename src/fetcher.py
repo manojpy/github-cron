@@ -1237,11 +1237,12 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
     next_idx = last_closed_idx + 1
     if next_idx >= ts_normalized.size or abs(int(ts_normalized[next_idx]) - actual_close) > 1:
         live_ts = (ticker_live_info or {}).get("live_ts")
+        live_age = (reference_time - live_ts) if live_ts is not None else None
         liveness_confirmed = (
             cfg.ENABLE_TICKER_LIVENESS_GATE
             and pair_name in cfg.TICKER_LIVENESS_SYMBOLS
-            and live_ts is not None
-            and (reference_time - live_ts) <= cfg.TICKER_LIVENESS_MAX_AGE_SEC
+            and live_age is not None
+            and 0 <= live_age <= cfg.TICKER_LIVENESS_MAX_AGE_SEC
         )
         if not liveness_confirmed:
             logger.warning(
@@ -1253,10 +1254,10 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
         logger.info(
             "[%s] Candle %dm at %s has no next-candle confirmation, but ticker liveness confirmed "
             "(kind=%s, age=%ds <= %ds). Proceeding.",
-            pair_name or "?", int(interval_minutes), (ticker_live_info or {}).get("live_ts_kind"),
-            int(reference_time - live_ts), cfg.TICKER_LIVENESS_MAX_AGE_SEC,
+            pair_name or "?", int(interval_minutes), format_ist_time(actual_candle_open),
+            (ticker_live_info or {}).get("live_ts_kind"),
+            int(live_age), cfg.TICKER_LIVENESS_MAX_AGE_SEC,
         )
-
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
