@@ -13,8 +13,8 @@ from indicators import (
     get_volume_percentile, get_adaptive_rvol_threshold, get_adaptive_ppo_threshold,
     get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold, _order_block_gate_reason,
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
+    _choch_gate_reason,
 )
-
 
 @dataclass(slots=True)
 class IndicatorCache:
@@ -153,6 +153,13 @@ class GateResult:
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None
     direction_is_buy: bool = True
+
+    # -- CHoCH liquidity-sweep reversal (optional confluence vote) --
+    choch_gate_ok_buy: Optional[bool] = None
+    choch_gate_ok_sell: Optional[bool] = None
+    choch_reason: Optional[str] = None
+    choch_fvg_buy: bool = False
+    choch_fvg_sell: bool = False
 
     # -- percentile-rank confluence votes (optional, all default-disabled) --
     adx_pctl: Optional[float] = None
@@ -928,8 +935,21 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close,
                 atr_short_arr, i15, cfg,
             )
+
             if ob_gate_reason:
                 logger_pair.debug(f"[{pair_name}] OB gate: {ob_gate_reason}")
+
+        choch_gate_ok_buy = choch_gate_ok_sell = None
+        choch_reason = None
+        choch_fvg_buy = choch_fvg_sell = False
+        if cfg.ENABLE_CHOCH_ALERT:
+            choch_gate_ok_buy, choch_gate_ok_sell, choch_reason, choch_fvg_buy, choch_fvg_sell = await asyncio.to_thread(
+                _choch_gate_reason,
+                data_15m.open, data_15m.high, data_15m.low, data_15m.close, data_15m.ts,
+                atr_short_arr, i15, cfg,
+            )
+            if choch_reason:
+                logger_pair.debug(f"[{pair_name}] CHoCH gate: {choch_reason}")
 
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
@@ -980,6 +1000,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             oi_funding_reason=oi_funding_reason,
             ob_gate_ok_buy=ob_gate_ok_buy, ob_gate_ok_sell=ob_gate_ok_sell,
             ob_gate_reason=ob_gate_reason,
+            choch_gate_ok_buy=choch_gate_ok_buy, choch_gate_ok_sell=choch_gate_ok_sell,
+            choch_reason=choch_reason,
+            choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
             direction_is_buy=bool(buy_common or buy_trend_common),
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,

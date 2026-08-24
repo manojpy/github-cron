@@ -14,11 +14,10 @@ from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     shutdown_event, format_ist_time,
 )
-
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, independent_candle_reverify, cross_check_15m_against_5m,
-    confirm_candle_unchanged, detect_reversal_candle_pattern, detect_choch_pattern,
+    confirm_candle_unchanged, detect_reversal_candle_pattern,
 )
 from state import RedisStateStore, TokenBucket
 from gates import GateResult, IndicatorCache
@@ -265,10 +264,9 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     { "key": "ob_reversal_sell", "title": "🔴🏛 Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common_relaxed",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.30 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
-    {"key":"choch_buy","title":"🟢 CHoCH Buy","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common_relaxed",False) and ctx.get("choch_buy",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_description','')} @ {ctx.get('choch_level',0):.2f} | FVG={ctx.get('choch_fvg',False)} | POI={ctx.get('choch_poi_tapped',False)} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
-    {"key":"choch_sell","title":"🔴 CHoCH Sell","check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common_relaxed",False) and ctx.get("choch_sell",False)),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_description','')} @ {ctx.get('choch_level',0):.2f} | FVG={ctx.get('choch_fvg',False)} | POI={ctx.get('choch_poi_tapped',False)} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]},
+    {"key":"choch_buy","title":"🟢🔀 CHoCH BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("choch_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_reason') or 'Bullish change of character'}","requires":["choch"]},
+    {"key":"choch_sell","title":"🔴🔀 CHoCH SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("choch_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_reason') or 'Bearish change of character'}","requires":["choch"]},
 ]
-
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
     if not pivots or level not in pivots:
@@ -405,6 +403,12 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
+    # ── CHoCH liquidity-sweep reversal ──
+    for k, ok_key in ((AlertKey.CHOCH_BUY, "choch_buy"), (AlertKey.CHOCH_SELL, "choch_sell")):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+
     # ── Pivots ──
     piv = context.get("pivots", {})
     close_c, close_p = context["close_curr"], context["close_prev"]
@@ -415,11 +419,6 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
                 rk = ALERT_KEYS.get(k)
                 if rk and conditional_states.get(rk, False):
                     resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
-    # ── CHoCH ──
-    for k, ok_key in ((AlertKey.CHOCH_BUY, "choch_buy"), (AlertKey.CHOCH_SELL, "choch_sell")):
-        rk = ALERT_KEYS.get(k)
-        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
-            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
     else:
         for lvl, val in piv.items():
             up_k = f"pivot_up_{lvl}"
@@ -541,7 +540,10 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     close_prev_invalid = gr.close_prev_invalid
     ob_gate_ok_buy, ob_gate_ok_sell = gr.ob_gate_ok_buy, gr.ob_gate_ok_sell
     ob_gate_reason = gr.ob_gate_reason
-
+    choch_gate_ok_buy, choch_gate_ok_sell = gr.choch_gate_ok_buy, gr.choch_gate_ok_sell
+    choch_reason = gr.choch_reason
+    choch_fvg_buy, choch_fvg_sell = gr.choch_fvg_buy, gr.choch_fvg_sell
+ 
     try:
         alert_indicators = await asyncio.to_thread(
             calculate_alert_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
@@ -679,6 +681,24 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             reversal_bullish, reversal_bearish, reversal_pattern_name = False, False, ""
             strong_reversal_buy, strong_reversal_sell = False, False
 
+        if cfg.ENABLE_CHOCH_ALERT:
+            if cfg.ENABLE_STRONG_REVERSAL_ALERT:
+                choch_reversal_bullish, choch_reversal_bearish = reversal_bullish, reversal_bearish
+            else:
+                choch_reversal_bullish, choch_reversal_bearish, _ = detect_reversal_candle_pattern(data_15m, i15)
+            choch_wick_ok_buy = (not np.isnan(buy_wick_ratio)) and buy_wick_ratio < Constants.MIN_WICK_RATIO
+            choch_wick_ok_sell = (not np.isnan(sell_wick_ratio)) and sell_wick_ratio < Constants.MIN_WICK_RATIO
+            choch_buy = bool(
+                buy_trend_common and choch_gate_ok_buy
+                and (is_valid_for_buy or choch_reversal_bullish)
+            )
+            choch_sell = bool(
+                sell_trend_common and choch_gate_ok_sell
+                and (is_valid_for_sell or choch_reversal_bearish)
+            )
+        else:
+            choch_buy, choch_sell = False, False
+
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
             'rsi_curr': rsi_curr, 'rsi_prev': rsi_prev,
@@ -689,31 +709,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         if not is_valid:
             logger_pair.debug(msg)
             return None
-
-        if cfg.ENABLE_CHOCH_ALERT:
-            choch_buy, choch_sell, choch_level, choch_sweep_level, choch_desc, choch_fvg = detect_choch_pattern(
-                data_15m, i15,
-                cfg.CHOCH_SWING_LOOKBACK,
-                cfg.CHOCH_SWEEP_LOOKBACK,
-                cfg.CHOCH_SWING_WINDOW,
-                cfg.CHOCH_MIN_SWEEP_PCT,
-                cfg.CHOCH_MIN_BREAK_PCT,
-                cfg.CHOCH_MIN_STRUCTURE_PCT,
-                cfg.CHOCH_DISPLACEMENT_BODY_RATIO,
-                cfg.CHOCH_ALLOW_SAME_CANDLE_SWEEP_BREAK,
-                cfg.CHOCH_MIN_FVG_PCT,
-            )
-        else:
-            choch_buy, choch_sell, choch_level, choch_sweep_level, choch_desc, choch_fvg = False, False, 0.0, 0.0, "", False
-
-        # POI tap bonus: did the CHoCH level or sweep sit on a known pivot?
-        choch_poi_tapped = False
-        if (choch_buy or choch_sell) and piv:
-            for lvl, val in piv.items():
-                if val > 0:
-                    if abs(choch_level - val) / val < 0.005 or abs(choch_sweep_level - val) / val < 0.005:
-                        choch_poi_tapped = True
-                        break
 
         context = {
             "close_curr": close_curr, "close_prev": close_prev,
@@ -766,13 +761,10 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "strong_reversal_buy": strong_reversal_buy, "strong_reversal_sell": strong_reversal_sell,
             "reversal_pattern_name": reversal_pattern_name,
             "reversal_bullish": reversal_bullish, "reversal_bearish": reversal_bearish,
-            "choch_buy": choch_buy,
-            "choch_sell": choch_sell,
-            "choch_level": choch_level,
-            "choch_sweep_level": choch_sweep_level,
-            "choch_description": choch_desc,
-            "choch_fvg": choch_fvg,
-            "choch_poi_tapped": choch_poi_tapped,
+            "choch_gate_ok_buy": choch_gate_ok_buy, "choch_gate_ok_sell": choch_gate_ok_sell,
+            "choch_reason": choch_reason,
+            "choch_fvg_buy": choch_fvg_buy, "choch_fvg_sell": choch_fvg_sell,
+            "choch_buy": choch_buy, "choch_sell": choch_sell, 
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -787,6 +779,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             if "pivots" in requires and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values())):
                 skip = True
             elif "strong_reversal" in requires and not cfg.ENABLE_STRONG_REVERSAL_ALERT:
+                skip = True
+            elif "choch" in requires and not cfg.ENABLE_CHOCH_ALERT:
                 skip = True
             elif "vwap" in requires and not vwap_available:
                 skip = True

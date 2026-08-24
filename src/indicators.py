@@ -1133,6 +1133,173 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
     )
     return ob_ok_buy, ob_ok_sell, reason
 
+def _get_minor_swings(h: np.ndarray, l: np.ndarray, length: int, start: int, end: int):
+    tops: List[Tuple[int, float, int]] = []
+    btms: List[Tuple[int, float, int]] = []
+    n = len(h)
+    if n == 0 or length < 1:
+        return tops, btms
+    end = min(end, n - 1)
+    if end < length:
+        return tops, btms
+
+    _, upper_arr = rolling_min_max_numba(h, length)
+    lower_arr, _ = rolling_min_max_numba(l, length)
+
+    os = 0
+    for i in range(length, end + 1):
+        upper = upper_arr[i]
+        lower = lower_arr[i]
+        h_len = h[i - length]
+        l_len = l[i - length]
+        if np.isnan(upper) or np.isnan(lower) or np.isnan(h_len) or np.isnan(l_len):
+            continue
+
+        prev_os = os
+        if h_len > upper:
+            os = 0
+        elif l_len < lower:
+            os = 1
+
+        if i < start:
+            continue
+        if os == 0 and prev_os != 0:
+            tops.append((i, h_len, i - length))
+        elif os == 1 and prev_os != 1:
+            btms.append((i, l_len, i - length))
+    return tops, btms
+
+def _bullish_fvg_at(h: np.ndarray, l: np.ndarray, k: int) -> bool:
+    """Direction-specific 3-candle Fair Value Gap ending at k: low[k] > high[k-2]."""
+    if k < 2:
+        return False
+    if np.isnan(h[k - 2]) or np.isnan(l[k]):
+        return False
+    return l[k] > h[k - 2]
+
+def _bearish_fvg_at(h: np.ndarray, l: np.ndarray, k: int) -> bool:
+    """Direction-specific 3-candle Fair Value Gap ending at k: high[k] < low[k-2]."""
+    if k < 2:
+        return False
+    if np.isnan(l[k - 2]) or np.isnan(h[k]):
+        return False
+    return h[k] < l[k - 2]
+
+def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
+    pair = PAIR_ID.get() or "?"
+    n = len(c)
+    length = cfg_obj.CHOCH_SWING_LEN
+    lookback = cfg_obj.CHOCH_LOOKBACK_CANDLES
+    window = cfg_obj.CHOCH_CONFIRM_WINDOW_CANDLES
+    same_candle_ok = cfg_obj.CHOCH_ALLOW_SAME_CANDLE_SWEEP
+    persistence = cfg_obj.CHOCH_PERSISTENCE_CANDLES
+    min_body_ratio = cfg_obj.CHOCH_MIN_DISPLACEMENT_BODY_RATIO
+
+    if i15 is None or i15 >= n or i15 < length + 2:
+        return None, None, None, False, False
+
+    scan_start = max(length, i15 - lookback - persistence)
+
+    # -- NaN / candle-continuity guards over the whole scan window --
+    for idx in range(scan_start, i15 + 1):
+        if (np.isnan(o[idx]) or np.isnan(h[idx]) or np.isnan(l[idx]) or np.isnan(c[idx])
+                or np.isnan(atr_short_arr[idx])):
+            logger.debug(f"[{pair}] CHoCH: NaN guard tripped at idx {idx} — abstaining")
+            return None, None, None, False, False
+        if idx > scan_start and (ts[idx] - ts[idx - 1]) != 900:
+            logger.debug(f"[{pair}] CHoCH: candle gap at idx {idx} — abstaining")
+            return None, None, None, False, False
+
+    tops, btms = _get_minor_swings(h, l, length, scan_start, i15)
+
+    def _nearest_before(pivots, before_idx):
+        for (idx, price, piv_idx) in reversed(pivots):
+            if idx < before_idx:
+                return idx, price, piv_idx
+        return None
+
+    def _scan(is_buy: bool):
+        struct_pivots = tops if is_buy else btms       # lower highs / higher lows being broken
+        sweep_pivots = btms if is_buy else tops         # short-term lows/highs being swept
+        found_br = None
+        found_reason = None
+        found_fvg = False
+
+        for br in range(i15, scan_start - 1, -1):
+            rng = h[br] - l[br]
+            if rng <= 1e-12:
+                continue
+            body = (c[br] - o[br]) if is_buy else (o[br] - c[br])
+            if body <= 0 or (body / rng) < min_body_ratio:
+                continue  # not a same-direction displacement candle
+
+            pivot = _nearest_before(struct_pivots, br)
+            if pivot is None:
+                continue
+            piv_idx, piv_price, _ = pivot
+
+            min_break_dist = cfg_obj.CHOCH_MIN_BREAK_DISTANCE_ATR * atr_short_arr[br]
+            broke = (c[br] > piv_price + min_break_dist) if is_buy else (c[br] < piv_price - min_break_dist)
+            if not broke:
+                continue
+
+            prior_sweep_level = _nearest_before(sweep_pivots, piv_idx)
+            if prior_sweep_level is None:
+                continue
+            _, sweep_level_price, _ = prior_sweep_level
+
+            sweep_hi = br if same_candle_ok else br - 1
+            sweep_idx = None
+            for k in range(sweep_hi, piv_idx, -1):
+                if k < 0:
+                    break
+                min_sweep_dist = cfg_obj.CHOCH_MIN_SWEEP_DISTANCE_ATR * atr_short_arr[k]
+                if is_buy:
+                    swept = (l[k] < sweep_level_price - min_sweep_dist) and (c[k] > sweep_level_price)
+                else:
+                    swept = (h[k] > sweep_level_price + min_sweep_dist) and (c[k] < sweep_level_price)
+                if swept:
+                    sweep_idx = k
+                    break
+            if sweep_idx is None:
+                continue
+            if not same_candle_ok and br == sweep_idx:
+                continue
+            if (br - sweep_idx) > window:
+                continue
+
+            fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
+            has_fvg = any(fvg_fn(h, l, k) for k in range(max(sweep_idx, 2), br + 1))
+            if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
+                continue
+
+            found_br = br
+            found_fvg = has_fvg
+            found_reason = (
+                f"{'Bullish' if is_buy else 'Bearish'} CHoCH: swept "
+                f"{'low' if is_buy else 'high'} {sweep_level_price:.4g} @idx{sweep_idx}, "
+                f"broke {'lower-high' if is_buy else 'higher-low'} {piv_price:.4g} @idx{piv_idx}, "
+                f"close {c[br]:.4g} @idx{br}" + (" | FVG" if has_fvg else "")
+            )
+            break  # newest-to-oldest: first hit is the freshest valid structure
+
+        if found_br is None:
+            return None, None, False
+        age = i15 - found_br
+        if age <= persistence:
+            return True, found_reason, found_fvg
+        return False, f"{found_reason} (stale, {age} candles old > persistence {persistence})", found_fvg
+
+    choch_ok_buy, reason_buy, fvg_buy = _scan(is_buy=True)
+    choch_ok_sell, reason_sell, fvg_sell = _scan(is_buy=False)
+
+    reason = reason_buy if choch_ok_buy else (reason_sell if choch_ok_sell else (reason_buy or reason_sell))
+    logger.debug(
+        f"[{pair}] CHoCH diag | choch_ok_buy={choch_ok_buy} choch_ok_sell={choch_ok_sell} | "
+        f"reason={reason or 'no qualifying sweep+break structure found'}"
+    )
+    return choch_ok_buy, choch_ok_sell, reason, fvg_buy, fvg_sell
+
 def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], price_now: Optional[float], price_history: List[List[float]], is_buy: bool) -> Optional[str]:
     if not cfg.ENABLE_OI_PRICE_DIVERGENCE or price_now is None:
         return None
