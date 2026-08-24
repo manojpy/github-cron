@@ -138,7 +138,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     confluence_total: Optional[float] = None
 
     reversal_eligible = (
-        (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
+        (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible

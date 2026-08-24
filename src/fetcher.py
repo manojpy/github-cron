@@ -974,6 +974,190 @@ def detect_reversal_candle_pattern(data_15m: "PriceData", i: int) -> Tuple[bool,
 
     return False, False, ""
 
+def detect_choch_pattern(data_15m: PriceData, i: int,
+                         swing_lookback: int = 12,
+                         sweep_lookback: int = 5,
+                         swing_window: int = 2,
+                         min_sweep_pct: float = 0.0005,
+                         min_break_pct: float = 0.0005,
+                         min_structure_pct: float = 0.001,
+                         displacement_body_ratio: float = 0.50,
+                         allow_same_candle_sweep_break: bool = True,
+                         min_fvg_pct: float = 0.0003) -> Tuple[bool, bool, float, float, str, bool]:
+    """Robust Change of Character (CHoCH) detector.
+
+    Returns
+    -------
+    (choch_buy, choch_sell, choch_level, sweep_level, description, fvg_created)
+    """
+    if i < 4:
+        return False, False, 0.0, 0.0, "", False
+
+    ha, la, ca, oa = data_15m.high, data_15m.low, data_15m.close, data_15m.open
+    ts = data_15m.ts
+    start = max(0, i - swing_lookback)
+
+    # ── 1. NaN & continuity guards ──
+    for idx in range(start, i + 1):
+        if np.isnan(ha[idx]) or np.isnan(la[idx]) or np.isnan(ca[idx]) or np.isnan(oa[idx]):
+            return False, False, 0.0, 0.0, "", False
+    for idx in range(start + 1, i + 1):
+        if ts[idx] - ts[idx - 1] != 900:
+            return False, False, 0.0, 0.0, "", False
+
+    # ── 2. Windowed swing pivot detection ──
+    swings: List[Tuple[str, int, float]] = []
+    w = max(1, swing_window)
+    scan_start = start + w
+    scan_end = i - w + 1
+    if scan_start >= scan_end:
+        return False, False, 0.0, 0.0, "", False
+
+    for idx in range(scan_start, scan_end):
+        is_high = True
+        for off in range(1, w + 1):
+            if ha[idx] < ha[idx - off] or ha[idx] < ha[idx + off]:
+                is_high = False
+                break
+        if is_high:
+            swings.append(("H", idx, float(ha[idx])))
+            continue
+
+        is_low = True
+        for off in range(1, w + 1):
+            if la[idx] > la[idx - off] or la[idx] > la[idx + off]:
+                is_low = False
+                break
+        if is_low:
+            swings.append(("L", idx, float(la[idx])))
+
+    if len(swings) < 4:
+        return False, False, 0.0, 0.0, "", False
+
+    choch_buy = False
+    choch_sell = False
+    choch_level = 0.0
+    sweep_level = 0.0
+    desc = ""
+    fvg = False
+
+    # ═══════════════════════════════════════════════════════
+    # BULLISH CHoCH  — newest-to-oldest scan
+    # Structure:  H(prev) , L(prev) , H(LH) , L(LL)
+    # ═══════════════════════════════════════════════════════
+    for j in range(len(swings) - 4, -1, -1):
+        if not (swings[j][0] == "H" and swings[j+1][0] == "L" and
+                swings[j+2][0] == "H" and swings[j+3][0] == "L"):
+            continue
+
+        _, _, val_prev_H = swings[j]
+        _, _, val_prev_L = swings[j+1]
+        _, idx_LH, val_LH = swings[j+2]
+        _, idx_LL, val_LL = swings[j+3]
+
+        # Downtrend validation: lower high, lower low
+        if val_LH >= val_prev_H or val_LL >= val_prev_L:
+            continue
+        if idx_LL >= i:
+            continue
+
+        # Reject noise structures
+        if (val_LH - val_LL) / val_LH < min_structure_pct:
+            continue
+
+        # ── True sweep: wick below LL  AND  close back above LL ──
+        sweep_idx = -1
+        sweep_limit = min(i + 1, idx_LL + sweep_lookback + 1)
+        for si in range(idx_LL + 1, sweep_limit):
+            if float(la[si]) < val_LL * (1.0 - min_sweep_pct) and float(ca[si]) >= val_LL:
+                sweep_idx = si
+
+        if sweep_idx == -1:
+            continue
+
+        # Break must occur within confirmation window after the sweep
+        if i - sweep_idx > sweep_lookback:
+            continue
+        if not allow_same_candle_sweep_break and sweep_idx == i:
+            continue
+
+        # ── Anti-stale: break must happen NOW, not yesterday ──
+        if float(ca[i]) > val_LH * (1.0 + min_break_pct) and float(ca[i - 1]) <= val_LH:
+            rng = float(ha[i]) - float(la[i])
+            body = abs(float(ca[i]) - float(oa[i]))
+            if rng > 1e-9 and body / rng >= displacement_body_ratio:
+                choch_buy = True
+                choch_level = val_LH
+                sweep_level = val_LL
+                desc = (f"Bull CHoCH | LH={val_LH:.2f} | Sweep={val_LL:.2f} "
+                        f"| Swept@{sweep_idx} | Break@{i}")
+                break
+
+    # ═══════════════════════════════════════════════════════
+    # BEARISH CHoCH  — newest-to-oldest scan
+    # Structure:  L(prev) , H(prev) , L(HL) , H(HH)
+    # ═══════════════════════════════════════════════════════
+    if not choch_buy:
+        for j in range(len(swings) - 4, -1, -1):
+            if not (swings[j][0] == "L" and swings[j+1][0] == "H" and
+                    swings[j+2][0] == "L" and swings[j+3][0] == "H"):
+                continue
+
+            _, _, val_prev_L = swings[j]
+            _, _, val_prev_H = swings[j+1]
+            _, idx_HL, val_HL = swings[j+2]
+            _, idx_HH, val_HH = swings[j+3]
+
+            # Uptrend validation: higher low, higher high
+            if val_HL <= val_prev_L or val_HH <= val_prev_H:
+                continue
+            if idx_HH >= i:
+                continue
+
+            # Reject noise structures
+            if (val_HH - val_HL) / val_HH < min_structure_pct:
+                continue
+
+            # ── True sweep: wick above HH  AND  close back below HH ──
+            sweep_idx = -1
+            sweep_limit = min(i + 1, idx_HH + sweep_lookback + 1)
+            for si in range(idx_HH + 1, sweep_limit):
+                if float(ha[si]) > val_HH * (1.0 + min_sweep_pct) and float(ca[si]) <= val_HH:
+                    sweep_idx = si
+
+            if sweep_idx == -1:
+                continue
+
+            if i - sweep_idx > sweep_lookback:
+                continue
+            if not allow_same_candle_sweep_break and sweep_idx == i:
+                continue
+
+            # ── Anti-stale: break must happen NOW ──
+            if float(ca[i]) < val_HL * (1.0 - min_break_pct) and float(ca[i - 1]) >= val_HL:
+                rng = float(ha[i]) - float(la[i])
+                body = abs(float(ca[i]) - float(oa[i]))
+                if rng > 1e-9 and body / rng >= displacement_body_ratio:
+                    choch_sell = True
+                    choch_level = val_HL
+                    sweep_level = val_HH
+                    desc = (f"Bear CHoCH | HL={val_HL:.2f} | Sweep={val_HH:.2f} "
+                            f"| Swept@{sweep_idx} | Break@{i}")
+                    break
+
+    # ── Direction-specific FVG with minimum size ──
+    if i >= 2:
+        if choch_buy:
+            gap = float(la[i]) - float(ha[i - 2])
+            if gap > 0 and gap / choch_level >= min_fvg_pct:
+                fvg = True
+        elif choch_sell:
+            gap = float(la[i - 2]) - float(ha[i])
+            if gap > 0 and gap / choch_level >= min_fvg_pct:
+                fvg = True
+
+    return choch_buy, choch_sell, choch_level, sweep_level, desc, fvg
+
 def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceData]:
     try:   
         if not result or not isinstance(result, dict):
