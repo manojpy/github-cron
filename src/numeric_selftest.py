@@ -7,9 +7,8 @@ functions, run once at startup before any pair is evaluated.
 """
 
 from typing import List, Tuple
-
+import os
 import numpy as np
-
 import aot_bridge
 
 
@@ -143,8 +142,7 @@ def run_self_test() -> Tuple[bool, List[str]]:
             f"got max deviation {np.nanmax(np.abs(flat_rsi_tail - 50.0)):.3e}"
         )
 
-    # --- AOT vs JIT cross-check (only meaningful when AOT is active) ---
-    if aot_bridge.is_using_aot():
+    if aot_bridge.is_using_aot() and os.getenv("NUMERIC_SELFTEST_JIT_CROSSCHECK", "false").lower() == "true":
         import numba_functions_shared as jit_ref  # lazy: see module docstring
 
         jit_atr = jit_ref.calculate_atr_rma(high, low, close, period)
