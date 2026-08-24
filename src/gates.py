@@ -315,7 +315,8 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
 
 async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, correlation_id: str,
-    reference_time: int, pair_oi: Optional[Dict[str, Any]] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
+    reference_time: int, pair_oi: Optional[Dict[str, Any]] = None,
+    ticker_live_info: Optional[Dict[str, Any]] = None) -> Union[GateResult, Tuple[str, Dict[str, Any]], None]:
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     close_15m = None
@@ -324,7 +325,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     rma200_5 = None
 
     try:
-        i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name)
+        i15 = get_last_closed_index_from_array(data_15m.ts, 15, reference_time, pair_name,
+                                                ticker_live_info=ticker_live_info)
         if i15 is None or i15 < Constants.MIN_CLOSED_CANDLES_15M:
             return None
 

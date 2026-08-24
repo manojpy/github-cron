@@ -218,6 +218,12 @@ class BotConfig(BaseModel):
     OI_DIVERGENCE_LOOKBACK_SAMPLES: int = Field(default=12, ge=2, le=200, description="How many OI/price history samples back to compare against for divergence (default 12 runs @15m ≈ 3h)")
     OI_DIVERGENCE_MIN_PRICE_ROC_PCT: float = Field(default=0.3, ge=0.0, le=50.0, description="Min absolute price move (%) over the lookback window before divergence logic applies at all")
     OI_DIVERGENCE_MIN_OI_FALL_PCT: float = Field(default=2.0, ge=0.0, le=100.0, description="Min OI decline (%) over the lookback window to count as 'falling with conviction' (closing/covering, not new positioning)")
+
+    ENABLE_TICKER_LIVENESS_GATE: bool = Field(default=False, description="When the next-15m-candle-confirmation check fails for a pair in TICKER_LIVENESS_SYMBOLS, allow the last-closed candle anyway if the ticker's live_ts is fresher than TICKER_LIVENESS_MAX_AGE_SEC. Stays False until live_ts is confirmed against real Delta ticker fields.")
+    TICKER_LIVENESS_MAX_AGE_SEC: int = Field(default=300, ge=5, le=3600, description="Max age (seconds) of a ticker's live_ts for it to count as proof the feed is live, when the next-candle confirmation is missing")
+    TICKER_LIVENESS_SYMBOLS: List[str] = Field(default=[], description="Pairs the ticker-liveness gate applies to. Empty (default) = all of PAIRS. Comma-separated env var (e.g. 'SUIUSD,ARBUSD') or JSON list.")
+    TICKER_RAW_LOG_SYMBOLS: List[str] = Field(default=[], description="Pairs whose full raw /v2/tickers row gets logged every run, to identify which field is a genuine live-update timestamp. Empty (default) = all of PAIRS. Unconditional -- ignores ENABLE_TICKER_LIVENESS_GATE. Narrow this down once the real field is confirmed, since logging every pair every run is verbose.")
+    
     ENABLE_OB_GATE: bool = Field(default=False, description="Add institutional order-block (supply/demand) reversal on 15m as a confluence vote. Abstains (None) unless a fresh, first-touch reversal off an unmitigated zone confirms this cycle")
     OB_FILTER_CONFLUENCE: bool = Field(default=False) 
     OB_LOOKBACK_CANDLES: int = Field(default=50, ge=20, le=500, description="How many closed 15m candles back to scan for order-block zones (default 96 ≈ 24h)")
@@ -318,6 +324,15 @@ class BotConfig(BaseModel):
         if not re.match(r'^(https?://)[A-Za-z0-9\.\-:_/]+$', v.strip()):
             raise ValueError('DELTA_API_BASE must be a valid http(s) URL')
         return v.strip().rstrip('/')
+
+    @field_validator('TICKER_LIVENESS_SYMBOLS', 'TICKER_RAW_LOG_SYMBOLS', mode='before')
+    @classmethod
+    def parse_symbol_list(cls, v):
+        if isinstance(v, str):
+            return [s.strip().upper() for s in v.split(",") if s.strip()]
+        if isinstance(v, list):
+            return [str(s).strip().upper() for s in v if str(s).strip()]
+        return v
 
     @field_validator('PPO_FAST', 'PPO_SLOW', 'PPO_SIGNAL')
     @classmethod
@@ -435,6 +450,14 @@ class BotConfig(BaseModel):
                 f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
                 f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
             )
+        return self
+
+    @model_validator(mode='after')
+    def resolve_ticker_symbol_scopes(self) -> 'BotConfig':
+        if not self.TICKER_LIVENESS_SYMBOLS:
+            self.TICKER_LIVENESS_SYMBOLS = list(self.PAIRS)
+        if not self.TICKER_RAW_LOG_SYMBOLS:
+            self.TICKER_RAW_LOG_SYMBOLS = list(self.PAIRS)
         return self
 
     @model_validator(mode='after')
