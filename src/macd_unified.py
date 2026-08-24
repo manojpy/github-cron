@@ -119,20 +119,16 @@ def get_trigger_timestamp() -> int:
     
     return int(datetime.now(timezone.utc).timestamp())
 
-
-# after
 async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     data_daily: Optional[Dict[str, np.ndarray]], sdb: RedisStateStore, telegram_queue: TelegramQueue, correlation_id: str,
     reference_time: int, fetcher: DataFetcher, symbol: str, alerts_sent_ref: List[int] = None, alerts_sent_lock: asyncio.Lock = None,
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN,
-    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
-    ticker_live_info: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
+    oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
 
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
 
     pair_oi = (oi_gate_data or {}).get(pair_name)
-    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi,
-                          ticker_live_info=ticker_live_info)
+    gr = await _eval_gate(pair_name, data_15m, data_5m, data_daily, sdb, correlation_id, reference_time, pair_oi)
     if gr is None:
         return None
     if isinstance(gr, tuple):
@@ -154,7 +150,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
         required = pct_floor if reversal_only_cycle else max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
         if score < required:
-            logger_pair.debug(
+            logger_pair.info(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
                 f"abs-floor={'n/a (reversal-only)' if reversal_only_cycle else f'{cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}'}) — skipping Phase-2 indicators"
@@ -243,12 +239,9 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
 async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, reference_time, fetcher,
                        alerts_sent_ref=None, alerts_sent_lock=None, max_alerts_per_run=cfg.MAX_ALERTS_PER_RUN,
-                       oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None,
-                       ticker_live_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None):
+                       oi_gate_data: Optional[Dict[str, Dict[str, Any]]] = None):
 
     p_name, symbol, candles = task_data
-
-    live_info = (ticker_live_by_symbol or {}).get(symbol) or (ticker_live_by_symbol or {}).get(p_name)
 
     try:
         pd_15m = parse_candles_to_numpy(candles.get("15"))
@@ -271,10 +264,10 @@ async def guarded_eval(task_data, state_db, telegram_queue, correlation_id, refe
             p_name, data_15m, data_5m, data_daily,
             state_db, telegram_queue, correlation_id, reference_time, fetcher, symbol,
             alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
-            oi_gate_data=oi_gate_data,
-            ticker_live_info=live_info,
+            oi_gate_data=oi_gate_data
         )
         return result
+    
     except asyncio.CancelledError:
         logger_main.warning(f"Evaluation cancelled for {p_name}")
         raise
@@ -293,9 +286,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     max_alerts_per_run: int = cfg.MAX_ALERTS_PER_RUN) -> List[Tuple[str, Dict[str, Any]]]:
 
     ticker_task = None
-    need_tickers = cfg.ENABLE_OI_FUNDING_FILTER or cfg.ENABLE_TICKER_LIVENESS_GATE
-    if need_tickers:
+    if cfg.ENABLE_OI_FUNDING_FILTER:
         ticker_task = asyncio.create_task(fetcher.fetch_tickers_batch())
+
     logger_main.info(f"🔡 Phase 1: Fetching candles for {len(pairs_to_process)} pairs...")
     fetch_start = time.time()
     limit_15m = 300
@@ -360,18 +353,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     logger_main.info(f"🌀 Phase 1 complete: {fetch_elapsed:.1f}s")
 
     oi_gate_data: Dict[str, Dict[str, Any]] = {}
-    ticker_map: Dict[str, Dict[str, Any]] = (await ticker_task) if ticker_task else {}
-
-    ticker_live_by_symbol: Dict[str, Dict[str, Any]] = {}
-    for sym, v in ticker_map.items():
-        if v.get("live_ts") is not None:
-            ticker_live_by_symbol[sym] = {
-                "live_ts": v["live_ts"],
-                "live_ts_kind": v.get("live_ts_kind"),
-            }
 
     if cfg.ENABLE_OI_FUNDING_FILTER:
-        oi_funding_map = ticker_map
+        oi_funding_map = await ticker_task if ticker_task else {}
         matched_oi = sum(
             1 for p in pairs_to_process
             if (oi_funding_map.get(products_map.get(p, {}).get("symbol", p)) or {}).get("oi") is not None
@@ -476,9 +460,9 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             return await guarded_eval(
                 t, state_db, telegram_queue, correlation_id,
                 reference_time, fetcher, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
-                oi_gate_data=oi_gate_data,
-                ticker_live_by_symbol=ticker_live_by_symbol,
+                oi_gate_data=oi_gate_data
             )
+
     results = await asyncio.gather(
         *[_bounded_eval(t) for t in prepared_tasks],
         return_exceptions=True,

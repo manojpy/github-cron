@@ -604,27 +604,7 @@ class DataFetcher:
                 (row[k] for k in ("mark_price", "markPrice", "close") if row.get(k) is not None),
                 None,
             )
-            # ── PROVISIONAL: candidate field names for a per-symbol live-update
-            live_ts_kind, live_ts_raw = next(
-                ((k, row[k]) for k in (
-                    "timestamp", "last_updated_at", "quote_time", "close_time", "time"
-                ) if row.get(k) is not None),
-                (None, None),
-            )
-            live_ts = None
-            if live_ts_raw is not None:
-                try:
-                    live_ts = float(live_ts_raw)
-                    if live_ts > 1_000_000_000_000:      # ms -> s, same convention as candles
-                        live_ts /= 1000.0
-                except (TypeError, ValueError):
-                    live_ts = None
-                    live_ts_kind = None
-
-            if symbol in cfg.TICKER_RAW_LOG_SYMBOLS and logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[%s] Raw ticker row: %s", symbol, row)
-
-            if oi_raw is None and funding_raw is None and live_ts is None:
+            if oi_raw is None and funding_raw is None:
                 continue
             try:
                 out[symbol] = {
@@ -632,11 +612,9 @@ class DataFetcher:
                     "oi_value_usd": float(oi_value_usd_raw) if oi_value_usd_raw is not None else None,
                     "funding": float(funding_raw) if funding_raw is not None else None,
                     "price": float(price_raw) if price_raw is not None else None,
-                    "live_ts": live_ts,
-                    "live_ts_kind": live_ts_kind,
                 }
             except (TypeError, ValueError):
-                continue  
+                continue
 
         if out:
             await self.circuit_breaker.record_success()
@@ -1175,8 +1153,7 @@ def candle_is_stable(ts_open: int, reference_time: int, interval_minutes: int = 
 
 def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: int, 
                                      reference_time: int, 
-                                     pair_name: Optional[str] = None,
-                                     ticker_live_info: Optional[Dict[str, Any]] = None) -> Optional[int]:
+                                     pair_name: Optional[str] = None) -> Optional[int]:
     if timestamps is None or timestamps.size < 1:
         return None
     reference_time = normalize_timestamp(reference_time)
@@ -1236,28 +1213,13 @@ def get_last_closed_index_from_array(timestamps: np.ndarray, interval_minutes: i
 
     next_idx = last_closed_idx + 1
     if next_idx >= ts_normalized.size or abs(int(ts_normalized[next_idx]) - actual_close) > 1:
-        live_ts = (ticker_live_info or {}).get("live_ts")
-        live_age = (reference_time - live_ts) if live_ts is not None else None
-        liveness_confirmed = (
-            cfg.ENABLE_TICKER_LIVENESS_GATE
-            and pair_name in cfg.TICKER_LIVENESS_SYMBOLS
-            and live_age is not None
-            and 0 <= live_age <= cfg.TICKER_LIVENESS_MAX_AGE_SEC
+        logger.warning(
+            "[%s] Candle %dm at %s NOT exchange-confirmed closed: next candle open %s missing from feed. Skipping.",
+            pair_name or "?", int(interval_minutes),
+            format_ist_time(actual_candle_open), format_ist_time(actual_close),
         )
-        if not liveness_confirmed:
-            logger.warning(
-                "[%s] Candle %dm at %s NOT exchange-confirmed closed: next candle open %s missing from feed. Skipping.",
-                pair_name or "?", int(interval_minutes),
-                format_ist_time(actual_candle_open), format_ist_time(actual_close),
-            )
-            return None
-        logger.info(
-            "[%s] Candle %dm at %s has no next-candle confirmation, but ticker liveness confirmed "
-            "(kind=%s, age=%ds <= %ds). Proceeding.",
-            pair_name or "?", int(interval_minutes), format_ist_time(actual_candle_open),
-            (ticker_live_info or {}).get("live_ts_kind"),
-            int(live_age), cfg.TICKER_LIVENESS_MAX_AGE_SEC,
-        )
+        return None
+
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "[%s] Selected CLOSED %dm candle idx=%d %s-%s (closed %ds ago)",
