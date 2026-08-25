@@ -160,6 +160,8 @@ class GateResult:
     choch_reason: Optional[str] = None
     choch_fvg_buy: bool = False
     choch_fvg_sell: bool = False
+    choch_poi_tap_buy: bool = False
+    choch_poi_tap_sell: bool = False
 
     # -- percentile-rank confluence votes (optional, all default-disabled) --
     adx_pctl: Optional[float] = None
@@ -942,8 +944,10 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         choch_gate_ok_buy = choch_gate_ok_sell = None
         choch_reason = None
         choch_fvg_buy = choch_fvg_sell = False
+        choch_poi_tap_buy = choch_poi_tap_sell = False
         if cfg.ENABLE_CHOCH_ALERT:
-            choch_gate_ok_buy, choch_gate_ok_sell, choch_reason, choch_fvg_buy, choch_fvg_sell = await asyncio.to_thread(
+            (choch_gate_ok_buy, choch_gate_ok_sell, choch_reason, choch_fvg_buy, choch_fvg_sell,
+             choch_poi_tap_buy, choch_poi_tap_sell) = await asyncio.to_thread(
                 _choch_gate_reason,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close, data_15m.ts,
                 atr_short_arr, i15, cfg,
@@ -1003,6 +1007,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             choch_gate_ok_buy=choch_gate_ok_buy, choch_gate_ok_sell=choch_gate_ok_sell,
             choch_reason=choch_reason,
             choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
+            choch_poi_tap_buy=choch_poi_tap_buy, choch_poi_tap_sell=choch_poi_tap_sell,
             direction_is_buy=bool(buy_common or buy_trend_common),
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,

@@ -1185,6 +1185,26 @@ def _bearish_fvg_at(h: np.ndarray, l: np.ndarray, k: int) -> bool:
         return False
     return h[k] < l[k - 2]
 
+def _choch_poi_tap(o, h, l, c, br, sweep_idx, is_buy, cfg_obj):
+    try:
+        atr200 = calculate_atr_rma(h[:br + 1], l[:br + 1], c[:br + 1], 200)
+        active_iobs, active_obs = calculate_pine_order_blocks(
+            o[:br + 1], h[:br + 1], l[:br + 1], c[:br + 1], atr200,
+            swing_len=cfg_obj.OB_LOOKBACK_CANDLES,
+            internal_len=5,
+            filter_confluence=cfg_obj.OB_FILTER_CONFLUENCE,
+            iob_showlast=10, ob_showlast=10,
+        )
+    except Exception:
+        return False
+    for z in (active_obs + active_iobs):
+        if z.is_demand != is_buy:
+            continue
+        for idx in range(sweep_idx, br + 1):
+            if l[idx] <= z.top and h[idx] >= z.bottom:
+                return True
+    return False
+
 def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
     pair = PAIR_ID.get() or "?"
     n = len(c)
@@ -1194,9 +1214,10 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
     same_candle_ok = cfg_obj.CHOCH_ALLOW_SAME_CANDLE_SWEEP
     persistence = cfg_obj.CHOCH_PERSISTENCE_CANDLES
     min_body_ratio = cfg_obj.CHOCH_MIN_DISPLACEMENT_BODY_RATIO
+    check_poi = getattr(cfg_obj, "CHOCH_CHECK_POI_TAP", False)
 
     if i15 is None or i15 >= n or i15 < length + 2:
-        return None, None, None, False, False
+        return None, None, None, False, False, False, False
 
     scan_start = max(length, i15 - lookback - persistence)
 
@@ -1205,10 +1226,10 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
         if (np.isnan(o[idx]) or np.isnan(h[idx]) or np.isnan(l[idx]) or np.isnan(c[idx])
                 or np.isnan(atr_short_arr[idx])):
             logger.debug(f"[{pair}] CHoCH: NaN guard tripped at idx {idx} — abstaining")
-            return None, None, None, False, False
+            return None, None, None, False, False, False, False
         if idx > scan_start and (ts[idx] - ts[idx - 1]) != 900:
             logger.debug(f"[{pair}] CHoCH: candle gap at idx {idx} — abstaining")
-            return None, None, None, False, False
+            return None, None, None, False, False, False, False
 
     tops, btms = _get_minor_swings(h, l, length, scan_start, i15)
 
@@ -1222,6 +1243,7 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
         struct_pivots = tops if is_buy else btms       # lower highs / higher lows being broken
         sweep_pivots = btms if is_buy else tops         # short-term lows/highs being swept
         found_br = None
+        found_sweep_idx = None
         found_reason = None
         found_fvg = False
 
@@ -1250,7 +1272,8 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
 
             sweep_hi = br if same_candle_ok else br - 1
             sweep_idx = None
-            for k in range(sweep_hi, piv_idx, -1):
+            for k in range(sweep_hi, piv_idx, -1):  # stop strictly after piv_idx: the sweep candle
+                                                     # can't be the same bar the structural pivot confirmed on
                 if k < 0:
                     break
                 min_sweep_dist = cfg_obj.CHOCH_MIN_SWEEP_DISTANCE_ATR * atr_short_arr[k]
@@ -1274,6 +1297,7 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                 continue
 
             found_br = br
+            found_sweep_idx = sweep_idx
             found_fvg = has_fvg
             found_reason = (
                 f"{'Bullish' if is_buy else 'Bearish'} CHoCH: swept "
@@ -1284,21 +1308,28 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
             break  # newest-to-oldest: first hit is the freshest valid structure
 
         if found_br is None:
-            return None, None, False
+            return None, None, False, False
+
+        poi_tap = False
+        if check_poi:
+            poi_tap = _choch_poi_tap(o, h, l, c, found_br, found_sweep_idx, is_buy, cfg_obj)
+            if poi_tap:
+                found_reason = f"{found_reason} | POI tap"
+
         age = i15 - found_br
         if age <= persistence:
-            return True, found_reason, found_fvg
-        return False, f"{found_reason} (stale, {age} candles old > persistence {persistence})", found_fvg
+            return True, found_reason, found_fvg, poi_tap
+        return False, f"{found_reason} (stale, {age} candles old > persistence {persistence})", found_fvg, poi_tap
 
-    choch_ok_buy, reason_buy, fvg_buy = _scan(is_buy=True)
-    choch_ok_sell, reason_sell, fvg_sell = _scan(is_buy=False)
+    choch_ok_buy, reason_buy, fvg_buy, poi_tap_buy = _scan(is_buy=True)
+    choch_ok_sell, reason_sell, fvg_sell, poi_tap_sell = _scan(is_buy=False)
 
     reason = reason_buy if choch_ok_buy else (reason_sell if choch_ok_sell else (reason_buy or reason_sell))
     logger.debug(
         f"[{pair}] CHoCH diag | choch_ok_buy={choch_ok_buy} choch_ok_sell={choch_ok_sell} | "
         f"reason={reason or 'no qualifying sweep+break structure found'}"
     )
-    return choch_ok_buy, choch_ok_sell, reason, fvg_buy, fvg_sell
+    return choch_ok_buy, choch_ok_sell, reason, fvg_buy, fvg_sell, poi_tap_buy, poi_tap_sell
 
 def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], price_now: Optional[float], price_history: List[List[float]], is_buy: bool) -> Optional[str]:
     if not cfg.ENABLE_OI_PRICE_DIVERGENCE or price_now is None:

@@ -543,7 +543,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
     choch_gate_ok_buy, choch_gate_ok_sell = gr.choch_gate_ok_buy, gr.choch_gate_ok_sell
     choch_reason = gr.choch_reason
     choch_fvg_buy, choch_fvg_sell = gr.choch_fvg_buy, gr.choch_fvg_sell
- 
+    choch_poi_tap_buy, choch_poi_tap_sell = gr.choch_poi_tap_buy, gr.choch_poi_tap_sell
+
     try:
         alert_indicators = await asyncio.to_thread(
             calculate_alert_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
@@ -686,8 +687,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 choch_reversal_bullish, choch_reversal_bearish = reversal_bullish, reversal_bearish
             else:
                 choch_reversal_bullish, choch_reversal_bearish, _ = detect_reversal_candle_pattern(data_15m, i15)
-            choch_wick_ok_buy = (not np.isnan(buy_wick_ratio)) and buy_wick_ratio < Constants.MIN_WICK_RATIO
-            choch_wick_ok_sell = (not np.isnan(sell_wick_ratio)) and sell_wick_ratio < Constants.MIN_WICK_RATIO
             choch_buy = bool(
                 buy_trend_common and choch_gate_ok_buy
                 and (is_valid_for_buy or choch_reversal_bullish)
@@ -765,6 +764,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "choch_reason": choch_reason,
             "choch_fvg_buy": choch_fvg_buy, "choch_fvg_sell": choch_fvg_sell,
             "choch_buy": choch_buy, "choch_sell": choch_sell, 
+            "choch_poi_tap_buy": choch_poi_tap_buy, "choch_poi_tap_sell": choch_poi_tap_sell,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
