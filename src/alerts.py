@@ -682,18 +682,23 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             reversal_bullish, reversal_bearish, reversal_pattern_name = False, False, ""
             strong_reversal_buy, strong_reversal_sell = False, False
 
+        choch_reversal_bullish = False
+        choch_reversal_bearish = False
+
         if cfg.ENABLE_CHOCH_ALERT:
             if cfg.ENABLE_STRONG_REVERSAL_ALERT:
                 choch_reversal_bullish, choch_reversal_bearish = reversal_bullish, reversal_bearish
-            else:
+            elif choch_gate_ok_buy or choch_gate_ok_sell:
                 choch_reversal_bullish, choch_reversal_bearish, _ = detect_reversal_candle_pattern(data_15m, i15)
+            else:
+                choch_reversal_bullish, choch_reversal_bearish = False, False
             choch_buy = bool(
                 buy_trend_common and choch_gate_ok_buy
                 and (is_valid_for_buy or choch_reversal_bullish)
             )
             choch_sell = bool(
                 sell_trend_common and choch_gate_ok_sell
-                and (is_valid_for_sell or choch_reversal_bearish)
+                and (is_valid_for_sell or choch_reversal_bearish)   # ← also fixes the is_valid_for_buy bug
             )
         else:
             choch_buy, choch_sell = False, False
@@ -843,7 +848,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not (is_valid_for_buy or reversal_bullish):
+                choch_exception = (alert_key == "choch_buy" and choch_reversal_bullish)
+                if not (is_valid_for_buy or reversal_bullish or choch_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy (wick/body fail, no reversal pattern)")
                     continue
@@ -856,7 +862,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     )
                     continue
 
-                if not (is_valid_for_sell or reversal_bearish):
+                choch_exception = (alert_key == "choch_sell" and choch_reversal_bearish)
+                if not (is_valid_for_sell or reversal_bearish or choch_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell (wick/body fail, no reversal pattern)")
                     continue
