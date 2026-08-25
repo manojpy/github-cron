@@ -1290,12 +1290,27 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                     continue
                 min_sweep_dist = cfg_obj.CHOCH_MIN_SWEEP_DISTANCE_ATR * atr_short_arr[k]
                 if is_buy:
-                    swept = (l[k] < sweep_level_price - min_sweep_dist) and (c[k] > sweep_level_price)
+                    wick_swept = l[k] < sweep_level_price - min_sweep_dist
                 else:
-                    swept = (h[k] > sweep_level_price + min_sweep_dist) and (c[k] < sweep_level_price)
-                if swept:
-                    sweep_idx = k
-                    break
+                    wick_swept = h[k] > sweep_level_price + min_sweep_dist
+
+                if wick_swept:
+                    # Recovery can happen on the sweep candle itself OR any candle up to the break
+                    recovered = False
+                    if is_buy:
+                        for r in range(k, br + 1):
+                            if c[r] > sweep_level_price:
+                                recovered = True
+                                break
+                    else:
+                        for r in range(k, br + 1):
+                            if c[r] < sweep_level_price:
+                                recovered = True
+                                break
+
+                    if recovered:
+                        sweep_idx = k
+                        break
 
             if sweep_idx is None:
                 continue

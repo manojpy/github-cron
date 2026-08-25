@@ -692,13 +692,14 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 choch_reversal_bullish, choch_reversal_bearish, _ = detect_reversal_candle_pattern(data_15m, i15)
             else:
                 choch_reversal_bullish, choch_reversal_bearish = False, False
+
             choch_buy = bool(
-                buy_trend_common and choch_gate_ok_buy
+                buy_trend_common_relaxed and choch_gate_ok_buy
                 and (is_valid_for_buy or choch_reversal_bullish)
             )
             choch_sell = bool(
-                sell_trend_common and choch_gate_ok_sell
-                and (is_valid_for_sell or choch_reversal_bearish)   # ← also fixes the is_valid_for_buy bug
+                sell_trend_common_relaxed and choch_gate_ok_sell
+                and (is_valid_for_sell or choch_reversal_bearish)
             )
         else:
             choch_buy, choch_sell = False, False
