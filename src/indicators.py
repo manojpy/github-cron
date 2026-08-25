@@ -1221,16 +1221,6 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
 
     scan_start = max(length, i15 - lookback - persistence)
 
-    # -- NaN / candle-continuity guards over the whole scan window --
-    for idx in range(scan_start, i15 + 1):
-        if (np.isnan(o[idx]) or np.isnan(h[idx]) or np.isnan(l[idx]) or np.isnan(c[idx])
-                or np.isnan(atr_short_arr[idx])):
-            logger.debug(f"[{pair}] CHoCH: NaN guard tripped at idx {idx} — abstaining")
-            return None, None, None, False, False, False, False
-        if idx > scan_start and (ts[idx] - ts[idx - 1]) != 900:
-            logger.debug(f"[{pair}] CHoCH: candle gap at idx {idx} — abstaining")
-            return None, None, None, False, False, False, False
-
     tops, btms = _get_minor_swings(h, l, length, scan_start, i15)
 
     def _nearest_before(pivots, before_idx):
@@ -1239,21 +1229,40 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                 return idx, price, piv_idx
         return None
 
+    def _continuity_ok(start_idx, end_idx) -> bool:
+        """Verify no timestamp gaps in [start_idx, end_idx]."""
+        for idx in range(start_idx + 1, end_idx + 1):
+            if (ts[idx] - ts[idx - 1]) != 900:
+                logger.debug(
+                    f"[{pair}] CHoCH: candle gap at idx {idx} "
+                    f"({ts[idx]} - {ts[idx-1]} != 900)"
+                )
+                return False
+        return True
+
     def _scan(is_buy: bool):
-        struct_pivots = tops if is_buy else btms       # lower highs / higher lows being broken
-        sweep_pivots = btms if is_buy else tops         # short-term lows/highs being swept
+        struct_pivots = tops if is_buy else btms
+        sweep_pivots = btms if is_buy else tops
         found_br = None
         found_sweep_idx = None
+        found_piv_price = None
         found_reason = None
         found_fvg = False
 
         for br in range(i15, scan_start - 1, -1):
+            # Localized NaN/Inf guard — a NaN candle simply fails to match
+            if not (np.isfinite(o[br]) and np.isfinite(h[br]) and
+                    np.isfinite(l[br]) and np.isfinite(c[br]) and
+                    np.isfinite(atr_short_arr[br])):
+                continue
+
             rng = h[br] - l[br]
             if rng <= 1e-12:
                 continue
+
             body = (c[br] - o[br]) if is_buy else (o[br] - c[br])
             if body <= 0 or (body / rng) < min_body_ratio:
-                continue  # not a same-direction displacement candle
+                continue
 
             pivot = _nearest_before(struct_pivots, br)
             if pivot is None:
@@ -1261,7 +1270,8 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
             piv_idx, piv_price, _ = pivot
 
             min_break_dist = cfg_obj.CHOCH_MIN_BREAK_DISTANCE_ATR * atr_short_arr[br]
-            broke = (c[br] > piv_price + min_break_dist) if is_buy else (c[br] < piv_price - min_break_dist)
+            broke = ((c[br] > piv_price + min_break_dist) if is_buy
+                     else (c[br] < piv_price - min_break_dist))
             if not broke:
                 continue
 
@@ -1272,10 +1282,12 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
 
             sweep_hi = br if same_candle_ok else br - 1
             sweep_idx = None
-            for k in range(sweep_hi, piv_idx, -1):  # stop strictly after piv_idx: the sweep candle
-                                                     # can't be the same bar the structural pivot confirmed on
+            for k in range(sweep_hi, piv_idx, -1):
                 if k < 0:
                     break
+                if not (np.isfinite(l[k]) and np.isfinite(h[k]) and
+                        np.isfinite(c[k]) and np.isfinite(atr_short_arr[k])):
+                    continue
                 min_sweep_dist = cfg_obj.CHOCH_MIN_SWEEP_DISTANCE_ATR * atr_short_arr[k]
                 if is_buy:
                     swept = (l[k] < sweep_level_price - min_sweep_dist) and (c[k] > sweep_level_price)
@@ -1284,6 +1296,7 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                 if swept:
                     sweep_idx = k
                     break
+
             if sweep_idx is None:
                 continue
             if not same_candle_ok and br == sweep_idx:
@@ -1291,13 +1304,21 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
             if (br - sweep_idx) > window:
                 continue
 
+            # Continuity: sweep must flow into break without gaps
+            if not _continuity_ok(sweep_idx, br):
+                continue
+
             fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
-            has_fvg = any(fvg_fn(h, l, k) for k in range(max(sweep_idx, 2), br + 1))
+            has_fvg = any(
+                fvg_fn(h, l, k)
+                for k in range(max(sweep_idx, 2), br + 1)
+            )
             if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
                 continue
 
             found_br = br
             found_sweep_idx = sweep_idx
+            found_piv_price = piv_price
             found_fvg = has_fvg
             found_reason = (
                 f"{'Bullish' if is_buy else 'Bearish'} CHoCH: swept "
@@ -1305,31 +1326,61 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                 f"broke {'lower-high' if is_buy else 'higher-low'} {piv_price:.4g} @idx{piv_idx}, "
                 f"close {c[br]:.4g} @idx{br}" + (" | FVG" if has_fvg else "")
             )
-            break  # newest-to-oldest: first hit is the freshest valid structure
+            break
 
         if found_br is None:
             return None, None, False, False
 
+        # POI tap (bonus only)
         poi_tap = False
         if check_poi:
             poi_tap = _choch_poi_tap(o, h, l, c, found_br, found_sweep_idx, is_buy, cfg_obj)
             if poi_tap:
                 found_reason = f"{found_reason} | POI tap"
 
+        # Persistence validation
         age = i15 - found_br
-        if age <= persistence:
+        if age == 0:
             return True, found_reason, found_fvg, poi_tap
-        return False, f"{found_reason} (stale, {age} candles old > persistence {persistence})", found_fvg, poi_tap
+
+        if age > persistence:
+            return False, (
+                f"{found_reason} (stale, {age} candles old > persistence {persistence})"
+            ), found_fvg, poi_tap
+
+        # age in (1 .. persistence]: validate continuity break→now + price still beyond pivot
+        if not _continuity_ok(found_br, i15):
+            return False, (
+                f"{found_reason} (data gap between break @{found_br} and now @{i15})"
+            ), found_fvg, poi_tap
+
+        if is_buy and c[i15] <= found_piv_price:
+            return False, (
+                f"Bullish CHoCH stale: close {c[i15]:.4g} back below pivot {found_piv_price:.4g}"
+            ), found_fvg, poi_tap
+
+        if not is_buy and c[i15] >= found_piv_price:
+            return False, (
+                f"Bearish CHoCH stale: close {c[i15]:.4g} back above pivot {found_piv_price:.4g}"
+            ), found_fvg, poi_tap
+
+        return True, found_reason, found_fvg, poi_tap
 
     choch_ok_buy, reason_buy, fvg_buy, poi_tap_buy = _scan(is_buy=True)
     choch_ok_sell, reason_sell, fvg_sell, poi_tap_sell = _scan(is_buy=False)
 
-    reason = reason_buy if choch_ok_buy else (reason_sell if choch_ok_sell else (reason_buy or reason_sell))
+    reason = (
+        reason_buy if choch_ok_buy
+        else (reason_sell if choch_ok_sell else (reason_buy or reason_sell))
+    )
     logger.debug(
-        f"[{pair}] CHoCH diag | choch_ok_buy={choch_ok_buy} choch_ok_sell={choch_ok_sell} | "
+        f"[{pair}] CHoCH diag | ok_buy={choch_ok_buy} ok_sell={choch_ok_sell} | "
         f"reason={reason or 'no qualifying sweep+break structure found'}"
     )
-    return choch_ok_buy, choch_ok_sell, reason, fvg_buy, fvg_sell, poi_tap_buy, poi_tap_sell
+    return (
+        choch_ok_buy, choch_ok_sell, reason,
+        fvg_buy, fvg_sell, poi_tap_buy, poi_tap_sell
+    )
 
 def _oi_price_divergence_reason(oi_now: float, oi_history: List[List[float]], price_now: Optional[float], price_history: List[List[float]], is_buy: bool) -> Optional[str]:
     if not cfg.ENABLE_OI_PRICE_DIVERGENCE or price_now is None:
