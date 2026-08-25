@@ -619,7 +619,7 @@ class RedisStateStore:
             logger_pair.debug(f"Failed to persist resolved outcomes for {pair}: {e}")
             return
 
-        logger_pair.debug(
+        logger_pair.info(
             f"[{pair}] Outcome resolution | "
             f"pending={len(keys)} | "
             f"resolved={resolved_count} | "
