@@ -255,7 +255,7 @@ class BotConfig(BaseModel):
     CHOCH_MIN_DISPLACEMENT_BODY_RATIO: float = Field(default=0.45, ge=0.0, le=1.0, description="Minimum body-to-range ratio required on the break candle so the CHoCH is backed by a displacement move rather than a thin/indecisive close")
     CHOCH_REQUIRE_FVG: bool = Field(default=False, description="If True, an unfilled direction-specific Fair Value Gap must also exist within the sweep-to-break window for the CHoCH to qualify. If False, FVG presence is still detected and reported in the alert reason as a bonus, not a requirement")
     CHOCH_CHECK_POI_TAP: bool = Field(default=False, description="Bonus confluence only, not a hard requirement: also check whether the sweep-to-break window touched an existing demand/supply order-block zone (POI). Reuses the OB gate's zone detection (same OB_LOOKBACK_CANDLES/OB_FILTER_CONFLUENCE settings) and appends 'POI tap' to the CHoCH alert reason when true")
-    CHOCH_PERSISTENCE_CANDLES: int = Field(default=1, ge=0, le=5, description="How many additional closed 15m candles after a confirmed CHoCH break to keep the gate valid. 0 = exact-candle-only (fresh break required every cycle)")
+    CHOCH_PERSISTENCE_CANDLES: int = Field(default=1, ge=0, le=9, description="How many additional closed 15m candles after a confirmed CHoCH break to keep the gate valid. 0 = exact-candle-only (fresh break required every cycle)")
     EVAL_CONCURRENCY_LIMIT: int = Field(default=5, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    
