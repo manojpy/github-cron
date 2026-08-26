@@ -820,7 +820,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             cloud_votes_buy.append(rma_cloud_ok_buy)
 
         if cloud_votes_buy:
-            cloud_group_ok_buy = all(v is True for v in cloud_votes_buy)
+            cloud_group_ok_buy = any(v is True for v in cloud_votes_buy)
             if not cloud_group_ok_buy and cfg.DEBUG_MODE:
                 logger_pair.debug(
                     f"[{pair_name}] Cloud group buy blocked: need ALL true "
@@ -838,7 +838,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             cloud_votes_sell.append(rma_cloud_ok_sell)
 
         if cloud_votes_sell:
-            cloud_group_ok_sell = all(v is True for v in cloud_votes_sell)
+            cloud_group_ok_sell = any(v is True for v in cloud_votes_sell)
             if not cloud_group_ok_sell and cfg.DEBUG_MODE:
                 logger_pair.debug(
                     f"[{pair_name}] Cloud group sell blocked: need ALL true "
