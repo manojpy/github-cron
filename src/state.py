@@ -108,6 +108,7 @@ class RedisKeyPrefix:
     OUTCOME_PENDING = "outcome_pending:"
     ALERT_STATS = "alert_stats:"
     OUTCOME_LOG_STREAM = "outcome_log_stream"
+    TLR_TOUCH = "tlr_touch:"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -465,6 +466,38 @@ class RedisStateStore:
             await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
         except Exception as e:
             logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
+
+    async def get_tlr_touch_state(self, pair: str, is_buy: bool) -> Optional[Dict[str, Any]]:
+        """Load persisted TLR touch-count state for a pair/direction. Returns
+        None if degraded, unset, or on any Redis error (caller treats None
+        the same as 'no prior state' — safe default, starts a fresh count)."""
+        if self.degraded or not self._redis:
+            return None
+        direction = "buy" if is_buy else "sell"
+        key = f"{RedisKeyPrefix.TLR_TOUCH}{pair}:{direction}"
+        return await self._safe_redis_op(
+            lambda: self._redis.get(key),
+            2.0,
+            f"get_tlr_touch_state {pair}:{direction}",
+            parser=lambda r: json_loads(r) if r else None,
+        )
+
+    async def save_tlr_touch_state(self, pair: str, is_buy: bool, state: Dict[str, Any]) -> None:
+        if self.degraded or not self._redis:
+            return
+        direction = "buy" if is_buy else "sell"
+        key = f"{RedisKeyPrefix.TLR_TOUCH}{pair}:{direction}"
+        try:
+            payload = json_dumps(state)
+        except Exception as e:
+            logger.warning(f"Failed to serialize TLR touch state for {pair}:{direction}: {e}")
+            return
+        try:
+            await asyncio.wait_for(
+                self._redis.set(key, payload, ex=cfg.TLR_TOUCH_STATE_TTL_SEC), timeout=2.0
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save TLR touch state for {pair}:{direction}: {e}")
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
