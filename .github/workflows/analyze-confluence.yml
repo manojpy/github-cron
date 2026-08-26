@@ -1,0 +1,52 @@
+name: 📊 Confluence Threshold Report
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"   # 00:00 & 12:00 UTC = 05:30 & 17:30 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet redis
+
+      - name: 📊 Run confluence threshold analysis
+        id: analysis
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          set +e
+          python3 scripts/analyze_confluence_thresholds.py \
+            --min-sample 20 --target-winrate 0.55 --min-total-for-alert 20 \
+            2>&1 | tee analysis_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 📊 Confluence Threshold Analysis"
+            echo '```'; cat analysis_output.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ⚠️ Fail on real error
+        if: steps.analysis.outputs.exit_code != '0' && steps.analysis.outputs.exit_code != '2'
+        run: exit 1
+
+      - name: 📨 Notify Telegram
+        if: steps.analysis.outputs.exit_code == '0'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          HIGHLIGHT=$(grep -A2 "Suggested CONFLUENCE_MIN_SCORE" analysis_output.txt || echo "No suggestion yet")
+          MSG="📊 Confluence threshold analysis complete"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
