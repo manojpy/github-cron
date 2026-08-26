@@ -1144,27 +1144,36 @@ def _get_minor_swings(h: np.ndarray, l: np.ndarray, length: int, start: int, end
     _, upper_arr = rolling_min_max_numba(h, length)
     lower_arr, _ = rolling_min_max_numba(l, length)
 
-    os = 0
+    os = None
     for i in range(length, end + 1):
-        upper = upper_arr[i]
-        lower = lower_arr[i]
-        h_len = h[i - length]
-        l_len = l[i - length]
-        if np.isnan(upper) or np.isnan(lower) or np.isnan(h_len) or np.isnan(l_len):
+        k = i - length
+        right_upper = upper_arr[i]
+        right_lower = lower_arr[i]
+        h_len = h[k]
+        l_len = l[k]
+        if np.isnan(right_upper) or np.isnan(right_lower) or np.isnan(h_len) or np.isnan(l_len):
             continue
+        # Symmetric check: candidate pivot must also beat the `length` bars to
+        # its LEFT, matching Pine's ta.pivothigh(length, length) / pivotlow.
+        if k - 1 < 0 or np.isnan(upper_arr[k - 1]) or np.isnan(lower_arr[k - 1]):
+            continue
+        left_upper = upper_arr[k - 1]
+        left_lower = lower_arr[k - 1]
 
         prev_os = os
-        if h_len > upper:
+        if h_len > right_upper and h_len > left_upper:
             os = 0
-        elif l_len < lower:
+        elif l_len < right_lower and l_len < left_lower:
             os = 1
+        else:
+            os = prev_os
 
         if i < start:
             continue
         if os == 0 and prev_os != 0:
-            tops.append((i, h_len, i - length))
+            tops.append((i, h_len, k))
         elif os == 1 and prev_os != 1:
-            btms.append((i, l_len, i - length))
+            btms.append((i, l_len, k))
     return tops, btms
 
 def _bullish_fvg_at(h: np.ndarray, l: np.ndarray, k: int) -> bool:
@@ -1847,7 +1856,6 @@ def _tlr_fib_confluence(h: np.ndarray, l: np.ndarray, tl: TrendlineState, i15: i
         return False
     return bool(fib_lo <= touch_price <= fib_hi)
 
-
 def _tlr_sr_confluence(h: np.ndarray, l: np.ndarray, atr_short_arr: np.ndarray, i15: int,
                         is_buy: bool, cfg_obj) -> bool:
     length = cfg_obj.TLR_FRACTAL_PERIODS
@@ -1893,7 +1901,6 @@ def _tlr_rsi_momentum_confluence(rsi_arr: np.ndarray, i15: int,
     if not (np.isfinite(rsi_now) and np.isfinite(rsi_prev)):
         return False
     return rsi_now > rsi_prev if is_buy else rsi_now < rsi_prev
-
 
 def _tlr_confluence_vote(h: np.ndarray, l: np.ndarray, atr_short_arr: np.ndarray,
                           rsi_arr: np.ndarray, tl: TrendlineState, i15: int, is_buy: bool,

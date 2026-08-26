@@ -835,6 +835,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 skip = True
             elif "choch" in requires and not cfg.ENABLE_CHOCH_ALERT:
                 skip = True
+            elif "tlr" in requires and not cfg.ENABLE_TLR_ALERT:
+                skip = True
             elif "vwap" in requires and not vwap_available:
                 skip = True
             elif "ppo" in requires and ppo_ctx is None:

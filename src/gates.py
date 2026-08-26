@@ -900,7 +900,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             and trend_gate_ok_sell
         )
         reversal_candidate = (
-            (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT)
+            (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT or cfg.ENABLE_TLR_ALERT)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
