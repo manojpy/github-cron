@@ -1239,120 +1239,99 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
         return True
 
     def _scan(is_buy: bool):
-        struct_pivots = tops if is_buy else btms
         sweep_pivots = btms if is_buy else tops
-        found_br = None
+        found_entry = None
         found_sweep_idx = None
-        found_piv_price = None
+        found_sweep_price = None
         found_reason = None
         found_fvg = False
 
-        for br in range(i15, scan_start - 1, -1):
+        for r in range(i15, scan_start - 1, -1):
             # Localized NaN/Inf guard — a NaN candle simply fails to match
-            if not (np.isfinite(o[br]) and np.isfinite(h[br]) and
-                    np.isfinite(l[br]) and np.isfinite(c[br]) and
-                    np.isfinite(atr_short_arr[br])):
+            if not (np.isfinite(o[r]) and np.isfinite(h[r]) and
+                    np.isfinite(l[r]) and np.isfinite(c[r]) and
+                    np.isfinite(atr_short_arr[r])):
                 continue
 
-            rng = h[br] - l[br]
+            rng = h[r] - l[r]
             if rng <= 1e-12:
                 continue
 
-            body = (c[br] - o[br]) if is_buy else (o[br] - c[br])
+            body = (c[r] - o[r]) if is_buy else (o[r] - c[r])
             if body <= 0 or (body / rng) < min_body_ratio:
                 continue
 
-            pivot = _nearest_before(struct_pivots, br)
-            if pivot is None:
-                continue
-            piv_idx, piv_price, _ = pivot
-
-            min_break_dist = cfg_obj.CHOCH_MIN_BREAK_DISTANCE_ATR * atr_short_arr[br]
-            broke = ((c[br] > piv_price + min_break_dist) if is_buy
-                     else (c[br] < piv_price - min_break_dist))
-            if not broke:
-                continue
-
-            prior_sweep_level = _nearest_before(sweep_pivots, piv_idx)
-            if prior_sweep_level is None:
-                continue
-            _, sweep_level_price, _ = prior_sweep_level
-
-            sweep_hi = br if same_candle_ok else br - 1
+            sweep_hi = r if same_candle_ok else r - 1
+            sweep_lo = max(scan_start, r - window)
             sweep_idx = None
-            for k in range(sweep_hi, piv_idx, -1):
+            sweep_level_price = None
+            for k in range(sweep_hi, sweep_lo - 1, -1):
                 if k < 0:
                     break
                 if not (np.isfinite(l[k]) and np.isfinite(h[k]) and
                         np.isfinite(c[k]) and np.isfinite(atr_short_arr[k])):
                     continue
+
+                pivot = _nearest_before(sweep_pivots, k)
+                if pivot is None:
+                    continue
+                _, level_price, _ = pivot
+
                 min_sweep_dist = cfg_obj.CHOCH_MIN_SWEEP_DISTANCE_ATR * atr_short_arr[k]
                 if is_buy:
-                    wick_swept = l[k] < sweep_level_price - min_sweep_dist
+                    wick_swept = l[k] < level_price - min_sweep_dist
                 else:
-                    wick_swept = h[k] > sweep_level_price + min_sweep_dist
+                    wick_swept = h[k] > level_price + min_sweep_dist
+                if not wick_swept:
+                    continue
 
-                if wick_swept:
-                    # Recovery can happen on the sweep candle itself OR any candle up to the break
-                    recovered = False
-                    if is_buy:
-                        for r in range(k, br + 1):
-                            if c[r] > sweep_level_price:
-                                recovered = True
-                                break
-                    else:
-                        for r in range(k, br + 1):
-                            if c[r] < sweep_level_price:
-                                recovered = True
-                                break
+                recovered = (c[r] > level_price) if is_buy else (c[r] < level_price)
+                if not recovered:
+                    continue
 
-                    if recovered:
-                        sweep_idx = k
-                        break
+                sweep_idx = k
+                sweep_level_price = level_price
+                break
 
             if sweep_idx is None:
                 continue
-            if not same_candle_ok and br == sweep_idx:
-                continue
-            if (br - sweep_idx) > window:
+            if not same_candle_ok and r == sweep_idx:
                 continue
 
-            # Continuity: sweep must flow into break without gaps
-            if not _continuity_ok(sweep_idx, br):
+            # Continuity: sweep must flow into the displacement candle without gaps
+            if not _continuity_ok(sweep_idx, r):
                 continue
 
             fvg_fn = _bullish_fvg_at if is_buy else _bearish_fvg_at
             has_fvg = any(
                 fvg_fn(h, l, k)
-                for k in range(max(sweep_idx, 2), br + 1)
+                for k in range(max(sweep_idx, 2), r + 1)
             )
             if cfg_obj.CHOCH_REQUIRE_FVG and not has_fvg:
                 continue
 
-            found_br = br
+            found_entry = r
             found_sweep_idx = sweep_idx
-            found_piv_price = piv_price
+            found_sweep_price = sweep_level_price
             found_fvg = has_fvg
             found_reason = (
-                f"{'Bullish' if is_buy else 'Bearish'} CHoCH: swept "
+                f"{'Bullish' if is_buy else 'Bearish'} CHoCH (early/displacement): swept "
                 f"{'low' if is_buy else 'high'} {sweep_level_price:.4g} @idx{sweep_idx}, "
-                f"broke {'lower-high' if is_buy else 'higher-low'} {piv_price:.4g} @idx{piv_idx}, "
-                f"close {c[br]:.4g} @idx{br}" + (" | FVG" if has_fvg else "")
+                f"displacement close {c[r]:.4g} @idx{r}" + (" | FVG" if has_fvg else "")
             )
             break
 
-        if found_br is None:
+        if found_entry is None:
             return None, None, False, False
 
         # POI tap (bonus only)
         poi_tap = False
         if check_poi:
-            poi_tap = _choch_poi_tap(o, h, l, c, found_br, found_sweep_idx, is_buy, cfg_obj)
+            poi_tap = _choch_poi_tap(o, h, l, c, found_entry, found_sweep_idx, is_buy, cfg_obj)
             if poi_tap:
                 found_reason = f"{found_reason} | POI tap"
 
-        # Persistence validation
-        age = i15 - found_br
+        age = i15 - found_entry
         if age == 0:
             return True, found_reason, found_fvg, poi_tap
 
@@ -1361,20 +1340,19 @@ def _choch_gate_reason(o, h, l, c, ts, atr_short_arr, i15, cfg_obj):
                 f"{found_reason} (stale, {age} candles old > persistence {persistence})"
             ), found_fvg, poi_tap
 
-        # age in (1 .. persistence]: validate continuity break→now + price still beyond pivot
-        if not _continuity_ok(found_br, i15):
+        if not _continuity_ok(found_entry, i15):
             return False, (
-                f"{found_reason} (data gap between break @{found_br} and now @{i15})"
+                f"{found_reason} (data gap between entry @{found_entry} and now @{i15})"
             ), found_fvg, poi_tap
 
-        if is_buy and c[i15] <= found_piv_price:
+        if is_buy and c[i15] <= found_sweep_price:
             return False, (
-                f"Bullish CHoCH stale: close {c[i15]:.4g} back below pivot {found_piv_price:.4g}"
+                f"Bullish CHoCH stale: close {c[i15]:.4g} back below swept level {found_sweep_price:.4g}"
             ), found_fvg, poi_tap
 
-        if not is_buy and c[i15] >= found_piv_price:
+        if not is_buy and c[i15] >= found_sweep_price:
             return False, (
-                f"Bearish CHoCH stale: close {c[i15]:.4g} back above pivot {found_piv_price:.4g}"
+                f"Bearish CHoCH stale: close {c[i15]:.4g} back above swept level {found_sweep_price:.4g}"
             ), found_fvg, poi_tap
 
         return True, found_reason, found_fvg, poi_tap
