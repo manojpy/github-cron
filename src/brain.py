@@ -45,6 +45,18 @@ _ALERT_CONFIG_MAP = {
     "fib_reversal_sell":    "ENABLE_FIB_REVERSAL_ALERT",
     "ob_reversal_buy":      "ENABLE_OB_GATE",
     "ob_reversal_sell":     "ENABLE_OB_GATE",
+    "ppo_signal_up":        "ENABLE_PPO_ALERTS",
+    "ppo_signal_down":      "ENABLE_PPO_ALERTS",
+    "ppo_zero_up":          "ENABLE_PPO_ALERTS",
+    "ppo_zero_down":        "ENABLE_PPO_ALERTS",
+    "ppo_adaptive_up":      "ENABLE_PPO_ALERTS",
+    "ppo_adaptive_down":    "ENABLE_PPO_ALERTS",
+    "rsi_ema5_up":          "ENABLE_RSI_ALERTS",
+    "rsi_ema5_down":        "ENABLE_RSI_ALERTS",
+    "rsi_cross_adaptive_up":   "ENABLE_RSI_ALERTS",
+    "rsi_cross_adaptive_down": "ENABLE_RSI_ALERTS",
+    "ppohist_buy":          "ENABLE_PPOHIST_ALERT",
+    "ppohist_sell":         "ENABLE_PPOHIST_ALERT",
 }
 
 class BrainEngine:
