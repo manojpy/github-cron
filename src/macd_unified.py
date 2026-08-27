@@ -78,6 +78,8 @@ from alerts import (
     TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
 )
 
+from brain import BrainEngine
+
 _pair_eval_counter = 0
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
