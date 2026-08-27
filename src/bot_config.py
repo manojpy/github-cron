@@ -278,7 +278,7 @@ class BotConfig(BaseModel):
     FIB_REVERSAL_VOL_DRYUP_LOOKBACK: int = Field(default=6, ge=2, le=50, description="Number of candles compared for the volume dry-up check: mean volume over the N candles before the touch candle vs mean volume over the N candles before that")
     FIB_REVERSAL_VOL_SPIKE_MULT: float = Field(default=1.3, ge=1.0, le=5.0, description="Touch candle's volume must exceed its volume EMA by this multiple to count as an exhaustion/reversal spike") 
     FIB_REVERSAL_MAX_DIVERGENCE_AGE_BARS: int = Field(default=50, ge=5, le=500, description="Max bars between the anchor swing and the prior swing for divergence comparison")
-
+    FIB_REVERSAL_MAJOR_SWING_LENGTH: int = Field(default=50, ge=2, le=200, description="Fallback only when no minor pivot exists...")
     EVAL_CONCURRENCY_LIMIT: int = Field(default=5, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    

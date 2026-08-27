@@ -1920,8 +1920,11 @@ def _fib_reversal_swing_info(h: np.ndarray, l: np.ndarray, c: np.ndarray, i15: i
     if i15 - 1 < lookback_start or i15 - 1 < length:
         return False, None, None, None
 
-    tops, btms = _get_minor_swings(h, l, length, start=lookback_start, end=i15 - 1)
+    tops, btms = _pivots_for(cfg_obj.FIB_REVERSAL_SWING_LENGTH)
     pivots = btms if is_buy else tops
+    if len(pivots) < 1:
+        tops, btms = _pivots_for(cfg_obj.FIB_REVERSAL_MAJOR_SWING_LENGTH)
+        pivots = btms if is_buy else tops
     if len(pivots) < 1:
         return False, None, None, None
 
