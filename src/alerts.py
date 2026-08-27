@@ -25,8 +25,8 @@ from gates import GateResult, IndicatorCache
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
     validate_cloud_cross, validate_conversion_cross, _tlr_confluence_vote,
+    _fib_reversal_confluence_vote,
 )
-
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
@@ -269,6 +269,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"choch_sell","title":"🔴🔀 CHoCH SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("choch_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_reason') or 'Bearish change of character'}","requires":["choch"]},
     {"key":"tlr_buy","title":"🟢📐 Trendline Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tlr_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('tlr_reason') or '3rd-touch ascending trendline reversal'}","requires":["tlr"]},
     {"key":"tlr_sell","title":"🔴📐 Trendline Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("tlr_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('tlr_reason') or '3rd-touch descending trendline reversal'}","requires":["tlr"]},
+    {"key":"fib_reversal_buy","title":"🟢🌀 Fib Pivot Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("fib_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('fib_reversal_reason') or 'Fibonacci zone reversal'}","requires":["fib_reversal"]},
+    {"key":"fib_reversal_sell","title":"🔴🌀 Fib Pivot Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("fib_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('fib_reversal_reason') or 'Fibonacci zone reversal'}","requires":["fib_reversal"]},
 ]
 def _validate_pivot_cross(ctx: Dict[str, Any], level: str, is_buy: bool) -> Tuple[bool, Optional[str]]:
     pivots = ctx.get("pivots")
@@ -418,6 +420,12 @@ def _build_resets(pair_name: str, context: dict, conditional_states: dict) -> Li
         if rk and conditional_states.get(rk, False) and not context.get(ok_key):
             resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
 
+    # ── Fibonacci Pivot Reversal ──
+    for k, ok_key in ((AlertKey.FIB_REVERSAL_BUY, "fib_reversal_buy"), (AlertKey.FIB_REVERSAL_SELL, "fib_reversal_sell")):
+        rk = ALERT_KEYS.get(k)
+        if rk and conditional_states.get(rk, False) and not context.get(ok_key):
+            resets.append((f"{pair_name}:{rk}", "INACTIVE", None))
+
     # ── Pivots ──
     piv = context.get("pivots", {})
     close_c, close_p = context["close_curr"], context["close_prev"]
@@ -496,7 +504,7 @@ BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
     "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
     "cloud_cross_up", "tk_conversion_up", "kijun_cross_up", "ob_reversal_buy", 
-    "strong_reversal_buy", "choch_buy", "tlr_buy",
+    "strong_reversal_buy", "choch_buy", "tlr_buy", "fib_reversal_buy",
 }
 BUY_ALERT_KEYS.update(f"pivot_up_{level}" for level in PIVOT_LEVELS_BUY)
 
@@ -504,7 +512,7 @@ SELL_ALERT_KEYS: Set[str] = {
     "ppo_signal_down", "ppo_zero_down", "ppo_adaptive_down",
     "rsi_ema5_down", "rsi_cross_adaptive_down", "vwap_down", "hist_rma_sell", "ppohist_sell",
     "cloud_cross_down", "tk_conversion_down", "kijun_cross_down", "ob_reversal_sell",
-    "strong_reversal_sell", "choch_sell", "tlr_sell",
+    "strong_reversal_sell", "choch_sell", "tlr_sell", "fib_reversal_sell",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
 
@@ -750,6 +758,38 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                     passed_names = ", ".join(k for k, v in tlr_votes_sell.items() if v)
                     tlr_reason = f"{tlr_touch_reason} | {passed_sell}/5 confluence ({passed_names})"
 
+        fib_reversal_buy, fib_reversal_sell = False, False
+        fib_reversal_reason = None
+        fib_reversal_votes_buy = fib_reversal_votes_sell = None
+        if cfg.ENABLE_FIB_REVERSAL_ALERT:
+            if cfg.ENABLE_STRONG_REVERSAL_ALERT:
+                fib_pattern_bullish, fib_pattern_bearish = reversal_bullish, reversal_bearish
+            else:
+                fib_pattern_bullish, fib_pattern_bearish, _ = detect_reversal_candle_pattern(data_15m, i15)
+
+            wick_or_pattern_buy = bool(buy_wick_ratio >= Constants.MIN_WICK_RATIO or fib_pattern_bullish)
+            wick_or_pattern_sell = bool(sell_wick_ratio >= Constants.MIN_WICK_RATIO or fib_pattern_bearish)
+
+            if buy_trend_common_relaxed and wick_or_pattern_buy:
+                vote_ok_buy, passed_buy, fib_reversal_votes_buy = _fib_reversal_confluence_vote(
+                    data_15m.high, data_15m.low, data_15m.close, data_15m.volume, indicators.volume_ema,
+                    smooth_rsi, ppo, i15, True, cfg, wick_or_pattern_buy,
+                )
+                fib_reversal_buy = bool(vote_ok_buy)
+                if fib_reversal_buy:
+                    passed_names = ", ".join(k for k, v in fib_reversal_votes_buy.items() if v)
+                    fib_reversal_reason = f"Fib pivot reversal | {passed_buy}/4 confluence ({passed_names})"
+
+            if sell_trend_common_relaxed and wick_or_pattern_sell:
+                vote_ok_sell, passed_sell, fib_reversal_votes_sell = _fib_reversal_confluence_vote(
+                    data_15m.high, data_15m.low, data_15m.close, data_15m.volume, indicators.volume_ema,
+                    smooth_rsi, ppo, i15, False, cfg, wick_or_pattern_sell,
+                )
+                fib_reversal_sell = bool(vote_ok_sell)
+                if fib_reversal_sell:
+                    passed_names = ", ".join(k for k, v in fib_reversal_votes_sell.items() if v)
+                    fib_reversal_reason = f"Fib pivot reversal | {passed_sell}/4 confluence ({passed_names})"
+
         values_to_check = {
             'ppo_curr': ppo_curr, 'ppo_prev': ppo_prev,
             'rsi_curr': rsi_curr, 'rsi_prev': rsi_prev,
@@ -818,6 +858,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             "choch_buy": choch_buy, "choch_sell": choch_sell, 
             "choch_poi_tap_buy": choch_poi_tap_buy, "choch_poi_tap_sell": choch_poi_tap_sell,
             "tlr_buy": tlr_buy, "tlr_sell": tlr_sell, "tlr_reason": tlr_reason,
+            "fib_reversal_buy": fib_reversal_buy, "fib_reversal_sell": fib_reversal_sell,
+            "fib_reversal_reason": fib_reversal_reason,
         }
         ppo_ctx = {"curr": ppo_curr, "prev": ppo_prev}
         ppo_sig_ctx = {"curr": ppo_sig_curr, "prev": ppo_sig_prev}
@@ -827,7 +869,7 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         for d in ALERT_DEFINITIONS:
             key = d.key
             requires = d.requires
-            
+           
             skip = False
             if "pivots" in requires and (not cfg.ENABLE_PIVOT or not piv or not any(piv.values())):
                 skip = True
@@ -836,6 +878,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             elif "choch" in requires and not cfg.ENABLE_CHOCH_ALERT:
                 skip = True
             elif "tlr" in requires and not cfg.ENABLE_TLR_ALERT:
+                skip = True
+            elif "fib_reversal" in requires and not cfg.ENABLE_FIB_REVERSAL_ALERT:
                 skip = True
             elif "vwap" in requires and not vwap_available:
                 skip = True
@@ -900,7 +944,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
                 choch_exception = (alert_key == "choch_buy" and choch_reversal_bullish)
                 tlr_exception = (alert_key == "tlr_buy" and tlr_buy)
-                if not (is_valid_for_buy or reversal_bullish or choch_exception or tlr_exception):
+                fib_reversal_exception = (alert_key == "fib_reversal_buy" and fib_reversal_buy)
+                if not (is_valid_for_buy or reversal_bullish or choch_exception or tlr_exception or fib_reversal_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for buy (wick/body fail, no reversal pattern)")
                     continue
@@ -915,7 +960,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
 
                 choch_exception = (alert_key == "choch_sell" and choch_reversal_bearish)
                 tlr_exception = (alert_key == "tlr_sell" and tlr_sell)
-                if not (is_valid_for_sell or reversal_bearish or choch_exception or tlr_exception):
+                fib_reversal_exception = (alert_key == "fib_reversal_sell" and fib_reversal_sell)
+                if not (is_valid_for_sell or reversal_bearish or choch_exception or tlr_exception or fib_reversal_exception):
                     if cfg.DEBUG_MODE:
                         logger_pair.debug(f"Skipping {alert_key}: not valid for sell (wick/body fail, no reversal pattern)")
                     continue

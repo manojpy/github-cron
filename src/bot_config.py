@@ -269,6 +269,16 @@ class BotConfig(BaseModel):
     TLR_SR_CLUSTER_ATR: float = Field(default=0.5, ge=0.0, le=5.0, description="Distance (in ATR_SHORT multiples) within which nearby swing levels are merged into a single S/R zone")
     TLR_SR_MIN_TOUCHES: int = Field(default=2, ge=1, le=10, description="Minimum number of prior swing points that must cluster together for a level to count as a real S/R zone rather than noise")
 
+    ENABLE_FIB_REVERSAL_ALERT: bool = Field(default=False, description="Enable Fibonacci Pivot Reversal alerts: price retraces into the 50-78.6% zone of the last major swing leg, with a confluence vote across the zone touch, oscillator divergence, wick/pattern rejection, and volume exhaustion")
+    FIB_REVERSAL_CONFLUENCE_REQUIRED: int = Field(default=3, ge=1, le=4, description="Minimum number of the 4 confluence checks (wick/pattern rejection, Fibonacci zone, oscillator divergence, volume exhaustion) that must pass for a Fib Reversal alert to fire")
+    FIB_REVERSAL_SWING_LENGTH: int = Field(default=5, ge=2, le=200, description="Bars on each side used to confirm a major swing pivot for the Fibonacci leg — matches the OB detection swing_len so the zone is anchored to the same structural swings")
+    FIB_REVERSAL_SWING_LOOKBACK_CANDLES: int = Field(default=150, ge=20, le=2000, description="How many candles back to search for the swing pivots that anchor the Fibonacci leg and the divergence comparison")
+    FIB_REVERSAL_ZONE_LOW: float = Field(default=0.5, ge=0.0, le=1.0, description="Lower bound of the Fibonacci retracement zone (as a fraction of the leg from the anchor swing to the extreme reached since) that counts as a zone touch")
+    FIB_REVERSAL_ZONE_HIGH: float = Field(default=0.786, ge=0.0, le=1.0, description="Upper bound of the Fibonacci retracement zone — default 0.5-0.786 is the conventional 'golden zone'")
+    FIB_REVERSAL_VOL_DRYUP_LOOKBACK: int = Field(default=6, ge=2, le=50, description="Number of candles compared for the volume dry-up check: mean volume over the N candles before the touch candle vs mean volume over the N candles before that")
+    FIB_REVERSAL_VOL_SPIKE_MULT: float = Field(default=1.3, ge=1.0, le=5.0, description="Touch candle's volume must exceed its volume EMA by this multiple to count as an exhaustion/reversal spike") 
+    FIB_REVERSAL_MAX_DIVERGENCE_AGE_BARS: int = Field(default=50, ge=5, le=500, description="Max bars between the anchor swing and the prior swing for divergence comparison")
+
     EVAL_CONCURRENCY_LIMIT: int = Field(default=5, ge=1, le=30, description="Max pairs evaluated concurrently")
     MIN_RUN_TIMEOUT: int = Field(default=480, ge=300, le=1800)  # Min/max run timeout in seconds (5-30 min)
     MAX_ALERTS_PER_PAIR: int = Field(default=8, ge=5, le=15)  # Max alerts per pair per run    

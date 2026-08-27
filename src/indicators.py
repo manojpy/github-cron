@@ -1913,3 +1913,141 @@ def _tlr_confluence_vote(h: np.ndarray, l: np.ndarray, atr_short_arr: np.ndarray
     passed = sum(votes.values())
     vote_ok = bool(passed >= cfg_obj.TLR_CONFLUENCE_REQUIRED)
     return vote_ok, passed, votes
+
+def _fib_reversal_swing_info(h: np.ndarray, l: np.ndarray, c: np.ndarray, i15: int, is_buy: bool, cfg_obj):
+    length = cfg_obj.FIB_REVERSAL_SWING_LENGTH
+    lookback_start = max(0, i15 - cfg_obj.FIB_REVERSAL_SWING_LOOKBACK_CANDLES)
+    if i15 - 1 < lookback_start or i15 - 1 < length:
+        return False, None, None, None
+
+    tops, btms = _get_minor_swings(h, l, length, start=lookback_start, end=i15 - 1)
+    pivots = btms if is_buy else tops
+    if len(pivots) < 1:
+        return False, None, None, None
+
+    anchor_idx, anchor_price, anchor_k = pivots[-1]
+    prior_pivot = pivots[-2] if len(pivots) >= 2 else None
+    zone_lo_pct, zone_hi_pct = cfg_obj.FIB_REVERSAL_ZONE_LOW, cfg_obj.FIB_REVERSAL_ZONE_HIGH
+
+    if is_buy:
+        # Measure completed leg up to (but not including) the current candle
+        window = h[anchor_k:i15]
+        if window.size == 0 or np.all(np.isnan(window)):
+            return False, None, None, prior_pivot
+        leg_high = float(np.nanmax(window))
+        leg_low = anchor_price
+        if leg_high <= leg_low:
+            return False, None, None, prior_pivot
+        touch_price = l[i15]
+        fib_hi = leg_high - zone_lo_pct * (leg_high - leg_low)
+        fib_lo = leg_high - zone_hi_pct * (leg_high - leg_low)
+    else:
+        # Measure completed leg up to (but not including) the current candle
+        window = l[anchor_k:i15]
+        if window.size == 0 or np.all(np.isnan(window)):
+            return False, None, None, prior_pivot
+        leg_low = float(np.nanmin(window))
+        leg_high = anchor_price
+        if leg_high <= leg_low:
+            return False, None, None, prior_pivot
+        touch_price = h[i15]
+        fib_lo = leg_low + zone_lo_pct * (leg_high - leg_low)
+        fib_hi = leg_low + zone_hi_pct * (leg_high - leg_low)
+
+    if not np.isfinite(touch_price) or not np.isfinite(c[i15]):
+        return False, None, None, prior_pivot
+
+    # 1. Wick must have reached the zone (at least the 50% level)
+    if is_buy:
+        reached_zone = bool(l[i15] <= fib_hi)
+    else:
+        reached_zone = bool(h[i15] >= fib_lo)
+    if not reached_zone:
+        return False, None, None, prior_pivot
+
+    # 2. Close-rejection: close must snap back out of the zone
+    if is_buy and c[i15] <= fib_lo:
+        return False, None, None, prior_pivot
+    if not is_buy and c[i15] >= fib_hi:
+        return False, None, None, prior_pivot
+
+    # 3. Deep-retracement invalidation (close beyond 88.6% kills the leg)
+    deep_invalid = 0.886
+    if is_buy:
+        deep_level = leg_high - deep_invalid * (leg_high - leg_low)
+        if c[i15] < deep_level:
+            return False, None, None, prior_pivot
+    else:
+        deep_level = leg_low + deep_invalid * (leg_high - leg_low)
+        if c[i15] > deep_level:
+            return False, None, None, prior_pivot
+
+    return True, anchor_k, anchor_price, prior_pivot
+
+def _fib_reversal_divergence(prior_pivot: Optional[Tuple[int, float, int]], anchor_k: Optional[int],
+                              anchor_price: Optional[float], rsi_arr: Optional[np.ndarray],
+                              ppo_arr: Optional[np.ndarray], is_buy: bool, cfg_obj) -> bool:
+  
+    if prior_pivot is None or anchor_k is None or anchor_price is None:
+        return False
+    _, prior_price, prior_k = prior_pivot
+
+    # Reject stale divergence: prior swing too far from anchor
+    if (anchor_k - prior_k) > cfg_obj.FIB_REVERSAL_MAX_DIVERGENCE_AGE_BARS:
+        return False
+
+    price_ok = (anchor_price <= prior_price) if is_buy else (anchor_price >= prior_price)
+    if not price_ok:
+        return False
+
+    for arr in (rsi_arr, ppo_arr):
+        if arr is None or anchor_k >= len(arr) or prior_k >= len(arr) or anchor_k < 0 or prior_k < 0:
+            continue
+        osc_now, osc_prior = arr[anchor_k], arr[prior_k]
+        if not (np.isfinite(osc_now) and np.isfinite(osc_prior)):
+            continue
+        if (osc_now > osc_prior) if is_buy else (osc_now < osc_prior):
+            return True
+    return False
+
+def _fib_reversal_volume_exhaustion(volume: Optional[np.ndarray], volume_ema: Optional[np.ndarray],
+                                     i15: int, cfg_obj) -> bool:
+    if volume is None or volume_ema is None:
+        return False
+    n_lb = cfg_obj.FIB_REVERSAL_VOL_DRYUP_LOOKBACK
+    if i15 < 2 * n_lb or i15 >= len(volume) or i15 >= len(volume_ema):
+        return False
+
+    recent = volume[i15 - n_lb:i15]
+    baseline = volume[i15 - 2 * n_lb:i15 - n_lb]
+    if recent.size == 0 or baseline.size == 0 or np.any(np.isnan(recent)) or np.any(np.isnan(baseline)):
+        return False
+    dryup_ok = bool(np.mean(recent) < np.mean(baseline))
+
+    vol_now = volume[i15]
+    ema_now = volume_ema[i15]
+    if not (np.isfinite(vol_now) and np.isfinite(ema_now)) or ema_now <= 0:
+        return False
+    spike_ok = bool(vol_now > ema_now * cfg_obj.FIB_REVERSAL_VOL_SPIKE_MULT)
+
+    return dryup_ok and spike_ok
+
+def _fib_reversal_confluence_vote(h: np.ndarray, l: np.ndarray, c: np.ndarray, volume: Optional[np.ndarray],
+                                   volume_ema: Optional[np.ndarray], rsi_arr: Optional[np.ndarray],
+                                   ppo_arr: Optional[np.ndarray], i15: int, is_buy: bool, cfg_obj,
+                                   wick_or_pattern_ok: bool) -> Tuple[bool, int, Dict[str, bool]]:
+    fib_ok, anchor_k, anchor_price, prior_pivot = _fib_reversal_swing_info(h, l, c, i15, is_buy, cfg_obj)
+    divergence_ok = (
+        _fib_reversal_divergence(prior_pivot, anchor_k, anchor_price, rsi_arr, ppo_arr, is_buy, cfg_obj)
+        if fib_ok else False
+    )
+    volume_ok = _fib_reversal_volume_exhaustion(volume, volume_ema, i15, cfg_obj)
+    votes = {
+        "wick_or_pattern": bool(wick_or_pattern_ok),
+        "fib_zone": bool(fib_ok),
+        "divergence": bool(divergence_ok),
+        "volume_exhaustion": bool(volume_ok),
+    }
+    passed = sum(votes.values())
+    vote_ok = bool(passed >= cfg_obj.FIB_REVERSAL_CONFLUENCE_REQUIRED)
+    return vote_ok, passed, votes
