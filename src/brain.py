@@ -291,57 +291,7 @@ class BrainEngine:
         logger_run.info("🧠 Brain generating analysis report...")
         recs = await self.generate_recommendations()
         from alerts import escape_markdown_v2
-        lines = [
-            "🧠 *BRAIN ANALYSIS REPORT*",
-            f"Generated: {format_ist_time()}",
-            f"Pairs monitored: {len(pairs)}",
-            f"Real trades sampled: {recs['real_sample_size']} | Shadow-tracked: {recs['shadow_sample_size']}",
-            "",
-        ]
-
-        high = [r for r in recs["recommendations"] if r["severity"] == "high"]
-        med = [r for r in recs["recommendations"] if r["severity"] == "medium"]
-        low = [r for r in recs["recommendations"] if r["severity"] == "low"]
-
-        if high:
-            lines.append("*🔴 HIGH PRIORITY*")
-            for r in high[:6]:
-                lines.append(f"• {r['message']}")
-            lines.append("")
-        if med:
-            lines.append("*🟡 WATCH*")
-            for r in med[:6]:
-                lines.append(f"• {r['message']}")
-            lines.append("")
-        if low:
-            lines.append("*🟢 STRONG PERFORMERS*")
-            for r in low[:6]:
-                lines.append(f"• {r['message']}")
-            lines.append("")
-
-        ss = recs.get("shadow_summary") or {}
-        if ss.get("total_tracked"):
-            lines.append("*👻 SHADOW MODE*")
-            if ss.get("overall_wr") is not None:
-                lines.append(f"{ss['total_tracked']} rejected alert(s) tracked | overall WR {ss['overall_wr']:.0%}")
-            else:
-                lines.append(f"{ss['total_tracked']} rejected alert(s) tracked")
-            if ss.get("high_confluence_wr") is not None:
-                lines.append(
-                    f"High-confluence rejections ({ss['high_confluence_tracked']}): "
-                    f"{ss['high_confluence_wr']:.0%} WR"
-                )
-            lines.append("")
-
-        if recs["config_patch"]:
-            lines.append("*⚙️ SUGGESTED config_macd.json PATCH*")
-            lines.append("```")
-            lines.append(json_dumps(recs["config_patch"]))
-            lines.append("```")
-
-        if recs["recommendation_count"] == 0:
-            lines.append("No actionable signal yet — still accumulating samples.")
-
+        
         # Build lines with dynamic content escaped, formatting preserved
         lines = [
             "🧠 *BRAIN ANALYSIS REPORT*",
