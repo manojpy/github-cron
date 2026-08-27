@@ -433,7 +433,7 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
                 pair = k[prefix_len:].split(":", 1)[0]
                 pending_by_pair.setdefault(pair, []).append(k)
 
-        state_db._pending_outcome_keys_by_pair = pending_by_pair
+        state_db._pending_outcome_keys_by_pair = pending_by_pair 
             total = sum(len(v) for v in pending_by_pair.values())
             if total:
                 logger_main.info(f"⏳ Pre-scanned {total} pending outcome(s) across {len(pending_by_pair)} pair(s)")
