@@ -348,6 +348,8 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         if cfg.ENABLE_WIN_RATE_FILTER:
             await sdb.resolve_pending_outcomes(pair_name, data_15m, i15, logger_pair)
+            if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
+                await sdb.resolve_shadow_pending_outcomes(pair_name, data_15m, i15, logger_pair)
 
         is_valid_for_buy, is_valid_for_sell, candle_info, error_msg = validate_candle_for_alerts(
             data_15m=data_15m.as_dict(),
@@ -491,7 +493,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         # ══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
-        # ═══════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )

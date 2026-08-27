@@ -432,7 +432,8 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             for k in keys:
                 pair = k[prefix_len:].split(":", 1)[0]
                 pending_by_pair.setdefault(pair, []).append(k)
-            state_db._pending_outcome_keys_by_pair = pending_by_pair
+
+        state_db._pending_outcome_keys_by_pair = pending_by_pair
             total = sum(len(v) for v in pending_by_pair.values())
             if total:
                 logger_main.info(f"⏳ Pre-scanned {total} pending outcome(s) across {len(pending_by_pair)} pair(s)")
@@ -441,6 +442,25 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
             state_db._pending_outcome_keys_by_pair = None
     else:
         state_db._pending_outcome_keys_by_pair = None
+
+    if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE and not state_db.degraded and state_db._redis:
+        try:
+            pattern = f"{RedisKeyPrefix.SHADOW_PENDING}*"
+            keys = [k async for k in state_db._redis.scan_iter(match=pattern, count=500)]
+            prefix_len = len(RedisKeyPrefix.SHADOW_PENDING)
+            shadow_by_pair: Dict[str, List[str]] = {}
+            for k in keys:
+                pair = k[prefix_len:].split(":", 1)[0]
+                shadow_by_pair.setdefault(pair, []).append(k)
+            state_db._shadow_pending_outcome_keys_by_pair = shadow_by_pair
+            total = sum(len(v) for v in shadow_by_pair.values())
+            if total:
+                logger_main.info(f"👻 Pre-scanned {total} shadow pending outcome(s) across {len(shadow_by_pair)} pair(s)")
+        except Exception as e:
+            logger_main.warning(f"Shadow pending outcome pre-scan failed: {e}")
+            state_db._shadow_pending_outcome_keys_by_pair = None
+    else:
+        state_db._shadow_pending_outcome_keys_by_pair = None
 
     logger_main.debug("⚙️ Phase 2: Preparing evaluation tasks...")
 
@@ -787,6 +807,12 @@ async def run_once() -> Optional[bool]:
         )
         logger_run.info(summary)
 
+        if cfg.ENABLE_BRAIN:
+            try:
+                from brain import BrainEngine
+                await BrainEngine(sdb).maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
+            except Exception as e:
+                logger_run.warning(f"Brain report generation failed: {e}")
         if alerts_sent_ref[0] > MAX_ALERTS_PER_RUN:
             await telegram_queue.send(escape_markdown_v2(
                 f"⚠️ HIGH ALERT VOLUME\n"

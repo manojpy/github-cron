@@ -109,6 +109,11 @@ class RedisKeyPrefix:
     ALERT_STATS = "alert_stats:"
     OUTCOME_LOG_STREAM = "outcome_log_stream"
     TLR_TOUCH = "tlr_touch:"
+    SHADOW_PENDING = "shadow_pending:"
+    SHADOW_STATS = "shadow_stats:"
+    SHADOW_LOG_STREAM = "shadow_log_stream"
+    SHADOW_HICONF_STATS = "shadow_hiconf:"
+    BRAIN_RUN_COUNTER = "brain_run_counter"
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -467,6 +472,29 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
 
+    async def record_shadow_pending_outcome(self, pair: str, alert_key: str, direction: str,
+                                              entry_ts: int, entry_price: float,
+                                              confluence_score: Optional[float] = None,
+                                              confluence_total: Optional[float] = None) -> None:
+        """Twin of record_pending_outcome for alerts REJECTED by the win-rate filter.
+        Lets the brain see what would have happened had the alert fired."""
+        if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
+            return
+        key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
+        try:
+            payload = json_dumps({
+                "direction": direction, "entry_ts": entry_ts, "entry_price": entry_price,
+                "confluence_score": confluence_score, "confluence_total": confluence_total,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to serialize shadow pending outcome for {pair}:{alert_key}: {e}")
+            return
+        ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60
+        try:
+            await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
+        except Exception as e:
+            logger.warning(f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}")
+
     async def get_tlr_touch_state(self, pair: str, is_buy: bool) -> Optional[Dict[str, Any]]:
         """Load persisted TLR touch-count state for a pair/direction. Returns
         None if degraded, unset, or on any Redis error (caller treats None
@@ -661,6 +689,129 @@ class RedisStateStore:
             f"missing_score={missing_score_count} | "
             f"bad_payload={bad_payload_count}"
         )
+
+    async def resolve_shadow_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
+                                                logger_pair: logging.Logger) -> None:
+        """Twin of resolve_pending_outcomes for shadow (rejected) alerts. Same grading logic,
+        writes to SHADOW_STATS/SHADOW_LOG_STREAM instead, and additionally pools outcomes whose
+        confluence was in the 'rewardable' bucket into SHADOW_HICONF_STATS for override checks."""
+        if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False) or not getattr(cfg, "BRAIN_SHADOW_MODE", True) or not self._redis:
+            return
+
+        precomputed = getattr(self, "_shadow_pending_outcome_keys_by_pair", None)
+        if precomputed is not None:
+            keys = precomputed.get(pair, [])
+            if not keys:
+                return
+        else:
+            try:
+                pattern = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:*"
+                keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
+            except Exception as e:
+                logger_pair.debug(f"Failed to scan shadow pending outcomes for {pair}: {e}")
+                return
+
+        if not keys:
+            return
+
+        try:
+            async with self._redis.pipeline() as read_pipe:
+                for key in keys:
+                    read_pipe.get(key)
+                raw_values = await asyncio.wait_for(read_pipe.execute(), timeout=2.0)
+        except Exception as e:
+            logger_pair.warning(f"Failed to batch-fetch shadow pending outcomes for {pair}: {e}")
+            return
+
+        resolved_count = 0
+        hiconf_pct = getattr(cfg, "BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT", 80.0)
+        stats_ttl = max(cfg.STATE_EXPIRY_DAYS * 86400, 7 * 86400)
+
+        try:
+            async with self._redis.pipeline() as write_pipe:
+                pending_writes = 0
+
+                for key, raw in zip(keys, raw_values):
+                    try:
+                        if raw is None:
+                            continue
+
+                        data = json_loads(raw)
+                        entry_ts = int(data["entry_ts"])
+                        direction = data["direction"]
+                        entry_price = float(data["entry_price"])
+                        conf_score = data.get("confluence_score")
+                        conf_total = data.get("confluence_total")
+
+                        if entry_price <= 0:
+                            continue
+
+                        direction_norm = str(direction).lower()
+                        if direction_norm in ("buy", "long"):
+                            is_buy = True
+                        elif direction_norm in ("sell", "short"):
+                            is_buy = False
+                        else:
+                            continue
+
+                        entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
+                        if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
+                            exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
+                            if exact_matches.size == 0:
+                                continue  # scrolled out of window; leave pending for next run
+                            entry_idx = int(exact_matches[-1])
+
+                        target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
+                        if target_idx > i15:
+                            continue  # not enough candles closed yet
+
+                        future_price = float(data_15m.close[target_idx])
+                        pct_move = (future_price - entry_price) / entry_price * 100.0
+                        win = (
+                            pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
+                            if is_buy
+                            else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
+                        )
+
+                        alert_key = key.split(":")[-2]
+                        stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
+                        write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
+                        write_pipe.expire(stats_key, stats_ttl)
+
+                        if conf_score is not None and conf_total is not None and conf_total > 0:
+                            conf_pct = (conf_score / conf_total) * 100.0
+                            write_pipe.xadd(
+                                RedisKeyPrefix.SHADOW_LOG_STREAM,
+                                {
+                                    "pair": str(pair), "alert_key": str(alert_key),
+                                    "direction": str(direction), "score": str(conf_score),
+                                    "total": str(conf_total), "pct_move": f"{pct_move:.4f}",
+                                    "win": "1" if win else "0", "entry_ts": str(entry_ts),
+                                },
+                                maxlen=50000, approximate=True,
+                            )
+                            if conf_pct >= hiconf_pct:
+                                hiconf_key = f"{RedisKeyPrefix.SHADOW_HICONF_STATS}{alert_key}"
+                                write_pipe.hincrby(hiconf_key, "wins" if win else "losses", 1)
+                                write_pipe.expire(hiconf_key, stats_ttl)
+
+                        write_pipe.delete(key)
+                        pending_writes += 1
+                        resolved_count += 1
+
+                    except Exception as e:
+                        logger_pair.debug(f"Failed to resolve shadow pending outcome {key}: {e}")
+                        continue
+
+                if pending_writes:
+                    await asyncio.wait_for(write_pipe.execute(), timeout=2.0)
+
+        except Exception as e:
+            logger_pair.debug(f"Failed to persist resolved shadow outcomes for {pair}: {e}")
+            return
+
+        if resolved_count:
+            logger_pair.debug(f"[{pair}] Shadow outcome resolution | resolved={resolved_count}")
 
     async def get_alert_win_rate(self, pair: str, alert_key: str) -> Tuple[Optional[float], int]:
         """Returns (win_rate, sample_size). win_rate is None until MIN_WIN_RATE_SAMPLE is reached."""

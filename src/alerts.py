@@ -1194,10 +1194,44 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 pair_name, alert_keys_to_check, timeout=3.0
             )
 
+            direction = "buy" if gr.direction_is_buy else "sell"
             surviving_alerts = []
+
+            brain_engine = None
+            if cfg.ENABLE_BRAIN:
+                try:
+                    from brain import BrainEngine
+                    brain_engine = BrainEngine(sdb)
+                except Exception as e:
+                    logger_pair.debug(f"Brain engine init failed: {e}")
+
             for alert_title, alert_extra, alert_key in alerts_to_send:
                 win_rate, sample = win_rate_map.get(alert_key, (None, 0))
                 if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
+                    override_reason = None
+                    if brain_engine:
+                        try:
+                            override_reason = await brain_engine.check_rewardable_override(
+                                alert_key, confluence_score, confluence_total
+                            )
+                        except Exception as e:
+                            logger_pair.debug(f"Brain override check failed for {alert_key}: {e}")
+
+                    if override_reason:
+                        logger_pair.info(
+                            f"[{pair_name}] 🧠 Rewardable override for {alert_key}: "
+                            f"WR={win_rate:.0%} below {cfg.MIN_WIN_RATE:.0%}, but {override_reason}"
+                        )
+                        alert_extra = f"{alert_extra} | 🧠 {override_reason}"
+                        surviving_alerts.append((alert_title, alert_extra, alert_key))
+                        continue
+
+                    if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
+                        await sdb.record_shadow_pending_outcome(
+                            pair_name, alert_key, direction, ts_curr, close_curr,
+                            confluence_score=confluence_score, confluence_total=confluence_total,
+                        )
+
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: "
                         f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
