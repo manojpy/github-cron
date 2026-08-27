@@ -1135,7 +1135,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
             pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-            required = pct_floor if reversal_only_cycle else max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
+            required = max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
             if confluence_score < required:
                 logger_pair.info(
                     f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"

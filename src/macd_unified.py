@@ -148,12 +148,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         score, total = compute_confluence_score(gr, is_buy=buy_side)
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
-        required = pct_floor if reversal_only_cycle else max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
+        required = max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
         if score < required:
             logger_pair.debug(
                 f"[{pair_name}] Confluence gate blocked: {score:.1f}/{total:.1f} weighted score "
                 f"(need {required:.1f}, pct-floor={pct_floor:.1f}, "
-                f"abs-floor={'n/a (reversal-only)' if reversal_only_cycle else f'{cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}'}) — skipping Phase-2 indicators"
+                f"abs-floor={cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) — skipping Phase-2 indicators"
             )
             await _blanket_reset_pair(sdb, pair_name, logger_pair)
             return pair_name, {
