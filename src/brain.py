@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from bot_config import cfg, json_dumps, format_ist_time
 from state import RedisKeyPrefix, RedisStateStore
-from alerts import escape_markdown_v2
+
 
 _ALERT_CONFIG_MAP = {
     "strong_reversal_buy":  "ENABLE_STRONG_REVERSAL_ALERT",
@@ -290,7 +290,7 @@ class BrainEngine:
 
         logger_run.info("🧠 Brain generating analysis report...")
         recs = await self.generate_recommendations()
-
+        from alerts import escape_markdown_v2
         lines = [
             "🧠 *BRAIN ANALYSIS REPORT*",
             f"Generated: {format_ist_time()}",

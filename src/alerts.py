@@ -21,7 +21,6 @@ from fetcher import (
 )
 from state import RedisStateStore, TokenBucket
 from gates import GateResult, IndicatorCache
-from brain import BrainEngine
 
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
