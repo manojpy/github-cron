@@ -1915,10 +1915,14 @@ def _tlr_confluence_vote(h: np.ndarray, l: np.ndarray, atr_short_arr: np.ndarray
     return vote_ok, passed, votes
 
 def _fib_reversal_swing_info(h: np.ndarray, l: np.ndarray, c: np.ndarray, i15: int, is_buy: bool, cfg_obj):
-    length = cfg_obj.FIB_REVERSAL_SWING_LENGTH
     lookback_start = max(0, i15 - cfg_obj.FIB_REVERSAL_SWING_LOOKBACK_CANDLES)
-    if i15 - 1 < lookback_start or i15 - 1 < length:
+    if i15 - 1 < lookback_start:
         return False, None, None, None
+
+    def _pivots_for(length):
+        if i15 - 1 < length:
+            return [], []
+        return _get_minor_swings(h, l, length, start=lookback_start, end=i15 - 1)
 
     tops, btms = _pivots_for(cfg_obj.FIB_REVERSAL_SWING_LENGTH)
     pivots = btms if is_buy else tops
