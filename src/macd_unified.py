@@ -612,12 +612,14 @@ async def run_once() -> Optional[bool]:
         if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true": 
             if sdb and not sdb.degraded:
                 logger_run.warning("🚨 CLEAR_ALL_STATES requested — purging all Redis alert states...")
-                st, dd, oo = await _clear_all_redis_states(sdb, pairs_to_process, logger_run)
+                st, dd, pend, sp, ast, sst, shc, strm = await _clear_all_redis_states(sdb, pairs_to_process, logger_run)
                 if telegram_queue is None:
                     telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
                     f"🧹 {cfg.BOT_NAME} All stored alert states cleared\n"
-                    f"States: {st} | Dedups: {dd} | Outcomes: {oo}\n"
+                    f"States: {st} | Dedups: {dd} | Pending: {pend} | ShadowPending: {sp}\n"
+                    f"AlertStats: {ast} | ShadowStats: {sst} | ShadowHiConf: {shc}\n"
+                    f"Streams: {strm}\n"
                     f"Time: {format_ist_time()}"
                 ))
             else:

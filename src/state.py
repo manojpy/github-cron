@@ -27,14 +27,19 @@ async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair:
         )
     return len(resets)
 
-async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger) -> Tuple[int, int, int]:
+async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger: logging.Logger) -> Tuple[int, int, int, int, int, int, int, int]:
     if sdb.degraded or not sdb._redis:
         logger.warning("Redis degraded — skipping mass state purge")
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0
 
     deleted_states = 0
     deleted_dedups = 0
-    deleted_outcomes = 0
+    deleted_pending = 0
+    deleted_shadow_pending = 0
+    deleted_alert_stats = 0
+    deleted_shadow_stats = 0
+    deleted_shadow_hiconf = 0
+    deleted_streams = 0
 
     async def _scan_keys_with_timeout(match: str, count: int = 100, timeout: float = 10.0) -> List[str]:
         """Safely consume an async scan_iter with a timeout to prevent runaway loops."""
@@ -71,18 +76,48 @@ async def _clear_all_redis_states(sdb: RedisStateStore, pairs: List[str], logger
         deleted_dedups = await _batch_unlink(dedup_keys)
 
         # ── 3. Pending Outcomes (Win-rate tracking queue) ──
-        outcome_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.OUTCOME_PENDING}*", count=100)
-        deleted_outcomes = await _batch_unlink(outcome_keys)
+        pending_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.OUTCOME_PENDING}*", count=100)
+        deleted_pending = await _batch_unlink(pending_keys)
+
+        # ── 4. Shadow Pending Outcomes ──
+        shadow_pending_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_PENDING}*", count=100)
+        deleted_shadow_pending = await _batch_unlink(shadow_pending_keys)
+
+        # ── 5. Alert Stats (per-pair win/loss counters) ──
+        alert_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.ALERT_STATS}*", count=100)
+        deleted_alert_stats = await _batch_unlink(alert_stats_keys)
+
+        # ── 6. Shadow Stats ──
+        shadow_stats_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_STATS}*", count=100)
+        deleted_shadow_stats = await _batch_unlink(shadow_stats_keys)
+
+        # ── 7. Shadow Hi-Conf Stats ──
+        hiconf_keys = await _scan_keys_with_timeout(f"{RedisKeyPrefix.SHADOW_HICONF_STATS}*", count=100)
+        deleted_shadow_hiconf = await _batch_unlink(hiconf_keys)
+
+        # ── 8. Streams & Counters (outcome_log_stream, shadow_log_stream, brain_run_counter, brain_report:*) ──
+        exact_keys = [
+            RedisKeyPrefix.OUTCOME_LOG_STREAM,
+            RedisKeyPrefix.SHADOW_LOG_STREAM,
+            RedisKeyPrefix.BRAIN_RUN_COUNTER,
+        ]
+        brain_report_keys = await _scan_keys_with_timeout("brain_report:*", count=50)
+        all_stream_keys = exact_keys + brain_report_keys
+        deleted_streams = await _batch_unlink(all_stream_keys)
 
         logger.info(
             f"🧹 MASS RESET complete | "
-            f"States: {deleted_states} | Dedups: {deleted_dedups} | Outcomes: {deleted_outcomes}"
+            f"States: {deleted_states} | Dedups: {deleted_dedups} | "
+            f"Pending: {deleted_pending} | ShadowPending: {deleted_shadow_pending} | "
+            f"AlertStats: {deleted_alert_stats} | ShadowStats: {deleted_shadow_stats} | "
+            f"ShadowHiConf: {deleted_shadow_hiconf} | Streams: {deleted_streams}"
         )
-        return deleted_states, deleted_dedups, deleted_outcomes
+        return (deleted_states, deleted_dedups, deleted_pending, deleted_shadow_pending,
+                deleted_alert_stats, deleted_shadow_stats, deleted_shadow_hiconf, deleted_streams)
 
     except Exception as e:
         logger.error(f"Mass reset failed: {e}")
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0
 
 def build_products_map_from_cfg() -> Dict[str, dict]:
     products_map: Dict[str, dict] = {}
