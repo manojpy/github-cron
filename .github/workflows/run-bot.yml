@@ -18,22 +18,22 @@ on:
       clear_active_states:
         description: 'Clear active alert states (pair_state:*)'
         required: false
-        default: true
+        default: false
         type: boolean
       clear_dedups:
         description: 'Clear dedup keys (recent_alert:*)'
         required: false
-        default: true
+        default: false
         type: boolean
       clear_pending_outcomes:
         description: 'Clear pending outcome queue (outcome_pending:*)'
         required: false
-        default: true
+        default: false
         type: boolean
       clear_shadow_pending:
         description: 'Clear shadow pending queue (shadow_pending:*)'
         required: false
-        default: true
+        default: false
         type: boolean
       clear_winrate_stats:
         description: 'Clear win-rate counters (alert_stats:*)'
