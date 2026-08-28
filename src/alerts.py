@@ -1080,7 +1080,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
     alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
-    data_5m: PriceData, confluence_score: Optional[float] = None, confluence_total: Optional[float] = None, reversal_only_cycle: bool = False) -> Tuple[str, Dict[str, Any]]:
+    data_5m: PriceData, confluence_score: Optional[float] = None, confluence_total: Optional[float] = None) -> Tuple[str, Dict[str, Any]]:
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     data_15m = gr.data_15m
@@ -1135,24 +1135,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             capped_alerts = raw_alerts
 
         alerts_to_send = capped_alerts[:cfg.MAX_ALERTS_PER_PAIR]
-
-        if alerts_to_send:
-            color_guarded = []
-            for title, extra, alert_key in alerts_to_send:
-                if alert_key in BUY_ALERT_KEYS and not gr.is_green:
-                    logger_pair.warning(
-                        f"[{pair_name}] 🚫 COLOR GUARD killed BUY '{alert_key}': "
-                        f"not a green candle (O={gr.open_curr:.4f} C={gr.close_curr:.4f})"
-                    )
-                    continue
-                if alert_key in SELL_ALERT_KEYS and not gr.is_red:
-                    logger_pair.warning(
-                        f"[{pair_name}] 🚫 COLOR GUARD killed SELL '{alert_key}': "
-                        f"not a red candle (O={gr.open_curr:.4f} C={gr.close_curr:.4f})"
-                    )
-                    continue
-                color_guarded.append((title, extra, alert_key))
-            alerts_to_send = color_guarded
 
         cached_snapshot: Optional[CandleSnapshot] = None
         if alerts_to_send:
@@ -1639,9 +1621,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     reasons.append(f"Ichimoku Cloud sell: price not below cloud / future not red (vote)")
 
             if not cloud_group_ok_buy:
-                reasons.append("Cloud group buy: need ALL enabled votes true (Ichimoku/RMA cloud) — abstention or disagreement")
+                reasons.append("Cloud group buy: need ANY enabled vote true (Ichimoku/RMA cloud) — all disagree or abstain")
             if not cloud_group_ok_sell:
-                reasons.append("Cloud group sell: need ALL enabled votes true (Ichimoku/RMA cloud) — abstention or disagreement")
+                reasons.append("Cloud group sell: need ANY enabled vote true (Ichimoku/RMA cloud) — all disagree or abstain")
             if not oscillator_group_ok_buy:
                 reasons.append(f"Oscillator group buy: need {Constants.OSCILLATOR_GROUP_MIN_VOTES}-of-3 (PPO/RSI/TK) — not met")
             if not oscillator_group_ok_sell:

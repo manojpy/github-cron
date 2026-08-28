@@ -25,11 +25,14 @@ twins, for the same reason the rest of the outcome pipeline lives there.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
+from alerts import escape_markdown_v2
+        
 from bot_config import cfg, json_dumps, format_ist_time
 from state import RedisKeyPrefix, RedisStateStore
 
@@ -155,7 +158,8 @@ class BrainEngine:
                     "win": f.get("win") == "1",
                     "pct_move": float(f.get("pct_move", 0.0)),
                 })
-            except (KeyError, ValueError):
+            except (KeyError, ValueError) as e:
+                logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
                 continue
         return parsed
 
@@ -166,8 +170,13 @@ class BrainEngine:
         threshold suggestion, shadow-mode insight, and a machine-readable
         config patch."""
         sample_size = getattr(cfg, "BRAIN_REPORT_STREAM_SAMPLE", 5000)
-        real_rows = self._parse_rows(await self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size))
-        shadow_rows = self._parse_rows(await self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size))
+
+        real_raw, shadow_raw = await asyncio.gather(
+            self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, sample_size),
+            self._read_stream(RedisKeyPrefix.SHADOW_LOG_STREAM, sample_size),
+        )
+        real_rows = self._parse_rows(real_raw)
+        shadow_rows = self._parse_rows(shadow_raw)
 
         recommendations: List[Dict[str, Any]] = []
         config_patch: List[Dict[str, Any]] = []
@@ -315,14 +324,15 @@ class BrainEngine:
 
         logger_run.info("🧠 Brain generating analysis report...")
         recs = await self.generate_recommendations()
-        from alerts import escape_markdown_v2
         
         # Build lines with dynamic content escaped, formatting preserved
         lines = [
             "🧠 *BRAIN ANALYSIS REPORT*",
             f"Generated: {escape_markdown_v2(format_ist_time())}",
             f"Pairs monitored: {len(pairs)}",
-            f"Real trades sampled: {recs['real_sample_size']} {escape_markdown_v2('|')} Shadow\\-tracked: {recs['shadow_sample_size']}",
+            escape_markdown_v2(
+                f"Real trades sampled: {recs['real_sample_size']} | Shadow-tracked: {recs['shadow_sample_size']}"
+            ),
             "",
         ]
         high = [r for r in recs["recommendations"] if r["severity"] == "high"]
@@ -380,12 +390,13 @@ class BrainEngine:
 
         # Persist full report for external tooling / audit
         if self.sdb._redis and not self.sdb.degraded:
-            try:
-                report_key = f"brain_report:{int(time.time())}"
-                await self.sdb._redis.set(report_key, json_dumps(recs), ex=30 * 86400)
-            except Exception as e:
-                logger_run.warning(f"Failed to persist brain report: {e}")
-
+            report_key = f"brain_report:{int(time.time())}"
+            result = await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.set(report_key, json_dumps(recs), ex=30 * 86400),
+                2.0, f"brain_report_persist:{report_key}",
+            )
+            if result is None:
+                logger_run.warning(f"Failed to persist brain report {report_key}")
         logger_run.info(
             f"🧠 Brain report sent | {len(high)} high, {len(med)} medium, {len(low)} low priority items"
         )

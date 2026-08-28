@@ -1054,16 +1054,15 @@ def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
         zone_prior_leg = _prior_leg_direction(
             c, h, l, leg_ref, Constants.REVERSAL_PRIOR_LEG_LOOKBACK
         )
-
         if confirmed_idx == i15:
-            if z.is_demand and zone_prior_leg == -1:
+            if z.is_demand and zone_prior_leg == -1 and ob_ok_buy is not True:
                 ob_ok_buy = True
                 zone_type = "Internal" if z.is_internal else "Swing"
                 reason_buy = (
                     f"Pine {zone_type} Demand OB {z.bottom:.4g}-{z.top:.4g} (idx {z.index}) "
                     f"reversed after down-leg, touched idx {touch_idx}"
                 )
-            elif (not z.is_demand) and zone_prior_leg == 1:
+            elif (not z.is_demand) and zone_prior_leg == 1 and ob_ok_sell is not True:
                 ob_ok_sell = True
                 zone_type = "Internal" if z.is_internal else "Swing"
                 reason_sell = (

@@ -527,25 +527,85 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to save TLR touch state for {pair}:{direction}: {e}")
 
+    async def _fetch_pending_keys(
+        self, pair: str, precomputed_attr: str, key_prefix: str,
+        logger_pair: logging.Logger, label: str,
+    ) -> List[str]:
+        """Shared key-lookup for resolve_pending_outcomes / resolve_shadow_pending_outcomes:
+        use the run-level pre-scan when available, else fall back to a per-pair scan."""
+        precomputed = getattr(self, precomputed_attr, None)
+        if precomputed is not None:
+            return precomputed.get(pair, [])
+        try:
+            pattern = f"{key_prefix}{pair}:*"
+            return [k async for k in self._redis.scan_iter(match=pattern, count=100)]
+        except Exception as e:
+            logger_pair.debug(f"Failed to scan {label} outcomes for {pair}: {e}")
+            return []
+
+    def _parse_pending_outcome_row(
+        self, key: str, raw: Optional[str], data_15m: "PriceData", i15: int,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        if raw is None:
+            return None, "raced"
+
+        data = json_loads(raw)
+        entry_ts = int(data["entry_ts"])
+        direction = data["direction"]
+        entry_price = float(data["entry_price"])
+        conf_score = data.get("confluence_score")
+        conf_total = data.get("confluence_total")
+
+        if entry_price <= 0:
+            return None, "bad_entry_price"
+
+        direction_norm = str(direction).lower()
+        if direction_norm in ("buy", "long"):
+            is_buy = True
+        elif direction_norm in ("sell", "short"):
+            is_buy = False
+        else:
+            return None, "bad_direction"
+
+        entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
+        if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
+            exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
+            if exact_matches.size == 0:
+                return None, "ts_mismatch"
+            entry_idx = int(exact_matches[-1])
+
+        target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
+        if target_idx > i15:
+            return None, "not_ready"
+
+        future_price = float(data_15m.close[target_idx])
+        pct_move = (future_price - entry_price) / entry_price * 100.0
+        win = (
+            pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
+            if is_buy
+            else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
+        )
+
+        return {
+            "alert_key": key.split(":")[-2],
+            "direction": direction,
+            "entry_ts": entry_ts,
+            "is_buy": is_buy,
+            "pct_move": pct_move,
+            "win": win,
+            "conf_score": conf_score,
+            "conf_total": conf_total,
+        }, ""
+
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
                                          logger_pair: logging.Logger) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER or not self._redis:
             return
 
-        # Use the run-level pre-scan when available (falls back to per-pair scan otherwise)
-        precomputed = getattr(self, "_pending_outcome_keys_by_pair", None)
-        if precomputed is not None:
-            keys = precomputed.get(pair, [])
-            if not keys:
-                return
-        else:
-            try:
-                pattern = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:*"
-                keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
-            except Exception as e:
-                logger_pair.debug(f"Failed to scan pending outcomes for {pair}: {e}")
-                return
-
+        keys = await self._fetch_pending_keys(
+            pair, "_pending_outcome_keys_by_pair", RedisKeyPrefix.OUTCOME_PENDING,
+            logger_pair, "pending",
+        )
         if not keys:
             return
 
@@ -572,67 +632,39 @@ class RedisStateStore:
 
                 for key, raw in zip(keys, raw_values):
                     try:
-                        if raw is None:
-                            # Race: expired between scan and fetch; harmless, skip silently
+                        result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
+
+                        if skip_reason == "raced":
                             continue
-
-                        data = json_loads(raw)
-                        entry_ts = int(data["entry_ts"])
-                        direction = data["direction"]
-                        entry_price = float(data["entry_price"])
-                        conf_score = data.get("confluence_score")
-                        conf_total = data.get("confluence_total")
-
-                        if entry_price <= 0:
-                            logger_pair.debug(
-                                f"Invalid entry_price {entry_price} for pending outcome {key}; skipping"
-                            )
+                        if skip_reason == "bad_entry_price":
+                            logger_pair.debug(f"Invalid entry_price for pending outcome {key}; skipping")
                             bad_payload_count += 1
                             continue
-
-                        direction_norm = str(direction).lower()
-                        if direction_norm in ("buy", "long"):
-                            is_buy = True
-                        elif direction_norm in ("sell", "short"):
-                            is_buy = False
-                        else:
-                            logger_pair.debug(
-                                f"Unknown direction '{direction}' for pending outcome {key}; skipping"
-                            )
+                        if skip_reason == "bad_direction":
+                            logger_pair.debug(f"Unknown direction for pending outcome {key}; skipping")
                             bad_payload_count += 1
                             continue
-
-                        entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
-                        # ── DEFENSIVE: fallback to exact match if searchsorted missed due to out-of-order timestamps ──
-                        if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
-                            exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
-                            if exact_matches.size == 0:
-                                ts_mismatch_count += 1
-                                if cfg.DEBUG_MODE:
-                                    logger_pair.debug(
-                                        f"[{pair}] Outcome entry_ts not found | "
-                                        f"entry_ts={entry_ts} | "
-                                        f"first_ts={data_15m.ts[0] if len(data_15m.ts) else None} | "
-                                        f"last_ts={data_15m.ts[-1] if len(data_15m.ts) else None}"
-                                    )
-                                continue  # scrolled out of window; leave pending for next run
-                            entry_idx = int(exact_matches[-1])
-                        # ── END DEFENSIVE ──
-
-                        target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
-                        if target_idx > i15:
+                        if skip_reason == "ts_mismatch":
+                            ts_mismatch_count += 1
+                            if cfg.DEBUG_MODE:
+                                logger_pair.debug(
+                                    f"[{pair}] Outcome entry_ts not found | "
+                                    f"first_ts={data_15m.ts[0] if len(data_15m.ts) else None} | "
+                                    f"last_ts={data_15m.ts[-1] if len(data_15m.ts) else None}"
+                                )
+                            continue
+                        if skip_reason == "not_ready":
                             not_ready_count += 1
-                            continue  # not enough candles closed yet; grade on a later run
+                            continue
 
-                        future_price = float(data_15m.close[target_idx])
-                        pct_move = (future_price - entry_price) / entry_price * 100.0
-                        win = (
-                            pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
-                            if is_buy
-                            else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
-                        )
+                        alert_key = result["alert_key"]
+                        direction = result["direction"]
+                        entry_ts = result["entry_ts"]
+                        pct_move = result["pct_move"]
+                        win = result["win"]
+                        conf_score = result["conf_score"]
+                        conf_total = result["conf_total"]
 
-                        alert_key = key.split(":")[-2]
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)
@@ -698,19 +730,10 @@ class RedisStateStore:
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False) or not getattr(cfg, "BRAIN_SHADOW_MODE", True) or not self._redis:
             return
 
-        precomputed = getattr(self, "_shadow_pending_outcome_keys_by_pair", None)
-        if precomputed is not None:
-            keys = precomputed.get(pair, [])
-            if not keys:
-                return
-        else:
-            try:
-                pattern = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:*"
-                keys = [k async for k in self._redis.scan_iter(match=pattern, count=100)]
-            except Exception as e:
-                logger_pair.debug(f"Failed to scan shadow pending outcomes for {pair}: {e}")
-                return
-
+        keys = await self._fetch_pending_keys(
+            pair, "_shadow_pending_outcome_keys_by_pair", RedisKeyPrefix.SHADOW_PENDING,
+            logger_pair, "shadow pending",
+        )
         if not keys:
             return
 
@@ -733,47 +756,18 @@ class RedisStateStore:
 
                 for key, raw in zip(keys, raw_values):
                     try:
-                        if raw is None:
+                        result, skip_reason = self._parse_pending_outcome_row(key, raw, data_15m, i15)
+                        if skip_reason:
                             continue
 
-                        data = json_loads(raw)
-                        entry_ts = int(data["entry_ts"])
-                        direction = data["direction"]
-                        entry_price = float(data["entry_price"])
-                        conf_score = data.get("confluence_score")
-                        conf_total = data.get("confluence_total")
+                        alert_key = result["alert_key"]
+                        direction = result["direction"]
+                        entry_ts = result["entry_ts"]
+                        pct_move = result["pct_move"]
+                        win = result["win"]
+                        conf_score = result["conf_score"]
+                        conf_total = result["conf_total"]
 
-                        if entry_price <= 0:
-                            continue
-
-                        direction_norm = str(direction).lower()
-                        if direction_norm in ("buy", "long"):
-                            is_buy = True
-                        elif direction_norm in ("sell", "short"):
-                            is_buy = False
-                        else:
-                            continue
-
-                        entry_idx = int(np.searchsorted(data_15m.ts, entry_ts))
-                        if entry_idx >= len(data_15m.ts) or data_15m.ts[entry_idx] != entry_ts:
-                            exact_matches = np.flatnonzero(data_15m.ts == entry_ts)
-                            if exact_matches.size == 0:
-                                continue  # scrolled out of window; leave pending for next run
-                            entry_idx = int(exact_matches[-1])
-
-                        target_idx = entry_idx + cfg.OUTCOME_LOOKAHEAD_CANDLES
-                        if target_idx > i15:
-                            continue  # not enough candles closed yet
-
-                        future_price = float(data_15m.close[target_idx])
-                        pct_move = (future_price - entry_price) / entry_price * 100.0
-                        win = (
-                            pct_move >= cfg.OUTCOME_FAVORABLE_MOVE_PCT
-                            if is_buy
-                            else pct_move <= -cfg.OUTCOME_FAVORABLE_MOVE_PCT
-                        )
-
-                        alert_key = key.split(":")[-2]
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
                         write_pipe.expire(stats_key, stats_ttl)

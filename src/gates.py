@@ -152,8 +152,7 @@ class GateResult:
     ob_gate_ok_buy: Optional[bool] = None
     ob_gate_ok_sell: Optional[bool] = None
     ob_gate_reason: Optional[str] = None
-    direction_is_buy: bool = True
-
+    
     # -- CHoCH liquidity-sweep reversal (optional confluence vote) --
     choch_gate_ok_buy: Optional[bool] = None
     choch_gate_ok_sell: Optional[bool] = None
@@ -211,11 +210,9 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "vwap_momentum": 1.0,
 }
 
-def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[Set[str]] = None) -> Tuple[float, float]:
-    exclude = exclude or set()
+def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float]:
     score = 0.0
     total = 0.0
-
     base_trend    = gr.base_buy_trend if is_buy else gr.base_sell_trend
     ichimoku_ok   = gr.ichimoku_gate_ok_buy if is_buy else gr.ichimoku_gate_ok_sell
     rma_cloud_ok  = gr.rma_cloud_ok_buy if is_buy else gr.rma_cloud_ok_sell
@@ -225,107 +222,105 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool, exclude: Optional[S
     oi_funding_ok = gr.oi_funding_ok_buy if is_buy else gr.oi_funding_ok_sell
     ob_gate_ok    = gr.ob_gate_ok_buy if is_buy else gr.ob_gate_ok_sell
 
-    base_trend_included = "base_trend" not in exclude
-    if base_trend_included:
-        w = CONFLUENCE_WEIGHTS["base_trend"]
-        total += w
-        if base_trend: score += w
+    w = CONFLUENCE_WEIGHTS["base_trend"]
+    total += w
+    if base_trend: score += w
 
-    if cfg.ICHIMOKU_CLOUD_ENABLED and ichimoku_ok is not None and "ichimoku_cloud" not in exclude:
+    if cfg.ICHIMOKU_CLOUD_ENABLED and ichimoku_ok is not None:
         w = CONFLUENCE_WEIGHTS["ichimoku_cloud"]
         total += w
         if ichimoku_ok: score += w
 
-    if cfg.RMA_CLOUD_ENABLED and rma_cloud_ok is not None and "rma_cloud" not in exclude:
+    if cfg.RMA_CLOUD_ENABLED and rma_cloud_ok is not None:
         w = CONFLUENCE_WEIGHTS["rma_cloud"]
         total += w
         if rma_cloud_ok: score += w
 
-    if cfg.ENABLE_PPO_GATE and "ppo_cross" not in exclude:
+    if cfg.ENABLE_PPO_GATE:
         w = CONFLUENCE_WEIGHTS["ppo_cross"]
         total += w
         if ppo_cross_ok: score += w
 
-    if cfg.RSI_GUARD_ENABLED and "rsi_guard" not in exclude:
+    if cfg.RSI_GUARD_ENABLED:
         w = CONFLUENCE_WEIGHTS["rsi_guard"]
         total += w
         if rsi_guard_ok: score += w
 
-    if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_ok is not None and "tk_guard" not in exclude:
+    if cfg.ICHIMOKU_TK_GUARD_ENABLED and tk_guard_ok is not None:
         w = CONFLUENCE_WEIGHTS["tk_guard"]
         total += w
         if tk_guard_ok: score += w
-    
+
     ppo_gate_mom_ok = gr.ppo_gate_momentum_ok_buy if is_buy else gr.ppo_gate_momentum_ok_sell
-    if cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE and ppo_gate_mom_ok is not None and "ppo_gate_momentum" not in exclude:
+    if cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE and ppo_gate_mom_ok is not None:
         w = CONFLUENCE_WEIGHTS["ppo_gate_momentum"]
         total += w
         if ppo_gate_mom_ok:
             score += w
 
     rsi_guard_mom_ok = gr.rsi_guard_momentum_ok_buy if is_buy else gr.rsi_guard_momentum_ok_sell
-    if cfg.ENABLE_RSI_GUARD_MOMENTUM_VOTE and rsi_guard_mom_ok is not None and "rsi_guard_momentum" not in exclude:
+    if cfg.ENABLE_RSI_GUARD_MOMENTUM_VOTE and rsi_guard_mom_ok is not None:
         w = CONFLUENCE_WEIGHTS["rsi_guard_momentum"]
         total += w
         if rsi_guard_mom_ok:
             score += w
 
     rma_cloud_mom_ok = gr.rma_cloud_momentum_ok_buy if is_buy else gr.rma_cloud_momentum_ok_sell
-    if cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE and rma_cloud_mom_ok is not None and "rma_cloud_momentum" not in exclude:
+    if cfg.ENABLE_RMA_CLOUD_MOMENTUM_VOTE and rma_cloud_mom_ok is not None:
         w = CONFLUENCE_WEIGHTS["rma_cloud_momentum"]
         total += w
         if rma_cloud_mom_ok:
             score += w
 
     vwap_mom_ok = gr.vwap_momentum_ok_buy if is_buy else gr.vwap_momentum_ok_sell
-    if cfg.ENABLE_VWAP_MOMENTUM_VOTE and vwap_mom_ok is not None and "vwap_momentum" not in exclude:
+    if cfg.ENABLE_VWAP_MOMENTUM_VOTE and vwap_mom_ok is not None:
         w = CONFLUENCE_WEIGHTS["vwap_momentum"]
         total += w
         if vwap_mom_ok:
             score += w
 
-    if cfg.ENABLE_ADX_FILTER and "adx" not in exclude:
+    if cfg.ENABLE_ADX_FILTER:
         w = CONFLUENCE_WEIGHTS["adx"]
         total += w
         if gr.adx_ok: score += w
 
-    if (cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED) and "rvol" not in exclude:
+    if cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED:
         w = CONFLUENCE_WEIGHTS["rvol"]
         total += w
         if gr.rvol_ok: score += w
 
-    if cfg.ENABLE_CPR and "cpr" not in exclude:
+    if cfg.ENABLE_CPR:
         w = CONFLUENCE_WEIGHTS["cpr"]
         total += w
         if gr.effective_cpr_ok: score += w
 
-    if cfg.ENABLE_ADX_STRENGTH_VOTE and gr.adx_strength_ok is not None and "adx_strength" not in exclude:
+    if cfg.ENABLE_ADX_STRENGTH_VOTE and gr.adx_strength_ok is not None:
         w = CONFLUENCE_WEIGHTS["adx_strength"]
         total += w
         if gr.adx_strength_ok: score += w
 
-    if cfg.ENABLE_ATR_PCTL_VOTE and gr.atr_pctl_ok is not None and "atr_percentile" not in exclude:
+    if cfg.ENABLE_ATR_PCTL_VOTE and gr.atr_pctl_ok is not None:
         w = CONFLUENCE_WEIGHTS["atr_percentile"]
         total += w
         if gr.atr_pctl_ok: score += w
 
-    if cfg.ENABLE_VOLUME_PCTL_VOTE and gr.volume_pctl_ok is not None and "volume_percentile" not in exclude:
+    if cfg.ENABLE_VOLUME_PCTL_VOTE and gr.volume_pctl_ok is not None:
         w = CONFLUENCE_WEIGHTS["volume_percentile"]
         total += w
         if gr.volume_pctl_ok: score += w
 
-    if cfg.ENABLE_OI_FUNDING_FILTER and oi_funding_ok is not None and "oi_funding" not in exclude:
+    if cfg.ENABLE_OI_FUNDING_FILTER and oi_funding_ok is not None:
         w = CONFLUENCE_WEIGHTS["oi_funding"]
         total += w
         if oi_funding_ok: score += w
 
-    if cfg.ENABLE_OB_GATE and ob_gate_ok is not None and "order_block" not in exclude:
+    if cfg.ENABLE_OB_GATE and ob_gate_ok is not None:
         w = CONFLUENCE_WEIGHTS["order_block"]
         total += w
         if ob_gate_ok:
             score += w
             base_trend_weight = CONFLUENCE_WEIGHTS["base_trend"]
-            other_score = score - w - (base_trend_weight if (base_trend and base_trend_included) else 0.0)
+            other_score = score - w - (base_trend_weight if base_trend else 0.0)
             if other_score < cfg.OB_MIN_OTHER_SCORE:
                 score -= w
 
@@ -412,7 +407,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"[{pair_name}] INVARIANT VIOLATED: is_valid_for_sell=True on non-red candle | "
                 f"O={o:.2f} C={c:.2f}"
             )
-
         logger_pair.debug(
             f"[{pair_name}] 🕯️ Candle | O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} | "
             f"{'🟢 GREEN' if is_green else '🔴 RED'} | "
@@ -493,7 +487,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         # ══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
-        # ══════════════════════════════════════════════════════
+        # ════════════════════��═════════════════════���══════════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
@@ -963,7 +957,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 data_15m.open, data_15m.high, data_15m.low, data_15m.close,
                 atr_short_arr, i15, cfg,
             )
-
             if ob_gate_reason:
                 logger_pair.debug(f"[{pair_name}] OB gate: {ob_gate_reason}")
 
@@ -1077,7 +1070,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             tlr_touch_reason=tlr_touch_reason,
             tlr_trendline_buy=tlr_trendline_buy, tlr_trendline_sell=tlr_trendline_sell,
             tlr_prior_touch_idx_buy=tlr_prior_touch_idx_buy, tlr_prior_touch_idx_sell=tlr_prior_touch_idx_sell,
-            direction_is_buy=bool(buy_common or buy_trend_common),
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
             rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,

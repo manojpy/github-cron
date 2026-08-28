@@ -143,8 +143,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
     buy_side = gr.buy_common or gr.buy_trend_common or gr.buy_trend_common_relaxed
-    reversal_only_cycle = reversal_eligible and not (gr.buy_common or gr.sell_common)
-
+    
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         score, total = compute_confluence_score(gr, is_buy=buy_side)
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
@@ -221,7 +220,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             data_5m,
             confluence_score=confluence_score,
             confluence_total=confluence_total,
-            reversal_only_cycle=reversal_only_cycle,
         )
     finally:
         PAIR_ID.set("")
@@ -301,17 +299,17 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
     pair_requests = []
     valid_tasks = []     
     daily_symbols = []
+
     for pair_name in pairs_to_process:
         product_info = products_map.get(pair_name)
         if not product_info:
             continue
 
-        symbol = product_info["symbol"]
         resolutions = [("15", limit_15m), ("5", limit_5m)]
-        pair_requests.append((symbol, resolutions))
-        valid_tasks.append((pair_name, symbol))
+        pair_requests.append((pair_name, resolutions))
+        valid_tasks.append((pair_name, pair_name))
         if fetch_daily:
-            daily_symbols.append(symbol)
+            daily_symbols.append(pair_name)
 
     all_candles = {}
     daily_task = None
@@ -369,12 +367,12 @@ async def process_pairs_with_workers(fetcher: DataFetcher, products_map: Dict[st
         # Pass 1 — which pairs actually have OI data?
         oi_entries = []                 # (pair_name, current, meta_key)
         meta_keys_to_read = []
+
         for pair_name in pairs_to_process:
             product_info = products_map.get(pair_name)
             if not product_info:
                 continue
-            symbol = product_info["symbol"]
-            current = oi_funding_map.get(symbol)
+            current = oi_funding_map.get(pair_name)
             if not current or current.get("oi") is None:
                 continue
             meta_key = f"oi_hist:{pair_name}"
