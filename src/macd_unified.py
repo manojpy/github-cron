@@ -1,54 +1,19 @@
-from __future__ import annotations   
+from __future__ import annotations
 import logging
 import aot_bridge
 import os
 import sys
 import time
 import asyncio
-import random
-from pathlib import Path
-import ssl
 import signal
-import re
 import uuid
 import argparse
 import psutil
 import gc
-import json
-from collections import deque, OrderedDict 
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, Set, Deque, Union
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from contextvars import ContextVar
-from urllib.parse import urlparse
-import aiohttp
+from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
-import redis.asyncio as redis
-from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
-from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
-from enum import StrEnum
-
-from aot_bridge import (
-    sanitize_array_numba,
-    ema_loop,
-    ema_loop_alpha,
-    ema_loop_pine,
-    kalman_loop,
-    vwap_daily_loop_safe,
-    rolling_mean_numba,
-    rolling_min_max_numba,
-    calculate_ppo_core,
-    calculate_rsi_core,
-    true_range_numba, 
-    calculate_atr_rma, 
-    calculate_adx_core, 
-    percentile_rank_numba
-)
 
 # ── bot_config : only what macd_unified.py touches directly ──
-
 from bot_config import (
     Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
     TRACE_ID, PAIR_ID, cfg, logger, logger_main,
@@ -72,12 +37,11 @@ from state import (
     RedisKeyPrefix, RedisStateStore, RedisLock,
 )
 
-from gates import GateResult, compute_confluence_score, _eval_gate
+from gates import compute_confluence_score, _eval_gate
 
 from alerts import (
     TelegramQueue, ALERT_KEYS, _eval_alerts, _apply_and_dispatch_alerts, escape_markdown_v2,
-)
-
+) 
 _pair_eval_counter = 0
 
 def _sync_signal_handler(sig: int, frame: Any) -> None:
