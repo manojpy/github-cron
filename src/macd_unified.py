@@ -611,15 +611,38 @@ async def run_once() -> Optional[bool]:
 
         if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true": 
             if sdb and not sdb.degraded:
-                logger_run.warning("🚨 CLEAR_ALL_STATES requested — purging all Redis alert states...")
-                st, dd, pend, sp, ast, sst, shc, strm = await _clear_all_redis_states(sdb, pairs_to_process, logger_run)
+                logger_run.warning("🚨 CLEAR_ALL_STATES requested — purging selected Redis states...")
+                
+                def _env_bool(key: str, default: str = "false") -> bool:
+                    return os.getenv(key, default).lower() == "true"
+                
+                st, dd, pend, sp, ast, sst, shc, strm = await _clear_all_redis_states(
+                    sdb, pairs_to_process, logger_run,
+                    clear_active_states=_env_bool("CLEAR_ACTIVE_STATES", "true"),
+                    clear_dedups=_env_bool("CLEAR_DEDUPS", "true"),
+                    clear_pending_outcomes=_env_bool("CLEAR_PENDING_OUTCOMES", "true"),
+                    clear_shadow_pending=_env_bool("CLEAR_SHADOW_PENDING", "true"),
+                    clear_alert_stats=_env_bool("CLEAR_WINRATE_STATS", "false"),
+                    clear_shadow_stats=_env_bool("CLEAR_SHADOW_TRACKING", "false"),
+                    clear_outcome_streams=_env_bool("CLEAR_OUTCOME_HISTORY", "false"),
+                )
+                
+                parts = []
+                if st: parts.append(f"States: {st}")
+                if dd: parts.append(f"Dedups: {dd}")
+                if pend: parts.append(f"Pending: {pend}")
+                if sp: parts.append(f"ShadowPending: {sp}")
+                if ast: parts.append(f"AlertStats: {ast}")
+                if sst: parts.append(f"ShadowStats: {sst}")
+                if shc: parts.append(f"ShadowHiConf: {shc}")
+                if strm: parts.append(f"Streams: {strm}")
+                cleared_str = " | ".join(parts) if parts else "Nothing selected to clear"
+                
                 if telegram_queue is None:
                     telegram_queue = TelegramQueue(cfg.TELEGRAM_BOT_TOKEN, cfg.TELEGRAM_CHAT_ID)
                 await telegram_queue.send(escape_markdown_v2(
-                    f"🧹 {cfg.BOT_NAME} All stored alert states cleared\n"
-                    f"States: {st} | Dedups: {dd} | Pending: {pend} | ShadowPending: {sp}\n"
-                    f"AlertStats: {ast} | ShadowStats: {sst} | ShadowHiConf: {shc}\n"
-                    f"Streams: {strm}\n"
+                    f"🧹 {cfg.BOT_NAME} Redis purge complete\n"
+                    f"{cleared_str}\n"
                     f"Time: {format_ist_time()}"
                 ))
             else:
