@@ -332,7 +332,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
     logger_pair = logging.getLogger(f"macd_bot.{pair_name}.{correlation_id}")
     PAIR_ID.set(pair_name)
     close_15m = None
-    timestamps_15m = None
     rma50_15 = None
     rma200_5 = None
 
@@ -417,9 +416,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         low_curr = l
         close_curr = c
         candle_range = h - l
-
         close_15m = data_15m.close
-        timestamps_15m = data_15m.ts
 
         interval_5m_sec = 5 * 60
         expected_5m_open = (reference_time // interval_5m_sec) * interval_5m_sec - interval_5m_sec

@@ -1086,7 +1086,6 @@ def parse_candles_to_numpy(result: Optional[Dict[str, Any]]) -> Optional[PriceDa
                 return None
 
         hl_mid = (h + l) / 2.0
-        candle_range = h - l
         close_deviation = np.abs(c - hl_mid) / (hl_mid + 1e-9)
         deviation_mask = close_deviation > Constants.HIGH_DEVIATION_THRESHOLD
         deviation_count = np.sum(deviation_mask)
