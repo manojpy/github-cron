@@ -1,5 +1,4 @@
 name: 🤖 Run MACD Unified Bot (Hybrid)
-
 on:
   workflow_dispatch:
     inputs:
@@ -12,11 +11,46 @@ on:
           - 'false'
           - 'true'
       clear_states:
-        description: 'Clear all Redis states before running'
+        description: '🔴 MASTER: Enable Redis state clearing'
         required: false
         default: false
         type: boolean
-      
+      clear_active_states:
+        description: 'Clear active alert states (pair_state:*)'
+        required: false
+        default: true
+        type: boolean
+      clear_dedups:
+        description: 'Clear dedup keys (recent_alert:*)'
+        required: false
+        default: true
+        type: boolean
+      clear_pending_outcomes:
+        description: 'Clear pending outcome queue (outcome_pending:*)'
+        required: false
+        default: true
+        type: boolean
+      clear_shadow_pending:
+        description: 'Clear shadow pending queue (shadow_pending:*)'
+        required: false
+        default: true
+        type: boolean
+      clear_winrate_stats:
+        description: 'Clear win-rate counters (alert_stats:*)'
+        required: false
+        default: false
+        type: boolean
+      clear_shadow_tracking:
+        description: 'Clear shadow stats & hiconf (shadow_stats:*, shadow_hiconf:*)'
+        required: false
+        default: false
+        type: boolean
+      clear_outcome_history:
+        description: 'Clear resolved outcome streams & brain reports'
+        required: false
+        default: false
+        type: boolean
+
 # Prevent overlapping runs from cron + manual dispatch
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,7 +60,14 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/macd-unified-aot
   BOT_TIMEOUT: 660
-  CLEAR_ALL_STATES: ${{ github.event.inputs.clear_states || 'false' }}
+  CLEAR_ALL_STATES: ${{ inputs.clear_states }}
+  CLEAR_ACTIVE_STATES: ${{ inputs.clear_active_states }}
+  CLEAR_DEDUPS: ${{ inputs.clear_dedups }}
+  CLEAR_PENDING_OUTCOMES: ${{ inputs.clear_pending_outcomes }}
+  CLEAR_SHADOW_PENDING: ${{ inputs.clear_shadow_pending }}
+  CLEAR_WINRATE_STATS: ${{ inputs.clear_winrate_stats }}
+  CLEAR_SHADOW_TRACKING: ${{ inputs.clear_shadow_tracking }}
+  CLEAR_OUTCOME_HISTORY: ${{ inputs.clear_outcome_history }}
 
 jobs:
   run-bot:
@@ -140,7 +181,7 @@ jobs:
           START_TIME=$(date +%s)
           echo "🕐 TRIGGER_TIMESTAMP=$START_TIME ($(TZ=Asia/Kolkata date -d @$START_TIME '+%Y-%m-%d %H:%M:%S IST'))"
           
-          # Write secrets to a temporary env-file to avoid exposing them in 'ps'
+
           ENV_FILE="$(pwd)/.bot_env"
           cat > "$ENV_FILE" <<EOF
           TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -150,7 +191,15 @@ jobs:
           DRY_RUN_MODE=$DRY_RUN
           TRIGGER_TIMESTAMP=$START_TIME
           CLEAR_ALL_STATES=$CLEAR_ALL_STATES
+          CLEAR_ACTIVE_STATES=$CLEAR_ACTIVE_STATES
+          CLEAR_DEDUPS=$CLEAR_DEDUPS
+          CLEAR_PENDING_OUTCOMES=$CLEAR_PENDING_OUTCOMES
+          CLEAR_SHADOW_PENDING=$CLEAR_SHADOW_PENDING
+          CLEAR_WINRATE_STATS=$CLEAR_WINRATE_STATS
+          CLEAR_SHADOW_TRACKING=$CLEAR_SHADOW_TRACKING
+          CLEAR_OUTCOME_HISTORY=$CLEAR_OUTCOME_HISTORY
           EOF
+
           
           timeout --signal=SIGTERM --kill-after=15s ${{ env.BOT_TIMEOUT }}s docker run \
             --rm \

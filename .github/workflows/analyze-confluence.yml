@@ -39,15 +39,21 @@ jobs:
         run: exit 1
 
       - name: 📨 Notify Telegram
-        if: steps.analysis.outputs.exit_code == '0'
+        if: steps.analysis.outputs.exit_code == '0' || steps.analysis.outputs.exit_code == '2'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          LOADED=$(grep "^Loaded" analysis_output.txt | head -1)
-          HIGHLIGHT=$(grep -A2 "Suggested CONFLUENCE_MIN_SCORE" analysis_output.txt || grep "No cap yet reaches" analysis_output.txt || echo "No suggestion yet")
-          MSG="📊 Confluence threshold analysis complete"$'\n'"${LOADED}"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
+          if [ "${{ steps.analysis.outputs.exit_code }}" == "0" ]; then
+            LOADED=$(grep "^Loaded" analysis_output.txt | head -1)
+            HIGHLIGHT=$(grep -A2 "Suggested CONFLUENCE_MIN_SCORE" analysis_output.txt || grep "No cap yet reaches" analysis_output.txt || echo "No suggestion yet")
+            MSG="📊 Confluence threshold analysis complete"$'\n'"${LOADED}"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
+          else
+            # exit_code == 2: stream exists but is empty / no usable rows yet
+            HIGHLIGHT=$(head -1 analysis_output.txt || echo "No data available yet")
+            MSG="📊 Confluence threshold analysis complete"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
+          fi
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${MSG}" -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
