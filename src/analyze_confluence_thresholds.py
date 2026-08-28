@@ -130,6 +130,8 @@ def main():
     print("-" * 42)
     candidate_caps = sorted(set(row["score"] for row in rows))
     best_cap = None
+    best_cap_n = None
+    best_cap_wr = None
     for cap in candidate_caps:
         subset = [row for row in rows if row["score"] >= cap]
         if not subset:
@@ -138,19 +140,20 @@ def main():
         marker = ""
         if len(subset) >= args.min_sample and wr >= args.target_winrate and best_cap is None:
             best_cap = cap
+            best_cap_n = len(subset)
+            best_cap_wr = wr
             marker = "  <-- lowest cap meeting target with enough sample"
         print(f"{cap:>10.1f}{len(subset):>12}{wr:>11.1%}{marker}")
 
     print()
     if best_cap is not None:
-        print(f"Suggested CONFLUENCE_MIN_SCORE: {best_cap:.1f}")
+        print(f"Suggested CONFLUENCE_MIN_SCORE: {best_cap:.1f} (from {best_cap_n} samples, {best_cap_wr:.1%} win rate)")
         print(f"  (lowest score threshold with >= {args.min_sample} samples and >= {args.target_winrate:.0%} win rate)")
         print(f"  Raising the cap further trades fewer/later alerts for a possibly higher win rate — "
               f"check the table above for that trade-off.")
     else:
-        print("No cap yet reaches your target win rate with sufficient sample size.")
+        print(f"No cap yet reaches your target win rate with sufficient sample size ({n} total samples collected).")
         print("Either lower --target-winrate, lower --min-sample, or collect more data.")
-
 
 if __name__ == "__main__":
     main()
