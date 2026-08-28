@@ -59,6 +59,19 @@ _ALERT_CONFIG_MAP = {
     "ppohist_sell":         "ENABLE_PPOHIST_ALERT",
 }
 
+def _hget_int(data: dict, key: str, default: int = 0) -> int:
+    value = data.get(key)
+    if value is None:
+        value = data.get(key.encode())
+    if value is None:
+        return default
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    try:
+        return int(value)
+    except Exception:
+        return default
+
 class BrainEngine:
     """Analysis layer over the bot's existing win-rate infrastructure."""
 
@@ -96,8 +109,8 @@ class BrainEngine:
         if not data:
             return None
 
-        wins = int(data.get("wins", 0))
-        losses = int(data.get("losses", 0))
+        wins = _hget_int(data, "wins")
+        losses = _hget_int(data, "losses")    
         total = wins + losses
         if total < cfg.BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE:
             return None
@@ -307,12 +320,11 @@ class BrainEngine:
         # Build lines with dynamic content escaped, formatting preserved
         lines = [
             "🧠 *BRAIN ANALYSIS REPORT*",
-            f"Generated: {format_ist_time()}",
+            f"Generated: {escape_markdown_v2(format_ist_time())}",
             f"Pairs monitored: {len(pairs)}",
-            f"Real trades sampled: {recs['real_sample_size']} | Shadow-tracked: {recs['shadow_sample_size']}",
+            f"Real trades sampled: {recs['real_sample_size']} {escape_markdown_v2('|')} Shadow\\-tracked: {recs['shadow_sample_size']}",
             "",
         ]
-
         high = [r for r in recs["recommendations"] if r["severity"] == "high"]
         med = [r for r in recs["recommendations"] if r["severity"] == "medium"]
         low = [r for r in recs["recommendations"] if r["severity"] == "low"]
@@ -338,14 +350,18 @@ class BrainEngine:
             lines.append("*👻 SHADOW MODE*")
             if ss.get("overall_wr") is not None:
                 lines.append(
-                    f"{ss['total_tracked']} rejected alert(s) tracked | overall WR {ss['overall_wr']:.0%}"
+                    escape_markdown_v2(
+                        f"{ss['total_tracked']} rejected alert(s) tracked | overall WR {ss['overall_wr']:.0%}"
+                    )
                 )
             else:
-                lines.append(f"{ss['total_tracked']} rejected alert(s) tracked")
+                lines.append(escape_markdown_v2(f"{ss['total_tracked']} rejected alert(s) tracked"))
             if ss.get("high_confluence_wr") is not None:
                 lines.append(
-                    f"High-confluence rejections ({ss['high_confluence_tracked']}): "
-                    f"{ss['high_confluence_wr']:.0%} WR"
+                    escape_markdown_v2(
+                        f"High-confluence rejections ({ss['high_confluence_tracked']}): "
+                        f"{ss['high_confluence_wr']:.0%} WR"
+                    )
                 )
             lines.append("")
 

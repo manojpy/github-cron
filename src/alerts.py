@@ -478,29 +478,6 @@ AlertKey = StrEnum("AlertKey", {k.upper(): k for k in ALERT_KEYS})
 
 logger.debug("Alert keys initialized: %s mappings", len(ALERT_KEYS))
 
-def validate_alert_definitions() -> None:
-    errors = []
-
-    keys_seen = set()
-    for def_ in ALERT_DEFINITIONS:
-        key = def_.key
-        if key in keys_seen:
-            errors.append(f"Duplicate alert key: {key}")
-        keys_seen.add(key)
-
-    for def_ in ALERT_DEFINITIONS:
-        if def_.key not in ALERT_KEYS:
-            errors.append(f"Alert key {def_.key} missing from ALERT_KEYS mapping")
-    
-    if errors:
-        error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
-        logger.critical(error_msg)
-        raise ValueError(error_msg)
-    
-    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
-
-validate_alert_definitions()
-
 BUY_ALERT_KEYS: Set[str] = {
     "ppo_signal_up", "ppo_zero_up", "ppo_adaptive_up",
     "rsi_ema5_up", "rsi_cross_adaptive_up", "vwap_up", "hist_rma_buy", "ppohist_buy",
@@ -516,6 +493,31 @@ SELL_ALERT_KEYS: Set[str] = {
     "strong_reversal_sell", "choch_sell", "tlr_sell", "fib_reversal_sell",
 }
 SELL_ALERT_KEYS.update(f"pivot_down_{level}" for level in PIVOT_LEVELS_SELL)
+
+def validate_alert_definitions() -> None:
+    errors = []
+
+    keys_seen = set()
+    for def_ in ALERT_DEFINITIONS:
+        key = def_.key
+        if key in keys_seen:
+            errors.append(f"Duplicate alert key: {key}")
+        keys_seen.add(key)
+
+    for def_ in ALERT_DEFINITIONS:
+        if def_.key not in ALERT_KEYS:
+            errors.append(f"Alert key {def_.key} missing from ALERT_KEYS mapping")
+        if def_.key not in BUY_ALERT_KEYS and def_.key not in SELL_ALERT_KEYS:
+            errors.append(f"Alert key {def_.key} missing from BUY_ALERT_KEYS/SELL_ALERT_KEYS")
+
+    if errors:
+        error_msg = "❌ ALERT DEFINITION VALIDATION FAILED:\n" + "\n".join(f"  - {e}" for e in errors)
+        logger.critical(error_msg)
+        raise ValueError(error_msg)
+    
+    logger.debug(f"✅ Validated {len(ALERT_DEFINITIONS)} alert definitions ({len(ALERT_KEYS)} keys)")
+
+validate_alert_definitions()
 
 async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[Dict[str, np.ndarray]],
     reference_time: int, sdb: RedisStateStore, correlation_id: str, logger_pair: logging.Logger
@@ -1201,9 +1203,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 pair_name, alert_keys_to_check, timeout=3.0
             )
 
-            direction = "buy" if gr.direction_is_buy else "sell"
             surviving_alerts = []
-
             brain_engine = None
             if cfg.ENABLE_BRAIN:
                 try:
@@ -1213,6 +1213,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     logger_pair.debug(f"Brain engine init failed: {e}")
 
             for alert_title, alert_extra, alert_key in alerts_to_send:
+                direction = "buy" if alert_key in BUY_ALERT_KEYS else "sell"
                 win_rate, sample = win_rate_map.get(alert_key, (None, 0))
                 if win_rate is not None and win_rate < cfg.MIN_WIN_RATE:
                     override_reason = None
@@ -1249,7 +1250,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
         coalesced_dedup_key: Optional[str] = None
         if alerts_to_send and cfg.ENABLE_ALERT_COALESCING:
-            direction = "BUY" if gr.direction_is_buy else "SELL"
+            buy_present = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send)
+            sell_present = any(ak in SELL_ALERT_KEYS for _, _, ak in alerts_to_send)
+            direction = "MIXED" if (buy_present and sell_present) else ("BUY" if buy_present else "SELL")
             coalesced_dedup_key = f"coalesced_{direction}"
             should_send = await sdb.check_recent_alert(
                 pair_name, coalesced_dedup_key, ts_curr, window_sec=cfg.COALESCE_DEDUP_WINDOW_SEC
@@ -1359,14 +1362,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                         if cfg.ENABLE_WIN_RATE_FILTER:
-                            direction = "buy" if gr.direction_is_buy else "sell"
                             await asyncio.gather(*(
                                 sdb.record_pending_outcome(
-                                    pair_name, alert_key, direction, ts_curr, close_curr,
+                                    pair_name, alert_key,
+                                    "buy" if alert_key in BUY_ALERT_KEYS else "sell",
+                                    ts_curr, close_curr,
                                     confluence_score=confluence_score, confluence_total=confluence_total,
                                 )
                                 for _, _, alert_key in alerts_to_send
-                            ))
+                            ))               
                     else:
                         await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
