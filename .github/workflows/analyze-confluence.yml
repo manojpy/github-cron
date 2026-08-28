@@ -25,7 +25,7 @@ jobs:
           REDIS_URL: ${{ secrets.REDIS_URL }}
         run: |
           set +e
-          python3 scripts/analyze_confluence_thresholds.py \
+          python3 src/analyze_confluence_thresholds.py \
             --min-sample 20 --target-winrate 0.55 --min-total-for-alert 20 \
             2>&1 | tee analysis_output.txt
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
