@@ -3,13 +3,16 @@ import time
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple, List, Set, ClassVar, Callable
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError
 from fetcher import compute_backoff
+
+if TYPE_CHECKING:
+    from fetcher import PriceData
 
 async def _blanket_reset_pair(sdb: RedisStateStore, pair_name: str, logger_pair: logging.Logger) -> int:
     from alerts import ALERT_KEYS

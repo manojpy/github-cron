@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import deque
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING
 import ssl
 import aiohttp
 from aiohttp import ClientConnectorError, ClientResponseError, TCPConnector, ClientError
@@ -18,6 +18,10 @@ from bot_config import (
 )
 from indicators import get_utc_date_key, _prior_leg_direction
 
+
+if TYPE_CHECKING:
+    from state import RedisStateStore
+ 
 class SessionManager:
     _session: ClassVar[Optional[aiohttp.ClientSession]] = None
     _ssl_context: ClassVar[Optional[ssl.SSLContext]] = None
