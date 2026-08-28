@@ -78,8 +78,12 @@ def main():
     r = redis.from_url(redis_url, decode_responses=True)
     raw = fetch_all(r)
     if not raw:
-        sys.exit(f"No entries found in '{STREAM_KEY}' yet. Deploy the patched bot and "
-                  f"wait for outcomes to resolve (OUTCOME_LOOKAHEAD_CANDLES * 15min after each alert fires).")
+        print(
+            f"No entries found in '{STREAM_KEY}' yet. Deploy the patched bot and "
+            f"wait for outcomes to resolve (OUTCOME_LOOKAHEAD_CANDLES * 15min after each alert fires).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     rows = []
     for f in raw:
@@ -101,7 +105,8 @@ def main():
         })
 
     if not rows:
-        sys.exit("No usable rows after filtering (check --pair spelling?).")
+        print("No usable rows after filtering (check --pair spelling?).", file=sys.stderr)
+        sys.exit(2)
 
     n = len(rows)
     overall_wr = sum(row["win"] for row in rows) / n
