@@ -3,7 +3,7 @@ import time
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, Set, Union
+from typing import Dict, Any, Optional, Tuple, Union
 import numpy as np
 from bot_config import cfg, Constants, PAIR_ID, normalize_timestamp, normalize_timestamp_array, format_ist_time
 from fetcher import PriceData, get_last_closed_index_from_array, validate_candle_for_alerts

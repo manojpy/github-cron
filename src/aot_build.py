@@ -3,20 +3,15 @@ AOT Build Script - Compiles Numba functions to native .so libraries
 ====================================================================
 Automatically syncs with numba_functions_shared.py via EXPORT_CONFIG.
 """
-
 import sys
 import os
 import argparse
 import platform
-import shutil
 from pathlib import Path
-from typing import List, Dict, Any
 import traceback
 
 try:
-    import numpy as np
     from numba.pycc import CC
-    from numba import types
 except ImportError as e:
     print(f"ERROR: Required dependencies missing: {e}", file=sys.stderr)
     print("Install with: pip install numba numpy", file=sys.stderr)

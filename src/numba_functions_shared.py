@@ -16,8 +16,7 @@ os.environ.setdefault(
 )
 
 import numpy as np
-from numba import njit, prange, types
-from typing import Dict, Optional, Tuple, Any
+from numba import njit, types
 import logging
 
 logger = logging.getLogger(__name__)

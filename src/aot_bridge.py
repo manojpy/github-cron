@@ -117,9 +117,8 @@ def check_aot_version_stamp(library_path: Path, module_name: str) -> Tuple[bool,
         )
     return True, None
 
-
 def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Optional[str]]:
-    global _aot_module, _using_aot, _fallback_reason
+    global _aot_module, _using_aot
 
     library_path = find_aot_library(module_name)
     if library_path is None:

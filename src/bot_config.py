@@ -6,7 +6,7 @@ import logging
 import json
 import asyncio
 from pathlib import Path
-from typing import Dict, Any, List, Set, Union
+from typing import Dict, Any, List, Union
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -696,7 +696,7 @@ def format_ist_time(dt_or_ts: Any = None, fmt: str = "%Y-%m-%d %H:%M:%S IST") ->
         return dt.astimezone(_IST_TZ).strftime(fmt)
     except Exception as e:
         if cfg.DEBUG_MODE:
-            logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}'")
+            logger.debug(f"format_ist_time parsing failed for '{dt_or_ts}': {e}")
         return str(dt_or_ts)
 
 shutdown_event = asyncio.Event()
