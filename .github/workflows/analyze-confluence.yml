@@ -45,8 +45,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          HIGHLIGHT=$(grep -A2 "Suggested CONFLUENCE_MIN_SCORE" analysis_output.txt || echo "No suggestion yet")
-          MSG="📊 Confluence threshold analysis complete"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
+          LOADED=$(grep "^Loaded" analysis_output.txt | head -1)
+          HIGHLIGHT=$(grep -A2 "Suggested CONFLUENCE_MIN_SCORE" analysis_output.txt || grep "No cap yet reaches" analysis_output.txt || echo "No suggestion yet")
+          MSG="📊 Confluence threshold analysis complete"$'\n'"${LOADED}"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${MSG}" -o /dev/null -w "Telegram notify HTTP %{http_code}\n"
