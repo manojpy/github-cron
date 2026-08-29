@@ -261,8 +261,8 @@ _ALERT_DEFINITIONS_RAW: List[Dict[str, Any]] = [
     {"key":"tk_conversion_down","title":"🌐🔴 Tenkan Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Conv {ctx.get('tk_conversion_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
     {"key":"kijun_cross_up","title":"⚓🟢 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("buy_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('buy_wick_ratio',0)*100:.1f}%","requires":[]},
     {"key":"kijun_cross_down","title":"⚓🔴 Kijun Cross","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("sell_common",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"Base {ctx.get('tk_base_curr',0):.2f} | Wick {ctx.get('sell_wick_ratio',0)*100:.1f}%","requires":[]}, 
-    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common_relaxed",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.30 or rsi.get("curr",np.nan) <60)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
-    { "key": "ob_reversal_sell", "title": "🔴🏛 Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common_relaxed",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.30 or rsi.get("curr",np.nan) >40)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
+    { "key": "ob_reversal_buy", "title": "🟢🏛️ Order Block Reversal BUY", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("buy_trend_common_relaxed",False) and ctx.get("ob_gate_ok_buy",False) and (ppo.get("curr",np.nan) <0.30 or rsi.get("curr",np.nan) <70)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Demand OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]},
+    { "key": "ob_reversal_sell", "title": "🔴🏛 Order Block Reversal SELL", "check_fn":lambda ctx,ppo,ppo_sig,rsi:(ctx.get("sell_trend_common_relaxed",False) and ctx.get("ob_gate_ok_sell",False) and (ppo.get("curr",np.nan) >-0.30 or rsi.get("curr",np.nan) >30)), "extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('ob_gate_reason') or 'Supply OB reversed'} | PPO {ppo.get('curr',0):.2f} RSI {rsi.get('curr',0):.1f}", "requires":[]}, 
     {"key":"strong_reversal_buy","title":"🟢🔄 Strong Reversal BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"strong_reversal_sell","title":"🔴🔄 Strong Reversal SELL","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("strong_reversal_sell",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('reversal_pattern_name','Reversal candle')} confluence confirmed","requires":["strong_reversal"]},
     {"key":"choch_buy","title":"🟢🔀 CHoCH BUY","check_fn":lambda ctx,ppo,ppo_sig,rsi:ctx.get("choch_buy",False),"extra_fn":lambda ctx,ppo,ppo_sig,rsi,_:f"{ctx.get('choch_reason') or 'Bullish change of character'}","requires":["choch"]},
@@ -697,11 +697,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
             reversal_bullish, reversal_bearish, reversal_pattern_name = detect_reversal_candle_pattern(data_15m, i15)
             strong_reversal_buy = (
                 buy_trend_common_relaxed and reversal_bullish
-                and (ppo_curr < 0.20 or rsi_curr < 60)
+                and (ppo_curr < 0.20 or rsi_curr < 70)
             )
             strong_reversal_sell = (
                 sell_trend_common_relaxed and reversal_bearish
-                and (ppo_curr > -0.20 or rsi_curr > 40)
+                and (ppo_curr > -0.20 or rsi_curr > 30)
             )
         else:
             reversal_bullish, reversal_bearish, reversal_pattern_name = False, False, ""
