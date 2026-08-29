@@ -72,21 +72,33 @@ codebase (state.py, gates.py, alerts.py, bot_config.py) before applying:
   • star_wr is now configurable (BRAIN_STAR_ALERT_WR, default 0.70).
   • Basic (pair, alert_key, entry_ts) de-dup on stream rows, since
     maxlen=... approximate=True xadd can occasionally double-write on retry.
+
+── Changelog (threshold_engine extraction) ─────────────────────────────
+All Wilson CI / EV / R:R / knee-point / temporal-drift / per-pair /
+vote-importance math now lives in threshold_engine.py, a pure-function
+module shared with analyze_confluence_thresholds.py (the CLI report).
+This file no longer carries its own copy of that logic — the confluence
+threshold suggestion below is produced by one call to
+engine.recommend_threshold(), the exact same function and same code path
+the CLI tool uses. Previously these two tools each had their own copy of
+this math and had already drifted (this file used to compute its own
+target_floor loop separately from the CLI script's); that class of bug is
+now structurally impossible since there's only one implementation.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import math
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from alerts import escape_markdown_v2
 
 from bot_config import cfg, json_dumps, format_ist_time
 from state import RedisKeyPrefix, RedisStateStore
+import threshold_engine as engine
 
 
 _ALERT_CONFIG_MAP = {
@@ -155,111 +167,6 @@ def _hget_int(data: dict, key: str, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Statistical helpers (ported from analyze_confluence_thresholds.py so
-# both tools agree on the same numbers for the same data)
-# ──────────────────────────────────────────────────────────────────────
-
-def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
-    """Wilson score interval — reliable even for small n."""
-    if n == 0:
-        return 0.0, 0.0, 0.0
-    p = wins / n
-    denom = 1 + z * z / n
-    centre = (p + z * z / (2 * n)) / denom
-    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return max(0.0, centre - margin), min(1.0, centre + margin), p
-
-
-def favourable_move(row: Dict[str, Any]) -> float:
-    """pct_move is signed by price direction, not by trade outcome — a
-    winning sell has a negative pct_move. Always take the magnitude of the
-    move that was favourable to the position."""
-    return abs(row.get("pct_move", 0.0))
-
-
-def expected_value(wins: int, losses: int, avg_win_pct: float, avg_loss_pct: float) -> float:
-    n = wins + losses
-    if n == 0:
-        return 0.0
-    wr = wins / n
-    return wr * avg_win_pct - (1 - wr) * abs(avg_loss_pct)
-
-
-def rr_ratio(avg_win_pct: float, avg_loss_pct: float) -> Optional[float]:
-    if not avg_loss_pct or abs(avg_loss_pct) < 1e-6:
-        return None
-    return avg_win_pct / abs(avg_loss_pct)
-
-
-def format_rr(rr: Optional[float]) -> str:
-    return f"{rr:.2f}" if rr is not None else "n/a"
-
-
-def ev_and_rr_for(rows: List[Dict[str, Any]]) -> Tuple[float, Optional[float], float, float]:
-    """Returns (ev, rr, avg_win_magnitude, avg_loss_magnitude) for a row subset."""
-    wins = [favourable_move(r) for r in rows if r["win"]]
-    losses = [favourable_move(r) for r in rows if not r["win"]]
-    avg_w = sum(wins) / len(wins) if wins else 0.0
-    avg_l = sum(losses) / len(losses) if losses else 0.0
-    ev = expected_value(len(wins), len(losses), avg_w, avg_l)
-    rr = rr_ratio(avg_w, avg_l)
-    return ev, rr, avg_w, avg_l
-
-
-def detect_temporal_drift(rows: List[Dict[str, Any]], window_days: int = 14):
-    """Compare win rate of recent outcomes vs older ones. Uses wall-clock
-    time as "now" — NOT the last trade's timestamp, which would be wrong
-    if the bot had downtime (a stale "recent" window silently shifts back
-    in time)."""
-    if not rows:
-        return None, None, None
-    now_ts = int(time.time())
-    cutoff = now_ts - (window_days * 86400)
-    recent = [r for r in rows if r["entry_ts"] >= cutoff]
-    older = [r for r in rows if r["entry_ts"] < cutoff]
-    if len(recent) < 10 or len(older) < 10:
-        return None, None, None
-    recent_wr = sum(r["win"] for r in recent) / len(recent)
-    older_wr = sum(r["win"] for r in older) / len(older)
-    return recent_wr, older_wr, len(recent)
-
-
-def per_pair_breakdown(rows: List[Dict[str, Any]], min_sample: int = 10):
-    stats = defaultdict(lambda: {"wins": 0, "n": 0})
-    for r in rows:
-        s = stats[r["pair"]]
-        s["wins"] += r["win"]
-        s["n"] += 1
-    results = []
-    for pair, s in stats.items():
-        if s["n"] < min_sample:
-            continue
-        results.append((pair, s["wins"] / s["n"], s["n"]))
-    results.sort(key=lambda x: x[1])
-    return results
-
-
-def vote_importance(rows: List[Dict[str, Any]], min_sample: int = 10):
-    """For each vote, win rate when it's True vs when it's False.
-    Sorted by lift (wr_with - wr_without), descending."""
-    vote_names = set()
-    for r in rows:
-        if r.get("votes"):
-            vote_names.update(r["votes"].keys())
-    results = []
-    for vn in sorted(vote_names):
-        with_vote = [r for r in rows if r.get("votes") and r["votes"].get(vn) is True]
-        without_vote = [r for r in rows if r.get("votes") and r["votes"].get(vn) is False]
-        if len(with_vote) < min_sample or len(without_vote) < min_sample:
-            continue
-        wr_with = sum(r["win"] for r in with_vote) / len(with_vote)
-        wr_without = sum(r["win"] for r in without_vote) / len(without_vote)
-        results.append((vn, wr_with, len(with_vote), wr_without, len(without_vote), wr_with - wr_without))
-    results.sort(key=lambda x: -x[5])
-    return results
 
 
 class BrainEngine:
@@ -429,7 +336,7 @@ class BrainEngine:
             if total < min_sample:
                 continue
             wr = s["wins"] / total
-            lo, hi, _ = wilson_ci(s["wins"], total)
+            lo, hi, _ = engine.wilson_ci(s["wins"], total)
             if hi < disable_wr:
                 # Even the OPTIMISTIC bound is below the disable line — not noise.
                 alert_verdicts[alert_key] = "disable"
@@ -504,101 +411,86 @@ class BrainEngine:
                     ),
                 })
 
-        # ── Confluence threshold suggestion — raw score space, Wilson lower
-        #    bound, same algorithm as analyze_confluence_thresholds.py ──
+        # ── Confluence threshold suggestion — ONE call to the same engine
+        #    function analyze_confluence_thresholds.py uses. Same Wilson
+        #    lower bound floor, same knee/EV/target-floor max(), same
+        #    toxic-zone-is-informational-not-a-hard-floor rule. ──
         threshold_rec: Dict[str, Any] = {}
-        if real_rows:
-            candidate_caps = sorted(set(r["score"] for r in real_rows))
-            caps_data = []
-            for cap in candidate_caps:
-                subset = [r for r in real_rows if r["score"] >= cap]
-                if len(subset) < min_sample:
-                    continue
-                wins_count = sum(r["win"] for r in subset)
-                wr = wins_count / len(subset)
-                lo, hi, _ = wilson_ci(wins_count, len(subset))
-                caps_data.append((cap, len(subset), wr, lo))
+        rec = engine.recommend_threshold(
+            real_rows, target_winrate=target_wr, min_sample=min_sample,
+        ) if real_rows else {"valid": False}
 
-            target_floor = None
-            for cap, n_pass, wr, wr_lo in caps_data:
-                if wr_lo >= target_wr:
-                    target_floor = cap
-                    break
-            if target_floor is None:
-                # Fall back to raw-WR criterion on thin datasets, same as the analyzer.
-                for cap, n_pass, wr, wr_lo in caps_data:
-                    if wr >= target_wr:
-                        target_floor = cap
-                        break
+        if rec.get("valid") and abs(rec["recommended"] - cfg.CONFLUENCE_MIN_ABS_SCORE) >= 0.5:
+            target_floor = rec["recommended"]
+            rec_n = rec["rec_n"]
+            rec_wr = rec["rec_wr"]
+            ev, rr = rec["rec_ev"], rec["rec_rr"]
+            buy_wr, buy_n, sell_wr, sell_n = rec["buy_wr"], rec["buy_n"], rec["sell_wr"], rec["sell_n"]
 
-            if target_floor is not None and abs(target_floor - cfg.CONFLUENCE_MIN_ABS_SCORE) >= 0.5:
-                rec_subset = [r for r in real_rows if r["score"] >= target_floor]
-                rec_n = len(rec_subset)
-                rec_wr = sum(r["win"] for r in rec_subset) / rec_n
-                ev, rr, avg_w, avg_l = ev_and_rr_for(rec_subset)
+            direction_note = ""
+            if buy_wr is not None and sell_wr is not None:
+                direction_note = f" | Buy WR {buy_wr:.0%} ({buy_n}), Sell WR {sell_wr:.0%} ({sell_n})"
 
-                buys = [r for r in rec_subset if r["direction"] == "buy"]
-                sells = [r for r in rec_subset if r["direction"] == "sell"]
-                buy_wr = sum(r["win"] for r in buys) / len(buys) if buys else None
-                sell_wr = sum(r["win"] for r in sells) / len(sells) if sells else None
+            threshold_rec = {
+                "type": "confluence_threshold", "severity": "high",
+                "current_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE,
+                "suggested_abs_score": target_floor,
+                "supporting_samples": rec_n, "resulting_wr": round(rec_wr, 3),
+                "ev": round(ev, 4), "rr": rr,
+                "message": (
+                    f"Set CONFLUENCE_MIN_ABS_SCORE to {target_floor:.1f} "
+                    f"(currently {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) for {rec_wr:.0%} WR, "
+                    f"EV {ev:+.3f}%/trade, R:R {engine.format_rr(rr)} across {rec_n} trades.{direction_note}\n"
+                    f"Alert frequency: {rec['alerts_per_week_before']:.1f}/wk -> "
+                    f"{rec['alerts_per_week_after']:.1f}/wk "
+                    f"(dropping {rec['dropped']}, {rec['dropped_pct']:.0%})."
+                ),
+            }
+            recommendations.append(threshold_rec)
+            # Emit BOTH keys — the live gate takes max(pct_floor, ABS_SCORE),
+            # so a percentage-only patch can be a complete no-op if the abs
+            # floor is the binding constraint.
+            config_patch.append({
+                "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
+                "suggested": target_floor, "supporting_samples": rec_n,
+            })
+            rec_subset = [r for r in real_rows if r["score"] >= target_floor]
+            avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
+            suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
+            config_patch.append({
+                "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
+                "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
+                "note": "Derived from suggested abs score / avg total this window — informational, "
+                        "the abs score patch above is the one that reliably binds.",
+            })
 
-                total_alerts = len(real_rows)
-                dropped = total_alerts - rec_n
-                ts_list = [r["entry_ts"] for r in real_rows if r["entry_ts"]]
-                weeks = (max(ts_list) - min(ts_list)) / (7 * 86400) if len(ts_list) > 1 else 0.1
-                freq_before = total_alerts / max(weeks, 0.1)
-                freq_after = rec_n / max(weeks, 0.1)
-
-                direction_note = ""
-                if buy_wr is not None and sell_wr is not None:
-                    direction_note = f" | Buy WR {buy_wr:.0%} ({len(buys)}), Sell WR {sell_wr:.0%} ({len(sells)})"
-
-                threshold_rec = {
-                    "type": "confluence_threshold", "severity": "high",
-                    "current_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                    "suggested_abs_score": target_floor,
-                    "supporting_samples": rec_n, "resulting_wr": round(rec_wr, 3),
-                    "ev": round(ev, 4), "rr": rr,
+            if rec.get("overlapping_toxic"):
+                worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
+                recommendations.append({
+                    "type": "toxic_zone_note", "severity": "low",
                     "message": (
-                        f"Set CONFLUENCE_MIN_ABS_SCORE to {target_floor:.1f} "
-                        f"(currently {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) for {rec_wr:.0%} WR, "
-                        f"EV {ev:+.3f}%/trade, R:R {format_rr(rr)} across {rec_n} trades.{direction_note}\n"
-                        f"Alert frequency: {freq_before:.1f}/wk -> {freq_after:.1f}/wk "
-                        f"(dropping {dropped}, {dropped/total_alerts:.0%})."
+                        f"Note: a toxic bucket (score {worst[0]:.1f}-{worst[1]:.1f}, {worst[2]:.0%} WR) "
+                        f"exists at or above the recommended threshold. Cumulative stats already price "
+                        f"this in — worth checking the per-alert breakdown below for what's firing there."
                     ),
-                }
-                recommendations.append(threshold_rec)
-                # Emit BOTH keys — the live gate takes max(pct_floor, ABS_SCORE),
-                # so a percentage-only patch can be a complete no-op if the abs
-                # floor is the binding constraint.
-                config_patch.append({
-                    "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                    "suggested": target_floor, "supporting_samples": rec_n,
-                })
-                avg_total = sum(r["total"] for r in rec_subset) / rec_n
-                suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
-                config_patch.append({
-                    "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
-                    "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
-                    "note": "Derived from suggested abs score / avg total this window — informational, "
-                            "the abs score patch above is the one that reliably binds.",
                 })
 
-        # ── Temporal drift ──
-        recent_wr, older_wr, recent_n = detect_temporal_drift(real_rows)
-        if recent_wr is not None:
-            drift = recent_wr - older_wr
+        # ── Temporal drift (from the same recommend_threshold() call —
+        #    no separate computation, no risk of disagreeing with the CLI) ──
+        if rec.get("valid") and rec.get("drift_recent_wr") is not None:
+            drift = rec["drift_recent_wr"] - rec["drift_older_wr"]
             if drift < -0.05:
                 recommendations.append({
                     "type": "temporal_drift", "severity": "high",
                     "message": (
-                        f"Edge may be decaying: last 14d WR {recent_wr:.0%} ({recent_n} samples) "
-                        f"vs prior WR {older_wr:.0%} (Δ{drift:+.0%})."
+                        f"Edge may be decaying: last 14d WR {rec['drift_recent_wr']:.0%} "
+                        f"({rec['drift_recent_n']} samples) vs prior WR {rec['drift_older_wr']:.0%} "
+                        f"(Δ{drift:+.0%})."
                     ),
                 })
 
         # ── Per-pair breakdown (worst pairs only, keeps report short) ──
-        pair_stats = per_pair_breakdown(real_rows, min_sample=min_sample)
+        pair_stats = engine.per_pair_breakdown(real_rows, min_sample=min_sample)
         weak_pairs = [p for p in pair_stats if p[1] < disable_wr]
         if weak_pairs:
             recommendations.append({
@@ -610,7 +502,7 @@ class BrainEngine:
             })
 
         # ── Vote importance (top lift / top drag only) ──
-        vote_imp = vote_importance(real_rows, min_sample=min_sample)
+        vote_imp = engine.vote_importance(real_rows, min_sample=min_sample)
         if vote_imp:
             best = [v for v in vote_imp if v[5] > 0.05][:3]
             worst = [v for v in vote_imp if v[5] < -0.05][-3:]

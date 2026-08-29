@@ -3,7 +3,7 @@ import time
 import asyncio
 import logging
 import uuid
-from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING
+from typing import Dict, Any, Optional, Tuple, List, ClassVar, Callable, TYPE_CHECKING, Set
 import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
