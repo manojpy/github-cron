@@ -5,7 +5,9 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, Union
 import numpy as np
-from bot_config import cfg, Constants, PAIR_ID, normalize_timestamp, normalize_timestamp_array, format_ist_time
+
+from bot_config import cfg, Constants, PAIR_ID, normalize_timestamp, normalize_timestamp_array, format_ist_time, CONFLUENCE_WEIGHTS
+
 from fetcher import PriceData, get_last_closed_index_from_array, validate_candle_for_alerts
 from state import RedisStateStore, _blanket_reset_pair
 from indicators import (
@@ -190,27 +192,6 @@ class GateResult:
     rma_cloud_momentum_ok_sell: Optional[bool] = None 
     vwap_momentum_ok_buy: Optional[bool] = None
     vwap_momentum_ok_sell: Optional[bool] = None
-
-CONFLUENCE_WEIGHTS: Dict[str, float] = {
-    "base_trend": 3.0,
-    "ichimoku_cloud": 2.0,
-    "rma_cloud": 2.0,
-    "ppo_cross": 2.0,
-    "rsi_guard": 2.0,
-    "tk_guard": 2.0,
-    "adx": 1.0,
-    "rvol": 1.5,
-    "cpr": 1.0,
-    "oi_funding": 2.5,
-    "order_block": 2.5,
-    "adx_strength": 1.5,
-    "atr_percentile": 1.5,
-    "volume_percentile": 1.5, 
-    "ppo_gate_momentum":  1.0,
-    "rsi_guard_momentum": 1.0,
-    "rma_cloud_momentum": 1.0,
-    "vwap_momentum": 1.0,
-}
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     score = 0.0

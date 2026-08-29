@@ -84,6 +84,27 @@ class CprNotReadyError(Exception):
 
 __version__ = "1.8.0-stable"
 
+CONFLUENCE_WEIGHTS: Dict[str, float] = {
+    "base_trend": 3.0,
+    "ichimoku_cloud": 2.0,
+    "rma_cloud": 2.0,
+    "ppo_cross": 2.0,
+    "rsi_guard": 2.0,
+    "tk_guard": 2.0,
+    "adx": 1.0,
+    "rvol": 1.5,
+    "cpr": 1.0,
+    "oi_funding": 2.5,
+    "order_block": 2.5,
+    "adx_strength": 1.5,
+    "atr_percentile": 1.5,
+    "volume_percentile": 1.5,
+    "ppo_gate_momentum":  1.0,
+    "rsi_guard_momentum": 1.0,
+    "rma_cloud_momentum": 1.0,
+    "vwap_momentum": 1.0,
+}
+
 class Constants:
     MIN_WICK_RATIO = 0.2
     PPO_RSI_GUARD_BUY = 0.50
@@ -475,7 +496,6 @@ class BotConfig(BaseModel):
     @model_validator(mode='after')
     def validate_confluence_floor(self) -> 'BotConfig':
         if self.ENABLE_CONFLUENCE_GATE:
-            from gates import CONFLUENCE_WEIGHTS
             max_achievable = sum(CONFLUENCE_WEIGHTS.values())
             if self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
                 raise ValueError(
