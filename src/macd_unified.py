@@ -100,6 +100,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
 
     confluence_score: Optional[float] = None
     confluence_total: Optional[float] = None
+    confluence_votes: Optional[Dict[str, bool]] = None
 
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
@@ -107,9 +108,21 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     )
     gate_passed = gr.buy_common or gr.sell_common or reversal_eligible
     buy_side = gr.buy_common or gr.buy_trend_common or gr.buy_trend_common_relaxed
-    
+
+    confluence_score_buy: Optional[float] = None
+    confluence_total_buy: Optional[float] = None
+    confluence_votes_buy: Optional[Dict[str, bool]] = None
+    confluence_score_sell: Optional[float] = None
+    confluence_total_sell: Optional[float] = None
+    confluence_votes_sell: Optional[Dict[str, bool]] = None
+
     if cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
-        score, total = compute_confluence_score(gr, is_buy=buy_side)
+        score_buy, total_buy, votes_buy = compute_confluence_score(gr, is_buy=True)
+        score_sell, total_sell, votes_sell = compute_confluence_score(gr, is_buy=False)
+        confluence_score_buy, confluence_total_buy, confluence_votes_buy = score_buy, total_buy, votes_buy
+        confluence_score_sell, confluence_total_sell, confluence_votes_sell = score_sell, total_sell, votes_sell
+
+        score, total = (score_buy, total_buy) if buy_side else (score_sell, total_sell)
         pct_floor = total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
         required = max(pct_floor, cfg.CONFLUENCE_MIN_ABS_SCORE)
         if score < required:
@@ -131,6 +144,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             }
         confluence_score = score
         confluence_total = total
+        confluence_votes = votes
 
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         if pair_oi is not None:
@@ -182,8 +196,12 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
             gr, context, conditional_states, raw_alerts, sdb, telegram_queue, fetcher, symbol,
             correlation_id, logger_pair, alerts_sent_ref, alerts_sent_lock, max_alerts_per_run,
             data_5m,
-            confluence_score=confluence_score,
-            confluence_total=confluence_total,
+            confluence_score_buy=confluence_score_buy,
+            confluence_total_buy=confluence_total_buy,
+            confluence_votes_buy=confluence_votes_buy,
+            confluence_score_sell=confluence_score_sell,
+            confluence_total_sell=confluence_total_sell,
+            confluence_votes_sell=confluence_votes_sell,
         )
     finally:
         PAIR_ID.set("")

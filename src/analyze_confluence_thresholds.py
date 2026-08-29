@@ -21,6 +21,7 @@ Notes:
     for a few weeks before this is statistically meaningful.
 """
 import argparse
+import json
 import os
 import sys
 from collections import defaultdict
@@ -69,6 +70,9 @@ def main():
                      help="Score bucket width for the breakdown table (default 1.0)")
     ap.add_argument("--pair", type=str, default=None,
                      help="Filter to a single pair, e.g. BTCUSD (default: all pairs combined)")
+    ap.add_argument("--vote-breakdown-range", type=str, default=None,
+                     help="Score range 'LOW,HIGH' to break down by vote combination, e.g. '24,25'. "
+                          "Skipped if not provided.")
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
@@ -94,6 +98,11 @@ def main():
         win = f.get("win")
         if score is None or total is None or win is None or total <= 0:
             continue
+        votes_raw = f.get("votes")
+        try:
+            votes = json.loads(votes_raw) if votes_raw else None
+        except (TypeError, ValueError):
+            votes = None
         rows.append({
             "pair": f.get("pair"),
             "alert_key": f.get("alert_key"),
@@ -102,6 +111,7 @@ def main():
             "total": total,
             "pct": score / total,
             "win": int(win),
+            "votes": votes,
         })
 
     if not rows:
@@ -156,9 +166,37 @@ def main():
         print(f"  (lowest score threshold with >= {args.min_sample} samples and >= {args.target_winrate:.0%} win rate)")
         print(f"  Raising the cap further trades fewer/later alerts for a possibly higher win rate — "
               f"check the table above for that trade-off.")
+
     else:
         print(f"No cap yet reaches your target win rate with sufficient sample size ({n} total samples collected).")
         print("Either lower --target-winrate, lower --min-sample, or collect more data.")
+
+    # --- Table 3: within a chosen score band, win rate by which votes actually fired ---
+    if args.vote_breakdown_range:
+        try:
+            lo_str, hi_str = args.vote_breakdown_range.split(",")
+            lo, hi = float(lo_str), float(hi_str)
+        except ValueError:
+            sys.exit("--vote-breakdown-range must be 'LOW,HIGH', e.g. '24,25'")
+
+        band_rows = [row for row in rows if lo <= row["score"] < hi and row["votes"] is not None]
+        if not band_rows:
+            print(f"\nNo rows with vote data in score range [{lo}, {hi}) "
+                  f"(vote logging may not have been deployed yet when these fired).")
+        else:
+            combo_stats = defaultdict(lambda: {"wins": 0, "n": 0})
+            for row in band_rows:
+                combo = tuple(sorted(k for k, v in row["votes"].items() if v))
+                combo_stats[combo]["n"] += 1
+                combo_stats[combo]["wins"] += row["win"]
+
+            print(f"\nVote-combination breakdown for score range [{lo}, {hi}) — {len(band_rows)} rows:")
+            print("-" * 60)
+            for combo, d in sorted(combo_stats.items(), key=lambda kv: -kv[1]["n"]):
+                wr = d["wins"] / d["n"] if d["n"] else 0
+                flag = "" if d["n"] >= args.min_sample else "  (low sample)"
+                label = ", ".join(combo) if combo else "(no votes true)"
+                print(f"  n={d['n']:<4} wr={wr:>6.1%}  {label}{flag}")
 
 if __name__ == "__main__":
     main()

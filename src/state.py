@@ -499,10 +499,12 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
+
     async def record_pending_outcome(self, pair: str, alert_key: str, direction: str,
                                        entry_ts: int, entry_price: float,
                                        confluence_score: Optional[float] = None,
-                                       confluence_total: Optional[float] = None) -> None:
+                                       confluence_total: Optional[float] = None,
+                                       confluence_votes: Optional[Dict[str, bool]] = None) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
@@ -510,10 +512,12 @@ class RedisStateStore:
             payload = json_dumps({
                 "direction": direction, "entry_ts": entry_ts, "entry_price": entry_price,
                 "confluence_score": confluence_score, "confluence_total": confluence_total,
+                "confluence_votes": confluence_votes,
             })
         except Exception as e:
             logger.warning(f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}")
             return
+
         ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
         try:
             await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
@@ -523,7 +527,8 @@ class RedisStateStore:
     async def record_shadow_pending_outcome(self, pair: str, alert_key: str, direction: str,
                                               entry_ts: int, entry_price: float,
                                               confluence_score: Optional[float] = None,
-                                              confluence_total: Optional[float] = None) -> None:
+                                              confluence_total: Optional[float] = None,
+                                              confluence_votes: Optional[Dict[str, bool]] = None) -> None:
         """Twin of record_pending_outcome for alerts REJECTED by the win-rate filter.
         Lets the brain see what would have happened had the alert fired."""
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
@@ -533,6 +538,7 @@ class RedisStateStore:
             payload = json_dumps({
                 "direction": direction, "entry_ts": entry_ts, "entry_price": entry_price,
                 "confluence_score": confluence_score, "confluence_total": confluence_total,
+                "confluence_votes": confluence_votes,
             })
         except Exception as e:
             logger.warning(f"Failed to serialize shadow pending outcome for {pair}:{alert_key}: {e}")
@@ -601,8 +607,10 @@ class RedisStateStore:
         entry_ts = int(data["entry_ts"])
         direction = data["direction"]
         entry_price = float(data["entry_price"])
+
         conf_score = data.get("confluence_score")
         conf_total = data.get("confluence_total")
+        conf_votes = data.get("confluence_votes")
 
         if entry_price <= 0:
             return None, "bad_entry_price"
@@ -643,6 +651,7 @@ class RedisStateStore:
             "win": win,
             "conf_score": conf_score,
             "conf_total": conf_total,
+            "conf_votes": conf_votes,
         }, ""
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
@@ -712,6 +721,7 @@ class RedisStateStore:
                         win = result["win"]
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
+                        conf_votes = result["conf_votes"]
 
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
@@ -728,6 +738,7 @@ class RedisStateStore:
                                 "pct_move": f"{pct_move:.4f}",
                                 "win": "1" if win else "0",
                                 "entry_ts": str(entry_ts),
+                                "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                             }
                         else:
                             missing_score_count += 1
@@ -815,6 +826,7 @@ class RedisStateStore:
                         win = result["win"]
                         conf_score = result["conf_score"]
                         conf_total = result["conf_total"]
+                        conf_votes = result["conf_votes"]
 
                         stats_key = f"{RedisKeyPrefix.SHADOW_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
@@ -829,6 +841,7 @@ class RedisStateStore:
                                     "direction": str(direction), "score": str(conf_score),
                                     "total": str(conf_total), "pct_move": f"{pct_move:.4f}",
                                     "win": "1" if win else "0", "entry_ts": str(entry_ts),
+                                    "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 },
                                 maxlen=50000, approximate=True,
                             )

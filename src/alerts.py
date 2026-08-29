@@ -1076,11 +1076,21 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         )
         return None
 
+
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
     alerts_sent_ref: List[int], alerts_sent_lock: asyncio.Lock, max_alerts_per_run: int,
-    data_5m: PriceData, confluence_score: Optional[float] = None, confluence_total: Optional[float] = None) -> Tuple[str, Dict[str, Any]]:
+    data_5m: PriceData,
+    confluence_score_buy: Optional[float] = None, confluence_total_buy: Optional[float] = None,
+    confluence_votes_buy: Optional[Dict[str, bool]] = None,
+    confluence_score_sell: Optional[float] = None, confluence_total_sell: Optional[float] = None,
+    confluence_votes_sell: Optional[Dict[str, bool]] = None) -> Tuple[str, Dict[str, Any]]:
+
+    def _confluence_for(alert_key: str) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, bool]]]:
+        if alert_key in BUY_ALERT_KEYS:
+            return confluence_score_buy, confluence_total_buy, confluence_votes_buy
+        return confluence_score_sell, confluence_total_sell, confluence_votes_sell
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     data_15m = gr.data_15m
@@ -1217,11 +1227,12 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         continue
 
                     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
+                        alert_score, alert_total, alert_votes = _confluence_for(alert_key)
                         await sdb.record_shadow_pending_outcome(
                             pair_name, alert_key, direction, ts_curr, close_curr,
-                            confluence_score=confluence_score, confluence_total=confluence_total,
+                            confluence_score=alert_score, confluence_total=alert_total,
+                            confluence_votes=alert_votes,
                         )
-
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: "
                         f"{win_rate:.0%} over {sample} samples (need >= {cfg.MIN_WIN_RATE:.0%})"
@@ -1344,15 +1355,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
                         if cfg.ENABLE_WIN_RATE_FILTER:
-                            await asyncio.gather(*(
-                                sdb.record_pending_outcome(
+                            async def _record_one(alert_key: str):
+                                s, t, v = _confluence_for(alert_key)
+                                await sdb.record_pending_outcome(
                                     pair_name, alert_key,
                                     "buy" if alert_key in BUY_ALERT_KEYS else "sell",
                                     ts_curr, close_curr,
-                                    confluence_score=confluence_score, confluence_total=confluence_total,
+                                    confluence_score=s, confluence_total=t, confluence_votes=v,
                                 )
-                                for _, _, alert_key in alerts_to_send
-                            ))               
+                            await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
                     else:
                         await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
