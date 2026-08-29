@@ -971,8 +971,7 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
     return final_iobs, final_obs
 
 def _order_block_gate_reason(o, h, l, c, atr_short_arr, i15, cfg_obj):
-    atr200 = calculate_atr_rma(h, l, c, 200)
-    
+    atr200 = calculate_atr_rma(h[:i15+1], l[:i15+1], c[:i15+1], 200)
     active_iobs, active_obs = calculate_pine_order_blocks(
         o[:i15 + 1], h[:i15 + 1], l[:i15 + 1], c[:i15 + 1], atr200[:i15 + 1],
         swing_len=cfg_obj.OB_LOOKBACK_CANDLES,
@@ -1513,7 +1512,7 @@ def _array_percentile_rank(arr: np.ndarray, i: int, lookback: int, min_history: 
         return None
 
     current = arr[i]
-    cache_key = (id(arr), i, lookback, min_history, allow_zero, current)
+    cache_key = (arr.ctypes.data, i, lookback, min_history, allow_zero, current)
     cached = _pctl_rank_cache.get(cache_key, _PCTL_CACHE_MISS)
     if cached is not _PCTL_CACHE_MISS:
         _pctl_rank_cache.move_to_end(cache_key)
@@ -1575,9 +1574,8 @@ def get_adaptive_adx_threshold(adx_arr: np.ndarray, i15: int, cfg: BotConfig) ->
     start = i15 - lookback
     if start < 0:
         return cfg.ADX_ADAPTIVE_FALLBACK
-
     current = adx_arr[i15] if i15 < len(adx_arr) else np.nan
-    cache_key = (id(adx_arr), i15, lookback, cfg.ADX_ADAPTIVE_TARGET_PCTL,
+    cache_key = (adx_arr.ctypes.data, i15, lookback, cfg.ADX_ADAPTIVE_TARGET_PCTL,
                  cfg.ADX_ADAPTIVE_BAND_WIDTH, current)
     cached = _adx_thresh_cache.get(cache_key, _ADX_CACHE_MISS)
     if cached is not _ADX_CACHE_MISS:

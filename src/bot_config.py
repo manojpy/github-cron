@@ -474,8 +474,10 @@ class BotConfig(BaseModel):
 
     @model_validator(mode='after')
     def validate_confluence_floor(self) -> 'BotConfig':
-        max_achievable = 30.0  # sum of CONFLUENCE_WEIGHTS
-        if self.ENABLE_CONFLUENCE_GATE and self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
+        if self.ENABLE_CONFLUENCE_GATE:
+            from gates import CONFLUENCE_WEIGHTS
+            max_achievable = sum(CONFLUENCE_WEIGHTS.values())
+            if self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
             raise ValueError(
                 f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
                 f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'

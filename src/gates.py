@@ -40,6 +40,7 @@ class IndicatorCache:
     cpr_ok: bool = True
     nr_cpr: float = float("nan")
     prev_day_close: float = float("nan")
+
     # -- alert indicators (Phase 2, expensive) --
     ppo: Optional[np.ndarray] = None
     ppo_signal: Optional[np.ndarray] = None
@@ -48,6 +49,7 @@ class IndicatorCache:
     vwap: Optional[np.ndarray] = None
     hist_rma: Optional[np.ndarray] = None
     pivots: Optional[Dict[str, Any]] = None
+    vwap_gate: Optional[np.ndarray] = None
 
     @classmethod
     def from_dicts(cls, gate: Dict[str, Any], alert: Optional[Dict[str, Any]] = None) -> "IndicatorCache":

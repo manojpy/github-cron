@@ -246,11 +246,12 @@ class BrainEngine:
                     "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
                     "suggested": best_threshold, "supporting_samples": best_n,
                 })
-
+        seen_paths = set()
         for r in recommendations:
             if r["type"] == "disable_alert":
                 cfg_path = _ALERT_CONFIG_MAP.get(r["alert"])
-                if cfg_path:
+                if cfg_path and cfg_path not in seen_paths:
+                    seen_paths.add(cfg_path)
                     config_patch.append({
                         "path": cfg_path, "current": True,
                         "suggested": False, "reason": r["message"],
@@ -376,7 +377,7 @@ class BrainEngine:
             lines.append("")
 
         if recs["config_patch"]:
-            lines.append("*⚙️ SUGGESTED config_macd.json PATCH*")
+            lines.append(f"*⚙️ SUGGESTED {escape_markdown_v2('config_macd.json')} PATCH*")
             lines.append("```")
             lines.append(json_dumps(recs["config_patch"]))
             lines.append("```")

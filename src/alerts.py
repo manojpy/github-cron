@@ -1182,7 +1182,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         is_buy_batch = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send) if alerts_to_send else False
         confluence_score = confluence_score_buy if is_buy_batch else confluence_score_sell
         confluence_total = confluence_total_buy if is_buy_batch else confluence_total_sell
-        confluence_votes = confluence_votes_buy if is_buy_batch else confluence_votes_sell
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
             pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
@@ -1215,9 +1214,10 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     override_reason = None
                     if brain_engine:
                         try:
+                            alert_score, alert_total, _ = _confluence_for(alert_key)
                             override_reason = await brain_engine.check_rewardable_override(
-                                alert_key, confluence_score, confluence_total
-                            )
+                                alert_key, alert_score, alert_total
+                            )              
                         except Exception as e:
                             logger_pair.debug(f"Brain override check failed for {alert_key}: {e}")
 
