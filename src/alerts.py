@@ -1076,7 +1076,6 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         )
         return None
 
-
 async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], conditional_states: Dict[str, bool],
     raw_alerts: List[Tuple[str, str, str]], sdb: RedisStateStore, telegram_queue: TelegramQueue,
     fetcher: DataFetcher, symbol: str, correlation_id: str, logger_pair: logging.Logger,
@@ -1091,6 +1090,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if alert_key in BUY_ALERT_KEYS:
             return confluence_score_buy, confluence_total_buy, confluence_votes_buy
         return confluence_score_sell, confluence_total_sell, confluence_votes_sell
+    confluence_score: Optional[float] = None
+    confluence_total: Optional[float] = None
+    confluence_votes: Optional[Dict[str, bool]] = None
+    if raw_alerts:
+        confluence_score, confluence_total, confluence_votes = _confluence_for(raw_alerts[0][2])
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     data_15m = gr.data_15m

@@ -98,10 +98,6 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
     if isinstance(gr, tuple):
         return gr  # hard reject / wick reject / gate blocked -- already final
 
-    confluence_score: Optional[float] = None
-    confluence_total: Optional[float] = None
-    confluence_votes: Optional[Dict[str, bool]] = None
-
     reversal_eligible = (
         (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE)
         and (gr.buy_trend_common_relaxed or gr.sell_trend_common_relaxed)
@@ -142,10 +138,7 @@ async def evaluate_pair_and_alert(pair_name: str, data_15m: PriceData, data_5m: 
                     "suppression": f"Confluence gate: {score:.1f}/{total:.1f} weighted score, need {required:.1f}"
                 }
             }
-        confluence_score = score
-        confluence_total = total
-        confluence_votes = votes
-
+  
     if cfg.ENABLE_OI_FUNDING_FILTER and not cfg.ENABLE_CONFLUENCE_GATE and gate_passed:
         if pair_oi is not None:
             oi_reason = _oi_funding_gate_reason(
