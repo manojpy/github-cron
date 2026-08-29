@@ -1090,11 +1090,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
         if alert_key in BUY_ALERT_KEYS:
             return confluence_score_buy, confluence_total_buy, confluence_votes_buy
         return confluence_score_sell, confluence_total_sell, confluence_votes_sell
-    confluence_score: Optional[float] = None
-    confluence_total: Optional[float] = None
-    confluence_votes: Optional[Dict[str, bool]] = None
-    if raw_alerts:
-        confluence_score, confluence_total, confluence_votes = _confluence_for(raw_alerts[0][2])
     pair_name = gr.pair_name
     i15, ts_curr, reference_time = gr.i15, gr.ts_curr, gr.reference_time
     data_15m = gr.data_15m
@@ -1183,6 +1178,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 )
                 if cross_check is False:
                     alerts_to_send = []
+
+        is_buy_batch = any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send) if alerts_to_send else False
+        confluence_score = confluence_score_buy if is_buy_batch else confluence_score_sell
+        confluence_total = confluence_total_buy if is_buy_batch else confluence_total_sell
+        confluence_votes = confluence_votes_buy if is_buy_batch else confluence_votes_sell
 
         if alerts_to_send and cfg.ENABLE_CONFLUENCE_GATE and confluence_score is not None and confluence_total is not None:
             pct_floor = confluence_total * (cfg.CONFLUENCE_MIN_PCT / 100.0)
