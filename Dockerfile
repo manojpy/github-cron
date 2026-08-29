@@ -106,6 +106,7 @@ COPY --chown=appuser:appuser src/fetcher.py ./
 COPY --chown=appuser:appuser src/indicators.py ./
 COPY --chown=appuser:appuser src/gates.py ./
 COPY --chown=appuser:appuser src/alerts.py ./
+COPY --chown=appuser:appuser src/threshold_engine.py ./
 COPY --chown=appuser:appuser src/brain.py ./
 COPY --chown=appuser:appuser src/macd_unified.py ./
 
