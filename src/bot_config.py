@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
 import numpy as np
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, PrivateAttr
 
 try:
     import orjson
@@ -154,6 +154,7 @@ PAIR_ID: ContextVar[str] = ContextVar("pair_id", default="")
 
 class BotConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    _validation_warnings: List[str] = PrivateAttr(default_factory=list)
     TELEGRAM_BOT_TOKEN: str = Field(..., min_length=1)
     TELEGRAM_CHAT_ID: str = Field(..., min_length=1)
     REDIS_URL: str = Field(..., min_length=1)
@@ -260,6 +261,9 @@ class BotConfig(BaseModel):
     BRAIN_CONFLUENCE_BUCKET_PCT: float = Field(default=10.0, ge=1.0, le=50.0, description="Bucket width (in confluence %) used when the brain scans for a better CONFLUENCE_MIN_PCT in its report")
     BRAIN_REPORT_STREAM_SAMPLE: int = Field(default=5000, ge=100, le=50000, description="Max recent OUTCOME_LOG_STREAM/SHADOW_LOG_STREAM entries the brain reads per report")
     BRAIN_ALERT_DISABLE_THRESHOLD_WR: float = Field(default=0.40, ge=0.0, le=1.0, description="Pooled win rate (across all pairs) below which the brain recommends disabling an alert_key entirely in its report")
+    BRAIN_OVERRIDE_COOLDOWN_SECONDS: int = Field(default=14400, ge=600, le=86400, description="Min seconds between rewardable overrides for the same alert_key")
+    BRAIN_STAR_ALERT_WR: float = Field(default=0.70, ge=0.5, le=1.0, description="Win rate above which an alert is flagged as a star performer")
+    BRAIN_ANALYSIS_WINDOW_DAYS: int = Field(default=30, ge=7, le=365, description="Only analyze outcomes from the last N days")
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
@@ -505,8 +509,7 @@ class BotConfig(BaseModel):
         return self
 
     @model_validator(mode='after')
-    def validate_logic(self) -> 'BotConfig':
-        
+    def validate_logic(self) -> 'BotConfig':   
         errors = []
         warnings = []
 
