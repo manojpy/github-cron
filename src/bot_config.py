@@ -478,10 +478,10 @@ class BotConfig(BaseModel):
             from gates import CONFLUENCE_WEIGHTS
             max_achievable = sum(CONFLUENCE_WEIGHTS.values())
             if self.CONFLUENCE_MIN_ABS_SCORE > max_achievable:
-            raise ValueError(
-                f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
-                f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
-            )
+                raise ValueError(
+                    f'CONFLUENCE_MIN_ABS_SCORE ({self.CONFLUENCE_MIN_ABS_SCORE}) exceeds the max '
+                    f'achievable weighted total ({max_achievable}) — every alert would be blocked forever'
+                )
         return self
 
     @model_validator(mode='after')
