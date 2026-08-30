@@ -55,13 +55,11 @@ def fetch_all(r: "redis.Redis"):
         last_id = batch[-1][0]
     return entries
 
-
 def to_float(x, default=None):
     try:
         return float(x)
     except (TypeError, ValueError):
         return default
-
 
 def load_rows(r, pair_filter=None, direction_filter=None, alert_key_filter=None):
     raw = fetch_all(r)
@@ -121,6 +119,11 @@ def main():
                     help="Score range 'LOW,HIGH' to break down by vote combination, e.g. '24,25'.")
     ap.add_argument("--json", action="store_true",
                     help="Output recommendation as JSON to stdout")
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="Fit the threshold on the older 2/3 of data, validate it against "
+                         "the newer 1/3 it never saw, and report whether it holds up out-of-sample.")
+    ap.add_argument("--train-frac", type=float, default=0.67,
+                    help="Fraction of (chronologically) older rows used for fitting in --walk-forward mode")
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
@@ -372,6 +375,40 @@ def main():
     print(f"  To apply: set CONFLUENCE_MIN_ABS_SCORE = {recommended:.1f} in config")
     print(f"{'='*70}\n")
 
+    wf = None
+    if args.walk_forward:
+        wf = engine.validate_threshold_walk_forward(
+            rows, target_winrate=args.target_winrate, min_sample=args.min_sample,
+            bucket_size=bw, train_frac=args.train_frac,
+        )
+        print(f"\n{'='*70}")
+        print(f"  WALK-FORWARD VALIDATION (train={args.train_frac:.0%} of older rows, "
+              f"holdout=rest)")
+        print(f"{'='*70}")
+        if not wf["valid"]:
+            print(f"\n  ❌ Could not validate: {wf.get('error')} "
+                  f"(train_n={wf.get('train_n', 0)}, holdout_n={wf.get('holdout_n', 0)})")
+            print(f"     Need at least {args.min_sample * 2} train rows and "
+                  f"{args.min_sample} holdout rows. Collect more data first.")
+        else:
+            print(f"\n  Train set:   {wf['train_n']} rows → threshold {wf['recommended']:.1f} "
+                  f"(train WR {wf['train_result']['rec_wr']:.1%}, N={wf['train_result']['rec_n']})")
+            if wf.get("passed") is None:
+                print(f"  Holdout set: {wf['holdout_n']} rows, but only "
+                      f"{wf['holdout_n_at_threshold']} clear score >= {wf['recommended']:.1f} "
+                      f"— too thin to judge. Collect more data.")
+            else:
+                icon = "✅ PASSED" if wf["passed"] else "🚨 FAILED"
+                print(f"  Holdout set: {wf['holdout_n']} rows, {wf['holdout_n_at_threshold']} "
+                      f"clear the threshold → OOS WR {wf['holdout_wr']:.1%} "
+                      f"[{wf['holdout_wilson_lo']:.0%}-{wf['holdout_wilson_hi']:.0%}]")
+                print(f"  {icon} — degraded {wf['degraded_pct']:+.1%} vs train WR "
+                      f"(target {args.target_winrate:.0%}, slack 5pt)")
+                if not wf["passed"]:
+                    print(f"     This threshold looked good on the data it was chosen from but")
+                    print(f"     didn't hold up on newer data it hadn't seen. Treat the")
+                    print(f"     recommendation above as unconfirmed — don't apply it yet.")
+
     if args.json:
         output = {
             "recommended_score": recommended,
@@ -394,8 +431,17 @@ def main():
             "alerts_per_week_before": round(rec["alerts_per_week_before"], 2),
             "alerts_per_week_after": round(rec["alerts_per_week_after"], 2),
         }
+        if wf is not None:
+            output["walk_forward"] = {
+                "valid": wf["valid"],
+                "passed": wf.get("passed"),
+                "error": wf.get("error"),
+                "train_n": wf.get("train_n"),
+                "holdout_n": wf.get("holdout_n"),
+                "holdout_n_at_threshold": wf.get("holdout_n_at_threshold"),
+                "holdout_wr": round(wf["holdout_wr"], 4) if wf.get("holdout_wr") is not None else None,
+            }
         print(json.dumps(output, indent=2))
-
 
 if __name__ == "__main__":
     main()

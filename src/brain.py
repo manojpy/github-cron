@@ -217,9 +217,6 @@ class BrainEngine:
         if wr < cfg.BRAIN_REWARDABLE_MIN_SHADOW_WR:
             return None
 
-        # Cooldown: at most one override per alert_key per window, so a
-        # volatile market can't flood Telegram with repeated overrides for
-        # the same alert type.
         cooldown_seconds = getattr(cfg, "BRAIN_OVERRIDE_COOLDOWN_SECONDS", 4 * 3600)
         cooldown_key = f"{_OVERRIDE_COOLDOWN_PREFIX}{alert_key}"
         try:
@@ -367,10 +364,6 @@ class BrainEngine:
                     "message": f"{alert_key} viable ({wr:.0%} WR, {total} samples).",
                 })
 
-        # ── Group disable candidates by shared config path — only disable if
-        #    every alert_key mapped to that path is bad (fixes the buy/sell
-        #    collapse bug: ppo_signal_up bad + ppo_signal_down good must NOT
-        #    disable both). ──
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:
             path = _resolve_config_path(alert_key)
@@ -411,10 +404,6 @@ class BrainEngine:
                     ),
                 })
 
-        # ── Confluence threshold suggestion — ONE call to the same engine
-        #    function analyze_confluence_thresholds.py uses. Same Wilson
-        #    lower bound floor, same knee/EV/target-floor max(), same
-        #    toxic-zone-is-informational-not-a-hard-floor rule. ──
         threshold_rec: Dict[str, Any] = {}
         rec = engine.recommend_threshold(
             real_rows, target_winrate=target_wr, min_sample=min_sample,
@@ -431,38 +420,58 @@ class BrainEngine:
             if buy_wr is not None and sell_wr is not None:
                 direction_note = f" | Buy WR {buy_wr:.0%} ({buy_n}), Sell WR {sell_wr:.0%} ({sell_n})"
 
+            wf = engine.validate_threshold_walk_forward(
+                real_rows, target_winrate=target_wr, min_sample=min_sample,
+            )
+            if wf["valid"] and wf.get("passed") is False:
+                wf_note = (
+                    f"⚠️ NOT applied — failed walk-forward validation: held up on "
+                    f"{wf['train_n']} older samples but degraded to {wf['holdout_wr']:.0%} WR "
+                    f"on {wf['holdout_n_at_threshold']} newer, unseen ones "
+                    f"({wf['degraded_pct']:+.1%} vs train). Likely curve-fit to this window."
+                )
+                emit_patch = False
+            elif wf["valid"] and wf.get("passed") is True:
+                wf_note = (
+                    f"✅ Walk-forward validated: held at {wf['holdout_wr']:.0%} WR on "
+                    f"{wf['holdout_n_at_threshold']} newer samples it wasn't fit on."
+                )
+                emit_patch = True
+            else:
+                wf_note = "ℹ️ Not enough data yet for walk-forward validation — treat as provisional."
+                emit_patch = True
+
             threshold_rec = {
-                "type": "confluence_threshold", "severity": "high",
+                "type": "confluence_threshold", "severity": "high" if emit_patch else "medium",
                 "current_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE,
                 "suggested_abs_score": target_floor,
                 "supporting_samples": rec_n, "resulting_wr": round(rec_wr, 3),
-                "ev": round(ev, 4), "rr": rr,
+                "ev": round(ev, 4), "rr": rr, "walk_forward_passed": wf.get("passed"),
                 "message": (
                     f"Set CONFLUENCE_MIN_ABS_SCORE to {target_floor:.1f} "
                     f"(currently {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) for {rec_wr:.0%} WR, "
                     f"EV {ev:+.3f}%/trade, R:R {engine.format_rr(rr)} across {rec_n} trades.{direction_note}\n"
                     f"Alert frequency: {rec['alerts_per_week_before']:.1f}/wk -> "
                     f"{rec['alerts_per_week_after']:.1f}/wk "
-                    f"(dropping {rec['dropped']}, {rec['dropped_pct']:.0%})."
+                    f"(dropping {rec['dropped']}, {rec['dropped_pct']:.0%}).\n"
+                    f"{wf_note}"
                 ),
             }
             recommendations.append(threshold_rec)
-            # Emit BOTH keys — the live gate takes max(pct_floor, ABS_SCORE),
-            # so a percentage-only patch can be a complete no-op if the abs
-            # floor is the binding constraint.
-            config_patch.append({
-                "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                "suggested": target_floor, "supporting_samples": rec_n,
-            })
-            rec_subset = [r for r in real_rows if r["score"] >= target_floor]
-            avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
-            suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
-            config_patch.append({
-                "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
-                "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
-                "note": "Derived from suggested abs score / avg total this window — informational, "
-                        "the abs score patch above is the one that reliably binds.",
-            })
+            if emit_patch:
+                config_patch.append({
+                    "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
+                    "suggested": target_floor, "supporting_samples": rec_n,
+                })
+                rec_subset = [r for r in real_rows if r["score"] >= target_floor]
+                avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
+                suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
+                config_patch.append({
+                    "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
+                    "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
+                    "note": "Derived from suggested abs score / avg total this window — informational, "
+                            "the abs score patch above is the one that reliably binds.",
+                })
 
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])

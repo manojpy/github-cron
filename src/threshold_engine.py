@@ -56,14 +56,12 @@ def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
     return max(0.0, centre - margin), min(1.0, centre + margin), p
 
-
 def favourable_move(row: Row) -> float:
     """pct_move is signed by price direction, not by trade outcome — a
     winning sell has a negative pct_move. Always take the magnitude of the
     move that was favourable to the position, or wins/losses from opposite
     directions cancel toward zero when averaged."""
     return abs(row.get("pct_move", 0.0))
-
 
 def expected_value(wins: int, losses: int, avg_win_pct: float, avg_loss_pct: float) -> float:
     """EV per trade in % terms. Positive = profitable long-run."""
@@ -73,7 +71,6 @@ def expected_value(wins: int, losses: int, avg_win_pct: float, avg_loss_pct: flo
     wr = wins / n
     return wr * avg_win_pct - (1 - wr) * abs(avg_loss_pct)
 
-
 def rr_ratio(avg_win_pct: float, avg_loss_pct: float) -> Optional[float]:
     """Reward:risk ratio. None if there's no meaningful loss magnitude to
     divide by (guards against a near-zero avg_loss producing a nonsense
@@ -82,10 +79,8 @@ def rr_ratio(avg_win_pct: float, avg_loss_pct: float) -> Optional[float]:
         return None
     return avg_win_pct / abs(avg_loss_pct)
 
-
 def format_rr(rr: Optional[float]) -> str:
     return f"{rr:.2f}" if rr is not None else "n/a"
-
 
 def ev_and_rr_for(rows: List[Row]) -> Tuple[float, Optional[float], float, float]:
     """EV, R:R, avg win magnitude, avg loss magnitude for a row subset.
@@ -97,7 +92,6 @@ def ev_and_rr_for(rows: List[Row]) -> Tuple[float, Optional[float], float, float
     ev = expected_value(len(wins), len(losses), avg_w, avg_l)
     rr = rr_ratio(avg_w, avg_l)
     return ev, rr, avg_w, avg_l
-
 
 def smooth(values: List[float], window: int = 3) -> List[float]:
     """Centered moving average — used only to de-noise knee-point
@@ -113,11 +107,9 @@ def smooth(values: List[float], window: int = 3) -> List[float]:
         out.append(sum(values[lo:hi]) / (hi - lo))
     return out
 
-
 # ────────────────────────────────────────────────────────────────────────
 # Bucket-level analysis
 # ────────────────────────────────────────────────────────────────────────
-
 def build_buckets(rows: List[Row], bucket_size: float = 1.0) -> Dict[float, Dict[str, int]]:
     buckets: Dict[float, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
     for row in rows:
@@ -125,7 +117,6 @@ def build_buckets(rows: List[Row], bucket_size: float = 1.0) -> Dict[float, Dict
         buckets[b]["n"] += 1
         buckets[b]["wins"] += row["win"]
     return buckets
-
 
 def detect_toxic_zones(
     buckets: Dict[float, Dict[str, int]], bucket_size: float = 1.0, min_sample: int = 10,
@@ -145,7 +136,6 @@ def detect_toxic_zones(
         if hi < 0.50:
             toxic.append((b, b + bucket_size, wr, d["n"]))
     return toxic
-
 
 def detect_anomalous_buckets(
     buckets: Dict[float, Dict[str, int]], bucket_size: float = 1.0,
@@ -170,11 +160,9 @@ def detect_anomalous_buckets(
             anomalies.append((b, b + bucket_size, wr, wr_prev, wr_next, d["n"]))
     return anomalies
 
-
 # ────────────────────────────────────────────────────────────────────────
 # Cumulative cap analysis
 # ────────────────────────────────────────────────────────────────────────
-
 def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float], List[CapRow]]:
     """candidate_caps: every distinct observed score (ascending).
     caps_data: (cap, n, wr, wilson_lower_bound) for caps whose cumulative
@@ -192,6 +180,67 @@ def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float],
         caps_data.append((cap, len(subset), wr, lo))
     return candidate_caps, caps_data
 
+
+# ────────────────────────────────────────────────────────────────────────
+# Walk-forward validation — guards against a threshold that only looks
+# good because it was chosen FROM the data being used to judge it.
+# ────────────────────────────────────────────────────────────────────────
+
+def walk_forward_split(rows: List[Row], train_frac: float = 0.67) -> Tuple[List[Row], List[Row]]:
+    """Chronological split by entry_ts (not random) — a threshold has to
+    survive time moving forward, not just a random resample of the same
+    period. Rows missing entry_ts (0) sort first, into the train side."""
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    split_idx = int(len(ordered) * train_frac)
+    return ordered[:split_idx], ordered[split_idx:]
+
+def validate_threshold_walk_forward(
+    rows: List[Row],
+    target_winrate: float = 0.55,
+    min_sample: int = 20,
+    bucket_size: float = 1.0,
+    train_frac: float = 0.67,
+    slack: float = 0.05,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"valid": False}
+    train_rows, holdout_rows = walk_forward_split(rows, train_frac)
+    result["train_n"] = len(train_rows)
+    result["holdout_n"] = len(holdout_rows)
+
+    if len(train_rows) < min_sample * 2:
+        result["error"] = "insufficient_train"
+        return result
+    if len(holdout_rows) < min_sample:
+        result["error"] = "insufficient_holdout"
+        return result
+
+    train_result = recommend_threshold(train_rows, target_winrate, min_sample, bucket_size)
+    result["train_result"] = train_result
+    if not train_result["valid"]:
+        result["error"] = train_result.get("error", "train_invalid")
+        return result
+
+    recommended = train_result["recommended"]
+    result["recommended"] = recommended
+    result["valid"] = True
+
+    holdout_subset = [r for r in holdout_rows if r["score"] >= recommended]
+    n_ho = len(holdout_subset)
+    result["holdout_n_at_threshold"] = n_ho
+    if n_ho < 5:
+        result["passed"] = None
+        result["error"] = "holdout_too_thin_at_threshold"
+        return result
+
+    wins_ho = sum(r["win"] for r in holdout_subset)
+    wr_ho = wins_ho / n_ho
+    lo, hi, _ = wilson_ci(wins_ho, n_ho)
+    result.update({
+        "holdout_wr": wr_ho, "holdout_wilson_lo": lo, "holdout_wilson_hi": hi,
+        "degraded_pct": train_result["rec_wr"] - wr_ho,
+        "passed": lo >= (target_winrate - slack),
+    })
+    return result
 
 def find_knee_point(caps_data: List[CapRow], min_sample: int = 30, smooth_window: int = 3) -> Optional[float]:
     """Where marginal WR gain per +1 score flattens. WR values are smoothed
