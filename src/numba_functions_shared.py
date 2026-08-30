@@ -42,6 +42,7 @@ SIG_TRUE_RANGE       = f8[:](f8[:], f8[:], f8[:])
 SIG_ATR_RMA          = f8[:](f8[:], f8[:], f8[:], i4)
 SIG_ADX_CORE         = f8[:](f8[:], f8[:], f8[:], i4, i4)
 SIG_PERCENTILE_RANK  = f8(f8[:], i4, i4, i4, types.boolean)
+SIG_DFR_DIRECTION    = f8[:](f8[:], f8[:], f8[:], f8)
 
 
 # ============================================================================
@@ -538,6 +539,63 @@ def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
 
     return (count_lt + 0.5 * count_eq) / count_valid
 
+# ============================================================================
+# 7. DYNAMIC FLOW RIBBON (BigBeluga) — SuperTrend-style band-flip direction
+# ============================================================================
+
+@njit(SIG_DFR_DIRECTION, nogil=True, cache=True)
+def dynamic_flow_direction_loop(src, basis, dist, factor):
+    n = len(src)
+    direction_out = np.full(n, np.nan, dtype=np.float64)
+
+    lower_band_prev = 0.0  # nz(lowerBand[1]) default
+    upper_band_prev = 0.0  # nz(upperBand[1]) default
+    trend_is_upper_prev = True
+
+    for i in range(n):
+        d = dist[i]
+        b = basis[i]
+
+        if np.isnan(d) or np.isnan(b):
+            lower_band = lower_band_prev
+            upper_band = upper_band_prev
+        else:
+            raw_upper = b + factor * d
+            raw_lower = b - factor * d
+            # FIX: Pine src[1] on bar 0 is na. na < x is na → ternary false.
+            src_prev = src[i - 1] if i >= 1 else np.nan
+
+            # Pine: lowerBand := lowerBand > prevLowerBand or src[1] < prevLowerBand ? lowerBand : prevLowerBand
+            lower_band = raw_lower if (raw_lower > lower_band_prev or src_prev < lower_band_prev) else lower_band_prev
+            # Pine: upperBand := upperBand < prevUpperBand or src[1] > prevUpperBand ? upperBand : prevUpperBand
+            upper_band = raw_upper if (raw_upper < upper_band_prev or src_prev > upper_band_prev) else upper_band_prev
+
+        dist_prev = dist[i - 1] if i >= 1 else np.nan
+
+        # --- Pine direction logic -----------------------------------------
+        if np.isnan(dist_prev):
+            # Pine: if na(dist[1]) → _direction := 1
+            direction = 1.0
+        elif trend_is_upper_prev:
+            # prevTrendLine was at the upper band
+            direction = -1.0 if src[i] > upper_band else 1.0
+        else:
+            # prevTrendLine was at the lower band
+            direction = 1.0 if src[i] < lower_band else -1.0
+        # -----------------------------------------------------------------
+
+        trend_is_upper_prev = (direction == 1.0)
+
+        # Warmup suppression: only report direction once dist itself is valid.
+        if not np.isnan(d):
+            direction_out[i] = direction
+
+        # Carry forward for next bar's nz() reference.
+        lower_band_prev = lower_band
+        upper_band_prev = upper_band
+
+    return direction_out
+
 from aot_version import SOURCE_VERSION  # noqa: E402
 
 # ============================================================================
@@ -559,6 +617,7 @@ EXPORT_CONFIG = {
     'calculate_atr_rma':     SIG_ATR_RMA,
     'calculate_adx_core':    SIG_ADX_CORE,
     'percentile_rank_numba': SIG_PERCENTILE_RANK,
+    'dynamic_flow_direction_loop': SIG_DFR_DIRECTION,
 }
 
 from aot_function_registry import AOT_FUNCTION_NAMES  # noqa: E402

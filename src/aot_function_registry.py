@@ -38,4 +38,11 @@ AOT_FUNCTION_NAMES = [
     'calculate_atr_rma',
     'calculate_adx_core',
     'percentile_rank_numba',
+    'dynamic_flow_direction_loop',
+]
+
+
+
+
+
 ]

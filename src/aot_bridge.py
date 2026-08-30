@@ -282,6 +282,9 @@ def percentile_rank_numba(arr: np.ndarray, i: int, lookback: int, min_history: i
     Numba functions can't return None."""
     return _dispatch['percentile_rank_numba'](arr, i, lookback, min_history, allow_zero)
 
+def dynamic_flow_direction_loop(src: np.ndarray, basis: np.ndarray, dist: np.ndarray, factor: float) -> np.ndarray:
+    """Direction array for the Dynamic Flow Ribbon: -1.0 bullish, 1.0 bearish, NaN during warmup."""
+    return _dispatch['dynamic_flow_direction_loop'](src, basis, dist, factor)
 
 # ============================================================================
 # COMPLETENESS CHECK -- catches a forgotten wrapper at import time instead of

@@ -39,6 +39,7 @@ class IndicatorCache:
     rsi_guard_smooth: np.ndarray
     rsi_guard_ema: np.ndarray
     rma_cloud_fast_15: np.ndarray
+    dynamic_flow_trend_15: np.ndarray
     cpr_ok: bool = True
     nr_cpr: float = float("nan")
     prev_day_close: float = float("nan")
@@ -193,6 +194,10 @@ class GateResult:
     vwap_momentum_ok_buy: Optional[bool] = None
     vwap_momentum_ok_sell: Optional[bool] = None
 
+    # -- Dynamic Flow Ribbon (optional, cloud-group vote + confluence vote) --
+    dynamic_flow_ok_buy: Optional[bool] = None
+    dynamic_flow_ok_sell: Optional[bool] = None
+
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     score = 0.0
     total = 0.0
@@ -200,6 +205,7 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
     base_trend    = gr.base_buy_trend if is_buy else gr.base_sell_trend
     ichimoku_ok   = gr.ichimoku_gate_ok_buy if is_buy else gr.ichimoku_gate_ok_sell
     rma_cloud_ok  = gr.rma_cloud_ok_buy if is_buy else gr.rma_cloud_ok_sell
+    dynamic_flow_ok = gr.dynamic_flow_ok_buy if is_buy else gr.dynamic_flow_ok_sell
     ppo_cross_ok  = gr.ppo_gate_ok_buy if is_buy else gr.ppo_gate_ok_sell
     rsi_guard_ok  = gr.rsi_guard_ok_buy if is_buy else gr.rsi_guard_ok_sell
     tk_guard_ok   = gr.tk_guard_ok_buy if is_buy else gr.tk_guard_ok_sell
@@ -222,6 +228,12 @@ def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, flo
         total += w
         votes["rma_cloud"] = bool(rma_cloud_ok)
         if rma_cloud_ok: score += w
+
+    if cfg.DYNAMIC_FLOW_RIBBON_ENABLED and dynamic_flow_ok is not None:
+        w = CONFLUENCE_WEIGHTS["dynamic_flow_ribbon"]
+        total += w
+        votes["dynamic_flow_ribbon"] = bool(dynamic_flow_ok)
+        if dynamic_flow_ok: score += w
 
     if cfg.ENABLE_PPO_GATE:
         w = CONFLUENCE_WEIGHTS["ppo_cross"]
@@ -487,7 +499,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         # ══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
-        # ════════════════════��═════════════════════���══════════
+        # ════════════════════��═════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
@@ -513,6 +525,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         rsi_guard_smooth_arr = gate_indicators["rsi_guard_smooth"]
         rsi_guard_ema_arr = gate_indicators["rsi_guard_ema"]
         rma_cloud_fast_arr = gate_indicators["rma_cloud_fast_15"]
+        dynamic_flow_trend_arr = gate_indicators["dynamic_flow_trend_15"]
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
@@ -763,6 +776,18 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rma_cloud_ok_buy = None
             rma_cloud_ok_sell = None
 
+        dynamic_flow_curr = dynamic_flow_trend_arr[i15]
+        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+            if not np.isnan(dynamic_flow_curr):
+                dynamic_flow_ok_buy = bool(dynamic_flow_curr == -1.0)
+                dynamic_flow_ok_sell = bool(dynamic_flow_curr == 1.0)
+            else:
+                dynamic_flow_ok_buy = None
+                dynamic_flow_ok_sell = None
+        else:
+            dynamic_flow_ok_buy = None
+            dynamic_flow_ok_sell = None
+
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
                 and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
@@ -806,21 +831,27 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             vwap_momentum_ok_buy = None
             vwap_momentum_ok_sell = None
 
-        cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED
+        cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
-  
+
         cloud_votes_buy = []
         if cfg.ICHIMOKU_CLOUD_ENABLED:
             cloud_votes_buy.append(ichimoku_gate_ok_buy)
         if cfg.RMA_CLOUD_ENABLED:
             cloud_votes_buy.append(rma_cloud_ok_buy)
+        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+            cloud_votes_buy.append(dynamic_flow_ok_buy)
 
-        if cloud_votes_buy:
-            cloud_group_ok_buy = any(v is True for v in cloud_votes_buy)
+        active_cloud_votes_buy = [v for v in cloud_votes_buy if v is not None]
+        if active_cloud_votes_buy:
+            if len(active_cloud_votes_buy) >= 3:
+                cloud_group_ok_buy = sum(1 for v in active_cloud_votes_buy if v) >= Constants.CLOUD_GROUP_MIN_VOTES_OF_3
+            else:
+                cloud_group_ok_buy = any(active_cloud_votes_buy)
             if not cloud_group_ok_buy and cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"[{pair_name}] Cloud group buy blocked: need ALL true "
-                    f"(Ichimoku={ichimoku_gate_ok_buy}, RMA={rma_cloud_ok_buy})"
+                    f"[{pair_name}] Cloud group buy blocked "
+                    f"(Ichimoku={ichimoku_gate_ok_buy}, RMA={rma_cloud_ok_buy}, DynamicFlow={dynamic_flow_ok_buy})"
                 )
         elif not cloud_group_enabled:
             cloud_group_ok_buy = True
@@ -832,13 +863,19 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             cloud_votes_sell.append(ichimoku_gate_ok_sell)
         if cfg.RMA_CLOUD_ENABLED:
             cloud_votes_sell.append(rma_cloud_ok_sell)
+        if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
+            cloud_votes_sell.append(dynamic_flow_ok_sell)
 
-        if cloud_votes_sell:
-            cloud_group_ok_sell = any(v is True for v in cloud_votes_sell)
+        active_cloud_votes_sell = [v for v in cloud_votes_sell if v is not None]
+        if active_cloud_votes_sell:
+            if len(active_cloud_votes_sell) >= 3:
+                cloud_group_ok_sell = sum(1 for v in active_cloud_votes_sell if v) >= Constants.CLOUD_GROUP_MIN_VOTES_OF_3
+            else:
+                cloud_group_ok_sell = any(active_cloud_votes_sell)
             if not cloud_group_ok_sell and cfg.DEBUG_MODE:
                 logger_pair.debug(
-                    f"[{pair_name}] Cloud group sell blocked: need ALL true "
-                    f"(Ichimoku={ichimoku_gate_ok_sell}, RMA={rma_cloud_ok_sell})"
+                    f"[{pair_name}] Cloud group sell blocked "
+                    f"(Ichimoku={ichimoku_gate_ok_sell}, RMA={rma_cloud_ok_sell}, DynamicFlow={dynamic_flow_ok_sell})"
                 )
         elif not cloud_group_enabled:
             cloud_group_ok_sell = True
@@ -1042,6 +1079,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             rsi_guard_ok_buy=rsi_guard_ok_buy, rsi_guard_ok_sell=rsi_guard_ok_sell,
             rma_cloud_fast_curr=rma_cloud_fast_curr,
             rma_cloud_ok_buy=rma_cloud_ok_buy, rma_cloud_ok_sell=rma_cloud_ok_sell,
+            dynamic_flow_ok_buy=dynamic_flow_ok_buy, dynamic_flow_ok_sell=dynamic_flow_ok_sell,
             trend_gate_ok_buy=trend_gate_ok_buy, trend_gate_ok_sell=trend_gate_ok_sell,
             adx_val=adx_val, adx_adaptive_threshold=adx_adaptive_threshold, adx_ok=adx_ok,
             rvol_bypass_ok=rvol_bypass_ok, rvol_ok=rvol_ok, adaptive_rvol_check=adaptive_rvol_check,
