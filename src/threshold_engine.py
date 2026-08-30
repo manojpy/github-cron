@@ -331,6 +331,74 @@ def monte_carlo_walk_forward(
         "robustness_score": mean_wr / max(std_wr, 0.01),
     }
 
+def confidence_label(n: int, wilson_lo: float, wilson_hi: float) -> str:
+    """Translate sample size + Wilson interval width into a plain-language
+    confidence label. n alone is misleading — 100 trades with a wide CI is
+    weaker evidence than 40 trades with a tight one — so this uses both."""
+    width = wilson_hi - wilson_lo
+    if n < 20 or width > 0.35:
+        return "LOW"
+    if n < 50 or width > 0.20:
+        return "MEDIUM"
+    if n < 150 or width > 0.10:
+        return "HIGH"
+    return "VERY HIGH"
+
+def regime_breakdown(rows: List[Row], min_sample: int = 20) -> Dict[str, Any]:
+    """Rule-based regime split — no clustering, no ML. Splits rows into
+    'trending' vs 'ranging' at the MEDIAN adx_val actually present in this
+    window (a self-relative quantile split, not a hardcoded ADX threshold
+    like 25 — 'trending' should mean relatively trending for THIS data,
+    since typical ADX levels vary by pair and period).
+
+    Purely diagnostic — this never changes live gating on its own. It only
+    tells you whether your edge holds up the same way in both regimes, or
+    is concentrated in one of them, which is a prerequisite for ever
+    trusting a regime-specific threshold multiplier.
+
+    Returns {"valid": False, "error": ...} if fewer than 2*min_sample rows
+    carry an adx_val (older outcome-log rows won't — the field was added
+    later, and this degrades gracefully rather than erroring on mixed old/
+    new data)."""
+    with_regime = [r for r in rows if r.get("adx_val") is not None]
+    result: Dict[str, Any] = {"valid": False, "n_with_adx": len(with_regime), "n_total": len(rows)}
+    if len(with_regime) < min_sample * 2:
+        result["error"] = "insufficient_adx_tagged_rows"
+        return result
+
+    adx_values = sorted(r["adx_val"] for r in with_regime)
+    mid = len(adx_values) // 2
+    median_adx = (
+        adx_values[mid] if len(adx_values) % 2
+        else (adx_values[mid - 1] + adx_values[mid]) / 2.0
+    )
+    result["median_adx"] = median_adx
+
+    buckets: Dict[str, List[Row]] = {"trending": [], "ranging": []}
+    for r in with_regime:
+        buckets["trending" if r["adx_val"] >= median_adx else "ranging"].append(r)
+
+    regimes: Dict[str, Any] = {}
+    for label, bucket_rows in buckets.items():
+        bn = len(bucket_rows)
+        if bn < min_sample:
+            regimes[label] = {"valid": False, "n": bn, "error": "insufficient_sample"}
+            continue
+        wins = sum(r["win"] for r in bucket_rows)
+        wr = wins / bn
+        lo, hi, _ = wilson_ci(wins, bn)
+        regimes[label] = {
+            "valid": True, "n": bn, "wr": wr,
+            "wilson_lo": lo, "wilson_hi": hi,
+            "confidence": confidence_label(bn, lo, hi),
+        }
+    result["regimes"] = regimes
+    result["valid"] = True
+
+    if regimes.get("trending", {}).get("valid") and regimes.get("ranging", {}).get("valid"):
+        result["wr_gap"] = regimes["trending"]["wr"] - regimes["ranging"]["wr"]
+    return result
+
 def find_knee_point(caps_data: List[CapRow], min_sample: int = 30, smooth_window: int = 3) -> Optional[float]:
     """Where marginal WR gain per +1 score flattens. WR values are smoothed
     first to resist single-bucket noise. Returns the (unsmoothed) score at
@@ -354,7 +422,6 @@ def find_knee_point(caps_data: List[CapRow], min_sample: int = 30, smooth_window
             best_ratio = drop
             best_knee = curr_cap
     return best_knee
-
 
 def compute_ev_by_cap(rows: List[Row], caps: List[float], min_sample: int = 10):
     """EV (and win/loss magnitudes for R:R) per trade for each cap level.
@@ -492,6 +559,7 @@ def recommend_threshold(
 
     On success (valid=True), also includes:
       recommended, rec_n, rec_wr, rec_ev, rec_rr, rec_avg_win, rec_avg_loss,
+      rec_wilson_lo, rec_wilson_hi, confidence,
       buy_wr, buy_n, sell_wr, sell_n,
       drift_recent_wr, drift_older_wr, drift_recent_n,
       alerts_per_week_before, alerts_per_week_after, dropped, dropped_pct,
@@ -528,10 +596,6 @@ def recommend_threshold(
     result["ev_data"] = ev_data
     best_ev = max(ev_data, key=lambda x: x[3]) if ev_data else None
     result["best_ev"] = best_ev
-
-    # Statistically-honest floor: lowest cap where the WILSON LOWER BOUND
-    # (not raw WR) clears the target. Falls back to raw WR on thin data so
-    # the tool stays usable early on.
     target_floor = None
     for cap, _n_pass, wr, wr_lo in caps_data:
         if wr_lo >= target_winrate:
@@ -550,12 +614,6 @@ def recommend_threshold(
 
     knee_floor = knee if knee is not None else 0.0
     ev_floor = best_ev[0] if best_ev else 0.0
-    # NOTE: toxic-zone ceiling is deliberately NOT included in this max().
-    # A single non-contiguous toxic bucket above a perfectly good region
-    # must not drag the recommendation past scores that already have
-    # strong cumulative win rate and sample size — toxic zones are
-    # informational (see detect_toxic_zones docstring and
-    # result["overlapping_toxic"] below), never a hard floor.
     recommended = max(knee_floor, ev_floor, target_floor or 0.0)
     if recommended <= 0.0:
         result["error"] = "zero_recommendation"
@@ -565,12 +623,16 @@ def recommend_threshold(
     rec_n = len(rec_subset)
     rec_wr = sum(r["win"] for r in rec_subset) / rec_n if rec_n else 0.0
     ev, rr, avg_w, avg_l = ev_and_rr_for(rec_subset)
+    rec_wilson_lo, rec_wilson_hi = (0.0, 0.0)
+    if rec_n:
+        rec_wilson_lo, rec_wilson_hi, _ = wilson_ci(int(round(rec_wr * rec_n)), rec_n)
     result.update({
         "recommended": recommended,
         "rec_n": rec_n, "rec_wr": rec_wr, "rec_ev": ev, "rec_rr": rr,
         "rec_avg_win": avg_w, "rec_avg_loss": avg_l,
+        "rec_wilson_lo": rec_wilson_lo, "rec_wilson_hi": rec_wilson_hi,
+        "confidence": confidence_label(rec_n, rec_wilson_lo, rec_wilson_hi) if rec_n else "LOW",
     })
-
     buy_wr, buy_n, sell_wr, sell_n = direction_split(rec_subset)
     result.update({"buy_wr": buy_wr, "buy_n": buy_n, "sell_wr": sell_wr, "sell_n": sell_n})
 

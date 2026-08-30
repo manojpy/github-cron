@@ -401,7 +401,6 @@ class BrainEngine:
                         f"_ALERT_CONFIG_MAP — no config_patch was emitted. Add a mapping or disable manually."
                     ),
                 })
-
         threshold_rec: Dict[str, Any] = {}
         rec = engine.recommend_threshold(
             real_rows, target_winrate=target_wr, min_sample=min_sample,
@@ -439,15 +438,19 @@ class BrainEngine:
                 wf_note = "ℹ️ Not enough data yet for walk-forward validation — treat as provisional."
                 emit_patch = True
 
+
             threshold_rec = {
                 "type": "confluence_threshold", "severity": "high" if emit_patch else "medium",
                 "current_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE,
                 "suggested_abs_score": target_floor,
                 "supporting_samples": rec_n, "resulting_wr": round(rec_wr, 3),
                 "ev": round(ev, 4), "rr": rr, "walk_forward_passed": wf.get("passed"),
+                "confidence": rec.get("confidence"),
                 "message": (
                     f"Set CONFLUENCE_MIN_ABS_SCORE to {target_floor:.1f} "
-                    f"(currently {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) for {rec_wr:.0%} WR, "
+                    f"(currently {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}) for {rec_wr:.0%} WR "
+                    f"[{rec.get('rec_wilson_lo', 0):.0%}-{rec.get('rec_wilson_hi', 0):.0%}], "
+                    f"confidence {rec.get('confidence', 'N/A')}, "
                     f"EV {ev:+.3f}%/trade, R:R {engine.format_rr(rr)} across {rec_n} trades.{direction_note}\n"
                     f"Alert frequency: {rec['alerts_per_week_before']:.1f}/wk -> "
                     f"{rec['alerts_per_week_after']:.1f}/wk "
@@ -490,6 +493,24 @@ class BrainEngine:
                         ),
                     })
 
+            rb = engine.regime_breakdown(real_rows, min_sample=min_sample)
+            if rb["valid"] and "wr_gap" in rb:
+                trending, ranging = rb["regimes"]["trending"], rb["regimes"]["ranging"]
+                gap = rb["wr_gap"]
+                gap_note = (
+                    "NOT regime-neutral — worth tracking separately"
+                    if abs(gap) > 0.10 else "roughly regime-neutral so far"
+                )
+                recommendations.append({
+                    "type": "regime_breakdown", "severity": "low",
+                    "message": (
+                        f"Regime split (median ADX {rb['median_adx']:.1f} this window): "
+                        f"trending WR {trending['wr']:.0%} (n={trending['n']}, {trending['confidence']}) "
+                        f"vs ranging WR {ranging['wr']:.0%} (n={ranging['n']}, {ranging['confidence']}). "
+                        f"Gap {gap:+.1%} — {gap_note}.\n"
+                        f"Diagnostic only — no regime-specific threshold applied yet."
+                    ),
+                })
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
                 recommendations.append({

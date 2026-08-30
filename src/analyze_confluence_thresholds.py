@@ -84,6 +84,7 @@ def load_rows(r, pair_filter=None, direction_filter=None, alert_key_filter=None)
             votes = json.loads(votes_raw) if votes_raw else None
         except (TypeError, ValueError):
             votes = None
+
         rows.append({
             "pair": f.get("pair"),
             "alert_key": f.get("alert_key"),
@@ -94,6 +95,7 @@ def load_rows(r, pair_filter=None, direction_filter=None, alert_key_filter=None)
             "pct_move": to_float(f.get("pct_move"), 0.0),
             "entry_ts": int(f.get("entry_ts", 0)),
             "votes": votes,
+            "adx_val": to_float(f.get("adx_val")),
         })
     if not rows:
         print("No usable rows after filtering.", file=sys.stderr)
@@ -331,11 +333,13 @@ def main():
     target_floor = rec.get("target_floor")
 
     print(f"\n  ✅ Recommended CONFLUENCE_MIN_ABS_SCORE: {recommended:.1f}")
-    print(f"     N={rec['rec_n']} | WR={rec['rec_wr']:.1%} | "
+    print(f"     N={rec['rec_n']} | WR={rec['rec_wr']:.1%} "
+          f"[{rec['rec_wilson_lo']:.0%}-{rec['rec_wilson_hi']:.0%}] | "
           f"EV={rec['rec_ev']:+.3f}% per trade | R:R={engine.format_rr(rec['rec_rr'])}")
+    print(f"     Confidence: {rec['confidence']}")
     if rec["rec_n"] < 50:
         print(f"     ⚠️  Only {rec['rec_n']} samples support this threshold — treat as provisional.")
-
+    
     print(f"     Alert frequency: {rec['alerts_per_week_before']:.1f}/week → "
           f"{rec['alerts_per_week_after']:.1f}/week "
           f"(dropping {rec['dropped']} alerts, {rec['dropped_pct']:.0%})")
@@ -429,12 +433,38 @@ def main():
             print(f"  OOS win rate:  mean {mc['oos_wr_mean']:.1%}  ±{mc['oos_wr_std']:.1%}  "
                   f"[p5={mc['oos_wr_p5']:.1%}, p95={mc['oos_wr_p95']:.1%}]")
             print(f"  Threshold:     mean {mc['threshold_mean']:.1f}  ±{mc['threshold_std']:.1f}")
+
             icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE — needs more data"
             print(f"  Robustness score: {mc['robustness_score']:.2f}  {icon}")
             print(f"  (p5 is the number to trust for a worst-case plan, not the mean)")
 
-
-
+    rb = None
+    if args.regime:
+        rb = engine.regime_breakdown(rows, min_sample=args.min_sample)
+        print(f"\n{'='*70}")
+        print(f"  REGIME BREAKDOWN (trending vs ranging, ADX self-relative median split)")
+        print(f"{'='*70}")
+        if not rb["valid"]:
+            print(f"\n  ❌ Could not break down: {rb.get('error')} "
+                  f"({rb['n_with_adx']}/{rb['n_total']} rows have adx_val — "
+                  f"older outcome rows predate this field and are skipped).")
+        else:
+            print(f"\n  Median ADX in this window: {rb['median_adx']:.1f}")
+            for label in ("trending", "ranging"):
+                d = rb["regimes"].get(label, {})
+                if not d.get("valid"):
+                    print(f"  {label:<10} — {d.get('error', 'no data')} (n={d.get('n', 0)})")
+                    continue
+                print(f"  {label:<10} n={d['n']:<5} WR={d['wr']:.1%} "
+                      f"[{d['wilson_lo']:.0%}-{d['wilson_hi']:.0%}]  confidence={d['confidence']}")
+            if "wr_gap" in rb:
+                gap = rb["wr_gap"]
+                print(f"\n  Gap (trending − ranging): {gap:+.1%}")
+                if abs(gap) > 0.10:
+                    print(f"  Meaningful gap — this edge is NOT regime-neutral. Worth tracking")
+                    print(f"  separately before ever picking a regime-specific multiplier.")
+                else:
+                    print(f"  Small gap — this edge looks roughly regime-neutral so far.")
 
     if args.json:
         output = {
@@ -478,6 +508,22 @@ def main():
                 "oos_wr_p5": round(mc["oos_wr_p5"], 4) if mc.get("oos_wr_p5") is not None else None,
                 "oos_wr_p95": round(mc["oos_wr_p95"], 4) if mc.get("oos_wr_p95") is not None else None,
                 "robustness_score": round(mc["robustness_score"], 3) if mc.get("robustness_score") is not None else None,
+            }
+        if rb is not None:
+            output["regime_breakdown"] = {
+                "valid": rb["valid"],
+                "error": rb.get("error"),
+                "median_adx": round(rb["median_adx"], 2) if rb.get("median_adx") is not None else None,
+                "wr_gap": round(rb["wr_gap"], 4) if rb.get("wr_gap") is not None else None,
+                "regimes": {
+                    label: {
+                        "valid": d.get("valid", False),
+                        "n": d.get("n"),
+                        "wr": round(d["wr"], 4) if d.get("wr") is not None else None,
+                        "confidence": d.get("confidence"),
+                    }
+                    for label, d in rb.get("regimes", {}).items()
+                } if rb["valid"] else {},
             }
         print(json.dumps(output, indent=2))
 

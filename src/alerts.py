@@ -1432,6 +1432,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
+
                         if cfg.ENABLE_WIN_RATE_FILTER:
                             async def _record_one(alert_key: str):
                                 s, t, v = _confluence_for(alert_key)
@@ -1440,6 +1441,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                     "buy" if alert_key in BUY_ALERT_KEYS else "sell",
                                     ts_curr, close_curr,
                                     confluence_score=s, confluence_total=t, confluence_votes=v,
+                                    adx_val=adx_val,
                                 )
                             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
                     else:
