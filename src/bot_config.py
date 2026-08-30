@@ -88,18 +88,17 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
     "ichimoku_cloud": 2.0,
     "rma_cloud": 2.0,
-    "dynamic_flow_ribbon": 2.0,
     "ppo_cross": 2.0,
     "rsi_guard": 2.0,
     "tk_guard": 2.0,
     "adx": 1.0,
     "rvol": 1.5,
     "cpr": 1.0,
-    "oi_funding": 2.0,
-    "order_block": 2.0,
-    "adx_strength": 1.0,
+    "oi_funding": 2.5,
+    "order_block": 2.5,
+    "adx_strength": 1.5,
     "atr_percentile": 1.5,
-    "volume_percentile": 1.0,
+    "volume_percentile": 1.5,
     "ppo_gate_momentum":  1.0,
     "rsi_guard_momentum": 1.0,
     "rma_cloud_momentum": 1.0,
@@ -138,9 +137,6 @@ class Constants:
     REVERSAL_PRIOR_LEG_MIN_RANGE_MULT = 0.5 
     OSCILLATOR_GROUP_MIN_VOTES = 1
     REVERSAL_MIN_PRIOR_BODY_RATIO: float = 0.40
-    CLOUD_GROUP_MIN_VOTES_OF_3 = 2
-
-
 
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
@@ -268,6 +264,8 @@ class BotConfig(BaseModel):
     BRAIN_OVERRIDE_COOLDOWN_SECONDS: int = Field(default=14400, ge=600, le=86400, description="Min seconds between rewardable overrides for the same alert_key")
     BRAIN_STAR_ALERT_WR: float = Field(default=0.70, ge=0.5, le=1.0, description="Win rate above which an alert is flagged as a star performer")
     BRAIN_ANALYSIS_WINDOW_DAYS: int = Field(default=30, ge=7, le=365, description="Only analyze outcomes from the last N days")
+    ENABLE_TELEGRAM_FEEDBACK: bool = Field(default=False, description="Attach 'Took Trade'/'Skipped' inline buttons to alerts and poll Telegram getUpdates each run to record taps into feedback_log_stream")
+    TELEGRAM_FEEDBACK_TTL_HOURS: int = Field(default=24, ge=1, le=168, description="How long a feedback_pending record (and its buttons) stays live before the alert is considered expired/unanswered")
     DRY_RUN_MODE: bool = Field(default=False)
     SKIP_WARMUP: bool = Field(default=False)
     REJECT_HIGH_DEVIATION: bool = Field( default=False)
@@ -282,10 +280,6 @@ class BotConfig(BaseModel):
     ICHIMOKU_TK_GUARD_ENABLED: bool = Field(default=True, description="Require 15m Tenkan(conversion) vs Kijun(base) alignment: buy needs conversion>=base, sell needs conversion<=base")
     RMA_CLOUD_ENABLED: bool = Field(default=True, description="Enable RMA(fast)/RMA(50) 15m cloud as trend gate; green (buy) when RMA_fast>RMA50, red (sell) when RMA_fast<RMA50. Reuses the existing RMA50(15m)/RMA_50_PERIOD used for base trend.")
     RMA_CLOUD_FAST_PERIOD: int = Field(default=20, ge=2, le=200, description="RMA Cloud fast period (15m). Slow leg reuses RMA_50_PERIOD.")
-    DYNAMIC_FLOW_RIBBON_ENABLED: bool = Field(default=True, description="Enable the 15m Dynamic Flow Ribbon (BigBeluga) as a third cloud-group trend gate alongside Ichimoku Cloud and RMA Cloud; green (buy) when the band-flip direction is bullish, red (sell) when bearish")
-    DYNAMIC_FLOW_FACTOR: float = Field(default=3.0, ge=0.1, le=20.0, description="Dynamic Flow Ribbon band-width multiplier (Pine 'Length' input) — bands sit at basis \u00b1 factor*dist")
-    DYNAMIC_FLOW_BASIS_LENGTH: int = Field(default=15, ge=2, le=200, description="Dynamic Flow Ribbon basis EMA period (15m, applied to hlc3)")
-    DYNAMIC_FLOW_DIST_LENGTH: int = Field(default=200, ge=10, le=500, description="Dynamic Flow Ribbon distance SMA period (15m, applied to high-low) used to size the bands")
     ENABLE_TK_CONVERSION_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku conversion (Tenkan) line, subject to all other buy/sell common conditions")
     ENABLE_CLOUD_CROSS_ALERT: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku cloud (9,26,52,26), subject to all other buy/sell common conditions") 
     ENABLE_KIJUN_CROSS: bool = Field(default=True, description="Enable 15m alert when close crosses above/below the Ichimoku base (Kijun) line (23,65), subject to all other buy/sell common conditions")

@@ -4,6 +4,7 @@ import re
 import random
 import asyncio
 import logging
+import uuid
 from enum import StrEnum
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List, Set, Callable, Union
@@ -12,8 +13,9 @@ import numpy as np
 
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
-    shutdown_event, format_ist_time,
+    shutdown_event, format_ist_time, json_dumps,
 )
+
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, independent_candle_reverify, cross_check_15m_against_5m,
@@ -27,6 +29,8 @@ from indicators import (
     validate_cloud_cross, validate_conversion_cross, _tlr_confluence_vote,
     _fib_reversal_confluence_vote,
 )
+from telegram_feedback import build_feedback_keyboard, record_feedback_pending
+
 def escape_markdown_v2(text: str) -> str:
     return CompiledPatterns.ESCAPE_MARKDOWN.sub(r'\\\g<0>', str(text))
 
@@ -80,6 +84,57 @@ class TelegramQueue:
                     logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
                     await asyncio.sleep(delay)
         return False
+
+    async def send_with_markup(self, message: str, reply_markup: Dict[str, Any]) -> Optional[int]:
+        """Like send(), but attaches an inline keyboard and returns the sent
+        message_id (needed later to edit the buttons off) instead of a bool.
+        Kept as a separate method rather than changing send()'s return type,
+        since every existing call site depends on send() returning bool.
+        Returns None on failure — treat the same as a failed send()."""
+        try:
+            return await asyncio.wait_for(
+                self._send_impl_with_markup(message, reply_markup), timeout=45.0
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Telegram send_with_markup failed: {e}")
+            if cfg.FAIL_ON_TELEGRAM_DOWN:
+                raise
+            return None
+
+    async def _send_impl_with_markup(self, message: str, reply_markup: Dict[str, Any]) -> Optional[int]:
+        await self.token_bucket.acquire()
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        params = {
+            "chat_id": self.chat_id, "text": message, "parse_mode": "MarkdownV2",
+            "reply_markup": json_dumps(reply_markup),
+        }
+        session = await SessionManager.get_session()
+        for attempt in range(1, cfg.TELEGRAM_RETRIES + 1):
+            if shutdown_event.is_set():
+                return None
+            try:
+                async with session.post(url, data=params, timeout=10) as resp:
+                    if resp.status == 429:
+                        wait_sec = min(int(resp.headers.get("Retry-After", 1)), Constants.CIRCUIT_BREAKER_MAX_WAIT)
+                        await asyncio.sleep(wait_sec + random.uniform(0.1, 0.5))
+                        continue
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("result", {}).get("message_id")
+                    if resp.status in (400, 401, 403, 404):
+                        logger.error(f"Telegram API error {resp.status} - check token/chat_id")
+                        return None
+                    raise Exception(f"Telegram API error {resp.status}")
+
+            except Exception as e:
+                logger.warning(f"Telegram send_with_markup attempt {attempt} failed: {e}")
+                if attempt < cfg.TELEGRAM_RETRIES:
+                    delay = compute_backoff(1.0, attempt)
+                    logger.debug(f"Retrying Telegram request in {delay:.1f}s (attempt {attempt})...")
+                    await asyncio.sleep(delay)
+        return None
 
 def _clean_extra_text(extra: Optional[str]) -> str:
     """Helper to strip emojis, OHLC data, and technical metadata."""
@@ -1349,6 +1404,25 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _refund_alert_budget(len(alerts_to_send))
                         send_success = False
+
+                    elif cfg.ENABLE_TELEGRAM_FEEDBACK:
+                        feedback_id = uuid.uuid4().hex[:12]
+                        direction = "buy" if any(ak in BUY_ALERT_KEYS for _, _, ak in alerts_to_send) else "sell"
+                        await record_feedback_pending(
+                            sdb, feedback_id, pair_name,
+                            [ak for _, _, ak in alerts_to_send], ts_curr, direction,
+                            message_id=None,
+                        )
+                        message_id = await telegram_queue.send_with_markup(
+                            msg, build_feedback_keyboard(feedback_id)
+                        )
+                        send_success = message_id is not None
+                        if send_success:
+                            await record_feedback_pending(
+                                sdb, feedback_id, pair_name,
+                                [ak for _, _, ak in alerts_to_send], ts_curr, direction,
+                                message_id=message_id,
+                            )
                     else:
                         send_success = await telegram_queue.send(msg)
 
