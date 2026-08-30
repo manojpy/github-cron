@@ -88,17 +88,18 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "base_trend": 3.0,
     "ichimoku_cloud": 2.0,
     "rma_cloud": 2.0,
+    "dynamic_flow_ribbon": 2.0,
     "ppo_cross": 2.0,
     "rsi_guard": 2.0,
     "tk_guard": 2.0,
     "adx": 1.0,
     "rvol": 1.5,
     "cpr": 1.0,
-    "oi_funding": 2.5,
-    "order_block": 2.5,
-    "adx_strength": 1.5,
+    "oi_funding": 2.0,
+    "order_block": 2.0,
+    "adx_strength": 1.0,
     "atr_percentile": 1.5,
-    "volume_percentile": 1.5,
+    "volume_percentile": 1.0,
     "ppo_gate_momentum":  1.0,
     "rsi_guard_momentum": 1.0,
     "rma_cloud_momentum": 1.0,
@@ -138,6 +139,8 @@ class Constants:
     OSCILLATOR_GROUP_MIN_VOTES = 1
     REVERSAL_MIN_PRIOR_BODY_RATIO: float = 0.40
     CLOUD_GROUP_MIN_VOTES_OF_3 = 2
+
+
 
 
 PIVOT_LEVELS_BUY = ["P", "S1", "S2", "S3", "R1", "R2"]
