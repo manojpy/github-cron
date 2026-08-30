@@ -96,10 +96,9 @@ from typing import Any, Dict, List, Optional
 
 from alerts import escape_markdown_v2
 
-from bot_config import cfg, json_dumps, format_ist_time
+from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
 import threshold_engine as engine
-
 
 _ALERT_CONFIG_MAP = {
     "strong_reversal_buy":  "ENABLE_STRONG_REVERSAL_ALERT",
@@ -438,7 +437,6 @@ class BrainEngine:
                 wf_note = "ℹ️ Not enough data yet for walk-forward validation — treat as provisional."
                 emit_patch = True
 
-
             threshold_rec = {
                 "type": "confluence_threshold", "severity": "high" if emit_patch else "medium",
                 "current_abs_score": cfg.CONFLUENCE_MIN_ABS_SCORE,
@@ -511,6 +509,31 @@ class BrainEngine:
                         f"Diagnostic only — no regime-specific threshold applied yet."
                     ),
                 })
+
+            attribution = engine.outcome_attribution(
+                real_rows, CONFLUENCE_WEIGHTS, threshold=target_floor, min_sample=min_sample,
+            )
+            flagged = [
+                e for e in attribution
+                if e.get("rescued_valid") and e["n_rescued"] >= min_sample and e["rescued_wr"] < target_wr - 0.10
+            ]
+            if flagged:
+                lines = [
+                    f"  • {e['vote']}: rescues {e['n_rescued']} trades ({e['rescued_pct']:.0%} of its True cases) "
+                    f"at only {e['rescued_wr']:.0%} WR [{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}]"
+                    for e in flagged[:5]
+                ]
+                recommendations.append({
+                    "type": "outcome_attribution", "severity": "medium",
+                    "message": (
+                        f"Outcome attribution at threshold {target_floor:.1f}: {len(flagged)} vote(s) are "
+                        f"propping up trades that clear the bar only because of that vote's weight, and "
+                        "those specific trades underperform target WR:\n" + "\n".join(lines) + "\n"
+                        "Consider re-checking these votes' weights — this is diagnostic, no config "
+                        "patch is auto-applied."
+                    ),
+                })
+
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])
                 recommendations.append({

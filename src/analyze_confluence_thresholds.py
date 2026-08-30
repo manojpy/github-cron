@@ -129,7 +129,17 @@ def main():
     ap.add_argument("--monte-carlo", type=int, default=0, metavar="N_SIMS",
                     help="Run N block-bootstrap walk-forward simulations for a robustness distribution "
                          "instead of trusting a single split (e.g. --monte-carlo 100). Offline-only.")
+    ap.add_argument("--regime", action="store_true",
+                    help="Break down win rate by trending vs ranging regime (ADX-based, self-relative "
+                         "median split). Diagnostic only — never changes the recommended threshold.")
+    ap.add_argument("--attribution", metavar="WEIGHTS_JSON_PATH",
+                    help="Counterfactual per-vote attribution: which votes are propping up otherwise-"
+                         "weak trades over the threshold. Needs a JSON file of {vote_name: weight} — "
+                         "e.g. dump cfg.CONFLUENCE_WEIGHTS from bot_config.py on the bot host, since "
+                         "this script runs standalone without bot_config. Diagnostic only.")
     args = ap.parse_args()
+
+
 
     redis_url = os.environ.get("REDIS_URL")
     if not redis_url:
@@ -466,6 +476,34 @@ def main():
                 else:
                     print(f"  Small gap — this edge looks roughly regime-neutral so far.")
 
+    attribution = None
+    if args.attribution:
+        try:
+            with open(args.attribution) as fh:
+                weights = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"\n  ❌ Could not read weights file {args.attribution}: {e}", file=sys.stderr)
+            weights = None
+        if weights:
+            attribution = engine.outcome_attribution(rows, weights, threshold=recommended, min_sample=args.min_sample)
+            print(f"\n{'='*70}")
+            print(f"  OUTCOME ATTRIBUTION (counterfactual, at threshold {recommended:.1f})")
+            print(f"{'='*70}")
+            if not attribution:
+                print(f"\n  No votes had enough rescued-trade samples to evaluate yet.")
+            else:
+                for e in attribution:
+                    if not e["rescued_valid"]:
+                        print(f"  {e['vote']:<20} rescues {e['n_rescued']} — too thin to judge yet")
+                        continue
+                    flag = "⚠️ " if e["rescued_wr"] < args.target_winrate - 0.10 else "   "
+                    print(f"  {flag}{e['vote']:<18} rescued {e['n_rescued']:>4} "
+                          f"({e['rescued_pct']:.0%} of its True cases) → WR {e['rescued_wr']:.1%} "
+                          f"[{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}] {e['rescued_confidence']}")
+                print(f"\n  Rescued = trades that only cleared the threshold because of that vote's")
+                print(f"  weight. Low WR among a vote's rescued trades means it's propping up")
+                print(f"  otherwise-weak setups over the line, not adding real edge.")
+
     if args.json:
         output = {
             "recommended_score": recommended,
@@ -522,9 +560,20 @@ def main():
                         "wr": round(d["wr"], 4) if d.get("wr") is not None else None,
                         "confidence": d.get("confidence"),
                     }
-                    for label, d in rb.get("regimes", {}).items()
+                    for label, d in rb.get("regimes", {}).items() 
                 } if rb["valid"] else {},
             }
+        if attribution is not None:
+            output["outcome_attribution"] = [
+                {
+                    "vote": e["vote"], "weight": e["weight"],
+                    "n_with_vote": e["n_with_vote"], "n_rescued": e["n_rescued"],
+                    "rescued_pct": round(e["rescued_pct"], 4),
+                    "rescued_valid": e["rescued_valid"],
+                    "rescued_wr": round(e["rescued_wr"], 4) if e.get("rescued_wr") is not None else None,
+                }
+                for e in attribution
+            ]
         print(json.dumps(output, indent=2))
 
 if __name__ == "__main__":

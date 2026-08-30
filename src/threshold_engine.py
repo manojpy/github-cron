@@ -473,6 +473,54 @@ def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     results.sort(key=lambda x: x[1])
     return results
 
+def outcome_attribution(
+    rows: List[Row],
+    weights: Dict[str, float],
+    threshold: float,
+    min_sample: int = 10,
+) -> List[Dict[str, Any]]:
+ 
+    vote_names = set()
+    for r in rows:
+        if r.get("votes"):
+            vote_names.update(r["votes"].keys())
+
+    results = []
+    for vn in sorted(vote_names):
+        weight = weights.get(vn)
+        if weight is None or weight <= 0:
+            continue
+        with_vote = [r for r in rows if r.get("votes") and r["votes"].get(vn) is True]
+        if len(with_vote) < min_sample:
+            continue
+
+        rescued = [r for r in with_vote if threshold <= r["score"] < threshold + weight]
+        comfortable = [r for r in with_vote if r["score"] >= threshold + weight]
+
+        entry: Dict[str, Any] = {
+            "vote": vn, "weight": weight,
+            "n_with_vote": len(with_vote),
+            "n_rescued": len(rescued),
+            "rescued_pct": len(rescued) / len(with_vote) if with_vote else 0.0,
+        }
+        if len(rescued) >= min_sample:
+            wins = sum(r["win"] for r in rescued)
+            wr = wins / len(rescued)
+            lo, hi, _ = wilson_ci(wins, len(rescued))
+            entry.update({
+                "rescued_valid": True, "rescued_wr": wr,
+                "rescued_wilson_lo": lo, "rescued_wilson_hi": hi,
+                "rescued_confidence": confidence_label(len(rescued), lo, hi),
+            })
+        else:
+            entry["rescued_valid"] = False
+        if len(comfortable) >= min_sample:
+            entry["comfortable_wr"] = sum(r["win"] for r in comfortable) / len(comfortable)
+            entry["comfortable_n"] = len(comfortable)
+        results.append(entry)
+
+    results.sort(key=lambda e: -e["n_rescued"])
+    return results
 
 def vote_importance(rows: List[Row], min_sample: int = 10):
     """For each vote, win rate when True vs False. Sorted by lift
