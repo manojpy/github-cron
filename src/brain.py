@@ -144,7 +144,6 @@ _ALERT_CONFIG_PREFIX_MAP = {
 
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 
-
 def _resolve_config_path(alert_key: str) -> Optional[str]:
     path = _ALERT_CONFIG_MAP.get(alert_key)
     if path:
@@ -167,7 +166,6 @@ def _hget_int(data: dict, key: str, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
-
 
 class BrainEngine:
     """Analysis layer over the bot's existing win-rate infrastructure."""
@@ -466,12 +464,31 @@ class BrainEngine:
                 rec_subset = [r for r in real_rows if r["score"] >= target_floor]
                 avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
                 suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
+
                 config_patch.append({
                     "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
                     "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
                     "note": "Derived from suggested abs score / avg total this window — informational, "
                             "the abs score patch above is the one that reliably binds.",
                 })
+
+            if cfg.BRAIN_MC_SIMULATIONS > 0:
+                mc = engine.monte_carlo_walk_forward(
+                    real_rows, n_simulations=cfg.BRAIN_MC_SIMULATIONS,
+                    min_sample=min_sample, target_winrate=target_wr,
+                )
+                if mc["valid"]:
+                    robust_icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE"
+                    recommendations.append({
+                        "type": "monte_carlo_robustness", "severity": "low",
+                        "message": (
+                            f"Monte Carlo ({mc['n_simulations']} block-bootstrap sims): "
+                            f"OOS WR mean {mc['oos_wr_mean']:.0%} ±{mc['oos_wr_std']:.0%}, "
+                            f"worst-case (5th pct) {mc['oos_wr_p5']:.0%}. "
+                            f"Robustness {mc['robustness_score']:.2f} — {robust_icon}\n"
+                            f"Diagnostic only — does not change the config patch above."
+                        ),
+                    })
 
             if rec.get("overlapping_toxic"):
                 worst = max(rec["overlapping_toxic"], key=lambda t: t[1])

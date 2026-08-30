@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import math
 import time
+import random
+import statistics
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -241,6 +243,93 @@ def validate_threshold_walk_forward(
         "passed": lo >= (target_winrate - slack),
     })
     return result
+
+def monte_carlo_walk_forward(
+    rows: List[Row],
+    n_simulations: int = 100,
+    train_frac: float = 0.7,
+    min_sample: int = 20,
+    target_winrate: float = 0.55,
+    bucket_size: float = 1.0,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Offline-only robustness check — never touches live gating. Runs many
+    walk-forward validations against block-bootstrap resamples of the same
+    history, instead of trusting one chronological split. A single split can
+    look good or bad by luck of exactly where the cut falls; resampling
+    contiguous blocks (not individual rows, which would destroy the
+    within-block time-correlation daily/session patterns actually have) and
+    re-running the split many times shows whether that result was typical
+    or a fluke of one particular window.
+
+    Returns a distribution of out-of-sample win rates across simulations,
+    not a single number — report the mean AND the spread (oos_wr_p5 is the
+    one that matters most: "how bad could this plausibly get").
+    """
+    rng = random.Random(seed)
+    if len(rows) < min_sample * 2:
+        return {"valid": False, "error": "insufficient_data", "n_rows": len(rows)}
+
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    block_size = max(10, len(ordered) // 20)
+    blocks = [ordered[i:i + block_size] for i in range(0, len(ordered), block_size)]
+    blocks = [b for b in blocks if b]
+    if len(blocks) < 5:
+        return {"valid": False, "error": "insufficient_blocks", "n_blocks": len(blocks)}
+
+    oos_wr_list: List[float] = []
+    threshold_list: List[float] = []
+
+    for _ in range(n_simulations):
+        sampled_blocks = rng.choices(blocks, k=len(blocks))
+        sampled_rows = [row for block in sampled_blocks for row in block]
+        sampled_rows.sort(key=lambda r: r.get("entry_ts", 0))
+
+        train_rows, holdout_rows = walk_forward_split(sampled_rows, train_frac)
+        if len(train_rows) < min_sample * 2 or len(holdout_rows) < min_sample:
+            continue
+
+        train_result = recommend_threshold(train_rows, target_winrate, min_sample, bucket_size)
+        if not train_result["valid"]:
+            continue
+
+        threshold = train_result["recommended"]
+        holdout_subset = [r for r in holdout_rows if r["score"] >= threshold]
+        if len(holdout_subset) < 5:
+            continue
+
+        wins = sum(r["win"] for r in holdout_subset)
+        oos_wr_list.append(wins / len(holdout_subset))
+        threshold_list.append(threshold)
+
+    if len(oos_wr_list) < 10:
+        return {
+            "valid": False, "error": "too_few_valid_simulations",
+            "n_valid": len(oos_wr_list), "n_requested": n_simulations,
+        }
+
+    oos_wr_list.sort()
+    n = len(oos_wr_list)
+    mean_wr = statistics.fmean(oos_wr_list)
+    std_wr = statistics.pstdev(oos_wr_list) if n > 1 else 0.0
+    p5_idx = max(0, min(n - 1, round(0.05 * (n - 1))))
+    p95_idx = max(0, min(n - 1, round(0.95 * (n - 1))))
+
+    return {
+        "valid": True,
+        "n_simulations": n,
+        "n_requested": n_simulations,
+        "oos_wr_mean": mean_wr,
+        "oos_wr_std": std_wr,
+        "oos_wr_p5": oos_wr_list[p5_idx],
+        "oos_wr_p95": oos_wr_list[p95_idx],
+        "threshold_mean": statistics.fmean(threshold_list),
+        "threshold_std": statistics.pstdev(threshold_list) if len(threshold_list) > 1 else 0.0,
+        # Mean/spread ratio — a rough "is this edge stable or just lucky
+        # sometimes" signal. Not a statistical test, just a sort key for
+        # the report; read oos_wr_p5 for the actual worst-case number.
+        "robustness_score": mean_wr / max(std_wr, 0.01),
+    }
 
 def find_knee_point(caps_data: List[CapRow], min_sample: int = 30, smooth_window: int = 3) -> Optional[float]:
     """Where marginal WR gain per +1 score flattens. WR values are smoothed

@@ -124,6 +124,9 @@ def main():
                          "the newer 1/3 it never saw, and report whether it holds up out-of-sample.")
     ap.add_argument("--train-frac", type=float, default=0.67,
                     help="Fraction of (chronologically) older rows used for fitting in --walk-forward mode")
+    ap.add_argument("--monte-carlo", type=int, default=0, metavar="N_SIMS",
+                    help="Run N block-bootstrap walk-forward simulations for a robustness distribution "
+                         "instead of trusting a single split (e.g. --monte-carlo 100). Offline-only.")
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
@@ -404,10 +407,34 @@ def main():
                       f"[{wf['holdout_wilson_lo']:.0%}-{wf['holdout_wilson_hi']:.0%}]")
                 print(f"  {icon} — degraded {wf['degraded_pct']:+.1%} vs train WR "
                       f"(target {args.target_winrate:.0%}, slack 5pt)")
+
                 if not wf["passed"]:
                     print(f"     This threshold looked good on the data it was chosen from but")
                     print(f"     didn't hold up on newer data it hadn't seen. Treat the")
                     print(f"     recommendation above as unconfirmed — don't apply it yet.")
+
+    mc = None
+    if args.monte_carlo > 0:
+        mc = engine.monte_carlo_walk_forward(
+            rows, n_simulations=args.monte_carlo, train_frac=args.train_frac,
+            min_sample=args.min_sample, target_winrate=args.target_winrate, bucket_size=bw,
+        )
+        print(f"\n{'='*70}")
+        print(f"  MONTE CARLO ROBUSTNESS ({args.monte_carlo} block-bootstrap simulations)")
+        print(f"{'='*70}")
+        if not mc["valid"]:
+            print(f"\n  ❌ Could not run: {mc.get('error')} — collect more data first.")
+        else:
+            print(f"\n  {mc['n_simulations']}/{mc['n_requested']} simulations produced a valid result.")
+            print(f"  OOS win rate:  mean {mc['oos_wr_mean']:.1%}  ±{mc['oos_wr_std']:.1%}  "
+                  f"[p5={mc['oos_wr_p5']:.1%}, p95={mc['oos_wr_p95']:.1%}]")
+            print(f"  Threshold:     mean {mc['threshold_mean']:.1f}  ±{mc['threshold_std']:.1f}")
+            icon = "✅ ROBUST" if mc["robustness_score"] > 2.0 else "⚠️ FRAGILE — needs more data"
+            print(f"  Robustness score: {mc['robustness_score']:.2f}  {icon}")
+            print(f"  (p5 is the number to trust for a worst-case plan, not the mean)")
+
+
+
 
     if args.json:
         output = {
@@ -440,6 +467,17 @@ def main():
                 "holdout_n": wf.get("holdout_n"),
                 "holdout_n_at_threshold": wf.get("holdout_n_at_threshold"),
                 "holdout_wr": round(wf["holdout_wr"], 4) if wf.get("holdout_wr") is not None else None,
+            }
+        if mc is not None:
+            output["monte_carlo"] = {
+                "valid": mc["valid"],
+                "error": mc.get("error"),
+                "n_simulations": mc.get("n_simulations"),
+                "oos_wr_mean": round(mc["oos_wr_mean"], 4) if mc.get("oos_wr_mean") is not None else None,
+                "oos_wr_std": round(mc["oos_wr_std"], 4) if mc.get("oos_wr_std") is not None else None,
+                "oos_wr_p5": round(mc["oos_wr_p5"], 4) if mc.get("oos_wr_p5") is not None else None,
+                "oos_wr_p95": round(mc["oos_wr_p95"], 4) if mc.get("oos_wr_p95") is not None else None,
+                "robustness_score": round(mc["robustness_score"], 3) if mc.get("robustness_score") is not None else None,
             }
         print(json.dumps(output, indent=2))
 
