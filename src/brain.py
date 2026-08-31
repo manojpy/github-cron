@@ -1,89 +1,6 @@
 #!/usr/bin/env python3
 """
 brain.py — analysis / reporting layer on top of the bot's existing win-rate system.
-
-Deliberately does NOT duplicate outcome tracking, win-rate storage, or pending-
-outcome resolution — those already live in state.py (record_pending_outcome,
-resolve_pending_outcomes, get_alert_win_rate, batch_get_alert_win_rates) and are
-reused as-is. This module adds three things on top:
-
-  1. check_rewardable_override() — called from alerts.py's win-rate gate. Lets a
-     win-rate-rejected alert through if its confluence score sits in the
-     'rewardable' bucket AND that bucket has its own solid shadow-tracked win
-     rate (pooled across pairs — per-pair shadow samples are too sparse).
-     Rate-limited per alert_key (BRAIN_OVERRIDE_COOLDOWN_SECONDS) so a volatile
-     market can't flood Telegram with overrides for the same alert type.
-  2. generate_recommendations() — reads OUTCOME_LOG_STREAM (real trades) and
-     SHADOW_LOG_STREAM (rejected-but-tracked trades) to produce per-alert win
-     rates, a confluence-threshold suggestion, and a structured config patch.
-  3. maybe_generate_report() — sends a Telegram report every
-     BRAIN_REPORT_INTERVAL_RUNS runs. The run counter is stored in Redis
-     (BRAIN_RUN_COUNTER), not in-memory, because run_once() is a fresh process
-     per cron invocation and has no persistent memory across runs.
-
-Shadow-mode recording/resolution (record_shadow_pending_outcome,
-resolve_shadow_pending_outcomes) live in state.py alongside their real-trade
-twins, for the same reason the rest of the outcome pipeline lives there.
-
-── Changelog (this revision) ──────────────────────────────────────────────
-Fixes a set of issues found in review, all verified against the live
-codebase (state.py, gates.py, alerts.py, bot_config.py) before applying:
-
-  • Confluence threshold search now uses the Wilson LOWER BOUND (not raw
-    win rate, not "most samples") and works in RAW SCORE space, matching
-    analyze_confluence_thresholds.py. The old version picked the threshold
-    with the largest qualifying sample — which is mechanically always the
-    lowest threshold that clears the bar, regardless of whether a higher
-    threshold had a meaningfully better win rate.
-  • Config patch now emits CONFLUENCE_MIN_ABS_SCORE (raw score), which is
-    what the actual gate (alerts.py: max(pct_floor, CONFLUENCE_MIN_ABS_SCORE))
-    often binds on — patching only CONFLUENCE_MIN_PCT could previously be a
-    complete no-op.
-  • Per-alert disable/star verdicts use Wilson bounds, not raw win rate, so
-    a 20-sample noisy bucket can't trigger a disable recommendation.
-  • Alert-config-path grouping fix: alerts that share one config key (e.g.
-    tlr_buy/tlr_sell both map to ENABLE_TLR_ALERT) are only recommended for
-    disable if BOTH directions are bad. If just one direction is bad, this
-    now emits an "investigate" recommendation instead of silently proposing
-    a patch that would also kill the good direction.
-  • _ALERT_CONFIG_MAP completed (14 previously-unmapped alert types added,
-    plus a prefix fallback for the pivot_up_*/pivot_down_* family). An
-    unmapped disable recommendation now emits an explicit warning instead
-    of silently producing no config_patch entry.
-  • EV and R:R added throughout, using abs(pct_move) — pct_move is signed
-    by price direction, not by trade outcome (a winning sell has a negative
-    pct_move), so raw signed averaging was cancelling wins toward zero.
-  • Direction split, per-pair breakdown, and vote-importance ranking added.
-  • detect_temporal_drift ported, using wall-clock time (not last-trade
-    timestamp, which would be wrong if the bot had downtime).
-  • Alert-frequency-impact line added to the threshold recommendation.
-  • BRAIN_ANALYSIS_WINDOW_DAYS filter added so old regime data (different
-    weights/config) doesn't get silently mixed with current data.
-  • Telegram message length capped with a "(N more items)" footer.
-  • Run counter is now rolled back (not left "spent") if report generation
-    raises, so the next run retries the same slot instead of waiting a
-    full BRAIN_REPORT_INTERVAL_RUNS.
-  • Report is persisted to Redis BEFORE the Telegram send attempt (not
-    after), and the send is wrapped in try/except — a Telegram failure no
-    longer loses the report.
-  • maybe_generate_report() now checks ENABLE_WIN_RATE_FILTER and
-    DRY_RUN_MODE itself, so whichever call site eventually invokes it gets
-    the guard for free.
-  • star_wr is now configurable (BRAIN_STAR_ALERT_WR, default 0.70).
-  • Basic (pair, alert_key, entry_ts) de-dup on stream rows, since
-    maxlen=... approximate=True xadd can occasionally double-write on retry.
-
-── Changelog (threshold_engine extraction) ─────────────────────────────
-All Wilson CI / EV / R:R / knee-point / temporal-drift / per-pair /
-vote-importance math now lives in threshold_engine.py, a pure-function
-module shared with analyze_confluence_thresholds.py (the CLI report).
-This file no longer carries its own copy of that logic — the confluence
-threshold suggestion below is produced by one call to
-engine.recommend_threshold(), the exact same function and same code path
-the CLI tool uses. Previously these two tools each had their own copy of
-this math and had already drifted (this file used to compute its own
-target_floor loop separately from the CLI script's); that class of bug is
-now structurally impossible since there's only one implementation.
 """
 from __future__ import annotations
 
@@ -120,8 +37,9 @@ _ALERT_CONFIG_MAP = {
     "rsi_cross_adaptive_up":   "ENABLE_RSI_ALERTS",
     "rsi_cross_adaptive_down": "ENABLE_RSI_ALERTS",
     "ppohist_buy":          "ENABLE_PPOHIST_ALERT",
-    "ppohist_sell":         "ENABLE_PPOHIST_ALERT",
-    # ── previously unmapped (added this revision) ──
+    "ppohist_sell":         "ENABLE_PPOHIST_ALERT",  
+    "dynamic_flow_cross_buy":  "ENABLE_DYNAMIC_FLOW_CROSS_ALERT",
+    "dynamic_flow_cross_sell": "ENABLE_DYNAMIC_FLOW_CROSS_ALERT", 
     "vwap_up":              "ENABLE_VWAP",
     "vwap_down":            "ENABLE_VWAP",
     "cloud_cross_up":       "ENABLE_CLOUD_CROSS_ALERT",

@@ -189,6 +189,8 @@ class GateResult:
     # -- Dynamic Flow Ribbon (optional, cloud-group vote + confluence vote) --
     dynamic_flow_ok_buy: Optional[bool] = None
     dynamic_flow_ok_sell: Optional[bool] = None
+    dynamic_flow_cross_up: bool = False
+    dynamic_flow_cross_down: bool = False 
 
 def compute_confluence_score(gr: "GateResult", is_buy: bool) -> Tuple[float, float, Dict[str, bool]]:
     score = 0.0
@@ -489,9 +491,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ══════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════��═
         # PHASE 1 — Gate indicators only (cheap)
-        # ════════════════════������═════════════════════���═══���══════
+        # ═════��══════════════������═════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
@@ -780,6 +782,14 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             dynamic_flow_ok_buy = None
             dynamic_flow_ok_sell = None
 
+        dynamic_flow_cross_up = False
+        dynamic_flow_cross_down = False
+        if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT and cfg.DYNAMIC_FLOW_RIBBON_ENABLED and i15 >= 1:
+            dynamic_flow_prev = dynamic_flow_trend_arr[i15 - 1]
+            if not np.isnan(dynamic_flow_curr) and not np.isnan(dynamic_flow_prev):
+                dynamic_flow_cross_up = bool(dynamic_flow_prev == 1.0 and dynamic_flow_curr == -1.0)
+                dynamic_flow_cross_down = bool(dynamic_flow_prev == -1.0 and dynamic_flow_curr == 1.0)
+
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
                 and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
@@ -926,7 +936,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         )
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
-             or cfg.ENABLE_FIB_REVERSAL_ALERT)
+             or cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
@@ -1058,6 +1068,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
             choch_poi_tap_buy=choch_poi_tap_buy, choch_poi_tap_sell=choch_poi_tap_sell,
             atr_short_arr=atr_short_arr,
+            dynamic_flow_cross_up=dynamic_flow_cross_up, dynamic_flow_cross_down=dynamic_flow_cross_down,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
             rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,
