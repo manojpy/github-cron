@@ -197,6 +197,46 @@ class BrainEngine:
 
     # ── Stream reading helpers ──────────────────────────────────────────────
 
+    async def _load_cusum(self, alert_key: str) -> engine.CUSUMDetector:
+        key = f"brain:cusum:{alert_key}"
+        if self.sdb.degraded or not self.sdb._redis:
+            return engine.CUSUMDetector(target_wr=cfg.MIN_WIN_RATE)
+        try:
+            data = await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.hgetall(key), 2.0, f"cusum_load:{alert_key}",
+            )
+        except Exception:
+            return engine.CUSUMDetector(target_wr=cfg.MIN_WIN_RATE)
+        cusum = engine.CUSUMDetector(
+            target_wr=cfg.MIN_WIN_RATE,
+            drift_delta=getattr(cfg, "CUSUM_DRIFT_DELTA", 0.10),
+            threshold=getattr(cfg, "CUSUM_THRESHOLD", 2.0),
+        )
+        if data:
+            try:
+                cusum.s_pos = float(data.get(b"s_pos", data.get("s_pos", 0.0)))
+                cusum.s_neg = float(data.get(b"s_neg", data.get("s_neg", 0.0)))
+                cusum.n = int(data.get(b"n", data.get("n", 0)))
+            except (ValueError, TypeError):
+                pass
+        return cusum
+
+    async def _save_cusum(self, cusum: engine.CUSUMDetector, alert_key: str) -> None:
+        key = f"brain:cusum:{alert_key}"
+        if self.sdb.degraded or not self.sdb._redis:
+            return
+        try:
+            await self.sdb._safe_redis_op(
+                lambda: self.sdb._redis.hset(key, mapping={
+                    "s_pos": cusum.s_pos,
+                    "s_neg": cusum.s_neg,
+                    "n": cusum.n,
+                }),
+                2.0, f"cusum_save:{alert_key}",
+            )
+        except Exception:
+            pass
+
     async def _read_stream(self, stream_key: str, count: int) -> List[Dict[str, str]]:
         """Read the most recent `count` entries from an outcome stream."""
         if self.sdb.degraded or not self.sdb._redis:
@@ -337,9 +377,10 @@ class BrainEngine:
             alert_rows = [r for r in real_rows if r["alert_key"] == alert_key]
             alert_rows.sort(key=lambda x: x.get("entry_ts", 0))
             
-            cusum = engine.CUSUMDetector(target_wr=target_wr)
+            cusum = await self._load_cusum(alert_key)
             for r in alert_rows:
                 cusum.update(r["win"])
+            await self._save_cusum(cusum, alert_key)
             
             if cusum.status()["drift_detected"]:
                 recommendations.append({
@@ -600,13 +641,12 @@ class BrainEngine:
         shadow_threshold = await thompson.select_threshold()
         
         # Update Thompson arms with resolved shadow outcomes
+
         for r in shadow_rows:
             if r.get("score") is not None:
-                # Update the arm corresponding to the threshold that was actually used
-                # If you track which threshold rejected it, use that; otherwise use the row's score floor
-                arm_used = int(r["score"])
+                arm_used = max(15, min(35, int(r["score"])))
                 await thompson.update(arm_used, win=r["win"])
-        
+
         # ── Shadow-mode insight: rejected alerts that would have won ──
         shadow_summary: Dict[str, Any] = {}
         if shadow_rows:
