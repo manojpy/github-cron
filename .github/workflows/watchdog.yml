@@ -1,8 +1,5 @@
 name: 🚨 MACD Bot Watchdog
 
-# Runs independently of run-bot.yml so it can detect the case where run-bot.yml
-# never even started (runner not acquired, GitHub internal error, or — if
-# nothing is currently cron-triggering run-bot.yml — simply never dispatched).
 on:
   schedule:
     - cron: "*/30 * * * *"   # check every 30 min (2 expected bot cycles)
@@ -13,8 +10,6 @@ permissions:
   contents: read
 
 env:
-  # Alert if no SUCCESSFUL run-bot.yml run in this many minutes.
-  # Bot cycle is ~15 min, so 40 min ≈ 2 missed cycles before paging you.
   MAX_SILENCE_MIN: 40
 
 jobs:
@@ -30,7 +25,6 @@ jobs:
           set -euo pipefail
           REPO="${{ github.repository }}"
 
-          # Most recent run of any status/conclusion
           LATEST_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?per_page=1")
           LATEST_STATUS=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].status // "none"')
           LATEST_CONCLUSION=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].conclusion // "none"')
@@ -38,8 +32,6 @@ jobs:
           LATEST_URL=$(echo "$LATEST_JSON" | jq -r '.workflow_runs[0].html_url // "none"')
 
           echo "Latest run → status=$LATEST_STATUS conclusion=$LATEST_CONCLUSION created=$LATEST_CREATED"
-
-          # Most recent SUCCESSFUL run
 
           SUCCESS_JSON=$(gh api "repos/${REPO}/actions/workflows/run-bot.yml/runs?conclusion=success&per_page=1")
           LAST_SUCCESS=$(echo "$SUCCESS_JSON" | jq -r '.workflow_runs[0].created_at // empty')
@@ -55,13 +47,10 @@ jobs:
 
           ALERT=""
 
-          # Case 1: most recent run finished but failed/was cancelled/timed out
           if [ "$LATEST_STATUS" = "completed" ] && [ "$LATEST_CONCLUSION" != "success" ]; then
             ALERT="⚠️ Latest run-bot.yml run finished with conclusion: ${LATEST_CONCLUSION}"$'\n'"Run: ${LATEST_URL}"
           fi
 
-          # Case 2: too long since any successful run — catches runner-acquisition
-          # failures, GitHub internal errors, and silently-stopped cron alike.
           if [ "$AGE_MIN" -ge "${MAX_SILENCE_MIN}" ]; then
             SILENCE="🚨 No successful MACD Bot run in ${AGE_MIN} min (expected every ~15 min)"$'\n'"Last success: ${LAST_SUCCESS:-never recorded}"$'\n'"Latest run seen: ${LATEST_URL} (status=${LATEST_STATUS}, conclusion=${LATEST_CONCLUSION})"
             if [ -n "$ALERT" ]; then

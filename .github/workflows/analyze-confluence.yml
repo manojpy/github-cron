@@ -51,7 +51,6 @@ jobs:
             MSG="📊 Confluence threshold analysis complete"$'\n'"${LOADED}"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
 
           else
-            # exit_code == 2: stream exists but is empty / no usable rows yet
             HIGHLIGHT=$(head -1 analysis_output.txt || echo "No data available yet")
             MSG="📊 Confluence threshold analysis complete"$'\n'"${HIGHLIGHT}"$'\n'"Run: ${RUN_URL}"
           fi
