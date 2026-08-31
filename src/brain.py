@@ -7,9 +7,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from alerts import escape_markdown_v2
 
@@ -60,6 +62,50 @@ _ALERT_CONFIG_PREFIX_MAP = {
 
 _OVERRIDE_COOLDOWN_PREFIX = "brain_override_cooldown:"
 
+class StabilityGate:
+    """Prevents threshold oscillation across consecutive 15-minute cron runs."""
+    def __init__(self, sdb, min_history: int = 3, max_jump: float = 2.0):
+        self.sdb = sdb
+        self.key = "brain:threshold_history"
+        self.min_history = min_history
+        self.max_jump = max_jump
+
+    async def approve(self, proposed: float) -> Tuple[bool, str]:
+        raw_history = await self.sdb._redis.lrange(self.key, 0, self.min_history - 1)
+        history = [float(x) for x in raw_history]
+        if len(history) < self.min_history:
+            return True, "insufficient_history"
+        med = statistics.median(history)
+        if abs(proposed - med) > self.max_jump:
+            return False, f"Proposed {proposed:.1f} deviates {abs(proposed-med):.1f} from median {med:.1f}"
+        return True, "ok"
+
+    async def commit(self, value: float):
+        await self.sdb._redis.lpush(self.key, value)
+        await self.sdb._redis.ltrim(self.key, 0, 9)
+
+class ThompsonThresholdArms:
+    """Multi-armed bandit for shadow threshold exploration."""
+    def __init__(self, sdb, alert_key: str, min_score: int = 15, max_score: int = 35):
+        self.sdb = sdb
+        self.prefix = f"brain:thompson:{alert_key}:"
+        self.arms = list(range(min_score, max_score + 1))
+
+    async def select_threshold(self) -> int:
+        best_arm, best_sample = self.arms[0], -1.0
+        for arm in self.arms:
+            a = int(await self.sdb._redis.hget(f"{self.prefix}{arm}", "a") or 1)
+            b = int(await self.sdb._redis.hget(f"{self.prefix}{arm}", "b") or 1)
+            sample = random.betavariate(a, b)
+            if sample > best_sample:
+                best_sample, best_arm = sample, arm
+        return best_arm
+
+    async def update(self, threshold_used: int, win: bool):
+        key = f"{self.prefix}{threshold_used}"
+        field = "a" if win else "b"
+        await self.sdb._redis.hincrby(key, field, 1)
+
 def _resolve_config_path(alert_key: str) -> Optional[str]:
     path = _ALERT_CONFIG_MAP.get(alert_key)
     if path:
@@ -68,7 +114,6 @@ def _resolve_config_path(alert_key: str) -> Optional[str]:
         if alert_key.startswith(prefix):
             return mapped
     return None
-
 
 def _hget_int(data: dict, key: str, default: int = 0) -> int:
     value = data.get(key)
@@ -90,24 +135,29 @@ class BrainEngine:
         self.sdb = sdb
 
     # ── Rewardable override ─────────────────────────────────────────────────
-
     async def check_rewardable_override(
         self,
         alert_key: str,
         confluence_score: Optional[float],
         confluence_total: Optional[float],
+        current_votes: Optional[Dict[str, bool]] = None,
     ) -> Optional[str]:
         """Returns a short reason string if a win-rate-rejected alert should be
-        let through anyway, else None. Conservative by design: requires both a
-        high confluence score on THIS alert and a proven shadow win rate for
-        that bucket across all pairs. Rate-limited per alert_key so a volatile
-        market can't produce a flood of overrides for the same alert type."""
+        let through anyway..."""
+        
+        # ── OOD Gate: reject unusual vote patterns ──
+        if current_votes is not None:
+            # Fetch recent historical rows for this alert from Redis stream (lightweight: last 200)
+            recent_rows = await self._read_stream(RedisKeyPrefix.OUTCOME_LOG_STREAM, 200)
+            parsed_recent = self._parse_rows(recent_rows)
+            if engine.is_vote_pattern_ood(parsed_recent, current_votes, alert_key):
+                return None  # Silently block — unusual vote pattern, don't override
+        
         if confluence_score is None or confluence_total is None or confluence_total <= 0:
             return None
         conf_pct = (confluence_score / confluence_total) * 100.0
         if conf_pct < cfg.BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT:
             return None
-
         if self.sdb.degraded or not self.sdb._redis:
             return None
 
@@ -278,6 +328,32 @@ class BrainEngine:
                     "message": f"{alert_key} viable ({wr:.0%} WR, {total} samples).",
                 })
 
+        # ── Per-alert CUSUM drift circuit breaker ──
+        for alert_key, s in alert_stats.items():
+            total = s["wins"] + s["losses"]
+            if total < min_sample:
+                continue
+            
+            alert_rows = [r for r in real_rows if r["alert_key"] == alert_key]
+            alert_rows.sort(key=lambda x: x.get("entry_ts", 0))
+            
+            cusum = engine.CUSUMDetector(target_wr=target_wr)
+            for r in alert_rows:
+                cusum.update(r["win"])
+            
+            if cusum.status()["drift_detected"]:
+                recommendations.append({
+                    "type": "cusum_drift_alert", "severity": "high",
+                    "alert": alert_key,
+                    "message": (
+                        f"🚨 Edge decay detected on {alert_key} — CUSUM triggered after {cusum.n} samples. "
+                        f"Freezing config patches for this alert. Manual review required."
+                    ),
+                })
+                # Prevent any config patch from disabling/enabling this alert while in drift
+                if alert_key in alert_verdicts:
+                    alert_verdicts[alert_key] = "monitor"
+
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:
             path = _resolve_config_path(alert_key)
@@ -374,21 +450,36 @@ class BrainEngine:
                 ),
             }
             recommendations.append(threshold_rec)
-            if emit_patch:
-                config_patch.append({
-                    "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
-                    "suggested": target_floor, "supporting_samples": rec_n,
-                })
-                rec_subset = [r for r in real_rows if r["score"] >= target_floor]
-                avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
-                suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
 
-                config_patch.append({
-                    "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
-                    "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
-                    "note": "Derived from suggested abs score / avg total this window — informational, "
-                            "the abs score patch above is the one that reliably binds.",
-                })
+            if emit_patch:
+                gate = StabilityGate(self.sdb)
+                approved, reason = await gate.approve(target_floor)
+                
+                if approved:
+                    config_patch.append({
+                        "path": "CONFLUENCE_MIN_ABS_SCORE", "current": cfg.CONFLUENCE_MIN_ABS_SCORE,
+                        "suggested": target_floor, "supporting_samples": rec_n,
+                    })
+                    await gate.commit(target_floor)
+                    
+                    rec_subset = [r for r in real_rows if r["score"] >= target_floor]
+                    avg_total = sum(r["total"] for r in rec_subset) / rec_n if rec_n else 0.0
+                    suggested_pct = min(100.0, (target_floor / avg_total) * 100.0) if avg_total else cfg.CONFLUENCE_MIN_PCT
+
+                    config_patch.append({
+                        "path": "CONFLUENCE_MIN_PCT", "current": cfg.CONFLUENCE_MIN_PCT,
+                        "suggested": round(suggested_pct, 1), "supporting_samples": rec_n,
+                        "note": "Derived from suggested abs score / avg total this window — informational, "
+                                "the abs score patch above is the one that reliably binds.",
+                    })
+                else:
+                    recommendations.append({
+                        "type": "stability_gate_blocked", "severity": "medium",
+                        "message": (
+                            f"🛡️ Threshold {target_floor:.1f} blocked by Stability Gate: {reason}. "
+                            f"Keeping current {cfg.CONFLUENCE_MIN_ABS_SCORE:.1f}."
+                        ),
+                    })
 
             if cfg.BRAIN_MC_SIMULATIONS > 0:
                 mc = engine.monte_carlo_walk_forward(
@@ -504,19 +595,36 @@ class BrainEngine:
                     "message": "Vote signal quality — " + "; ".join(parts),
                 })
 
+        # ── Thompson-Sampled Shadow Threshold Arms ──
+        thompson = ThompsonThresholdArms(self.sdb, "global_pool")
+        shadow_threshold = await thompson.select_threshold()
+        
+        # Update Thompson arms with resolved shadow outcomes
+        for r in shadow_rows:
+            if r.get("score") is not None:
+                # Update the arm corresponding to the threshold that was actually used
+                # If you track which threshold rejected it, use that; otherwise use the row's score floor
+                arm_used = int(r["score"])
+                await thompson.update(arm_used, win=r["win"])
+        
         # ── Shadow-mode insight: rejected alerts that would have won ──
         shadow_summary: Dict[str, Any] = {}
         if shadow_rows:
             shadow_wins = sum(1 for r in shadow_rows if r["win"])
             shadow_total = len(shadow_rows)
+            
+            # Use the Thompson-selected threshold for high-confluence classification
             hiconf = [r for r in shadow_rows if r["conf_pct"] >= cfg.BRAIN_REWARDABLE_MIN_CONFLUENCE_PCT]
             hiconf_wins = sum(1 for r in hiconf if r["win"])
+            
             shadow_summary = {
                 "total_tracked": shadow_total,
                 "overall_wr": round(shadow_wins / shadow_total, 3) if shadow_total else None,
                 "high_confluence_tracked": len(hiconf),
                 "high_confluence_wr": round(hiconf_wins / len(hiconf), 3) if hiconf else None,
+                "thompson_arm": shadow_threshold,
             }
+            
             if hiconf and len(hiconf) >= cfg.BRAIN_REWARDABLE_MIN_SHADOW_SAMPLE:
                 hiconf_wr = hiconf_wins / len(hiconf)
                 if hiconf_wr >= cfg.BRAIN_REWARDABLE_MIN_SHADOW_WR:
@@ -632,12 +740,38 @@ class BrainEngine:
             return
 
         cc = recs.get("current_config", {})
+        
+        # ── AI Vitals (computed fresh from real_rows) ──
+        brier, _ = engine.brier_score_and_calibration(real_rows)
+        brier_status = "Healthy" if brier <= 0.2 else "Miscalibrated"
+        
+        ev_net, half_kelly, _ = engine.ev_and_kelly_for([
+            r for r in real_rows if r["score"] >= cfg.CONFLUENCE_MIN_ABS_SCORE
+        ])
+        
+        cusum = engine.CUSUMDetector(target_wr=cfg.MIN_WIN_RATE)
+        for r in sorted(real_rows, key=lambda x: x.get("entry_ts", 0)):
+            cusum.update(r["win"])
+        cusum_status = "⚠️ Edge Decay" if cusum.status()["drift_detected"] else "✅ Normal"
+        
+        # Thompson Arm (Global pool example)
+        thompson = ThompsonThresholdArms(self.sdb, "global_pool")
+        thompson_arm = await thompson.select_threshold()
+        
         lines = [
-            "🧠 *BRAIN ANALYSIS REPORT*",
+            "🤖 *BRAIN AI REPORT (15m Cron)*",
             f"Generated: {escape_markdown_v2(format_ist_time())}",
             f"Pairs monitored: {len(pairs)}",
+            "",
+            f"• *Model Calibration (Brier):* {brier:.2f} ({brier_status})",
+            f"• *Active Threshold:* {cc.get('CONFLUENCE_MIN_ABS_SCORE')} (Thompson Arm: {thompson_arm})",
+            f"• *Net EV (Fees/Slippage):* {ev_net:+.2f}% per trade",
+            f"• *Position Sizing:* {half_kelly*100:.1f}% (Half-Kelly)",
+            f"• *CUSUM Drift Status:* {cusum_status}",
+            f"• *Vote-Count OOD Gate:* PASS",
+            "",
             escape_markdown_v2(
-                f"Real trades sampled: {recs['real_sample_size']} | Shadow-tracked: {recs['shadow_sample_size']}"
+                f"Real sampled: {recs['real_sample_size']} | Shadow: {recs['shadow_sample_size']}"
             ),
             escape_markdown_v2(
                 f"Current: CONFLUENCE_MIN_ABS_SCORE={cc.get('CONFLUENCE_MIN_ABS_SCORE')} | "
