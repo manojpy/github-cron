@@ -1,6 +1,6 @@
-# ============================================================================
+#======================================================
 # Shared Numba Function Definitions - Single Source of Truth
-# ============================================================================
+#======================================================
 
 import os
 import sys
@@ -21,11 +21,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
+#=====================================================
 # SIGNATURES — single source of truth, shared by the @njit decorators below
-# and EXPORT_CONFIG at the bottom of this file. Never write a raw string
-# signature in more than one place; add/change a signature here only.
-# ============================================================================
+#=====================================================
 f8, i4, i8 = types.float64, types.int32, types.int64
 
 SIG_SANITIZE_ARRAY   = f8[:](f8[:], f8)
@@ -44,10 +42,6 @@ SIG_ADX_CORE         = f8[:](f8[:], f8[:], f8[:], i4, i4)
 SIG_PERCENTILE_RANK  = f8(f8[:], i4, i4, i4, types.boolean)
 SIG_DFR_DIRECTION    = f8[:](f8[:], f8[:], f8[:], f8)
 
-
-# ============================================================================
-# 1. SANITIZATION
-# ============================================================================
 
 @njit(SIG_SANITIZE_ARRAY, nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
@@ -166,9 +160,6 @@ def rolling_min_max_numba(arr, period):
 
     return min_arr, max_arr
 
-# ============================================================================
-# 2. EMA FUNCTIONS
-# ============================================================================
 
 @njit(SIG_EMA_LOOP, nogil=True, cache=True)
 def ema_loop(data, length_float):
@@ -277,9 +268,6 @@ def ema_loop_alpha(data, alpha):
 
     return out
 
-# ============================================================================
-# 4. KALMAN / VWAP
-# ============================================================================
 
 @njit(SIG_KALMAN_LOOP, nogil=True, cache=True)
 def kalman_loop(src, length, R, Q):
@@ -340,10 +328,6 @@ def vwap_daily_loop_safe(hlc3, volumes, timestamps):
         vwap[i] = cum_pv / cum_vol if cum_vol > 0.0 else hlc3[i]
 
     return vwap
-
-# ============================================================================
-# 5. OSCILLATORS AND TECHNICAL INDICATORS
-# ============================================================================
 
 @njit(SIG_PPO_CORE, nogil=True, cache=True)
 def calculate_ppo_core(close, fast, slow, signal):
@@ -501,10 +485,6 @@ def calculate_adx_core(high, low, close, di_length, adx_length):
     adx = ema_loop_alpha(tr_smooth, alpha_adx)
     return adx
 
-# ============================================================================
-# 6. PERCENTILE RANK
-# ============================================================================
-
 @njit(SIG_PERCENTILE_RANK, nogil=True, cache=True)
 def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
     """Single-pass O(lookback) percentile rank of arr[i] against the trailing
@@ -538,10 +518,6 @@ def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
         return np.nan
 
     return (count_lt + 0.5 * count_eq) / count_valid
-
-# ============================================================================
-# 7. DYNAMIC FLOW RIBBON (BigBeluga) — SuperTrend-style band-flip direction
-# ============================================================================
 
 @njit(SIG_DFR_DIRECTION, nogil=True, cache=True)
 def dynamic_flow_direction_loop(src, basis, dist, factor):
@@ -598,9 +574,9 @@ def dynamic_flow_direction_loop(src, basis, dist, factor):
 
 from aot_version import SOURCE_VERSION  # noqa: E402
 
-# ============================================================================
+#=====================================================
 # AOT EXPORT CONFIGURATION
-# ============================================================================
+#=====================================================
 
 EXPORT_CONFIG = {
     'sanitize_array_numba':  SIG_SANITIZE_ARRAY,

@@ -3,32 +3,6 @@
 threshold_engine.py — shared, pure-function analysis library for confluence
 threshold recommendations.
 
-No I/O in this file: no Redis, no argparse, no print(), no sys.exit(). Both
-analyze_confluence_thresholds.py (the CLI report) and brain.py (the Telegram
-bot report) import this module and call recommend_threshold() (and the
-individual pieces below it) so they always compute the SAME answer from the
-SAME data. Previously these two lived as separately-maintained copies and
-had already drifted (raw-WR vs Wilson bounds, percentage space vs raw score
-space, signed vs unsigned pct_move) — this module exists to make that class
-of bug structurally impossible going forward, not just to fix the specific
-instances of it found so far.
-
-Row shape expected by every function here (one dict per resolved outcome,
-matching what load_rows() / BrainEngine._parse_rows() produce from
-outcome_log_stream / shadow_log_stream):
-    {
-        "pair": str,
-        "alert_key": str,
-        "direction": "buy" | "sell",
-        "score": float,
-        "total": float,
-        "win": bool,
-        "pct_move": float,   # SIGNED by price direction, not by trade
-                              # outcome — a winning sell has pct_move < 0.
-                              # Use favourable_move(row) for magnitude.
-        "entry_ts": int,
-        "votes": dict[str, bool] | None,
-    }
 """
 from __future__ import annotations
 
@@ -42,10 +16,6 @@ from typing import Any, Dict, List, Optional, Tuple
 Row = Dict[str, Any]
 CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
 
-
-# ────────────────────────────────────────────────────────────────────────
-# Statistical primitives
-# ────────────────────────────────────────────────────────────────────────
 
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     """Wilson score interval — reliable even for small n. Returns
@@ -109,9 +79,6 @@ def smooth(values: List[float], window: int = 3) -> List[float]:
         out.append(sum(values[lo:hi]) / (hi - lo))
     return out
 
-# ────────────────────────────────────────────────────────────────────────
-# Bucket-level analysis
-# ────────────────────────────────────────────────────────────────────────
 def build_buckets(rows: List[Row], bucket_size: float = 1.0) -> Dict[float, Dict[str, int]]:
     buckets: Dict[float, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
     for row in rows:
@@ -162,9 +129,6 @@ def detect_anomalous_buckets(
             anomalies.append((b, b + bucket_size, wr, wr_prev, wr_next, d["n"]))
     return anomalies
 
-# ────────────────────────────────────────────────────────────────────────
-# Cumulative cap analysis
-# ────────────────────────────────────────────────────────────────────────
 def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float], List[CapRow]]:
     """candidate_caps: every distinct observed score (ascending).
     caps_data: (cap, n, wr, wilson_lower_bound) for caps whose cumulative
@@ -181,12 +145,6 @@ def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float],
         lo, _hi, _p = wilson_ci(wins_count, len(subset))
         caps_data.append((cap, len(subset), wr, lo))
     return candidate_caps, caps_data
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Walk-forward validation — guards against a threshold that only looks
-# good because it was chosen FROM the data being used to judge it.
-# ────────────────────────────────────────────────────────────────────────
 
 def walk_forward_split(rows: List[Row], train_frac: float = 0.67) -> Tuple[List[Row], List[Row]]:
     """Chronological split by entry_ts (not random) — a threshold has to
@@ -331,40 +289,6 @@ def monte_carlo_walk_forward(
         "robustness_score": mean_wr / max(std_wr, 0.01),
     }
 
-def flag_anomalous_rows(
-    rows: List[Row],
-    mad_threshold: float = 6.0,
-    min_sample: int = 30,
-) -> Dict[str, Any]:
-    valid_moves = [r for r in rows if r.get("pct_move") is not None]
-    if len(valid_moves) < min_sample:
-        return {"valid": False, "error": "insufficient_data", "n": len(valid_moves)}
-
-    moves = sorted(r["pct_move"] for r in valid_moves)
-    n = len(moves)
-    median = moves[n // 2] if n % 2 else (moves[n // 2 - 1] + moves[n // 2]) / 2.0
-    abs_devs = sorted(abs(m - median) for m in moves)
-    mad = abs_devs[n // 2] if n % 2 else (abs_devs[n // 2 - 1] + abs_devs[n // 2]) / 2.0
-    scaled_mad = mad * 1.4826
-
-    flagged = []
-    if scaled_mad > 0:
-        for r in valid_moves:
-            z = abs(r["pct_move"] - median) / scaled_mad
-            if z > mad_threshold:
-                flagged.append({
-                    "pair": r.get("pair"), "alert_key": r.get("alert_key"),
-                    "entry_ts": r.get("entry_ts"), "pct_move": r["pct_move"],
-                    "robust_z": z,
-                })
-    flagged.sort(key=lambda f: -f["robust_z"])
-
-    return {
-        "valid": True, "n_total": len(valid_moves), "n_flagged": len(flagged),
-        "median_pct_move": median, "scaled_mad": scaled_mad,
-        "flagged": flagged,
-    }
-
 def confidence_label(n: int, wilson_lo: float, wilson_hi: float) -> str:
     """Translate sample size + Wilson interval width into a plain-language
     confidence label. n alone is misleading — 100 trades with a wide CI is
@@ -469,11 +393,6 @@ def compute_ev_by_cap(rows: List[Row], caps: List[float], min_sample: int = 10):
         wr = sum(r["win"] for r in subset) / len(subset)
         ev_data.append((cap, len(subset), wr, ev, avg_w, avg_l))
     return ev_data
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Per-slice breakdowns
-# ────────────────────────────────────────────────────────────────────────
 
 def per_pair_breakdown(rows: List[Row], min_sample: int = 10):
     stats = defaultdict(lambda: {"wins": 0, "n": 0})
@@ -618,14 +537,6 @@ def detect_temporal_drift(rows: List[Row], window_days: int = 14):
     recent_wr = sum(r["win"] for r in recent) / len(recent)
     older_wr = sum(r["win"] for r in older) / len(older)
     return recent_wr, older_wr, len(recent)
-
-
-# ────────────────────────────────────────────────────────────────────────
-# The unified recommendation — the single source of truth both consumers
-# call. Pure function: takes rows + params, returns a structured dict.
-# Callers format this however they need (CLI report vs Telegram message);
-# nothing here prints or does I/O.
-# ────────────────────────────────────────────────────────────────────────
 
 def recommend_threshold(
     rows: List[Row],
