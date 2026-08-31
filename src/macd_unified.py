@@ -14,7 +14,6 @@ from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timezone
 import numpy as np
 
-
 # ── bot_config : only what macd_unified.py touches directly ──
 from bot_config import (
     Constants, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
@@ -586,6 +585,16 @@ async def run_once() -> Optional[bool]:
                     await fetcher.circuit_breaker.restore(json_loads(cb_state_raw))
             except Exception as e:
                 logger_run.warning(f"Could not restore circuit breaker state from Redis: {e}")
+
+        if sdb and not sdb.degraded:
+            try:
+                applied_overrides = await sdb.load_config_override()
+                if applied_overrides:
+                    logger_run.warning(
+                        "⚙️ Config override active from Redis this run: " + "; ".join(applied_overrides)
+                    )
+            except Exception as e:
+                logger_run.warning(f"Could not load config override from Redis (non-fatal): {e}")
 
         if os.getenv("CLEAR_ALL_STATES", "false").lower() == "true": 
             if sdb and not sdb.degraded:

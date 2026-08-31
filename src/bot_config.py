@@ -6,7 +6,7 @@ import logging
 import json
 import asyncio
 from pathlib import Path
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Union, Set
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from contextvars import ContextVar
@@ -105,6 +105,12 @@ CONFLUENCE_WEIGHTS: Dict[str, float] = {
     "rma_cloud_momentum": 1.0,
     "vwap_momentum": 1.0,
 }
+
+CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
+    "CONFLUENCE_MIN_ABS_SCORE",
+    "CONFLUENCE_MIN_PCT",
+}
+CONFIG_OVERRIDE_METADATA_KEY = "config_override"
 
 class Constants:
     MIN_WICK_RATIO = 0.2

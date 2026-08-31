@@ -8,7 +8,7 @@ import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
-from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError
+from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY
 from fetcher import compute_backoff
 
 if TYPE_CHECKING:
@@ -436,6 +436,37 @@ class RedisStateStore:
             timeout,
             f"set_metadata {key}",
         )
+
+    async def load_config_override(self) -> List[str]:
+        if self.degraded or not self._redis:
+            return []
+        raw = await self.get_metadata(CONFIG_OVERRIDE_METADATA_KEY)
+        if not raw:
+            return []
+        try:
+            override = json_loads(raw)
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed config_override in Redis: {e}")
+            return []
+        if not isinstance(override, dict):
+            logger.warning("Ignoring config_override in Redis: not a JSON object")
+            return []
+
+        applied = []
+        for field, new_value in override.items():
+            if field not in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+                logger.warning(f"Ignoring config_override field '{field}' — not in the allowed safelist")
+                continue
+            if not hasattr(cfg, field):
+                continue
+            old_value = getattr(cfg, field)
+            try:
+                coerced = type(old_value)(new_value)
+                setattr(cfg, field, coerced)
+                applied.append(f"{field}: {old_value} -> {coerced}")
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Ignoring config_override field '{field}' — could not coerce {new_value!r}: {e}")
+        return applied
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not keys:

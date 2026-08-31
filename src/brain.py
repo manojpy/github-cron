@@ -521,6 +521,7 @@ class BrainEngine:
                     f"at only {e['rescued_wr']:.0%} WR [{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}]"
                     for e in flagged[:5]
                 ]
+
                 recommendations.append({
                     "type": "outcome_attribution", "severity": "medium",
                     "message": (
@@ -529,6 +530,25 @@ class BrainEngine:
                         "those specific trades underperform target WR:\n" + "\n".join(lines) + "\n"
                         "Consider re-checking these votes' weights — this is diagnostic, no config "
                         "patch is auto-applied."
+                    ),
+                })
+
+            anomalies_check = engine.flag_anomalous_rows(real_rows, min_sample=min_sample)
+            if anomalies_check["valid"] and anomalies_check["n_flagged"] > 0:
+                top = anomalies_check["flagged"][:5]
+                anomaly_lines = [
+                    f"  • {f['pair']} {f['alert_key']} pct_move={f['pct_move']:+.1f}% "
+                    f"(robust z={f['robust_z']:.1f}, ts={f['entry_ts']})"
+                    for f in top
+                ]
+                recommendations.append({
+                    "type": "data_anomaly", "severity": "medium",
+                    "message": (
+                        f"⚠️ {anomalies_check['n_flagged']} of {anomalies_check['n_total']} outcome "
+                        f"rows have a pct_move statistically far from the rest (median "
+                        f"{anomalies_check['median_pct_move']:+.2f}%):\n" + "\n".join(anomaly_lines) + "\n"
+                        "Worth checking these against exchange data for a bad tick before trusting "
+                        "the EV/WR numbers above. Not auto-excluded — could be a real outsized move."
                     ),
                 })
 
@@ -557,7 +577,7 @@ class BrainEngine:
                     ),
                 })
 
-        # ── Per-pair breakdown (worst pairs only, keeps report short) ──
+        # ── Per-pair breakdown (worst pairs only, keeps report short) ─��
         pair_stats = engine.per_pair_breakdown(real_rows, min_sample=min_sample)
         weak_pairs = [p for p in pair_stats if p[1] < disable_wr]
         if weak_pairs:
