@@ -166,6 +166,7 @@ class GateResult:
     choch_fvg_sell: bool = False
     choch_poi_tap_buy: bool = False
     choch_poi_tap_sell: bool = False
+    atr_short_arr: Optional[np.ndarray] = None
 
     # -- percentile-rank confluence votes (optional, all default-disabled) --
     adx_pctl: Optional[float] = None
@@ -490,7 +491,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         # ══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
-        # ════════════════════����═════════════════════���═══���══════
+        # ════════════════════������═════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
