@@ -1254,10 +1254,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     override_reason = None
                     if brain_engine:
                         try:
-                            alert_score, alert_total, alert_votes = _confluence_for(alert_key)
+                            alert_score, alert_total, _ = _confluence_for(alert_key)
                             override_reason = await brain_engine.check_rewardable_override(
-                                alert_key, alert_score, alert_total,
-                                current_votes=alert_votes,
+                                alert_key, alert_score, alert_total
                             )              
                         except Exception as e:
                             logger_pair.debug(f"Brain override check failed for {alert_key}: {e}")
