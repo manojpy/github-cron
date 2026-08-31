@@ -15,7 +15,7 @@ from indicators import (
     get_volume_percentile, get_adaptive_rvol_threshold, get_adaptive_ppo_threshold,
     get_adaptive_rsi_thresholds, get_adaptive_cpr_threshold, _order_block_gate_reason,
     _oi_funding_gate_reason, get_adaptive_adx_threshold_smoothed, _get_smoothed_pctl,
-    _choch_gate_reason, _tlr_evaluate_touch, TrendlineState,
+    _choch_gate_reason,
 )
 
 @dataclass(slots=True)
@@ -166,15 +166,6 @@ class GateResult:
     choch_fvg_sell: bool = False
     choch_poi_tap_buy: bool = False
     choch_poi_tap_sell: bool = False
-
-    atr_short_arr: Optional[np.ndarray] = None
-    tlr_touch_gate_ok_buy: bool = False
-    tlr_touch_gate_ok_sell: bool = False
-    tlr_touch_reason: Optional[str] = None
-    tlr_trendline_buy: Optional[TrendlineState] = None
-    tlr_trendline_sell: Optional[TrendlineState] = None
-    tlr_prior_touch_idx_buy: Optional[int] = None
-    tlr_prior_touch_idx_sell: Optional[int] = None
 
     # -- percentile-rank confluence votes (optional, all default-disabled) --
     adx_pctl: Optional[float] = None
@@ -499,7 +490,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
 
         # ══════════════════════════════════════════════════════
         # PHASE 1 — Gate indicators only (cheap)
-        # ════════════════════��═════════════════════���═══���══════
+        # ════════════════════����═════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
@@ -934,7 +925,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         )
         reversal_candidate = (
             (cfg.ENABLE_STRONG_REVERSAL_ALERT or cfg.ENABLE_OB_GATE or cfg.ENABLE_CHOCH_ALERT
-             or cfg.ENABLE_TLR_ALERT or cfg.ENABLE_FIB_REVERSAL_ALERT)
+             or cfg.ENABLE_FIB_REVERSAL_ALERT)
             and (buy_trend_common_relaxed or sell_trend_common_relaxed)
         )
         if not buy_common and not sell_common and not reversal_candidate:
@@ -1011,44 +1002,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             if choch_reason:
                 logger_pair.debug(f"[{pair_name}] CHoCH gate: {choch_reason}")
 
-        tlr_touch_gate_ok_buy = tlr_touch_gate_ok_sell = False
-        tlr_touch_reason = None
-        tlr_trendline_buy = tlr_trendline_sell = None
-        tlr_prior_touch_idx_buy = tlr_prior_touch_idx_sell = None
-        if cfg.ENABLE_TLR_ALERT:
-            prior_state_buy = await sdb.get_tlr_touch_state(pair_name, True)
-            prior_state_sell = await sdb.get_tlr_touch_state(pair_name, False)
-            tlr_prior_touch_idx_buy = (prior_state_buy or {}).get("last_touch_idx")
-            tlr_prior_touch_idx_sell = (prior_state_sell or {}).get("last_touch_idx")
-
-            touch_result_buy = await asyncio.to_thread(
-                _tlr_evaluate_touch,
-                data_15m.open, data_15m.high, data_15m.low, data_15m.close,
-                atr_short_arr, i15, cfg, True, prior_state_buy,
-            )
-            touch_result_sell = await asyncio.to_thread(
-                _tlr_evaluate_touch,
-                data_15m.open, data_15m.high, data_15m.low, data_15m.close,
-                atr_short_arr, i15, cfg, False, prior_state_sell,
-            )
-            await sdb.save_tlr_touch_state(pair_name, True, touch_result_buy["state"])
-            await sdb.save_tlr_touch_state(pair_name, False, touch_result_sell["state"])
-
-            tlr_touch_gate_ok_buy = touch_result_buy["gate_ok"]
-            tlr_touch_gate_ok_sell = touch_result_sell["gate_ok"]
-            tlr_trendline_buy = touch_result_buy["tl"]
-            tlr_trendline_sell = touch_result_sell["tl"]
-            tlr_touch_reason = (
-                touch_result_buy["reason"] if tlr_touch_gate_ok_buy
-                else touch_result_sell["reason"] if tlr_touch_gate_ok_sell
-                else None
-            )
-            if tlr_touch_gate_ok_buy or tlr_touch_gate_ok_sell:
-                logger_pair.debug(
-                    f"[{pair_name}] TLR touch gate: buy={tlr_touch_gate_ok_buy} "
-                    f"sell={tlr_touch_gate_ok_sell} | {tlr_touch_reason}"
-                )
-
         return GateResult(
             pair_name=pair_name, i15=i15, i5=i5, ts_curr=ts_curr, reference_time=reference_time,
             candle_info=candle_info, o=o, h=h, l=l, c=c,
@@ -1104,10 +1057,6 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             choch_fvg_buy=choch_fvg_buy, choch_fvg_sell=choch_fvg_sell,
             choch_poi_tap_buy=choch_poi_tap_buy, choch_poi_tap_sell=choch_poi_tap_sell,
             atr_short_arr=atr_short_arr,
-            tlr_touch_gate_ok_buy=tlr_touch_gate_ok_buy, tlr_touch_gate_ok_sell=tlr_touch_gate_ok_sell,
-            tlr_touch_reason=tlr_touch_reason,
-            tlr_trendline_buy=tlr_trendline_buy, tlr_trendline_sell=tlr_trendline_sell,
-            tlr_prior_touch_idx_buy=tlr_prior_touch_idx_buy, tlr_prior_touch_idx_sell=tlr_prior_touch_idx_sell,
             ppo_gate_momentum_ok_buy=ppo_gate_momentum_ok_buy,
             ppo_gate_momentum_ok_sell=ppo_gate_momentum_ok_sell,
             rsi_guard_momentum_ok_buy=rsi_guard_momentum_ok_buy,

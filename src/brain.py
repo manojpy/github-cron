@@ -105,8 +105,6 @@ _ALERT_CONFIG_MAP = {
     "strong_reversal_sell": "ENABLE_STRONG_REVERSAL_ALERT",
     "choch_buy":            "ENABLE_CHOCH_ALERT",
     "choch_sell":           "ENABLE_CHOCH_ALERT",
-    "tlr_buy":              "ENABLE_TLR_ALERT",
-    "tlr_sell":             "ENABLE_TLR_ALERT",
     "fib_reversal_buy":     "ENABLE_FIB_REVERSAL_ALERT",
     "fib_reversal_sell":    "ENABLE_FIB_REVERSAL_ALERT",
     "ob_reversal_buy":      "ENABLE_OB_GATE",
