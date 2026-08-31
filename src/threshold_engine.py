@@ -10,7 +10,6 @@ import math
 import time
 import random
 import statistics
-import numpy as np
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -131,30 +130,20 @@ def detect_anomalous_buckets(
     return anomalies
 
 def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float], List[CapRow]]:
-    """O(N log N) suffix accumulation. Sorts once, then walks backwards."""
-    score_counts = defaultdict(int)
-    score_wins = defaultdict(int)
-    for r in rows:
-        score_counts[r["score"]] += 1
-        if r["win"]:
-            score_wins[r["score"]] += 1
-            
-    candidate_caps = sorted(score_counts.keys())
-    temp_caps = []
-    acc_n = 0
-    acc_wins = 0
-    
-    # Walk backwards (highest score to lowest) accumulating wins/n
-    for cap in reversed(candidate_caps):
-        acc_n += score_counts[cap]
-        acc_wins += score_wins[cap]
-        if acc_n >= min_sample:
-            wr = acc_wins / acc_n
-            lo, _hi, _p = wilson_ci(acc_wins, acc_n)
-            temp_caps.append((cap, acc_n, wr, lo))
-            
-    # Reverse to return in ascending order
-    caps_data = list(reversed(temp_caps))
+    """candidate_caps: every distinct observed score (ascending).
+    caps_data: (cap, n, wr, wilson_lower_bound) for caps whose cumulative
+    subset (score >= cap) has at least min_sample rows — this is the list
+    knee-point / target-floor / EV searches all operate on."""
+    candidate_caps = sorted(set(r["score"] for r in rows))
+    caps_data: List[CapRow] = []
+    for cap in candidate_caps:
+        subset = [r for r in rows if r["score"] >= cap]
+        if len(subset) < min_sample:
+            continue
+        wins_count = sum(r["win"] for r in subset)
+        wr = wins_count / len(subset)
+        lo, _hi, _p = wilson_ci(wins_count, len(subset))
+        caps_data.append((cap, len(subset), wr, lo))
     return candidate_caps, caps_data
 
 def walk_forward_split(rows: List[Row], train_frac: float = 0.67) -> Tuple[List[Row], List[Row]]:
@@ -549,139 +538,6 @@ def detect_temporal_drift(rows: List[Row], window_days: int = 14):
     older_wr = sum(r["win"] for r in older) / len(older)
     return recent_wr, older_wr, len(recent)
 
-def brier_score_and_calibration(rows: List[Dict[str, Any]], bucket_size: float = 1.0) -> Tuple[float, List[Dict]]:
-    """Evaluates prediction honesty. 0 = perfect, 0.25 = random coin flip."""
-    if not rows:
-        return 0.5, []
-    
-    # Build buckets
-    buckets: Dict[float, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "n": 0})
-    for r in rows:
-        b = int(r["score"] // bucket_size) * bucket_size
-        buckets[b]["wins"] += int(r["win"])
-        buckets[b]["n"] += 1
-        
-    total_brier = 0.0
-    count = 0
-    curve = []
-    
-    # Single-pass O(n) Brier calculation
-    for r in rows:
-        b = int(r["score"] // bucket_size) * bucket_size
-        d = buckets.get(b)
-        if not d or d["n"] < 5:
-            continue
-        p = d["wins"] / d["n"]
-        outcome = 1.0 if r["win"] else 0.0
-        total_brier += (p - outcome) ** 2
-        count += 1
-    
-    # Calibration curve from buckets
-    for b in sorted(buckets.keys()):
-        d = buckets[b]
-        if d["n"] < 5:
-            continue
-        p = d["wins"] / d["n"]
-        curve.append({"score_floor": b, "predicted_p": p, "observed_p": p, "n": d["n"]})
-        
-    brier = (total_brier / count) if count > 0 else 0.5
-    return brier, curve
-
-class CUSUMDetector:
-    """Page-Hinkley / CUSUM for binary outcomes. Online edge-decay circuit breaker."""
-    def __init__(self, target_wr: float = 0.55, drift_delta: float = 0.10, threshold: float = 2.0):
-        self.mu = target_wr
-        self.delta = drift_delta
-        self.h = threshold
-        self.s_pos = 0.0
-        self.s_neg = 0.0
-        self.n = 0
-
-    def update(self, win: bool) -> bool:
-        self.n += 1
-        x = 1.0 if win else 0.0
-        self.s_pos = max(0.0, self.s_pos + (x - self.mu) - self.delta / 2)
-        self.s_neg = max(0.0, self.s_neg + (self.mu - x) - self.delta / 2)
-        return self.s_neg > self.h  # Only negative drift triggers breaker
-
-    def status(self):
-        return {
-            "drift_detected": self.s_neg > self.h,
-            "s_pos": self.s_pos,
-            "s_neg": self.s_neg,
-            "n": self.n,
-        }
-
-def bootstrap_ev_ci(rows: List[Row], n_sims: int = 1000, block_size: int = 20) -> Tuple[float, float, float]:
-    """Returns (mean_ev, p5_ev, p95_ev) using block bootstrap.
-    
-    NOTE: Run this OFFLINE in analyze_confluence_thresholds.py only.
-    Too heavy for the 15-minute cron brain.py cycle.
-    """
-    if not rows:
-        return 0.0, 0.0, 0.0
-    n = len(rows)
-    if n < block_size:
-        block_size = n
-    num_blocks = n // block_size
-    if num_blocks == 0:
-        return 0.0, 0.0, 0.0
-        
-    blocks = [rows[i*block_size:(i+1)*block_size] for i in range(num_blocks)]
-    ev_samples = []
-    
-    for _ in range(n_sims):
-        sampled_blocks = random.choices(blocks, k=num_blocks)
-        sampled_rows = [r for block in sampled_blocks for r in block]
-        ev, _, _ = ev_and_kelly_for(sampled_rows)
-        ev_samples.append(ev)
-        
-    ev_samples.sort()
-    mean_ev = statistics.mean(ev_samples)
-    p5_idx = max(0, min(len(ev_samples)-1, int(0.05 * len(ev_samples))))
-    p95_idx = max(0, min(len(ev_samples)-1, int(0.95 * len(ev_samples))))
-    return mean_ev, ev_samples[p5_idx], ev_samples[p95_idx]
-
-def is_vote_pattern_ood(rows: List[Row], current_votes: Dict[str, bool], alert_key: str) -> bool:
-    """Poor man's OOD: reject if vote count is outside historical 5th-95th percentile."""
-    historical_counts = [
-        sum(1 for v in r["votes"].values() if v)
-        for r in rows
-        if r.get("alert_key") == alert_key and r.get("votes")
-    ]
-    if not historical_counts:
-        return False
-    current_count = sum(1 for v in current_votes.values() if v)
-    lo, hi = np.percentile(historical_counts, [5, 95])
-    return current_count < lo or current_count > hi
-
-def ev_and_kelly_for(rows: List[Dict[str, Any]], fee_pct: float = 0.0006, slippage_pct: float = 0.0003) -> Tuple[float, float, float]:
-    """Calculates net EV considering round-trip fees + slippage, and Half-Kelly fraction.
-    
-    Uses TRUE win rate (original outcomes) for Kelly, but net P&L for sizing.
-    """
-    if not rows:
-        return 0.0, 0.0, 0.0
-    total_cost = (fee_pct * 2) + slippage_pct
-    net_moves = [
-        favourable_move(r) - total_cost if r["win"] else -(favourable_move(r) + total_cost)
-        for r in rows
-    ]
-    # True win rate (do NOT reclassify by net P&L)
-    wr = sum(1 for r in rows if r["win"]) / len(rows)
-    
-    win_amounts = [m for m, r in zip(net_moves, rows) if r["win"]]
-    loss_amounts = [abs(m) for m, r in zip(net_moves, rows) if not r["win"]]
-    
-    avg_win = statistics.mean(win_amounts) if win_amounts else 0.0
-    avg_loss = statistics.mean(loss_amounts) if loss_amounts else 0.0
-    ev = statistics.mean(net_moves)
-    
-    b = (avg_win / avg_loss) if avg_loss > 0 else 1.0
-    full_kelly = (wr * b - (1 - wr)) / b if b > 0 else 0.0
-    half_kelly = max(0.0, min(full_kelly * 0.5, 0.25))  # Capped at 25% for safety
-    return ev, half_kelly, wr
-
 def recommend_threshold(
     rows: List[Row],
     target_winrate: float = 0.55,
@@ -795,4 +651,3 @@ def recommend_threshold(
 
     result["valid"] = True
     return result
-
