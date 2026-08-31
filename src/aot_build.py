@@ -27,9 +27,6 @@ except ImportError as e:
 
 
 def write_version_stamp(output_dir: Path, module_name: str) -> Path:
-    """Write a sidecar file recording the SOURCE_VERSION this library was built
-    from, so aot_bridge.py can detect a stale .so at load time (see FIX note in
-    numba_functions_shared.py above SOURCE_VERSION)."""
     version_path = output_dir / f"{module_name}.version"
     version_path.write_text(shared.SOURCE_VERSION.strip())
     print(f"🏷️  Stamped version: {shared.SOURCE_VERSION} -> {version_path.name}")

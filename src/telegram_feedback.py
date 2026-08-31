@@ -5,25 +5,6 @@ telegram_feedback.py — reinforcement-loop layer: attaches "Took Trade" /
 (no webhook — this bot has no always-on server, so it catches button taps
 made since the previous cron run) to record which ones the user acted on.
 
-Design constraints this respects:
-  - The bot is a fresh process every 15 minutes (GitHub Actions cron), not
-    a long-running server, so there's no webhook endpoint to receive
-    callback_query updates. Polling getUpdates once per run, with the
-    offset persisted in Redis, is the only fit for this architecture.
-  - A tap on a button sent runs ago must still resolve correctly even
-    though this is a brand-new process with no memory of that message —
-    all context (pair, alert_keys, entry_ts, direction) is looked up from
-    Redis via the feedback_id embedded in callback_data, never held in
-    memory.
-  - Idempotent: Telegram can redeliver the same update on retry. The
-    feedback_pending Redis key is deleted on first successful use, so a
-    duplicate delivery finds nothing and is a safe no-op (still
-    acknowledged to Telegram, just not re-logged).
-  - Bounded blast radius: getUpdates is called with a short timeout, and
-    only callback_query updates from the configured chat_id are processed
-    — a run must not hang, and must not act on someone else's taps if the
-    bot token is ever reused elsewhere.
-
 This module owns all direct Telegram Bot API calls for the feedback loop
 (getUpdates / answerCallbackQuery / editMessageReplyMarkup). Sending the
 buttoned message itself is TelegramQueue.send_with_markup() in alerts.py,
@@ -49,7 +30,6 @@ _ACTIONS = {
     "skip": "❌ Skipped",
 }
 
-
 def build_feedback_keyboard(feedback_id: str) -> Dict[str, Any]:
     return {
         "inline_keyboard": [[
@@ -58,14 +38,7 @@ def build_feedback_keyboard(feedback_id: str) -> Dict[str, Any]:
         ]]
     }
 
-
-async def record_feedback_pending(
-    sdb: RedisStateStore, feedback_id: str, pair: str, alert_keys: List[str],
-    entry_ts: int, direction: str, message_id: Optional[int],
-) -> None:
-    """Store what a feedback_id refers to, so a button tap on a fresh cron
-    process (which has no memory of having sent the message) can still be
-    resolved. TTL-bound — an unanswered alert eventually just expires."""
+async def record_feedback_pending(sdb: RedisStateStore, feedback_id: str, pair: str, alert_keys: List[str], entry_ts: int, direction: str, message_id: Optional[int]) -> None:
     if sdb.degraded or not sdb._redis:
         return
     key = f"{FEEDBACK_PENDING_PREFIX}{feedback_id}"
@@ -79,7 +52,6 @@ async def record_feedback_pending(
     except Exception as e:
         logging.getLogger("macd_bot").warning(f"Failed to record feedback pending {feedback_id}: {e}")
 
-
 async def _telegram_api(method: str, token: str, payload: Dict[str, Any], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
     session = await SessionManager.get_session()
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -92,14 +64,7 @@ async def _telegram_api(method: str, token: str, payload: Dict[str, Any], timeou
         logging.getLogger("macd_bot").warning(f"Telegram {method} failed: {e}")
         return None
 
-
-async def poll_and_process_feedback(
-    sdb: RedisStateStore, token: str, chat_id: str, logger_run: logging.Logger,
-) -> int:
-    """Call once per cron run. Fetches any callback_query updates since the
-    last run, resolves each against its feedback_pending record, logs it to
-    FEEDBACK_LOG_STREAM, acknowledges it on Telegram, and advances the
-    stored offset. Returns the number of feedback events processed."""
+async def poll_and_process_feedback(sdb: RedisStateStore, token: str, chat_id: str, logger_run: logging.Logger) -> int:
     if not getattr(cfg, "ENABLE_TELEGRAM_FEEDBACK", False):
         return 0
     if sdb.degraded or not sdb._redis:
@@ -129,8 +94,6 @@ async def poll_and_process_feedback(
             continue
         cq_chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
         if cq_chat_id != str(chat_id):
-            # Not our chat — never act on it, but still ack so it isn't
-            # redelivered forever by getUpdates.
             await _telegram_api("answerCallbackQuery", token, {"callback_query_id": cq["id"]})
             continue
 
@@ -148,8 +111,6 @@ async def poll_and_process_feedback(
             raw = None
 
         if not raw:
-            # Expired, or already handled by a redelivered update — ack
-            # and move on rather than re-logging.
             await _telegram_api("answerCallbackQuery", token, {
                 "callback_query_id": cq["id"], "text": "This alert has expired.",
             })
@@ -159,9 +120,6 @@ async def poll_and_process_feedback(
             meta = json_loads(raw)
         except Exception:
             meta = {}
-
-        # Delete first — makes a redelivered update for the same tap land
-        # in the "not found" branch above instead of double-logging.
         try:
             await asyncio.wait_for(sdb._redis.delete(key), timeout=2.0)
         except Exception:

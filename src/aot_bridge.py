@@ -5,19 +5,7 @@ AOT Bridge Module - Runtime AOT/JIT Function Dispatcher (OPTIMIZED)
 Provides transparent fallback between AOT-compiled (.so) and JIT-compiled
 functions with zero-overhead dispatch via lookup dictionary.
 
-Performance: ~5-6 seconds faster than wrapper-based approach.
-
-FUNCTION LIST: driven entirely by AOT_FUNCTION_NAMES in
-aot_function_registry.py -- the JIT-fallback dict and the AOT dispatch dict
-are both built from that single list, so adding a new function only means:
-(1) add its name to aot_function_registry.py, (2) add its @njit function to
-numba_functions_shared.py, (3) add its thin wrapper function below. The
-wrapper functions themselves stay hand-written on purpose (they're the
-typed public API other modules import from), but the completeness check at
-the bottom of this file raises immediately at import time if a wrapper is
-ever forgotten -- instead of failing later, silently or otherwise.
 """
-
 import os
 import sys
 import platform
@@ -52,11 +40,9 @@ _dispatch: Dict[str, Callable] = {}
 # JIT function storage (for fallback)
 _jit_functions: Dict[str, Callable] = {}
 
-
 def get_library_extension() -> str:
     
     return ".pyd" if platform.system() == "Windows" else ".so"
-
 
 def find_aot_library(module_name: str = "macd_aot_compiled") -> Optional[Path]:
     """Search for compiled AOT library in standard locations"""
@@ -141,11 +127,7 @@ def initialize_aot(module_name: str = "macd_aot_compiled") -> Tuple[bool, Option
     _using_aot = True
     return True, None
 
-
 def initialize_jit_fallback() -> None:
-    """Initialize JIT fallback functions from numba_functions_shared.
-    Driven by REQUIRED_AOT_FUNCTIONS (from aot_function_registry.py) --
-    adding a function there is enough; nothing here needs to change."""
     global _jit_functions, _fallback_reason
 
     try:
@@ -164,14 +146,8 @@ def initialize_jit_fallback() -> None:
         _fallback_reason = f"JIT fallback failed: {e}"
         raise RuntimeError(f"Cannot initialize JIT fallback: {e}")
 
-
 def _build_aot_dispatch() -> Dict[str, Callable]:
-    """Build the AOT dispatch dict. Isolated in its own function so
-    ensure_initialized() can safely try/except around it as a defense-in-depth
-    safety net (belt-and-suspenders on top of the REQUIRED_AOT_FUNCTIONS
-    check in initialize_aot())."""
     return {name: getattr(_aot_module, name) for name in REQUIRED_AOT_FUNCTIONS}
-
 
 def ensure_initialized() -> None:
     """Initialize dispatch table with either AOT or JIT functions"""
@@ -226,14 +202,6 @@ def requires_warmup() -> bool:
 
 # ============================================================================
 # HIGH-PERFORMANCE DISPATCH INTERFACE
-# ----------------------------------------------------------------------------
-# Hand-written on purpose: this is the typed public API other modules import
-# from (`from aot_bridge import rolling_min_max_numba, ...`). Auto-generating
-# these via globals()/lambda would erase type hints, argument names, and
-# docstrings like ema_loop_pine's -- not worth it to save a few lines.
-# If you add a name to aot_function_registry.py, add its wrapper here; the
-# completeness check at the bottom of this file will raise at import time
-# if you forget.
 # ============================================================================
 
 def sanitize_array_numba(arr: np.ndarray, default: float) -> np.ndarray:
@@ -288,7 +256,6 @@ def dynamic_flow_direction_loop(src: np.ndarray, basis: np.ndarray, dist: np.nda
 
 # ============================================================================
 # COMPLETENESS CHECK -- catches a forgotten wrapper at import time instead of
-# an ImportError at some later call site.
 # ============================================================================
 
 _missing_wrappers = [name for name in REQUIRED_AOT_FUNCTIONS if name not in globals()]
@@ -300,10 +267,8 @@ if _missing_wrappers:
         f"        return _dispatch['{_missing_wrappers[0]}'](...)"
     )
 
-
 # ============================================================================
 # MODULE EXPORTS -- derived from REQUIRED_AOT_FUNCTIONS, so a name added to
-# the registry is automatically exported once its wrapper exists above.
 # ============================================================================
 
 __all__ = [

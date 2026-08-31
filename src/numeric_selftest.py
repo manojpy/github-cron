@@ -5,20 +5,12 @@ Independent numerical verification of the AOT/JIT-dispatched indicator
 functions, run once at startup before any pair is evaluated.
 
 """
-
 from typing import List, Tuple
 import os
 import numpy as np
 import aot_bridge
 
-
 def _ref_ema_alpha(data: List[float], alpha: float) -> List[float]:
-    """Mirrors ema_loop_alpha's SMA-seeded Wilder/RMA convention: the first
-    `period = round(1/alpha)` bars are seeded with a plain average, then the
-    recursion `alpha*curr + (1-alpha)*prev` takes over. A naive first-value
-    seed (plain EMA) does NOT match this function -- confirmed against
-    numba_functions_shared.calculate_atr_rma's actual seeding logic, not
-    assumed."""
     n = len(data)
     period = int(round(1.0 / alpha))
     out = [None] * n
@@ -33,7 +25,6 @@ def _ref_ema_alpha(data: List[float], alpha: float) -> List[float]:
         out[i] = prev
     return out
 
-
 def _ref_true_range(high: List[float], low: List[float], close: List[float]) -> List[float]:
     tr = [high[0] - low[0]]
     for i in range(1, len(close)):
@@ -44,11 +35,9 @@ def _ref_true_range(high: List[float], low: List[float], close: List[float]) -> 
         ))
     return tr
 
-
 def _ref_atr_rma(high: List[float], low: List[float], close: List[float], period: int) -> List[float]:
     tr = _ref_true_range(high, low, close)
     return _ref_ema_alpha(tr, 1.0 / period)
-
 
 def _ref_rolling_min_max(arr: List[float], period: int) -> Tuple[List[float], List[float]]:
     mins, maxs = [], []
@@ -58,7 +47,6 @@ def _ref_rolling_min_max(arr: List[float], period: int) -> Tuple[List[float], Li
         maxs.append(max(window))
     return mins, maxs
 
-
 # ---------------------------------------------------------------------------
 # Deterministic synthetic fixtures -- no RNG, must be byte-identical every run
 # ---------------------------------------------------------------------------
@@ -66,8 +54,6 @@ def _ref_rolling_min_max(arr: List[float], period: int) -> Tuple[List[float], Li
 def _fixtures():
     n = 60
     idx = np.arange(n, dtype=np.float64)
-    # Gentle uptrend with a sinusoidal wobble: deterministic, non-degenerate,
-    # exercises both rising and falling legs so RSI/ADX see real movement.
     close = 100.0 + 0.15 * idx + 2.0 * np.sin(idx / 3.0)
     high = close + 0.8
     low = close - 0.8
@@ -81,9 +67,7 @@ def _fixtures():
         "flat": (flat, flat.copy(), flat.copy(), flat, volume),
     }
 
-
 TOLERANCE = 1e-6
-
 
 def _check(name: str, actual, expected, failures: List[str], tol: float = TOLERANCE) -> None:
     actual = np.asarray(actual, dtype=np.float64)
@@ -100,7 +84,6 @@ def _check(name: str, actual, expected, failures: List[str], tol: float = TOLERA
             f"{name}: max abs diff {max_diff:.3e} > tol {tol:.1e} "
             f"(worst: actual={actual[mask][bad]:.6f}, expected={expected[mask][bad]:.6f})"
         )
-
 
 def run_self_test() -> Tuple[bool, List[str]]:
     """Runs golden-value checks plus, when AOT is active, an AOT-vs-JIT
