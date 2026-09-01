@@ -510,7 +510,6 @@ class BrainEngine:
             rec_subset_kelly = [
                 r for r in real_rows if r["score"] >= target_floor
             ] if target_floor else []
-            net_ev = half_kelly = kelly_wr = None
             if rec_subset_kelly:
                 net_ev, half_kelly, kelly_wr = engine.ev_and_kelly_for(rec_subset_kelly)
                 recommendations.append({

@@ -27,7 +27,6 @@ try:
     JSON_BACKEND = "orjson"
 
 except ImportError:
-    import json
 
     class _NumpyFallbackEncoder(json.JSONEncoder):
         """Ensures stdlib json does not crash on NumPy types if orjson is missing."""
