@@ -491,7 +491,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ════════════════════════════════════════════════════���═
+        # ════════════════════════════════════════════════════����═
         # PHASE 1 — Gate indicators only (cheap)
         # ════════════════════════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
@@ -656,25 +656,27 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             and adx_prev > 0 and adx_val > adx_prev
         )
 
-        rvol_vote_ok = rvol_static_pass or rvol_adaptive_pass
-
         body_conviction_ok = (
             candle_range > 1e-9
             and (abs(close_curr - open_curr) / candle_range) >= cfg.CPR_MOMENTUM_BODY_RATIO_MIN
         )
+
+        # 6 conditions now - RVOL static/adaptive get separate votes
         momentum_conditions = [
             adx_bypass_ok,         # 1. ADX level >= threshold
             adx_rising,            # 2. ADX rising vs prior bar
-            rvol_vote_ok,          # 3. RVOL (static or adaptive, single vote — not both)
-            volume_above_ema_ok,   # 4. Volume > EMA(volume)
-            body_conviction_ok,    # 5. Candle body conviction (|close-open|/range)
+            rvol_static_pass,      # 3. RVOL static (separate vote)
+            rvol_adaptive_pass,    # 4. RVOL adaptive (separate vote)
+            volume_above_ema_ok,   # 5. Volume > EMA(volume)
+            body_conviction_ok,    # 6. Candle body conviction
         ]
         momentum_count = sum(momentum_conditions)
 
         any_vol_feature_enabled = cfg.ENABLE_ADX_FILTER or cfg.ENABLE_RVOL_ALERT or cfg.ATR_ADAPTIVE_ENABLED
+        # 50% threshold: need >= 3 of 6 (half)
         volatility_filter_ok = (not any_vol_feature_enabled) or (momentum_count >= 3)
-        rvol_ok = volatility_filter_ok
 
+        rvol_ok = volatility_filter_ok
         adx_pctl = None
         adx_strength_ok = None
         if cfg.ENABLE_ADX_STRENGTH_VOTE:
@@ -846,6 +848,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         cloud_group_enabled = cfg.RMA_CLOUD_ENABLED or cfg.ICHIMOKU_CLOUD_ENABLED or cfg.DYNAMIC_FLOW_RIBBON_ENABLED
         oscillator_group_enabled = cfg.ENABLE_PPO_GATE or cfg.RSI_GUARD_ENABLED or cfg.ICHIMOKU_TK_GUARD_ENABLED
 
+        # ── Cloud group buy ──
         cloud_votes_buy = []
         if cfg.ICHIMOKU_CLOUD_ENABLED:
             cloud_votes_buy.append(ichimoku_gate_ok_buy)
@@ -855,11 +858,11 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             cloud_votes_buy.append(dynamic_flow_ok_buy)
 
         active_cloud_votes_buy = [v for v in cloud_votes_buy if v is not None]
+        true_votes_buy = sum(1 for v in active_cloud_votes_buy if v)
+
         if active_cloud_votes_buy:
-            if len(active_cloud_votes_buy) >= 3:
-                cloud_group_ok_buy = sum(1 for v in active_cloud_votes_buy if v) >= Constants.CLOUD_GROUP_MIN_VOTES_OF_3
-            else:
-                cloud_group_ok_buy = any(active_cloud_votes_buy)
+            # Strict majority: > half of active votes must be true
+            cloud_group_ok_buy = true_votes_buy > (len(active_cloud_votes_buy) / 2.0)
             if not cloud_group_ok_buy and cfg.DEBUG_MODE:
                 logger_pair.debug(
                     f"[{pair_name}] Cloud group buy blocked "
@@ -870,6 +873,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         else:
             cloud_group_ok_buy = False
 
+        # ── Cloud group sell ──
         cloud_votes_sell = []
         if cfg.ICHIMOKU_CLOUD_ENABLED:
             cloud_votes_sell.append(ichimoku_gate_ok_sell)
@@ -879,11 +883,11 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
             cloud_votes_sell.append(dynamic_flow_ok_sell)
 
         active_cloud_votes_sell = [v for v in cloud_votes_sell if v is not None]
+        true_votes_sell = sum(1 for v in active_cloud_votes_sell if v)
+
         if active_cloud_votes_sell:
-            if len(active_cloud_votes_sell) >= 3:
-                cloud_group_ok_sell = sum(1 for v in active_cloud_votes_sell if v) >= Constants.CLOUD_GROUP_MIN_VOTES_OF_3
-            else:
-                cloud_group_ok_sell = any(active_cloud_votes_sell)
+            # Strict majority: > half of active votes must be true
+            cloud_group_ok_sell = true_votes_sell > (len(active_cloud_votes_sell) / 2.0)
             if not cloud_group_ok_sell and cfg.DEBUG_MODE:
                 logger_pair.debug(
                     f"[{pair_name}] Cloud group sell blocked "
