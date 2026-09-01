@@ -704,6 +704,51 @@ class BrainEngine:
                         ),
                     })
 
+        # ── OOD vote-pattern check ───────────────────────────────────────────
+        ood_status = "Normal"
+        ood_detail = ""
+
+        if real_rows:
+            # Sample the most recent row per alert_key for OOD check.
+            latest_by_alert = {}
+
+            for r in real_rows:
+                ak = r["alert_key"]
+
+                if ak not in latest_by_alert and r.get("votes"):
+                    latest_by_alert[ak] = r
+
+                    if len(latest_by_alert) >= 5:
+                        break
+
+            ood_passes = 0
+            ood_total = 0
+            ood_details = []
+
+            for ak, r in latest_by_alert.items():
+                ood, detail = engine.is_vote_pattern_ood(
+                    real_rows,
+                    r["votes"],
+                    ak,
+                )
+
+                ood_total += 1
+
+                if not ood:
+                    ood_passes += 1
+                elif detail:
+                    ood_details.append(f"{ak}: {detail}")
+
+            if ood_total > 0:
+                ood_status = (
+                    "PASS"
+                    if ood_passes == ood_total
+                    else f"{ood_passes}/{ood_total} PASS"
+                )
+
+                if ood_details:
+                    ood_detail = "; ".join(ood_details)
+
         severity_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
 
@@ -726,8 +771,11 @@ class BrainEngine:
                 "half_kelly": round(half_kelly, 4) if half_kelly is not None else None,
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
+                "ood_status": ood_status,
+                "ood_detail": ood_detail,
             },
         }
+
     # ── Report generation / delivery ────────────────────────────────────────
 
     async def _next_run_count(self) -> Optional[int]:
@@ -804,7 +852,7 @@ class BrainEngine:
         if run_count is None or run_count % interval != 0:
             return
 
-        logger_run.info("🧠 Brain generating analysis report...")
+        logger_run.info("��� Brain generating analysis report...")
         try:
             recs = await self.generate_recommendations()
         except Exception as e:
