@@ -420,12 +420,10 @@ def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, 
 
 def warmup_if_needed() -> None:
     """Hybrid warmup with comprehensive coverage & better logging"""
-   
-    is_prod = os.path.isfile("/.dockerenv")
-    
-    if aot_bridge.is_using_aot() or getattr(cfg, 'SKIP_WARMUP', False) or is_prod:
-        reason = ("AOT active" if aot_bridge.is_using_aot() else 
-                 "Explicitly disabled" if getattr(cfg, 'SKIP_WARMUP', False) else "Production mode")
+
+    if aot_bridge.is_using_aot() or getattr(cfg, 'SKIP_WARMUP', False):
+        reason = ("AOT active" if aot_bridge.is_using_aot() else
+                  "Explicitly disabled")
         logger.info(f"🚨 Skipping JIT warmup ({reason})")
         if aot_bridge.is_using_aot():
             logger.debug("Native library status: Operational (Zero-warmup mode)")
@@ -451,7 +449,10 @@ def warmup_if_needed() -> None:
         _ = aot_bridge.calculate_atr_rma(test_data, test_data * 0.8, test_data, 5)
         _ = aot_bridge.calculate_adx_core(test_data, test_data * 0.8, test_data * 0.9, 14, 14)
         _ = aot_bridge.vwap_daily_loop_safe(test_data, test_data, test_ts)
-        
+        _ = aot_bridge.sanitize_array_numba(test_data, 50.0)
+        _ = aot_bridge.percentile_rank_numba(test_data, 75, 50, 10, False)
+        _ = aot_bridge.dynamic_flow_direction_loop(test_data, test_data, test_data * 0.01, 1.0) 
+      
         warmup_elapsed = time.time() - warmup_start
         logger.info(f"✅ JIT warmup complete ({warmup_elapsed:.2f}s)")
 
