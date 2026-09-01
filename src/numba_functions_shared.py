@@ -373,24 +373,30 @@ def calculate_rsi_core(close, period):
     avg_gain = 0.0
     avg_loss = 0.0
     prev_valid = close[first_valid_idx]
+    valid_count = 0
 
+    # NaN-tolerant warmup: skip NaNs, use available valid bars
     for i in range(first_valid_idx + 1, seed_idx + 1):
         curr = close[i]
-
         if np.isnan(curr):
-            return rsi
-
+            continue
+        
         diff = curr - prev_valid
-
         if diff > 0.0:
             avg_gain += diff
         else:
             avg_loss += -diff
-
+        
         prev_valid = curr
+        valid_count += 1
 
-    avg_gain /= period
-    avg_loss /= period
+    if valid_count == 0:
+        return rsi
+
+    # Use actual valid count for averaging if fewer than period
+    avg_period = max(1, min(period, valid_count))
+    avg_gain /= avg_period
+    avg_loss /= avg_period
 
     # Seed RSI value
     if avg_loss == 0.0:
