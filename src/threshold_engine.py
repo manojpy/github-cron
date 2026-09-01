@@ -289,43 +289,6 @@ def monte_carlo_walk_forward(
         "robustness_score": mean_wr / max(std_wr, 0.01),
     }
 
-def flag_anomalous_rows(
-    rows: List[Row],
-    mad_threshold: float = 6.0,
-    min_sample: int = 30,
-) -> Dict[str, Any]:
-    valid_moves = [r for r in rows if r.get("pct_move") is not None]
-    if len(valid_moves) < min_sample:
-        return {"valid": False, "error": "insufficient_data", "n": len(valid_moves)}
-
-    moves = sorted(r["pct_move"] for r in valid_moves)
-    n = len(moves)
-    median = moves[n // 2] if n % 2 else (moves[n // 2 - 1] + moves[n // 2]) / 2.0
-    abs_devs = sorted(abs(m - median) for m in moves)
-    mad = abs_devs[n // 2] if n % 2 else (abs_devs[n // 2 - 1] + abs_devs[n // 2]) / 2.0
-    # 1.4826 is the standard consistency constant that scales MAD to
-    # approximate a stdev under a normal distribution, so mad_threshold
-    # reads on roughly the same scale as an ordinary z-score.
-    scaled_mad = mad * 1.4826
-
-    flagged = []
-    if scaled_mad > 0:
-        for r in valid_moves:
-            z = abs(r["pct_move"] - median) / scaled_mad
-            if z > mad_threshold:
-                flagged.append({
-                    "pair": r.get("pair"), "alert_key": r.get("alert_key"),
-                    "entry_ts": r.get("entry_ts"), "pct_move": r["pct_move"],
-                    "robust_z": z,
-                })
-    flagged.sort(key=lambda f: -f["robust_z"])
-
-    return {
-        "valid": True, "n_total": len(valid_moves), "n_flagged": len(flagged),
-        "median_pct_move": median, "scaled_mad": scaled_mad,
-        "flagged": flagged,
-    }
-
 def confidence_label(n: int, wilson_lo: float, wilson_hi: float) -> str:
     """Translate sample size + Wilson interval width into a plain-language
     confidence label. n alone is misleading — 100 trades with a wide CI is
