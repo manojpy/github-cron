@@ -799,9 +799,9 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 and (is_valid_for_sell or dynamic_flow_pattern_bearish)
             )
             if dynamic_flow_cross_buy:
-                dynamic_flow_cross_reason = "Dynamic Flow Ribbon flipped bullish"
+                dynamic_flow_cross_reason = "Price reclaimed Dynamic Flow line (bullish)"
             elif dynamic_flow_cross_sell:
-                dynamic_flow_cross_reason = "Dynamic Flow Ribbon flipped bearish"
+                dynamic_flow_cross_reason = "Price lost Dynamic Flow line (bearish)"
 
         fib_reversal_buy, fib_reversal_sell = False, False
         fib_reversal_reason = None

@@ -19,4 +19,5 @@ without reintroducing that cost on every run.
 numba_functions_shared.py and aot_build.py both import SOURCE_VERSION from
 here too, so there is exactly one place to update it.
 """
-SOURCE_VERSION = "2026-08-30.1"  # add dynamic_flow_direction_loop (Dynamic Flow Ribbon)
+
+SOURCE_VERSION = "2026-09-01.1"  # dynamic_flow_direction_loop now also returns the plotted midline (line_) for price-cross detection

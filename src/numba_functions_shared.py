@@ -40,8 +40,7 @@ SIG_TRUE_RANGE       = f8[:](f8[:], f8[:], f8[:])
 SIG_ATR_RMA          = f8[:](f8[:], f8[:], f8[:], i4)
 SIG_ADX_CORE         = f8[:](f8[:], f8[:], f8[:], i4, i4)
 SIG_PERCENTILE_RANK  = f8(f8[:], i4, i4, i4, types.boolean)
-SIG_DFR_DIRECTION    = f8[:](f8[:], f8[:], f8[:], f8)
-
+SIG_DFR_DIRECTION    = types.Tuple((f8[:], f8[:]))(f8[:], f8[:], f8[:], f8)
 
 @njit(SIG_SANITIZE_ARRAY, nogil=True, cache=True)
 def sanitize_array_numba(arr, default):
@@ -523,6 +522,7 @@ def percentile_rank_numba(arr, i, lookback, min_history, allow_zero):
 def dynamic_flow_direction_loop(src, basis, dist, factor):
     n = len(src)
     direction_out = np.full(n, np.nan, dtype=np.float64)
+    line_out = np.full(n, np.nan, dtype=np.float64)
 
     lower_band_prev = 0.0  # nz(lowerBand[1]) default
     upper_band_prev = 0.0  # nz(upperBand[1]) default
@@ -565,12 +565,13 @@ def dynamic_flow_direction_loop(src, basis, dist, factor):
         # Warmup suppression: only report direction once dist itself is valid.
         if not np.isnan(d):
             direction_out[i] = direction
+            line_out[i] = (lower_band + upper_band) / 2.0
 
         # Carry forward for next bar's nz() reference.
         lower_band_prev = lower_band
         upper_band_prev = upper_band
 
-    return direction_out
+    return direction_out, line_out
 
 from aot_version import SOURCE_VERSION  # noqa: E402
 

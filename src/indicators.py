@@ -384,13 +384,14 @@ def calculate_dynamic_flow_ribbon_numpy(high: np.ndarray, low: np.ndarray, close
         basis = ema_loop_pine(hlc3, float(basis_length))
         dist = rolling_mean_numba(high - low, dist_length)
 
-        direction = dynamic_flow_direction_loop(hlc3, basis, dist, float(factor))
-        return direction
+        direction, line_ = dynamic_flow_direction_loop(hlc3, basis, dist, float(factor))
+        return direction, line_
 
     except Exception as e:
         logger.error(f"Dynamic Flow Ribbon calculation failed: {e}", exc_info=True)
         n = len(close) if close is not None else 1
-        return np.full(n, np.nan, dtype=np.float64)
+        nan_arr = np.full(n, np.nan, dtype=np.float64)
+        return nan_arr, nan_arr.copy()
 
 def calculate_rsi_guard_numpy(close: np.ndarray, rsi_len: int, kalman_len: int, ema_len: int) -> Tuple[np.ndarray, np.ndarray]:
     try:
@@ -654,12 +655,13 @@ def calculate_gate_indicators_numpy(data_15m: Dict[str, np.ndarray], data_5m: Di
 
         # ── Dynamic Flow Ribbon (BigBeluga) — third cloud-group trend gate ──
         if cfg.DYNAMIC_FLOW_RIBBON_ENABLED:
-            results['dynamic_flow_trend_15'] = calculate_dynamic_flow_ribbon_numpy(
+            results['dynamic_flow_trend_15'], results['dynamic_flow_line_15'] = calculate_dynamic_flow_ribbon_numpy(
                 data_15m["high"], data_15m["low"], close_15m,
                 cfg.DYNAMIC_FLOW_FACTOR, cfg.DYNAMIC_FLOW_BASIS_LENGTH, cfg.DYNAMIC_FLOW_DIST_LENGTH
             )
         else:
             results['dynamic_flow_trend_15'] = np.full(n_15m, np.nan, dtype=np.float64)
+            results['dynamic_flow_line_15'] = np.full(n_15m, np.nan, dtype=np.float64)
 
         if cfg.ENABLE_VWAP:
             results['vwap_gate'] = calculate_vwap_numpy(

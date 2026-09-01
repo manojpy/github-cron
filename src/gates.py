@@ -491,9 +491,9 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ════════════════════════════════════════════════════��═
+        # ════════════════════════════════════════════════════���═
         # PHASE 1 — Gate indicators only (cheap)
-        # ═════��══════════════������═════════════════════���═══���══════
+        # ════════════════════════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
             calculate_gate_indicators_numpy, data_15m.as_dict(), data_5m.as_dict(), data_daily, reference_time
         )
@@ -520,6 +520,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         rsi_guard_ema_arr = gate_indicators["rsi_guard_ema"]
         rma_cloud_fast_arr = gate_indicators["rma_cloud_fast_15"]
         dynamic_flow_trend_arr = gate_indicators["dynamic_flow_trend_15"]
+        dynamic_flow_line_arr = gate_indicators["dynamic_flow_line_15"]
         cpr_ok = gate_indicators.get('cpr_ok', not cfg.ENABLE_CPR)
         nr_cpr = gate_indicators.get('nr_cpr', float('nan'))
         prev_day_close = gate_indicators.get('prev_day_close', float('nan'))
@@ -785,11 +786,20 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
         dynamic_flow_cross_up = False
         dynamic_flow_cross_down = False
         if cfg.ENABLE_DYNAMIC_FLOW_CROSS_ALERT and cfg.DYNAMIC_FLOW_RIBBON_ENABLED and i15 >= 1:
-            dynamic_flow_prev = dynamic_flow_trend_arr[i15 - 1]
-            if not np.isnan(dynamic_flow_curr) and not np.isnan(dynamic_flow_prev):
-                dynamic_flow_cross_up = bool(dynamic_flow_prev == 1.0 and dynamic_flow_curr == -1.0)
-                dynamic_flow_cross_down = bool(dynamic_flow_prev == -1.0 and dynamic_flow_curr == 1.0)
-
+            dynamic_flow_line_curr = dynamic_flow_line_arr[i15]
+            dynamic_flow_line_prev = dynamic_flow_line_arr[i15 - 1]
+            if (not np.isnan(dynamic_flow_curr) and not np.isnan(dynamic_flow_line_curr)
+                    and not np.isnan(dynamic_flow_line_prev) and not np.isnan(close_prev)):
+                dynamic_flow_cross_up = bool(
+                    dynamic_flow_curr == -1.0
+                    and close_prev < dynamic_flow_line_prev
+                    and close_curr > dynamic_flow_line_curr
+                )
+                dynamic_flow_cross_down = bool(
+                    dynamic_flow_curr == 1.0
+                    and close_prev > dynamic_flow_line_prev
+                    and close_curr < dynamic_flow_line_curr
+                )
         ppo_gate_prev_val = ppo_gate_arr[i15 - 1] if i15 >= 1 else ppo_gate_curr
         if (cfg.ENABLE_PPO_GATE_MOMENTUM_VOTE
                 and not np.isnan(ppo_gate_curr) and not np.isnan(ppo_gate_prev_val)):
