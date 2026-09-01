@@ -83,7 +83,6 @@ def load_rows(r, pair_filter=None, direction_filter=None, alert_key_filter=None)
         sys.exit(2)
     return rows
 
-
 def main():
     ap = argparse.ArgumentParser(description="Intelligent Confluence Threshold Advisor v3.0")
     ap.add_argument("--target-winrate", type=float, default=0.55)
@@ -118,6 +117,16 @@ def main():
                     help="Flag outcome rows whose pct_move is a statistical outlier (robust median+MAD "
                          "z-score) — likely a bad exchange tick, not real edge. Diagnostic only, "
                          "nothing is auto-excluded from the main recommendation.")
+    ap.add_argument("--calibration", action="store_true",
+                    help="Show Brier score and calibration curve (predicted vs observed WR)")
+    ap.add_argument("--kelly", action="store_true",
+                    help="Show cost-aware EV and Half-Kelly position sizing")
+    ap.add_argument("--bootstrap-ev", type=int, default=0, metavar="N_SIMS",
+                    help="Run N block-bootstrap EV simulations for confidence intervals "
+                         "(e.g. --bootstrap-ev 1000). Offline-only.")
+    ap.add_argument("--ood-check", action="store_true",
+                    help="Show vote-count OOD gate status per alert_key")
+
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
@@ -504,6 +513,98 @@ def main():
             print(f"\n  Not auto-excluded — check these against exchange data before trusting")
             print(f"  the EV/WR numbers above if any of these look like bad ticks.")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    #  NEW: Calibration / Brier  (Recommended.txt §2)
+    # ═══════════════════════════════════════════════════════════════════════
+    brier_val = None
+    cal_curve_val = None
+    if args.calibration:
+        brier_val, cal_curve_val = engine.brier_score_and_calibration(rows, bw)
+        cal_alerts = engine.calibration_alert(rows, bw)
+        print(f"\n{'='*70}")
+        print(f"  CALIBRATION & BRIER SCORE")
+        print(f"{'='*70}")
+        status = "✅ Healthy" if brier_val < 0.20 else "🚨 MISALIBRATED"
+        print(f"\n  Brier Score: {brier_val:.4f} ({status})")
+        print(f"  (0.00 = perfect, 0.25 = random coin flip)")
+        if cal_curve_val:
+            print(f"\n  {'Score':<10}{'Predicted':>10}{'Observed':>10}{'N':>6}")
+            print(f"  {'-'*36}")
+            for c in cal_curve_val:
+                flag = " ⚠️" if abs(c["predicted_p"] - c["observed_p"]) > 0.10 else ""
+                print(f"  {c['score_floor']:>8.1f}{c['predicted_p']:>9.1%}"
+                      f"{c['observed_p']:>10.1%}{c['n']:>6}{flag}")
+        if cal_alerts:
+            print(f"\n  ⚠️  {len(cal_alerts)} bucket(s) with >10% divergence:")
+            for ca in cal_alerts:
+                print(f"     Score {ca['score_floor']:.0f}: "
+                      f"predicted {ca['predicted']:.0%} vs observed {ca['observed']:.0%} "
+                      f"(n={ca['n']})")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  NEW: Kelly Sizing  (Recommended.txt §5)
+    # ═══════════════════════════════════════════════════════════════════════
+    nev = hk = kwr = None
+    if args.kelly:
+        nev, hk, kwr = engine.ev_and_kelly_for(rows)
+        print(f"\n{'='*70}")
+        print(f"  COST-AWARE EV & KELLY POSITION SIZING")
+        print(f"{'='*70}")
+        print(f"\n  Net EV (after fees+slippage): {nev:+.4f}%/trade")
+        print(f"  Half-Kelly fraction:          {hk:.4f} ({hk:.1%})")
+        print(f"  Win rate used:                {kwr:.1%}")
+        if nev <= 0:
+            print(f"\n  🚨 WARNING: Net EV is non-positive after costs.")
+            print(f"     The strategy may not be profitable at current parameters.")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  NEW: Bootstrap EV CI  (Recommended.txt §6)
+    # ═══════════════════════════════════════════════════════════════════════
+    bev_out = None
+    if args.bootstrap_ev > 0:
+        bev_out = engine.bootstrap_ev_ci(rows, n_sims=args.bootstrap_ev)
+        print(f"\n{'='*70}")
+        print(f"  BLOCK-BOOTSTRAP EV CONFIDENCE ({args.bootstrap_ev} sims)")
+        print(f"{'='*70}")
+        if not bev_out["valid"]:
+            print(f"\n  ❌ Could not run: {bev_out.get('error')}")
+        else:
+            print(f"\n  EV mean:  {bev_out['ev_mean']:+.4f}%/trade")
+            print(f"  EV p5:    {bev_out['ev_p5']:+.4f}%/trade  (worst plausible)")
+            print(f"  EV p95:   {bev_out['ev_p95']:+.4f}%/trade  (best plausible)")
+            print(f"  EV std:   {bev_out['ev_std']:.4f}")
+            if bev_out["ev_p5"] > 0:
+                print(f"\n  ✅ Even the worst 5% case is profitable (p5 > 0)")
+            else:
+                print(f"\n  ⚠️  Worst 5% case is unprofitable — proceed with caution")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  NEW: OOD Gate  (Recommended.txt §8)
+    # ═══════════════════════════════════════════════════════════════════════
+    if args.ood_check:
+        print(f"\n{'='*70}")
+        print(f"  VOTE-COUNT OOD GATE (per alert_key)")
+        print(f"{'='*70}")
+        alert_keys_seen = sorted(set(r["alert_key"] for r in rows if r.get("votes")))
+        for ak in alert_keys_seen:
+            sample_votes = {}
+            for r in rows:
+                if r["alert_key"] == ak and r.get("votes"):
+                    sample_votes = r["votes"]
+                    break
+            if not sample_votes:
+                continue
+            ood, detail = engine.is_vote_pattern_ood(rows, sample_votes, ak)
+            status = "🚨 OOD" if ood else "✅ PASS"
+            print(f"  {ak:<28} {status}  "
+                  f"(count={detail.get('current_count','?')}, "
+                  f"range={detail.get('hist_p5','?'):.0f}-"
+                  f"{detail.get('hist_p95','?'):.0f}, "
+                  f"n={detail.get('n_history', 0)})")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  JSON OUTPUT
+    # ═══════════════════════════════════════════════════════════════════════
     if args.json:
         output = {
             "recommended_score": recommended,
@@ -589,7 +690,29 @@ def main():
                     for f in anomalies.get("flagged", [])[:20]
                 ] if anomalies["valid"] else [],
             }
+        # ── NEW JSON fields for AI/ML additions ──
+        if brier_val is not None:
+            output["calibration"] = {
+                "brier_score": round(brier_val, 4),
+                "curve": cal_curve_val,
+            }
+        if nev is not None:
+            output["kelly"] = {
+                "net_ev": round(nev, 4),
+                "half_kelly": round(hk, 4),
+                "win_rate": round(kwr, 4),
+            }
+        if bev_out is not None and bev_out.get("valid"):
+            output["bootstrap_ev"] = {
+                "ev_mean": round(bev_out["ev_mean"], 4),
+                "ev_p5": round(bev_out["ev_p5"], 4),
+                "ev_p95": round(bev_out["ev_p95"], 4),
+                "ev_std": round(bev_out["ev_std"], 4),
+                "n_simulations": bev_out["n_simulations"],
+            }
+
         print(json.dumps(output, indent=2))
+
 
 if __name__ == "__main__":
     main()

@@ -23,6 +23,7 @@ from fetcher import (
 )
 from state import RedisStateStore, TokenBucket
 from gates import GateResult, IndicatorCache
+import threshold_engine as engine
 
 from indicators import (
     calculate_alert_indicators_numpy, validate_indicators_dict, validate_vwap_cross,
@@ -1231,6 +1232,26 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     f"[{pair_name}] Confluence gate blocked dispatch: {confluence_score:.1f}/{confluence_total:.1f} weighted score (need {required:.1f})"
                 )
                 alerts_to_send = []
+
+        if alerts_to_send and getattr(cfg, "BRAIN_OOD_ENABLED", True):
+            ood_survivors = []
+            for alert_title, alert_extra, alert_key in alerts_to_send:
+                _, _, alert_votes = _confluence_for(alert_key)
+                if alert_votes is None:
+                    ood_survivors.append((alert_title, alert_extra, alert_key))
+                    continue
+                current_count = sum(1 for v in alert_votes.values() if v)
+                hist = await sdb.get_vote_count_history(alert_key)
+                is_ood, detail = engine.is_vote_count_ood(current_count, hist)
+                if is_ood:
+                    logger_pair.warning(
+                        f"[{pair_name}] ⚠️ Unusual vote pattern detected — trade blocked as precaution: "
+                        f"{alert_key} vote count {detail['current_count']} outside historical range "
+                        f"[{detail['hist_p5']:.1f}-{detail['hist_p95']:.1f}] (n={detail['n_history']})"
+                    )
+                    continue
+                ood_survivors.append((alert_title, alert_extra, alert_key))
+            alerts_to_send = ood_survivors
 
         if alerts_to_send and cfg.ENABLE_WIN_RATE_FILTER:
             alert_keys_to_check = [ak for _, _, ak in alerts_to_send]

@@ -17,6 +17,8 @@ from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
 import threshold_engine as engine
 
+from threshold_engine import (CUSUMDetector, StabilityGate, brier_score_and_calibration, calibration_alert, ev_and_kelly_for, is_vote_pattern_ood)
+
 _ALERT_CONFIG_MAP = {
     "strong_reversal_buy":  "ENABLE_STRONG_REVERSAL_ALERT",
     "strong_reversal_sell": "ENABLE_STRONG_REVERSAL_ALERT",
@@ -88,6 +90,11 @@ class BrainEngine:
 
     def __init__(self, sdb: RedisStateStore):
         self.sdb = sdb
+        self.stability_gate = StabilityGate(
+            min_history=getattr(cfg, "BRAIN_STABILITY_MIN_HISTORY", 3),
+            max_jump=getattr(cfg, "BRAIN_STABILITY_MAX_JUMP", 2.0),
+        )
+        self._cusum_detectors: Dict[str, CUSUMDetector] = {}
 
     # ── Rewardable override ─────────────────────────────────────────────────
 
@@ -209,6 +216,77 @@ class BrainEngine:
                 continue
         return parsed
 
+    # ── CUSUM drift detection ────────────────────────────────────────────
+    async def _load_or_create_cusum(self, alert_key: str) -> CUSUMDetector:
+        """Load persisted CUSUM state, or create a fresh detector."""
+        if alert_key in self._cusum_detectors:
+            return self._cusum_detectors[alert_key]
+        saved = await self.sdb.load_cusum_state(alert_key)
+        if saved:
+            det = CUSUMDetector.from_dict(saved)
+        else:
+            det = CUSUMDetector(
+                target_wr=cfg.MIN_WIN_RATE,
+                drift_delta=getattr(cfg, "BRAIN_CUSUM_DRIFT_DELTA", 0.10),
+                threshold=getattr(cfg, "BRAIN_CUSUM_THRESHOLD", 2.0),
+            )
+        self._cusum_detectors[alert_key] = det
+        return det
+
+    async def _feed_cusum(self, alert_key: str, win: bool) -> bool:
+        """Feed one outcome to the CUSUM detector. Returns True if drift."""
+        det = await self._load_or_create_cusum(alert_key)
+        drifted = det.update(win)
+        await self.sdb.save_cusum_state(alert_key, det.to_dict())
+        return drifted
+
+    async def _check_cusum_drift(
+        self, real_rows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Run CUSUM over rows per alert_key, but only the ones not already
+        fed in a previous report cycle — real_rows is a rolling window read
+        fresh every run, so without a watermark the same trades would be
+        replayed into the persisted detector state every cycle."""
+        drift_alerts: List[Dict[str, Any]] = []
+        by_alert: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for r in real_rows:
+            by_alert[r["alert_key"]].append(r)
+
+        for alert_key, rows in by_alert.items():
+            watermark = await self.sdb.load_cusum_watermark(alert_key)
+            rows_sorted = sorted(
+                (r for r in rows if r.get("entry_ts", 0) > watermark),
+                key=lambda r: r.get("entry_ts", 0),
+            )
+            if not rows_sorted:
+                continue
+            det = await self._load_or_create_cusum(alert_key)
+            for r in rows_sorted:
+                drifted = det.update(r["win"])
+                if drifted:
+                    drift_alerts.append({
+                        "type": "cusum_drift",
+                        "severity": "high",
+                        "alert": alert_key,
+                        "message": (
+                            f"🚨 CUSUM EDGE DECAY on {alert_key}: "
+                            f"drift detected after {det.n} outcomes "
+                            f"(s_neg={det.s_neg:.2f} > h={det.h:.1f}). "
+                            f"All config patches FROZEN for this alert. "
+                            f"Manual review required."
+                        ),
+                    })
+                    break
+            await self.sdb.save_cusum_state(alert_key, det.to_dict())
+            await self.sdb.save_cusum_watermark(alert_key, rows_sorted[-1]["entry_ts"])
+        return drift_alerts
+
+    def _is_alert_frozen(self, alert_key: str, drift_alerts: List[Dict]) -> bool:
+        return any(
+            d.get("alert") == alert_key and d["type"] == "cusum_drift"
+            for d in drift_alerts
+        )
+
     # ── Recommendations ──────────────────────────────────────────────────────
 
     async def generate_recommendations(self) -> Dict[str, Any]:
@@ -240,6 +318,11 @@ class BrainEngine:
             s = alert_stats[r["alert_key"]]
             s["wins" if r["win"] else "losses"] += 1
             s["pairs"].add(r["pair"])
+
+        # ── CUSUM drift detection (moved up so path_to_keys below can check
+        drift_alerts = await self._check_cusum_drift(real_rows)
+        if drift_alerts:
+            recommendations.extend(drift_alerts)
 
         alert_verdicts: Dict[str, str] = {}  # alert_key -> "disable" | "star" | "monitor"
         for alert_key, s in alert_stats.items():
@@ -285,15 +368,25 @@ class BrainEngine:
                 path_to_keys[path].append(alert_key)
 
         for path, keys in path_to_keys.items():
-            verdicts = {k: alert_verdicts.get(k) for k in keys if k in alert_verdicts}
+            frozen_keys = [k for k in keys if self._is_alert_frozen(k, drift_alerts)]
+            active_keys = [k for k in keys if k not in frozen_keys]
+            if frozen_keys:
+                recommendations.append({
+                    "type": "config_patch_frozen", "severity": "medium",
+                    "message": (
+                        f"{path}: config patch suppressed for {', '.join(frozen_keys)} — "
+                        f"CUSUM drift detected, awaiting manual review."
+                    ),
+                })
+            verdicts = {k: alert_verdicts.get(k) for k in active_keys if k in alert_verdicts}
             if not verdicts:
                 continue
-            if all(v == "disable" for v in verdicts.values()) and len(verdicts) == len([k for k in keys if k in alert_stats]):
+            if all(v == "disable" for v in verdicts.values()) and len(verdicts) == len([k for k in active_keys if k in alert_stats]):
                 if path not in seen_paths:
                     seen_paths.add(path)
                     config_patch.append({
                         "path": path, "current": True, "suggested": False,
-                        "reason": f"All alert types on this config path are underperforming: {', '.join(keys)}",
+                        "reason": f"All alert types on this config path are underperforming: {', '.join(active_keys)}",
                     })
             elif "disable" in verdicts.values() and not all(v == "disable" for v in verdicts.values()):
                 bad = [k for k, v in verdicts.items() if v == "disable"]
@@ -301,12 +394,11 @@ class BrainEngine:
                 recommendations.append({
                     "type": "investigate", "severity": "medium",
                     "message": (
-                        f"{path} is shared by {', '.join(keys)} — {', '.join(bad)} underperforming but "
+                        f"{path} is shared by {', '.join(active_keys)} — {', '.join(bad)} underperforming but "
                         f"{', '.join(good)} is not. Disabling {path} would also kill the good direction; "
                         f"needs a per-direction config key or manual review."
                     ),
                 })
-
         # Warn on any disable-worthy alert with no config path at all (exact or prefix)
         for alert_key, verdict in alert_verdicts.items():
             if verdict == "disable" and not _resolve_config_path(alert_key):
@@ -318,10 +410,40 @@ class BrainEngine:
                     ),
                 })
         threshold_rec: Dict[str, Any] = {}
+        net_ev = half_kelly = kelly_wr = None
         rec = engine.recommend_threshold(
             real_rows, target_winrate=target_wr, min_sample=min_sample,
         ) if real_rows else {"valid": False}
 
+        # ── Brier Score / Calibration ────────────────────────────────────
+        brier, cal_curve = brier_score_and_calibration(real_rows)
+        cal_alerts = calibration_alert(real_rows)
+        brier_status = "Healthy" if brier < 0.20 else "MISALIBRATED"
+        recommendations.append({
+            "type": "calibration",
+            "severity": "medium" if brier >= 0.20 or cal_alerts else "low",
+            "brier_score": round(brier, 4),
+            "brier_status": brier_status,
+            "message": (
+                f"Model Calibration (Brier): {brier:.3f} ({brier_status})"
+                + (
+                    f" | {len(cal_alerts)} bucket(s) show predicted-vs-observed "
+                    f"divergence >10%"
+                    if cal_alerts else ""
+                )
+            ),
+        })
+        if cal_alerts:
+            for ca in cal_alerts[:3]:
+                recommendations.append({
+                    "type": "calibration_divergence",
+                    "severity": "medium",
+                    "message": (
+                        f"Calibration gap at score {ca['score_floor']:.0f}: "
+                        f"predicted {ca['predicted']:.0%} vs observed "
+                        f"{ca['observed']:.0%} (n={ca['n']})"
+                    ),
+                })
         if rec.get("valid") and abs(rec["recommended"] - cfg.CONFLUENCE_MIN_ABS_SCORE) >= 0.5:
             target_floor = rec["recommended"]
             rec_n = rec["rec_n"]
@@ -373,6 +495,40 @@ class BrainEngine:
                     f"{wf_note}"
                 ),
             }
+            # ── Stability Gate check on threshold recommendation ─────────────
+            if emit_patch:
+                history = await self.sdb.load_threshold_history()
+                gate_ok, gate_reason = self.stability_gate.approve(
+                    target_floor, history,
+                )
+                if not gate_ok:
+                    # Downgrade: don't emit the patch, warn instead
+                    threshold_rec["severity"] = "medium"
+                    threshold_rec["stability_blocked"] = True
+                    threshold_rec["message"] += (
+                        f"\n⚠️ STABILITY GATE BLOCKED: {gate_reason}. "
+                        f"Patch suppressed to prevent oscillation."
+                    )
+                    emit_patch = False
+                else:
+                    await self.sdb.save_threshold_value(target_floor)
+        
+            # ── Net EV + Kelly sizing at recommended threshold ───────────────
+            rec_subset_kelly = [
+                r for r in real_rows if r["score"] >= target_floor
+            ] if target_floor else []
+            net_ev = half_kelly = kelly_wr = None
+            if rec_subset_kelly:
+                net_ev, half_kelly, kelly_wr = ev_and_kelly_for(rec_subset_kelly)
+                recommendations.append({
+                    "type": "kelly_sizing",
+                    "severity": "low",
+                    "message": (
+                        f"Net EV (after fees/slippage): {net_ev:+.3f}%/trade | "
+                        f"Half-Kelly position size: {half_kelly:.1%} | "
+                        f"WR: {kelly_wr:.0%}"
+                    ),
+                })
             recommendations.append(threshold_rec)
             if emit_patch:
                 config_patch.append({
@@ -563,8 +719,15 @@ class BrainEngine:
                 "CONFLUENCE_MIN_ABS_SCORE": cfg.CONFLUENCE_MIN_ABS_SCORE,
                 "CONFLUENCE_MIN_PCT": cfg.CONFLUENCE_MIN_PCT,
             },
+            "ai_metrics": {
+                "brier_score": round(brier, 4),
+                "brier_status": brier_status,
+                "net_ev": round(net_ev, 4) if net_ev is not None else None,
+                "half_kelly": round(half_kelly, 4) if half_kelly is not None else None,
+                "cusum_drifts": len(drift_alerts),
+                "threshold_history": await self.sdb.load_threshold_history(),
+            },
         }
-
     # ── Report generation / delivery ────────────────────────────────────────
 
     async def _next_run_count(self) -> Optional[int]:
@@ -666,6 +829,41 @@ class BrainEngine:
         high = [r for r in recs["recommendations"] if r["severity"] == "high"]
         med = [r for r in recs["recommendations"] if r["severity"] == "medium"]
         low = [r for r in recs["recommendations"] if r["severity"] == "low"]
+
+        # ── AI Metrics header ────────────────────────────────────────────
+        ai = recs.get("ai_metrics", {})
+        if ai:
+            lines.append("*🤖 AI METRICS*")
+            brier_val = ai.get("brier_score")
+            brier_st = ai.get("brier_status", "?")
+            if brier_val is not None:
+                lines.append(
+                    escape_markdown_v2(
+                        f"  Calibration (Brier): {brier_val:.3f} ({brier_st})"
+                    )
+                )
+            net_ev = ai.get("net_ev")
+            half_kelly = ai.get("half_kelly")
+            if net_ev is not None:
+                lines.append(
+                    escape_markdown_v2(
+                        f"  Net EV (fees/slippage): {net_ev:+.3f}%/trade"
+                    )
+                )
+            if half_kelly is not None:
+                lines.append(
+                    escape_markdown_v2(
+                        f"  Position Sizing: {half_kelly:.1%} (Half-Kelly)"
+                    )
+                )
+            cusum_n = ai.get("cusum_drifts", 0)
+            lines.append(
+                escape_markdown_v2(
+                    f"  CUSUM Drift Status: "
+                    f"{'🚨 ' + str(cusum_n) + ' ALERT(S)' if cusum_n else 'Normal'}"
+                )
+            )
+            lines.append("")
 
         if high:
             lines.append("*🔴 HIGH PRIORITY*")

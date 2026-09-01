@@ -532,7 +532,6 @@ def vote_importance(rows: List[Row], min_sample: int = 10):
     results.sort(key=lambda x: -x[5])
     return results
 
-
 def vote_combo_breakdown(rows: List[Row], lo: float, hi: float, min_sample: int = 20):
     """Within a score band, win rate by which votes actually fired
     together. Returns (band_rows, combo_stats) or None if no vote data in
@@ -688,3 +687,303 @@ def recommend_threshold(
 
     result["valid"] = True
     return result
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NEW: Cost-Aware EV + Kelly Sizing  (Recommended.txt §5)
+# ═══════════════════════════════════════════════════════════════════════
+
+def ev_and_kelly_for(
+    rows: List[Row],
+    fee_pct: float = 0.0006,
+    slippage_pct: float = 0.0003,
+) -> Tuple[float, float, float]:
+    """Net EV after round-trip fees + slippage, plus Half-Kelly fraction.
+    Returns (net_ev_pct, half_kelly_fraction, win_rate)."""
+    if not rows:
+        return 0.0, 0.0, 0.0
+    total_cost = (fee_pct * 2) + slippage_pct  # entry + exit
+    net_moves = []
+    for r in rows:
+        mag = abs(r.get("pct_move", 0.0))
+        if r["win"]:
+            net_moves.append(mag - total_cost)
+        else:
+            net_moves.append(-(mag + total_cost))
+    wins = [m for m in net_moves if m > 0]
+    losses = [abs(m) for m in net_moves if m <= 0]
+    wr = len(wins) / len(net_moves) if net_moves else 0.0
+    avg_win = statistics.mean(wins) if wins else 0.0
+    avg_loss = statistics.mean(losses) if losses else 0.0
+    ev = statistics.mean(net_moves) if net_moves else 0.0
+    b = (avg_win / avg_loss) if avg_loss > 0 else 1.0
+    full_kelly = (wr * b - (1 - wr)) / b if b > 0 else 0.0
+    half_kelly = max(0.0, min(full_kelly * 0.5, 0.25))  # cap 25 %
+    return ev, half_kelly, wr
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NEW: Brier Score & Calibration Curve  (Recommended.txt §2)
+# ═══════════════════════════════════════════════════════════════════════
+
+def brier_score_and_calibration(
+    rows: List[Row],
+    bucket_size: float = 1.0,
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """Brier score (0 = perfect, 0.25 = coin-flip) + calibration curve.
+    Returns (brier, [{"score_floor", "predicted_p", "observed_p", "n"}])."""
+    if not rows:
+        return 0.5, []
+    buckets: Dict[float, Dict[str, int]] = {}
+    for r in rows:
+        b = int(r["score"] // bucket_size) * bucket_size
+        buckets.setdefault(b, {"wins": 0, "n": 0})
+        buckets[b]["wins"] += int(r["win"])
+        buckets[b]["n"] += 1
+
+    # Pre-compute which rows fall into which bucket (O(n))
+    row_buckets = [
+        (int(r["score"] // bucket_size) * bucket_size, 1.0 if r["win"] else 0.0)
+        for r in rows
+    ]
+
+    total_brier = 0.0
+    count = 0
+    curve: List[Dict[str, Any]] = []
+
+    for b in sorted(buckets.keys()):
+        d = buckets[b]
+        if d["n"] < 5:
+            continue
+        p = d["wins"] / d["n"]
+        curve.append({
+            "score_floor": b,
+            "predicted_p": p,
+            "observed_p": p,
+            "n": d["n"],
+        })
+        for bucket_id, outcome in row_buckets:
+            if bucket_id == b:
+                total_brier += (p - outcome) ** 2
+                count += 1
+
+    brier = (total_brier / count) if count > 0 else 0.5
+    return brier, curve
+
+
+def calibration_alert(
+    rows: List[Row],
+    bucket_size: float = 1.0,
+    max_divergence: float = 0.10,
+) -> List[Dict[str, Any]]:
+    """Return buckets where predicted vs observed WR diverge > max_divergence."""
+    _brier, curve = brier_score_and_calibration(rows, bucket_size)
+    alerts = []
+    for c in curve:
+        if c["n"] < 10:
+            continue
+        lo, hi, _ = wilson_ci(
+            int(round(c["observed_p"] * c["n"])), c["n"]
+        )
+        if abs(c["predicted_p"] - c["observed_p"]) > max_divergence:
+            alerts.append({
+                "score_floor": c["score_floor"],
+                "predicted": c["predicted_p"],
+                "observed": c["observed_p"],
+                "n": c["n"],
+                "wilson_lo": lo,
+                "wilson_hi": hi,
+            })
+    return alerts
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NEW: Sequential CUSUM Drift Detector  (Recommended.txt §4)
+# ═══════════════════════════════════════════════════════════════════════
+
+class CUSUMDetector:
+    """Page-Hinkley / CUSUM for binary outcomes. Online, O(1) memory."""
+
+    def __init__(
+        self,
+        target_wr: float = 0.55,
+        drift_delta: float = 0.10,
+        threshold: float = 2.0,
+    ):
+        self.mu = target_wr
+        self.delta = drift_delta
+        self.h = threshold
+        self.s_pos = 0.0
+        self.s_neg = 0.0
+        self.n = 0
+
+    def update(self, win: bool) -> bool:
+        """Feed one outcome. Returns True when drift is detected."""
+        self.n += 1
+        x = 1.0 if win else 0.0
+        self.s_pos = max(0.0, self.s_pos + (x - self.mu) - self.delta / 2)
+        self.s_neg = max(0.0, self.s_neg + (self.mu - x) - self.delta / 2)
+        return self.s_neg > self.h  # edge-decay direction
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "drift_detected": self.s_neg > self.h,
+            "s_pos": self.s_pos,
+            "s_neg": self.s_neg,
+            "n": self.n,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mu": self.mu, "delta": self.delta, "h": self.h,
+            "s_pos": self.s_pos, "s_neg": self.s_neg, "n": self.n,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CUSUMDetector":
+        det = cls(
+            target_wr=d.get("mu", 0.55),
+            drift_delta=d.get("delta", 0.10),
+            threshold=d.get("h", 2.0),
+        )
+        det.s_pos = d.get("s_pos", 0.0)
+        det.s_neg = d.get("s_neg", 0.0)
+        det.n = d.get("n", 0)
+        return det
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NEW: Config Stability Gate  (Recommended.txt §3)
+# ═══════════════════════════════════════════════════════════════════════
+
+class StabilityGate:
+    """Prevents threshold oscillation across consecutive brain runs."""
+
+    def __init__(self, min_history: int = 3, max_jump: float = 2.0):
+        self.min_history = min_history
+        self.max_jump = max_jump
+
+    def approve(
+        self, proposed: float, history: List[float],
+    ) -> Tuple[bool, str]:
+        if len(history) < self.min_history:
+            return True, "insufficient_history"
+        median = statistics.median(history)
+        deviation = abs(proposed - median)
+        if deviation > self.max_jump:
+            return False, (
+                f"proposed {proposed:.1f} deviates {deviation:.1f} "
+                f"from median {median:.1f} (max {self.max_jump})"
+            )
+        return True, "ok"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NEW: Vote-Count OOD Gate  (Recommended.txt §8)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _percentile(data: List[float], p: float) -> float:
+    """Linear-interpolation percentile (numpy-compatible)."""
+    if not data:
+        return 0.0
+    s = sorted(data)
+    k = (len(s) - 1) * p / 100.0
+    f = int(math.floor(k))
+    c = int(math.ceil(k))
+    if f == c:
+        return s[f]
+    return s[f] * (c - k) + s[c] * (k - f)
+
+
+def is_vote_pattern_ood(
+    rows: List[Row],
+    current_votes: Dict[str, bool],
+    alert_key: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Reject if vote count is outside historical 5th-95th percentile.
+    Returns (is_ood, detail_dict)."""
+    historical_counts = []
+    for r in rows:
+        if r.get("alert_key") != alert_key or not r.get("votes"):
+            continue
+        historical_counts.append(
+            sum(1 for v in r["votes"].values() if v)
+        )
+    if len(historical_counts) < 10:
+        return False, {"reason": "insufficient_history", "n": len(historical_counts)}
+
+    current_count = sum(1 for v in current_votes.values() if v)
+    lo = _percentile(historical_counts, 5)
+    hi = _percentile(historical_counts, 95)
+    ood = current_count < lo or current_count > hi
+    return ood, {
+        "current_count": current_count,
+        "hist_p5": lo,
+        "hist_p95": hi,
+        "n_history": len(historical_counts),
+    }
+
+def is_vote_count_ood(
+    current_count: int,
+    historical_counts: List[int],
+    min_history: int = 10,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Lightweight variant of is_vote_pattern_ood() for callers that only
+    have a running list of past vote-counts (e.g. a capped Redis list per
+    alert_key) rather than full Row objects. This is what the live
+    dispatch path uses; the offline analyzer still uses
+    is_vote_pattern_ood() directly against full rows."""
+    if len(historical_counts) < min_history:
+        return False, {"reason": "insufficient_history", "n": len(historical_counts)}
+    counts_f = [float(c) for c in historical_counts]
+    lo = _percentile(counts_f, 5)
+    hi = _percentile(counts_f, 95)
+    ood = current_count < lo or current_count > hi
+    return ood, {
+        "current_count": current_count,
+        "hist_p5": lo,
+        "hist_p95": hi,
+        "n_history": len(historical_counts),
+    }
+# ═══════════════════════════════════════════════════════════════════════
+#  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
+# ═══════════════════════════════════════════════════════════════════════
+
+def bootstrap_ev_ci(
+    rows: List[Row],
+    n_sims: int = 1000,
+    block_size: int = 20,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Block-bootstrap EV distribution. Returns mean / p5 / p95 EV."""
+    if len(rows) < block_size * 3:
+        return {"valid": False, "error": "insufficient_data"}
+
+    rng = random.Random(seed)
+    ordered = sorted(rows, key=lambda r: r.get("entry_ts", 0))
+    blocks = [
+        ordered[i:i + block_size]
+        for i in range(0, len(ordered), block_size)
+    ]
+    blocks = [b for b in blocks if b]
+    if len(blocks) < 5:
+        return {"valid": False, "error": "insufficient_blocks"}
+
+    ev_samples: List[float] = []
+    for _ in range(n_sims):
+        sampled = rng.choices(blocks, k=len(blocks))
+        flat = [r for blk in sampled for r in blk]
+        ev, _hk, _wr = ev_and_kelly_for(flat)
+        ev_samples.append(ev)
+
+    ev_samples.sort()
+    n = len(ev_samples)
+    p5_idx = max(0, min(n - 1, round(0.05 * (n - 1))))
+    p95_idx = max(0, min(n - 1, round(0.95 * (n - 1))))
+    return {
+        "valid": True,
+        "n_simulations": n,
+        "ev_mean": statistics.fmean(ev_samples),
+        "ev_p5": ev_samples[p5_idx],
+        "ev_p95": ev_samples[p95_idx],
+        "ev_std": statistics.pstdev(ev_samples) if n > 1 else 0.0,
+    }

@@ -161,6 +161,11 @@ class RedisKeyPrefix:
     SHADOW_LOG_STREAM = "shadow_log_stream"
     SHADOW_HICONF_STATS = "shadow_hiconf:"
     BRAIN_RUN_COUNTER = "brain_run_counter"
+    CUSUM_STATE = "brain_cusum:"
+    CUSUM_WATERMARK = "brain_cusum_watermark:"
+    THRESHOLD_HISTORY = "brain_threshold_history:"
+    VOTE_COUNT_HISTORY = "brain_vote_counts:"
+
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -549,11 +554,14 @@ class RedisStateStore:
             logger.warning(f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}")
             return
 
-        ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
-        try:
-            await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
-        except Exception as e:
-            logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
+    ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
+    try:
+        await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
+    except Exception as e:
+        logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
+
+    if confluence_votes is not None:
+        await self.record_vote_count(alert_key, confluence_votes)
 
     async def record_shadow_pending_outcome(self, pair: str, alert_key: str, direction: str,
                                               entry_ts: int, entry_price: float,
@@ -574,11 +582,43 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to serialize shadow pending outcome for {pair}:{alert_key}: {e}")
             return
+
         ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60
         try:
             await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
         except Exception as e:
             logger.warning(f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}")
+
+        # ── Vote-count history (OOD gate) ────────────────────────────────────
+        VOTE_COUNT_HISTORY_MAX = 500
+
+        async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
+            if self.degraded or not self._redis:
+                return
+            count = sum(1 for v in votes.values() if v)
+            key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
+            try:
+                async with self._redis.pipeline() as pipe:
+                    pipe.lpush(key, str(count))
+                    pipe.ltrim(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1)
+                    await self._safe_redis_op(
+                        lambda: pipe.execute(), 2.0, f"vote_count_save:{alert_key}",
+                    )
+            except Exception:
+                pass
+
+        async def get_vote_count_history(self, alert_key: str) -> List[int]:
+            if self.degraded or not self._redis:
+                return []
+            key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
+            try:
+                raw_list = await self._safe_redis_op(
+                    lambda: self._redis.lrange(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1),
+                    2.0, f"vote_count_load:{alert_key}",
+                )
+                return [int(x) for x in raw_list] if raw_list else []
+            except Exception:
+                return []
 
     async def _fetch_pending_keys(
         self, pair: str, precomputed_attr: str, key_prefix: str,
@@ -1017,6 +1057,88 @@ class RedisStateStore:
         except Exception as e:
             await self._record_redis_failure("atomic_batch_update", e)
             return False
+
+    # ── CUSUM state persistence ──────────────────────────────────────────
+    async def load_cusum_state(self, alert_key: str) -> Optional[Dict[str, Any]]:
+        """Load persisted CUSUM accumulator for one alert_key."""
+        if self.degraded or not self._redis:
+            return None
+        key = f"{RedisKeyPrefix.CUSUM_STATE}{alert_key}"
+        raw = await self._safe_redis_op(
+            lambda: self._redis.get(key), 2.0, f"cusum_load:{alert_key}",
+        )
+        if raw is None:
+            return None
+        try:
+            return json_loads(raw)
+        except Exception:
+            return None
+
+    async def save_cusum_state(self, alert_key: str, state: Dict[str, Any]) -> None:
+        if self.degraded or not self._redis:
+            return
+        key = f"{RedisKeyPrefix.CUSUM_STATE}{alert_key}"
+        try:
+            await self._safe_redis_op(
+                lambda: self._redis.set(key, json_dumps(state), ex=30 * 86400),
+                2.0, f"cusum_save:{alert_key}",
+            )
+        except Exception:
+            pass
+
+    async def load_cusum_watermark(self, alert_key: str) -> int:
+        """Last entry_ts already fed into this alert_key's CUSUM detector.
+        0 means nothing has been fed yet."""
+        if self.degraded or not self._redis:
+            return 0
+        key = f"{RedisKeyPrefix.CUSUM_WATERMARK}{alert_key}"
+        try:
+            raw = await self._safe_redis_op(
+                lambda: self._redis.get(key), 2.0, f"cusum_watermark_load:{alert_key}",
+            )
+            return int(raw) if raw else 0
+        except Exception:
+            return 0
+
+    async def save_cusum_watermark(self, alert_key: str, entry_ts: int) -> None:
+        if self.degraded or not self._redis:
+            return
+        key = f"{RedisKeyPrefix.CUSUM_WATERMARK}{alert_key}"
+        try:
+            await self._safe_redis_op(
+                lambda: self._redis.set(key, str(entry_ts), ex=30 * 86400),
+                2.0, f"cusum_watermark_save:{alert_key}",
+            )
+        except Exception:
+            pass
+
+    # ── Threshold history (Stability Gate) ───────────────────────────────
+    async def load_threshold_history(self) -> List[float]:
+        if self.degraded or not self._redis:
+            return []
+        try:
+            raw_list = await self._safe_redis_op(
+                lambda: self._redis.lrange(RedisKeyPrefix.THRESHOLD_HISTORY, 0, 9),
+                2.0, "threshold_history_load",
+            )
+            if not raw_list:
+                return []
+            return [float(x) for x in raw_list]
+        except Exception:
+            return []
+
+    async def save_threshold_value(self, value: float) -> None:
+        if self.degraded or not self._redis:
+            return
+        try:
+            async with self._redis.pipeline() as pipe:
+                pipe.lpush(RedisKeyPrefix.THRESHOLD_HISTORY, str(value))
+                pipe.ltrim(RedisKeyPrefix.THRESHOLD_HISTORY, 0, 9)
+                await self._safe_redis_op(
+                    lambda: pipe.execute(), 2.0, "threshold_history_save",
+                )
+        except Exception:
+            pass
 
 class RedisLock:    
     RELEASE_LUA = """

@@ -362,6 +362,13 @@ class BotConfig(BaseModel):
     ENABLE_RSI_GUARD_MOMENTUM_VOTE: bool = Field(default=False) 
     ENABLE_RMA_CLOUD_MOMENTUM_VOTE: bool = Field(default=False) 
     ENABLE_VWAP_MOMENTUM_VOTE: bool = Field(default=False)
+    BRAIN_STABILITY_MIN_HISTORY: int = Field(default=3, ge=1, le=20, description="StabilityGate: min threshold history entries before gating kicks in")
+    BRAIN_STABILITY_MAX_JUMP: float = Field(default=2.0, ge=0.1, le=10.0, description="StabilityGate: max allowed deviation (in score points) from median history")
+    BRAIN_CUSUM_DRIFT_DELTA: float = Field(default=0.10, ge=0.01, le=0.50, description="CUSUM: sensitivity to WR shift (delta parameter)")
+    BRAIN_CUSUM_THRESHOLD: float = Field(default=2.0, ge=0.5, le=10.0, description="CUSUM: alarm threshold (h parameter)")
+    BRAIN_FEE_PCT: float = Field(default=0.0006, ge=0.0, le=0.01, description="Taker fee per side (0.06%) used in EV/Kelly calculations")
+    BRAIN_SLIPPAGE_PCT: float = Field(default=0.0003, ge=0.0, le=0.01, description="Estimated slippage per side used in EV/Kelly calculations")
+    BRAIN_OOD_ENABLED: bool = Field(default=True, description="Vote-count OOD gate on/off")
 
     @field_validator('TELEGRAM_BOT_TOKEN')
     def validate_token(cls, v: str) -> str:
