@@ -730,53 +730,105 @@ def ev_and_kelly_for(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  NEW: Brier Score & Calibration Curve  (Recommended.txt §2)
+#  FIXED: Brier Score & Calibration Curve  (Recommended.txt §2)
 # ═══════════════════════════════════════════════════════════════════════
-
 def brier_score_and_calibration(
     rows: List[Row],
     bucket_size: float = 1.0,
+    train_frac: float = 0.67,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """Brier score (0 = perfect, 0.25 = coin-flip) + calibration curve.
-    Returns (brier, [{"score_floor", "predicted_p", "observed_p", "n"}])."""
+    Uses a train/holdout split to provide a true out-of-sample calibration check.
+    predicted_p comes from the train set, observed_p from the holdout set.
+    If there isn't enough data for a split, falls back to in-sample (predicted = observed)
+    but flags it so calibration_alert knows not to fire.
+    Returns (brier, [{"score_floor", "predicted_p", "observed_p", "n", "is_oos"}])."""
     if not rows:
         return 0.5, []
-    buckets: Dict[float, Dict[str, int]] = {}
-    for r in rows:
-        b = int(r["score"] // bucket_size) * bucket_size
-        buckets.setdefault(b, {"wins": 0, "n": 0})
-        buckets[b]["wins"] += int(r["win"])
-        buckets[b]["n"] += 1
 
-    # Pre-compute which rows fall into which bucket (O(n))
-    row_buckets = [
-        (int(r["score"] // bucket_size) * bucket_size, 1.0 if r["win"] else 0.0)
-        for r in rows
-    ]
+    train_rows, holdout_rows = walk_forward_split(rows, train_frac)
+    use_oos = len(train_rows) >= 20 and len(holdout_rows) >= 20
+    
+    if use_oos:
+        # 1. Build buckets for TRAIN set to get predicted_p
+        train_buckets: Dict[float, Dict[str, int]] = {}
+        for r in train_rows:
+            b = int(r["score"] // bucket_size) * bucket_size
+            train_buckets.setdefault(b, {"wins": 0, "n": 0})
+            train_buckets[b]["wins"] += int(r["win"])
+            train_buckets[b]["n"] += 1
+            
+        # 2. Build buckets for HOLDOUT set to get observed_p and compute Brier
+        holdout_buckets: Dict[float, Dict[str, int]] = {}
+        for r in holdout_rows:
+            b = int(r["score"] // bucket_size) * bucket_size
+            holdout_buckets.setdefault(b, {"wins": 0, "n": 0})
+            holdout_buckets[b]["wins"] += int(r["win"])
+            holdout_buckets[b]["n"] += 1
+            
+        curve: List[Dict[str, Any]] = []
+        total_brier = 0.0
+        count = 0
+        
+        # Only report buckets that exist in BOTH train and holdout with enough samples
+        all_buckets = set(train_buckets.keys()).intersection(set(holdout_buckets.keys()))
+        
+        for b in sorted(all_buckets):
+            t_d = train_buckets[b]
+            h_d = holdout_buckets[b]
+            
+            if t_d["n"] < 5 or h_d["n"] < 5:
+                continue
+                
+            predicted_p = t_d["wins"] / t_d["n"]
+            observed_p = h_d["wins"] / h_d["n"]
+            
+            curve.append({
+                "score_floor": b,
+                "predicted_p": predicted_p,
+                "observed_p": observed_p,
+                "n": h_d["n"],  # n represents the holdout samples evaluated
+                "is_oos": True,
+            })
+            
+            # Brier score is computed on the holdout set using the train set's predictions
+            total_brier += h_d["wins"] * ((predicted_p - 1.0) ** 2)
+            total_brier += (h_d["n"] - h_d["wins"]) * (predicted_p ** 2)
+            count += h_d["n"]
+                
+        brier = (total_brier / count) if count > 0 else 0.5
+        return brier, curve
 
-    total_brier = 0.0
-    count = 0
-    curve: List[Dict[str, Any]] = []
+    else:
+        # Fallback to in-sample if data is too thin for a reliable split
+        buckets: Dict[float, Dict[str, int]] = {}
+        for r in rows:
+            b = int(r["score"] // bucket_size) * bucket_size
+            buckets.setdefault(b, {"wins": 0, "n": 0})
+            buckets[b]["wins"] += int(r["win"])
+            buckets[b]["n"] += 1
 
-    for b in sorted(buckets.keys()):
-        d = buckets[b]
-        if d["n"] < 5:
-            continue
-        p = d["wins"] / d["n"]
-        curve.append({
-            "score_floor": b,
-            "predicted_p": p,
-            "observed_p": p,
-            "n": d["n"],
-        })
-        for bucket_id, outcome in row_buckets:
-            if bucket_id == b:
-                total_brier += (p - outcome) ** 2
-                count += 1
-
-    brier = (total_brier / count) if count > 0 else 0.5
-    return brier, curve
-
+        curve = []
+        total_brier = 0.0
+        count = 0
+        for b in sorted(buckets.keys()):
+            d = buckets[b]
+            if d["n"] < 5:
+                continue
+            p = d["wins"] / d["n"]
+            curve.append({
+                "score_floor": b,
+                "predicted_p": p,
+                "observed_p": p,
+                "n": d["n"],
+                "is_oos": False,  # Flagged so calibration_alert ignores it
+            })
+            total_brier += d["wins"] * ((p - 1.0) ** 2)
+            total_brier += (d["n"] - d["wins"]) * (p ** 2)
+            count += d["n"]
+                
+        brier = (total_brier / count) if count > 0 else 0.5
+        return brier, curve
 
 def calibration_alert(
     rows: List[Row],
@@ -787,6 +839,8 @@ def calibration_alert(
     _brier, curve = brier_score_and_calibration(rows, bucket_size)
     alerts = []
     for c in curve:
+        if not c.get("is_oos", False):
+            continue  # Skip in-sample fallback buckets (they always have 0 divergence)
         if c["n"] < 10:
             continue
         lo, hi, _ = wilson_ci(
@@ -802,7 +856,6 @@ def calibration_alert(
                 "wilson_hi": hi,
             })
     return alerts
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Sequential CUSUM Drift Detector  (Recommended.txt §4)
