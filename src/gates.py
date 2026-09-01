@@ -40,6 +40,7 @@ class IndicatorCache:
     rsi_guard_ema: np.ndarray
     rma_cloud_fast_15: np.ndarray
     dynamic_flow_trend_15: np.ndarray
+    dynamic_flow_line_15: np.ndarray
     cpr_ok: bool = True
     nr_cpr: float = float("nan")
     prev_day_close: float = float("nan")
@@ -491,7 +492,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"Close={data_5m.close[i5]:.2f}"
             )
 
-        # ════════════════════════════════════════════════════����═
+        # ════════════════════════════════════════���═══════════�����═
         # PHASE 1 — Gate indicators only (cheap)
         # ════════════════════════════════════════���═══���══════
         gate_indicators = await asyncio.to_thread(
@@ -715,7 +716,7 @@ async def _eval_gate(pair_name: str, data_15m: PriceData, data_5m: PriceData,
                 f"[{pair_name}] CPR {'narrow' if cpr_ok else 'WIDE'} | "
                 f"effective={effective_cpr_ok} | momentum={momentum_count}/5 "
                 f"(adx={adx_val:.1f}[{adx_bypass_ok},{adx_rising}], "
-                f"rvol={rvol_vote_ok}[static={rvol_static_pass},adaptive={rvol_adaptive_pass}]"
+                f"rvol={rvol_ok}[static={rvol_static_pass},adaptive={rvol_adaptive_pass}]"
                 f"[thr={adaptive_threshold if adaptive_threshold is not None else float('nan'):.3f}], "
                 f"vol_ema={volume_above_ema_ok}, body={body_conviction_ok}) | "
                 f"move_from_prev_close={pct_move_from_prev_close:.2f}%[{move_from_prev_close_ok}] | "
