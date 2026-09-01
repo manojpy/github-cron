@@ -21,8 +21,6 @@ import threshold_engine as engine
 
 STREAM_KEY = "outcome_log_stream"
 
-
-
 def fetch_all(r: "redis.Redis"):
     entries = []
     last_id = "-"
@@ -116,6 +114,10 @@ def main():
                          "weak trades over the threshold. Needs a JSON file of {vote_name: weight} — "
                          "e.g. dump cfg.CONFLUENCE_WEIGHTS from bot_config.py on the bot host, since "
                          "this script runs standalone without bot_config. Diagnostic only.")
+    ap.add_argument("--anomalies", action="store_true",
+                    help="Flag outcome rows whose pct_move is a statistical outlier (robust median+MAD "
+                         "z-score) — likely a bad exchange tick, not real edge. Diagnostic only, "
+                         "nothing is auto-excluded from the main recommendation.")
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
@@ -477,9 +479,30 @@ def main():
                     print(f"  {flag}{e['vote']:<18} rescued {e['n_rescued']:>4} "
                           f"({e['rescued_pct']:.0%} of its True cases) → WR {e['rescued_wr']:.1%} "
                           f"[{e['rescued_wilson_lo']:.0%}-{e['rescued_wilson_hi']:.0%}] {e['rescued_confidence']}")
+                
                 print(f"\n  Rescued = trades that only cleared the threshold because of that vote's")
                 print(f"  weight. Low WR among a vote's rescued trades means it's propping up")
                 print(f"  otherwise-weak setups over the line, not adding real edge.")
+
+    anomalies = None
+    if args.anomalies:
+        anomalies = engine.flag_anomalous_rows(rows, min_sample=args.min_sample)
+        print(f"\n{'='*70}")
+        print(f"  DATA ANOMALY CHECK (robust median+MAD outlier flag on pct_move)")
+        print(f"{'='*70}")
+        if not anomalies["valid"]:
+            print(f"\n  ❌ Could not run: {anomalies.get('error')} — collect more data first.")
+        elif anomalies["n_flagged"] == 0:
+            print(f"\n  ✅ No outliers flagged across {anomalies['n_total']} rows "
+                  f"(median pct_move {anomalies['median_pct_move']:+.2f}%).")
+        else:
+            print(f"\n  ⚠️  {anomalies['n_flagged']} of {anomalies['n_total']} rows flagged "
+                  f"(median pct_move {anomalies['median_pct_move']:+.2f}%):")
+            for f in anomalies["flagged"][:10]:
+                print(f"     {f['pair']:<10} {f['alert_key']:<20} pct_move={f['pct_move']:+.1f}% "
+                      f"robust_z={f['robust_z']:.1f}  entry_ts={f['entry_ts']}")
+            print(f"\n  Not auto-excluded — check these against exchange data before trusting")
+            print(f"  the EV/WR numbers above if any of these look like bad ticks.")
 
     if args.json:
         output = {
@@ -551,6 +574,21 @@ def main():
                 }
                 for e in attribution
             ]
+        if anomalies is not None:
+            output["anomalies"] = {
+                "valid": anomalies["valid"],
+                "error": anomalies.get("error"),
+                "n_total": anomalies.get("n_total"),
+                "n_flagged": anomalies.get("n_flagged"),
+                "median_pct_move": round(anomalies["median_pct_move"], 4) if anomalies.get("median_pct_move") is not None else None,
+                "flagged": [
+                    {
+                        "pair": f["pair"], "alert_key": f["alert_key"], "entry_ts": f["entry_ts"],
+                        "pct_move": round(f["pct_move"], 4), "robust_z": round(f["robust_z"], 2),
+                    }
+                    for f in anomalies.get("flagged", [])[:20]
+                ] if anomalies["valid"] else [],
+            }
         print(json.dumps(output, indent=2))
 
 if __name__ == "__main__":

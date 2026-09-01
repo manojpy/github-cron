@@ -467,6 +467,7 @@ class RedisStateStore:
             except (TypeError, ValueError) as e:
                 logger.warning(f"Ignoring config_override field '{field}' — could not coerce {new_value!r}: {e}")
         return applied
+
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
         if not self._redis or self.degraded or not keys:
