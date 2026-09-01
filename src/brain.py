@@ -17,7 +17,7 @@ from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
 import threshold_engine as engine
 
-from threshold_engine import (CUSUMDetector, StabilityGate, brier_score_and_calibration, calibration_alert, ev_and_kelly_for, is_vote_pattern_ood)
+from threshold_engine import CUSUMDetector, StabilityGate
 
 _ALERT_CONFIG_MAP = {
     "strong_reversal_buy":  "ENABLE_STRONG_REVERSAL_ALERT",
@@ -233,13 +233,6 @@ class BrainEngine:
         self._cusum_detectors[alert_key] = det
         return det
 
-    async def _feed_cusum(self, alert_key: str, win: bool) -> bool:
-        """Feed one outcome to the CUSUM detector. Returns True if drift."""
-        det = await self._load_or_create_cusum(alert_key)
-        drifted = det.update(win)
-        await self.sdb.save_cusum_state(alert_key, det.to_dict())
-        return drifted
-
     async def _check_cusum_drift(
         self, real_rows: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
@@ -416,8 +409,8 @@ class BrainEngine:
         ) if real_rows else {"valid": False}
 
         # ── Brier Score / Calibration ────────────────────────────────────
-        brier, cal_curve = brier_score_and_calibration(real_rows)
-        cal_alerts = calibration_alert(real_rows)
+        brier, cal_curve = engine.brier_score_and_calibration(real_rows)
+        cal_alerts = engine.calibration_alert(real_rows)
         brier_status = "Healthy" if brier < 0.20 else "MISALIBRATED"
         recommendations.append({
             "type": "calibration",
@@ -519,7 +512,7 @@ class BrainEngine:
             ] if target_floor else []
             net_ev = half_kelly = kelly_wr = None
             if rec_subset_kelly:
-                net_ev, half_kelly, kelly_wr = ev_and_kelly_for(rec_subset_kelly)
+                net_ev, half_kelly, kelly_wr = engine.ev_and_kelly_for(rec_subset_kelly)
                 recommendations.append({
                     "type": "kelly_sizing",
                     "severity": "low",
@@ -704,50 +697,30 @@ class BrainEngine:
                         ),
                     })
 
-        # ── OOD vote-pattern check ───────────────────────────────────────────
+        # ── Vote-Count OOD summary ─────────────────────────────────────────
         ood_status = "Normal"
-        ood_detail = ""
-
         if real_rows:
-            # Sample the most recent row per alert_key for OOD check.
-            latest_by_alert = {}
-
-            for r in real_rows:
+            latest_by_alert: Dict[str, engine.Row] = {}
+            for r in reversed(real_rows):
                 ak = r["alert_key"]
-
                 if ak not in latest_by_alert and r.get("votes"):
                     latest_by_alert[ak] = r
-
                     if len(latest_by_alert) >= 5:
                         break
 
             ood_passes = 0
             ood_total = 0
-            ood_details = []
-
             for ak, r in latest_by_alert.items():
-                ood, detail = engine.is_vote_pattern_ood(
-                    real_rows,
-                    r["votes"],
-                    ak,
-                )
-
+                is_ood, detail = engine.is_vote_pattern_ood(real_rows, r["votes"], ak)
                 ood_total += 1
-
-                if not ood:
+                if not is_ood:
                     ood_passes += 1
-                elif detail:
-                    ood_details.append(f"{ak}: {detail}")
 
             if ood_total > 0:
                 ood_status = (
-                    "PASS"
-                    if ood_passes == ood_total
+                    "PASS" if ood_passes == ood_total
                     else f"{ood_passes}/{ood_total} PASS"
                 )
-
-                if ood_details:
-                    ood_detail = "; ".join(ood_details)
 
         severity_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda x: severity_order.get(x["severity"], 3))
@@ -772,7 +745,6 @@ class BrainEngine:
                 "cusum_drifts": len(drift_alerts),
                 "threshold_history": await self.sdb.load_threshold_history(),
                 "ood_status": ood_status,
-                "ood_detail": ood_detail,
             },
         }
 
@@ -852,7 +824,7 @@ class BrainEngine:
         if run_count is None or run_count % interval != 0:
             return
 
-        logger_run.info("��� Brain generating analysis report...")
+        logger_run.info("Brain generating analysis report...")
         try:
             recs = await self.generate_recommendations()
         except Exception as e:
@@ -885,32 +857,21 @@ class BrainEngine:
             brier_val = ai.get("brier_score")
             brier_st = ai.get("brier_status", "?")
             if brier_val is not None:
-                lines.append(
-                    escape_markdown_v2(
-                        f"  Calibration (Brier): {brier_val:.3f} ({brier_st})"
-                    )
-                )
+                lines.append(escape_markdown_v2(f"  Calibration (Brier): {brier_val:.3f} ({brier_st})"))
             net_ev = ai.get("net_ev")
             half_kelly = ai.get("half_kelly")
             if net_ev is not None:
-                lines.append(
-                    escape_markdown_v2(
-                        f"  Net EV (fees/slippage): {net_ev:+.3f}%/trade"
-                    )
-                )
+                lines.append(escape_markdown_v2(f"  Net EV (fees/slippage): {net_ev:+.3f}%/trade"))
             if half_kelly is not None:
-                lines.append(
-                    escape_markdown_v2(
-                        f"  Position Sizing: {half_kelly:.1%} (Half-Kelly)"
-                    )
-                )
+                lines.append(escape_markdown_v2(f"  Position Sizing: {half_kelly:.1%} (Half-Kelly)"))
+
             cusum_n = ai.get("cusum_drifts", 0)
-            lines.append(
-                escape_markdown_v2(
-                    f"  CUSUM Drift Status: "
-                    f"{'🚨 ' + str(cusum_n) + ' ALERT(S)' if cusum_n else 'Normal'}"
-                )
-            )
+            lines.append(escape_markdown_v2(
+                f"  CUSUM Drift Status: {'🚨 ' + str(cusum_n) + ' ALERT(S)' if cusum_n else 'Normal'}"
+            ))
+            
+            if ai.get("ood_status"):
+                lines.append(escape_markdown_v2(f"  Vote-Count OOD Gate: {ai['ood_status']}"))
             lines.append("")
 
         if high:
