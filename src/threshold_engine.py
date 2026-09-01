@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional, Tuple
 Row = Dict[str, Any]
 CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
 
-
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float, float]:
     """Wilson score interval — reliable even for small n. Returns
     (lower_bound, upper_bound, raw_p)."""
@@ -130,22 +129,31 @@ def detect_anomalous_buckets(
     return anomalies
 
 def build_caps_data(rows: List[Row], min_sample: int = 20) -> Tuple[List[float], List[CapRow]]:
-    """candidate_caps: every distinct observed score (ascending).
-    caps_data: (cap, n, wr, wilson_lower_bound) for caps whose cumulative
-    subset (score >= cap) has at least min_sample rows — this is the list
-    knee-point / target-floor / EV searches all operate on."""
-    candidate_caps = sorted(set(r["score"] for r in rows))
+    # Sort descending by score so we can accumulate suffix stats in one pass
+    sorted_rows = sorted(rows, key=lambda r: r["score"], reverse=True)
+    candidate_caps = sorted(set(r["score"] for r in rows))  # ascending for output
     caps_data: List[CapRow] = []
-    for cap in candidate_caps:
-        subset = [r for r in rows if r["score"] >= cap]
-        if len(subset) < min_sample:
-            continue
-        wins_count = sum(r["win"] for r in subset)
-        wr = wins_count / len(subset)
-        lo, _hi, _p = wilson_ci(wins_count, len(subset))
-        caps_data.append((cap, len(subset), wr, lo))
+    
+    cumulative_wins = 0
+    cumulative_n = 0
+    row_idx = 0
+    total_rows = len(sorted_rows)
+    
+    # Walk caps from highest to lowest, accumulating rows that qualify
+    for cap in reversed(candidate_caps):
+        while row_idx < total_rows and sorted_rows[row_idx]["score"] >= cap:
+            cumulative_wins += int(sorted_rows[row_idx]["win"])
+            cumulative_n += 1
+            row_idx += 1
+        
+        if cumulative_n >= min_sample:
+            wr = cumulative_wins / cumulative_n
+            lo, _hi, _p = wilson_ci(cumulative_wins, cumulative_n)
+            caps_data.append((cap, cumulative_n, wr, lo))
+    
+    caps_data.reverse()  # back to ascending order
     return candidate_caps, caps_data
-
+ 
 def walk_forward_split(rows: List[Row], train_frac: float = 0.67) -> Tuple[List[Row], List[Row]]:
     """Chronological split by entry_ts (not random) — a threshold has to
     survive time moving forward, not just a random resample of the same
