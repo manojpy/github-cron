@@ -535,90 +535,145 @@ class RedisStateStore:
         except Exception as e:
             logger.warning(f"Failed to release dedup claim for {pair}:{alert_key}: {e}")
 
-    async def record_pending_outcome(self, pair: str, alert_key: str, direction: str,
-                                       entry_ts: int, entry_price: float,
-                                       confluence_score: Optional[float] = None,
-                                       confluence_total: Optional[float] = None,
-                                       confluence_votes: Optional[Dict[str, bool]] = None,
-                                       adx_val: Optional[float] = None) -> None:
+    VOTE_COUNT_HISTORY_MAX = 500
+
+    async def record_pending_outcome(
+        self,
+        pair: str,
+        alert_key: str,
+        direction: str,
+        entry_ts: int,
+        entry_price: float,
+        confluence_score: Optional[float] = None,
+        confluence_total: Optional[float] = None,
+        confluence_votes: Optional[Dict[str, bool]] = None,
+        adx_val: Optional[float] = None,
+    ) -> None:
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
+
         key = f"{RedisKeyPrefix.OUTCOME_PENDING}{pair}:{alert_key}:{entry_ts}"
+
         try:
             payload = json_dumps({
-                "direction": direction, "entry_ts": entry_ts, "entry_price": entry_price,
-                "confluence_score": confluence_score, "confluence_total": confluence_total,
-                "confluence_votes": confluence_votes, "adx_val": adx_val,
+                "direction": direction,
+                "entry_ts": entry_ts,
+                "entry_price": entry_price,
+                "confluence_score": confluence_score,
+                "confluence_total": confluence_total,
+                "confluence_votes": confluence_votes,
+                "adx_val": adx_val,
             })
         except Exception as e:
-            logger.warning(f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}")
+            logger.warning(
+                f"Failed to serialize pending outcome for {pair}:{alert_key}: {e}"
+            )
             return
 
-    ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
-    try:
-        await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
-    except Exception as e:
-        logger.warning(f"Failed to record pending outcome for {pair}:{alert_key}: {e}")
+        ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60  # lookahead + buffer, in seconds
 
-    if confluence_votes is not None:
-        await self.record_vote_count(alert_key, confluence_votes)
+        try:
+            await asyncio.wait_for(
+                self._redis.set(key, payload, ex=ttl),
+                timeout=2.0,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to record pending outcome for {pair}:{alert_key}: {e}"
+            )
 
-    async def record_shadow_pending_outcome(self, pair: str, alert_key: str, direction: str,
-                                              entry_ts: int, entry_price: float,
-                                              confluence_score: Optional[float] = None,
-                                              confluence_total: Optional[float] = None,
-                                              confluence_votes: Optional[Dict[str, bool]] = None) -> None:
+        if confluence_votes is not None:
+            await self.record_vote_count(alert_key, confluence_votes)
+
+    async def record_shadow_pending_outcome(
+        self,
+        pair: str,
+        alert_key: str,
+        direction: str,
+        entry_ts: int,
+        entry_price: float,
+        confluence_score: Optional[float] = None,
+        confluence_total: Optional[float] = None,
+        confluence_votes: Optional[Dict[str, bool]] = None,
+    ) -> None:
         """Twin of record_pending_outcome for alerts REJECTED by the win-rate filter.
-        Lets the brain see what would have happened had the alert fired."""
+
+        Lets the brain see what would have happened had the alert fired.
+        """
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
             return
+
         key = f"{RedisKeyPrefix.SHADOW_PENDING}{pair}:{alert_key}:{entry_ts}"
+
         try:
             payload = json_dumps({
-                "direction": direction, "entry_ts": entry_ts, "entry_price": entry_price,
-                "confluence_score": confluence_score, "confluence_total": confluence_total,
+                "direction": direction,
+                "entry_ts": entry_ts,
+                "entry_price": entry_price,
+                "confluence_score": confluence_score,
+                "confluence_total": confluence_total,
                 "confluence_votes": confluence_votes,
             })
         except Exception as e:
-            logger.warning(f"Failed to serialize shadow pending outcome for {pair}:{alert_key}: {e}")
+            logger.warning(
+                f"Failed to serialize shadow pending outcome for {pair}:{alert_key}: {e}"
+            )
             return
 
         ttl = (cfg.OUTCOME_LOOKAHEAD_CANDLES + 4) * 15 * 60
+
         try:
-            await asyncio.wait_for(self._redis.set(key, payload, ex=ttl), timeout=2.0)
+            await asyncio.wait_for(
+                self._redis.set(key, payload, ex=ttl),
+                timeout=2.0,
+            )
         except Exception as e:
-            logger.warning(f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}")
+            logger.warning(
+                f"Failed to record shadow pending outcome for {pair}:{alert_key}: {e}"
+            )
 
-        # ── Vote-count history (OOD gate) ────────────────────────────────────
-        VOTE_COUNT_HISTORY_MAX = 500
+    # ── Vote-count history (OOD gate) ────────────────────────────────────────
 
-        async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
-            if self.degraded or not self._redis:
-                return
-            count = sum(1 for v in votes.values() if v)
-            key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
-            try:
-                async with self._redis.pipeline() as pipe:
-                    pipe.lpush(key, str(count))
-                    pipe.ltrim(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1)
-                    await self._safe_redis_op(
-                        lambda: pipe.execute(), 2.0, f"vote_count_save:{alert_key}",
-                    )
-            except Exception:
-                pass
+    async def record_vote_count(self, alert_key: str, votes: Dict[str, bool]) -> None:
+        if self.degraded or not self._redis:
+            return
 
-        async def get_vote_count_history(self, alert_key: str) -> List[int]:
-            if self.degraded or not self._redis:
-                return []
-            key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
-            try:
-                raw_list = await self._safe_redis_op(
-                    lambda: self._redis.lrange(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1),
-                    2.0, f"vote_count_load:{alert_key}",
+        count = sum(1 for v in votes.values() if v)
+        key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
+
+        try:
+            async with self._redis.pipeline() as pipe:
+                pipe.lpush(key, str(count))
+                pipe.ltrim(key, 0, self.VOTE_COUNT_HISTORY_MAX - 1)
+
+                await self._safe_redis_op(
+                    lambda: pipe.execute(),
+                    2.0,
+                    f"vote_count_save:{alert_key}",
                 )
-                return [int(x) for x in raw_list] if raw_list else []
-            except Exception:
-                return []
+        except Exception:
+            pass
+
+    async def get_vote_count_history(self, alert_key: str) -> List[int]:
+        if self.degraded or not self._redis:
+            return []
+
+        key = f"{RedisKeyPrefix.VOTE_COUNT_HISTORY}{alert_key}"
+
+        try:
+            raw_list = await self._safe_redis_op(
+                lambda: self._redis.lrange(
+                    key,
+                    0,
+                    self.VOTE_COUNT_HISTORY_MAX - 1,
+                ),
+                2.0,
+                f"vote_count_load:{alert_key}",
+            )
+
+            return [int(x) for x in raw_list] if raw_list else []
+        except Exception:
+            return []
 
     async def _fetch_pending_keys(
         self, pair: str, precomputed_attr: str, key_prefix: str,
