@@ -358,48 +358,67 @@ def calculate_rsi_core(close, period):
         return rsi
 
     first_valid_idx = -1
-    last_valid_close = 0.0
     for i in range(n):
         if not np.isnan(close[i]):
             first_valid_idx = i
-            last_valid_close = close[i]
             break
 
     if first_valid_idx == -1:
         return rsi
 
+    seed_idx = first_valid_idx + period
+    if seed_idx >= n:
+        return rsi
+
     avg_gain = 0.0
     avg_loss = 0.0
-    prev_valid = last_valid_close
-    warmup_end = min(first_valid_idx + period + 1, n)
+    prev_valid = close[first_valid_idx]
 
-    for i in range(first_valid_idx + 1, warmup_end):
+    for i in range(first_valid_idx + 1, seed_idx + 1):
         curr = close[i]
-        if not np.isnan(curr):
-            diff = curr - prev_valid
-            if diff > 0.0:
-                avg_gain += diff
-            else:
-                avg_loss += -diff
-            if i < first_valid_idx + period:
-                prev_valid = curr
+
+        if np.isnan(curr):
+            return rsi
+
+        diff = curr - prev_valid
+
+        if diff > 0.0:
+            avg_gain += diff
+        else:
+            avg_loss += -diff
+
+        prev_valid = curr
 
     avg_gain /= period
     avg_loss /= period
 
+    # Seed RSI value
+    if avg_loss == 0.0:
+        rsi[seed_idx] = 100.0 if avg_gain > 0.0 else 50.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi[seed_idx] = 100.0 - (100.0 / (1.0 + rs))
+
     alpha = 1.0 / period
 
-    for i in range(first_valid_idx + period, n):
+    # Wilder smoothing after the seed bar
+    for i in range(seed_idx + 1, n):
         curr = close[i]
-        if not np.isnan(curr):
-            diff = curr - prev_valid
-            if diff > 0.0:
-                avg_gain = (diff * alpha) + (avg_gain * (1.0 - alpha))
-                avg_loss = (avg_loss * (1.0 - alpha))
-            else:
-                avg_gain = (avg_gain * (1.0 - alpha))
-                avg_loss = (-diff * alpha) + (avg_loss * (1.0 - alpha))
-            prev_valid = curr
+
+        if np.isnan(curr):
+            rsi[i] = rsi[i - 1]
+            continue
+
+        diff = curr - prev_valid
+
+        if diff > 0.0:
+            avg_gain = (diff * alpha) + (avg_gain * (1.0 - alpha))
+            avg_loss = avg_loss * (1.0 - alpha)
+        else:
+            avg_gain = avg_gain * (1.0 - alpha)
+            avg_loss = (-diff * alpha) + (avg_loss * (1.0 - alpha))
+
+        prev_valid = curr
 
         if avg_loss == 0.0:
             rsi[i] = 100.0 if avg_gain > 0.0 else 50.0
