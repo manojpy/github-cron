@@ -53,7 +53,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           mypy src/macd_unified.py src/aot_bridge.py src/numeric_selftest.py \
             src/bot_config.py src/state.py src/fetcher.py src/indicators.py \
-            src/gates.py src/alerts.py src/threshold_engine.py src/brain.py  src/apply_config_override.py src/telegram_feedback.py \
+            src/gates.py src/alerts.py src/threshold_engine.py src/brain.py src/brain_enhanced.py src/apply_config_override.py src/telegram_feedback.py \
             --ignore-missing-imports 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "ℹ️ Non-blocking for now -- see PR description before flipping to blocking." >> $GITHUB_STEP_SUMMARY
@@ -167,6 +167,7 @@ jobs:
                 "/app/src/alerts.py"
                 "/app/src/threshold_engine.py"        
                 "/app/src/brain.py"
+                "/app/src/brain_enhanced.py"
                 "/app/src/apply_config_override.py" 
                 "/app/src/telegram_feedback.py"
                 "/app/src/macd_aot_compiled.so"
