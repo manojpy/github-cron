@@ -827,8 +827,8 @@ async def run_once() -> Optional[bool]:
 
         if cfg.ENABLE_BRAIN:
             try:
-                from brain import BrainEngine
-                await BrainEngine(sdb).maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
+                from brain_enhanced import BrainEngineV2
+                await BrainEngineV2(sdb).maybe_generate_report(pairs_to_process, telegram_queue, logger_run)
             except Exception as e:
                 logger_run.warning(f"Brain report generation failed: {e}")
         if alerts_sent_ref[0] > MAX_ALERTS_PER_RUN:
