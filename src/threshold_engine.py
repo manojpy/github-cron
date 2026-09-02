@@ -454,7 +454,6 @@ def per_pair_breakdown(rows: List[Row], min_sample: int = 10):
     results.sort(key=lambda x: x[1])
     return results
 
-
 def per_alert_breakdown(rows: List[Row], min_sample: int = 10):
     stats = defaultdict(lambda: {"wins": 0, "n": 0, "scores": []})
     for r in rows:
@@ -952,7 +951,6 @@ def _percentile(data: List[float], p: float) -> float:
         return s[f]
     return s[f] * (c - k) + s[c] * (k - f)
 
-
 def is_vote_pattern_ood(
     rows: List[Row],
     current_votes: Dict[str, bool],
@@ -985,24 +983,46 @@ def is_vote_count_ood(
     current_count: int,
     historical_counts: List[int],
     min_history: int = 10,
+    margin: int = 2,
+    p5: int = 5,
+    p95: int = 95,
+    relaxed_mode: bool = True,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Lightweight variant of is_vote_pattern_ood() for callers that only
     have a running list of past vote-counts (e.g. a capped Redis list per
     alert_key) rather than full Row objects. This is what the live
     dispatch path uses; the offline analyzer still uses
-    is_vote_pattern_ood() directly against full rows."""
+    is_vote_pattern_ood() directly against full rows.
+    
+    relaxed_mode adds a margin to the percentile bounds so that small
+    deviations from the historical range don't trigger false positives.
+    """
     if len(historical_counts) < min_history:
-        return False, {"reason": "insufficient_history", "n": len(historical_counts)}
+        return False, {
+            "reason": "insufficient_history", 
+            "n": len(historical_counts),
+            "min_history": min_history,
+        }
+    
     counts_f = [float(c) for c in historical_counts]
-    lo = _percentile(counts_f, 5)
-    hi = _percentile(counts_f, 95)
-    ood = current_count < lo or current_count > hi
+    lo = _percentile(counts_f, p5)
+    hi = _percentile(counts_f, p95)
+    
+    # Apply margin if relaxed mode is enabled
+    if relaxed_mode:
+        ood = current_count < (lo - margin) or current_count > (hi + margin)
+    else:
+        ood = current_count < lo or current_count > hi
+    
     return ood, {
         "current_count": current_count,
         "hist_p5": lo,
         "hist_p95": hi,
         "n_history": len(historical_counts),
+        "margin_applied": margin if relaxed_mode else 0,
+        "relaxed_mode": relaxed_mode,
     }
+
 # ═══════════════════════════════════════════════════════════════════════
 #  NEW: Block-Bootstrap EV Confidence Intervals  (Recommended.txt §6)
 # ═══════════════════════════════════════════════════════════════════════

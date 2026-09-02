@@ -1244,7 +1244,15 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     continue
                 current_count = sum(1 for v in alert_votes.values() if v)
                 hist = await sdb.get_vote_count_history(alert_key)
-                is_ood, detail = engine.is_vote_count_ood(current_count, hist)
+                is_ood, detail = engine.is_vote_count_ood(
+                    current_count, 
+                    hist,
+                    min_history=cfg.OOD_MIN_HISTORY,
+                    margin=cfg.OOD_MARGIN,
+                    p5=cfg.OOD_P5,
+                    p95=cfg.OOD_P95,
+                    relaxed_mode=cfg.OOD_RELAXED_MODE,
+                )
                 if is_ood:
                     logger_pair.warning(
                         f"[{pair_name}] ⚠️ Unusual vote pattern detected — trade blocked as precaution: "
