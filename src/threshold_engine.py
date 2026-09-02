@@ -5,13 +5,14 @@ threshold recommendations.
 
 """
 from __future__ import annotations
-
+import hashlib
+import json 
 import math
 import time
 import random
 import statistics
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 Row = Dict[str, Any]
 CapRow = Tuple[float, int, float, float]  # (cap, n, wr, wilson_lower_bound)
@@ -1045,3 +1046,404 @@ def bootstrap_ev_ci(
         "ev_p95": ev_samples[p95_idx],
         "ev_std": statistics.pstdev(ev_samples) if n > 1 else 0.0,
     }
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PHASE 1.5 — VOTE WEIGHT OPTIMIZER (Logistic Regression)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _sigmoid(z: float) -> float:
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    ez = math.exp(z)
+    return ez / (1.0 + ez)
+
+def optimize_vote_weights(
+    rows: List[Row],
+    current_weights: Dict[str, float],
+    min_sample: int = 100,
+    max_iter: int = 2000,
+    lr: float = 0.05,
+    l2: float = 0.01,
+) -> Dict[str, Any]:
+    """Data-driven CONFLUENCE_WEIGHTS via gradient-descent logistic regression."""
+    vote_names = sorted(current_weights.keys())
+    X: List[List[float]] = []
+    y: List[float] = []
+
+    for r in rows:
+        votes = r.get("votes")
+        if not votes or not isinstance(votes, dict):
+            continue
+        vec = [1.0] + [1.0 if votes.get(vn) else 0.0 for vn in vote_names]
+        X.append(vec)
+        y.append(1.0 if r["win"] else 0.0)
+
+    n = len(X)
+    if n < min_sample:
+        return {"valid": False, "error": f"insufficient_data: {n} < {min_sample}"}
+
+    win_rate = sum(y) / n
+    beta = [0.0] * (len(vote_names) + 1)
+    beta[0] = math.log(win_rate / (1 - win_rate)) if 0 < win_rate < 1 else 0.0
+
+    for iteration in range(max_iter):
+        grad = [0.0] * len(beta)
+        for i in range(n):
+            z = sum(beta[j] * X[i][j] for j in range(len(beta)))
+            p = _sigmoid(z)
+            error = p - y[i]
+            for j in range(len(beta)):
+                grad[j] += error * X[i][j]
+        # Normalize by n, add L2 regularization
+        for j in range(len(beta)):
+            grad[j] = grad[j] / n + l2 * beta[j]
+        # Use cosine-annealed learning rate (0.05 → 0.001)
+        step = lr * (0.5 * (1 + math.cos(math.pi * iteration / max_iter)))
+        for j in range(len(beta)):
+            beta[j] -= step * grad[j]
+
+    intercept = beta[0]
+    coeffs = beta[1:]
+    positive_coeffs = [max(0.0, c) for c in coeffs]
+    total_pos = sum(positive_coeffs)
+
+    suggested: Dict[str, float] = {}
+    negative_votes: List[Tuple[str, float]] = []
+    for idx, vn in enumerate(vote_names):
+        c = coeffs[idx]
+        if c < -0.05:
+            negative_votes.append((vn, round(c, 4)))
+        if total_pos > 0 and positive_coeffs[idx] > 0:
+            raw = 3.0 * (positive_coeffs[idx] / (total_pos / len(vote_names)))
+            suggested[vn] = round(min(5.0, max(0.5, raw)), 2)
+        else:
+            suggested[vn] = 0.0
+
+    return {
+        "valid": True,
+        "n_samples": n,
+        "intercept": round(intercept, 4),
+        "current_weights": dict(current_weights),
+        "suggested_weights": suggested,
+        "negative_votes": negative_votes,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PHASE 2 — PARAMETER AUTOPSY ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def parameter_autopsy(
+    rows: List[Row],
+    param_field: str,
+    target_winrate: float = 0.55,
+    min_sample: int = 30,
+    n_quantiles: int = 5,
+) -> Dict[str, Any]:
+    valid = [r for r in rows if r.get("context") and r["context"].get(param_field) is not None]
+    if len(valid) < min_sample:
+        return {"valid": False, "error": f"insufficient_data: {len(valid)} < {min_sample}"}
+
+    valid.sort(key=lambda r: r["context"][param_field])
+    bucket_size = max(1, len(valid) // n_quantiles)
+    buckets: List[Dict[str, Any]] = []
+
+    for i in range(n_quantiles):
+        lo = i * bucket_size
+        hi = (i + 1) * bucket_size if i < n_quantiles - 1 else len(valid)
+        chunk = valid[lo:hi]
+        vals = [r["context"][param_field] for r in chunk]
+        wins = sum(r["win"] for r in chunk)
+        n = len(chunk)
+        wr = wins / n
+        wlo, whi, _ = wilson_ci(wins, n)
+        buckets.append({
+            "range": (round(min(vals), 4), round(max(vals), 4)),
+            "n": n,
+            "wr": round(wr, 4),
+            "wilson_lo": round(wlo, 4),
+            "wilson_hi": round(whi, 4),
+        })
+
+    optimal_cutoff = None
+    for b in buckets:
+        if b["wilson_hi"] < target_winrate:
+            optimal_cutoff = b["range"][0]
+            break
+    if optimal_cutoff is None:
+        optimal_cutoff = buckets[-1]["range"][1]
+
+    return {
+        "valid": True,
+        "param": param_field,
+        "buckets": buckets,
+        "optimal_cutoff": round(optimal_cutoff, 4),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PHASE 3 — CONDITIONAL ALERT GATING
+# ═══════════════════════════════════════════════════════════════════════
+
+def conditional_performance(
+    rows: List[Row],
+    alert_key: str,
+    condition_field: str,
+    condition_threshold: float,
+    min_sample: int = 15,
+) -> Dict[str, Any]:
+    subset = [
+        r for r in rows
+        if r.get("alert_key") == alert_key
+        and r.get("context")
+        and r["context"].get(condition_field) is not None
+    ]
+    if len(subset) < min_sample * 2:
+        return {"valid": False, "error": "insufficient_data"}
+
+    above = [r for r in subset if r["context"][condition_field] > condition_threshold]
+    below = [r for r in subset if r["context"][condition_field] <= condition_threshold]
+    if len(above) < min_sample or len(below) < min_sample:
+        return {"valid": False, "error": "insufficient_split"}
+
+    def _stats(chunk: List[Row]) -> Dict[str, Any]:
+        wins = sum(r["win"] for r in chunk)
+        n = len(chunk)
+        wr = wins / n
+        lo, hi, _ = wilson_ci(wins, n)
+        return {"n": n, "wr": wr, "wilson_lo": lo, "wilson_hi": hi}
+
+    a_stats = _stats(above)
+    b_stats = _stats(below)
+    gap = a_stats["wr"] - b_stats["wr"]
+
+    recommendation = "neutral"
+    if gap < -0.10 and a_stats["wilson_hi"] < 0.50:
+        recommendation = "disable_when_above"
+    elif gap > 0.10 and b_stats["wilson_hi"] < 0.50:
+        recommendation = "disable_when_below"
+
+    return {
+        "valid": True,
+        "alert_key": alert_key,
+        "condition": f"{condition_field} > {condition_threshold}",
+        "above": a_stats,
+        "below": b_stats,
+        "gap": round(gap, 4),
+        "recommendation": recommendation,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PHASE 4 — VOTE INTERACTION MINER
+# ═══════════════════════════════════════════════════════════════════════
+
+def interaction_miner(
+    rows: List[Row],
+    min_sample: int = 20,
+) -> List[Dict[str, Any]]:
+    vote_names: Set[str] = set()
+    for r in rows:
+        if r.get("votes"):
+            vote_names.update(r["votes"].keys())
+    vote_names = sorted(vote_names)
+    interactions: List[Dict[str, Any]] = []
+
+    for i, v1 in enumerate(vote_names):
+        for v2 in vote_names[i + 1 :]:
+            both = [r for r in rows if r.get("votes") and r["votes"].get(v1) and r["votes"].get(v2)]
+            only_v1 = [r for r in rows if r.get("votes") and r["votes"].get(v1) and not r["votes"].get(v2)]
+            only_v2 = [r for r in rows if r.get("votes") and r["votes"].get(v2) and not r["votes"].get(v1)]
+            neither = [r for r in rows if r.get("votes") and not r["votes"].get(v1) and not r["votes"].get(v2)]
+
+            if len(both) < min_sample or len(only_v1) < min_sample:
+                continue
+
+            wr_both = sum(r["win"] for r in both) / len(both)
+            wr_only_v1 = sum(r["win"] for r in only_v1) / len(only_v1)
+            wr_only_v2 = sum(r["win"] for r in only_v2) / len(only_v2) if only_v2 else 0.0
+            wr_neither = sum(r["win"] for r in neither) / len(neither) if neither else 0.0
+
+            synergy = wr_both - max(wr_only_v1, wr_only_v2, wr_neither)
+            if synergy > 0.10:
+                interactions.append({
+                    "pair": (v1, v2),
+                    "type": "synergy",
+                    "delta": round(synergy, 4),
+                    "wr_both": round(wr_both, 4),
+                    "wr_only_v1": round(wr_only_v1, 4),
+                    "wr_only_v2": round(wr_only_v2, 4),
+                    "n_both": len(both),
+                })
+
+            poison = wr_only_v1 - wr_both
+            if poison > 0.15 and len(both) >= min_sample:
+                interactions.append({
+                    "pair": (v1, v2),
+                    "type": "poison",
+                    "delta": round(-poison, 4),
+                    "wr_both": round(wr_both, 4),
+                    "wr_only_v1": round(wr_only_v1, 4),
+                    "n_both": len(both),
+                    "note": f"{v2} poisons {v1}",
+                })
+
+    interactions.sort(key=lambda x: -abs(x["delta"]))
+    return interactions
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PHASE 5 — COUNTERFACTUAL SIMULATOR
+# ═══════════════════════════════════════════════════════════════════════
+
+def simulate_config_change(
+    rows: List[Row],
+    baseline_ev: float,
+    new_threshold: Optional[float] = None,
+    new_params: Optional[Dict[str, float]] = None,
+) -> Optional[Dict[str, Any]]:
+    simulated: List[Row] = []
+    for r in rows:
+        if new_threshold is not None and r["score"] < new_threshold:
+            continue
+        if new_params and r.get("context"):
+            blocked = False
+            for param, max_val in new_params.items():
+                if r["context"].get(param) is not None and r["context"][param] > max_val:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+        simulated.append(r)
+
+    if not simulated:
+        return None
+
+    wins = sum(r["win"] for r in simulated)
+    n = len(simulated)
+    wr = wins / n
+    ev, rr, _, _ = ev_and_rr_for(simulated)
+    return {
+        "n": n,
+        "wr": round(wr, 4),
+        "ev": round(ev, 4),
+        "delta_n": n - len(rows),
+        "delta_ev": round(ev - baseline_ev, 4),
+        "filtered_out": len(rows) - n,
+        "rr": rr,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PHASE 6 — DYNAMIC REGIME PROFILES
+# ═══════════════════════════════════════════════════════════════════════
+
+def regime_profile_optimizer(
+    rows: List[Row],
+    regime_field: str = "adx_val",
+    n_regimes: int = 3,
+    min_sample: int = 25,
+    target_winrate: float = 0.55,
+) -> Dict[str, Any]:
+    valid = [r for r in rows if r.get("context") and r["context"].get(regime_field) is not None]
+    if len(valid) < min_sample * n_regimes:
+        return {"valid": False, "error": "insufficient_data"}
+
+    values = sorted(r["context"][regime_field] for r in valid)
+    cuts = [values[int(len(values) * i / n_regimes)] for i in range(1, n_regimes)]
+
+    regimes: List[Dict[str, Any]] = []
+    prev = float("-inf")
+    for i, cut in enumerate(cuts + [float("inf")]):
+        chunk = [r for r in valid if prev <= r["context"][regime_field] < cut]
+        prev = cut
+        if len(chunk) < min_sample:
+            continue
+        rec = recommend_threshold(chunk, target_winrate=target_winrate, min_sample=min_sample)
+        if rec["valid"]:
+            regimes.append({
+                "regime_id": i,
+                "range": (
+                    round(min(r["context"][regime_field] for r in chunk), 2),
+                    round(max(r["context"][regime_field] for r in chunk), 2),
+                ),
+                "n": len(chunk),
+                "recommended_threshold": rec["recommended"],
+                "wr": round(rec["rec_wr"], 4),
+                "ev": round(rec["rec_ev"], 4),
+            })
+    return {"valid": True, "regime_field": regime_field, "regimes": regimes}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  RISK FLAGS — Config Version Hash & Actionability
+# ═══════════════════════════════════════════════════════════════════════
+def compare_config_versions(
+    rows: List[Row],
+    min_sample: int = 20,
+) -> List[Dict[str, Any]]:
+    """Group real outcome rows by their tagged config_version and compare
+    WR across consecutive versions (ordered by first-seen entry_ts), so a
+    config_patch that tanks WR gets flagged instead of going unnoticed."""
+    by_version: Dict[str, List[Row]] = defaultdict(list)
+    for r in rows:
+        ctx = r.get("context")
+        if not ctx:
+            continue
+        cv = ctx.get("config_version")
+        if not cv:
+            continue
+        by_version[cv].append(r)
+
+    if len(by_version) < 2:
+        return []
+
+    version_order = sorted(
+        by_version.keys(),
+        key=lambda v: min(r.get("entry_ts", 0) for r in by_version[v]),
+    )
+
+    comparisons: List[Dict[str, Any]] = []
+    for prev_v, cur_v in zip(version_order, version_order[1:]):
+        prev_rows = by_version[prev_v]
+        cur_rows = by_version[cur_v]
+        if len(prev_rows) < min_sample or len(cur_rows) < min_sample:
+            continue
+
+        prev_wins = sum(r["win"] for r in prev_rows)
+        cur_wins = sum(r["win"] for r in cur_rows)
+        prev_wr = prev_wins / len(prev_rows)
+        cur_wr = cur_wins / len(cur_rows)
+        prev_lo, prev_hi, _ = wilson_ci(prev_wins, len(prev_rows))
+        cur_lo, cur_hi, _ = wilson_ci(cur_wins, len(cur_rows))
+        delta = cur_wr - prev_wr
+
+        comparisons.append({
+            "prev_version": prev_v,
+            "cur_version": cur_v,
+            "prev_n": len(prev_rows),
+            "cur_n": len(cur_rows),
+            "prev_wr": round(prev_wr, 4),
+            "cur_wr": round(cur_wr, 4),
+            "delta_wr": round(delta, 4),
+            # non-overlapping Wilson intervals = statistically meaningful move
+            "regression": delta < -0.05 and cur_hi < prev_lo,
+            "improvement": delta > 0.05 and cur_lo > prev_hi,
+        })
+
+    return comparisons
+
+def hash_config_state(weights: Dict[str, float], threshold: float, min_pct: float) -> str:
+    payload = json.dumps({"w": weights, "t": threshold, "p": min_pct}, sort_keys=True)
+    return hashlib.md5(payload.encode()).hexdigest()[:12]
+
+def score_actionability(rec: Dict[str, Any]) -> float:
+    impact = abs(rec.get("delta_ev", 0)) * 100.0
+    confidence = 1.0
+    if rec.get("wilson_hi") is not None and rec.get("wilson_lo") is not None:
+        confidence = max(0.1, 1.0 - (rec["wilson_hi"] - rec["wilson_lo"]))
+    effort = 1.0
+    if rec.get("type") == "dynamic_regime_profile":
+        effort = 3.0
+    elif rec.get("type") == "conditional_gating":
+        effort = 2.0
+    return impact * confidence / effort

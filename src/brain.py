@@ -198,6 +198,11 @@ class BrainEngine:
                     votes = json.loads(votes_raw) if votes_raw else None
                 except (TypeError, ValueError):
                     votes = None
+                context_raw = f.get("context")
+                try:
+                    row_context = json.loads(context_raw) if context_raw else None
+                except (TypeError, ValueError):
+                    row_context = None
 
                 parsed.append({
                     "pair": pair,
@@ -210,6 +215,7 @@ class BrainEngine:
                     "pct_move": float(f.get("pct_move", 0.0)),
                     "entry_ts": entry_ts,
                     "votes": votes,
+                    "context": row_context,
                 })
             except (KeyError, ValueError) as e:
                 logging.getLogger("macd_bot").debug(f"Brain: dropping malformed outcome row: {e}")
@@ -625,6 +631,19 @@ class BrainEngine:
                         f"Note: a toxic bucket (score {worst[0]:.1f}-{worst[1]:.1f}, {worst[2]:.0%} WR) "
                         f"exists at or above the recommended threshold. Cumulative stats already price "
                         f"this in — worth checking the per-alert breakdown below for what's firing there."
+                    ),
+                })
+
+        # ── Config Version Regression Check ─────────────────────────────
+        config_comparisons = compare_config_versions(real_rows, min_sample=min_sample)
+        for comp in config_comparisons:
+            if comp["regression"]:
+                recommendations.append({
+                    "type": "config_regression", "severity": "high",
+                    "message": (
+                        f"🚨 Config regression: WR fell {comp['prev_wr']:.0%}→{comp['cur_wr']:.0%} "
+                        f"after config {comp['prev_version']}→{comp['cur_version']} "
+                        f"(n={comp['prev_n']}/{comp['cur_n']}). Consider reverting."
                     ),
                 })
 

@@ -9,7 +9,9 @@ import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
 from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY
+from threshold_engine import hash_config_state
 from fetcher import compute_backoff
+
 
 if TYPE_CHECKING:
     from fetcher import PriceData
@@ -548,7 +550,9 @@ class RedisStateStore:
         confluence_total: Optional[float] = None,
         confluence_votes: Optional[Dict[str, bool]] = None,
         adx_val: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> None:
+
         if self.degraded or not cfg.ENABLE_WIN_RATE_FILTER:
             return
 
@@ -563,6 +567,7 @@ class RedisStateStore:
                 "confluence_total": confluence_total,
                 "confluence_votes": confluence_votes,
                 "adx_val": adx_val,
+                "context": context,
             })
         except Exception as e:
             logger.warning(
@@ -595,11 +600,9 @@ class RedisStateStore:
         confluence_score: Optional[float] = None,
         confluence_total: Optional[float] = None,
         confluence_votes: Optional[Dict[str, bool]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Twin of record_pending_outcome for alerts REJECTED by the win-rate filter.
 
-        Lets the brain see what would have happened had the alert fired.
-        """
         if self.degraded or not getattr(cfg, "ENABLE_BRAIN", False):
             return
 
@@ -613,6 +616,7 @@ class RedisStateStore:
                 "confluence_score": confluence_score,
                 "confluence_total": confluence_total,
                 "confluence_votes": confluence_votes,
+                "context": context,
             })
         except Exception as e:
             logger.warning(
@@ -747,6 +751,7 @@ class RedisStateStore:
             "conf_total": conf_total,
             "conf_votes": conf_votes,
             "adx_val": adx_val,
+            "context": data.get("context"),
         }, ""
 
     async def resolve_pending_outcomes(self, pair: str, data_15m: "PriceData", i15: int,
@@ -818,6 +823,7 @@ class RedisStateStore:
                         conf_total = result["conf_total"]
                         conf_votes = result["conf_votes"]
                         adx_val = result["adx_val"]
+                        row_context = result.get("context")
 
                         stats_key = f"{RedisKeyPrefix.ALERT_STATS}{pair}:{alert_key}"
                         write_pipe.hincrby(stats_key, "wins" if win else "losses", 1)
@@ -825,7 +831,9 @@ class RedisStateStore:
 
                         stream_fields = None
                         if conf_score is not None and conf_total is not None:
-                            stream_fields = {
+
+
+                            stream_fields = { 
                                 "pair": str(pair),
                                 "alert_key": str(alert_key),
                                 "direction": str(direction),
@@ -836,6 +844,7 @@ class RedisStateStore:
                                 "entry_ts": str(entry_ts),
                                 "votes": json_dumps(conf_votes) if conf_votes is not None else "",
                                 "adx_val": str(adx_val) if adx_val is not None else "",
+                                "context": json_dumps(row_context) if row_context is not None else "",
                             }
                         else:
                             missing_score_count += 1

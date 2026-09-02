@@ -30,6 +30,8 @@ from indicators import (
     validate_cloud_cross, validate_conversion_cross,
     _fib_reversal_confluence_vote,
 )
+
+from threshold_engine import hash_config_state
 from telegram_feedback import build_feedback_keyboard, record_feedback_pending
 
 def escape_markdown_v2(text: str) -> str:
@@ -1259,12 +1261,11 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
             win_rate_map = await sdb.batch_get_alert_win_rates(
                 pair_name, alert_keys_to_check, timeout=3.0
             )
-
             surviving_alerts = []
             brain_engine = None
             if cfg.ENABLE_BRAIN:
                 try:
-                    from brain import BrainEngine
+                    from brain_enhanced import BrainEngineV2 as BrainEngine
                     brain_engine = BrainEngine(sdb)
                 except Exception as e:
                     logger_pair.debug(f"Brain engine init failed: {e}")
@@ -1294,10 +1295,24 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
 
                     if cfg.ENABLE_BRAIN and cfg.BRAIN_SHADOW_MODE:
                         alert_score, alert_total, alert_votes = _confluence_for(alert_key)
+                        shadow_context = {
+                            "rsi_curr": context.get("rsi_curr"),
+                            "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+                            "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+                            "ppo_curr": context.get("ppo_curr"),
+                            "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+                            "buy_wick_ratio": gr.buy_wick_ratio,
+                            "sell_wick_ratio": gr.sell_wick_ratio,
+                            "adx_val": gr.adx_val,
+                            "config_version": hash_config_state(
+                                CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
+                            ),
+                        }
                         await sdb.record_shadow_pending_outcome(
                             pair_name, alert_key, direction, ts_curr, close_curr,
                             confluence_score=alert_score, confluence_total=alert_total,
                             confluence_votes=alert_votes,
+                            context=shadow_context,
                         )
                     logger_pair.info(
                         f"[{pair_name}] Win-rate filter dropped {alert_key}: "
@@ -1439,16 +1454,29 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"🔔🎯🟢 Sent {len(alerts_to_send)} alerts for {pair_name} | "
                             f"Keys: {[ak for _, _, ak in alerts_to_send]}"
                         )
-
                         if cfg.ENABLE_WIN_RATE_FILTER:
                             async def _record_one(alert_key: str):
                                 s, t, v = _confluence_for(alert_key)
+                                trigger_context = {
+                                    "rsi_curr": context.get("rsi_curr"),
+                                    "rsi_adaptive_buy": gr.rsi_adaptive_buy,
+                                    "rsi_adaptive_sell": gr.rsi_adaptive_sell,
+                                    "ppo_curr": context.get("ppo_curr"),
+                                    "ppo_adaptive_threshold": gr.ppo_adaptive_threshold,
+                                    "buy_wick_ratio": gr.buy_wick_ratio,
+                                    "sell_wick_ratio": gr.sell_wick_ratio,
+                                    "adx_val": gr.adx_val,
+                                    "config_version": hash_config_state(
+                                        CONFLUENCE_WEIGHTS, cfg.CONFLUENCE_MIN_ABS_SCORE, cfg.CONFLUENCE_MIN_PCT
+                                    ),
+                                }
                                 await sdb.record_pending_outcome(
                                     pair_name, alert_key,
                                     "buy" if alert_key in BUY_ALERT_KEYS else "sell",
                                     ts_curr, close_curr,
                                     confluence_score=s, confluence_total=t, confluence_votes=v,
                                     adx_val=adx_val,
+                                    context=trigger_context,
                                 )
                             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
                     else:
