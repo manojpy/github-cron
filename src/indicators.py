@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -856,7 +855,7 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
     def get_swings(length):
         tops = []
         btms = []
-        os = 0
+        swing_state = 0
         _, upper_arr = rolling_min_max_numba(h, length)
         lower_arr, _ = rolling_min_max_numba(l, length)
 
@@ -867,15 +866,15 @@ def calculate_pine_order_blocks(o, h, l, c, atr200, ob_filter: str = 'Atr', swin
             h_len = h[i - length]
             l_len = l[i - length]
 
-            prev_os = os
+            prev_swing_state = swing_state
             if h_len > upper:
-                os = 0
+                swing_state = 0
             elif l_len < lower:
-                os = 1
+                swing_state = 1
 
-            if os == 0 and prev_os != 0:
+            if swing_state == 0 and prev_swing_state != 0:
                 tops.append((i, h_len, i - length))
-            elif os == 1 and prev_os != 1:
+            elif swing_state == 1 and prev_swing_state != 1:
                 btms.append((i, l_len, i - length))
         return tops, btms
 
@@ -1173,7 +1172,7 @@ def _get_minor_swings(h: np.ndarray, l: np.ndarray, length: int, start: int, end
     _, upper_arr = rolling_min_max_numba(h, length)
     lower_arr, _ = rolling_min_max_numba(l, length)
 
-    os = None
+    swing_state = None
     for i in range(length, end + 1):
         k = i - length
         right_upper = upper_arr[i]
@@ -1189,19 +1188,19 @@ def _get_minor_swings(h: np.ndarray, l: np.ndarray, length: int, start: int, end
         left_upper = upper_arr[k - 1]
         left_lower = lower_arr[k - 1]
 
-        prev_os = os
+        prev_swing_state = swing_state
         if h_len > right_upper and h_len > left_upper:
-            os = 0
+            swing_state = 0
         elif l_len < right_lower and l_len < left_lower:
-            os = 1
+            swing_state = 1
         else:
-            os = prev_os
+            swing_state = prev_swing_state
 
         if i < start:
             continue
-        if os == 0 and prev_os != 0:
+        if swing_state == 0 and prev_swing_state != 0:
             tops.append((i, h_len, k))
-        elif os == 1 and prev_os != 1:
+        elif swing_state == 1 and prev_swing_state != 1:
             btms.append((i, l_len, k))
     return tops, btms
 
