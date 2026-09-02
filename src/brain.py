@@ -635,7 +635,8 @@ class BrainEngine:
                 })
 
         # ── Config Version Regression Check ─────────────────────────────
-        config_comparisons = compare_config_versions(real_rows, min_sample=min_sample)
+
+        config_comparisons = engine.compare_config_versions(real_rows, min_sample=min_sample)
         for comp in config_comparisons:
             if comp["regression"]:
                 recommendations.append({

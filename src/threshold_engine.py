@@ -1159,6 +1159,7 @@ def parameter_autopsy(
     target_winrate: float = 0.55,
     min_sample: int = 30,
     n_quantiles: int = 5,
+    higher_is_worse: bool = False,  # NEW: direction parameter
 ) -> Dict[str, Any]:
     valid = [r for r in rows if r.get("context") and r["context"].get(param_field) is not None]
     if len(valid) < min_sample:
@@ -1186,20 +1187,33 @@ def parameter_autopsy(
         })
 
     optimal_cutoff = None
-    for b in buckets:
-        if b["wilson_hi"] < target_winrate:
-            optimal_cutoff = b["range"][0]
-            break
+    
+    # FIX: Iterate in the correct direction based on parameter semantics
+    if higher_is_worse:
+        # For parameters where higher values are bad (e.g., RSI buy cap):
+        # Find the LOWEST value where performance drops below target
+        for b in buckets:
+            if b["wilson_hi"] < target_winrate:
+                optimal_cutoff = b["range"][0]
+                break
+    else:
+        # For parameters where higher values are good (e.g., ADX strength):
+        # Find the HIGHEST value where performance drops below target
+        for b in reversed(buckets):
+            if b["wilson_hi"] < target_winrate:
+                optimal_cutoff = b["range"][1]
+                break
+
     if optimal_cutoff is None:
-        optimal_cutoff = buckets[-1]["range"][1]
+        optimal_cutoff = buckets[-1]["range"][1] if higher_is_worse else buckets[0]["range"][0]
 
     return {
         "valid": True,
         "param": param_field,
         "buckets": buckets,
         "optimal_cutoff": round(optimal_cutoff, 4),
+        "higher_is_worse": higher_is_worse,
     }
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 3 — CONDITIONAL ALERT GATING
@@ -1342,17 +1356,24 @@ def simulate_config_change(
     wins = sum(r["win"] for r in simulated)
     n = len(simulated)
     wr = wins / n
-    ev, rr, _, _ = ev_and_rr_for(simulated)
+    
+    # FIX: Use ev_and_kelly_for() for NET EV (deducts fees/slippage)
+    # This ensures consistent comparison with baseline_ev
+    net_ev, _half_kelly, _wr = ev_and_kelly_for(simulated)
+    
+    # Also compute gross EV for R:R display
+    gross_ev, rr, _, _ = ev_and_rr_for(simulated)
+    
     return {
         "n": n,
         "wr": round(wr, 4),
-        "ev": round(ev, 4),
+        "ev": round(net_ev, 4),  # NET EV - consistent with baseline
+        "gross_ev": round(gross_ev, 4),  # Additional info for reference
         "delta_n": n - len(rows),
-        "delta_ev": round(ev - baseline_ev, 4),
+        "delta_ev": round(net_ev - baseline_ev, 4),  # Compare NET vs NET
         "filtered_out": len(rows) - n,
         "rr": rr,
-    }
-
+    } 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  PHASE 6 — DYNAMIC REGIME PROFILES

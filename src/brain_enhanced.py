@@ -10,8 +10,10 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from alerts import escape_markdown_v2
+
 from bot_config import cfg, json_dumps, format_ist_time, CONFLUENCE_WEIGHTS
 from state import RedisKeyPrefix, RedisStateStore
+from brain import BrainEngine as BaseBrainEngine
 import threshold_engine as engine
 
 from threshold_engine import (
@@ -30,21 +32,12 @@ _PHASE_MIN_SAMPLES = {
     "config_regression": 20,
 }
 
-class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else object):
-    """Drop-in replacement for BrainEngine.  Inherits the original and adds
+class BrainEngineV2(BaseBrainEngine):
+    """Drop-in replacement for BrainEngine. Inherits the original and adds
     prescriptive phases 1.5-6 plus actionability scoring."""
 
     def __init__(self, sdb: RedisStateStore):
-        # If the base BrainEngine exists, init it; otherwise manual fallback
-        if hasattr(engine, "BrainEngine"):
-            super().__init__(sdb)
-        else:
-            self.sdb = sdb
-            self.stability_gate = engine.StabilityGate(
-                min_history=getattr(cfg, "BRAIN_STABILITY_MIN_HISTORY", 3),
-                max_jump=getattr(cfg, "BRAIN_STABILITY_MAX_JUMP", 2.0),
-            )
-            self._cusum_detectors: Dict[str, engine.CUSUMDetector] = {}
+        super().__init__(sdb)
         self._phase_samples = _PHASE_MIN_SAMPLES
 
     async def _load_rows(self) -> tuple:
@@ -89,7 +82,9 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
                             f"data-driven weights differ from current. Top changes: "
                             f"{', '.join(changed[:5])}."
                         ),
-                        "delta_ev": 0.0,  # populated below via counterfactual
+
+                        "delta_ev": max(abs(new_v - CONFLUENCE_WEIGHTS.get(k, 0))
+                            for k, new_v in wopt["suggested_weights"].items()) / 100.0,
                         "wilson_lo": 0.0,
                         "wilson_hi": 0.0,
                     })
@@ -112,12 +107,24 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
 
         # ── Phase 2: Parameter Autopsy ───────────────────────────────────
         if real_rows and any("context" in r for r in real_rows):
-            for param in ["rsi_adaptive_buy", "rsi_adaptive_sell",
-                          "ppo_adaptive_threshold", "buy_wick_ratio", "sell_wick_ratio"]:
+
+            # Parameters where higher is worse (e.g., RSI buy cap, buy_wick_ratio)
+            params_higher_worse = {
+                "rsi_adaptive_buy": True,   # Higher RSI buy cap = worse
+                "rsi_adaptive_sell": False,  # Lower RSI sell cap = worse (so higher is better)
+                "ppo_adaptive_threshold": True,  # Higher threshold = worse
+                "buy_wick_ratio": True,     # Higher wick ratio = worse
+                "sell_wick_ratio": True,    # Higher wick ratio = worse
+            }
+
+            for param in params_higher_worse.keys():
                 if len(real_rows) < self._phase_samples["parameter_autopsy"]:
                     break
-                autopsy = parameter_autopsy(real_rows, param,
-                                            min_sample=self._phase_samples["parameter_autopsy"])
+                autopsy = parameter_autopsy(
+                    real_rows, param,
+                    min_sample=self._phase_samples["parameter_autopsy"],
+                    higher_is_worse=params_higher_worse[param],
+                )
                 if autopsy.get("valid") and autopsy.get("optimal_cutoff") is not None:
                     last_bucket = autopsy["buckets"][-1]
                     if last_bucket["wilson_hi"] < cfg.MIN_WIN_RATE:
@@ -130,7 +137,7 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
                                 f"show {last_bucket['wr']:.0%} WR (n={last_bucket['n']}). "
                                 f"Consider tightening to ≤{autopsy['optimal_cutoff']:.2f}."
                             ),
-                            "delta_ev": 0.0,
+                            "delta_ev": max(0.0, cfg.MIN_WIN_RATE - last_bucket["wr"]),
                             "wilson_lo": last_bucket["wilson_lo"],
                             "wilson_hi": last_bucket["wilson_hi"],
                         })
@@ -161,7 +168,7 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
                                 f"vs {cp['below']['wr']:.0%} when ≤{cond_thr}. "
                                 f"Recommendation: {cp['recommendation']}."
                             ),
-                            "delta_ev": 0.0,
+                            "delta_ev": abs(cp["gap"]),
                             "wilson_lo": min(cp["above"]["wilson_lo"], cp["below"]["wilson_lo"]),
                             "wilson_hi": max(cp["above"]["wilson_hi"], cp["below"]["wilson_hi"]),
                         })
@@ -180,6 +187,7 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
                             f"(n={inter['n_both']}). Alone: {v1}={inter['wr_only_v1']:.0%}, "
                             f"{v2}={inter['wr_only_v2']:.0%}. Stack these votes."
                         ),
+                        "delta_ev": abs(inter["delta"]), 
                     })
                 else:
                     recommendations.append({
@@ -189,6 +197,7 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
                             f"☠️ Poison: {v2} kills {v1}. Together={inter['wr_both']:.0%} WR, "
                             f"{v1} alone={inter['wr_only_v1']:.0%}. Avoid this combo."
                         ),
+                        "delta_ev": abs(inter["delta"]),
                     })
 
         # ── Phase 5: Counterfactual Simulator ────────────────────────────
@@ -266,7 +275,7 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
                         f"after the last config change (config {comp['prev_version']}→{comp['cur_version']}, "
                         f"n={comp['prev_n']}/{comp['cur_n']}). Consider reverting."
                     ),
-                    "delta_ev": 0.0,
+                    "delta_ev": abs(comp["delta_wr"]),
                 })
             elif comp["improvement"]:
                 recommendations.append({
@@ -304,14 +313,7 @@ class BrainEngineV2(engine.BrainEngine if hasattr(engine, "BrainEngine") else ob
 
     # ── Baseline wrapper that also exposes raw rows ──────────────────────
     async def _generate_baseline_recommendations(self) -> Dict[str, Any]:
-        """Calls the original BrainEngine logic and tucks raw rows into
-        the dict so the new phases don't have to re-fetch."""
-        # If original BrainEngine exists, call super(); else inline minimal
-        if hasattr(engine.BrainEngine, "generate_recommendations"):
-            base = await super().generate_recommendations()
-        else:
-            base = await self._minimal_baseline()
-
+        base = await super().generate_recommendations()  # BaseBrainEngine always has it — drop the hasattr guard entirely
         real_rows, shadow_rows = await self._load_rows()
         base["_real_rows"] = real_rows
         base["_shadow_rows"] = shadow_rows

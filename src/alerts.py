@@ -1405,7 +1405,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         "suppression": f"Global limit {max_alerts_per_run} reached"
                     }
                 }
+
         if alerts_to_send:
+            budget_refunded = False  # NEW: Flag to prevent double refund
             try:
                 if len(alerts_to_send) == 1:
                     title, extra, _ = alerts_to_send[0]
@@ -1425,6 +1427,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                         )
                         await _release_dedup_claims()
                         await _refund_alert_budget(len(alerts_to_send))
+                        budget_refunded = True  # Mark as refunded
                         send_success = False
                     elif reconfirmed is False:           
                         logger_pair.warning(
@@ -1432,6 +1435,7 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                             f"alert suppressed, dedup key KEPT to prevent duplicates"
                         )
                         await _refund_alert_budget(len(alerts_to_send))
+                        budget_refunded = True  # Mark as refunded
                         send_success = False
 
                     elif cfg.ENABLE_TELEGRAM_FEEDBACK:
@@ -1487,7 +1491,9 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                                 )
                             await asyncio.gather(*(_record_one(alert_key) for _, _, alert_key in alerts_to_send))
                     else:
-                        await _refund_alert_budget(len(alerts_to_send))
+                        # Only refund if not already done
+                        if not budget_refunded:
+                            await _refund_alert_budget(len(alerts_to_send))
                         logger_pair.error(
                             f"Alert dispatch failed | {pair_name} | "
                             f"State NOT marked ACTIVE, dedup claim retained for retry next run | "
@@ -1499,7 +1505,8 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                     logger_pair.info(f"[DRY RUN] Would send: {msg[:100]}...")
 
             except Exception as e:
-                await _refund_alert_budget(len(alerts_to_send))
+                if not budget_refunded:
+                    await _refund_alert_budget(len(alerts_to_send))
                 logger_pair.error(
                     f"Alert dispatch exception for {pair_name}: {e} | "
                     f"State NOT marked ACTIVE, dedup key retained, budget refunded — "
@@ -1515,7 +1522,6 @@ async def _apply_and_dispatch_alerts(gr: GateResult, context: Dict[str, Any], co
                 ("sell_common", sell_common),
             ] if not val
         ]
-
         reasons = []
         if not alerts_to_send:
             if not buy_common and not sell_common:
