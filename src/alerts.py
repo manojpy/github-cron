@@ -13,9 +13,8 @@ import numpy as np
 
 from bot_config import (
     cfg, logger, Constants, CompiledPatterns, PIVOT_LEVELS_BUY, PIVOT_LEVELS_SELL,
-    shutdown_event, format_ist_time, json_dumps,
+    shutdown_event, format_ist_time, json_dumps, CONFLUENCE_WEIGHTS,
 )
-
 from fetcher import (
     PriceData, DataFetcher, SessionManager, compute_backoff, validate_indicator_values,
     CandleSnapshot, independent_candle_reverify, cross_check_15m_against_5m,
