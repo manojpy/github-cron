@@ -53,7 +53,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           # Clone data repo
-          git clone https://x-access-token:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git /tmp/data-repo
+          git clone https://oauth2:${DATA_REPO_TOKEN}@github.com/manojpy/outcome-data.git /tmp/data-repo
           
           # Copy archive files
           mkdir -p /tmp/data-repo/outcome /tmp/data-repo/shadow
