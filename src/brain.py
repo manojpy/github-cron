@@ -355,14 +355,15 @@ class BrainEngine:
                                 f"(≥{auto_disable_min} required)."
                             ),
                         })
-            elif lo >= star_wr:
-                alert_verdicts[alert_key] = "star"
+
+            elif lo >= cfg.MIN_WIN_RATE:  # e.g., 55% lower bound proves it's profitable again
+                alert_verdicts[alert_key] = "recovered"
                 recommendations.append({
-                    "type": "star_alert", "severity": "low", "alert": alert_key,
+                    "type": "recovered_alert", "severity": "low", "alert": alert_key,
                     "win_rate": round(wr, 3), "sample_size": total,
                     "message": (
-                        f"STRONG: {alert_key} at {wr:.0%} WR over {total} samples "
-                        f"(95% CI lower bound {lo:.0%}). Consider lowering its confluence bar."
+                        f"RECOVERED: {alert_key} at {wr:.0%} WR over {total} samples "
+                        f"(95% CI lower bound {lo:.0%} ≥ target {cfg.MIN_WIN_RATE:.0%})."
                     ),
                 })
                 if auto_eligible and alert_key in current_disabled_keys:
