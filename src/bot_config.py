@@ -109,6 +109,8 @@ CONFIG_OVERRIDE_ALLOWED_FIELDS: Set[str] = {
     "CONFLUENCE_MIN_ABS_SCORE",
     "CONFLUENCE_MIN_PCT",
 }
+
+BRAIN_DISABLED_KEYS_METADATA_KEY = "brain_disabled_alert_keys"
 CONFIG_OVERRIDE_METADATA_KEY = "config_override"
 
 class Constants:
@@ -271,6 +273,8 @@ class BotConfig(BaseModel):
     BRAIN_OVERRIDE_COOLDOWN_SECONDS: int = Field(default=14400, ge=600, le=86400, description="Min seconds between rewardable overrides for the same alert_key")
     BRAIN_STAR_ALERT_WR: float = Field(default=0.70, ge=0.5, le=1.0, description="Win rate above which an alert is flagged as a star performer")
     BRAIN_ANALYSIS_WINDOW_DAYS: int = Field(default=30, ge=7, le=365, description="Only analyze outcomes from the last N days")
+    BRAIN_AUTO_DISABLE_ENABLED: bool = Field(default=True, description="If True, the brain writes disable_alert/reinstate verdicts directly to the live config_override in Redis instead of only reporting them")
+    BRAIN_AUTO_DISABLE_MIN_SAMPLE: int = Field(default=200, ge=50, description="Min samples per individual alert_key (not pooled) before the brain will auto-disable or auto-reinstate its shared config path")
     ENABLE_TELEGRAM_FEEDBACK: bool = Field(default=False, description="Attach 'Took Trade'/'Skipped' inline buttons to alerts and poll Telegram getUpdates each run to record taps into feedback_log_stream")
     TELEGRAM_FEEDBACK_TTL_HOURS: int = Field(default=24, ge=1, le=168, description="How long a feedback_pending record (and its buttons) stays live before the alert is considered expired/unanswered")
     BRAIN_MC_SIMULATIONS: int = Field(default=50, ge=0, le=500, description="Block-bootstrap Monte Carlo simulations for the robustness check in the periodic brain report. 0 disables it (offline-only, never affects live gating).")
@@ -331,7 +335,7 @@ class BotConfig(BaseModel):
     ADX_DI_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_SMOOTHING_LENGTH: int = Field(default=14, ge=5, le=30)
     ADX_ADAPTIVE_TARGET_PCTL: float = Field(default=60.0, ge=1.0, le=99.0, description="ADX threshold = this percentile of the pair's own trailing ADX history")
-    ENABLE_ADX_STRENGTH_VOTE: bool = Field(default=False, description="Confluence vote: ADX in top ADX_STRENGTH_PCTL of its own history — a stricter secondary bar on top of the existing adx_ok gate, not a duplicate of it")
+    ENABLE_ADX_STRENGTH_VOTE: bool = Field(default=False, description="Confluence vote: ADX in top ADX_STRENGTH_PCTL of its own history �� a stricter secondary bar on top of the existing adx_ok gate, not a duplicate of it")
     ADX_STRENGTH_PCTL: float = Field(default=80.0, ge=1.0, le=99.0, description="Percentile threshold for the adx_strength confluence vote. Should be set meaningfully above ADX_ADAPTIVE_TARGET_PCTL so this vote and the base 'adx' vote aren't answering the same question")
     ENABLE_ATR_PCTL_VOTE: bool = Field(default=False, description="Confluence vote: current volatility (ATR) in top ATR_PCTL_VOTE_MIN of its own history — a volatility-regime check, distinct from the existing rvol vote which checks short/long ATR expansion trend")
     ATR_PCTL_VOTE_MIN: float = Field(default=0.60, ge=0.0, le=1.0, description="Min ATR percentile rank (0-1) required for the atr_percentile confluence vote to pass")

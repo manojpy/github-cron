@@ -323,15 +323,20 @@ class BrainEngine:
         if drift_alerts:
             recommendations.extend(drift_alerts)
 
+        current_disabled_keys = await self.sdb.get_disabled_alert_keys()
+        auto_disable_min = getattr(cfg, "BRAIN_AUTO_DISABLE_MIN_SAMPLE", 500)
+        auto_disable_on = getattr(cfg, "BRAIN_AUTO_DISABLE_ENABLED", False)
+
         alert_verdicts: Dict[str, str] = {}  # alert_key -> "disable" | "star" | "monitor"
         for alert_key, s in alert_stats.items():
             total = s["wins"] + s["losses"]
+            s["total"] = total
             if total < min_sample:
                 continue
             wr = s["wins"] / total
             lo, hi, _ = engine.wilson_ci(s["wins"], total)
+            auto_eligible = auto_disable_on and total >= auto_disable_min
             if hi < disable_wr:
-                # Even the OPTIMISTIC bound is below the disable line — not noise.
                 alert_verdicts[alert_key] = "disable"
                 recommendations.append({
                     "type": "disable_alert", "severity": "high", "alert": alert_key,
@@ -341,8 +346,16 @@ class BrainEngine:
                         f"{len(s['pairs'])} pairs (95% CI upper bound {hi:.0%}, still below {disable_wr:.0%})."
                     ),
                 })
+                if auto_eligible and alert_key not in current_disabled_keys:
+                    if await self.sdb.set_alert_key_disabled(alert_key, True):
+                        recommendations.append({
+                            "type": "auto_disabled", "severity": "high", "alert": alert_key,
+                            "message": (
+                                f"🔒 Auto-disabled {alert_key}: {wr:.0%} WR over {total} samples "
+                                f"(≥{auto_disable_min} required)."
+                            ),
+                        })
             elif lo >= star_wr:
-                # Even the PESSIMISTIC bound clears the star line.
                 alert_verdicts[alert_key] = "star"
                 recommendations.append({
                     "type": "star_alert", "severity": "low", "alert": alert_key,
@@ -352,6 +365,12 @@ class BrainEngine:
                         f"(95% CI lower bound {lo:.0%}). Consider lowering its confluence bar."
                     ),
                 })
+                if auto_eligible and alert_key in current_disabled_keys:
+                    if await self.sdb.set_alert_key_disabled(alert_key, False):
+                        recommendations.append({
+                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {total} samples.",
+                        })
             else:
                 alert_verdicts[alert_key] = "monitor"
                 recommendations.append({
@@ -359,7 +378,12 @@ class BrainEngine:
                     "win_rate": round(wr, 3), "sample_size": total,
                     "message": f"{alert_key} viable ({wr:.0%} WR, {total} samples).",
                 })
-
+                if auto_eligible and alert_key in current_disabled_keys:
+                    if await self.sdb.set_alert_key_disabled(alert_key, False):
+                        recommendations.append({
+                            "type": "auto_reenabled", "severity": "medium", "alert": alert_key,
+                            "message": f"🔓 Re-enabled {alert_key}: recovered to {wr:.0%} WR over {total} samples.",
+                        }) 
         path_to_keys: Dict[str, List[str]] = defaultdict(list)
         for alert_key in alert_stats:
             path = _resolve_config_path(alert_key)
@@ -796,7 +820,7 @@ class BrainEngine:
             pass
 
     @staticmethod
-    def _truncate_telegram(lines: List[str], limit: int = 3500) -> str:
+    def _truncate_telegram(lines: List[str], limit: int = 4000) -> str:
         """Telegram hard-caps messages at 4096 chars. Stay well under that
         and note how much was cut rather than letting the send fail outright."""
         msg = "\n".join(lines)
@@ -848,7 +872,7 @@ class BrainEngine:
             recs = await self.generate_recommendations()
         except Exception as e:
             logger_run.error(f"Brain report generation failed: {e}")
-            await self._rollback_run_count()  # no argument
+            await self._rollback_run_count()
             return
 
         cc = recs.get("current_config", {})
@@ -883,60 +907,97 @@ class BrainEngine:
                 lines.append(escape_markdown_v2(f"  Net EV (fees/slippage): {net_ev:+.3f}%/trade"))
             if half_kelly is not None:
                 lines.append(escape_markdown_v2(f"  Position Sizing: {half_kelly:.1%} (Half-Kelly)"))
-
             cusum_n = ai.get("cusum_drifts", 0)
             lines.append(escape_markdown_v2(
                 f"  CUSUM Drift Status: {'🚨 ' + str(cusum_n) + ' ALERT(S)' if cusum_n else 'Normal'}"
             ))
-            
             if ai.get("ood_status"):
                 lines.append(escape_markdown_v2(f"  Vote-Count OOD Gate: {ai['ood_status']}"))
             lines.append("")
 
-        if high:
-            lines.append("*🔴 HIGH PRIORITY*")
-            for r in high[:6]:
-                lines.append(f"• {escape_markdown_v2(r['message'])}")
-            lines.append("")
-        if med:
-            lines.append("*🟡 WATCH*")
-            for r in med[:6]:
-                lines.append(f"• {escape_markdown_v2(r['message'])}")
-            lines.append("")
-        if low:
-            lines.append("*🟢 STRONG PERFORMERS*")
-            for r in low[:6]:
-                lines.append(f"• {escape_markdown_v2(r['message'])}")
+        # ── Auto-Block Status ──
+        auto_disabled = [r for r in recs["recommendations"] if r["type"] == "auto_disabled"]
+        auto_reenabled = [r for r in recs["recommendations"] if r["type"] == "auto_reenabled"]
+        if auto_disabled or auto_reenabled:
+            lines.append("*🔒 AUTO-BLOCK STATUS*")
+            for r in (auto_disabled + auto_reenabled)[:4]:
+                icon = "🔴" if r["type"] == "auto_disabled" else "🟢"
+                lines.append(f"{icon} {escape_markdown_v2(r['message'][:150])}")
             lines.append("")
 
-        ss = recs.get("shadow_summary") or {}
-        if ss.get("total_tracked"):
-            lines.append("*👻 SHADOW MODE*")
-            if ss.get("overall_wr") is not None:
-                lines.append(
-                    escape_markdown_v2(
-                        f"{ss['total_tracked']} rejected alert(s) tracked | overall WR {ss['overall_wr']:.0%}"
-                    )
-                )
-            else:
-                lines.append(escape_markdown_v2(f"{ss['total_tracked']} rejected alert(s) tracked"))
-            if ss.get("high_confluence_wr") is not None:
-                lines.append(
-                    escape_markdown_v2(
-                        f"High-confluence rejections ({ss['high_confluence_tracked']}): "
-                        f"{ss['high_confluence_wr']:.0%} WR"
-                    )
-                )
+        # ── Per-Alert Performance ──
+        perf = [r for r in recs["recommendations"] if r["type"] == "per_alert_breakdown"]
+        if perf:
+            lines.append("*📊 ALERT PERFORMANCE*")
+            for line in perf[0]["message"].split("\n")[:12]:
+                lines.append(escape_markdown_v2(line))
             lines.append("")
 
+        # ── Parameter Autopsy ──
+        param_recs = [r for r in recs["recommendations"] if r["type"] == "parameter_autopsy"]
+        if param_recs:
+            lines.append("*🎚️ PARAMETER TUNING*")
+            for r in param_recs[:6]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            lines.append("")
+
+        # ── Diagnostics (Weak Pairs + Vote Quality) ──
+        weak = [r for r in recs["recommendations"] if r["type"] == "weak_pairs"]
+        vq = [r for r in recs["recommendations"] if r["type"] == "vote_importance"]
+        if weak or vq:
+            lines.append("*🔻 DIAGNOSTICS*")
+            if weak:
+                lines.append(f"• {escape_markdown_v2(weak[0]['message'][:200])}")
+            if vq:
+                lines.append(f"• {escape_markdown_v2(vq[0]['message'][:200])}")
+            lines.append("")
+
+        # ── Regime & Robustness ──
+        regime = [r for r in recs["recommendations"] if r["type"] == "regime_breakdown"]
+        mc = [r for r in recs["recommendations"] if r["type"] == "monte_carlo_robustness"]
+        if regime or mc:
+            lines.append("*📈 REGIME & ROBUSTNESS*")
+            if regime:
+                lines.append(f"• {escape_markdown_v2(regime[0]['message'][:200])}")
+            if mc:
+                lines.append(f"• {escape_markdown_v2(mc[0]['message'][:200])}")
+            lines.append("")
+
+        # ── Config Patch ──
         if recs["config_patch"]:
             lines.append(f"*⚙️ SUGGESTED {escape_markdown_v2('config_macd.json')} PATCH*")
             lines.append("```")
-            lines.append(json_dumps(recs["config_patch"]))
+            patch_details = json.dumps(recs["config_patch"], indent=2)
+            if len(patch_details) > 1500:
+                patch_details = patch_details[:1500] + "\n... (truncated)"
+            lines.append(patch_details)
             lines.append("```")
+            lines.append("")
 
+        # ── High Priority (remaining) ──
+        if high:
+            lines.append("*🔴 HIGH PRIORITY*")
+            for r in high[:6]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            lines.append("")
+
+        # ── Medium Priority (remaining) ──
+        if med:
+            lines.append("*🟡 WATCH*")
+            for r in med[:8]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            lines.append("")
+
+        # ── Low Priority (remaining) ──
+        if low:
+            lines.append("*🟢 STRONG PERFORMERS*")
+            for r in low[:8]:
+                lines.append(f"• {escape_markdown_v2(r['message'][:180])}")
+            lines.append("")
+
+        # ── Total count ──
         total_recs = recs["recommendation_count"]
-        shown = len(high[:6]) + len(med[:6]) + len(low[:6])
+        shown = len(auto_disabled) + len(auto_reenabled) + len(perf) + len(param_recs[:6]) + len(weak) + len(vq) + len(regime) + len(mc) + len(high[:6]) + len(med[:8]) + len(low[:8])
         if total_recs == 0:
             lines.append("No actionable signal yet — still accumulating samples.")
         elif total_recs > shown:
@@ -952,8 +1013,7 @@ class BrainEngine:
 
         msg = self._truncate_telegram(lines)
 
-        # Persist BEFORE attempting the Telegram send, so a send failure
-        # doesn't also lose the report.
+        # Persist BEFORE attempting the Telegram send
         report_key = f"brain_report:{int(time.time())}"
         if self.sdb._redis and not self.sdb.degraded:
             result = await self.sdb._safe_redis_op(
@@ -963,7 +1023,6 @@ class BrainEngine:
             if result is None:
                 logger_run.warning(f"Failed to persist brain report {report_key}")
 
-        # FIX #3: only log "sent" if Telegram actually succeeded
         send_ok = False
         if telegram_queue:
             try:

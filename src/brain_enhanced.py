@@ -61,6 +61,9 @@ class BrainEngineV2(BaseBrainEngine):
         recommendations: List[Dict[str, Any]] = list(base_recs.get("recommendations", []))
         config_patch: List[Dict[str, Any]] = list(base_recs.get("config_patch", []))
         ai_metrics: Dict[str, Any] = dict(base_recs.get("ai_metrics", {}))
+        min_sample = getattr(cfg, "MIN_WIN_RATE_SAMPLE", 20)
+        disable_wr = getattr(cfg, "BRAIN_ALERT_DISABLE_THRESHOLD_WR", 0.40)
+        star_wr = getattr(cfg, "BRAIN_STAR_ALERT_WR", 0.70)
 
         # ── Phase 1.5: Vote Weight Optimizer ─────────────────────────────
         if len(real_rows) >= self._phase_samples["weight_optimizer"]:
@@ -105,43 +108,98 @@ class BrainEngineV2(BaseBrainEngine):
                         ),
                     })
 
-        # ── Phase 2: Parameter Autopsy ───────────────────────────────────
-        if real_rows and any("context" in r for r in real_rows):
+        # ── NEW: Per-alert breakdown (worst + best) ──────────────────────
+        alert_stats = engine.per_alert_breakdown(real_rows, min_sample=min_sample)
+        if alert_stats:
+            display = alert_stats if len(alert_stats) <= 10 else alert_stats[:5] + alert_stats[-5:]
+            msg_parts = []
+            for idx, (ak, wr, cnt, avg_s) in enumerate(display):
+                if len(alert_stats) > 10 and idx == 5:
+                    msg_parts.append(f"... ({len(alert_stats) - 10} more) ...")
+                flag = " 🔴" if wr < disable_wr else (" 🟢" if wr >= star_wr else "")
+                msg_parts.append(f"{ak}: {wr:.0%} WR (n={cnt}, avg score {avg_s:.1f}){flag}")
+            recommendations.append({
+                "type": "per_alert_breakdown", "severity": "low",
+                "message": "Per-alert breakdown:\n" + "\n".join(msg_parts),
+            })
 
-            # Parameters where higher is worse (e.g., RSI buy cap, buy_wick_ratio)
-            params_higher_worse = {
-                "rsi_adaptive_buy": True,   # Higher RSI buy cap = worse
-                "rsi_adaptive_sell": False,  # Lower RSI sell cap = worse (so higher is better)
-                "ppo_adaptive_threshold": True,  # Higher threshold = worse
-                "buy_wick_ratio": True,     # Higher wick ratio = worse
-                "sell_wick_ratio": True,    # Higher wick ratio = worse
+        # ── Phase 2: Parameter Autopsy (ALERT-AWARE) ─────────────────────
+        if real_rows and any("context" in r for r in real_rows):
+            # Map context parameters → the alert keys they gate
+            PARAM_ALERT_MAP = {
+                "ppo_adaptive_threshold": [
+                    "ppo_adaptive_up", "ppo_adaptive_down"
+                ],
+                "rsi_adaptive_buy": [
+                    "rsi_ema5_up", "rsi_cross_adaptive_up"
+                ],
+                "rsi_adaptive_sell": [
+                    "rsi_ema5_down", "rsi_cross_adaptive_down"
+                ],
+                "buy_wick_ratio": [
+                    "strong_reversal_buy", "hist_rma_buy", "ppohist_buy",
+                    "tk_conversion_up", "kijun_cross_up",
+                ],
+                "sell_wick_ratio": [
+                    "strong_reversal_sell", "hist_rma_sell", "ppohist_sell",
+                    "tk_conversion_down", "kijun_cross_down",
+                ],
             }
 
-            for param in params_higher_worse.keys():
+            params_higher_worse = {
+                "rsi_adaptive_buy": True,    # higher buy cap = worse
+                "rsi_adaptive_sell": False,  # higher sell cap = better (lower is worse)
+                "ppo_adaptive_threshold": True,
+                "buy_wick_ratio": True,
+                "sell_wick_ratio": True,
+            }
+
+            for param, higher_is_worse in params_higher_worse.items():
                 if len(real_rows) < self._phase_samples["parameter_autopsy"]:
                     break
-                autopsy = parameter_autopsy(
+
+                autopsy = engine.parameter_autopsy(
                     real_rows, param,
                     min_sample=self._phase_samples["parameter_autopsy"],
-                    higher_is_worse=params_higher_worse[param],
+                    higher_is_worse=higher_is_worse,
                 )
-                if autopsy.get("valid") and autopsy.get("optimal_cutoff") is not None:
-                    last_bucket = autopsy["buckets"][-1]
-                    if last_bucket["wilson_hi"] < cfg.MIN_WIN_RATE:
-                        recommendations.append({
-                            "type": "parameter_autopsy",
-                            "severity": "high",
-                            "param": param,
-                            "message": (
-                                f"🎚️ {param}: trades above {autopsy['optimal_cutoff']:.2f} "
-                                f"show {last_bucket['wr']:.0%} WR (n={last_bucket['n']}). "
-                                f"Consider tightening to ≤{autopsy['optimal_cutoff']:.2f}."
-                            ),
-                            "delta_ev": max(0.0, cfg.MIN_WIN_RATE - last_bucket["wr"]),
-                            "wilson_lo": last_bucket["wilson_lo"],
-                            "wilson_hi": last_bucket["wilson_hi"],
-                        })
+                if not autopsy.get("valid") or autopsy.get("optimal_cutoff") is None:
+                    continue
 
+                last_bucket = autopsy["buckets"][-1]
+                if last_bucket["wilson_hi"] < cfg.MIN_WIN_RATE:
+                    affected = PARAM_ALERT_MAP.get(param, [])
+                    alert_hint = f" (affects: {', '.join(affected[:3])})" if affected else ""
+
+                    recommendations.append({
+                        "type": "parameter_autopsy",
+                        "severity": "high",
+                        "param": param,
+                        "message": (
+                            f"🎚️ {param}{alert_hint}: trades above {autopsy['optimal_cutoff']:.2f} "
+                            f"show {last_bucket['wr']:.0%} WR (n={last_bucket['n']}). "
+                            f"Consider tightening to ≤{autopsy['optimal_cutoff']:.2f}."
+                        ),
+                        "delta_ev": max(0.0, cfg.MIN_WIN_RATE - last_bucket["wr"]),
+                        "wilson_lo": last_bucket["wilson_lo"],
+                        "wilson_hi": last_bucket["wilson_hi"],
+                    })
+                    # Suggest a config patch for manual review (not auto-applied)
+                    config_path = None
+                    if param == "ppo_adaptive_threshold":
+                        config_path = "PPO_ADAPTIVE_VOLATILE" if higher_is_worse else "PPO_ADAPTIVE_CALM"
+                    elif param == "rsi_adaptive_buy":
+                        config_path = "RSI_ADAPTIVE_BUY_VOLATILE"
+                    elif param == "rsi_adaptive_sell":
+                        config_path = "RSI_ADAPTIVE_SELL_VOLATILE"
+
+                    if config_path and config_path not in {p["path"] for p in config_patch}:
+                        config_patch.append({
+                            "path": config_path,
+                            "current": getattr(cfg, config_path, None),
+                            "suggested": round(autopsy["optimal_cutoff"], 3),
+                            "reason": f"Parameter autopsy: WR drops above {autopsy['optimal_cutoff']:.2f}",
+                        })
         # ── Phase 3: Conditional Alert Gating ────────────────────────────
         if real_rows and len(real_rows) >= self._phase_samples["conditional_gating"]:
             # Check top 5 most frequent alert keys

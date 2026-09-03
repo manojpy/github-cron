@@ -920,10 +920,8 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
                 alert_keys_to_check.append(key)
 
         all_redis_alert_keys = list(ALERT_KEYS.values())
-        previous_states = await sdb.batch_get_all_alert_states(
-            pair_name, all_redis_alert_keys
-        )
-
+        previous_states = await sdb.batch_get_all_alert_states(pair_name, all_redis_alert_keys)
+        disabled_alert_keys = await sdb.get_disabled_alert_keys()
         raw_alerts: List[Tuple[str, str, str]] = []
 
         # ── Registry for cross-based alerts (same pattern as _build_resets) ──
@@ -958,6 +956,11 @@ async def _eval_alerts(gr: GateResult, data_5m: PriceData, data_daily: Optional[
         for alert_key in alert_keys_to_check:
             def_ = ALERT_DEFINITIONS_MAP.get(alert_key)
             if not def_:
+                continue
+
+            if alert_key in disabled_alert_keys: 
+                if cfg.DEBUG_MODE:
+                    logger_pair.debug(f"Skipping {alert_key}: brain-disabled (underperforming, per-key)")
                 continue
 
             if alert_key in BUY_ALERT_KEYS:

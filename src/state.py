@@ -8,7 +8,7 @@ import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
 
-from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY
+from bot_config import cfg, logger, json_dumps, json_loads, JSONDecodeError, CONFIG_OVERRIDE_ALLOWED_FIELDS, CONFIG_OVERRIDE_METADATA_KEY, BRAIN_DISABLED_KEYS_METADATA_KEY 
 from threshold_engine import hash_config_state
 from fetcher import compute_backoff
 
@@ -167,7 +167,6 @@ class RedisKeyPrefix:
     CUSUM_WATERMARK = "brain_cusum_watermark:"
     THRESHOLD_HISTORY = "brain_threshold_history:"
     VOTE_COUNT_HISTORY = "brain_vote_counts:"
-
 
 class RedisStateStore:
     POOL_MAX_AGE_SECONDS = 3600
@@ -444,21 +443,28 @@ class RedisStateStore:
             f"set_metadata {key}",
         )
 
-    async def load_config_override(self) -> List[str]:
+    async def _read_raw_config_override(self) -> Dict[str, Any]:
+        """Parses the config_override metadata blob without applying it.
+        Shared by load_config_override (startup-apply) and get_config_override
+        (read-only inspection, e.g. brain.py checking a path's current state
+        before deciding whether to auto-disable/auto-reinstate it)."""
         if self.degraded or not self._redis:
-            return []
+            return {}
         raw = await self.get_metadata(CONFIG_OVERRIDE_METADATA_KEY)
         if not raw:
-            return []
+            return {}
         try:
             override = json_loads(raw)
         except (JSONDecodeError, TypeError, ValueError) as e:
             logger.warning(f"Ignoring malformed config_override in Redis: {e}")
-            return []
+            return {}
         if not isinstance(override, dict):
             logger.warning("Ignoring config_override in Redis: not a JSON object")
-            return []
+            return {}
+        return override
 
+    async def load_config_override(self) -> List[str]:
+        override = await self._read_raw_config_override()
         applied = []
         for field, new_value in override.items():
             if field not in CONFIG_OVERRIDE_ALLOWED_FIELDS:
@@ -474,6 +480,53 @@ class RedisStateStore:
             except (TypeError, ValueError) as e:
                 logger.warning(f"Ignoring config_override field '{field}' — could not coerce {new_value!r}: {e}")
         return applied
+
+    async def get_config_override(self) -> Dict[str, Any]:
+        """Read-only: current override dict, safelist-filtered, for inspection
+        without mutating cfg. Used by brain.py to check whether a path is
+        already disabled before deciding to (re)write it."""
+        override = await self._read_raw_config_override()
+        return {k: v for k, v in override.items() if k in CONFIG_OVERRIDE_ALLOWED_FIELDS}
+
+    async def write_config_override(self, field: str, value: Any) -> bool:
+        """Merge one field into the live config_override blob (read-modify-write).
+        Returns False (and writes nothing) if field isn't on the safelist —
+        callers should not assume success without checking the return value."""
+        if field not in CONFIG_OVERRIDE_ALLOWED_FIELDS:
+            logger.warning(f"Refusing to write config_override field '{field}' — not in the allowed safelist")
+            return False
+        override = await self._read_raw_config_override()
+        override[field] = value
+        try:
+            await self.set_metadata(CONFIG_OVERRIDE_METADATA_KEY, json_dumps(override))
+        except Exception as e:
+            logger.warning(f"Failed to write config_override field '{field}': {e}")
+            return False
+        return True
+
+    async def get_disabled_alert_keys(self) -> Set[str]:
+        raw = await self.get_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY)
+        if not raw:
+            return set()
+        try:
+            keys = json_loads(raw)
+        except (JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Ignoring malformed {BRAIN_DISABLED_KEYS_METADATA_KEY} in Redis: {e}")
+            return set()
+        return set(keys) if isinstance(keys, list) else set()
+
+    async def set_alert_key_disabled(self, alert_key: str, disabled: bool) -> bool:
+        current = await self.get_disabled_alert_keys()
+        if disabled:
+            current.add(alert_key)
+        else:
+            current.discard(alert_key)
+        try:
+            await self.set_metadata(BRAIN_DISABLED_KEYS_METADATA_KEY, json_dumps(sorted(current)))
+        except Exception as e:
+            logger.warning(f"Failed to update disabled-key set for '{alert_key}': {e}")
+            return False
+        return True
 
     async def batch_get_metadata(self, keys: List[str], timeout: float = 5.0) -> Dict[str, Optional[str]]:
         """Fetch many metadata keys in ONE Redis round-trip (pipeline)."""
