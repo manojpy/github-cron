@@ -20,7 +20,7 @@ use (duplicates are easy to dedupe on _stream_id if it ever matters),
 so no distributed-lock complexity has been added for it.
 
 Usage:
-    REDIS_URL=... python3 export_outcomes.py [--data-dir data/outcomes]
+    REDIS_URL=... python3 export_outcomes.py [--data-dir src/data/outcomes]
 """
 
 import argparse
@@ -135,8 +135,8 @@ def export_stream(r: "redis.Redis", label: str, stream_key: str,
 
 def main():
     ap = argparse.ArgumentParser(description="Archive Redis outcome streams to durable JSONL")
-    ap.add_argument("--data-dir", default="data/outcomes",
-                     help="Root directory for archived JSONL files (default: data/outcomes)")
+    ap.add_argument("--data-dir", default="src/data/outcomes",
+                     help="Root directory for archived JSONL files (default: src/data/outcomes)")
     args = ap.parse_args()
 
     redis_url = os.environ.get("REDIS_URL")
